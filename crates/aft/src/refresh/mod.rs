@@ -262,12 +262,20 @@ pub fn apply_path_status(
 ) -> Result<(), PathStatusError> {
     for outcome in outcomes {
         let reason = outcome.reason.as_deref().unwrap_or("refresh failed");
+        if matches!(outcome.disposition, WorkDisposition::Retry { .. }) {
+            statuses.mark_pending_many(
+                outcome
+                    .rel_paths
+                    .iter()
+                    .map(|path| (path.as_slice(), reason)),
+                since_generation,
+            )?;
+            continue;
+        }
         for rel_path in &outcome.rel_paths {
             match outcome.disposition {
                 WorkDisposition::Published => statuses.clear(rel_path)?,
-                WorkDisposition::Retry { .. } => {
-                    statuses.mark_pending(rel_path, reason, since_generation)?
-                }
+                WorkDisposition::Retry { .. } => unreachable!("retry fanout was batched above"),
                 WorkDisposition::Failed { .. }
                 | WorkDisposition::Quarantined
                 | WorkDisposition::BreakerRecorded { .. } => {
@@ -298,6 +306,29 @@ pub fn preserve_pending_after_unstable_read(
 mod tests {
     use super::*;
     use crate::blob_store::{CallgraphKey, SemanticKey};
+
+    #[test]
+    fn retry_fanout_batches_5000_pending_marks_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut statuses = PathStatusStore::open(dir.path()).unwrap();
+        let outcomes = [ProcessedFanout {
+            full_key: CallgraphKey::for_current(b"source", "rust").full_key(),
+            rel_paths: (0..5000)
+                .map(|index| format!("src/{index:04}.rs").into_bytes())
+                .collect(),
+            disposition: WorkDisposition::Retry {
+                retry: 1,
+                backoff: transient_backoff(1),
+            },
+            reason: Some("retry later".into()),
+        }];
+        let transactions =
+            crate::path_status::test_support::count_write_transactions(&mut statuses, |statuses| {
+                apply_path_status(statuses, &outcomes, 7).unwrap()
+            });
+        assert_eq!(statuses.summary().unwrap().pending_count, 5000);
+        assert_eq!(transactions, 1, "5000 pending marks must share one commit");
+    }
 
     #[test]
     fn full_key_dedup_runs_one_operation_and_fans_out_bytewise_sorted_paths() {

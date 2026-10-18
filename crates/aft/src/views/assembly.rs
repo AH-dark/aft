@@ -566,15 +566,15 @@ pub fn prepare_checkout_deferring(
     prepared.profile.pending_paths = blocking_paths.len() + semantic_pending_paths.len();
     let mut status = PathStatusStore::open(view.view_dir())
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    for path in blocking_paths.iter().chain(&semantic_pending_paths) {
-        status
-            .mark_pending(
-                path,
-                pending_inputs[path].reason,
-                generation_number(&next_generation),
-            )
-            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    }
+    status
+        .mark_pending_many(
+            blocking_paths
+                .iter()
+                .chain(&semantic_pending_paths)
+                .map(|path| (path.as_slice(), pending_inputs[path].reason)),
+            generation_number(&next_generation),
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     prepared.report.pending_inputs = pending_inputs;
     if !blocking_paths.is_empty() {
         prepared.profile.outcome = "pending";

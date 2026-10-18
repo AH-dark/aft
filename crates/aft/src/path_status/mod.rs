@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 /// Maximum paths included in a refresh-status response; counts include paths beyond this limit.
 pub const VISIBLE_PATH_CAP: usize = 20;
@@ -26,6 +26,17 @@ CREATE TABLE IF NOT EXISTS maintenance_outcomes (
     generation INTEGER NOT NULL CHECK(generation >= 0)
 ) WITHOUT ROWID;
 "#;
+
+const UPSERT_PATH_STATUS: &str =
+    "INSERT INTO path_status (rel_path, state, reason, since_generation)
+    VALUES (?1, ?2, ?3, ?4)
+    ON CONFLICT(rel_path) DO UPDATE SET
+        state = excluded.state,
+        reason = excluded.reason,
+        since_generation = CASE
+            WHEN path_status.state = excluded.state THEN path_status.since_generation
+            ELSE excluded.since_generation
+        END";
 
 /// The two path problem states exposed by view status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +189,39 @@ impl PathStatusStore {
         )
     }
 
+    /// Marks a pending set in one IMMEDIATE transaction with the same age rule
+    /// as `mark_pending`. Readers see all rows or none; an error or unwinding
+    /// cancellation rolls back the entire set, without changing durability.
+    /// Reasons may differ per path, and repeated paths are applied in order.
+    pub fn mark_pending_many<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = (&'a [u8], &'a str)>,
+        since_generation: u64,
+    ) -> Result<(), PathStatusError> {
+        let generation = i64::try_from(since_generation)
+            .map_err(|_| PathStatusError::GenerationOutOfRange(since_generation))?;
+        let mut rows = rows.into_iter().peekable();
+        if rows.peek().is_none() {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut upsert = transaction.prepare_cached(UPSERT_PATH_STATUS)?;
+            for (path, reason) in rows {
+                upsert.execute(params![
+                    path,
+                    PathState::Pending.as_str(),
+                    reason,
+                    generation
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Marks a path failed. A state transition starts a new annotation age.
     pub fn mark_failed(
         &mut self,
@@ -316,15 +360,7 @@ impl PathStatusStore {
         let generation = i64::try_from(since_generation)
             .map_err(|_| PathStatusError::GenerationOutOfRange(since_generation))?;
         self.connection.execute(
-            "INSERT INTO path_status (rel_path, state, reason, since_generation)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(rel_path) DO UPDATE SET
-                 state = excluded.state,
-                 reason = excluded.reason,
-                 since_generation = CASE
-                     WHEN path_status.state = excluded.state THEN path_status.since_generation
-                     ELSE excluded.since_generation
-                 END",
+            UPSERT_PATH_STATUS,
             params![rel_path, state.as_str(), reason, generation],
         )?;
         Ok(())
@@ -344,8 +380,206 @@ impl PathStatusStore {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::PathStatusStore;
+    use std::cell::Cell;
+
+    thread_local! {
+        static IN_TRANSACTION: Cell<bool> = const { Cell::new(false) };
+        static WRITE_TRANSACTIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // Observe SQLite statements, including implicit transactions, rather than
+    // counting calls to the batch API: a caller can accidentally bypass that API.
+    pub(crate) fn count_write_transactions(
+        store: &mut PathStatusStore,
+        operation: impl FnOnce(&mut PathStatusStore),
+    ) -> usize {
+        IN_TRANSACTION.set(false);
+        WRITE_TRANSACTIONS.set(0);
+        store.connection.trace(Some(|sql| {
+            let sql = sql.trim_start();
+            if sql.starts_with("BEGIN") {
+                IN_TRANSACTION.set(true);
+            } else if sql.starts_with("COMMIT") {
+                WRITE_TRANSACTIONS.set(WRITE_TRANSACTIONS.get() + 1);
+                IN_TRANSACTION.set(false);
+            } else if sql.starts_with("ROLLBACK") {
+                IN_TRANSACTION.set(false);
+            } else if !IN_TRANSACTION.get()
+                && (sql.starts_with("INSERT") || sql.starts_with("DELETE"))
+            {
+                WRITE_TRANSACTIONS.set(WRITE_TRANSACTIONS.get() + 1);
+            }
+        }));
+        operation(store);
+        store.connection.trace(None);
+        WRITE_TRANSACTIONS.get()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_batch_matches_per_row_states_reasons_and_ages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut per_row = PathStatusStore::open(&dir.path().join("per-row")).unwrap();
+        let mut batched = PathStatusStore::open(&dir.path().join("batched")).unwrap();
+        for store in [&mut per_row, &mut batched] {
+            store.mark_pending(b"pending", "old pending", 2).unwrap();
+            store.mark_failed(b"failed", "old failure", 3).unwrap();
+            store.mark_pending(b"cleared", "old cleared", 4).unwrap();
+            store.clear(b"cleared").unwrap();
+            store.mark_failed(b"untouched", "keep failed", 5).unwrap();
+        }
+        let rows = [
+            (b"new".as_slice(), "new path"),
+            (b"pending", "still pending"),
+            (b"failed", "retry failure"),
+            (b"cleared", "requeued"),
+            (b"\x80binary", "byte path"),
+            (b"new", "last reason wins"),
+        ];
+        for (path, reason) in rows {
+            per_row.mark_pending(path, reason, 9).unwrap();
+        }
+        batched.mark_pending_many(rows, 9).unwrap();
+        assert_eq!(batched.summary().unwrap(), per_row.summary().unwrap());
+        for (path, age, reason) in [
+            (b"new".as_slice(), 9, "last reason wins"),
+            (b"pending", 2, "still pending"),
+            (b"failed", 9, "retry failure"),
+            (b"cleared", 9, "requeued"),
+        ] {
+            let row = batched.status_for(path).unwrap().unwrap();
+            assert_eq!(row.state, PathState::Pending);
+            assert_eq!(row.since_generation, age);
+            assert_eq!(row.reason, reason);
+        }
+        assert_eq!(
+            batched.status_for(b"untouched").unwrap().unwrap().state,
+            PathState::Failed
+        );
+    }
+
+    #[test]
+    fn pending_batch_sql_error_and_cancellation_roll_back_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PathStatusStore::open(dir.path()).unwrap();
+        store.mark_failed(b"existing", "failure", 2).unwrap();
+        let before = store.summary().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_b BEFORE INSERT ON path_status WHEN new.rel_path = x'62'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        assert!(store
+            .mark_pending_many(
+                [
+                    (b"existing".as_slice(), "retry"),
+                    (b"a", "new"),
+                    (b"b", "new")
+                ],
+                9,
+            )
+            .is_err());
+        assert_eq!(store.summary().unwrap(), before);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER refuse_b")
+            .unwrap();
+        let paths = (0..5000).map(|n| format!("path-{n}")).collect::<Vec<_>>();
+        let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store
+                .mark_pending_many(
+                    paths.iter().enumerate().map(|(index, path)| {
+                        assert_ne!(index, 1000, "injected cancellation after 1000 rows");
+                        (path.as_bytes(), "pending")
+                    }),
+                    9,
+                )
+                .unwrap();
+        }));
+        assert!(cancelled.is_err());
+        drop(store);
+        let store = PathStatusStore::open(dir.path()).unwrap();
+        assert_eq!(store.summary().unwrap(), before);
+        let integrity: String = store
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn pending_batch_process_exit_before_commit_leaves_no_partial_rows() {
+        const CHILD_DIR: &str = "AFT_PENDING_BATCH_CRASH_DIR";
+        const INTERRUPTED_EXIT: i32 = 86;
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let mut store = PathStatusStore::open(Path::new(&dir)).unwrap();
+            let paths = (0..5000).map(|n| format!("path-{n}")).collect::<Vec<_>>();
+            store
+                .mark_pending_many(
+                    paths.iter().enumerate().map(|(index, path)| {
+                        if index == 1000 {
+                            // Exit without destructors, leaving SQLite to recover the
+                            // uncommitted transaction when the parent opens the store.
+                            std::process::exit(INTERRUPTED_EXIT);
+                        }
+                        (path.as_bytes(), "pending")
+                    }),
+                    9,
+                )
+                .unwrap();
+            panic!("crash injection did not execute");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PathStatusStore::open(dir.path()).unwrap();
+        store.mark_failed(b"existing", "failure", 2).unwrap();
+        let before = store.summary().unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "path_status::tests::pending_batch_process_exit_before_commit_leaves_no_partial_rows", "--nocapture"])
+            .env(CHILD_DIR, dir.path())
+            .status().unwrap();
+        assert_eq!(status.code(), Some(INTERRUPTED_EXIT));
+        let store = PathStatusStore::open(dir.path()).unwrap();
+        assert_eq!(store.summary().unwrap(), before);
+    }
+
+    #[test]
+    fn pending_batch_5000_rows_use_one_immediate_transaction_and_empty_uses_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PathStatusStore::open(dir.path()).unwrap();
+        let paths = (0..5000).map(|n| format!("path-{n}")).collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let count = test_support::count_write_transactions(&mut store, |store| {
+            store
+                .mark_pending_many(paths.iter().map(|path| (path.as_bytes(), "queued")), 1)
+                .unwrap();
+        });
+        eprintln!("5000-row pending transaction: {:?}", started.elapsed());
+        assert_eq!(count, 1);
+        assert_eq!(store.summary().unwrap().pending_count, 5000);
+        let count = test_support::count_write_transactions(&mut store, |store| {
+            store.mark_pending_many(std::iter::empty(), 1).unwrap();
+        });
+        assert_eq!(count, 0);
+        assert!(matches!(
+            store.mark_pending_many([(b"bad".as_slice(), "bad")], u64::MAX),
+            Err(PathStatusError::GenerationOutOfRange(_))
+        ));
+        assert!(store.status_for(b"bad").unwrap().is_none());
+        let synchronous: i64 = store
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2, "batching must not weaken FULL durability");
+    }
 
     #[test]
     fn repeated_status_writes_use_wal_without_rollback_journals() {
