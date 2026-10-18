@@ -680,3 +680,192 @@ fn grants_launch_fixture_roots_do_not_contain_windows_verbatim_glob_prefix() {
         assert_eq!(root, &policy_path(root));
     }
 }
+
+/// The launch check resolves the head's policy, which probes the filesystem.
+/// It must do so with aft.db unlocked, so a slow or stalled filesystem never
+/// keeps other routes (such as a flow read of the head's files) from the
+/// database.
+#[test]
+fn grants_catalog_resolves_head_policy_with_database_unlocked() {
+    let (_dir, ctx, head, worker) = fixture();
+    let target = head.project_root.join("shared");
+    let raw = json!([{"path":target,"mode":"read"}]);
+    let db = ctx.db().unwrap();
+    let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let hook = {
+        let probes = probes.clone();
+        unlocked_hook::install(move |_| probes.borrow_mut().push(db.try_lock().is_ok()))
+    };
+    remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap();
+    drop(hook);
+    let probes = probes.borrow();
+    assert!(
+        !probes.is_empty(),
+        "the launch check resolved the head's policy"
+    );
+    assert!(
+        probes.iter().all(|unlocked| *unlocked),
+        "aft.db was locked during resolution: {probes:?}"
+    );
+    let granted = operation(json!({"scope":"worker"}), "grants.list", &head, &ctx).unwrap();
+    assert_eq!(granted["grants"].as_array().unwrap().len(), 1, "{granted}");
+}
+
+/// A head's standing grant on an outside directory, which the head therefore
+/// holds, and a worker launch asking to read that directory. Returns the
+/// directory and the launch's `allow_paths`.
+fn delegated_launch() -> (
+    tempfile::TempDir,
+    AppContext,
+    RouteIdentity,
+    RouteIdentity,
+    PathBuf,
+    Value,
+) {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let outside = policy_path(&outside);
+    let raw = json!([{"path":outside,"mode":"read"}]);
+    {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        store::insert(
+            &conn,
+            &scope_key(&head),
+            &AccessGrant {
+                path: outside.clone(),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Read,
+            },
+        )
+        .unwrap();
+        // Against the head's policy as stored now, the launch is accepted.
+        let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
+            .unwrap()
+            .unwrap();
+        validate(&raw, Some(&policy)).unwrap();
+    }
+    (dir, ctx, head, worker, outside, raw)
+}
+
+/// Installs a hook that records every unlocked step and, the first time the
+/// catalog reaches `at`, runs `change` on the database as a concurrent route
+/// would.
+fn change_once_at(
+    ctx: &AppContext,
+    at: unlocked_hook::Point,
+    change: impl Fn(&rusqlite::Connection) + 'static,
+) -> (
+    unlocked_hook::Installed,
+    std::rc::Rc<std::cell::RefCell<Vec<unlocked_hook::Point>>>,
+) {
+    let db = ctx.db().unwrap();
+    let points = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = points.clone();
+    let hook = unlocked_hook::install(move |point| {
+        let first = !seen.borrow().contains(&point);
+        seen.borrow_mut().push(point);
+        if point == at && first {
+            change(&db.lock().unwrap());
+        }
+    });
+    (hook, points)
+}
+
+fn revoke_head_grant(head: &RouteIdentity, path: &Path) -> impl Fn(&rusqlite::Connection) {
+    let (key, path) = (scope_key(head), path.to_path_buf());
+    move |conn| assert_eq!(store::revoke(conn, &key, &path).unwrap(), 1)
+}
+
+fn worker_grants(head: &RouteIdentity, ctx: &AppContext) -> Vec<Value> {
+    operation(json!({"scope":"worker"}), "grants.list", head, ctx).unwrap()["grants"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn assert_head_not_held(error: &subc_protocol::ErrorBody, path: &Path) {
+    assert_eq!(error.code, "plan_param_refused", "{error:?}");
+    let detail = error.detail.as_ref().expect("refusal names the entry");
+    assert_eq!(detail["reason"], "head_not_held", "{error:?}");
+    assert_eq!(detail["path"], json!(path), "{error:?}");
+}
+
+/// The head stops holding the launch's directory while its policy is being
+/// resolved. The launch must be judged by the head's new policy: refused, no
+/// grant materialized, and the stored launch parameters never read on the
+/// strength of the stale snapshot.
+#[test]
+fn grants_catalog_head_change_during_resolution_refuses_by_the_new_policy() {
+    let (_dir, ctx, head, worker, outside, raw) = delegated_launch();
+    let (hook, points) = change_once_at(
+        &ctx,
+        unlocked_hook::Point::Resolve,
+        revoke_head_grant(&head, &outside),
+    );
+    let error = remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap_err();
+    drop(hook);
+    assert_head_not_held(&error, &outside);
+    let points = points.borrow();
+    assert!(
+        points
+            .iter()
+            .filter(|point| **point == unlocked_hook::Point::Resolve)
+            .count()
+            >= 2,
+        "the changed policy was resolved again: {points:?}"
+    );
+    assert!(
+        !points.contains(&unlocked_hook::Point::LaunchValidation),
+        "stored launch parameters were read after a stale validation: {points:?}"
+    );
+    assert!(worker_grants(&head, &ctx).is_empty());
+}
+
+/// The head stops holding the launch's directory after the launch read its
+/// stored parameters and before it materializes them. Nothing may be
+/// materialized against the stale snapshot; the new policy refuses.
+#[test]
+fn grants_catalog_head_change_before_materialize_refuses_by_the_new_policy() {
+    let (_dir, ctx, head, worker, outside, raw) = delegated_launch();
+    let (hook, points) = change_once_at(
+        &ctx,
+        unlocked_hook::Point::LaunchValidation,
+        revoke_head_grant(&head, &outside),
+    );
+    let error = remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap_err();
+    drop(hook);
+    assert_head_not_held(&error, &outside);
+    let points = points.borrow();
+    assert!(
+        points
+            .iter()
+            .filter(|point| **point == unlocked_hook::Point::Resolve)
+            .count()
+            >= 2,
+        "the changed policy was resolved again: {points:?}"
+    );
+    assert!(worker_grants(&head, &ctx).is_empty());
+}
+
+/// Another launch of the same worker scope stores different parameters
+/// between this launch's read of them and its materialize step. This launch
+/// must then validate the stored parameters, not the ones it read earlier:
+/// here the stored ones name a path the head does not hold, so it refuses
+/// and names that path.
+#[test]
+fn grants_catalog_validates_params_stored_by_a_concurrent_launch() {
+    let (dir, ctx, head, worker, _outside, raw) = delegated_launch();
+    let unheld = policy_path(&dir.path().join("unheld"));
+    let key = launch_key(&worker, "worker").unwrap();
+    let other = json!([{"path":unheld,"mode":"read"}]);
+    let (hook, _points) =
+        change_once_at(&ctx, unlocked_hook::Point::LaunchValidation, move |conn| {
+            store::materialize(conn, &key, &other, &[]).unwrap()
+        });
+    let error = remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap_err();
+    drop(hook);
+    assert_head_not_held(&error, &unheld);
+    assert!(worker_grants(&head, &ctx).is_empty());
+}
