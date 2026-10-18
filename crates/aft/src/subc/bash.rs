@@ -897,6 +897,54 @@ fn finish_bash_poll_done(
     response
 }
 
+/// Combine the reply windows chosen by bash dispatch into the watchdog deadline.
+pub(super) fn unanswered_bash_reply_deadline(
+    received_at: Instant,
+    wait_window_ms: u64,
+    startup_window_ms: u64,
+    capture_deadline: Option<Instant>,
+    command_timeout_ms: u64,
+) -> Instant {
+    // Local command timeouts start at launch, not receipt. Allow startup before
+    // that timeout while keeping the reply wait cap measured from receipt.
+    let reply_wait_ms = wait_window_ms.min(startup_window_ms.saturating_add(command_timeout_ms));
+    let mut deadline = received_at + Duration::from_millis(startup_window_ms.max(reply_wait_ms));
+    if let Some(capture_deadline) = capture_deadline {
+        deadline = deadline.max(capture_deadline);
+    }
+    deadline
+}
+
+#[cfg(test)]
+mod unanswered_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn command_timeout_watchdog_includes_startup_but_respects_reply_cap() {
+        let received_at = Instant::now();
+        for (wait_ms, startup_ms, timeout_ms, capture_ms, expected_ms) in [
+            (120_000, 5_000, 30_000, None, 35_000),
+            (32_000, 5_000, 30_000, None, 32_000),
+            (2_000, 5_000, 30_000, None, 5_000),
+            (120_000, 5_000, 30_000, Some(60_000), 60_000),
+            (120_000, 5_000, u64::MAX, None, 120_000),
+        ] {
+            let deadline = unanswered_bash_reply_deadline(
+                received_at,
+                wait_ms,
+                startup_ms,
+                capture_ms.map(|ms| received_at + Duration::from_millis(ms)),
+                timeout_ms,
+            );
+            assert_eq!(
+                deadline.duration_since(received_at),
+                Duration::from_millis(expected_ms),
+                "wait={wait_ms} startup={startup_ms} timeout={timeout_ms} capture={capture_ms:?}"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_deferred_bash(
     executor: &Arc<Executor>,
@@ -991,9 +1039,10 @@ pub(super) fn submit_deferred_bash(
         .and_then(crate::subc_translate::model_boolean)
         == Some(true)
         && !server_completion;
+    let worker_wait_max_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&spawn_ctx);
     let blocking_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
         blocking_intent,
-        crate::commands::bash_orchestrate::worker_wait_max_ms(&spawn_ctx),
+        worker_wait_max_ms,
     );
     let capture_deadline = raw_args
         .get("runon")
@@ -1067,6 +1116,7 @@ pub(super) fn submit_deferred_bash(
                 call_key: key.clone(),
             });
     let submit_executor = executor.clone();
+    let unanswered_metrics = Arc::clone(metrics);
     let spawn_cancel = JobCancellation::new();
     let submit_cancel = spawn_cancel.clone();
     let submit_request_id = request_id.clone();
@@ -1183,6 +1233,9 @@ pub(super) fn submit_deferred_bash(
                         }
                     }
                     let settings = bash_settings_from_translated(&translated.args);
+                    let command_timeout_ms = settings.timeout.unwrap_or_else(|| {
+                        crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64
+                    });
                     let raw_req = RawRequest {
                         id: request_id_for_spawn.clone(),
                         command: "bash".to_string(),
@@ -1294,6 +1347,18 @@ pub(super) fn submit_deferred_bash(
                         .unwrap_or("pipes");
                     let is_pty = mode == "pty" || settings.pty;
                     if !server_completion && (is_pty || settings.background) {
+                        let unanswered_deadline = unanswered_bash_reply_deadline(
+                            received_at,
+                            0,
+                            startup_window,
+                            capture_deadline,
+                            command_timeout_ms,
+                        );
+                        unanswered_metrics.set_bash_unanswered_deadline(
+                            route,
+                            corr,
+                            unanswered_deadline,
+                        );
                         let response = bash_background_launch_response(
                             &request_id_for_spawn,
                             &task_id,
@@ -1347,6 +1412,14 @@ pub(super) fn submit_deferred_bash(
                                     .unwrap_or(wait_window_ms);
                             wait_window_ms.min(20_000)
                         };
+                    let unanswered_deadline = unanswered_bash_reply_deadline(
+                        received_at,
+                        wait_window_ms,
+                        startup_window,
+                        capture_deadline,
+                        command_timeout_ms,
+                    );
+                    unanswered_metrics.set_bash_unanswered_deadline(route, corr, unanswered_deadline);
                     let deadline = received_at + Duration::from_millis(wait_window_ms);
                     // A server-owned call is killed rather than handed back.
                     let remote_handback = ((settings.block_to_completion || settings.wait)

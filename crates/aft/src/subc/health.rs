@@ -15,6 +15,7 @@ use crate::executor::BindBlockerSnapshot;
 
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
+const UNANSWERED_TOOL_DEADLINE: Duration = Duration::from_secs(25);
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
@@ -634,6 +635,37 @@ impl DispatchPathMetrics {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "undecoded".into());
+        let client_deadline = if name == "bash" {
+            body.and_then(client_deadline)
+        } else {
+            None
+        };
+        let client_deadline_supplied = name == "bash"
+            && body
+                .and_then(|body| body.get("deadline_ms"))
+                .and_then(Value::as_u64)
+                .is_some();
+        let (deadline, deadline_class_ms) = if name == "bash" {
+            let deadline = client_deadline.or_else(|| {
+                if client_deadline_supplied {
+                    None
+                } else {
+                    received_at.checked_add(UNANSWERED_TOOL_DEADLINE)
+                }
+            });
+            let class_ms = deadline.map(|deadline| {
+                deadline
+                    .saturating_duration_since(received_at)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            });
+            (deadline, class_ms)
+        } else {
+            (
+                received_at.checked_add(UNANSWERED_TOOL_DEADLINE),
+                Some(UNANSWERED_TOOL_DEADLINE.as_millis() as u64),
+            )
+        };
         if let Ok(mut tools) = self.unanswered_tools.lock() {
             tools.insert(
                 (
@@ -643,10 +675,37 @@ impl DispatchPathMetrics {
                 UnansweredTool {
                     received_at,
                     name,
+                    deadline,
+                    deadline_class_ms,
+                    client_deadline_supplied,
                     warned: false,
                 },
             );
         }
+    }
+
+    pub(super) fn set_bash_unanswered_deadline(
+        &self,
+        route: super::RouteChannel,
+        corr: u64,
+        deadline: Instant,
+    ) {
+        let Ok(mut tools) = self.unanswered_tools.lock() else {
+            return;
+        };
+        let Some(tool) = tools.get_mut(&(route, corr)) else {
+            return;
+        };
+        if tool.name != "bash" || tool.client_deadline_supplied {
+            return;
+        }
+        tool.deadline = Some(deadline);
+        tool.deadline_class_ms = Some(
+            deadline
+                .saturating_duration_since(tool.received_at)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        );
     }
 
     /// Called by the independent watchdog thread, not by an executor job or
@@ -660,11 +719,17 @@ impl DispatchPathMetrics {
             return;
         };
         for (&(route, corr), tool) in tools.iter_mut() {
-            if !tool.warned
-                && now.saturating_duration_since(tool.received_at) >= Duration::from_secs(25)
-            {
+            if !tool.warned && tool.deadline.is_some_and(|deadline| now >= deadline) {
                 tool.warned = true;
-                log(&format!("tool_call unanswered past client deadline class name={} channel={} epoch={} corr={} elapsed_ms={} deadline_class_ms=25000", tool.name, route.channel, route.epoch, corr, now.saturating_duration_since(tool.received_at).as_millis()));
+                log(&format!(
+                    "tool_call unanswered past client deadline class name={} channel={} epoch={} corr={} elapsed_ms={} deadline_class_ms={}",
+                    tool.name,
+                    route.channel,
+                    route.epoch,
+                    corr,
+                    now.saturating_duration_since(tool.received_at).as_millis(),
+                    tool.deadline_class_ms.unwrap_or_default()
+                ));
             }
         }
     }
@@ -1207,7 +1272,23 @@ impl DispatchPathMetrics {
 struct UnansweredTool {
     received_at: Instant,
     name: String,
+    deadline: Option<Instant>,
+    deadline_class_ms: Option<u64>,
+    client_deadline_supplied: bool,
     warned: bool,
+}
+
+fn client_deadline(body: &Value) -> Option<Instant> {
+    let deadline_ms = body.get("deadline_ms")?.as_u64()?;
+    // Pair the clocks here: the reader's receipt instant can predate this
+    // wall-clock sample by time spent queued for dispatch.
+    let now = Instant::now();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    now.checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
 }
 
 pub(super) struct DeferredBashWaitGuard {
@@ -3226,6 +3307,11 @@ mod tests {
         )
         .unwrap();
         metrics.tool_received(&request, now);
+        metrics.set_bash_unanswered_deadline(
+            super::super::route_key(24, 1),
+            1188,
+            now + super::Duration::from_secs(25),
+        );
         let lines = RefCell::new(Vec::new());
         let sink = |line: &str| lines.borrow_mut().push(line.to_string());
         metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(24), &sink);
@@ -3243,6 +3329,137 @@ mod tests {
         reply.header.ty = crate::subc::FrameType::Response;
         metrics.tool_replied(&reply);
         assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bash_call_without_submission_keeps_fallback_watchdog_deadline() {
+        use std::cell::RefCell;
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1187,
+            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now);
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(24), &sink);
+        assert!(lines.borrow().is_empty());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(25), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1187"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(30), &sink);
+        assert_eq!(
+            lines.borrow().len(),
+            1,
+            "warn only once per unanswered call"
+        );
+    }
+
+    #[test]
+    fn bash_client_deadline_watchdog_does_not_double_count_reader_queue_time() {
+        use std::cell::RefCell;
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let now_ms = super::SystemTime::now()
+            .duration_since(super::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1190,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "bash",
+                "deadline_ms": now_ms + 10_000,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now - super::Duration::from_secs(5));
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(9), &sink);
+        assert!(
+            lines.borrow().is_empty(),
+            "reader queue time must not shorten the client's remaining ten seconds: {:?}",
+            lines.borrow()
+        );
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(11), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1190"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(12), &sink);
+        assert_eq!(lines.borrow().len(), 1, "each call warns only once");
+    }
+
+    #[test]
+    fn bash_deadline_watchdog_uses_each_calls_effective_deadline() {
+        use std::cell::RefCell;
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = |corr, arguments| {
+            crate::subc::Frame::build_with_version(
+                crate::subc::PROTOCOL_VERSION,
+                crate::subc::FrameType::Request,
+                crate::subc::control_flags(),
+                24,
+                1,
+                corr,
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "bash",
+                    "arguments": arguments,
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let waiting = request(1188, serde_json::json!({"wait": true}));
+        let waiting_deadline = super::super::bash::unanswered_bash_reply_deadline(
+            now, 120_000, 15_000, None, 1_800_000,
+        );
+        metrics.tool_received(&waiting, now);
+        metrics.set_bash_unanswered_deadline(
+            super::super::route_key(24, 1),
+            1188,
+            waiting_deadline,
+        );
+
+        let expiring = request(1189, serde_json::json!({"timeout": 5_000}));
+        let expiring_deadline =
+            super::super::bash::unanswered_bash_reply_deadline(now, 20_000, 20_000, None, 5_000);
+        metrics.tool_received(&expiring, now);
+        metrics.set_bash_unanswered_deadline(
+            super::super::route_key(24, 1),
+            1189,
+            expiring_deadline,
+        );
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(26), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("corr=1189"));
+
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(121), &sink);
+        assert_eq!(lines.borrow().len(), 2);
+        assert!(lines.borrow()[1].contains("corr=1188"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(130), &sink);
+        assert_eq!(lines.borrow().len(), 2, "each call warns only once");
     }
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
