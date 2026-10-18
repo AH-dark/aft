@@ -399,7 +399,7 @@ fn handle_identity(file: &File) -> io::Result<(u64, u64)> {
 }
 
 /// Stable module-operation refusals; messages deliberately omit paths and policy contents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadExactRefusal {
     BadRequest,
     AccessDenied,
@@ -407,6 +407,7 @@ pub(crate) enum ReadExactRefusal {
     NotRegular,
     TooLarge,
     RouteNotAdmitted(&'static str),
+    ParentNotAdmitted(String),
     IoError,
     /// The parent head's access policy was still locked by other work when
     /// the read's time limit ran out. Reported under the I/O error code.
@@ -414,19 +415,21 @@ pub(crate) enum ReadExactRefusal {
 }
 
 impl ReadExactRefusal {
-    pub(crate) fn code(self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::BadRequest => "file_read_exact_bad_request",
             Self::AccessDenied => "file_read_exact_access_denied",
             Self::NotFound => "file_read_exact_not_found",
             Self::NotRegular => "file_read_exact_not_regular",
             Self::TooLarge => "file_read_exact_too_large",
-            Self::RouteNotAdmitted(_) => "file_read_exact_route_not_admitted",
+            Self::RouteNotAdmitted(_) | Self::ParentNotAdmitted(_) => {
+                "file_read_exact_route_not_admitted"
+            }
             Self::IoError | Self::PolicyTimeout => "file_read_exact_io_error",
         }
     }
 
-    pub(crate) fn message(self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             Self::BadRequest => "Missing or invalid path.".into(),
             Self::AccessDenied => "Access denied by the parent head's policy.".into(),
@@ -434,6 +437,7 @@ impl ReadExactRefusal {
             Self::NotRegular => "Not a regular file.".into(),
             Self::TooLarge => "File exceeds the 1048576-byte limit.".into(),
             Self::RouteNotAdmitted(check) => format!("Route not admitted: {check}."),
+            Self::ParentNotAdmitted(reason) => format!("Route not admitted: parent: {reason}."),
             Self::IoError => "The file could not be read.".into(),
             Self::PolicyTimeout => {
                 "The parent head's access policy could not be read within the read's time limit."
@@ -1169,6 +1173,13 @@ mod tests {
                 "File exceeds the 1048576-byte limit.",
             ),
             (
+                ReadExactRefusal::ParentNotAdmitted(
+                    "the flow-read scope carries no parent scope".into(),
+                ),
+                "file_read_exact_route_not_admitted",
+                "Route not admitted: parent: the flow-read scope carries no parent scope.",
+            ),
+            (
                 ReadExactRefusal::IoError,
                 "file_read_exact_io_error",
                 "The file could not be read.",
@@ -1184,7 +1195,6 @@ mod tests {
             ("owner", "Route not admitted: owner."),
             ("kind", "Route not admitted: kind."),
             ("scope_ref", "Route not admitted: scope_ref."),
-            ("parent", "Route not admitted: parent."),
             ("expiry", "Route not admitted: expiry."),
             ("operation", "Route not admitted: operation."),
         ] {
