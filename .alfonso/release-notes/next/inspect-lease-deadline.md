@@ -1,1 +1,1 @@
-Inspect cache writer-lease acquisition now preserves one deadline across path and directory preparation and lock contention, rather than restarting its remaining wait after filesystem preparation. Retry sleeps stay capped to the remaining budget. Scheduler pauses and blocking filesystem calls can still delay the return, but no fresh wait budget is granted after they finish.
+- `aft_inspect` no longer waits past its time limit for another process's cache lock: the wait now counts setup time instead of starting over after it.
