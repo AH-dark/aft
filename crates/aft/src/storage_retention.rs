@@ -728,6 +728,8 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
         recorded_at_ms: u64,
     }
     let mut result: BTreeMap<String, Vec<Binding>> = BTreeMap::new();
+    #[cfg(test)]
+    test_hook(storage, "history-read");
     let mut linked_roots = HashMap::new();
     let memo = storage.join("cache-keys.json");
     if memo.exists() {
@@ -1232,34 +1234,306 @@ fn root_resident(storage: &Path, key: &str, history: &BTreeMap<String, Vec<Bindi
         })
 }
 
-fn owner_protected(storage: &Path, key: &str, known: bool) -> io::Result<bool> {
-    for owner in bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES)? {
-        let path = owner.path().join("owner.json");
-        if !path.exists() {
-            continue;
-        }
-        let metadata: crate::artifact_owner::ArtifactOwnerManifest = read_json(&path)?;
-        if ((!known && !owner_has_residency_marker(storage, &metadata))
-            || owner.file_name() == key
-            || metadata.project_scope_key == key)
-            && crate::artifact_owner::protected_for_retention(&metadata)
-        {
-            return Ok(true);
-        }
+/// The artifact-owner manifests under a storage folder, read once and then
+/// consulted for many keys. Each manifest keeps its own read result, so a
+/// key is refused on an unreadable manifest exactly when a fresh scan in the
+/// same order would have hit it before finding a protecting owner.
+struct OwnerManifests(
+    io::Result<
+        Vec<(
+            std::ffi::OsString,
+            io::Result<crate::artifact_owner::ArtifactOwnerManifest>,
+        )>,
+    >,
+);
+
+impl OwnerManifests {
+    fn read(storage: &Path) -> Self {
+        #[cfg(test)]
+        test_hook(storage, "owner-scan");
+        Self(
+            bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES).map(|owners| {
+                owners
+                    .into_iter()
+                    .filter_map(|owner| {
+                        let path = owner.path().join("owner.json");
+                        path.exists().then(|| (owner.file_name(), read_json(&path)))
+                    })
+                    .collect()
+            }),
+        )
     }
-    Ok(false)
+
+    /// Whether a live owner protects `key`. `known` says whether the key has
+    /// binding history; without it, any protected owner lacking a residency
+    /// marker protects the key as well.
+    fn protect(&self, storage: &Path, key: &str, known: bool) -> io::Result<bool> {
+        let owners = self
+            .0
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        for (name, metadata) in owners {
+            let metadata = metadata
+                .as_ref()
+                .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+            if ((!known && !owner_has_residency_marker(storage, metadata))
+                || name == key
+                || metadata.project_scope_key == key)
+                && crate::artifact_owner::protected_for_retention(metadata)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
-/// Entirely due roots do not need obsolete-generation GC or four byte walks.
-/// Validate once without measuring, then recheck admission before retiring.
-fn retire_due_cache(
+/// Most due caches one admission recheck covers. Prepared caches keep their
+/// leases until that recheck, so this also bounds how many caches a pass
+/// holds locked at once.
+const ADMISSION_BATCH: usize = 16;
+
+/// Due caches that passed every check that runs without the retention
+/// barrier, waiting with their leases held for one shared admission recheck.
+///
+/// The recheck needs the binding history read under the barrier, and that
+/// history is every binding record and owner manifest in the storage. Reading
+/// it once per batch, instead of once per cache, keeps a backlog drain from
+/// rereading thousands of records for every cache it removes. The barrier is
+/// still taken only for the recheck and rename, never across the walks.
+#[derive(Default)]
+struct DueBatch {
+    items: Vec<PreparedDue>,
+    /// Owner manifests for the checks made before the retention barrier
+    /// (`retention/sweep.lock`, which binds and pins also take), read once
+    /// per pass. The admission recheck reads them again while holding the
+    /// barrier, just before each rename.
+    owners: Option<OwnerManifests>,
+    /// Set while the due-first lane prepares caches, so their outcomes also
+    /// count toward [`SweepReport::due_first`].
+    due_lane: bool,
+}
+
+struct PreparedDue {
+    directory: PathBuf,
+    key: String,
+    leases: Vec<crate::fs_lock::LockGuard>,
+    due_lane: bool,
+    deadline: Instant,
+}
+
+impl DueBatch {
+    fn full(&self) -> bool {
+        self.items.len() >= ADMISSION_BATCH
+    }
+
+    /// Recheck and retire every prepared cache under one barrier hold. Each
+    /// cache's outcome is counted for its own domain, as it would have been
+    /// had it been retired when its lane met it.
+    fn flush(
+        &mut self,
+        storage: &Path,
+        now: u64,
+        deadline: Instant,
+        clock: &dyn Fn() -> Instant,
+        cancelled: &dyn Fn() -> bool,
+        report: &mut SweepReport,
+    ) -> io::Result<()> {
+        if self.items.is_empty() {
+            return Ok(());
+        }
+        let items = std::mem::take(&mut self.items);
+        // Cancelled or expired caches stay on disk for the next pass. Skip the
+        // lock and metadata rereads so root binding and cache pinning are not
+        // delayed by work that can no longer be retired.
+        if report.cancelled {
+            return Ok(());
+        }
+        if clock() >= deadline {
+            report.stopped_early = true;
+            return Ok(());
+        }
+        let phase = Instant::now();
+        // Try the retention barrier without waiting. If a bind or pin holds it,
+        // that caller is protecting this storage right now, so retention backs
+        // off instead of spending its pass budget waiting.
+        let admission =
+            crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
+                .map_err(|error| io::Error::other(error.to_string()))
+                .and_then(|barrier| {
+                    #[cfg(test)]
+                    test_hook(storage, "due-admitted");
+                    if cancelled() {
+                        report.cancelled = true;
+                        return Ok(None);
+                    }
+                    if clock() >= deadline {
+                        report.stopped_early = true;
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        barrier,
+                        bindings(storage)?,
+                        OwnerManifests::read(storage),
+                    )))
+                });
+        *report
+            .timings_ms
+            .entry("due_admission_history".into())
+            .or_default() += phase.elapsed().as_millis() as u64;
+        let (barrier, current, owners) = match admission {
+            Ok(Some(admission)) => admission,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                for item in items {
+                    let before = DomainReport::from_report(report);
+                    item.refuse(&error, report);
+                    item.attribute(storage, &before, report)?;
+                }
+                return Ok(());
+            }
+        };
+        for item in items {
+            if clock() >= deadline {
+                report.stopped_early = true;
+                break;
+            }
+            let before = DomainReport::from_report(report);
+            let cache = item.directory.join(&item.key);
+            let directory = item.directory.clone();
+            let due_lane = item.due_lane;
+            if !report.cancelled {
+                if let Err(error) = item.retire(storage, &current, &owners, now, cancelled, report)
+                {
+                    report.skipped_protected += 1;
+                    if report.errors.len() < 16 {
+                        report.errors.push(format!("{}: {error}", cache.display()));
+                    }
+                }
+            }
+            attribute_due(storage, &directory, due_lane, &before, report)?;
+        }
+        drop(barrier);
+        Ok(())
+    }
+}
+
+fn attribute_due(
+    storage: &Path,
+    directory: &Path,
+    due_lane: bool,
+    before: &DomainReport,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    let delta = DomainReport::from_report(report).difference(before);
+    if due_lane {
+        report.due_first.add(&delta);
+    }
+    report
+        .domains
+        .entry(
+            directory
+                .strip_prefix(storage)
+                .map_err(io::Error::other)?
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .or_default()
+        .add(&delta);
+    Ok(())
+}
+
+impl PreparedDue {
+    fn attribute(
+        &self,
+        storage: &Path,
+        before: &DomainReport,
+        report: &mut SweepReport,
+    ) -> io::Result<()> {
+        attribute_due(storage, &self.directory, self.due_lane, before, report)
+    }
+
+    /// The retention barrier (`retention/sweep.lock`) could not be taken: the
+    /// cache stays, counted as `skipped_protected` with the error and the
+    /// cache path, as a lane reports any candidate whose checks failed.
+    fn refuse(&self, error: &io::Error, report: &mut SweepReport) {
+        report.skipped_protected += 1;
+        if report.errors.len() < 16 {
+            report.errors.push(format!(
+                "{}: {error}",
+                self.directory.join(&self.key).display()
+            ));
+        }
+    }
+
+    /// Recheck admission against history read under the barrier, then retire
+    /// the cache with a rename.
+    fn retire(
+        self,
+        storage: &Path,
+        current: &BTreeMap<String, Vec<Binding>>,
+        owners: &OwnerManifests,
+        now: u64,
+        cancelled: &dyn Fn() -> bool,
+        report: &mut SweepReport,
+    ) -> io::Result<()> {
+        let Self {
+            directory,
+            key,
+            leases,
+            deadline,
+            ..
+        } = self;
+        let cache = directory.join(&key);
+        let key = key.as_str();
+        if !eligible(storage, key, current, now, ROOT_GRACE_MS, report)?
+            || root_resident(storage, key, current)
+            || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
+            || owners.protect(storage, key, current.contains_key(key))?
+            || protected(&cache)?
+        {
+            report.skipped_protected += 1;
+            return Ok(());
+        }
+        let _files = crate::db::file_identity::filesystem_guard();
+        if crate::db::file_identity::has_open_connections_under(&cache) {
+            report.skipped_protected += 1;
+            return Ok(());
+        }
+        if cancelled() {
+            report.cancelled = true;
+            return Ok(());
+        }
+        let phase = Instant::now();
+        retire_directory(&cache)?;
+        *report.timings_ms.entry("due_rename".into()).or_default() +=
+            phase.elapsed().as_millis() as u64;
+        report.removed_roots += 1;
+        report.unmeasured_removed_roots += 1;
+        if directory == storage.join("views") {
+            report.due_views_remaining = report.due_views_remaining.saturating_sub(1);
+        }
+        if !cache_key_present(storage, key, deadline)? {
+            clear_unknown_observation(storage, key)?;
+        }
+        // Lease guards address the old pathname. Drop them before releasing
+        // admission so they cannot touch a newly bound replacement at that path.
+        drop(leases);
+        Ok(())
+    }
+}
+
+/// A cache whose every binding is past its grace is about to be retired whole,
+/// so it skips the obsolete-generation GC and the byte-measuring tree walks
+/// that other candidates get. Validate its tree once without measuring, then
+/// queue it in `batch` for the admission recheck that retires it.
+fn prepare_due_cache(
     storage: &Path,
     directory: &Path,
     key: &str,
     history: &BTreeMap<String, Vec<Binding>>,
-    now: u64,
     deadline: Instant,
-    cancelled: &dyn Fn() -> bool,
+    batch: &mut DueBatch,
     report: &mut SweepReport,
 ) -> io::Result<()> {
     let cache = directory.join(key);
@@ -1288,7 +1562,10 @@ fn retire_due_cache(
         }
     }
     if root_resident(storage, key, history)
-        || owner_protected(storage, key, true)?
+        || batch
+            .owners
+            .get_or_insert_with(|| OwnerManifests::read(storage))
+            .protect(storage, key, true)?
         || protected(&cache)?
     {
         report.skipped_protected += 1;
@@ -1304,50 +1581,13 @@ fn retire_due_cache(
         .timings_ms
         .entry("due_validation".into())
         .or_default() += phase.elapsed().as_millis() as u64;
-    let phase = Instant::now();
-    // Retention yields to admission instead of spending another lane's budget
-    // waiting for a bind or pin that already protects this storage.
-    let _barrier =
-        crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-    let current = bindings(storage)?;
-    *report
-        .timings_ms
-        .entry("due_admission_history".into())
-        .or_default() += phase.elapsed().as_millis() as u64;
-    if !eligible(storage, key, &current, now, ROOT_GRACE_MS, report)?
-        || root_resident(storage, key, &current)
-        || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
-        || owner_protected(storage, key, current.contains_key(key))?
-        || protected(&cache)?
-    {
-        report.skipped_protected += 1;
-        return Ok(());
-    }
-    let _files = crate::db::file_identity::filesystem_guard();
-    if crate::db::file_identity::has_open_connections_under(&cache) {
-        report.skipped_protected += 1;
-        return Ok(());
-    }
-    if cancelled() {
-        report.cancelled = true;
-        return Ok(());
-    }
-    let phase = Instant::now();
-    retire_directory(&cache)?;
-    *report.timings_ms.entry("due_rename".into()).or_default() +=
-        phase.elapsed().as_millis() as u64;
-    report.removed_roots += 1;
-    report.unmeasured_removed_roots += 1;
-    if directory == storage.join("views") {
-        report.due_views_remaining = report.due_views_remaining.saturating_sub(1);
-    }
-    if !cache_key_present(storage, key, deadline)? {
-        clear_unknown_observation(storage, key)?;
-    }
-    // Lease guards address the old pathname. Drop them before releasing
-    // admission so they cannot touch a newly bound replacement at that path.
-    drop(leases);
+    batch.items.push(PreparedDue {
+        directory: directory.to_path_buf(),
+        key: key.to_owned(),
+        leases,
+        due_lane: batch.due_lane,
+        deadline,
+    });
     Ok(())
 }
 
@@ -1464,6 +1704,7 @@ fn candidate(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
     members: &mut ViewMembers,
+    batch: &mut DueBatch,
     report: &mut SweepReport,
 ) -> io::Result<()> {
     let before = DomainReport::from_report(report);
@@ -1478,6 +1719,7 @@ fn candidate(
         deadline,
         cancelled,
         members,
+        batch,
         &mut orphan,
         report,
     );
@@ -1506,6 +1748,7 @@ fn candidate_inner(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
     members: &mut ViewMembers,
+    batch: &mut DueBatch,
     orphan: &mut bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
@@ -1519,9 +1762,7 @@ fn candidate_inner(
             .get(key)
             .is_some_and(|records| records.iter().all(|binding| missing_and_old(binding, now)))
     {
-        return retire_due_cache(
-            storage, directory, key, history, now, deadline, cancelled, report,
-        );
+        return prepare_due_cache(storage, directory, key, history, deadline, batch, report);
     }
     let before = tree_files(&cache, deadline)?;
     if directory.file_name().is_some_and(|name| name == "views") {
@@ -1759,10 +2000,16 @@ fn due_first(
     clock: &dyn Fn() -> Instant,
     cancelled: &dyn Fn() -> bool,
     members: &mut ViewMembers,
+    batch: &mut DueBatch,
     report: &mut SweepReport,
 ) -> io::Result<()> {
     let mut caches = Vec::new();
-    for key in due_keys(history, report.at_ms) {
+    let phase = Instant::now();
+    let keys = due_keys(history, report.at_ms);
+    report
+        .timings_ms
+        .insert("due_keys".into(), phase.elapsed().as_millis() as u64);
+    for key in keys {
         let mut present = false;
         for (directory, flat) in domains {
             // A flat domain keeps the files of many keys side by side in one
@@ -1796,6 +2043,7 @@ fn due_first(
         )
     });
     let mut last = None;
+    batch.due_lane = true;
     for (key, directory) in caches.into_iter().take(DUE_FIRST_ENTRIES) {
         if cancelled() {
             report.cancelled = true;
@@ -1817,6 +2065,7 @@ fn due_first(
             deadline,
             cancelled,
             members,
+            batch,
             report,
         ) {
             report.skipped_protected += 1;
@@ -1840,7 +2089,13 @@ fn due_first(
             .or_default()
             .add(&delta);
         last = Some(key);
+        if batch.full() {
+            batch.flush(storage, report.at_ms, deadline, clock, cancelled, report)?;
+        }
     }
+    let flushed = batch.flush(storage, report.at_ms, deadline, clock, cancelled, report);
+    batch.due_lane = false;
+    flushed?;
     if let Some(last) = last {
         states()
             .lock()
@@ -1877,6 +2132,7 @@ fn orphan_first(
     clock: &dyn Fn() -> Instant,
     cancelled: &dyn Fn() -> bool,
     members: &mut ViewMembers,
+    due: &mut DueBatch,
     report: &mut SweepReport,
 ) -> io::Result<HashSet<PathBuf>> {
     let batch = traversal_batch_filtered(
@@ -1917,6 +2173,7 @@ fn orphan_first(
                 deadline,
                 cancelled,
                 members,
+                due,
                 report,
             ) {
                 report.skipped_protected += 1;
@@ -1936,6 +2193,9 @@ fn orphan_first(
         visited.insert(item.entry.path());
         last = Some(item.after);
     }
+    // Views this lane visits have no binding history, so none is due; flush
+    // anyway so nothing prepared here can outlive the lane.
+    due.flush(storage, report.at_ms, deadline, clock, cancelled, report)?;
     if completed {
         last = Some(batch.end);
     }
@@ -1984,6 +2244,7 @@ fn run_pass_with_budget(
             .insert("setup".into(), started.elapsed().as_millis() as u64);
         let phase = Instant::now();
         let mut members = ViewMembers::default();
+        let mut due = DueBatch::default();
         // Keys already past their grace go first, with at most half the
         // budget, so their reclaim does not wait for the lexical walk to come
         // around. That walk visits every cache in every domain and takes days
@@ -1996,6 +2257,7 @@ fn run_pass_with_budget(
             clock,
             cancelled,
             &mut members,
+            &mut due,
             &mut report,
         )?;
         report
@@ -2012,6 +2274,7 @@ fn run_pass_with_budget(
             clock,
             cancelled,
             &mut members,
+            &mut due,
             &mut report,
         )?;
         report
@@ -2065,6 +2328,7 @@ fn run_pass_with_budget(
                     deadline,
                     cancelled,
                     &mut members,
+                    &mut due,
                     &mut report,
                 ) {
                     report.skipped_protected += 1;
@@ -2082,7 +2346,25 @@ fn run_pass_with_budget(
                 .or_default()
                 .add(&delta);
             last_processed = Some(after);
+            if due.full() {
+                due.flush(
+                    storage,
+                    report.at_ms,
+                    deadline,
+                    clock,
+                    cancelled,
+                    &mut report,
+                )?;
+            }
         }
+        due.flush(
+            storage,
+            report.at_ms,
+            deadline,
+            clock,
+            cancelled,
+            &mut report,
+        )?;
         if completed {
             last_processed = Some(batch.end);
         }
@@ -3344,6 +3626,8 @@ mod storage_retention_tests {
             .unwrap();
         let key = "0123456789abcdef";
         let mut report = SweepReport::default();
+        let mut due = DueBatch::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
         candidate(
             &storage,
             &storage.join("symbols"),
@@ -3351,9 +3635,19 @@ mod storage_retention_tests {
             false,
             &BTreeMap::new(),
             now,
-            Instant::now() + Duration::from_secs(5),
+            deadline,
             &|| false,
             &mut ViewMembers::default(),
+            &mut due,
+            &mut report,
+        )
+        .unwrap();
+        due.flush(
+            &storage,
+            now,
+            deadline,
+            &Instant::now,
+            &|| false,
             &mut report,
         )
         .unwrap();
@@ -3637,6 +3931,470 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn storage_retention_cancelled_final_flush_skips_admission_and_rereads() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let callgraph = cache(temp.path(), "callgraph", &scope);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let walk_hook = {
+            let cancelled = cancelled.clone();
+            observe_test_hook(
+                &view,
+                Arc::new(move |step| {
+                    if step == "walk" {
+                        // Signal cancellation while validating the view. Preparation
+                        // still queues it before the loop checks the next candidate.
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                }),
+            )
+        };
+        let hook = {
+            let cancelled = cancelled.clone();
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            let admissions = admissions.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| {
+                    // Setup reads precede cancellation; only count final-flush work.
+                    if cancelled.load(Ordering::SeqCst) {
+                        match step {
+                            "history-read" => {
+                                history_reads.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "owner-scan" => {
+                                owner_scans.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "due-admitted" => {
+                                admissions.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }),
+            )
+        };
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| cancelled.load(Ordering::SeqCst),
+            &Instant::now,
+            NO_TIME_BOUND,
+        );
+        assert!(report.cancelled, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.examined, 1, "cancel after queuing only the view");
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 1, "{report:?}");
+        assert!(view.exists() && callgraph.exists());
+        assert_eq!(
+            (
+                history_reads.load(Ordering::SeqCst),
+                owner_scans.load(Ordering::SeqCst),
+                admissions.load(Ordering::SeqCst),
+            ),
+            (0, 0, 0),
+            "cancelled final flush must not reread history, scan owners, or take sweep.lock"
+        );
+        drop(hook);
+        drop(walk_hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(!next.cancelled, "{next:?}");
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 2, "{next:?}");
+        assert_eq!(next.due_views_remaining, 0, "{next:?}");
+        assert!(!view.exists() && !callgraph.exists());
+    }
+
+    #[test]
+    fn storage_retention_due_flush_rechecks_cancellation_under_barrier() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let cancelled = cancelled.clone();
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            let admissions = admissions.clone();
+            let storage = temp.path().to_path_buf();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "due-admitted" => {
+                        assert!(storage.join("retention/sweep.lock").exists());
+                        admissions.fetch_add(1, Ordering::SeqCst);
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                    "history-read" if cancelled.load(Ordering::SeqCst) => {
+                        history_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    "owner-scan" if cancelled.load(Ordering::SeqCst) => {
+                        owner_scans.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| cancelled.load(Ordering::SeqCst),
+            &Instant::now,
+            NO_TIME_BOUND,
+        );
+        assert!(report.cancelled, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 1, "{report:?}");
+        assert!(view.exists());
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (
+                history_reads.load(Ordering::SeqCst),
+                owner_scans.load(Ordering::SeqCst),
+            ),
+            (0, 0),
+            "cancellation at admission must skip history and owner rereads"
+        );
+        drop(hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(!next.cancelled, "{next:?}");
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 1, "{next:?}");
+        assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_budget_expired_final_flush_skips_admission_and_rereads() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let callgraph = cache(temp.path(), "callgraph", &scope);
+        let expired = Arc::new(AtomicBool::new(false));
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let walk_hook = {
+            let expired = expired.clone();
+            observe_test_hook(
+                &view,
+                Arc::new(move |step| {
+                    if step == "walk" {
+                        // The injected clock expires while validation still queues
+                        // the view, before the loop checks the next candidate.
+                        expired.store(true, Ordering::SeqCst);
+                    }
+                }),
+            )
+        };
+        let hook = {
+            let expired = expired.clone();
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            let admissions = admissions.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| {
+                    // Ignore setup reads; only final-flush work is past budget.
+                    if expired.load(Ordering::SeqCst) {
+                        match step {
+                            "history-read" => {
+                                history_reads.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "owner-scan" => {
+                                owner_scans.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "due-admitted" => {
+                                admissions.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }),
+            )
+        };
+        let started = Instant::now();
+        let now = || {
+            started
+                + if expired.load(Ordering::SeqCst) {
+                    NO_TIME_BOUND * 2
+                } else {
+                    Duration::ZERO
+                }
+        };
+        let report = run_pass_with_budget(temp.path(), &|| false, &now, NO_TIME_BOUND);
+        assert!(report.stopped_early && !report.cancelled, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.examined, 1, "expire after queuing only the view");
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.unmeasured_removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 1, "{report:?}");
+        assert!(view.exists() && callgraph.exists());
+        assert_eq!(
+            (
+                history_reads.load(Ordering::SeqCst),
+                owner_scans.load(Ordering::SeqCst),
+                admissions.load(Ordering::SeqCst),
+            ),
+            (0, 0, 0),
+            "expired final flush must not reread history, scan owners, or take sweep.lock"
+        );
+        drop(hook);
+        drop(walk_hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(!next.cancelled, "{next:?}");
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 2, "{next:?}");
+        assert_eq!(next.due_views_remaining, 0, "{next:?}");
+        assert!(!view.exists() && !callgraph.exists());
+    }
+
+    #[test]
+    fn storage_retention_budget_due_flush_rechecks_expiry_under_barrier() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let expired = Arc::new(AtomicBool::new(false));
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let expired = expired.clone();
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            let admissions = admissions.clone();
+            let storage = temp.path().to_path_buf();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "due-admitted" => {
+                        assert!(storage.join("retention/sweep.lock").exists());
+                        admissions.fetch_add(1, Ordering::SeqCst);
+                        expired.store(true, Ordering::SeqCst);
+                    }
+                    "history-read" if expired.load(Ordering::SeqCst) => {
+                        history_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    "owner-scan" if expired.load(Ordering::SeqCst) => {
+                        owner_scans.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let started = Instant::now();
+        let now = || {
+            started
+                + if expired.load(Ordering::SeqCst) {
+                    NO_TIME_BOUND * 2
+                } else {
+                    Duration::ZERO
+                }
+        };
+        let report = run_pass_with_budget(temp.path(), &|| false, &now, NO_TIME_BOUND);
+        assert!(report.stopped_early && !report.cancelled, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.unmeasured_removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 1, "{report:?}");
+        assert!(view.exists());
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (
+                history_reads.load(Ordering::SeqCst),
+                owner_scans.load(Ordering::SeqCst),
+            ),
+            (0, 0),
+            "expiry at admission must skip history and owner rereads"
+        );
+        drop(hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 1, "{next:?}");
+        assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_budget_due_flush_stops_retiring_between_items() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        let view = cache(temp.path(), "views", &scope);
+        let callgraph = cache(temp.path(), "callgraph", &scope);
+        let expired = Arc::new(AtomicBool::new(false));
+        let hook = {
+            let expired = expired.clone();
+            observe_test_hook(
+                &view,
+                Arc::new(move |step| {
+                    if step == "rename-root" {
+                        // Let the first retirement finish, but exhaust the budget
+                        // before the next queued cache can be retired.
+                        expired.store(true, Ordering::SeqCst);
+                    }
+                }),
+            )
+        };
+        let started = Instant::now();
+        let now = || {
+            started
+                + if expired.load(Ordering::SeqCst) {
+                    NO_TIME_BOUND * 2
+                } else {
+                    Duration::ZERO
+                }
+        };
+        let report = run_pass_with_budget(temp.path(), &|| false, &now, NO_TIME_BOUND);
+        assert!(
+            expired.load(Ordering::SeqCst),
+            "first retirement was not reached"
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(report.stopped_early && !report.cancelled, "{report:?}");
+        assert_eq!(report.unmeasured_removed_roots, 1, "{report:?}");
+        assert_eq!(report.due_first.removed_roots, 1, "{report:?}");
+        assert_eq!(report.domains["views"].removed_roots, 1, "{report:?}");
+        assert_eq!(report.domains["callgraph"].removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_protected, 0, "{report:?}");
+        assert_eq!(report.due_views_remaining, 0, "{report:?}");
+        assert!(!view.exists() && callgraph.exists());
+        drop(hook);
+        let next = run_pass_entry_bound(temp.path());
+        assert!(next.errors.is_empty(), "{next:?}");
+        assert_eq!(next.removed_roots, 1, "{next:?}");
+        assert!(!callgraph.exists());
+    }
+
+    /// A drain burst over a large backlog. Every removal rechecks binding
+    /// history under the retention barrier, and that history is every binding
+    /// record in the storage. The recheck must not reread all of it for each
+    /// removed cache: with thousands of records that made each pass cost
+    /// seconds of file reads, and a burst runs pass after pass.
+    #[test]
+    fn storage_retention_due_drain_rereads_history_per_batch_not_per_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DUE: usize = 600;
+        const LIVE: usize = 1400;
+        let (temp, root, scope) = fixture();
+        let template: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        fs::remove_dir(root).unwrap();
+        // Checkouts live outside the storage folder, as they do in production.
+        let checkouts = tempfile::tempdir().unwrap();
+        for number in 0..DUE + LIVE {
+            let key = format!("{number:016x}");
+            let mut binding = template.clone();
+            binding.artifact_key = key.clone();
+            if number < DUE {
+                binding.root = checkouts.path().join(format!("deleted-{number}"));
+                cache(temp.path(), "views", &key);
+                cache(temp.path(), "callgraph", &key);
+            } else {
+                // Bindings whose checkout still exists: every admission
+                // recheck reads them, and retention must never remove them.
+                let live = checkouts.path().join(format!("live-{number}"));
+                fs::create_dir(&live).unwrap();
+                binding.root = live;
+            }
+            atomic_json(
+                &temp.path().join(format!("retention/roots/{key}.json")),
+                &binding,
+            )
+            .unwrap();
+        }
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let owner_scans = Arc::new(AtomicUsize::new(0));
+        let _hook = {
+            let history_reads = history_reads.clone();
+            let owner_scans = owner_scans.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "history-read" => {
+                        history_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "owner-scan" => {
+                        owner_scans.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let started = Instant::now();
+        let mut passes = Vec::new();
+        drain_due_views(|| {
+            let reads_before = history_reads.load(Ordering::Relaxed);
+            let scans_before = owner_scans.load(Ordering::Relaxed);
+            let report = run_pass_entry_bound(temp.path());
+            let reads = history_reads.load(Ordering::Relaxed) - reads_before;
+            let scans = owner_scans.load(Ordering::Relaxed) - scans_before;
+            eprintln!(
+                "retention drain pass={} removed_roots={} examined={} due_first_examined={} due_views_remaining={} history_reads={reads} owner_scans={scans} errors={:?} timings_ms={:?}",
+                passes.len() + 1,
+                report.removed_roots,
+                report.examined,
+                report.due_first.examined,
+                report.due_views_remaining,
+                report.errors,
+                report.timings_ms
+            );
+            passes.push((
+                report.removed_roots,
+                reads,
+                scans,
+                report.due_views_remaining,
+            ));
+            report
+        });
+        let removed: usize = passes.iter().map(|(removed, ..)| removed).sum();
+        eprintln!(
+            "retention drain due={DUE} live={LIVE} passes={} removed={removed} elapsed_ms={}",
+            passes.len(),
+            started.elapsed().as_millis()
+        );
+        assert_eq!(
+            passes.last().map(|(.., remaining)| *remaining),
+            Some(0),
+            "the burst left due views: {passes:?}"
+        );
+        assert!(removed >= DUE, "the burst removed too little: {passes:?}");
+        for (removed, reads, scans, _) in &passes {
+            // One read at pass setup, and one per admission batch of removals
+            // (each lane flushes its own partial batch, hence the slack).
+            let batches = removed.div_ceil(ADMISSION_BATCH) + 2;
+            assert!(
+                *reads <= 1 + batches,
+                "history reread per removal: removed={removed} reads={reads}"
+            );
+            assert!(
+                *scans <= 1 + batches,
+                "owners rescanned per removal: removed={removed} scans={scans}"
+            );
+        }
+    }
+
+    #[test]
     fn storage_retention_backlog_burst_stops_without_progress_or_on_cancellation() {
         for cancelled in [false, true] {
             let mut passes = 0;
@@ -3664,6 +4422,7 @@ mod storage_retention_tests {
         fs::remove_dir(root).unwrap();
         let measurements = Arc::new(AtomicUsize::new(0));
         let walks = Arc::new(AtomicUsize::new(0));
+        let retirements = Arc::new(AtomicUsize::new(0));
         let cursor_commits = Arc::new(AtomicUsize::new(0));
         let mut hooks = Vec::new();
         for number in 0..ROOTS {
@@ -3684,6 +4443,7 @@ mod storage_retention_tests {
             }
             let measurements = measurements.clone();
             let walks = walks.clone();
+            let retirements = retirements.clone();
             hooks.push(observe_test_hook(
                 &path,
                 Arc::new(move |step| {
@@ -3691,6 +4451,8 @@ mod storage_retention_tests {
                         measurements.fetch_add(1, Ordering::Relaxed);
                     } else if step == "walk" {
                         walks.fetch_add(1, Ordering::Relaxed);
+                    } else if step == "rename-root" {
+                        retirements.fetch_add(1, Ordering::Relaxed);
                     }
                 }),
             ));
@@ -3709,15 +4471,15 @@ mod storage_retention_tests {
         age_orphan(temp.path(), &orphan, orphan_key);
         let run_bounded_pass = || {
             let clock_start = Instant::now();
-            let clock_calls = AtomicUsize::new(0);
+            let retired_before = retirements.load(Ordering::Relaxed);
             let clock = || {
-                if clock_calls.fetch_add(1, Ordering::Relaxed) < MIN_REMOVED {
+                if retirements.load(Ordering::Relaxed) - retired_before < MIN_REMOVED {
                     clock_start
                 } else {
-                    // Prioritized due candidates stop at half the pass budget. After
-                    // MIN_REMOVED checks, jump past that cutoff but stay before
-                    // the unbound-view stage's three-quarter cutoff and the
-                    // full-budget cutoff of the general directory traversal.
+                    // Expire the due lane after MIN_REMOVED retirements, not
+                    // clock probes: admission and inter-item checks also read it.
+                    // Stay before the orphan lane's three-quarter cutoff and
+                    // the full-budget cutoff of the lexical traversal.
                     clock_start + NO_TIME_BOUND * 5 / 8
                 }
             };
