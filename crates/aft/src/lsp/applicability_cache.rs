@@ -118,14 +118,6 @@ pub(super) fn observe_path(path: &Path) {
     });
 }
 
-pub(super) fn is_external_input(path: &Path) -> bool {
-    DEPENDENCIES.with_borrow(|capture| {
-        capture
-            .as_ref()
-            .is_some_and(|capture| !path.starts_with(&capture.root))
-    })
-}
-
 pub(super) fn capture_id() -> Option<u64> {
     DEPENDENCIES.with_borrow(|capture| capture.as_ref().map(|capture| capture.id))
 }

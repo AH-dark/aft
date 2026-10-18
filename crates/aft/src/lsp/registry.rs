@@ -992,21 +992,22 @@ impl BiomeIncludes {
 }
 
 /// Parsed `files.includes` of one Biome configuration, memoized by path and
-/// modification time so a walk over thousands of files reads it once.
+/// file identity so a walk over thousands of files reads it once. Identity
+/// covers replacement as well as edits (inode and change time on Unix, size
+/// and modification time everywhere), because an ancestor configuration above
+/// the project root can change without a watcher event.
 fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
     type Memo = parking_lot::Mutex<
-        HashMap<PathBuf, (Option<std::time::SystemTime>, Option<Arc<BiomeIncludes>>)>,
+        HashMap<PathBuf, (Option<BiomeConfigStamp>, Option<Arc<BiomeIncludes>>)>,
     >;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let modified = std::fs::metadata(config_path)
-        .and_then(|metadata| metadata.modified())
-        .ok();
+    let stamp = std::fs::metadata(config_path)
+        .ok()
+        .map(|metadata| BiomeConfigStamp::of(&metadata));
     let memo = MEMO.get_or_init(Default::default);
-    // An ancestor configuration can be replaced without a watcher event. Its
-    // identity is checked by the walk cache, not this mtime-only parse memo.
-    if !super::applicability_cache::is_external_input(config_path) {
+    if stamp.is_some() {
         if let Some((at, includes)) = memo.lock().get(config_path) {
-            if *at == modified {
+            if *at == stamp {
                 return includes.clone();
             }
         }
@@ -1014,6 +1015,8 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
     let parsed = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|source| {
+            #[cfg(test)]
+            BIOME_PARSES.with(|parses| parses.set(parses.get() + 1));
             serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&source)).ok()
         })
         .and_then(|config| {
@@ -1035,8 +1038,40 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
             Some(Arc::new(BiomeIncludes { patterns }))
         });
     memo.lock()
-        .insert(config_path.to_path_buf(), (modified, parsed.clone()));
+        .insert(config_path.to_path_buf(), (stamp, parsed.clone()));
     parsed
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Biome configuration parses made by this thread.
+    static BIOME_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The identity of a Biome configuration file as `biome_includes` last parsed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BiomeConfigStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl BiomeConfigStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
@@ -1402,8 +1437,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        builtin_servers, is_config_file_path, resolve_lsp_binary, resolve_server_binary,
-        servers_for_file, ServerDef, ServerKind,
+        biome_includes, builtin_servers, is_config_file_path, resolve_lsp_binary,
+        resolve_server_binary, servers_for_file, ServerDef, ServerKind, BIOME_PARSES,
     };
     use crate::config::{Config, UserServerDef};
 
@@ -1501,6 +1536,40 @@ mod tests {
         assert_eq!(server_root("cli"), root);
         assert_eq!(server_root("plugin"), root);
         assert_eq!(server_root("old"), root.join("packages/old"));
+    }
+
+    /// One parse serves every file of a walk, including a configuration above
+    /// the project root, and replacing the file is still noticed.
+    #[test]
+    fn biome_config_is_parsed_once_until_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("biome.json");
+        write_file(&config_path, r#"{"files":{"includes":["a/**"]}}"#);
+        let parses = || BIOME_PARSES.with(std::cell::Cell::get);
+        let before = parses();
+        for _ in 0..50 {
+            assert!(biome_includes(&config_path).is_some());
+        }
+        assert_eq!(parses() - before, 1, "one parse serves every lookup");
+
+        // Replace the file with same-length content and restore its old
+        // modification time: only its inode and change time differ.
+        let modified = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let staged = temp.path().join("biome.json.new");
+        write_file(&staged, r#"{"files":{"includes":["b/**"]}}"#);
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&staged, &config_path).unwrap();
+        assert!(biome_includes(&config_path).is_some());
+        assert_eq!(
+            parses() - before,
+            2,
+            "a replaced configuration is parsed again"
+        );
     }
 
     /// Biome is not a producer for a file its `files.includes` leaves out, so
