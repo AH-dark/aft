@@ -56,9 +56,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: e2e-linux-${{ inputs.cargo_profile }}
           cache-on-failure: true
@@ -426,9 +426,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: e2e-windows-${{ inputs.cargo_profile }}
           cache-on-failure: true
@@ -503,13 +503,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # cache-bin: false makes rust-cache safe on macOS: the old failure was
       # the cached ~/.cargo/bin shim overwriting the fresh cargo shim (which
       # then misread argv as rustup-init). Excluding bin keeps the dependency
       # artifacts without touching shims. See _unit-suite.yml unit-macos.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: e2e-macos-${{ inputs.cargo_profile }}
           cache-bin: false
