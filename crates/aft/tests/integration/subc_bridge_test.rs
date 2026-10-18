@@ -12788,13 +12788,10 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     send_tool_call(&mut stream, 2, 32, "status", json!({})).await;
     expect_error_frame(&mut stream, 2, 32, "unknown_management_op").await;
 
+    // A tool route does not serve management operations: the request is
+    // refused with a protocol error naming the operation, never answered.
     send_management_request(&mut stream, 1, 33, json!({ "op": "memory.census" })).await;
-    let tool_route_refusal = read_frame_timeout(&mut stream, "tool-route management refusal").await;
-    assert_tool_error_code(
-        &tool_response_json(&tool_route_refusal),
-        "unknown_tool",
-        "management operation on a tool route",
-    );
+    expect_error_frame(&mut stream, 1, 33, "unknown_op").await;
 
     send_management_route_bind(&mut stream, 3, 40, &root2, Some(Principal::Unverified)).await;
     expect_route_bind_error(&mut stream, 40, "route_refused").await;
