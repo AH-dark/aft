@@ -837,6 +837,21 @@ pub(super) fn admission_trusted(
             && matches!(call.name.as_str(), "bash" | "powershell"))
 }
 
+/// Shell capability refusals need no saved policy or database access.
+pub(super) fn shell_capability_refusal(name: &str, trusted: bool) -> Option<ErrorBody> {
+    (!trusted
+        && matches!(
+            name,
+            "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write" | "bash_watch"
+        ))
+    .then(|| {
+        ErrorBody::new(
+            errors::CAPABILITY_NOT_ADMITTED,
+            "shell execution and observation require an admitted principal",
+        )
+    })
+}
+
 pub(super) fn ledger_scope(
     scope: &subc_protocol::scope::ScopeStamp,
 ) -> crate::db::call_ledger::ScopeIdentity {
@@ -2217,16 +2232,8 @@ fn admit_as(
             "v1 execution requires a bound session",
         ));
     }
-    if !trusted
-        && matches!(
-            call.name.as_str(),
-            "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write" | "bash_watch"
-        )
-    {
-        return Err(ErrorBody::new(
-            errors::CAPABILITY_NOT_ADMITTED,
-            "shell execution and observation require an admitted principal",
-        ));
+    if let Some(error) = shell_capability_refusal(&call.name, trusted) {
+        return Err(error);
     }
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
@@ -3971,6 +3978,45 @@ mod route_tests {
                 .is_err()
         );
         reply
+    }
+
+    #[tokio::test]
+    async fn untrusted_shell_capability_refusal_precedes_unavailable_confinement() {
+        for opening in [false, true] {
+            for keyed in [false, true] {
+                let (_dir, root) = test_support::test_root("untrusted-shell-policy-order");
+                let ctx = test_support::test_ctx();
+                ctx.mark_database_runtime_initializing_for_test();
+                if !opening {
+                    ctx.finish_database_runtime_error("unreadable database".into(), false);
+                }
+                let mut identity = test_support::route_identity(&root, "session");
+                let inner = Arc::get_mut(&mut identity.0).unwrap();
+                inner.role = RouteRole::ToolProviderV1;
+                inner.trust = BindTrust::Untrusted;
+                inner.consumer_elicitation_capable = false;
+                inner.scope = Some(stamp("worker"));
+                let mut body = json!({"name":"bash", "arguments":{"command":"true"}});
+                if keyed {
+                    body["call_key"] = json!("no-elicitation");
+                }
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    exchange_with_actor(
+                        body,
+                        identity,
+                        ctx,
+                        &Arc::new(DispatchPathMetrics::new()),
+                        |_, _| panic!("a refused shell must never dispatch"),
+                    ),
+                )
+                .await
+                .expect("a capability refusal must not wait for the database");
+                assert_eq!(reply.header.ty, FrameType::Error);
+                let error: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(error["code"], "capability_not_admitted");
+            }
+        }
     }
 
     #[cfg(unix)]

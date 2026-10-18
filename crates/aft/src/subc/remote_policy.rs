@@ -226,7 +226,13 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
         return known;
     }
     let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
-        return Err(policy_unavailable());
+        // A busy handle slot can hide an empty, never-configured store from
+        // the memory probe. Recheck after waiting for the slot off the loop.
+        return if ctx.database_runtime_unconfigured() {
+            Ok(false)
+        } else {
+            Err(policy_unavailable())
+        };
     };
     // A confining save can invalidate another epoch's fallback read. Retry
     // when it races this read so even this call cannot use a stale answer;

@@ -135,13 +135,15 @@ impl DatabaseWaits {
     /// the frame loop would stop health checks, cancellations and other roots
     /// from being served meanwhile. The frame comes back from [`Self::next`]
     /// carrying the result in `DecodedFrame::confinement`, and the call is
-    /// not admitted before then. Returns the frame unchanged when no read is
-    /// needed. Past the waiter limit the frame also comes back unchanged, and
+    /// not admitted before then. Opening the database and reading its policy
+    /// share the bounded persistence wait budget. Memory answers are carried
+    /// forward too, since a later nonblocking probe may find a busy slot.
+    /// Past the waiter limit the frame comes back unchanged, and
     /// admission refuses it for want of a policy (see
     /// `remote_policy::admit_confined_on_frame_loop`).
     pub(super) fn read_confinement(
         &mut self,
-        decoded: DecodedFrame,
+        mut decoded: DecodedFrame,
         routes: &HashMap<RouteChannel, RouteIdentity>,
         executor: &Executor,
     ) -> Result<(), DecodedFrame> {
@@ -155,9 +157,6 @@ impl DatabaseWaits {
         let Some(ctx) = executor.actor_context(&identity.root) else {
             return Err(decoded);
         };
-        if remote_policy::confinement_from_memory(&ctx, identity).is_some() {
-            return Err(decoded);
-        }
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
@@ -174,24 +173,60 @@ impl DatabaseWaits {
         }) {
             return Err(decoded);
         }
+        if identity.role == tool_provider::RouteRole::ToolProviderV1 {
+            if let Ok(call) = serde_json::from_value::<
+                cortexkit_role_tool_provider::call::ToolCallRequest,
+            >(body.clone())
+            {
+                if tool_provider::shell_capability_refusal(
+                    &call.name,
+                    tool_provider::admission_trusted(identity, &call),
+                )
+                .is_some()
+                {
+                    return Err(decoded);
+                }
+            }
+        }
+        let opening = remote_policy::awaits_policy_store(&ctx, identity);
+        if !opening {
+            if let Some(read) = remote_policy::confinement_from_memory(&ctx, identity) {
+                // Keep the answer for admission: another route may hold the
+                // handle slot by then, making the same memory probe inconclusive.
+                decoded.confinement = Some(read);
+                return Err(decoded);
+            }
+        }
         let name = body
             .get("name")
             .or_else(|| body.get("op"))
             .and_then(Value::as_str)
             .unwrap_or("tool.call")
             .to_owned();
+        let deadline = wait_deadline(&decoded, body.get("deadline_ms").and_then(Value::as_u64));
         if self.pending.len() >= MAX_WAITERS {
             return Err(decoded);
         }
         let key = (route, decoded.frame.header.corr);
         let admission = AdmissionWait::from_decoded(&decoded, &name);
         let identity = identity.clone();
-        let mut decoded = decoded;
+        if opening {
+            crate::database_open::dispatch(&ctx);
+        }
         let handle = self.tasks.spawn(async move {
-            let read =
-                tokio::task::spawn_blocking(move || remote_policy::confined(&ctx, &identity))
-                    .await
-                    .unwrap_or_else(|_| Err(remote_policy::policy_unavailable()));
+            // Keyed calls skip the general persistence wait because the ledger
+            // owns admission, but their policy still needs a completed open.
+            if opening {
+                ctx.wait_for_database_open(deadline).await;
+            }
+            let read = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                tokio::task::spawn_blocking(move || remote_policy::confined(&ctx, &identity)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| Err(remote_policy::policy_unavailable()));
             decoded.confinement = Some(read);
             decoded
         });
@@ -230,19 +265,7 @@ impl DatabaseWaits {
         // A caller may shorten the wait with an absolute Unix-millisecond
         // deadline. The bash timeout limits command execution, not the wait
         // for permission to admit the command.
-        let mut deadline = decoded.phase_trace.received_at() + WAIT_BUDGET;
-        if let Some(epoch_ms) = deadline_ms {
-            let remaining = Duration::from_millis(
-                epoch_ms.saturating_sub(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        .min(u64::MAX as u128) as u64,
-                ),
-            );
-            deadline = deadline.min(Instant::now() + remaining.min(WAIT_BUDGET));
-        }
+        let deadline = wait_deadline(&decoded, deadline_ms);
         let ctx = Arc::clone(ctx);
         let handle = self.tasks.spawn(async move {
             if any_command {
@@ -307,6 +330,23 @@ impl DatabaseWaits {
             })
             .collect()
     }
+}
+
+fn wait_deadline(decoded: &DecodedFrame, deadline_ms: Option<u64>) -> Instant {
+    let mut deadline = decoded.phase_trace.received_at() + WAIT_BUDGET;
+    if let Some(epoch_ms) = deadline_ms {
+        let remaining = Duration::from_millis(
+            epoch_ms.saturating_sub(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            ),
+        );
+        deadline = deadline.min(Instant::now() + remaining.min(WAIT_BUDGET));
+    }
+    deadline
 }
 
 #[cfg(test)]
@@ -725,7 +765,7 @@ mod tests {
             Ok(()) => panic!("a remembered unconfined worker was read from aft.db again"),
             Err(decoded) => decoded,
         };
-        assert!(second.confinement.is_none());
+        assert_eq!(second.confinement, Some(Ok(false)));
         assert!(!remote_policy::admit_confined_on_frame_loop(&ctx, &worker, "bash", None).unwrap());
         assert!(!remote_policy::admit_confined(&ctx, &worker, "bash").unwrap());
         assert!(
