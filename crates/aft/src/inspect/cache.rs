@@ -564,10 +564,15 @@ pub trait InspectCacheRead {
 
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
+        let writer_deadline = crate::fs_lock::acquisition_now() + INSPECT_WRITER_LEASE_TIMEOUT;
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let project_inspect_dir = project_inspect_dir(inspect_dir.clone(), &project_key);
-        let Some(writer_lease) =
-            acquire_writer_lease(&project_inspect_dir, &project_key, &project_root)?
+        let Some(writer_lease) = acquire_writer_lease(
+            &project_inspect_dir,
+            &project_key,
+            &project_root,
+            writer_deadline,
+        )?
         else {
             return match Self::open_readonly(inspect_dir, project_root.clone())? {
                 Some(cache) => Ok(cache.into_inner()),
@@ -2003,13 +2008,14 @@ fn acquire_writer_lease(
     inspect_dir: &Path,
     project_key: &str,
     project_root: &Path,
+    deadline: Instant,
 ) -> Result<Option<Arc<crate::root_cache::WriterLease>>, InspectCacheError> {
-    crate::root_cache::WriterLease::acquire_shared_with_timeout(
+    crate::root_cache::WriterLease::acquire_shared_until(
         crate::root_cache::RootCacheDomain::Inspect,
         inspect_dir,
         project_key,
         project_root,
-        INSPECT_WRITER_LEASE_TIMEOUT,
+        deadline,
     )
     .map_err(|error| match error {
         crate::fs_lock::AcquireError::Timeout => InspectCacheError::WriterLeaseTimeout,
@@ -2699,16 +2705,39 @@ mod tests {
             Duration::ZERO,
         )
         .expect("hold inspect writer lease");
-        let started = Instant::now();
-        let error = match InspectCache::open(inspect_dir.clone(), project_root.clone()) {
-            Err(error) => error,
-            Ok(_) => panic!("contended inspect cache must fail honestly"),
-        };
-        assert!(matches!(error, InspectCacheError::WriterLeaseTimeout));
-        assert!(
-            started.elapsed() <= INSPECT_WRITER_LEASE_TIMEOUT + Duration::from_secs(1),
-            "writer lease acquisition exceeded its deadline"
-        );
+        for (preparation_ms, expected_elapsed_ms, expected_sleeps, expected_attempts) in [
+            (0, 2_000, vec![Duration::from_millis(100); 20], 20),
+            (1_975, 2_000, vec![Duration::from_millis(25)], 1),
+            (6_000, 6_000, vec![], 0),
+        ] {
+            let inspect_dir = inspect_dir.clone();
+            let project_root = project_root.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let contender = std::thread::spawn(move || {
+                let clock = crate::fs_lock::retry_clock::Guard::install(Duration::from_millis(
+                    preparation_ms,
+                ));
+                let result = InspectCache::open(inspect_dir, project_root).map(|_| ());
+                tx.send((result, clock.observations())).unwrap();
+            });
+            // The channel bounds hangs, not scheduler latency. Deadline arithmetic
+            // is checked against the injected clock, including preparation delays.
+            let (result, (elapsed, sleeps, attempts)) = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("contended inspect open must terminate");
+            contender.join().expect("contender must exit");
+            assert!(matches!(result, Err(InspectCacheError::WriterLeaseTimeout)));
+            assert_eq!(
+                elapsed,
+                Duration::from_millis(expected_elapsed_ms),
+                "preparation must not restart the writer-lease budget ({preparation_ms}ms delay)"
+            );
+            assert_eq!(
+                sleeps, expected_sleeps,
+                "retry sleeps must fit the deadline"
+            );
+            assert_eq!(attempts, expected_attempts, "bounded lease poll iterations");
+        }
 
         drop(held);
         InspectCache::open(inspect_dir, project_root)
