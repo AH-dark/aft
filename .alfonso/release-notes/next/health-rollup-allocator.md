@@ -1,1 +1,1 @@
-- - The daemon's background health summary measures memory at most every 30 seconds instead of every 3, lowering its idle CPU use.
+- The daemon's background health summary reuses its allocator reading for up to 30 seconds instead of taking a new one every 3 seconds, lowering its idle CPU use.
