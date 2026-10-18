@@ -3,6 +3,8 @@ use rusqlite::ffi;
 use std::ffi::{c_int, c_void, CStr};
 
 const NOW: i64 = 100 * TERMINAL_ROW_RETENTION_AGE_MS;
+const TASK_HISTORY_ROWS: usize = 4096;
+const EVENT_HISTORY_ROWS: usize = 8192;
 
 struct Fixture {
     conn: crate::db::TrackedConnection,
@@ -11,7 +13,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::with_sizes(250_000, 500_000)
+        Self::with_sizes(TASK_HISTORY_ROWS, EVENT_HISTORY_ROWS)
     }
 
     fn with_sizes(task_rows: usize, event_rows: usize) -> Self {
@@ -137,35 +139,47 @@ fn explain(conn: &Connection, sql: &str) -> String {
 
 #[test]
 fn terminal_retention_delete_uses_primary_key_and_batch_work() {
-    let mut fixture = Fixture::new();
-    let mut measured = Vec::new();
-    for count in [1, 8, 32] {
-        fixture.conn.execute_batch("BEGIN").unwrap();
-        let prepared = fixture.prepared(count);
-        let (result, statements) = record(&mut fixture.conn, |conn| {
-            delete_prepared_terminal_rows(conn, prepared).unwrap()
-        });
-        assert_eq!(result.removed, count);
-        assert_eq!(result.remaining_candidates, 0);
-        let deletes = statements
-            .iter()
-            .filter(|s| s.sql.starts_with("DELETE FROM bash_tasks"))
-            .collect::<Vec<_>>();
-        assert!(!deletes.is_empty(), "no production delete was observed");
-        let steps: i32 = deletes.iter().map(|s| s.vm_steps).sum();
-        let plan = explain(&fixture.conn, &deletes[0].sql);
-        println!("batch={count} VM_STEP={steps} plan={plan}");
-        assert!(
-            plan.contains("(harness=? AND session_id=? AND task_id=?)")
-                && !plan.contains("idx_bash_tasks_status")
-                && steps > 0
-                && steps < 500 * count as i32,
-            "retention must probe full primary keys, not history: batch={count} VM_STEP={steps} plan={plan}"
-        );
-        measured.push(steps);
-        fixture.conn.execute_batch("ROLLBACK").unwrap();
+    let mut histories = Vec::new();
+    // A 16-fold history increase must not increase point-delete VM work. Even
+    // the smaller history makes a status-index scan exceed the per-key bound.
+    for task_rows in [256, TASK_HISTORY_ROWS] {
+        let mut fixture = Fixture::with_sizes(task_rows, 128);
+        let mut measured = Vec::new();
+        for count in [1, 8, 32] {
+            fixture.conn.execute_batch("BEGIN").unwrap();
+            let prepared = fixture.prepared(count);
+            let (result, statements) = record(&mut fixture.conn, |conn| {
+                delete_prepared_terminal_rows(conn, prepared).unwrap()
+            });
+            assert_eq!(result.removed, count);
+            assert_eq!(result.remaining_candidates, 0);
+            let deletes = statements
+                .iter()
+                .filter(|s| s.sql.starts_with("DELETE FROM bash_tasks"))
+                .collect::<Vec<_>>();
+            assert!(!deletes.is_empty(), "no production delete was observed");
+            let steps: i32 = deletes.iter().map(|s| s.vm_steps).sum();
+            let plan = explain(&fixture.conn, &deletes[0].sql);
+            println!("history={task_rows} batch={count} VM_STEP={steps} plan={plan}");
+            assert!(
+                plan.contains("(harness=? AND session_id=? AND task_id=?)")
+                    && !plan.contains("idx_bash_tasks_status")
+                    && steps > 0
+                    && steps < 500 * count as i32,
+                "retention must probe full primary keys, not history: history={task_rows} batch={count} VM_STEP={steps} plan={plan}"
+            );
+            measured.push(steps);
+            fixture.conn.execute_batch("ROLLBACK").unwrap();
+        }
+        assert!(measured[2] <= measured[0] * 32 + 100);
+        histories.push(measured);
     }
-    assert!(measured[2] <= measured[0] * 32 + 100);
+    for (small, large) in histories[0].iter().zip(&histories[1]) {
+        assert!(
+            *large <= small * 2,
+            "delete work grew with history: {histories:?}"
+        );
+    }
 }
 
 #[test]
@@ -263,9 +277,9 @@ fn retention_and_hot_query_plans_on_unanalyzed_history() {
         list_bash_tasks_for_session(conn, "opencode", "s65").unwrap();
         list_replayable_bash_tasks_for_project(conn, "opencode", "p65").unwrap();
         find_bash_task_for_project(conn, "opencode", "p65", "t65").unwrap();
-        delete_delivered_terminal_bash_task(conn, "opencode", "s999", "t249999", "plan audit")
+        delete_delivered_terminal_bash_task(conn, "opencode", "s999", "t3999", "plan audit")
             .unwrap();
-        delete_bash_task(conn, "opencode", "s998", "t249998").unwrap();
+        delete_bash_task(conn, "opencode", "s998", "t3998").unwrap();
         let cache = CompressionAggregateCache::default();
         cache
             .aggregates_for_session(conn, "opencode", "p65", "s65")
@@ -305,7 +319,7 @@ fn retention_and_hot_query_plans_on_unanalyzed_history() {
             .or_insert(statement);
     }
     println!(
-        "SQLite {}: 250000 tasks, 500000 events, no ANALYZE; {} distinct statements",
+        "SQLite {}: {TASK_HISTORY_ROWS} tasks, {EVENT_HISTORY_ROWS} events, no ANALYZE; {} distinct statements",
         rusqlite::version(),
         unique.len()
     );
