@@ -7961,11 +7961,14 @@ fn open_view_runtime_for_configure(
         );
         let mut status = crate::path_status::PathStatusStore::open(view.view_dir())
             .map_err(|error| error.to_string())?;
-        for path in &pending_paths {
-            status
-                .mark_pending(path, "view publication scheduled", 1)
-                .map_err(|error| error.to_string())?;
-        }
+        status
+            .mark_pending_many(
+                pending_paths
+                    .iter()
+                    .map(|path| (path.as_slice(), "view publication scheduled")),
+                1,
+            )
+            .map_err(|error| error.to_string())?;
     }
     let pin = generation
         .as_deref()
