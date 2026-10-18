@@ -1,0 +1,1 @@
+- `aft_search` now keeps the approved paused-embedding notice visible while the keyword index is still building.
