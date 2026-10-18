@@ -1,27 +1,100 @@
 use super::*;
 
 fn manifest() -> Manifest {
-    let mut value: Value = serde_json::from_str(include_str!(
-        "../../tests/fixtures/gh_shim/v16-manifest.json"
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v19-manifest.json"
     ))
     .unwrap();
-    let additions: Value = serde_json::from_str(include_str!(
-        "../../tests/fixtures/gh_shim/v19-additions.json"
+    manifest.validate().unwrap();
+    manifest
+}
+
+fn v18_manifest() -> Manifest {
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v18-manifest.json"
     ))
     .unwrap();
-    value["manifest_version"] = additions["manifest_version"].clone();
-    for tier in ["governed", "admin"] {
-        value["tiers"][tier]
-            .as_array_mut()
-            .unwrap()
-            .extend(additions["tiers"][tier].as_array().unwrap().iter().cloned());
+    manifest.validate().unwrap();
+    manifest
+}
+
+#[test]
+fn v19_payload_parses_additions_and_preserves_v18_bindings() {
+    let current = manifest();
+    let previous = v18_manifest();
+    assert_eq!(current.manifest_version, 19);
+    assert_eq!(previous.manifest_version, 18);
+
+    let governed = [
+        (&["pr", "ready", "5"][..], "pr ready"),
+        (&["pr", "ready", "5", "--undo"][..], "pr ready"),
+    ];
+    for (raw, tuple) in governed {
+        assert!(matches!(
+            classify(&args(raw), &current, "linux"),
+            Classification::Governed { tuple: found, .. } if found == tuple
+        ));
+        assert!(matches!(
+            classify(&args(raw), &previous, "linux"),
+            Classification::Unclassified
+        ));
     }
-    value["api_rules"]
-        .as_array_mut()
-        .unwrap()
-        .extend(additions["api_rules"].as_array().unwrap().iter().cloned());
-    value["canonicalization"]["pr ready"] = additions["canonicalization"]["pr ready"].clone();
-    serde_json::from_value(value).unwrap()
+
+    let admin = [
+        (&["repo", "create", "cortexkit/new-repo"][..], "repo create"),
+        (
+            &["repo", "rename", "new-name", "--repo", "cortexkit/aft"][..],
+            "repo rename",
+        ),
+        (
+            &["workflow", "disable", "ci.yml", "--repo", "cortexkit/aft"][..],
+            "workflow disable",
+        ),
+        (
+            &["workflow", "enable", "ci.yml", "--repo", "cortexkit/aft"][..],
+            "workflow enable",
+        ),
+        (
+            &[
+                "api",
+                "-X",
+                "PUT",
+                "repos/cortexkit/aft/private-vulnerability-reporting",
+            ][..],
+            "api:PUT:/repos/*/*/private-vulnerability-reporting",
+        ),
+        (
+            &[
+                "api",
+                "-X",
+                "DELETE",
+                "/repos/cortexkit/aft/private-vulnerability-reporting",
+            ][..],
+            "api:DELETE:/repos/*/*/private-vulnerability-reporting",
+        ),
+    ];
+    for (raw, tuple) in admin {
+        assert!(matches!(
+            classify(&args(raw), &current, "linux"),
+            Classification::Admin { tuple: found } if found == tuple
+        ));
+        assert!(matches!(
+            classify(&args(raw), &previous, "linux"),
+            Classification::Unclassified
+        ));
+    }
+
+    assert_eq!(
+        current
+            .bindings
+            .get("cortexkit/common-auth")
+            .map(String::as_str),
+        Some("agent_0f4d7713e64e7cc4")
+    );
+    assert_eq!(current.bindings.len(), previous.bindings.len() + 1);
+    for (repository, agent_id) in &previous.bindings {
+        assert_eq!(current.bindings.get(repository), Some(agent_id));
+    }
 }
 
 fn args(raw: &[&str]) -> Vec<OsString> {
