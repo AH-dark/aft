@@ -1210,6 +1210,14 @@ mod tests {
         };
         #[cfg(windows)]
         let alias = short_path(&root);
+        // Short names are a per-volume setting; where they are turned off,
+        // GetShortPathNameW returns the long path and there is no alias to
+        // test. The verbatim-prefix case below is covered by its own test.
+        #[cfg(windows)]
+        if alias == root {
+            eprintln!("skipped: the temp volume does not create 8.3 short names");
+            return;
+        }
         assert_ne!(
             alias, root,
             "the fixture must exercise a distinct root spelling"
