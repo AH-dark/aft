@@ -2770,7 +2770,7 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
     let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let hook = {
         let (probes, db) = (probes.clone(), db.clone());
-        access_grants::resolve_hook::install(move || {
+        access_grants::unlocked_hook::install(move |_| {
             probes.borrow_mut().push(db.try_lock().is_ok())
         })
     };
@@ -2823,4 +2823,88 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
         probes.iter().all(|unlocked| *unlocked),
         "aft.db was locked during resolution: {probes:?}"
     );
+}
+
+/// The head stops holding the asked path while its policy is being resolved
+/// for a head's allow answer. The answer must be judged by the head's new
+/// policy: declined as no longer held, the ask discarded and no grant stored
+/// for the worker, after resolving the changed policy again.
+#[tokio::test]
+async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy() {
+    use access_grants::unlocked_hook::Point;
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let directory = f.dir.path().join("delegated");
+    std::fs::create_dir(&directory).unwrap();
+    let target = directory.join("elsewhere.txt");
+    std::fs::write(&target, "unheld contents").unwrap();
+    let head_grant = AccessGrant {
+        path: crate::access_policy::policy_path(&directory),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    let db = f.ctx.db().unwrap();
+    crate::db::access_grants::insert(
+        &db.lock().unwrap(),
+        &access_grants::scope_key(&f.head),
+        &head_grant,
+    )
+    .unwrap();
+    let grant = AccessGrant {
+        path: crate::access_policy::policy_path(&target),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let Prep::Ask(prep) = prepare(
+        &db,
+        &f.ctx,
+        &f.worker,
+        "read",
+        &json!({"path":target}),
+        &grant,
+        &grant,
+        None,
+    )
+    .unwrap() else {
+        panic!("expected a fresh ask");
+    };
+    // The head holds the path when the ask is prepared.
+    assert_eq!(prep.request["head_policy"], "allow", "{}", prep.request);
+
+    let resolves = std::rc::Rc::new(std::cell::Cell::new(0));
+    let hook = {
+        let (resolves, db) = (resolves.clone(), db.clone());
+        let (key, path) = (access_grants::scope_key(&f.head), head_grant.path.clone());
+        access_grants::unlocked_hook::install(move |point| {
+            if point != Point::Resolve {
+                return;
+            }
+            resolves.set(resolves.get() + 1);
+            if resolves.get() == 1 {
+                let revoked =
+                    crate::db::access_grants::revoke(&db.lock().unwrap(), &key, &path).unwrap();
+                assert_eq!(revoked, 1);
+            }
+        })
+    };
+    let applied = apply_allow(
+        &db,
+        &f.ctx,
+        &f.worker,
+        &prep.key,
+        &prep.call_key,
+        &asks::new_holder(),
+        &prep.grant,
+        true,
+        false,
+    )
+    .unwrap();
+    drop(hook);
+    assert!(
+        matches!(applied, Applied::HeadNotHeld),
+        "the answer was judged by the stale head policy"
+    );
+    assert!(resolves.get() >= 2, "the changed policy was resolved again");
+    assert!(f.worker_grants().is_empty(), "no worker grant is recorded");
+    assert!(f.asks().is_empty(), "the declined ask is discarded");
 }

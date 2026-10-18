@@ -382,7 +382,7 @@ impl PolicySnapshot {
     /// Resolve filesystem-backed path identities separately from the database snapshot.
     pub(super) fn resolve(self, storage: &Path) -> AccessPolicy {
         #[cfg(test)]
-        resolve_hook::run();
+        unlocked_hook::run(unlocked_hook::Point::Resolve);
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
@@ -402,14 +402,25 @@ impl PolicySnapshot {
     }
 }
 
-/// Tests observe each `PolicySnapshot::resolve` call on their own thread, to
-/// check that it runs with the aft.db lock released.
+/// Tests observe the steps that run with the aft.db lock released, on their
+/// own thread: to check that the lock really is free there, or to change the
+/// stored policy at that moment as a concurrent route could.
 #[cfg(test)]
-pub(super) mod resolve_hook {
+pub(super) mod unlocked_hook {
     use std::cell::RefCell;
 
+    /// Where the hook was called from.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::subc) enum Point {
+        /// `PolicySnapshot::resolve`, before it probes the filesystem.
+        Resolve,
+        /// `catalog`, after it read the stored launch parameters and before
+        /// it validates them.
+        LaunchValidation,
+    }
+
     thread_local! {
-        static HOOK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+        static HOOK: RefCell<Option<Box<dyn Fn(Point)>>> = const { RefCell::new(None) };
     }
 
     /// Removes the hook when dropped.
@@ -421,15 +432,15 @@ pub(super) mod resolve_hook {
         }
     }
 
-    pub(in crate::subc) fn install(hook: impl Fn() + 'static) -> Installed {
+    pub(in crate::subc) fn install(hook: impl Fn(Point) + 'static) -> Installed {
         HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
         Installed(())
     }
 
-    pub(super) fn run() {
+    pub(super) fn run(point: Point) {
         HOOK.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
-                hook();
+                hook(point);
             }
         });
     }
@@ -652,6 +663,8 @@ pub(super) fn catalog(
         };
         let empty = json!([]);
         let chosen = stored.as_ref().or(raw).unwrap_or(&empty);
+        #[cfg(test)]
+        unlocked_hook::run(unlocked_hook::Point::LaunchValidation);
         let grants = validate(chosen, head.as_ref())?;
         let conn = lock()?;
         let current = read_head(&conn)?;
