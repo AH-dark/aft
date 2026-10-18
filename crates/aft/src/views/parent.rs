@@ -511,6 +511,28 @@ pub fn release_context_except(ctx: &crate::context::AppContext, root: &Path) {
     }
 }
 
+/// Release a context as soon as its last route closes. Parent readers have no
+/// local builds to preserve during the project-root abandonment grace period.
+/// Returns whether the context held a parent session.
+pub(crate) fn release_context(ctx: &crate::context::AppContext) -> bool {
+    let id = context_id(ctx);
+    let mut registry = lock(registry());
+    let mut released = false;
+    registry.sessions.retain(|_, session| {
+        let held = lock(&session.holders).iter().any(|holder| holder.id == id);
+        if held {
+            released = true;
+            session.release(id);
+            if !session.held() {
+                session.stop();
+                return false;
+            }
+        }
+        true
+    });
+    released
+}
+
 /// Drops the parent session for `root`, if any: its worker stops and every
 /// reader registration and read marker it holds is released.
 pub fn deactivate(root: &Path) {

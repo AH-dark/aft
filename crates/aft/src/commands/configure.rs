@@ -542,6 +542,81 @@ fn resolve_home_dir() -> Option<PathBuf> {
     Some(std::fs::canonicalize(&raw).unwrap_or(raw))
 }
 
+fn resolve_account_home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    let home = crate::production_storage::account_home().ok()?;
+    #[cfg(windows)]
+    let home = resolve_windows_profile_dir().ok()?;
+
+    let canonical = std::fs::canonicalize(home).ok()?;
+    canonical.is_dir().then_some(canonical)
+}
+
+fn project_root_is_too_broad(
+    canonical_root: &Path,
+    canonicalization_failed: bool,
+    account_home: Option<&Path>,
+) -> bool {
+    let root_identity = crate::access_policy::policy_path(canonical_root);
+    canonicalization_failed
+        || crate::storage_retention::volume_anchor(canonical_root)
+            .map(|(volume, _)| crate::access_policy::policy_path(&volume))
+            .is_none_or(|volume| {
+                let home_identity = account_home
+                    .filter(|home| home.is_dir())
+                    .map(crate::access_policy::policy_path)
+                    .unwrap_or_else(|| volume.clone());
+                crate::path_identity::project_root_is_narrow(
+                    &root_identity,
+                    &home_identity,
+                    &volume,
+                ) != Some(true)
+            })
+}
+
+#[cfg(windows)]
+fn resolve_windows_profile_dir() -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY,
+    };
+
+    struct FolderPath(*mut u16);
+    impl Drop for FolderPath {
+        fn drop(&mut self) {
+            // SAFETY: SHGetKnownFolderPath allocates its result with the COM allocator.
+            unsafe { CoTaskMemFree(self.0.cast()) };
+        }
+    }
+
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the folder identifier is valid and raw is writable.
+    let status = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Profile,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = FolderPath(raw);
+    if status < 0 || path.0.is_null() {
+        return Err(std::io::Error::other(format!(
+            "SHGetKnownFolderPath(FOLDERID_Profile) lookup failed (HRESULT 0x{:08x})",
+            status as u32
+        )));
+    }
+    let mut len = 0;
+    // SAFETY: a successful lookup returns an allocated NUL-terminated path.
+    while unsafe { *path.0.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: the scan above found the end of the allocated path.
+    let units = unsafe { std::slice::from_raw_parts(path.0, len) };
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(units)))
+}
+
 fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
@@ -741,7 +816,7 @@ fn file_watcher_disabled_for_test() -> bool {
 }
 
 fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
-    if file_watcher_disabled_for_test() {
+    if ctx.root_too_broad() || file_watcher_disabled_for_test() {
         return;
     }
     let mut extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
@@ -784,6 +859,10 @@ fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
 /// external-change invalidation as well.
 #[doc(hidden)]
 pub fn ensure_project_watcher(ctx: &AppContext) {
+    if ctx.root_too_broad() || ctx.subc_unbound_quiesced() {
+        ctx.stop_watcher_runtime();
+        return;
+    }
     if ctx.watcher_runtime_active() {
         return;
     }
@@ -2636,7 +2715,7 @@ fn configure_fingerprint(
 fn configure_warm_key(
     canonical_root: &Path,
     config: &Config,
-    home_match: bool,
+    root_too_broad: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
 ) -> String {
@@ -2651,7 +2730,7 @@ fn configure_warm_key(
         "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}",
         canonical_root,
         config.storage_dir,
-        home_match,
+        root_too_broad,
         is_worktree_bridge,
         shared_artifacts_read_only,
         config.indexes.trigram,
@@ -2669,7 +2748,7 @@ fn configure_warm_key(
 fn configure_callgraph_build_key(
     canonical_root: &Path,
     config: &Config,
-    home_match: bool,
+    root_too_broad: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
 ) -> String {
@@ -2677,7 +2756,7 @@ fn configure_callgraph_build_key(
         "root={:?};storage={:?};home={};worktree={};readonly={};enabled={}",
         canonical_root,
         config.storage_dir,
-        home_match,
+        root_too_broad,
         is_worktree_bridge,
         shared_artifacts_read_only,
         config.indexes.callgraph,
@@ -3161,13 +3240,54 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // The common plugin auto-install update repeats the configured root spelling.
-    // That spelling and the stored canonical root form a proven alias pair, so the
-    // live-session check avoids another filesystem canonicalization entirely.
+    ctx.begin_configure_ack_phase("canonicalize");
+    let canonical_root = std::fs::canonicalize(&root_path);
+    let canonicalization_failed = canonical_root.is_err();
+    let canonical_cache_root = canonical_root.unwrap_or_else(|_| root_path.clone());
+    debug_assert!(canonical_cache_root.is_absolute());
+    let mut degraded_reasons: Vec<String> = Vec::new();
+    let home = resolve_home_dir();
+    let home_root = home
+        .as_ref()
+        .is_some_and(|home| *home == canonical_cache_root);
+    if home_root {
+        degraded_reasons.push("home_root".to_string());
+    }
+    let account_home = resolve_account_home_dir();
+    let root_too_broad = home_root
+        || project_root_is_too_broad(
+            &canonical_cache_root,
+            canonicalization_failed,
+            account_home.as_deref(),
+        );
+    if root_too_broad {
+        degraded_reasons.push("root_too_broad".to_string());
+        let warning_reason = if home_root {
+            "home_root"
+        } else if account_home.is_some() {
+            "root_too_broad"
+        } else {
+            "account_home_unknown"
+        };
+        let warning_message = if account_home.is_some() || home_root {
+            "Watching and indexing are off for this broad root; explicit-path tools remain available."
+        } else {
+            "The account home could not be determined, so only the filesystem or volume root is protected by the home rule. Watching and indexing are off for this broad root; explicit-path tools remain available."
+        };
+        configure_warnings.push(json!({
+            "code": "root_too_broad",
+            "reason": warning_reason,
+            "message": warning_message,
+        }));
+    }
+
+    // Equivalent live binds can reuse the existing topology and artifacts, but
+    // only after canonicalization and the broad-root safety check above.
     let active_canonical_root = previous_canonical_cache_root
         .as_ref()
         .filter(|canonical_root| {
             ctx.configure_generation() > 0
+                && !root_too_broad
                 && ctx.harness_opt().as_ref() == Some(&harness)
                 && (previous_project_root.as_deref() == Some(root_path.as_path())
                     || canonical_root.as_path() == root_path)
@@ -3221,7 +3341,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     storage_root: storage_root.clone(),
                     harness_dir: storage_root.join(harness.storage_segment()),
                     session_id: req.session().to_string(),
-                    home_match: ctx.is_home_root(),
+                    root_too_broad: ctx.root_too_broad(),
                     format_tool_cache_clear_needed: false,
                     run_bash_replay: first_session_bind,
                     configure_database_runtime: false,
@@ -3327,10 +3447,6 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    ctx.begin_configure_ack_phase("canonicalize");
-    let canonical_cache_root =
-        std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
-    debug_assert!(canonical_cache_root.is_absolute());
     let project_root_changed =
         previous_canonical_cache_root.as_deref() != Some(canonical_cache_root.as_path());
     next_config.semantic.route_project_root = Some(canonical_cache_root.clone());
@@ -3345,13 +3461,6 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let watcher_topology_changed =
         ctx.is_worktree_bridge() != is_worktree_bridge || ctx.git_common_dir() != git_common_dir;
-    // Detect "this is not really a project root" scenarios before any walks
-    // that traverse `project_root`.
-    let mut degraded_reasons: Vec<String> = Vec::new();
-    let home_match = resolve_home_dir().is_some_and(|home| home == canonical_cache_root);
-    if home_match {
-        degraded_reasons.push("home_root".to_string());
-    }
 
     // `_bypass_size_limits` (set by `aft warmup --force`) lifts the semantic
     // `max_files` cap so a very large repo is fully embedded for measurement.
@@ -3366,19 +3475,14 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
-    // HOME is a user container, never a project root; keep project-wide index
-    // options from causing a persistent configuration to scan the entire home directory.
-    let search_disabled_for_home = home_match && next_config.indexes.trigram;
-    let semantic_disabled_for_home = home_match && next_config.indexes.semantic;
-    let callgraph_disabled_for_home = home_match && next_config.indexes.callgraph;
-    if search_disabled_for_home {
+    // Reject filesystem/volume roots, home and its ancestors before discovering
+    // repositories or scheduling indexes. Direct children of a volume can be
+    // ordinary projects; retain this project-specific admission for later work.
+    if root_too_broad {
         next_config.indexes.trigram = false;
-    }
-    if semantic_disabled_for_home {
         next_config.indexes.semantic = false;
-    }
-    if callgraph_disabled_for_home {
         next_config.indexes.callgraph = false;
+        next_config.views.enabled = false;
     }
     // A context that binds another root stops holding the parent folder
     // session it held before; a session no context holds stops.
@@ -3389,7 +3493,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // parent session, which serves those same types from the children.
     // The decision is a probe bounded by a short wall-clock budget; the full
     // walk for every child runs on the parent session's worker.
-    let parent_folder = !home_match
+    let parent_folder = !root_too_broad
         && next_config.views.enabled
         && crate::views::parent::prepare(
             &canonical_cache_root,
@@ -3431,11 +3535,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let preflight_warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
-        home_match,
+        root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
     );
     if ctx.configure_generation() > 0
+        && !root_too_broad
+        && (!parent_folder || crate::views::parent::held_by(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
         && ctx.configure_warm_key_matches(&preflight_warm_key)
@@ -3508,7 +3614,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 storage_root: storage_root.clone(),
                 harness_dir: storage_root.join(harness.storage_segment()),
                 session_id: req.session().to_string(),
-                home_match,
+                root_too_broad,
                 format_tool_cache_clear_needed: false,
                 run_bash_replay: first_session_bind,
                 configure_database_runtime: false,
@@ -3599,24 +3705,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
     }
 
-    if search_disabled_for_home {
+    if root_too_broad {
         slog_warn!(
-            "search_index auto-disabled: project root is the user home directory \
-             ({}). Open a project subdirectory for full features.",
-            canonical_cache_root.display()
-        );
-    }
-    if semantic_disabled_for_home {
-        slog_warn!(
-            "semantic_search auto-disabled: project root is the user home directory \
-             ({}). Open a project subdirectory for full features.",
-            canonical_cache_root.display()
-        );
-    }
-    if callgraph_disabled_for_home {
-        slog_warn!(
-            "callgraph_store auto-disabled: project root is the user home directory \
-             ({}). Open a project subdirectory for full features.",
+            "watching and indexing auto-disabled: root_too_broad ({}). Open a project subdirectory for full features.",
             canonical_cache_root.display()
         );
     }
@@ -3627,7 +3718,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let format_tool_cache_clear_needed = effective_configure_changed;
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-    let artifact_key_needed = !home_match
+    let artifact_key_needed = !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
             || next_config.indexes.callgraph);
@@ -3754,12 +3845,14 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             false
         }
     };
-    let callgraph_writer_capability =
-        root_cache_storage_ok && !is_worktree_bridge && !artifact_owner_read_only && !home_match;
+    let callgraph_writer_capability = root_cache_storage_ok
+        && !is_worktree_bridge
+        && !artifact_owner_read_only
+        && !root_too_broad;
     // A parent folder, like HOME, runs no project-wide work over the folder
     // itself; its children are served from their own sessions' results.
-    let inspect_writer_capability = root_cache_storage_ok && !home_match && !parent_folder;
-    let heavy_root_work_allowed = !home_match
+    let inspect_writer_capability = root_cache_storage_ok && !root_too_broad && !parent_folder;
+    let heavy_root_work_allowed = !root_too_broad
         && !parent_folder
         && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
@@ -3873,19 +3966,25 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_cache_writer_capabilities(callgraph_writer_capability, inspect_writer_capability);
     // Snapshot degraded-mode state once at configure time so every later
     // heavy-work entry point reads the same cheap gate instead of re-deriving
-    // home-root logic independently.
+    // directory-scope rules independently.
     ctx.set_degraded_reasons(degraded_reasons.clone());
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
+    if root_too_broad {
+        ctx.stop_watcher_runtime();
+        crate::views::parent::deactivate(&canonical_cache_root);
+    }
     // Past the commit seal: start (or join) the parent session now, so the
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
-    crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
+    if !root_too_broad {
+        crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
+    }
     ctx.begin_configure_ack_step("warm_key");
     let warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
-        home_match,
+        root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
     );
@@ -3903,7 +4002,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let callgraph_build_key = configure_callgraph_build_key(
         &canonical_cache_root,
         &next_config,
-        home_match,
+        root_too_broad,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
     );
@@ -3933,7 +4032,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             // finishes; a root that will not build must not hold it.
             if next_config.indexes.semantic
                 && !ctx.shared_artifacts_read_only()
-                && !home_match
+                && !root_too_broad
                 && semantic_admitted
             {
                 ctx.schedule_semantic_cold_seed_gate_for_configure();
@@ -4161,7 +4260,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         storage_root,
         harness_dir: ctx.harness_dir(),
         session_id: req.session().to_string(),
-        home_match,
+        root_too_broad,
         format_tool_cache_clear_needed,
         run_bash_replay: !equivalent_warm_config || first_session_bind,
         configure_database_runtime: true,
@@ -4170,7 +4269,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
         warm_callgraph_store: next_config.indexes.callgraph
-            && !home_match
+            && !root_too_broad
             && !equivalent_warm_config
             && (!equivalent_callgraph_build || !callgraph_build_in_progress),
         supersede_search_artifact_persistence: !equivalent_warm_config,
@@ -4195,7 +4294,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    let warnings_pending = !home_match && ctx.progress_sender_handle().is_some();
+    let warnings_pending = !root_too_broad && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let warning_generation = configure_generation;
@@ -6800,7 +6899,7 @@ pub(crate) fn drain_standalone_configure_unit(
     };
     if continuation.stage == ConfigureMaintenanceStage::ViewLoad
         && ctx.config().views.enabled
-        && !continuation.job.home_match
+        && !continuation.job.root_too_broad
         && !crate::views::parent::held_by(ctx, &continuation.job.canonical_cache_root)
     {
         if continuation.view_load.is_none() {
@@ -7335,7 +7434,7 @@ fn run_configure_maintenance_unit_inner(
                 // Rebuild the watcher matcher outside the acknowledgement path. Keep
                 // this project walk separate so queued requests can run before artifact
                 // loading and callgraph work.
-                if !job.home_match {
+                if !job.root_too_broad {
                     ctx.rebuild_gitignore();
                 } else {
                     ctx.clear_gitignore();
@@ -7365,7 +7464,7 @@ fn run_configure_maintenance_unit_inner(
                     ctx.stop_watcher_runtime();
                     if ctx
                         .run_if_subc_bound_generation(job.generation, || {
-                            if !job.home_match {
+                            if !job.root_too_broad {
                                 start_project_watcher(ctx, &job.canonical_cache_root);
                             }
                         })
@@ -7388,7 +7487,7 @@ fn run_configure_maintenance_unit_inner(
             if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
-            } else if ctx.config().views.enabled && !job.home_match {
+            } else if ctx.config().views.enabled && !job.root_too_broad {
                 finish_configure_view_load(
                     ctx,
                     prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
@@ -8138,7 +8237,7 @@ mod tests {
         configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
         configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
-        only_lsp_process_state_changed, parse_lsp_paths_extra,
+        only_lsp_process_state_changed, parse_lsp_paths_extra, project_root_is_too_broad,
         release_callgraph_start_waiters_for_generation_change,
         release_configure_artifact_post_gate_for_test,
         reset_configure_artifact_load_attempts_for_test,
@@ -18150,6 +18249,266 @@ mod tests {
 
     fn artifact_owner_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::artifact_owner::artifact_owner_test_lock()
+    }
+
+    fn assert_broad_configure_root(root: &std::path::Path) {
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": root, "harness": "runner",
+            "storage_dir": ctx._storage.path(),
+            "config": [user_tier(json!({
+                "indexes": { "trigram": true, "semantic": true, "callgraph": true },
+                "views": { "enabled": true },
+            }))],
+        }));
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(
+            !ctx.heavy_root_work_allowed(),
+            "broad root must close the heavy-root-work gate"
+        );
+        assert!(ctx.degraded_reasons().contains(&"root_too_broad".into()));
+        let assert_no_workers = || {
+            assert!(!ctx.config().indexes.trigram);
+            assert!(!ctx.config().indexes.semantic);
+            assert!(!ctx.config().indexes.callgraph);
+            assert!(!ctx.config().views.enabled);
+            assert!(ctx.search_index_rx().read().unwrap().is_none());
+            assert!(ctx.semantic_index_rx().lock().is_none());
+            assert!(ctx.callgraph_store_rx().lock().is_none());
+            assert!(ctx.view_runtime_snapshot().is_none());
+            assert!(crate::views::parent::session_for_root(root).is_none());
+            assert!(!ctx.watcher_runtime_active());
+        };
+        assert_no_workers();
+        super::drain_deferred_configure_maintenance(&ctx);
+        super::ensure_project_watcher(&ctx);
+        assert_no_workers();
+        let status = ctx.build_status_snapshot();
+        for lane in ["search_index", "semantic_index"] {
+            assert_eq!(status[lane]["status"], "disabled");
+            assert_eq!(status[lane]["reason"], "root_too_broad");
+        }
+        for plane in crate::feature_status::IndexPlane::ALL {
+            let observation =
+                crate::feature_status::observed_index_status(&ctx, plane).consumer_json();
+            assert_eq!(observation["status"], "off");
+            assert_eq!(observation["reason"], "root_too_broad");
+        }
+        let inspect = RawRequest {
+            id: "inspect-broad".into(),
+            command: "inspect".into(),
+            session_id: None,
+            lsp_hints: None,
+            params: json!({}),
+        };
+        let response = crate::commands::inspect::handle_inspect(&inspect, &ctx);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "root_too_broad");
+        let search = RawRequest {
+            id: "search-broad".into(),
+            command: "semantic_search".into(),
+            session_id: None,
+            lsp_hints: None,
+            params: json!({"query": "find the authentication handler"}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "no_search_lanes_enabled");
+        for lane in ["trigram", "semantic"] {
+            assert_eq!(response.data["lanes"][lane]["status"], "off");
+            assert_eq!(response.data["lanes"][lane]["reason"], "root_too_broad");
+        }
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("off: root_too_broad"));
+        // A backend left by an older bind must be removed even on the same root.
+        install_project_watcher_with(&ctx, root, Vec::new(), |_, _, tx| Ok::<_, &'static str>(tx));
+        assert!(ctx.watcher_runtime_active());
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        super::ensure_project_watcher(&ctx);
+        assert_no_workers();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_filesystem_root_disables_root_work() {
+        let _env = home_env_mutex();
+        assert_broad_configure_root(std::path::Path::new("/"));
+    }
+
+    #[test]
+    fn configure_volume_root_disables_root_work() {
+        let _env = home_env_mutex();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let (volume, _) = crate::storage_retention::volume_anchor(&canonical).unwrap();
+        assert_broad_configure_root(&volume);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configure_windows_drive_root_disables_root_work() {
+        let _env = home_env_mutex();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_broad_configure_root(canonical.ancestors().last().unwrap());
+    }
+
+    #[test]
+    fn account_home_and_ancestors_are_broad_when_environment_home_differs() {
+        let _env = home_env_mutex();
+        let account_tree = tempfile::tempdir().unwrap();
+        let account_home = account_tree.path().join("account-home");
+        std::fs::create_dir(&account_home).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let override_home = project.path().join(".home");
+        std::fs::create_dir(&override_home).unwrap();
+        let _home = EnvVarGuard::set("HOME", override_home.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", override_home.to_str().unwrap());
+        let account_home = account_home.canonicalize().unwrap();
+
+        for root in account_home.ancestors().filter(|root| root.is_dir()) {
+            assert!(
+                project_root_is_too_broad(root, false, Some(&account_home)),
+                "account home ancestor must be protected: {}",
+                root.display()
+            );
+        }
+        assert!(
+            !project_root_is_too_broad(project.path(), false, Some(&account_home)),
+            "a project must remain narrow when HOME points inside it"
+        );
+        assert!(
+            !project_root_is_too_broad(project.path(), false, None),
+            "an unknown account home must not broaden protection beyond the volume root"
+        );
+        let volume = crate::storage_retention::volume_anchor(project.path())
+            .unwrap()
+            .0;
+        assert!(project_root_is_too_broad(&volume, false, None));
+    }
+
+    #[test]
+    fn configure_home_override_inside_project_keeps_root_work_enabled() {
+        let _env = home_env_mutex();
+        let _git = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "0");
+        let _sync = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let override_home = project.path().join(".home");
+        std::fs::create_dir(&override_home).unwrap();
+        let _home = EnvVarGuard::set("HOME", override_home.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", override_home.to_str().unwrap());
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
+            "config": [user_tier(json!({
+                "indexes": {"trigram": true, "semantic": true, "callgraph": true},
+                "views": {"enabled": true},
+            }))],
+        }));
+
+        let response = handle_configure_for_test(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(
+            !ctx.root_too_broad(),
+            "HOME inside a project must not protect its parent"
+        );
+        assert!(ctx.heavy_root_work_allowed());
+        assert!(ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.semantic);
+        assert!(ctx.config().indexes.callgraph);
+        assert!(ctx.config().views.enabled);
+        super::drain_deferred_configure_maintenance(&ctx);
+        ctx.stop_watcher_runtime();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_symlinked_home_disables_root_work() {
+        let _env = home_env_mutex();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&home).unwrap();
+        create_dir_symlink(&home, &alias);
+        let _home = EnvVarGuard::set("HOME", alias.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", alias.to_str().unwrap());
+        assert_broad_configure_root(&home);
+        assert_broad_configure_root(&alias);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_filesystem_root_still_reads_absolute_path() {
+        let _env = home_env_mutex();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": "/", "harness": "runner", "storage_dir": ctx._storage.path(),
+        }));
+        assert!(handle_configure_for_test(&req, &ctx).success);
+        let file = ctx._storage.path().join("readable.txt");
+        std::fs::write(&file, "explicit path still works\n").unwrap();
+        let read = RawRequest {
+            id: "read-root".into(),
+            command: "read".into(),
+            session_id: None,
+            lsp_hints: None,
+            params: json!({"file": file}),
+        };
+        let response = crate::commands::read::handle_read(&read, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(response
+            .data
+            .to_string()
+            .contains("explicit path still works"));
+    }
+
+    #[test]
+    fn configure_normal_project_keeps_root_work_enabled() {
+        let _env = home_env_mutex();
+        let _git = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "0");
+        let _sync = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = test_context();
+        // Treat the temporary project's parent as an injected volume root to
+        // exercise /app-style admission without creating a host root directory.
+        let canonical_project = project.path().canonicalize().unwrap();
+        assert_eq!(
+            crate::path_identity::project_root_is_narrow(
+                &canonical_project,
+                &ctx._storage.path().canonicalize().unwrap(),
+                canonical_project.parent().unwrap(),
+            ),
+            Some(true),
+        );
+        let req = configure_request_with_params(json!({
+            "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
+            "config": [user_tier(json!({
+                "indexes": {"trigram": true, "semantic": true, "callgraph": true},
+                "semantic": {"backend": "openai-compatible", "base_url": "http://127.0.0.1:1"},
+                "views": {"enabled": true},
+            }))],
+        }));
+        let response = handle_configure_for_test(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(ctx.heavy_root_work_allowed());
+        assert!(ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.semantic);
+        assert!(ctx.config().indexes.callgraph);
+        assert!(ctx.config().views.enabled);
+        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        assert!(ctx.semantic_index_rx().lock().is_some());
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(ctx.watcher_runtime_active());
+        assert!(ctx.view_runtime_snapshot().is_some());
+        assert!(ctx.callgraph_writer());
+        ctx.stop_watcher_runtime();
     }
 
     #[test]

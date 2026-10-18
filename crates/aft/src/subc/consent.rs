@@ -982,38 +982,7 @@ fn probe_directory_scope_with(
     Ok(true)
 }
 
-/// Inputs are canonical policy identities, including home aliases and native
-/// volume roots. Exclude root-level system directories and all home ancestors.
-fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
-    directory.is_absolute()
-        && directory.parent().and_then(Path::parent).is_some()
-        && !home.starts_with(directory)
-        && directory != volume
-        && directory.parent() != Some(volume)
-}
-
-/// Bind mounts can preserve a protected directory's identity without preserving
-/// its path spelling. Device/inode checks also catch same-device volume aliases.
-#[cfg(unix)]
-fn directory_is_protected_alias(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let identity = |path: &Path| {
-        let metadata = std::fs::metadata(path).ok()?;
-        Some((metadata.dev(), metadata.ino()))
-    };
-    let candidate = identity(directory)?;
-    for ancestor in home.ancestors().chain(std::iter::once(volume)) {
-        if identity(ancestor)? == candidate {
-            return Some(true);
-        }
-    }
-    Some(identity(directory.parent()?)? == identity(volume)?)
-}
-
-#[cfg(not(unix))]
-fn directory_is_protected_alias(_directory: &Path, _home: &Path, _volume: &Path) -> Option<bool> {
-    Some(false)
-}
+use crate::path_identity::{directory_is_protected_alias, directory_scope_is_narrow};
 
 /// A canonical directory can still be a root-level alias, such as /etc pointing
 /// to /private/etc. Only resolvable aliases have a target identity to compare.

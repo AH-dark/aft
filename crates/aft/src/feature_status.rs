@@ -88,6 +88,8 @@ pub mod cause {
     /// The project root is the user's home directory; heavy indexes never run
     /// there.
     pub const HOME_ROOT: &str = "home_root";
+    /// The root is too broad for watching or project-wide indexing.
+    pub const ROOT_TOO_BROAD: &str = "root_too_broad";
     /// The configured embedding backend is currently unreachable.
     pub const SEMANTIC_BACKEND_UNAVAILABLE: &str = "semantic_backend_unavailable";
     /// The local embedding backend needs an ONNX Runtime that AFT cannot
@@ -115,7 +117,7 @@ pub mod cause {
 }
 
 /// Observed state of one index plane: the effective state plus, only when
-/// unavailable, the named cause.
+/// unavailable or safety-disabled, the named cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexObservation {
     pub effective: IndexEffective,
@@ -156,8 +158,8 @@ impl IndexObservation {
     }
 
     /// The `{status, reason}` object consumers embed in their responses. In
-    /// consumer payloads `reason` carries only the unavailable cause (null for
-    /// off, building and ready); the setup plan's derivation reason is a
+    /// consumer payloads `reason` carries the unavailable or safety-disabled
+    /// cause; the setup plan's derivation reason is a
     /// separate field that consumers do not expose.
     pub fn consumer_json(&self) -> Value {
         json!({
@@ -180,11 +182,17 @@ pub fn unobserved_index_status(enabled: bool) -> IndexObservation {
 /// Current observed status of `plane` in this engine runtime.
 ///
 /// A resolved-off index is `off` regardless of backend support or whether it
-/// was ever observed. A HOME root is the one exception: configure turns its
-/// indexes off internally, so it reports `unavailable` with `home_root`. An enabled index is `ready` or `building` when the
+/// was ever observed. A safety-disabled root reports `off` with its cause.
+/// An enabled index is `ready` or `building` when the
 /// runtime holds that state, otherwise `unavailable` with a named cause
 /// (`runtime_not_observed` when nothing has been observed yet).
 pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObservation {
+    if ctx.root_too_broad() {
+        return IndexObservation {
+            effective: IndexEffective::Off,
+            unavailable_reason: Some(cause::ROOT_TOO_BROAD.into()),
+        };
+    }
     // Configure forces every index off for a HOME root (degraded mode). That
     // is not the user's resolved choice, so report it as unavailable with its
     // cause rather than as configured off.

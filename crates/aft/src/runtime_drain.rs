@@ -4071,7 +4071,7 @@ pub(crate) fn configure_search_order_context_for_test(
         storage_root: storage.to_path_buf(),
         harness_dir: storage.join("opencode"),
         session_id: "order-test".to_string(),
-        home_match: false,
+        root_too_broad: false,
         format_tool_cache_clear_needed: false,
         run_bash_replay: false,
         configure_database_runtime: false,

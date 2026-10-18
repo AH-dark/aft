@@ -1,0 +1,1 @@
+- AFT no longer watches or indexes the filesystem root, a drive or volume root, your home folder, or any folder above it, even when a session opens one. Tools still work there with explicit paths, and status says why indexing is off. A folder-of-projects watcher now stops when its last session closes.

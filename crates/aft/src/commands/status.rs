@@ -278,12 +278,21 @@ impl AppContext {
                 })
             })
         };
-        let search_index_info = if config.indexes.trigram {
+        let safety_disabled_info = || {
+            serde_json::json!({
+                "status": "disabled", "state": "disabled", "reason": "root_too_broad",
+            })
+        };
+        let search_index_info = if self.root_too_broad() {
+            safety_disabled_info()
+        } else if config.indexes.trigram {
             refused_info(crate::feature_status::IndexPlane::Trigram).unwrap_or(search_index_info)
         } else {
             search_index_info
         };
-        let semantic_index_info = if config.indexes.semantic {
+        let semantic_index_info = if self.root_too_broad() {
+            safety_disabled_info()
+        } else if config.indexes.semantic {
             refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
         } else {
             semantic_index_info
