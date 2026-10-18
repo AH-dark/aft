@@ -1,1 +1,1 @@
-Reduced idle daemon CPU use by sharing allocator measurements across health surfaces for up to 30 seconds, with their actual age reported.
+- - The daemon's background health summary measures memory at most every 30 seconds instead of every 3, lowering its idle CPU use.
