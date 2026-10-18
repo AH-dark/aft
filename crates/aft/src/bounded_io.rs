@@ -80,8 +80,31 @@ struct Access {
     direct: bool,
 }
 struct Probe {
-    result: Mutex<Option<Result<Access, ProbeError>>>,
+    state: Mutex<ProbeState>,
     ready: Condvar,
+}
+struct ProbeState {
+    result: Option<Result<Access, ProbeError>>,
+    deadline: Instant,
+    started: Option<Instant>,
+}
+impl Probe {
+    fn queued(deadline: Instant) -> Self {
+        Self {
+            state: Mutex::new(ProbeState {
+                result: None,
+                deadline,
+                started: None,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+    fn set_deadline(&self, deadline: Instant, started: Option<Instant>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.deadline = deadline;
+        state.started = started;
+        self.ready.notify_all();
+    }
 }
 #[derive(Clone)]
 pub(crate) struct Budget {
@@ -307,9 +330,14 @@ pub(crate) fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
 fn deadline(at: Option<Instant>) -> Instant {
+    request_deadline(at)
+        .into_iter()
+        .fold(Instant::now() + IO_BUDGET, Instant::min)
+}
+fn request_deadline(at: Option<Instant>) -> Option<Instant> {
     at.into_iter()
         .chain(CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.deadline)))
-        .fold(Instant::now() + IO_BUDGET, Instant::min)
+        .min()
 }
 fn failure(path: &Path, code: &'static str, reason: &str) -> io::Error {
     let message = format!("{code}: {}: {reason}", path.display());
@@ -451,29 +479,33 @@ fn run_with_limiter<T: Send + 'static>(
     limiter: Arc<Limiter>,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
+    run_with_timeout(path, at, limiter, access_budget(), None, work)
+}
+fn access_budget() -> Duration {
     #[cfg(test)]
-    let access_budget = current().map_or(IO_BUDGET, |budget| budget.access_budget);
+    return current().map_or(IO_BUDGET, |budget| budget.access_budget);
     #[cfg(not(test))]
-    let access_budget = IO_BUDGET;
-    run_with_timeout(path, at, limiter, access_budget, work)
+    IO_BUDGET
 }
 fn run_with_timeout<T: Send + 'static>(
     path: &Path,
     at: Option<Instant>,
     limiter: Arc<Limiter>,
     access_budget: Duration,
+    probe: Option<Arc<Probe>>,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     if let Some(error) = prior_failure() {
         return Err(error);
     }
     let queued = Instant::now();
-    let request_deadline = at
-        .into_iter()
-        .chain(current().map(|budget| budget.deadline))
-        .min()
-        .unwrap_or(queued + access_budget);
-    let queue_deadline = request_deadline.min(queued + access_budget);
+    let request_deadline = request_deadline(at);
+    // Without a request deadline, queueing and access each get their own cap.
+    let queue_deadline =
+        request_deadline.map_or(queued + access_budget, |at| at.min(queued + access_budget));
+    if let Some(probe) = &probe {
+        probe.set_deadline(queue_deadline, None);
+    }
     if queued >= queue_deadline {
         return Err(failure(
             path,
@@ -484,7 +516,12 @@ fn run_with_timeout<T: Send + 'static>(
     // A bounded walk already owns an isolated helper. Do not consume another
     // slot per nested directory probe (or let healthy walks deadlock each
     // other on admission). Its caller's deadline must be no later than ours.
-    if HELPER_DEADLINE.with(|outer| outer.get().is_some_and(|outer| outer <= queue_deadline)) {
+    if let Some(outer) =
+        HELPER_DEADLINE.with(|outer| outer.get().filter(|outer| *outer <= queue_deadline))
+    {
+        if let Some(probe) = &probe {
+            probe.set_deadline(outer, Some(Instant::now()));
+        }
         return work(path.to_path_buf());
     }
     let Some(permit) = limiter.acquire(queue_deadline) else {
@@ -496,8 +533,8 @@ fn run_with_timeout<T: Send + 'static>(
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let running = Arc::new(Mutex::new(None));
-    let helper_running = Arc::clone(&running);
+    let probe = probe.unwrap_or_else(|| Arc::new(Probe::queued(queue_deadline)));
+    let helper_probe = Arc::clone(&probe);
     #[cfg(test)]
     if let Some(counts) = &measurements {
         counts.round_trips.fetch_add(1, Ordering::Relaxed);
@@ -511,16 +548,22 @@ fn run_with_timeout<T: Send + 'static>(
             let result = crate::context::confinement::inherit(confinement, || with_budget(budget, || {
                 // Owning a slot does not mean the OS has scheduled this helper.
                 // Never start expired work or blame its scheduling delay on I/O.
-                let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
+                // Publish the phase under the same lock used by the owner and
+                // shared waiters, so neither can mistake a started access for
+                // an expired queue while the helper is being scheduled.
+                let mut state = helper_probe.state.lock().unwrap_or_else(|e| e.into_inner());
                 let started = Instant::now();
                 if started >= queue_deadline {
                     return Err(failure(&owned, "read_io_queue_timeout", "filesystem helper did not start before the deadline; this call did not start"));
                 }
                 // Admission and scheduling are not OS access. Start the access
                 // cap here, while retaining the caller's hard request deadline.
-                let at = request_deadline.min(started + access_budget);
-                *running = Some((started, at));
-                drop(running);
+                let at = request_deadline
+                    .map_or(started + access_budget, |at| at.min(started + access_budget));
+                state.started = Some(started);
+                state.deadline = at;
+                helper_probe.ready.notify_all();
+                drop(state);
                 HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
                 #[cfg(test)]
                 regression_tests::after_helper_start(&owned);
@@ -537,14 +580,16 @@ fn run_with_timeout<T: Send + 'static>(
         match rx.recv_timeout(wait_until.saturating_duration_since(Instant::now())) {
             Ok(result) => return result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let state = *running.lock().unwrap_or_else(|e| e.into_inner());
-                let Some((started, at)) = state else {
+                let state = probe.state.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(started) = state.started else {
                     return Err(failure(
                     path,
                     "read_io_queue_timeout",
                     "filesystem helper did not start before the deadline; this call did not start",
                 ));
                 };
+                let at = state.deadline;
+                drop(state);
                 if Instant::now() < at {
                     wait_until = at;
                     continue;
@@ -588,58 +633,77 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
         match dirs.entry(path.to_path_buf()) {
             std::collections::hash_map::Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let probe = Arc::new(Probe {
-                    result: Mutex::new(None),
-                    ready: Condvar::new(),
-                });
+                let probe = Arc::new(Probe::queued(
+                    at.map_or(budget.deadline, |at| at.min(budget.deadline)),
+                ));
                 entry.insert(Arc::clone(&probe));
                 (probe, true)
             }
         }
     };
     let access = if owner {
-        let result = run(path, at, |path| {
-            #[cfg(test)]
-            regression_tests::before_directory_probe(&path)?;
-            #[cfg(all(test, unix))]
-            tests::before_directory_probe(&path)?;
-            // Opening and advancing ReadDir probes consent, not just existence.
-            let mut entries = std::fs::read_dir(&path)?;
-            let _ = entries.next().transpose()?;
-            let access = Access {
-                direct: local_filesystem(&path)?,
-            };
-            #[cfg(all(test, unix))]
-            tests::after_directory_probe(&path);
-            Ok(access)
-        });
+        let result = run_with_timeout(
+            path,
+            at,
+            Arc::clone(&HELPERS),
+            access_budget(),
+            Some(Arc::clone(&probe)),
+            |path| {
+                #[cfg(test)]
+                regression_tests::before_directory_probe(&path)?;
+                #[cfg(all(test, unix))]
+                tests::before_directory_probe(&path)?;
+                // Opening and advancing ReadDir probes consent, not just existence.
+                let mut entries = std::fs::read_dir(&path)?;
+                let _ = entries.next().transpose()?;
+                let access = Access {
+                    direct: local_filesystem(&path)?,
+                };
+                #[cfg(all(test, unix))]
+                tests::after_directory_probe(&path);
+                Ok(access)
+            },
+        );
         let macos = cfg!(target_os = "macos");
         #[cfg(all(test, unix))]
         let macos = macos || tests::macos_directory(path);
         observe_permission(path, &result, macos);
         let result = result.map_err(|error| ProbeError::from(&error));
-        *probe.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+        probe.state.lock().unwrap_or_else(|e| e.into_inner()).result = Some(result.clone());
         probe.ready.notify_all();
         result.map_err(|error| error.error())?
     } else {
-        let at = deadline(at);
-        let mut result = probe.result.lock().unwrap_or_else(|e| e.into_inner());
-        while result.is_none() {
+        let request_deadline = request_deadline(at);
+        let mut state = probe.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.result.is_none() {
+            // The owner may still be queued. Once it starts, all waiters follow
+            // its new access deadline, without extending their own request.
+            let at = request_deadline.map_or(state.deadline, |at| at.min(state.deadline));
             let remaining = at.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                let blocked = state.started.is_some() && at == state.deadline;
                 return Err(failure(
                     path,
-                    "read_io_queue_timeout",
-                    "deadline elapsed waiting for this directory's already-running probe",
+                    if blocked {
+                        "read_blocked"
+                    } else {
+                        "read_io_queue_timeout"
+                    },
+                    if blocked {
+                        "OS access deadline elapsed waiting for this directory's running probe"
+                    } else {
+                        "deadline elapsed waiting for this directory's shared probe"
+                    },
                 ));
             }
-            result = probe
+            state = probe
                 .ready
-                .wait_timeout(result, remaining)
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        result
+        state
+            .result
             .as_ref()
             .unwrap()
             .clone()
