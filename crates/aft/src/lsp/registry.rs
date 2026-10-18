@@ -1003,7 +1003,7 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let stamp = std::fs::metadata(config_path)
         .ok()
-        .map(|metadata| BiomeConfigStamp::of(&metadata));
+        .map(|metadata| BiomeConfigStamp::of(config_path, &metadata));
     let memo = MEMO.get_or_init(Default::default);
     if stamp.is_some() {
         if let Some((at, includes)) = memo.lock().get(config_path) {
@@ -1049,6 +1049,11 @@ thread_local! {
 }
 
 /// The identity of a Biome configuration file as `biome_includes` last parsed it.
+///
+/// On Unix the inode and change time reveal any edit or replacement. Windows
+/// exposes neither through stable std APIs, and NTFS can carry a replaced
+/// file's creation time over to its successor, so there the stamp hashes the
+/// file's bytes: still far cheaper than parsing and compiling its globs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BiomeConfigStamp {
     len: u64,
@@ -1057,12 +1062,16 @@ struct BiomeConfigStamp {
     inode: (u64, u64),
     #[cfg(unix)]
     changed: (i64, i64),
+    #[cfg(not(unix))]
+    content: Option<u64>,
 }
 
 impl BiomeConfigStamp {
-    fn of(metadata: &std::fs::Metadata) -> Self {
+    fn of(path: &Path, metadata: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        let _ = path;
         Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
@@ -1070,6 +1079,13 @@ impl BiomeConfigStamp {
             inode: (metadata.dev(), metadata.ino()),
             #[cfg(unix)]
             changed: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(not(unix))]
+            content: std::fs::read(path).ok().map(|bytes| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            }),
         }
     }
 }
@@ -1553,7 +1569,7 @@ mod tests {
         assert_eq!(parses() - before, 1, "one parse serves every lookup");
 
         // Replace the file with same-length content and restore its old
-        // modification time: only its inode and change time differ.
+        // modification time: only its identity (Unix) or bytes (Windows) differ.
         let modified = std::fs::metadata(&config_path).unwrap().modified().unwrap();
         let staged = temp.path().join("biome.json.new");
         write_file(&staged, r#"{"files":{"includes":["b/**"]}}"#);
