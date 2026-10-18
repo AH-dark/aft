@@ -225,8 +225,16 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
     if let Some(known) = confinement_from_memory(ctx, identity) {
         return known;
     }
+    #[cfg(test)]
+    ctx.run_after_policy_memory_miss_hook_for_test();
     let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
-        return Err(policy_unavailable());
+        // A busy handle slot can hide an empty, never-configured store from
+        // the memory probe. Recheck after waiting for the slot off the loop.
+        return if ctx.database_runtime_unconfigured() {
+            Ok(false)
+        } else {
+            Err(policy_unavailable())
+        };
     };
     // A confining save can invalidate another epoch's fallback read. Retry
     // when it races this read so even this call cannot use a stale answer;
@@ -255,6 +263,44 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
 /// A route's saved confinement: whether its scoped worker saved
 /// `confine: "root"`, or why that could not be read.
 pub(super) type ConfinementRead = Result<bool, subc_protocol::ErrorBody>;
+
+/// A policy answer carried across admission waits. An unconfined answer is
+/// valid only until a confining save advances the context's policy generation;
+/// a worker epoch without its own saved row inherits an older epoch's policy.
+/// Saving confinement for the older epoch therefore invalidates carried
+/// unconfined answers for the later epoch too.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CarriedConfinement {
+    pub(super) read: ConfinementRead,
+    generation: u64,
+}
+
+impl CarriedConfinement {
+    pub(super) fn from_memory(ctx: &AppContext, identity: &RouteIdentity) -> Option<Self> {
+        let generation = ctx.policy_confinement_generation();
+        confinement_from_memory(ctx, identity).map(|read| Self { read, generation })
+    }
+
+    pub(super) fn read(ctx: &AppContext, identity: &RouteIdentity) -> Self {
+        let generation = ctx.policy_confinement_generation();
+        Self {
+            read: confined(ctx, identity),
+            generation,
+        }
+    }
+
+    pub(super) fn unavailable() -> Self {
+        Self {
+            read: Err(policy_unavailable()),
+            generation: 0,
+        }
+    }
+
+    fn current(&self, ctx: &AppContext) -> Option<ConfinementRead> {
+        (self.read != Ok(false) || self.generation == ctx.policy_confinement_generation())
+            .then(|| self.read.clone())
+    }
+}
 
 pub(super) fn policy_unavailable() -> subc_protocol::ErrorBody {
     subc_protocol::ErrorBody::new(
@@ -314,15 +360,18 @@ pub(super) fn admit_confined(
 /// its write lock, and the loop would stop answering health checks,
 /// cancellations and other roots meanwhile. The policy comes from memory or
 /// from `read`, the result of [`confined`] run off the loop before the call
-/// reached admission. A call with neither is refused, never run unconfined.
+/// reached admission. A carried unconfined answer invalidated during an
+/// admission wait is unknown, just like a missing read. The frame loop cannot
+/// re-read aft.db synchronously, so it refuses rather than use a stale answer.
 pub(super) fn admit_confined_on_frame_loop(
     ctx: &AppContext,
     identity: &RouteIdentity,
     name: &str,
-    read: Option<&ConfinementRead>,
+    read: Option<&CarriedConfinement>,
 ) -> Result<bool, subc_protocol::ErrorBody> {
-    let confined = confinement_from_memory(ctx, identity)
-        .or_else(|| read.cloned())
+    let confined = CarriedConfinement::from_memory(ctx, identity)
+        .and_then(|read| read.current(ctx))
+        .or_else(|| read.and_then(|read| read.current(ctx)))
         .unwrap_or_else(|| Err(policy_unavailable()))?;
     admit_confined_tool(confined, name)
 }

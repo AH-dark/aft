@@ -196,14 +196,14 @@ fn unconfined_read_racing_a_confining_save_is_not_remembered() {
     });
     // No row is saved yet, so the newer epoch reads as unconfined; the older
     // epoch's confining save then commits before that answer is remembered.
-    let read = confined(&ctx, &newer);
+    let read = CarriedConfinement::read(&ctx, &newer);
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &newer, "bash", Some(&read))
             .unwrap_err()
             .code,
         "tool_not_offered_confined"
     );
-    assert_eq!(read, Ok(true));
+    assert_eq!(read.read, Ok(true));
     assert_eq!(ctx.policy_confinement_reads_for_test(), 2);
     assert_eq!(confinement_from_memory(&ctx, &older), Some(Ok(true)));
     assert_eq!(confinement_from_memory(&ctx, &newer), Some(Ok(true)));
@@ -269,9 +269,9 @@ fn confine_lookup_fails_closed_when_generation_keeps_changing() {
     let older = identity(root.path(), "designer", 7, true);
     let newer = identity(root.path(), "designer", 8, true);
     invalidate_next_read(&ctx, key(&older, Some("worker")).unwrap());
-    let read = confined(&ctx, &newer);
+    let read = CarriedConfinement::read(&ctx, &newer);
     assert_eq!(
-        read.as_ref().unwrap_err().code,
+        read.read.as_ref().unwrap_err().code,
         "confine_policy_unavailable"
     );
     assert_eq!(ctx.policy_confinement_reads_for_test(), 3);
@@ -328,6 +328,409 @@ fn confine_lookup_never_waits_for_the_database_handle_slot_on_the_frame_loop() {
         Ok(false)
     );
     assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
+}
+
+fn admission_frame() -> super::super::DecodedFrame {
+    admission_frame_for("bash", json!({"command": "true"}))
+}
+
+fn admission_frame_for(name: &str, arguments: Value) -> super::super::DecodedFrame {
+    use super::super::*;
+    DecodedFrame {
+        parsed_body: Default::default(),
+        confinement: None,
+        frame: Frame::build(
+            FrameType::Request,
+            control_flags(),
+            43,
+            1,
+            7,
+            serde_json::to_vec(&json!({
+                "name": name, "arguments": arguments, "call_key": "busy-db", "preset": "worker"
+            }))
+            .unwrap(),
+        )
+        .unwrap(),
+        phase_trace: PhaseTrace::new(Instant::now()),
+    }
+}
+
+#[tokio::test]
+async fn unconfined_call_keeps_policy_answer_when_database_slot_becomes_busy() {
+    use super::super::{persistence::DatabaseWaits, route_key};
+    use std::sync::mpsc;
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context(root.path(), storage.path(), None));
+    let route = identity(root.path(), "designer", 7, true);
+    assert_eq!(confined(&ctx, &route), Ok(false));
+    let executor = crate::executor::Executor::new();
+    assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+    let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+    let mut waits = DatabaseWaits::default();
+    let decoded = waits
+        .read_confinement(admission_frame(), &routes, &executor)
+        .err()
+        .expect("a memoized policy needs no background read");
+
+    // The slot can become busy after the memory probe but before admission.
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let app = ctx.app();
+    let holder = std::thread::spawn(move || {
+        app.with_database_slot_locked_for_test(|| {
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    assert_eq!(confinement_from_memory(&ctx, &route), None);
+    let admitted = admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref());
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "frame loop blocked: {elapsed:?}"
+    );
+    assert_eq!(admitted, Ok(false));
+    catalog(
+        json!({"preset":"worker", "params":{"confine":"root"}}),
+        &route,
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref())
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined",
+        "a newly saved fence must override the carried unconfined answer"
+    );
+}
+
+#[tokio::test]
+async fn uncached_calls_wait_for_busy_database_slot_and_keep_saved_confinement() {
+    use super::super::{persistence::DatabaseWaits, route_key};
+    use std::sync::mpsc;
+
+    for (has_database, saved_confined) in [(false, false), (true, false), (true, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let route = identity(root.path(), "designer", 7, true);
+        if saved_confined {
+            catalog(
+                json!({"preset":"worker", "params":{"confine":"root"}}),
+                &route,
+                &context(root.path(), storage.path(), None),
+            )
+            .unwrap();
+        }
+        let ctx = Arc::new(if has_database {
+            context(root.path(), storage.path(), None)
+        } else {
+            context_without_database(root.path(), storage.path())
+        });
+        let executor = crate::executor::Executor::new();
+        assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+        let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let app = ctx.app();
+        let holder = std::thread::spawn(move || {
+            app.with_database_slot_locked_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waits = DatabaseWaits::default();
+        let started = Instant::now();
+        assert!(waits
+            .read_confinement(admission_frame(), &routes, &executor)
+            .is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waits.next())
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let decoded = tokio::time::timeout(Duration::from_secs(5), waits.next())
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.confinement.as_ref().map(|read| &read.read),
+            Some(&Ok(saved_confined))
+        );
+        let admitted =
+            admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref());
+        if saved_confined {
+            assert_eq!(admitted.unwrap_err().code, "tool_not_offered_confined");
+        } else {
+            assert_eq!(admitted, Ok(false));
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyed_call_waits_for_slow_policy_store_before_confinement_admission() {
+    use super::super::{persistence::DatabaseWaits, route_key};
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context_without_database(root.path(), storage.path()));
+    ctx.mark_database_runtime_initializing_for_test();
+    let route = identity(root.path(), "designer", 7, true);
+    let executor = crate::executor::Executor::new();
+    assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+    let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+    let mut waits = DatabaseWaits::default();
+    // Keyed calls bypass DatabaseWaits::defer because the ledger owns their
+    // persistence admission. Their confinement lookup still needs the open.
+    assert!(waits
+        .read_confinement(admission_frame(), &routes, &executor)
+        .is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), waits.next())
+            .await
+            .is_err()
+    );
+    ctx.set_db(Arc::new(std::sync::Mutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    )));
+    ctx.finish_database_runtime(Ok(()));
+    let decoded = tokio::time::timeout(Duration::from_secs(5), waits.next())
+        .await
+        .unwrap();
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Ok(false))
+    );
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref()),
+        Ok(false)
+    );
+}
+
+#[tokio::test]
+async fn policy_read_wait_budget_exhaustion_fails_closed() {
+    use super::super::{persistence::DatabaseWaits, route_key};
+    use std::sync::mpsc;
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context(root.path(), storage.path(), None));
+    let route = identity(root.path(), "designer", 7, true);
+    let executor = crate::executor::Executor::new();
+    assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+    let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let app = ctx.app();
+    let holder = std::thread::spawn(move || {
+        app.with_database_slot_locked_for_test(|| {
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut frame = admission_frame();
+    // An already-expired budget avoids a ten-second sleep in this regression.
+    frame.phase_trace = super::super::PhaseTrace::new(Instant::now() - Duration::from_secs(11));
+    let mut waits = DatabaseWaits::default();
+    let started = Instant::now();
+    let decoded = waits
+        .read_confinement(frame, &routes, &executor)
+        .err()
+        .expect("an exhausted budget must refuse without spawning a read");
+    let admitted = admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref());
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "a busy slot exceeded the policy wait budget"
+    );
+    assert_eq!(admitted.unwrap_err().code, "confine_policy_unavailable");
+}
+
+/// Force the blocking read past its memory fast path with an empty handle
+/// slot. The hook releases the slot only after that probe returned None, so
+/// neither scheduler timing nor a sleep decides which refusal branch is tested.
+fn hold_empty_policy_slot_until_memory_miss(ctx: &Arc<AppContext>) -> std::thread::JoinHandle<()> {
+    use std::sync::mpsc;
+
+    assert!(ctx.db().is_none());
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (released_tx, released_rx) = mpsc::channel();
+    let app = ctx.app();
+    let holder = std::thread::spawn(move || {
+        app.with_database_slot_locked_for_test(|| {
+            held_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        released_tx.send(()).unwrap();
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    ctx.after_next_policy_memory_miss_for_test(move || {
+        release_tx.send(()).unwrap();
+        released_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    holder
+}
+
+#[test]
+fn failed_policy_store_direct_read_fails_closed_after_inconclusive_probe() {
+    for busy in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(context_without_database(root.path(), storage.path()));
+        ctx.mark_database_runtime_initializing_for_test();
+        ctx.finish_database_runtime_error("configured store cannot open".into(), busy);
+        assert!(!ctx.database_runtime_unconfigured());
+        let route = identity(root.path(), "designer", 7, true);
+        let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
+        let read = confined(&ctx, &route);
+        holder.join().unwrap();
+        assert_eq!(read.unwrap_err().code, "confine_policy_unavailable");
+    }
+}
+
+#[tokio::test]
+async fn failed_policy_store_frame_read_fails_closed_after_off_loop_wait() {
+    use super::super::{persistence::DatabaseWaits, route_key};
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context_without_database(root.path(), storage.path()));
+    ctx.mark_database_runtime_initializing_for_test();
+    ctx.finish_database_runtime_error("configured store cannot open".into(), false);
+    assert!(!ctx.database_runtime_unconfigured());
+    let route = identity(root.path(), "designer", 7, true);
+    let executor = crate::executor::Executor::new();
+    assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+    let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+    let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
+    let frame = admission_frame_for("read", json!({"path":"input.txt"}));
+    let mut waits = DatabaseWaits::default();
+    assert!(waits.read_confinement(frame, &routes, &executor).is_ok());
+    let decoded = tokio::time::timeout(Duration::from_secs(5), waits.next())
+        .await
+        .unwrap();
+    holder.join().unwrap();
+    // Check the off-loop answer itself: the frame loop's independent memory
+    // refusal must not hide a blocking read that incorrectly returned false.
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Err(policy_unavailable()))
+    );
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &route, "read", decoded.confinement.as_ref())
+            .unwrap_err()
+            .code,
+        "confine_policy_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn opening_policy_store_past_wait_budget_fails_closed() {
+    use super::super::{persistence::DatabaseWaits, route_key, PhaseTrace};
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context_without_database(root.path(), storage.path()));
+    ctx.mark_database_runtime_initializing_for_test();
+    assert!(!ctx.database_runtime_unconfigured());
+    let route = identity(root.path(), "designer", 7, true);
+    let executor = crate::executor::Executor::new();
+    assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+    let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+    let mut frame = admission_frame_for("grep", json!({"pattern":"token"}));
+    frame.phase_trace = PhaseTrace::new(Instant::now() - Duration::from_secs(11));
+    let mut waits = DatabaseWaits::default();
+    assert!(waits.defer(frame, &routes, &executor).is_ok());
+    let expired = tokio::time::timeout(Duration::from_secs(1), waits.next())
+        .await
+        .unwrap();
+    assert!(ctx.database_runtime_initializing());
+    assert!(expired.confinement.is_none());
+
+    // Once the opening wait expires, a contended empty slot must still be
+    // classified as unavailable, not as a never-configured store.
+    let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
+    let reading = Arc::clone(&ctx);
+    let worker = route.clone();
+    let read = tokio::task::spawn_blocking(move || confined(&reading, &worker))
+        .await
+        .unwrap();
+    holder.join().unwrap();
+    assert_eq!(read, Err(policy_unavailable()));
+
+    let decoded = waits
+        .read_confinement(expired, &routes, &executor)
+        .err()
+        .expect("the opening wait already exhausted the read budget");
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Err(policy_unavailable()))
+    );
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &route, "grep", decoded.confinement.as_ref())
+            .unwrap_err()
+            .code,
+        "confine_policy_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
+    use super::super::{persistence::DatabaseWaits, route_key};
+
+    let root = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().into()),
+            storage_dir: None,
+            ..Default::default()
+        },
+    ));
+    assert!(ctx.database_runtime_unconfigured());
+    let route = identity(root.path(), "designer", 7, true);
+    let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
+    let read = confined(&ctx, &route);
+    holder.join().unwrap();
+    assert_eq!(read, Ok(false));
+
+    let executor = crate::executor::Executor::new();
+    assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
+    let routes = HashMap::from([(route_key(43, 1), route.clone())]);
+    let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
+    let mut waits = DatabaseWaits::default();
+    assert!(waits
+        .read_confinement(
+            admission_frame_for("read", json!({"path":"input.txt"})),
+            &routes,
+            &executor
+        )
+        .is_ok());
+    let decoded = tokio::time::timeout(Duration::from_secs(5), waits.next())
+        .await
+        .unwrap();
+    holder.join().unwrap();
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Ok(false))
+    );
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &route, "read", decoded.confinement.as_ref()),
+        Ok(false)
+    );
 }
 
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {
@@ -1200,11 +1603,11 @@ async fn exercise_catalog_remote_bash(
     let routes = HashMap::from([(route_key(42, 1), bind)]);
     // The frame loop reads the worker's saved confinement off the loop before
     // admission; this route saved none.
-    let confinement = confined(
+    let confinement = CarriedConfinement::read(
         &executor.actor_context(&root_id).unwrap(),
         &routes[&route_key(42, 1)],
     );
-    assert_eq!(confinement, Ok(false));
+    assert_eq!(confinement.read, Ok(false));
     let call = Frame::build(
         FrameType::Request,
         control_flags(),

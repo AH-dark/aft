@@ -2747,6 +2747,10 @@ struct PolicyConfinementMemo {
     /// answer, so a test can save a policy in that window.
     #[cfg(test)]
     after_read_for_test: Option<Box<dyn FnOnce(&AppContext) + Send>>,
+    /// Runs after an inconclusive memory probe, before acquiring the database
+    /// handle, so a test can release a contended slot at that exact boundary.
+    #[cfg(test)]
+    after_memory_miss_for_test: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Default)]
@@ -6681,6 +6685,26 @@ impl AppContext {
         let hook = self.policy_confinement.lock().after_read_for_test.take();
         if let Some(hook) = hook {
             hook(self);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_next_policy_memory_miss_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.policy_confinement.lock().after_memory_miss_for_test = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_policy_memory_miss_hook_for_test(&self) {
+        let hook = self
+            .policy_confinement
+            .lock()
+            .after_memory_miss_for_test
+            .take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 

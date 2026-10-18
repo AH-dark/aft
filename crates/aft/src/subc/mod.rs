@@ -434,10 +434,9 @@ struct DecodedFrame {
     frame: Frame,
     phase_trace: PhaseTrace,
     parsed_body: OnceLock<Result<Value, serde_json::Error>>,
-    /// The route's saved confinement, read off the frame loop by
-    /// `persistence::DatabaseWaits::read_confinement` when memory could not
-    /// answer it. `None` until then.
-    confinement: Option<remote_policy::ConfinementRead>,
+    /// The route's confinement answer from memory or an off-loop database read
+    /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
+    confinement: Option<remote_policy::CarriedConfinement>,
 }
 
 impl DecodedFrame {
@@ -8309,7 +8308,7 @@ async fn handle_tool_call(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
-    confinement: Option<remote_policy::ConfinementRead>,
+    confinement: Option<remote_policy::CarriedConfinement>,
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
@@ -8472,6 +8471,12 @@ async fn handle_tool_call(
                 .await
             }
         };
+        if let Some(error) = tool_provider::shell_capability_refusal(
+            &call.name,
+            tool_provider::admission_trusted(&identity, &call),
+        ) {
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
         if let Err(error) =
             admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
         {
@@ -9911,7 +9916,8 @@ async fn signal_fatal_teardown(
     shutdown.notify_one();
 }
 /// Check a tool call against the route's saved root confinement, before any
-/// admission step that looks a tool up by name, on every route kind.
+/// catalog or call-mode admission, on every route kind. Policy-independent
+/// capability refusals run first and never need a database lookup.
 ///
 /// A call cannot escape a saved worker fence by claiming another preset or by
 /// sending a tool that was absent from its catalog. A confined catalog offers
@@ -9925,7 +9931,7 @@ fn admit_confined_call_name(
     executor: &Executor,
     identity: &RouteIdentity,
     name: &mut String,
-    confinement: Option<&remote_policy::ConfinementRead>,
+    confinement: Option<&remote_policy::CarriedConfinement>,
 ) -> Result<(), subc_protocol::ErrorBody> {
     let ctx = executor.actor_context(&identity.root).ok_or_else(|| {
         subc_protocol::ErrorBody::new("confine_policy_unavailable", "session context unavailable")
