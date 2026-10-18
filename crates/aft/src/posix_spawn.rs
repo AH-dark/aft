@@ -517,11 +517,13 @@ mod tests {
             child.kill().is_err(),
             "never signal a pid once it has been reaped"
         );
+        // The child's shell derives $PWD from the physical working folder, so
+        // compare against the canonical path (/private/var on macOS, not /var).
         assert_eq!(
             std::fs::read_to_string(dir.path().join("out")).unwrap(),
             format!(
                 "requested-zero:child-value:{}:released",
-                dir.path().display()
+                dir.path().canonicalize().unwrap().display()
             )
         );
         assert_eq!(std::fs::read(dir.path().join("exit")).unwrap(), b"exit");
