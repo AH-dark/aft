@@ -542,6 +542,81 @@ fn resolve_home_dir() -> Option<PathBuf> {
     Some(std::fs::canonicalize(&raw).unwrap_or(raw))
 }
 
+fn resolve_account_home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    let home = crate::production_storage::account_home().ok()?;
+    #[cfg(windows)]
+    let home = resolve_windows_profile_dir().ok()?;
+
+    let canonical = std::fs::canonicalize(home).ok()?;
+    canonical.is_dir().then_some(canonical)
+}
+
+fn project_root_is_too_broad(
+    canonical_root: &Path,
+    canonicalization_failed: bool,
+    account_home: Option<&Path>,
+) -> bool {
+    let root_identity = crate::access_policy::policy_path(canonical_root);
+    canonicalization_failed
+        || crate::storage_retention::volume_anchor(canonical_root)
+            .map(|(volume, _)| crate::access_policy::policy_path(&volume))
+            .is_none_or(|volume| {
+                let home_identity = account_home
+                    .filter(|home| home.is_dir())
+                    .map(crate::access_policy::policy_path)
+                    .unwrap_or_else(|| volume.clone());
+                crate::path_identity::project_root_is_narrow(
+                    &root_identity,
+                    &home_identity,
+                    &volume,
+                ) != Some(true)
+            })
+}
+
+#[cfg(windows)]
+fn resolve_windows_profile_dir() -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY,
+    };
+
+    struct FolderPath(*mut u16);
+    impl Drop for FolderPath {
+        fn drop(&mut self) {
+            // SAFETY: SHGetKnownFolderPath allocates its result with the COM allocator.
+            unsafe { CoTaskMemFree(self.0.cast()) };
+        }
+    }
+
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the folder identifier is valid and raw is writable.
+    let status = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Profile,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = FolderPath(raw);
+    if status < 0 || path.0.is_null() {
+        return Err(std::io::Error::other(format!(
+            "SHGetKnownFolderPath(FOLDERID_Profile) lookup failed (HRESULT 0x{:08x})",
+            status as u32
+        )));
+    }
+    let mut len = 0;
+    // SAFETY: a successful lookup returns an allocated NUL-terminated path.
+    while unsafe { *path.0.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: the scan above found the end of the allocated path.
+    let units = unsafe { std::slice::from_raw_parts(path.0, len) };
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(units)))
+}
+
 fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
@@ -3172,33 +3247,37 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     debug_assert!(canonical_cache_root.is_absolute());
     let mut degraded_reasons: Vec<String> = Vec::new();
     let home = resolve_home_dir();
-    if home
+    let home_root = home
         .as_ref()
-        .is_some_and(|home| *home == canonical_cache_root)
-    {
+        .is_some_and(|home| *home == canonical_cache_root);
+    if home_root {
         degraded_reasons.push("home_root".to_string());
     }
-    let root_identity = crate::access_policy::policy_path(&canonical_cache_root);
-    let root_too_broad = canonicalization_failed
-        || crate::storage_retention::volume_anchor(&canonical_cache_root)
-            .map(|(volume, _)| crate::access_policy::policy_path(&volume))
-            .is_none_or(|volume| {
-                let home_identity = home
-                    .as_deref()
-                    .filter(|home| home.is_dir())
-                    .map(crate::access_policy::policy_path)
-                    .unwrap_or_else(|| volume.clone());
-                crate::path_identity::project_root_is_narrow(
-                    &root_identity,
-                    &home_identity,
-                    &volume,
-                ) != Some(true)
-            });
+    let account_home = resolve_account_home_dir();
+    let root_too_broad = home_root
+        || project_root_is_too_broad(
+            &canonical_cache_root,
+            canonicalization_failed,
+            account_home.as_deref(),
+        );
     if root_too_broad {
         degraded_reasons.push("root_too_broad".to_string());
+        let warning_reason = if home_root {
+            "home_root"
+        } else if account_home.is_some() {
+            "root_too_broad"
+        } else {
+            "account_home_unknown"
+        };
+        let warning_message = if account_home.is_some() || home_root {
+            "Watching and indexing are off for this broad root; explicit-path tools remain available."
+        } else {
+            "The account home could not be determined, so only the filesystem or volume root is protected by the home rule. Watching and indexing are off for this broad root; explicit-path tools remain available."
+        };
         configure_warnings.push(json!({
             "code": "root_too_broad",
-            "message": "Watching and indexing are off for this broad root; explicit-path tools remain available.",
+            "reason": warning_reason,
+            "message": warning_message,
         }));
     }
 
@@ -8157,7 +8236,7 @@ mod tests {
         configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
         configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
-        only_lsp_process_state_changed, parse_lsp_paths_extra,
+        only_lsp_process_state_changed, parse_lsp_paths_extra, project_root_is_too_broad,
         release_callgraph_start_waiters_for_generation_change,
         release_configure_artifact_post_gate_for_test,
         reset_configure_artifact_load_attempts_for_test,
@@ -18277,15 +18356,73 @@ mod tests {
     }
 
     #[test]
-    fn configure_home_and_ancestor_disable_root_work() {
+    fn account_home_and_ancestors_are_broad_when_environment_home_differs() {
         let _env = home_env_mutex();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        std::fs::create_dir(&home).unwrap();
-        let _home = EnvVarGuard::set("HOME", home.to_str().unwrap());
-        let _profile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
-        assert_broad_configure_root(&home);
-        assert_broad_configure_root(dir.path());
+        let account_tree = tempfile::tempdir().unwrap();
+        let account_home = account_tree.path().join("account-home");
+        std::fs::create_dir(&account_home).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let override_home = project.path().join(".home");
+        std::fs::create_dir(&override_home).unwrap();
+        let _home = EnvVarGuard::set("HOME", override_home.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", override_home.to_str().unwrap());
+        let account_home = account_home.canonicalize().unwrap();
+
+        for root in account_home.ancestors().filter(|root| root.is_dir()) {
+            assert!(
+                project_root_is_too_broad(root, false, Some(&account_home)),
+                "account home ancestor must be protected: {}",
+                root.display()
+            );
+        }
+        assert!(
+            !project_root_is_too_broad(project.path(), false, Some(&account_home)),
+            "a project must remain narrow when HOME points inside it"
+        );
+        assert!(
+            !project_root_is_too_broad(project.path(), false, None),
+            "an unknown account home must not broaden protection beyond the volume root"
+        );
+        let volume = crate::storage_retention::volume_anchor(project.path())
+            .unwrap()
+            .0;
+        assert!(project_root_is_too_broad(&volume, false, None));
+    }
+
+    #[test]
+    fn configure_home_override_inside_project_keeps_root_work_enabled() {
+        let _env = home_env_mutex();
+        let _git = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "0");
+        let _sync = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let override_home = project.path().join(".home");
+        std::fs::create_dir(&override_home).unwrap();
+        let _home = EnvVarGuard::set("HOME", override_home.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", override_home.to_str().unwrap());
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
+            "config": [user_tier(json!({
+                "indexes": {"trigram": true, "semantic": true, "callgraph": true},
+                "views": {"enabled": true},
+            }))],
+        }));
+
+        let response = handle_configure_for_test(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(
+            !ctx.root_too_broad(),
+            "HOME inside a project must not protect its parent"
+        );
+        assert!(ctx.heavy_root_work_allowed());
+        assert!(ctx.config().indexes.trigram);
+        assert!(ctx.config().indexes.semantic);
+        assert!(ctx.config().indexes.callgraph);
+        assert!(ctx.config().views.enabled);
+        super::drain_deferred_configure_maintenance(&ctx);
+        ctx.stop_watcher_runtime();
     }
 
     #[cfg(unix)]
