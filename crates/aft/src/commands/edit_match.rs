@@ -1808,11 +1808,17 @@ mod audit_regressions {
         let path = dir.path().join("write-only.txt");
         std::fs::write(&path, "before").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
-        assert_eq!(
-            std::fs::File::open(&path).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "this test requires a user whose read access is denied by mode 0200"
-        );
+        match std::fs::File::open(&path) {
+            // Root (and some CI containers) read files regardless of mode 0200,
+            // so a write-only file cannot be produced and the fixture proves nothing.
+            Ok(_) => {
+                eprintln!(
+                    "skipped: mode 0200 does not deny reads for this user (running as root?)"
+                );
+                return;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        }
         let mut config = crate::config::Config {
             format_on_edit: false,
             ..Default::default()
