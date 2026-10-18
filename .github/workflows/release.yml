@@ -172,11 +172,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # cache-bin: false keeps a cached ~/.cargo/bin from overwriting the fresh
       # cargo shim, as in build-darwin-x64.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-darwin-arm64
           cache-bin: false
@@ -244,9 +244,9 @@ jobs:
         with:
           targets: x86_64-apple-darwin
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-darwin-x64
           cache-bin: false
@@ -309,7 +309,7 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-linux-arm64
           cache-on-failure: true
@@ -322,7 +322,7 @@ jobs:
       # Prebuilt binary via binstall — `cargo install cross` compiled it from
       # source for 2-3 minutes on every release.
       - name: Install cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cross@0.2.5
 
@@ -352,7 +352,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-linux-x64
           cache-on-failure: true
@@ -363,7 +363,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Install cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cross@0.2.5
 
@@ -403,9 +403,9 @@ jobs:
         with:
           targets: aarch64-pc-windows-msvc
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-win32-arm64
           cache-on-failure: true
@@ -445,9 +445,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-win32-x64
           cache-on-failure: true
@@ -1115,7 +1115,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Post to Discord
-        uses: SethCohen/github-releases-to-discord@v1
+        uses: SethCohen/github-releases-to-discord@24d166886aee4646d448c8a389ff9e1ebcab3682 # v1
         with:
           webhook_url: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
           # Cortexkit teal — decimal value of #2C4A7C.

@@ -48,7 +48,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: GitHub Releases to Discord
-        uses: SethCohen/github-releases-to-discord@v1
+        uses: SethCohen/github-releases-to-discord@24d166886aee4646d448c8a389ff9e1ebcab3682 # v1
         with:
           webhook_url: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
           # Cortexkit teal — matches the brand. Decimal value of #2C4A7C.
