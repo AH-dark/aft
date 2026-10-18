@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+MEASUREMENT_PROFILE = "cold-index-no-inspect-v1"
 SYNTHETIC_FILE_COUNT = 24_000
 SYNTHETIC_VERSION = "synthetic-v2"
 REPO_ORDER = ("redox", "typescript-eslint", "jupyterlab", "hugo", "synthetic-24k")
@@ -717,7 +718,9 @@ def write_baseline(
     }
     for name in names:
         runs = runs_by_repo[name]
+        require_run_profile(name, runs)
         config = payload["repos"][name]
+        config["measurement_profile"] = MEASUREMENT_PROFILE
         config["metrics"] = repo_metrics_from_runs(name, config, runs)
         config["index_events"] = best_run(runs).events
         config["sample"] = {"runs": 2, "selection": "minimum observed value per metric"}
@@ -753,7 +756,9 @@ def write_baseline_from_results(
     payload["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     payload[PLATFORM_KEY] = {"platform": measured_on, "provenance": provenance}
     for name in REPO_ORDER:
+        require_run_profile(name, runs_by_repo[name])
         config = payload["repos"][name]
+        config["measurement_profile"] = MEASUREMENT_PROFILE
         config["metrics"] = repo_metrics_from_runs(name, config, runs_by_repo[name])
         # Event counts are parsed from the per-repo AFT logs, which are only
         # present when the artifact carried them.  Keeping another capture's
@@ -768,6 +773,16 @@ def write_baseline_from_results(
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     print(f"wrote baseline {path} from {results_dir} (measured on {measured_on})")
     return 0
+
+
+def require_run_profile(name: str, runs: list[RunData]) -> None:
+    """Only bless rows from the workload that disables AFT's inspect scanners.
+
+    Older rows include opportunistic scanner work and cannot supply a baseline
+    for a measurement that excludes it, even when their numbers look similar.
+    """
+    if not runs or any(run.row.get("measurement_profile") != MEASUREMENT_PROFILE for run in runs):
+        raise ValueError(f"{name}: results need measurement profile {MEASUREMENT_PROFILE}; re-record on the gate runner")
 
 
 def runner_facts() -> str:
@@ -1169,6 +1184,15 @@ def main() -> int:
         )
         return 2
     names = [args.repo] if args.repo else list(REPO_ORDER)
+    incompatible = [name for name in names if baseline["repos"][name].get("measurement_profile") != MEASUREMENT_PROFILE]
+    if incompatible and not args.write_baseline:
+        print(
+            f"cost-gate: incompatible measurement profile for {', '.join(incompatible)}; "
+            f"re-record baselines on the gate runner with --write-baseline ({MEASUREMENT_PROFILE}). "
+            "Inspect-inclusive measurements cannot bound an inspect-free cold index.",
+            file=sys.stderr,
+        )
+        return 2
     cache_dir = args.cache_dir.expanduser().resolve()
     results_dir = args.results_dir.expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)

@@ -30,12 +30,13 @@ DEFAULT_REPOS = (
     "spark", "kubernetes", "elasticsearch", "llvm", "linux", "_nongit-24k", "chromium",
 )
 PLANES = ("search", "callgraph")
+MEASUREMENT_PROFILE = "cold-index-no-inspect-v1"
 CSV_FIELDS: tuple[str, ...] = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
     "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
     "callgraph_first_query_ms", "callgraph_resolution_share_pct", "callgraph_resolution_ms", "search_superseded", "search_failed", "search_suspended",
     "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
-    "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps",
+    "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
 )
 TEXT_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt",
@@ -231,7 +232,7 @@ PHASE_TRACE_FIELDS = ("elapsed_ms", "rss_kb", "hwm_kb", "callgraph_stage", "sear
 TRACKED_PLANES = ("callgraph", "search", "tier2")
 INDEX_EVENT_MARKER = "index_event "
 INDEX_EVENT_FIELD_RE = re.compile(r"([a-z_]+)=(\S+)")
-LOG_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z")
+LOG_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z")
 
 
 def index_event_fields(line: str) -> dict[str, str] | None:
@@ -303,17 +304,16 @@ class PhaseSample:
 
 
 def log_seconds(line: str) -> float | None:
-    """Wall clock of a log line, estimated at the middle of the second it stamps.
+    """Wall clock of a log line, retaining fractional seconds when available.
 
-    The log stamps whole seconds, so a line written at any point inside second
-    N reads as N. Taking the middle rather than the edge keeps the error
-    symmetric and never worse than half a second.
+    Older logs stamp whole seconds. Taking their midpoint keeps the rounding
+    error symmetric instead of charging every boundary to the earlier phase.
     """
     stamp = LOG_TIMESTAMP_RE.match(line)
     if not stamp:
         return None
     parsed = datetime.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-    return parsed.timestamp() + 0.5
+    return parsed.timestamp() + (float(stamp.group(2)) if stamp.group(2) else 0.5)
 
 
 @dataclass
@@ -754,6 +754,7 @@ def close_after_final_sample(sampler: ProcessSampler | None, client: NdjsonClien
 
 def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_seconds: float) -> dict[str, str]:
     row = empty_row(root.name, root)
+    row["measurement_profile"] = MEASUREMENT_PROFILE
     row["semantic"] = "disabled (matrix policy; no embedding backend)"
     if not root.is_dir():
         row.update({"git": "n/a", "files": "n/a", "top_languages": "n/a", "outcome": "missing", "gaps": "repository path absent"})
@@ -780,7 +781,12 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         sampler.start()
         phases = PhaseSampler(client.proc, storage)
         phases.start()
-        config_doc = json.dumps({"indexes": {"trigram": True, "callgraph": True, "semantic": False}})
+        # Inspect warms its own scanners in the same process. Their scheduling
+        # and allocator retention must not become part of a cold-index budget.
+        config_doc = json.dumps({
+            "indexes": {"trigram": True, "callgraph": True, "semantic": False},
+            "inspect": {"enabled": False},
+        })
         configured = client.request(
             "configure",
             timeout_s=max(0.1, min(30.0, deadline - time.monotonic())),
