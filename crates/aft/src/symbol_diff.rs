@@ -402,6 +402,7 @@ fn git_name_status(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Option<Ve
     }
     let range = format!("{base_sha}..{tip_sha}");
     let output = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -479,6 +480,7 @@ fn read_git_blob(repo_root: &Path, sha: &str, path_bytes: &[u8]) -> Option<Vec<u
     }
     let object = git_object_spec(sha, path_bytes);
     let output = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(repo_root)
         .args(["-c", "core.quotepath=false", "show", "--no-textconv"])

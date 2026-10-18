@@ -1558,6 +1558,7 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
     #[cfg(test)]
     ctx.record_worktree_bridge_probe_spawn_for_test();
     let output = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(project_root)
         .args([
@@ -7539,6 +7540,7 @@ thread_local! {
 
 fn view_git_changed_paths(root: &Path, max_examined: usize) -> Result<BTreeSet<Vec<u8>>, String> {
     let child = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(root)
         .args([

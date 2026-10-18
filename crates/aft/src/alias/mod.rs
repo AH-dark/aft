@@ -785,6 +785,7 @@ pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasErro
         });
     }
     let output = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(repo_root)
         .args(["ls-tree", "-r", "-z", "HEAD"])
@@ -920,6 +921,7 @@ fn git_filter_attributes(
     let started_at = Instant::now();
     let output = run_command_with_input(
         crate::effective_path::new_command("git")
+            .build()
             .arg("-C")
             .arg(repo_root)
             .args(["check-attr", "--cached", "-z", "--stdin", "filter"]),

@@ -597,6 +597,7 @@ fn git_paths(root: &Path, args: &[&str]) -> Option<HashSet<String>> {
         return None;
     }
     let mut child = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(root)
         .args(args)

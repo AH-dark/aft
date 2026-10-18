@@ -1299,12 +1299,13 @@ impl CompletedRustCheck {
             .get("CARGO")
             .map(String::as_str)
             .unwrap_or("cargo");
-        let mut command = crate::effective_path::new_command(binary);
+        let mut command = crate::effective_path::new_command(binary)
+            .envs(&self.runtime.env)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .build();
         command
             .args(args)
             .current_dir(&self.root)
-            .envs(&self.runtime.env)
-            .env("GIT_OPTIONAL_LOCKS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

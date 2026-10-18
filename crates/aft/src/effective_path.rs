@@ -116,42 +116,113 @@ pub fn log_startup_probe_result() {
     }
 }
 
-/// Create a new `Command` with the effective PATH set on Unix.
+/// Configure the child environment before resolving its executable with [`CommandBuilder::build`].
 #[cfg(unix)]
-pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
+pub fn new_command<S: AsRef<OsStr>>(program: S) -> CommandBuilder {
     command_with_path(program.as_ref(), effective_path())
 }
 
 #[cfg(unix)]
-fn command_with_path(program: &OsStr, path: &OsStr) -> std::process::Command {
+fn command_with_path(program: &OsStr, path: &OsStr) -> CommandBuilder {
+    let mut builder = CommandBuilder::new(program);
     // Startup exports the effective PATH before threads start. Reapplying even
     // the same value marks PATH as changed in Rust's Command and disables
     // posix_spawn for bare executable names, forcing a costly daemon fork.
-    if std::env::var_os("PATH").as_deref() == Some(path) {
-        return std::process::Command::new(program);
+    if std::env::var_os("PATH").as_deref() != Some(path) {
+        builder.env("PATH", path);
     }
-    // The process PATH can still differ: library callers that never
-    // initialized it, or a daemon started from an AFT-governed shell, whose
-    // startup removes the outer gh-shim directory from the process PATH after
-    // the effective PATH was computed. The child must keep the effective PATH
-    // for its environment and for the executable lookup. std only does that
-    // lookup itself on the fork+exec path (execvp after installing the new
-    // environment), so resolve the bare name here, against the same PATH, and
-    // spawn the absolute path. argv[0] keeps the bare name, as execvp would.
-    // This preflight can skip deterministic script-interpreter failures before
-    // constructing a posix_spawn command. A race or another failure after the
-    // check still comes back from spawn: retrying then would require a custom
-    // spawn API for every caller of this Command-returning helper.
-    let mut cmd = match resolve_in_path(program, path) {
-        Some(resolved) => {
-            let mut cmd = std::process::Command::new(resolved);
-            cmd.arg0(program);
-            cmd
+    builder
+}
+
+/// The environment-only construction phase of a child command.
+///
+/// Apply all environment overrides here, then call [`Self::build`] before
+/// configuring arguments, working directory, I/O, or process-group settings.
+/// Resolving sooner would ignore a configured PATH that selects another tool.
+pub struct CommandBuilder {
+    environment: std::process::Command,
+    clear_environment: bool,
+}
+
+impl CommandBuilder {
+    fn new(program: &OsStr) -> Self {
+        Self {
+            environment: std::process::Command::new(program),
+            clear_environment: false,
         }
-        None => std::process::Command::new(program),
-    };
-    cmd.env("PATH", path);
-    cmd
+    }
+
+    pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, value: V) -> &mut Self {
+        self.environment.env(key, value);
+        self
+    }
+
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.environment.envs(vars);
+        self
+    }
+
+    pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+        self.environment.env_remove(key);
+        self
+    }
+
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.environment.env_clear();
+        self.clear_environment = true;
+        self
+    }
+
+    /// Finish environment configuration and resolve against the final child PATH.
+    /// Only non-environment command settings should be applied after this point.
+    pub fn build(&self) -> std::process::Command {
+        let program = self.environment.get_program();
+        // An absolute executable lets std use posix_spawn even with a changed
+        // PATH; a bare name would require fork+exec to search the child PATH.
+        #[cfg(unix)]
+        let resolved = self
+            .environment
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, path)| path)
+            .and_then(|path| resolve_in_path(program, path));
+        #[cfg(unix)]
+        let mut command = match resolved {
+            Some(resolved) => {
+                let mut command = std::process::Command::new(resolved);
+                command.arg0(program);
+                command
+            }
+            // Inherited PATH needs no pre-resolution. A removed PATH must use
+            // execvp's platform default, not AFT's effective PATH. Relative or
+            // empty entries likewise need lookup in the child's working directory.
+            None => std::process::Command::new(program),
+        };
+        #[cfg(not(unix))]
+        let mut command = std::process::Command::new(program);
+        if self.clear_environment {
+            command.env_clear();
+        }
+        for (key, value) in self.environment.get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command
+    }
+
+    /// Leave lookup to execvp when a mandatory pre_exec hook requires fork anyway.
+    /// The returned command may still receive environment changes before spawning.
+    #[cfg(unix)]
+    pub(crate) fn build_unresolved(self) -> std::process::Command {
+        self.environment
+    }
 }
 
 /// Find `program` in `path`, skipping executable scripts whose interpreter is
@@ -237,8 +308,8 @@ fn script_interpreter_is_available(script: &Path) -> bool {
 /// On Windows the process PATH is already correct (registry-backed
 /// environment block); pass through without touching the child env.
 #[cfg(not(unix))]
-pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
-    std::process::Command::new(program)
+pub fn new_command<S: AsRef<OsStr>>(program: S) -> CommandBuilder {
+    CommandBuilder::new(program.as_ref())
 }
 
 /// Return the cached PATH that subprocesses should inherit.
@@ -919,7 +990,7 @@ mod tests {
     #[test]
     fn helpers_do_not_override_inherited_path() {
         let path = std::env::var_os("PATH").unwrap();
-        let command = super::command_with_path(std::ffi::OsStr::new("git"), &path);
+        let command = super::command_with_path(std::ffi::OsStr::new("git"), &path).build();
         assert!(
             !command.get_envs().any(|(key, _)| key == "PATH"),
             "an explicit PATH, even unchanged, forces Rust's macOS Command to fork"
@@ -929,10 +1000,104 @@ mod tests {
     #[test]
     fn helpers_preserve_distinct_effective_path() {
         let path = std::ffi::OsStr::new("/aft-test-distinct-path");
-        let command = super::command_with_path(std::ffi::OsStr::new("git"), path);
+        let command = super::command_with_path(std::ffi::OsStr::new("git"), path).build();
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "PATH" && value == Some(path)));
+    }
+
+    #[test]
+    fn path_set_after_construction_selects_the_child_cargo() {
+        let effective_tools = tempfile::tempdir().unwrap();
+        let child_tools = tempfile::tempdir().unwrap();
+        write_executable_shim(
+            &effective_tools.path().join("cargo"),
+            "#!/bin/sh\nprintf 'effective-path cargo'\n",
+        );
+        write_executable_shim(
+            &child_tools.path().join("cargo"),
+            "#!/bin/sh\nprintf 'configured cargo:%s' \"$PATH\"\n",
+        );
+        let mut command =
+            command_with_path(OsStr::new("cargo"), effective_tools.path().as_os_str());
+        command.env("PATH", child_tools.path());
+
+        let (output, forks) = fork_counter::forks_during(|| command.build().output().unwrap());
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("configured cargo:{}", child_tools.path().display())
+        );
+        assert_eq!(forks, 0, "configured PATH forced a fork+exec spawn");
+    }
+
+    #[test]
+    fn path_removed_after_construction_uses_execvp_default() {
+        let tools = tempfile::tempdir().unwrap();
+        write_executable_shim(
+            &tools.path().join("sh"),
+            "#!/bin/sh\nprintf 'effective-path shell'\n",
+        );
+        let mut command = command_with_path(OsStr::new("sh"), tools.path().as_os_str());
+        command.env_remove("PATH");
+
+        let output = command
+            .build()
+            .args(["-c", "printf 'default-path shell'"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "default-path shell"
+        );
+    }
+
+    #[test]
+    fn environment_cleared_after_construction_uses_execvp_default() {
+        let tools = tempfile::tempdir().unwrap();
+        write_executable_shim(
+            &tools.path().join("sh"),
+            "#!/bin/sh\nprintf 'effective-path shell'\n",
+        );
+        let mut command = command_with_path(OsStr::new("sh"), tools.path().as_os_str());
+        command.env_clear();
+
+        let output = command
+            .build()
+            .args(["-c", "printf 'default-path shell'"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "default-path shell"
+        );
+    }
+
+    #[test]
+    fn configured_relative_path_uses_the_child_working_directory() {
+        let effective_tools = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        fs::create_dir(workdir.path().join("bin")).unwrap();
+        write_executable_shim(
+            &effective_tools.path().join("cargo"),
+            "#!/bin/sh\nprintf 'effective-path cargo'\n",
+        );
+        write_executable_shim(
+            &workdir.path().join("bin/cargo"),
+            "#!/bin/sh\nprintf 'relative-path cargo'\n",
+        );
+        for path in ["bin", ":bin", "bin:"] {
+            let output = command_with_path(OsStr::new("cargo"), effective_tools.path().as_os_str())
+                .env("PATH", path)
+                .build()
+                .current_dir(workdir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{path}: {output:?}");
+            assert_eq!(output.stdout, b"relative-path cargo", "{path}");
+        }
     }
 
     /// A PATH that differs from the process PATH must not push bare-name
@@ -950,7 +1115,7 @@ mod tests {
 
         let workdir = tempfile::tempdir().unwrap();
         let (output, forks) = fork_counter::forks_during(|| {
-            let mut command = command_with_path(OsStr::new("aft-path-probe-tool"), &path);
+            let mut command = command_with_path(OsStr::new("aft-path-probe-tool"), &path).build();
             command.current_dir(workdir.path()).output().unwrap()
         });
         assert!(output.status.success(), "{output:?}");
@@ -1018,6 +1183,7 @@ mod tests {
         assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
 
         let output = command_with_path(OsStr::new(name), &path)
+            .build()
             .output()
             .expect("run the later executable after the broken script");
         assert!(output.status.success(), "{output:?}");
@@ -1042,6 +1208,7 @@ mod tests {
         assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
 
         let output = command_with_path(OsStr::new(name), &path)
+            .build()
             .output()
             .expect("the first candidate's env interpreter can start");
         let shell_output = std::process::Command::new("/bin/sh")

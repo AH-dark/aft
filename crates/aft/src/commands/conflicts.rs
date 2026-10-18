@@ -32,6 +32,7 @@ fn git_toplevel(base_path: &Path) -> Result<PathBuf, String> {
         return Err(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
     }
     let output = crate::effective_path::new_command("git")
+        .build()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(working_dir)
         .output()
@@ -84,6 +85,7 @@ fn discover_conflicted_files(
     let mut unmerged_files = HashSet::new();
 
     let output = crate::effective_path::new_command("git")
+        .build()
         .args(["ls-files", "--unmerged", "-z"])
         .current_dir(&toplevel)
         .output()
@@ -110,6 +112,7 @@ fn discover_conflicted_files(
 
     let mut sweep_error = None;
     match crate::effective_path::new_command("git")
+        .build()
         .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
         .current_dir(&toplevel)
         .output()
@@ -560,12 +563,14 @@ line 6"#;
         .expect("write conflicted file");
 
         let init = crate::effective_path::new_command("git")
+            .build()
             .args(["init", "--quiet"])
             .current_dir(&repo)
             .status()
             .expect("run git init");
         assert!(init.success(), "git init failed: {init}");
         let add = crate::effective_path::new_command("git")
+            .build()
             .args(["add", "conflicted.txt"])
             .current_dir(&repo)
             .status()

@@ -7663,6 +7663,7 @@ fn git_root_commit_once_real(
     });
     let output = match time_cache_key_work(&mut timings.rev_list, || {
         crate::effective_path::new_command("git")
+            .build()
             .arg("-C")
             .arg(project_root)
             .args(["rev-list", "--max-parents=0", "HEAD"])
@@ -8529,6 +8530,7 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let mut child = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -8592,6 +8594,7 @@ fn read_git_diff(
     }
     let diff_range = format!("{}..{}", from, to);
     let output = match crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(root)
         .args([

@@ -166,7 +166,7 @@ fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, Format
         });
     }
 
-    let mut cmd = crate::effective_path::new_command(command);
+    let mut cmd = crate::effective_path::new_command(command).build();
     cmd.args(args);
     Ok(cmd)
 }
