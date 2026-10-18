@@ -4959,9 +4959,10 @@ mod watcher_filter_tests {
         }
 
         assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                10
-            ),),
+            aft::callgraph_store::wait_for_process_callgraph_refresh_for_test(
+                &root,
+                Duration::from_secs(10)
+            ),
             "oversized callgraph refresh should finish"
         );
         assert_eq!(
