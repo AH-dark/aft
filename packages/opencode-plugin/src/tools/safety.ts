@@ -11,7 +11,6 @@ import {
   permissionDeniedResponse,
   resolveAbsolutePath,
   resolveRelativePatternFromAbsolute,
-  workspacePattern,
 } from "./permissions.js";
 
 const z = tool.schema;
@@ -157,9 +156,11 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             if (denial) return permissionDeniedResponse(denial);
           }
 
-          const permissionError = await askEditPermission(context, [workspacePattern(context)], {
-            checkpoint: args.name,
-          });
+          const permissionError = await askEditPermission(
+            context,
+            relativePatternsFromPaths(context, Array.from(new Set(responsePaths(preview)))),
+            { checkpoint: args.name },
+          );
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
 

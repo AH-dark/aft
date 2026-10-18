@@ -237,7 +237,9 @@ export async function askEditPermission(
     return undefined;
   } catch (error) {
     const failure = classifyPermissionError(error, "Permission denied.");
-    return failure.kind === "rule_denied" ? permissionRuleDenial("edit") : failure.message;
+    return failure.kind === "rule_denied"
+      ? `${permissionRuleDenial("edit")}: ${failure.message}`
+      : failure.message;
   }
 }
 

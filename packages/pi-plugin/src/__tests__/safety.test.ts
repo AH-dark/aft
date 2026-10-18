@@ -5,8 +5,15 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 import { registerSafetyTool } from "../tools/safety.js";
-import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
+import {
+  executeTool,
+  makeExtContext,
+  makeMockApi,
+  makeMockBridge,
+  makePluginContext,
+} from "./tool-test-utils.js";
 
 describe("aft_safety adapter", () => {
   test("checkpoint forwards agent-facing filePath so server translation promotes it", async () => {
@@ -112,5 +119,53 @@ describe("aft_safety adapter", () => {
         },
       },
     });
+  });
+
+  for (const restrictToProjectRoot of [true, false]) {
+    test(`restore checks every preview path with restriction ${restrictToProjectRoot}`, async () => {
+      const { api, tools } = makeMockApi();
+      const externalFile = resolve(process.cwd(), "../outside/secrets/x");
+      const { bridge, calls } = makeMockBridge((command) =>
+        command === "checkpoint_paths"
+          ? { success: true, paths: [resolve("public.txt"), externalFile] }
+          : { success: true, text: "checkpoint restored" },
+      );
+      registerSafetyTool(
+        api,
+        makePluginContext(bridge, { config: { restrict_to_project_root: restrictToProjectRoot } }),
+      );
+      const restore = executeTool(
+        tools.get("aft_safety")!,
+        { op: "restore", name: "mixed" },
+        makeExtContext(),
+      );
+      if (restrictToProjectRoot) {
+        await expect(restore).rejects.toThrow(`'${externalFile}' is outside the project root`);
+        expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths"]);
+      } else {
+        await restore;
+        expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "tool_call"]);
+      }
+      expect(calls[0].params).toMatchObject({ name: "mixed" });
+    });
+  }
+
+  test("restore permits all in-project preview paths without UI even under restriction", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) =>
+      command === "checkpoint_paths"
+        ? { success: true, paths: [resolve("public.txt"), resolve("secrets/x")] }
+        : { success: true, text: "checkpoint restored" },
+    );
+    registerSafetyTool(
+      api,
+      makePluginContext(bridge, { config: { restrict_to_project_root: true } }),
+    );
+    await executeTool(
+      tools.get("aft_safety")!,
+      { op: "restore", name: "internal" },
+      makeExtContext(),
+    );
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "tool_call"]);
   });
 });
