@@ -2,7 +2,7 @@ use super::{executing_image, resolve_real_gh, RefusalCode};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,46 @@ const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
 const MAX_DISPLAY_PATHS: usize = 5;
 const PUBLISHED_MESSAGE: &str = "{repo} publishes {count} item(s) other repositories can reference by name ({paths}). GitHub does not redirect those references after a rename, so workflows that use them would break. To rename anyway, re-run with GH_SHIM_RENAME_PUBLISHED=allow.";
 const UNVERIFIED_MESSAGE: &str = "could not check whether {repo} publishes reusable workflows or actions ({reason}). A rename would silently break any workflow that references them. To rename anyway, re-run with GH_SHIM_RENAME_PUBLISHED=allow.";
+
+#[cfg(test)]
+pub(super) type TestPreflightRunner = fn(&[String]) -> Result<String, String>;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PREFLIGHT_RUNNER: std::cell::Cell<Option<TestPreflightRunner>> = const { std::cell::Cell::new(None) };
+    static TEST_PREFLIGHT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct TestPreflightScope {
+    previous_runner: Option<TestPreflightRunner>,
+    previous_calls: usize,
+}
+
+#[cfg(test)]
+impl Drop for TestPreflightScope {
+    fn drop(&mut self) {
+        TEST_PREFLIGHT_RUNNER.with(|runner| runner.set(self.previous_runner));
+        TEST_PREFLIGHT_CALLS.with(|calls| calls.set(self.previous_calls));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn with_test_preflight_runner<T>(
+    runner: TestPreflightRunner,
+    f: impl FnOnce() -> T,
+) -> (T, usize) {
+    let previous_runner = TEST_PREFLIGHT_RUNNER.with(|slot| slot.replace(Some(runner)));
+    let previous_calls = TEST_PREFLIGHT_CALLS.with(|calls| calls.replace(0));
+    let scope = TestPreflightScope {
+        previous_runner,
+        previous_calls,
+    };
+    let result = f();
+    let calls = TEST_PREFLIGHT_CALLS.with(std::cell::Cell::get);
+    drop(scope);
+    (result, calls)
+}
 
 pub(super) struct RenameCheck {
     pub repository: Option<String>,
@@ -31,7 +71,7 @@ pub(super) fn check(
     let mut repo = repository.unwrap_or("the current repository").to_string();
     let mut audit_repository = repository.map(str::to_owned);
     let result = (|| {
-        let real_gh = resolve_real_gh(&executing_image()).ok_or("real gh was not found")?;
+        let real_gh = resolve_preflight_gh().ok_or("real gh was not found")?;
         // Let gh select the current repository (including GH_REPO and remote
         // selection), rather than guessing from a local branch or origin.
         let mut view = vec!["repo".to_string(), "view".to_string()];
@@ -39,9 +79,13 @@ pub(super) fn check(
             view.push(explicit);
         }
         view.extend(["--json".into(), "nameWithOwner,defaultBranchRef,url".into()]);
-        let metadata: Value =
-            serde_json::from_str(&read_gh(&real_gh, &view, deadline, MAX_WORKFLOW_BYTES)?)
-                .map_err(|e| format!("invalid repository metadata: {e}"))?;
+        let metadata: Value = serde_json::from_str(&read_preflight_gh(
+            &real_gh,
+            &view,
+            deadline,
+            MAX_WORKFLOW_BYTES,
+        )?)
+        .map_err(|e| format!("invalid repository metadata: {e}"))?;
         repo = metadata["nameWithOwner"]
             .as_str()
             .filter(|name| valid_repo(name))
@@ -61,7 +105,7 @@ pub(super) fn check(
             .as_str()
             .filter(|branch| !branch.is_empty())
             .ok_or("repository has no default branch")?;
-        let tree: Value = serde_json::from_str(&read_gh(
+        let tree: Value = serde_json::from_str(&read_preflight_gh(
             &real_gh,
             &[
                 "api".into(),
@@ -75,7 +119,7 @@ pub(super) fn check(
         .map_err(|e| format!("invalid recursive tree: {e}"))?;
         let (mut published, workflows) = tree_candidates(&tree)?;
         for (path, sha) in workflows {
-            let yaml = read_gh(
+            let yaml = read_preflight_gh(
                 &real_gh,
                 &[
                     "api".into(),
@@ -235,6 +279,28 @@ fn ensure_time(deadline: Instant) -> Result<(), String> {
     }
 }
 
+fn resolve_preflight_gh() -> Option<PathBuf> {
+    #[cfg(test)]
+    if TEST_PREFLIGHT_RUNNER.with(std::cell::Cell::get).is_some() {
+        return Some(PathBuf::new());
+    }
+    resolve_real_gh(&executing_image())
+}
+
+fn read_preflight_gh(
+    real_gh: &Path,
+    args: &[String],
+    deadline: Instant,
+    cap: u64,
+) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(runner) = TEST_PREFLIGHT_RUNNER.with(std::cell::Cell::get) {
+        TEST_PREFLIGHT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        return runner(args);
+    }
+    read_gh(real_gh, args, deadline, cap)
+}
+
 fn read_gh(real_gh: &Path, args: &[String], deadline: Instant, cap: u64) -> Result<String, String> {
     ensure_time(deadline)?;
     let mut command = Command::new(real_gh);
@@ -302,11 +368,7 @@ fn read_gh(real_gh: &Path, args: &[String], deadline: Instant, cap: u64) -> Resu
     if result.is_err() {
         // A child or descendant may still hold a pipe open after gh exits.
         // Never join those readers past the shared preflight deadline.
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
-        let _ = child.kill();
+        crate::format::kill_process_tree(&mut child);
         let _ = child.wait();
     }
     result
@@ -445,6 +507,104 @@ mod tests {
             8,
         );
         assert!(result.unwrap_err().contains("capture limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_a_grandchild_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("grandchild.pid");
+        let script = "sleep 30 & echo $! > \"$1\"; wait";
+        let start = Instant::now();
+        let result = read_gh(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                script.into(),
+                "rename-guard-test".into(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            start + Duration::from_millis(100),
+            1024,
+        );
+        assert!(result.unwrap_err().contains("deadline"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_is_alive(pid),
+            "grandchild process {pid} survived timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            #[cfg(target_os = "linux")]
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                return stat
+                    .rsplit_once(')')
+                    .and_then(|(_, fields)| fields.trim_start().chars().next())
+                    != Some('Z');
+            }
+            true
+        } else {
+            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timeout_kills_a_grandchild_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("grandchild.pid");
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
+        let script = format!(
+            "$child = Start-Process -FilePath {} -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath {} -Value $child.Id; Start-Sleep -Seconds 30",
+            quote(&powershell),
+            quote(&pid_file),
+        );
+        let start = Instant::now();
+        let result = read_gh(
+            &powershell,
+            &[
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script,
+            ],
+            start + Duration::from_secs(5),
+            1024,
+        );
+        assert!(result.unwrap_err().contains("deadline"));
+        assert!(start.elapsed() < Duration::from_secs(10));
+
+        let pid: u32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let query = format!(
+            "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
+        );
+        let status = Command::new(&powershell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "grandchild process {pid} survived timeout"
+        );
     }
 
     #[test]
