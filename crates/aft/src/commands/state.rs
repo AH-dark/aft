@@ -474,7 +474,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u02_state_private_mode_survives_restrictive_umask() {
+    fn state_private_mode_survives_restrictive_umask() {
         use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "AFT_TEST_STATE_PRIVATE_UMASK";
         if std::env::var_os(CHILD).is_some() {
@@ -493,7 +493,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "commands::state::tests::u02_state_private_mode_survives_restrictive_umask",
+                "commands::state::tests::state_private_mode_survives_restrictive_umask",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn u02_state_publication_refuses_a_colliding_temporary() {
+    fn state_publication_refuses_a_colliding_temporary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         fs::write(&path, "old").unwrap();
@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn u02_state_publication_syncs_required_file_and_directory() {
+    fn state_publication_syncs_required_file_and_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         fs::write(&path, "old").unwrap();
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn u02_state_failed_replace_cleans_owned_temporary() {
+    fn state_failed_replace_cleans_owned_temporary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         fs::create_dir(&path).unwrap();

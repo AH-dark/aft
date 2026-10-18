@@ -278,7 +278,7 @@ fn write_atomic_to_temp(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn u02_jsonc_collision_preserves_temporary_and_destination() {
+    fn jsonc_collision_preserves_temporary_and_destination() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.jsonc");
         let temp = dir.path().join("occupied.tmp");
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn u02_jsonc_failed_replace_cleans_owned_temporary() {
+    fn jsonc_failed_replace_cleans_owned_temporary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("destination");
         let temp = dir.path().join("owned.tmp");
@@ -303,7 +303,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u02_jsonc_new_config_is_private_under_permissive_umask() {
+    fn jsonc_new_config_is_private_under_permissive_umask() {
         use std::os::unix::fs::PermissionsExt;
 
         const CHILD: &str = "AFT_TEST_JSONC_PRIVATE_CHILD";
@@ -329,7 +329,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "jsonc_edit::tests::u02_jsonc_new_config_is_private_under_permissive_umask",
+                "jsonc_edit::tests::jsonc_new_config_is_private_under_permissive_umask",
                 "--nocapture",
             ])
             .env(CHILD, "1")

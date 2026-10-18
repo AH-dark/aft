@@ -7362,7 +7362,7 @@ mod v19_tests;
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
     #[test]
-    fn u02_empty_home_uses_userprofile_for_config_and_parent_exclusion() {
+    fn empty_home_uses_userprofile_for_config_and_parent_exclusion() {
         const CHILD: &str = "AFT_TEST_EMPTY_HOME_PROFILE";
         if let Some(profile) = std::env::var_os(CHILD).map(PathBuf::from) {
             let config_path = profile.join(".config/cortexkit/aft.jsonc");
@@ -7396,7 +7396,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "gh_shim::tests::u02_empty_home_uses_userprofile_for_config_and_parent_exclusion",
+                "gh_shim::tests::empty_home_uses_userprofile_for_config_and_parent_exclusion",
                 "--nocapture",
             ])
             .env(CHILD, &profile)
