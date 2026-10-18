@@ -690,6 +690,7 @@ pub fn prepare_checkout_deferring(
         } else {
             None
         };
+        timing.phase("sibling_seed");
         let base = base.or_else(|| {
             sibling
                 .as_ref()
@@ -728,6 +729,7 @@ pub fn prepare_checkout_deferring(
             }
         }
         prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
+        timing.phase("derived_clone");
         prepared.profile.io.enter(super::io::Phase::Materialize);
         let materialization_started = Instant::now();
         let mut patched = false;
@@ -810,6 +812,7 @@ pub fn prepare_checkout_deferring(
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
         }
         prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
+        timing.phase("derived_materialization");
     }
     prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
@@ -857,6 +860,7 @@ pub fn prepare_checkout_deferring(
         )?
     };
     prepared.profile.closure_ms = closure_started.elapsed().as_millis();
+    timing.phase("publication_closure");
     prepared.profile.derived_bytes = fs::metadata(&derived)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
