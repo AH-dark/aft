@@ -7,8 +7,9 @@
 //! so a move whose source and destination folders can differ in volume goes
 //! through [`move_path`], which falls back to a copy that is published by a
 //! same-folder, no-replace rename in the destination and only then removes the
-//! source. Filesystems without no-replace support use an atomic hard link for
-//! regular files and a non-atomic existence check before renaming directories.
+//! source. Filesystems without no-replace support prefer an atomic hard link
+//! for regular files. Directories, and files where hard links are unsupported,
+//! use a non-atomic existence check before renaming.
 //!
 //! [`rename`] also refuses to replace an existing destination. Tests make it
 //! report the cross-device error for folders registered with
@@ -44,8 +45,9 @@ fn cross_device_error() -> io::Error {
 }
 
 /// Rename without replacing a destination, including an empty directory.
-/// When the filesystem lacks no-replace support, directory publication falls
-/// back to a non-atomic existence check and rename, with a process-wide warning.
+/// When the filesystem lacks no-replace support, directories and files without
+/// hard-link support use a non-atomic existence check and rename. Each fallback
+/// reason produces one process-wide warning.
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(error) = publish_no_replace(from, to)? {
         Moved::PublishedWithWarning(error).warn_if_incomplete(from, to);
@@ -117,32 +119,20 @@ fn rename_or_fallback(
         Err(error) if no_replace_unsupported(&error) => {
             let metadata = fs::symlink_metadata(from)?;
             if metadata.is_dir() {
-                // Some external/network filesystems cannot enforce no-replace.
-                // Preserve directory retirement there with the old rename
-                // behavior, but check first. Another process can still create
-                // an empty destination between this check and the rename; this
-                // race is confined to filesystems without the native flag.
-                static WARN: std::sync::Once = std::sync::Once::new();
-                WARN.call_once(|| {
-                    crate::slog_warn!(
-                        "atomic no-replace rename is unavailable at {}; directory moves use a non-atomic existence check and can race with destination creation",
-                        to.display()
-                    );
-                });
-                match fs::symlink_metadata(to) {
-                    Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-                fs::rename(from, to)?;
-                return Ok(None);
+                return checked_rename(from, to, CheckedRenameReason::DirectoryWithoutNoReplace);
             }
             // Hard links still publish regular files atomically when native
             // no-replace flags are unavailable. Other entry types are refused.
             if !metadata.is_file() {
                 return Err(error);
             }
-            fs::hard_link(from, to)?;
+            match hard_link_for_publication(from, to) {
+                Ok(()) => {}
+                Err(error) if hard_link_unsupported(&error) => {
+                    return checked_rename(from, to, CheckedRenameReason::FileWithoutHardLinks);
+                }
+                Err(error) => return Err(error),
+            }
             Ok(fs::remove_file(from).err().map(|error| {
                 io::Error::new(
                     error.kind(),
@@ -155,6 +145,71 @@ fn rename_or_fallback(
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum CheckedRenameReason {
+    DirectoryWithoutNoReplace,
+    FileWithoutHardLinks,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn checked_rename(
+    from: &Path,
+    to: &Path,
+    reason: CheckedRenameReason,
+) -> io::Result<Option<io::Error>> {
+    // Some external/network filesystems support neither native no-replace nor
+    // hard links. Preserve moves there with the old rename behavior, but check
+    // first. Another process can still create a destination between this check
+    // and rename, and that destination can be replaced. The race is confined
+    // to filesystems where atomic publication is unavailable for this entry.
+    static DIRECTORY_WARN: std::sync::Once = std::sync::Once::new();
+    static FILE_WARN: std::sync::Once = std::sync::Once::new();
+    let (warning, reason) = match reason {
+        CheckedRenameReason::DirectoryWithoutNoReplace => (
+            &DIRECTORY_WARN,
+            "atomic no-replace rename is unavailable for directories",
+        ),
+        CheckedRenameReason::FileWithoutHardLinks => (
+            &FILE_WARN,
+            "atomic no-replace rename and hard links are unavailable for files",
+        ),
+    };
+    warning.call_once(|| {
+        crate::slog_warn!(
+            "{reason} at {}; using a non-atomic existence check before rename, which can race with destination creation",
+            to.display()
+        );
+    });
+    match fs::symlink_metadata(to) {
+        Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(from, to).map(|()| None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hard_link_unsupported(error: &io::Error) -> bool {
+    // macOS msdos/exFAT reports EPERM for unsupported hard links. A link-count
+    // limit (EMLINK) or another permission/I/O failure must remain a refusal.
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM) {
+        return true;
+    }
+    error
+        .raw_os_error()
+        .is_some_and(|errno| errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hard_link_for_publication(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = UNSUPPORTED_LINK.with(|slot| slot.take()) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    fs::hard_link(from, to)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -304,8 +359,8 @@ impl From<io::Error> for MoveError {
 /// The source is authoritative unless [`MoveError::AlreadyPublished`]
 /// identifies a destination won by another mover. That outcome never removes
 /// the source and carries any staging-cleanup warning for the caller to report.
-/// Directory moves on filesystems without native no-replace support instead
-/// use the checked, non-atomic fallback described by [`rename`].
+/// Directories and linkless files on filesystems without native no-replace
+/// support use the checked, non-atomic fallback described by [`rename`].
 /// Once published, directory sync or source removal failures return
 /// [`Moved::PublishedWithWarning`]: callers must report the warning and use `to`.
 pub(crate) fn move_path(from: &Path, to: &Path) -> Result<Moved, MoveError> {
@@ -495,6 +550,8 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 thread_local! {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     static UNSUPPORTED_RENAME: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static UNSUPPORTED_LINK: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const {
         std::cell::RefCell::new(None)
     };
@@ -549,17 +606,55 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unsupported_flag_file_fallback_moves_without_replacing_an_existing_destination() {
-        unsupported_flag_fallback(false);
+        unsupported_flag_fallback(false, None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unsupported_flag_directory_fallback_moves_without_replacing_an_existing_destination() {
-        unsupported_flag_fallback(true);
+        unsupported_flag_fallback(true, None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn unsupported_flag_fallback(directory: bool) {
+    #[test]
+    fn linkless_file_fallback_moves_without_replacing_an_existing_destination() {
+        #[cfg(target_os = "linux")]
+        let errors = [libc::ENOTSUP, libc::EOPNOTSUPP];
+        #[cfg(target_os = "macos")]
+        let errors = [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EPERM];
+        for errno in errors {
+            unsupported_flag_fallback(false, Some(errno));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn link_limit_and_permission_errors_do_not_use_checked_rename() {
+        #[cfg(target_os = "linux")]
+        let errors = [libc::EMLINK, libc::EACCES, libc::EPERM];
+        #[cfg(target_os = "macos")]
+        let errors = [libc::EMLINK, libc::EACCES];
+        for errno in errors {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            fs::write(&source, b"old").unwrap();
+            UNSUPPORTED_RENAME.with(|slot| slot.set(Some(libc::ENOTSUP)));
+            UNSUPPORTED_LINK.with(|slot| slot.set(Some(errno)));
+            let result = move_path(&source, &destination);
+            assert!(UNSUPPORTED_RENAME.with(|slot| slot.take()).is_none());
+            assert!(UNSUPPORTED_LINK.with(|slot| slot.take()).is_none());
+            assert!(
+                matches!(result, Err(MoveError::Failed(ref error)) if error.raw_os_error() == Some(errno)),
+                "{result:?}"
+            );
+            assert_eq!(fs::read(&source).unwrap(), b"old");
+            assert!(!destination.exists());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unsupported_flag_fallback(directory: bool, link_error: Option<i32>) {
         #[cfg(target_os = "linux")]
         let errors = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP];
         #[cfg(target_os = "macos")]
@@ -582,10 +677,15 @@ mod tests {
                 };
                 create_source();
                 UNSUPPORTED_RENAME.with(|slot| slot.set(Some(errno)));
+                UNSUPPORTED_LINK.with(|slot| slot.set(link_error));
                 let result = move_path(&source, &destination);
                 assert!(
                     UNSUPPORTED_RENAME.with(|slot| slot.take()).is_none(),
                     "the unsupported syscall seam must execute"
+                );
+                assert!(
+                    UNSUPPORTED_LINK.with(|slot| slot.take()).is_none(),
+                    "the injected link error must execute"
                 );
                 assert!(result.is_ok(), "fallback must move the source: {result:?}");
                 assert!(!source.exists());
@@ -607,10 +707,15 @@ mod tests {
                     fs::remove_file(&saved).unwrap();
                 }
                 UNSUPPORTED_RENAME.with(|slot| slot.set(Some(errno)));
+                UNSUPPORTED_LINK.with(|slot| slot.set(link_error));
                 let result = move_path(&source, &destination);
                 assert!(
                     UNSUPPORTED_RENAME.with(|slot| slot.take()).is_none(),
                     "the collision must reach the unsupported syscall seam"
+                );
+                assert!(
+                    UNSUPPORTED_LINK.with(|slot| slot.take()).is_none(),
+                    "the collision must reach the injected link error"
                 );
                 assert!(
                     matches!(
