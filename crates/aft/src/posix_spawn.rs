@@ -253,6 +253,119 @@ pub(crate) fn try_spawn(
     ))
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum NativeTestPlatform {
+    MacOs,
+    LinuxGnu,
+    Other,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum NativeTestDecision {
+    Run,
+    Skip(String),
+    Fail(String),
+}
+
+#[cfg(test)]
+fn native_test_decision(
+    platform: NativeTestPlatform,
+    glibc_version: Option<(u32, u32)>,
+    missing: Option<&str>,
+) -> NativeTestDecision {
+    match platform {
+        NativeTestPlatform::MacOs => match missing {
+            Some(reason) => NativeTestDecision::Fail(format!(
+                "macOS requires the native POSIX spawn backend, but it is unavailable: {reason}"
+            )),
+            None => NativeTestDecision::Run,
+        },
+        NativeTestPlatform::LinuxGnu => {
+            let Some(reason) = missing else {
+                return NativeTestDecision::Run;
+            };
+            let Some((capability, minimum)) = native_capability_minimum(reason) else {
+                return NativeTestDecision::Fail(format!(
+                    "glibc native POSIX spawn capability check failed unexpectedly: {reason}"
+                ));
+            };
+            let Some(version) = glibc_version else {
+                return NativeTestDecision::Fail(format!(
+                    "could not determine glibc version while checking {capability}: {reason}"
+                ));
+            };
+            if version < minimum {
+                NativeTestDecision::Skip(format!(
+                    "glibc {}.{} predates {capability} (requires {}.{}): {reason}",
+                    version.0, version.1, minimum.0, minimum.1
+                ))
+            } else {
+                NativeTestDecision::Fail(format!(
+                    "glibc {}.{} should provide {capability} (available since {}.{}), but the native backend is unavailable: {reason}",
+                    version.0, version.1, minimum.0, minimum.1
+                ))
+            }
+        }
+        NativeTestPlatform::Other => NativeTestDecision::Skip(
+            "native POSIX spawn tests require macOS or Linux with glibc".into(),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn native_capability_minimum(reason: &str) -> Option<(&'static str, (u32, u32))> {
+    if reason.contains("posix_spawn_file_actions_addclosefrom_np") {
+        Some(("posix_spawn_file_actions_addclosefrom_np", (2, 34)))
+    } else if reason.contains("posix_spawn_file_actions_addchdir_np") {
+        Some(("posix_spawn_file_actions_addchdir_np", (2, 29)))
+    } else if reason.contains("POSIX_SPAWN_SETSID") {
+        Some(("POSIX_SPAWN_SETSID", (2, 26)))
+    } else {
+        None
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+fn test_glibc_version() -> Option<(u32, u32)> {
+    let version = unsafe { CStr::from_ptr(libc::gnu_get_libc_version()) }
+        .to_str()
+        .ok()?;
+    let mut components = version.split('.');
+    Some((
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    ))
+}
+
+#[cfg(all(test, not(all(target_os = "linux", target_env = "gnu"))))]
+fn test_glibc_version() -> Option<(u32, u32)> {
+    None
+}
+
+/// Returns false only when native-only assertions do not apply on this libc.
+#[cfg(test)]
+pub(crate) fn native_backend_for_tests() -> bool {
+    initialize();
+    let platform = if cfg!(target_os = "macos") {
+        NativeTestPlatform::MacOs
+    } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        NativeTestPlatform::LinuxGnu
+    } else {
+        NativeTestPlatform::Other
+    };
+    let missing = BACKEND.get().unwrap().as_ref().err().map(String::as_str);
+    match native_test_decision(platform, test_glibc_version(), missing) {
+        NativeTestDecision::Run => true,
+        NativeTestDecision::Skip(reason) => {
+            eprintln!("skipping native-only spawn assertion: {reason}");
+            false
+        }
+        NativeTestDecision::Fail(reason) => panic!("{reason}"),
+    }
+}
+
 fn check(rc: libc::c_int) -> io::Result<()> {
     if rc == 0 {
         Ok(())
@@ -473,6 +586,10 @@ mod tests {
     use std::io::Write;
 
     fn spawn(command: &Command, root: &Path, gated: bool) -> (Child, [File; 4]) {
+        assert!(
+            native_backend_for_tests(),
+            "native spawn helper called when native-only tests should be skipped"
+        );
         let files =
             ["out", "err", "exit", "failure"].map(|name| File::create(root.join(name)).unwrap());
         let child = try_spawn(
@@ -493,7 +610,42 @@ mod tests {
     }
 
     #[test]
+    fn native_test_policy_skips_only_versioned_glibc_capability_gaps() {
+        assert!(matches!(
+            native_test_decision(
+                NativeTestPlatform::LinuxGnu,
+                Some((2, 33)),
+                Some("posix_spawn_file_actions_addclosefrom_np")
+            ),
+            NativeTestDecision::Skip(_)
+        ));
+        assert!(matches!(
+            native_test_decision(
+                NativeTestPlatform::LinuxGnu,
+                Some((2, 34)),
+                Some("posix_spawn_file_actions_addclosefrom_np")
+            ),
+            NativeTestDecision::Fail(_)
+        ));
+        assert!(matches!(
+            native_test_decision(NativeTestPlatform::MacOs, None, None),
+            NativeTestDecision::Run
+        ));
+        assert!(matches!(
+            native_test_decision(
+                NativeTestPlatform::MacOs,
+                None,
+                Some("posix_spawn_file_actions_addchdir_np")
+            ),
+            NativeTestDecision::Fail(_)
+        ));
+    }
+
+    #[test]
     fn native_spawn_cwd_env_arg0_markers_and_stdin() {
+        if !native_backend_for_tests() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("shell");
         std::os::unix::fs::symlink("/bin/sh", &script).unwrap();
@@ -552,6 +704,9 @@ mod tests {
 
     #[test]
     fn native_spawn_clears_spawning_thread_signal_mask() {
+        if !native_backend_for_tests() {
+            return;
+        }
         struct RestoreMask(libc::sigset_t);
         impl Drop for RestoreMask {
             fn drop(&mut self) {
@@ -616,6 +771,9 @@ mod tests {
 
     #[test]
     fn native_spawn_absent_path_uses_default_search_but_empty_path_uses_cwd() {
+        if !native_backend_for_tests() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let shadow = dir.path().join("env");
@@ -645,6 +803,9 @@ mod tests {
 
     #[test]
     fn native_spawn_reports_exec_errors() {
+        if !native_backend_for_tests() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let not_executable = dir.path().join("not-executable");
@@ -701,6 +862,9 @@ mod tests {
 
     #[test]
     fn native_spawn_closes_non_cloexec_daemon_fd() {
+        if !native_backend_for_tests() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let file = File::create(dir.path().join("secret")).unwrap();
         let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };

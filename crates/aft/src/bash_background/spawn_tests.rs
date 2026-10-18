@@ -64,6 +64,9 @@ fn wait_done(registry: &BgTaskRegistry, id: &str) {
 
 #[test]
 fn bash_posix_spawn_zero_daemon_forks() {
+    if !crate::posix_spawn::native_backend_for_tests() {
+        return;
+    }
     // Isolate the counter from unrelated tests so it can observe every daemon thread.
     const CHILD: &str = "AFT_BASH_FORK_COUNTER_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -127,6 +130,9 @@ fn bash_posix_spawn_zero_daemon_forks() {
 #[test]
 #[ignore = "allocates a daemon-sized heap; run explicitly for spawn latency evidence"]
 fn bash_posix_spawn_heap_latency() {
+    if !crate::posix_spawn::native_backend_for_tests() {
+        return;
+    }
     let mib: usize = std::env::var("AFT_SPAWN_HEAP_MIB")
         .unwrap_or_else(|_| "4096".into())
         .parse()
@@ -326,7 +332,16 @@ fn bash_posix_spawn_no_daemon_fd_leak() {
     );
     let _lock = COUNTER_LOCK.lock().unwrap();
     let registry = BgTaskRegistry::default();
-    for fallback in [false, true] {
+    let native_available = crate::posix_spawn::native_backend_for_tests();
+    if !native_available {
+        eprintln!("skipping native descriptor assertion; testing forced fallback only");
+    }
+    let fallback_modes = if native_available {
+        vec![false, true]
+    } else {
+        vec![true]
+    };
+    for fallback in fallback_modes {
         crate::posix_spawn::FORCE_FALLBACK.set(fallback);
         struct Reset;
         impl Drop for Reset {
