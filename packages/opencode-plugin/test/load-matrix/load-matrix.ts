@@ -90,6 +90,7 @@ type HostIsolation = {
 let tempRoot = "";
 let packedRoot = "";
 let tarball = "";
+let bridgeTarball = "";
 let modernV1 = "";
 let hostInstalls: Promise<HostInstalls> | undefined;
 let operatorBefore: { db: PathSnapshot; logs: PathSnapshot };
@@ -235,6 +236,9 @@ async function installHost(
           [packageName]: `file:${tarball}`,
           [pluginPackage]: pluginVersion,
           ...dependencies,
+          // npm resolves the plugin's bridge dependency from the registry unless the host
+          // also installs the bridge packed from this checkout.
+          "@cortexkit/aft-bridge": `file:${bridgeTarball}`,
         },
       },
       null,
@@ -2181,6 +2185,12 @@ beforeAll(async () => {
   tempRoot = await mkdtemp(join(suiteTempParent, "load-matrix-"));
   run("bun", ["run", "build"], join(repoRoot, "packages/aft-bridge"));
   run("bun", ["run", "build"], pluginRoot);
+  const packedBridge = run(
+    "npm",
+    ["pack", "--json", "--pack-destination", tempRoot],
+    join(repoRoot, "packages/aft-bridge"),
+  );
+  bridgeTarball = join(tempRoot, packedFilename(packedBridge.stdout));
   const packed = run("npm", ["pack", "--json", "--pack-destination", tempRoot], pluginRoot);
   tarball = join(tempRoot, packedFilename(packed.stdout));
   packedRoot = join(tempRoot, "packed", "package");
@@ -2263,6 +2273,24 @@ describe("packed module shapes", () => {
 });
 
 describe.serial("real host load matrix", () => {
+  test("matrix hosts install the bridge packed from this checkout", async () => {
+    const installs = await ensureHostInstalls();
+    for (const hostRoot of [installs.v1, installs.v2]) {
+      const hostManifest = JSON.parse(await readFile(join(hostRoot, "package.json"), "utf8"));
+      expect(hostManifest.dependencies["@cortexkit/aft-bridge"]).toBe(`file:${bridgeTarball}`);
+      const installedBridge = JSON.parse(
+        await readFile(
+          join(hostRoot, "node_modules", "@cortexkit", "aft-bridge", "package.json"),
+          "utf8",
+        ),
+      );
+      const workspaceBridge = JSON.parse(
+        await readFile(join(repoRoot, "packages/aft-bridge/package.json"), "utf8"),
+      );
+      expect(installedBridge.version).toBe(workspaceBridge.version);
+    }
+  }, 240_000);
+
   test("packed installs have no peer warning under modern V1 and the GA host", async () => {
     const installs = await ensureHostInstalls();
     expect(installs.v1Output).not.toContain("ERESOLVE");
@@ -2643,8 +2671,8 @@ export default { id: original.id, effect };
   // The subc daemon serves every head bound to a project from one AFT module,
   // so this row binds an OpenCode 1-style head beside the GA host's session on
   // one root and checks each keeps its own tool names. The e2e test starts its
-  // own isolated daemon and skips, saying why, when no subc-core binary is
-  // available (set SUBC_CORE_BIN).
+  // own isolated daemon; beta-pin-gate supplies the pinned wire-v2 binary via
+  // SUBC_CORE_BIN so this row exercises the daemon instead of skipping it.
   test("GA host on the subc daemon keeps its tool names beside an OpenCode 1 head", async () => {
     const { v2 } = await ensureHostInstalls();
     const result = await withOperatorCanary("v2-subc-tool-names", () =>
