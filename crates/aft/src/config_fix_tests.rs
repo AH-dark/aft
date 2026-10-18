@@ -480,7 +480,7 @@ const RETIRED_USER_FILE: &str =
     "{\n  // my settings\n  \"search_index\": false,\n  \"hoist_builtin_tools\": false\n}\n";
 
 #[test]
-fn u01_review_migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
+fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
     std::fs::write(&path, RETIRED_USER_FILE).unwrap();
@@ -514,7 +514,7 @@ fn u01_review_migration_keeps_backup_and_reports_applied_after_directory_sync_er
 }
 
 #[test]
-fn u01_review_migration_pre_rename_error_preserves_original_and_removes_backup() {
+fn migration_pre_rename_error_preserves_original_and_removes_backup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
     std::fs::write(&path, RETIRED_USER_FILE).unwrap();

@@ -359,7 +359,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn u01_review_launcher_read_error_is_retried_without_metadata_changes() {
+    fn launcher_read_error_is_retried_without_metadata_changes() {
         let dir = tempfile::tempdir().unwrap();
         let tool = dir.path().join("git");
         std::fs::write(&tool, b"a real tool without the launcher marker").unwrap();
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn u01_launcher_marker_is_memoized_and_invalidated_by_file_replacement() {
+    fn launcher_marker_is_memoized_and_invalidated_by_file_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = dir.path().join("git");
         std::fs::write(&launcher, XCSELECT_LIBRARY_MARKER).unwrap();

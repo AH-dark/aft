@@ -88,7 +88,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn u01_lexical_normalization_preserves_parents_and_root_boundaries() {
+    fn lexical_normalization_preserves_parents_and_root_boundaries() {
         for (input, expected) in [
             ("../../x", "../../x"),
             ("../a/../../x", "../../x"),
@@ -103,7 +103,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn u01_lexical_normalization_preserves_drive_relative_parents() {
+    fn lexical_normalization_preserves_drive_relative_parents() {
         assert_eq!(
             lexical_normalize(Path::new(r"C:..\..\x")),
             Path::new(r"C:..\..\x")

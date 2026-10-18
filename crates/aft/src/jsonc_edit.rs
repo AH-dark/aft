@@ -259,7 +259,7 @@ pub(crate) fn write_atomic_with_sync_dir(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn u01_review_atomic_write_reports_committed_sync_warning() {
+    fn atomic_write_reports_committed_sync_warning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.jsonc");
         std::fs::write(&path, "old").unwrap();
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn u01_review_atomic_write_pre_rename_failure_never_calls_directory_sync() {
+    fn atomic_write_pre_rename_failure_never_calls_directory_sync() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.jsonc");
         std::fs::create_dir(&path).unwrap();
@@ -397,7 +397,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u01_atomic_write_preserves_config_symlinks() {
+    fn atomic_write_preserves_config_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dotfiles.jsonc");
         let link = dir.path().join("aft.jsonc");
@@ -418,7 +418,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u01_atomic_write_refuses_dangling_config_symlinks() {
+    fn atomic_write_refuses_dangling_config_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("aft.jsonc");
         std::os::unix::fs::symlink("missing.jsonc", &link).unwrap();
@@ -431,7 +431,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u01_atomic_write_syncs_target_directory() {
+    fn atomic_write_syncs_target_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.jsonc");
         crate::durability::take();

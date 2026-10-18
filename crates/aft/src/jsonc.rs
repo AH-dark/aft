@@ -128,7 +128,7 @@ mod tests {
     use super::{strip_jsonc, strip_jsonc_comments, strip_trailing_commas};
 
     #[test]
-    fn u01_block_comments_do_not_join_json_tokens() {
+    fn block_comments_do_not_join_json_tokens() {
         for source in ["1/**/2", "tr/**/ue", "{\"n\": 1/**/2}"] {
             assert!(
                 serde_json::from_str::<Value>(&strip_jsonc(source)).is_err(),

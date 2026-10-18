@@ -1380,7 +1380,7 @@ eval "$2"
     }
 
     #[test]
-    fn u01_login_path_mixed_probe_retains_only_absolute_entries() {
+    fn login_path_mixed_probe_retains_only_absolute_entries() {
         let _guard = crate::test_env::process_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let shell = dir.path().join("shell");
@@ -1394,7 +1394,7 @@ eval "$2"
     }
 
     #[test]
-    fn u01_login_path_failed_cache_is_not_authoritative() {
+    fn login_path_failed_cache_is_not_authoritative() {
         let _guard = crate::test_env::process_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("HOME", dir.path().to_str().unwrap());

@@ -195,7 +195,7 @@ mod tests {
     use super::{sanitize_client, Harness};
 
     #[test]
-    fn u01_directly_constructed_fed_storage_segment_handles_invalid_utf8_boundaries() {
+    fn directly_constructed_fed_storage_segment_handles_invalid_utf8_boundaries() {
         for fingerprint in ["short", "0123456789abcde€rest"] {
             let harness = Harness::Fed {
                 fingerprint: fingerprint.to_string(),

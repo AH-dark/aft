@@ -109,7 +109,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn u01_windows_tool_probe_prefers_runnable_wrapper_to_posix_shim() {
+    fn windows_tool_probe_prefers_runnable_wrapper_to_posix_shim() {
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("prettier");
         let cmd = dir.path().join("prettier.cmd");

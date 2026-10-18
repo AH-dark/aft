@@ -60,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u01_text_surface_does_not_allocate_for_envelope_lookup() {
+    fn text_surface_does_not_allocate_for_envelope_lookup() {
         let data = serde_json::json!({"bash_list_envelope": {"irrelevant": "x".repeat(8192)}});
         let (text, allocations) =
             crate::test_allocations::count(|| build_ndjson_text("", &data, Some("bash"), true));

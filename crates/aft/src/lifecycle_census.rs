@@ -423,7 +423,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn u01_thread_class_recognizes_linux_comm_truncation() {
+    fn thread_class_recognizes_linux_comm_truncation() {
         for (full, expected) in [
             ("aft-fs-lock-heartbeat", "aft-fs-lock-heartbeat"),
             ("aft-health-rollup", "aft-health-rollup"),
