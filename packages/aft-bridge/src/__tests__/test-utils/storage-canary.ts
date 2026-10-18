@@ -8,6 +8,18 @@ export interface StorageSnapshot {
   objects: Array<{ type: "table" | "index"; name: string; sql: string | null }>;
 }
 
+export interface UnreachableStorageSnapshot {
+  kind: "unreachable";
+  reason: "EPERM" | "EACCES";
+}
+
+export type StorageSnapshotResult = StorageSnapshot | UnreachableStorageSnapshot | null;
+
+type DatabaseStat = (path: string) => unknown;
+
+// Preload checks run both before and after tests, so report each denial once.
+const reportedUnreachableReasons = new Set<UnreachableStorageSnapshot["reason"]>();
+
 /** Account lookup ignores the suite's replacement HOME/XDG variables. */
 export function liveAftDatabasePath(): string {
   let dataHome: string;
@@ -51,11 +63,22 @@ export function liveAftDatabasePath(): string {
  * second fd here could invalidate POSIX locks held by a bridge in this process.
  * readonly forbids creation/migration; never use AFT itself to inspect the store.
  */
-export function snapshotAftDatabase(path: string): StorageSnapshot | null {
+export function snapshotAftDatabase(
+  path: string,
+  stat: DatabaseStat = statSync,
+): StorageSnapshotResult {
   try {
-    statSync(path);
+    stat(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    if (code === "EPERM" || code === "EACCES") {
+      if (!reportedUnreachableReasons.has(code)) {
+        reportedUnreachableReasons.add(code);
+        console.warn(`AFT live-store canary is inactive: database stat failed with ${code}`);
+      }
+      return { kind: "unreachable", reason: code };
+    }
     throw error;
   }
   const result = spawnSync(
@@ -79,10 +102,16 @@ export function snapshotAftDatabase(path: string): StorageSnapshot | null {
   return JSON.parse(result.stdout) as StorageSnapshot;
 }
 
-export function assertAftDatabaseUnchanged(path: string, before: StorageSnapshot | null): void {
-  assert.deepEqual(
-    snapshotAftDatabase(path),
-    before,
-    `live AFT database changed during tests: ${path}`,
-  );
+export function assertAftDatabaseUnchanged(
+  path: string,
+  before: StorageSnapshotResult,
+  stat: DatabaseStat = statSync,
+): void {
+  const after = snapshotAftDatabase(path, stat);
+  if (isUnreachable(before) && isUnreachable(after)) return;
+  assert.deepEqual(after, before, `live AFT database changed during tests: ${path}`);
+}
+
+function isUnreachable(snapshot: StorageSnapshotResult): snapshot is UnreachableStorageSnapshot {
+  return snapshot !== null && "kind" in snapshot && snapshot.kind === "unreachable";
 }

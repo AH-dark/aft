@@ -3,11 +3,14 @@ import { spawnSync as nativeSpawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
 import { spawnSync } from "../child-process.js";
 import { isolatedAftEnvironment } from "../test-child-environment.js";
 import {
   assertAftDatabaseUnchanged,
   liveAftDatabasePath,
+  type StorageSnapshot,
+  type StorageSnapshotResult,
   snapshotAftDatabase,
 } from "./test-utils/storage-canary.js";
 
@@ -59,6 +62,19 @@ function seedDatabase(path: string, version: number): void {
     INSERT INTO schema_version VALUES (${version});
   `,
   );
+}
+
+function readableSnapshot(snapshot: StorageSnapshotResult): StorageSnapshot {
+  if (snapshot === null || "kind" in snapshot) {
+    throw new Error("Expected a readable storage snapshot");
+  }
+  return snapshot;
+}
+
+function deniedStat(code: "EPERM" | "EACCES"): (path: string) => never {
+  return () => {
+    throw Object.assign(new Error(`stat denied: ${code}`), { code });
+  };
 }
 
 describe("test storage isolation", () => {
@@ -159,11 +175,11 @@ describe("test storage isolation", () => {
     fixture((root) => {
       const path = join(root, "aft.db");
       seedDatabase(path, 13);
-      const before = snapshotAftDatabase(path);
-      expect(before?.schemaVersion).toBe(13);
+      const before = readableSnapshot(snapshotAftDatabase(path));
+      expect(before.schemaVersion).toBe(13);
       expect(() => assertAftDatabaseUnchanged(path, before)).not.toThrow();
       seedDatabase(path, 14);
-      expect(snapshotAftDatabase(path)?.schemaVersion).toBe(14);
+      expect(readableSnapshot(snapshotAftDatabase(path)).schemaVersion).toBe(14);
       expect(() => assertAftDatabaseUnchanged(path, before)).toThrow("live AFT database changed");
     }));
 
@@ -171,10 +187,10 @@ describe("test storage isolation", () => {
     fixture((root) => {
       const path = join(root, "aft.db");
       seedDatabase(path, 14);
-      const before = snapshotAftDatabase(path);
-      expect(before?.objects.map((object) => object.name)).toEqual(["records", "schema_version"]);
+      const before = readableSnapshot(snapshotAftDatabase(path));
+      expect(before.objects.map((object) => object.name)).toEqual(["records", "schema_version"]);
       executeFixtureSql(path, "CREATE TABLE call_ledger (id INTEGER);");
-      expect(snapshotAftDatabase(path)?.schemaVersion).toBe(14);
+      expect(readableSnapshot(snapshotAftDatabase(path)).schemaVersion).toBe(14);
       expect(() => assertAftDatabaseUnchanged(path, before)).toThrow("live AFT database changed");
     }));
 
@@ -182,9 +198,9 @@ describe("test storage isolation", () => {
     fixture((root) => {
       const path = join(root, "aft.db");
       seedDatabase(path, 14);
-      const before = snapshotAftDatabase(path);
+      const before = readableSnapshot(snapshotAftDatabase(path));
       executeFixtureSql(path, "CREATE INDEX records_content ON records (content);");
-      expect(snapshotAftDatabase(path)?.schemaVersion).toBe(14);
+      expect(readableSnapshot(snapshotAftDatabase(path)).schemaVersion).toBe(14);
       expect(() => assertAftDatabaseUnchanged(path, before)).toThrow("live AFT database changed");
     }));
 
@@ -192,7 +208,7 @@ describe("test storage isolation", () => {
     fixture((root) => {
       const path = join(root, "aft.db");
       seedDatabase(path, 14);
-      const before = snapshotAftDatabase(path);
+      const before = readableSnapshot(snapshotAftDatabase(path));
       executeFixtureSql(path, "INSERT INTO records VALUES (zeroblob(16384));");
       expect(() => assertAftDatabaseUnchanged(path, before)).not.toThrow();
     }));
@@ -203,6 +219,32 @@ describe("test storage isolation", () => {
       expect(snapshotAftDatabase(path)).toBeNull();
       seedDatabase(path, 14);
       expect(() => assertAftDatabaseUnchanged(path, null)).toThrow("live AFT database changed");
+    }));
+
+  test("storage canary treats EPERM as an unreachable live store", () =>
+    fixture((root) => {
+      const path = join(root, "aft.db");
+      const stat = deniedStat("EPERM");
+      const before = snapshotAftDatabase(path, stat);
+      expect(before).toEqual({ kind: "unreachable", reason: "EPERM" });
+      expect(() => assertAftDatabaseUnchanged(path, before, stat)).not.toThrow();
+    }));
+
+  test("storage canary treats EACCES as an unreachable live store", () =>
+    fixture((root) => {
+      const path = join(root, "aft.db");
+      expect(snapshotAftDatabase(path, deniedStat("EACCES"))).toEqual({
+        kind: "unreachable",
+        reason: "EACCES",
+      });
+    }));
+
+  test("storage canary rejects a readable store after an unreachable snapshot", () =>
+    fixture((root) => {
+      const path = join(root, "aft.db");
+      seedDatabase(path, 14);
+      const before = snapshotAftDatabase(path, deniedStat("EPERM"));
+      expect(() => assertAftDatabaseUnchanged(path, before)).toThrow("live AFT database changed");
     }));
 
   test("storage canary refuses an unreadable database instead of skipping it", () =>
