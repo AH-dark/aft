@@ -1,9 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { writeSmokeBinary } from "../../../aft-bridge/src/__tests__/test-utils/smoke-binary.js";
 import { runAutoInstall } from "../lsp-auto-install.js";
 import { __githubBinaryHashCountForTests, runGithubAutoInstall } from "../lsp-github-install.js";
 
@@ -78,6 +87,7 @@ describe("cached LSP validation before lsp_paths_extra", () => {
       disabled: new Set(),
     });
 
+    await result.installsComplete;
     expect(result.cachedBinDirs).not.toContain(binDir);
     const quarantine = join(root, "lsp-binaries", ".quarantine", "clangd");
     expect(existsSync(quarantine)).toBe(true);
@@ -89,17 +99,16 @@ describe("cached LSP validation before lsp_paths_extra", () => {
   // MB, so an unchanged one must be hashed once per process, not per check.
   test("an unchanged GitHub cached binary is hashed once across repeated validation", async () => {
     const root = await tempCache();
-    const pkgDir = join(root, "lsp-binaries", "clangd");
+    const pkgDir = join(root, "lsp-binaries", "texlab");
     const binDir = join(pkgDir, "bin");
     mkdirSync(binDir, { recursive: true });
-    const binary = join(binDir, "clangd");
-    writeFileSync(binary, "clangd-binary");
+    const binary = writeSmokeBinary(join(binDir, "texlab"));
     writeFileSync(
       join(pkgDir, ".aft-installed"),
       JSON.stringify({
         version: "21.1.0",
         installedAt: "now",
-        binarySha256: createHash("sha256").update("clangd-binary").digest("hex"),
+        binarySha256: createHash("sha256").update(readFileSync(binary)).digest("hex"),
       }),
     );
 
@@ -110,15 +119,16 @@ describe("cached LSP validation before lsp_paths_extra", () => {
       versions: {},
       disabled: new Set(),
     });
+    await result.installsComplete;
     expect(result.cachedBinDirs).toContain(binDir);
-    expect(result.getCachedBinDirs()).toContain(binDir);
-    expect(result.getCachedBinDirs()).toContain(binDir);
+    expect(await result.getCachedBinDirs()).toContain(binDir);
+    expect(await result.getCachedBinDirs()).toContain(binDir);
     expect(__githubBinaryHashCountForTests() - before).toBe(1);
 
     // A changed binary is hashed again and caught by the recorded digest.
     writeFileSync(binary, "tampered-binary");
-    expect(result.getCachedBinDirs()).not.toContain(binDir);
+    expect(await result.getCachedBinDirs()).not.toContain(binDir);
     expect(__githubBinaryHashCountForTests() - before).toBe(2);
-    expect(existsSync(join(root, "lsp-binaries", ".quarantine", "clangd"))).toBe(true);
+    expect(existsSync(join(root, "lsp-binaries", ".quarantine", "texlab"))).toBe(true);
   });
 });

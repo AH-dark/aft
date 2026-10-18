@@ -231,6 +231,30 @@ export {
   sampleBridgeLifecycleCensus,
 } from "./location-lifecycle.js";
 export type { Logger, LogMeta } from "./logger.js";
+export {
+  createGithubInstaller,
+  type GithubAutoInstallOptions,
+  type GithubAutoInstallResult,
+  type GithubInstallConfig,
+  type GithubInstallerHost,
+} from "./lsp-github-install.js";
+export {
+  assertSafeVersion,
+  type GithubVersionPickResult,
+  isSafeVersion,
+  pickEligibleRelease,
+  probeGithubReleases,
+  stripTagV,
+} from "./lsp-github-probe.js";
+export {
+  type Arch,
+  type ArchiveType,
+  detectHostPlatform,
+  findGithubServerById,
+  GITHUB_LSP_TABLE,
+  type GithubServerSpec,
+  type Platform,
+} from "./lsp-github-table.js";
 // --- which incoming messages interrupt a blocking bash wait ---
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,

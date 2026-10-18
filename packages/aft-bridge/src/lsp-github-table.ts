@@ -30,8 +30,16 @@ export interface GithubServerSpec {
   readonly id: string;
   /** GitHub `owner/repo`. */
   readonly githubRepo: string;
-  /** Binary name placed under the cache `bin/` dir after extraction. */
+  /** Executable name used by the Rust resolver. */
   readonly binary: string;
+  /** Keep runtime resources beside the executable, or install a standalone binary. */
+  readonly layout: "distribution" | "standalone";
+  /** A short, non-interactive command that must exit successfully before exposing the install. */
+  readonly smokeArgs: readonly string[];
+  /** Runtime entries relative to the extraction root, checked without hashing their contents. */
+  readonly requiredRuntimePaths?: (
+    version: string,
+  ) => readonly { path: string; kind: "file" | "directory" }[];
   /** Returns the asset filename and archive type for the given platform/arch + version. */
   readonly resolveAsset: (
     platform: Platform,
@@ -40,8 +48,8 @@ export interface GithubServerSpec {
   ) => { name: string; archive: ArchiveType } | null;
   /**
    * Path inside the extracted archive where the binary lives, relative to the
-   * extraction root. May contain `${version}` placeholder. The installer
-   * looks up this path and copies/symlinks it to `bin/<binary>`.
+   * extraction root. Distribution installs expose this executable's actual
+   * directory to the resolver; standalone installs copy it into `bin/`.
    */
   readonly binaryPathInArchive: (platform: Platform, arch: Arch, version: string) => string;
 }
@@ -67,6 +75,10 @@ const CLANGD: GithubServerSpec = {
   id: "clangd",
   githubRepo: "clangd/clangd",
   binary: "clangd",
+  // clangd locates its bundled lib/clang builtin headers relative to bin/clangd.
+  layout: "distribution",
+  smokeArgs: ["--version"],
+  requiredRuntimePaths: (version) => [{ path: `clangd_${version}/lib/clang`, kind: "directory" }],
   resolveAsset: (platform, _arch, version) => {
     const platformName = platform === "darwin" ? "mac" : platform === "linux" ? "linux" : "windows";
     return { name: `clangd-${platformName}-${version}.zip`, archive: "zip" };
@@ -85,6 +97,13 @@ const LUA_LS: GithubServerSpec = {
   id: "lua-ls",
   githubRepo: "LuaLS/lua-language-server",
   binary: "lua-language-server",
+  // LuaLS bootstraps main.lua and its runtime from the extracted distribution.
+  layout: "distribution",
+  smokeArgs: ["--version"],
+  requiredRuntimePaths: () => [
+    { path: "main.lua", kind: "file" },
+    { path: "script", kind: "directory" },
+  ],
   resolveAsset: (platform, arch, version) => {
     const ext: ArchiveType = platform === "win32" ? "zip" : "tar.gz";
     const platformName =
@@ -110,6 +129,8 @@ const ZLS: GithubServerSpec = {
   id: "zls",
   githubRepo: "zigtools/zls",
   binary: "zls",
+  layout: "standalone",
+  smokeArgs: ["--version"],
   resolveAsset: (platform, arch, _version) => {
     const ext: ArchiveType = platform === "win32" ? "zip" : "tar.xz";
     const archName = arch === "arm64" ? "aarch64" : "x86_64";
@@ -132,6 +153,8 @@ const TINYMIST: GithubServerSpec = {
   id: "tinymist",
   githubRepo: "Myriad-Dreamin/tinymist",
   binary: "tinymist",
+  layout: "standalone",
+  smokeArgs: ["--version"],
   resolveAsset: (platform, arch, _version) => {
     const archName = arch === "arm64" ? "aarch64" : "x86_64";
     const triple =
@@ -158,6 +181,8 @@ const TEXLAB: GithubServerSpec = {
   id: "texlab",
   githubRepo: "latex-lsp/texlab",
   binary: "texlab",
+  layout: "standalone",
+  smokeArgs: ["--version"],
   resolveAsset: (platform, arch, _version) => {
     const archName = arch === "arm64" ? "aarch64" : "x86_64";
     const platformName =

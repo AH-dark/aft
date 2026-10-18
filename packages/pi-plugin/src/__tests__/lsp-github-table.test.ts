@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { detectHostPlatform, findGithubServerById, GITHUB_LSP_TABLE } from "../lsp-github-table.js";
+import { detectHostPlatform, findGithubServerById, GITHUB_LSP_TABLE } from "@cortexkit/aft-bridge";
 
 describe("findGithubServerById", () => {
   test("returns spec by id", () => {

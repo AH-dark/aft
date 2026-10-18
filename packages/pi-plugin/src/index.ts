@@ -40,6 +40,7 @@ import {
   findBinary,
   findBinarySync,
   formatDroppedKeyWarnings,
+  GITHUB_LSP_TABLE,
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isHomeDirectoryRoot,
@@ -83,7 +84,6 @@ import {
   discoverRelevantGithubServers,
   runGithubAutoInstall,
 } from "./lsp-github-install.js";
-import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
 import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import {
   type ConfigureWarning,
@@ -667,17 +667,45 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         versions: lspVersions,
         disabled: lspDisabled,
       });
+      // Publish per-server paths as they settle so one process-held lock cannot
+      // delay unrelated servers behind the aggregate completion promise.
+      let getGithubCacheDirs: (() => Promise<string[]>) | undefined;
+      let cachePathRefresh = Promise.resolve();
+      const refreshCachePaths = (newlyReadyDir?: string) => {
+        const getCachedBinDirs = getGithubCacheDirs;
+        if (!getCachedBinDirs) return;
+        cachePathRefresh = cachePathRefresh
+          .then(async () => {
+            const updatedPaths = [
+              ...new Set([
+                ...npmResult.getCachedBinDirs(),
+                ...(await getCachedBinDirs()),
+                ...(newlyReadyDir ? [newlyReadyDir] : []),
+              ]),
+            ];
+            await pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths);
+          })
+          .catch((err) => {
+            warn(`[lsp] incremental cache-path refresh failed: ${err}`);
+          });
+      };
       // The relevance scan only feeds install decisions, so skip the walk when
       // no install can start.
       const relevantGithub = runSharedAutoInstall
         ? discoverRelevantGithubServers(projectRoot)
         : new Set<string>();
-      const ghResult = runGithubAutoInstall(relevantGithub, {
-        autoInstall: runSharedAutoInstall,
-        graceDays: lspGraceDays,
-        versions: lspVersions,
-        disabled: lspDisabled,
-      });
+      const ghResult = runGithubAutoInstall(
+        relevantGithub,
+        {
+          autoInstall: runSharedAutoInstall,
+          graceDays: lspGraceDays,
+          versions: lspVersions,
+          disabled: lspDisabled,
+        },
+        undefined,
+        { onCachedBinDirsChanged: refreshCachePaths },
+      );
+      getGithubCacheDirs = ghResult.getCachedBinDirs;
       // The pool copied `configOverrides` when it was created, so the paths
       // found here reach new bridges through the pool's own overrides.
       const mergedBinDirs = [...npmResult.cachedBinDirs, ...ghResult.cachedBinDirs];
@@ -705,11 +733,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       // default logging see them. Routine skips (already-installed,
       // not-relevant, disabled) stay out of the warning summary.
       const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
-        .then(() => {
-          if (installsWereStarted || skippedByRecentAutoInstall) {
-            return [...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()])];
-          }
-          return null;
+        .then(async () => {
+          return [
+            ...new Set([...npmResult.getCachedBinDirs(), ...(await ghResult.getCachedBinDirs())]),
+          ];
         })
         .then((updatedPaths) => {
           const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
@@ -739,20 +766,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           lspAutoInstallPassLease?.release();
           lspAutoInstallPassLease = null;
         });
-      if (installsWereStarted || skippedByRecentAutoInstall) {
-        installCompletion.then((updatedPaths) => {
-          if (!updatedPaths) return;
-          void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
-            .then(() => {
-              log(
-                `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
-              );
-            })
-            .catch((err) => {
-              warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
-            });
-        });
-      }
+      installCompletion.then((updatedPaths) => {
+        if (!updatedPaths) return;
+        void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
+          .then(() => {
+            log(
+              `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
+            );
+          })
+          .catch((err) => {
+            warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
+          });
+      });
     } catch (err) {
       lspAutoInstallPassLease?.release();
       lspAutoInstallPassLease = null;
