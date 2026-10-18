@@ -7208,11 +7208,12 @@ pub fn walk_applicable_area(
     })
 }
 
-/// Test hook: stretch the applicability walk so a test can prove the walk
-/// does not block other users of the language-server manager. Debug builds
-/// only. `AFT_TEST_APPLICABILITY_WALK_DELAY_MS` is the delay in milliseconds;
-/// when `AFT_TEST_APPLICABILITY_WALK_SIGNAL` names a file, it is written as the
-/// delay starts so the test knows the walk is under way.
+/// Test hook: hold the applicability walk so a test can prove that configure
+/// does not wait for it. Debug builds only. `AFT_TEST_APPLICABILITY_WALK_DELAY_MS`
+/// caps the hold in milliseconds. When `AFT_TEST_APPLICABILITY_WALK_SIGNAL`
+/// names a file, it is written as the hold starts; when
+/// `AFT_TEST_APPLICABILITY_WALK_RELEASE` names a file, the hook waits for it to
+/// appear or until the cap expires.
 fn delay_applicability_walk_for_test() {
     #[cfg(debug_assertions)]
     if let Some(delay_ms) = std::env::var("AFT_TEST_APPLICABILITY_WALK_DELAY_MS")
@@ -7222,7 +7223,19 @@ fn delay_applicability_walk_for_test() {
         if let Some(signal) = std::env::var_os("AFT_TEST_APPLICABILITY_WALK_SIGNAL") {
             let _ = std::fs::write(signal, b"walking");
         }
-        std::thread::sleep(Duration::from_millis(delay_ms));
+        if let Some(release) = std::env::var_os("AFT_TEST_APPLICABILITY_WALK_RELEASE") {
+            let release = PathBuf::from(release);
+            let deadline = Instant::now() + Duration::from_millis(delay_ms);
+            while !release.exists() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
     }
 }
 
