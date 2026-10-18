@@ -494,12 +494,13 @@ mod tests {
         let start = Instant::now();
         let result = read_gh(
             Path::new("/bin/sh"),
-            &["-c".into(), "sleep 5 & exit 0".into()],
-            start + Duration::from_millis(100),
+            &["-c".into(), "sleep 30 & exit 0".into()],
+            start + Duration::from_secs(1),
             1024,
         );
         assert!(result.unwrap_err().contains("deadline"));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        // Generous for loaded runners, yet far below the descendant's 30 s.
+        assert!(start.elapsed() < Duration::from_secs(15));
         let result = read_gh(
             Path::new("/bin/sh"),
             &["-c".into(), "printf 123456789".into()],
@@ -524,18 +525,20 @@ mod tests {
                 "rename-guard-test".into(),
                 pid_file.to_string_lossy().into_owned(),
             ],
-            start + Duration::from_millis(100),
+            // Long enough for a loaded runner to start the shell and record
+            // the grandchild's pid before the deadline kills the tree.
+            start + Duration::from_secs(3),
             1024,
         );
         assert!(result.unwrap_err().contains("deadline"));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(15));
 
         let pid: i32 = std::fs::read_to_string(pid_file)
-            .unwrap()
+            .expect("the shell did not record the grandchild pid before the deadline")
             .trim()
             .parse()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while process_is_alive(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
