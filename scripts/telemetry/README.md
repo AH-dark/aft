@@ -78,6 +78,22 @@ measure and print, but it will not gate, because it cannot.
 All compared numbers come from the runner sampler or structured telemetry; no
 human-readable log message is used as a gate input.
 
+- The measurement profile is `cold-index-no-inspect-v1`: trigram and callgraph
+  build together with semantic and inspect disabled. Inspect's opportunistic
+  refresh after callgraph readiness is not a cold-index cost. Previously that
+  refresh raced the first-query probes and process shutdown, so the same Hugo
+  binary could measure roughly 190 or 300 MB depending on how much inspect work
+  ran before the final sample. Disabling inspect leaves index concurrency,
+  allocator policy, sampling cadence, tolerances, and the two-run rule unchanged.
+  Inspect performance needs its own workload rather than an accidental fraction
+  of a refresh inside this one.
+- Each CSV row and blessed repository records `measurement_profile`. The gate
+  refuses a missing or different profile (exit 2), including with
+  `--ignore-platform`, instead of comparing different workloads. Existing
+  inspect-inclusive baselines must be re-recorded on the CI runner using
+  `write_baseline: true`; do not just tag their old numbers with the new profile.
+  Offline blessing requires the profile in every source CSV row. A one-repository
+  capture migrates only that repository; the others still need re-recording.
 - Search and callgraph cold `build_ready` elapsed time, first-query latency,
   and the callgraph resolution stage's duration (`callgraph_resolution_ms`)
   come from `index_event` records. The resolution stage's share of the build is
