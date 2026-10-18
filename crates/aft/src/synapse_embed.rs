@@ -2,12 +2,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
+use subc_client_rs::{
+    CallError, CallOptions, ConsumerOptions, OutcomeUnknownCause, RouteHandle, SubcConsumer,
+};
 use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
 
@@ -24,6 +26,10 @@ const CIRCUIT_TIMEOUT_THRESHOLD: usize = 3;
 const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(5);
 const RETRY_BACKOFF_MS: [u64; 3] = [100, 200, 400];
 static LIVE_CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[path = "synapse_route_tests.rs"]
+pub(crate) mod route_tests;
 
 const LANE_PAUSE_MARKER: &str = "[lane_paused] ";
 pub(crate) const MAX_LANE_PAUSE_MS: u64 = 120 * 60 * 1_000;
@@ -358,10 +364,84 @@ struct SynapseState {
     model: String,
     call_timeout: Duration,
     required_operations: &'static [&'static str],
-    consumer: Option<SubcConsumer>,
-    route: Option<RouteHandle>,
+    connection: Arc<SynapseConnection>,
     consecutive_timeouts: usize,
     circuit_open_until: Option<Instant>,
+}
+
+struct ActiveConnection {
+    consumer: SubcConsumer,
+    route: RouteHandle,
+}
+
+fn connection_is_gone(error: &CallError) -> bool {
+    // The SDK distinguishes lost routes/writers from request deadlines and
+    // module replies. Bare NotSent errors also include flow-control timeouts,
+    // so only a typed close reason proves that their route has ended.
+    matches!(error, CallError::StaleRouteHandle(_))
+        || error.close_reason().is_some()
+        || matches!(
+            error.outcome_cause(),
+            Some(
+                OutcomeUnknownCause::WriterClosed
+                    | OutcomeUnknownCause::ConsumerClosed
+                    | OutcomeUnknownCause::ConnectionFailed
+                    | OutcomeUnknownCause::RouteEnded
+            )
+        )
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ConnectionKey {
+    connection_file: PathBuf,
+    harness: String,
+    operations: &'static [&'static str],
+}
+
+struct SynapseConnection {
+    active: tokio::sync::Mutex<Option<Arc<ActiveConnection>>>,
+    runtime: Arc<SynapseRuntime>,
+}
+
+impl SynapseConnection {
+    fn new() -> Result<Arc<Self>, SynapseEmbeddingError> {
+        Ok(Arc::new(Self {
+            active: tokio::sync::Mutex::new(None),
+            runtime: Arc::new(SynapseRuntime::new()?),
+        }))
+    }
+
+    fn shared(key: ConnectionKey) -> Result<Arc<Self>, SynapseEmbeddingError> {
+        static CONNECTIONS: OnceLock<Mutex<HashMap<ConnectionKey, Weak<SynapseConnection>>>> =
+            OnceLock::new();
+        let mut connections = CONNECTIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connections.retain(|_, connection| connection.strong_count() != 0);
+        if let Some(connection) = connections.get(&key).and_then(Weak::upgrade) {
+            return Ok(connection);
+        }
+        let connection = Arc::new(Self {
+            active: tokio::sync::Mutex::new(None),
+            runtime: Arc::new(SynapseRuntime::shared()?),
+        });
+        connections.insert(key, Arc::downgrade(&connection));
+        Ok(connection)
+    }
+
+    async fn reset(&self, failed: &Arc<ActiveConnection>) {
+        let mut active = self.active.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, failed))
+        {
+            // Other in-flight callers may fail on this generation too. Only its
+            // first failure closes it; late failures cannot close its replacement.
+            failed.consumer.close().await;
+            *active = None;
+        }
+    }
 }
 
 /// A synchronous client can be released by the async SubC frame loop, including
@@ -372,6 +452,17 @@ struct SynapseRuntime(Option<tokio::runtime::Runtime>);
 impl SynapseRuntime {
     fn new() -> Result<Self, SynapseEmbeddingError> {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| Self(Some(runtime)))
+            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))
+    }
+
+    fn shared() -> Result<Self, SynapseEmbeddingError> {
+        // Transport tasks must keep running even when the model that opened
+        // the connection is idle while another root is embedding.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .map(|runtime| Self(Some(runtime)))
@@ -398,7 +489,7 @@ impl Drop for SynapseRuntime {
 }
 
 pub struct SynapseEmbeddingClient {
-    runtime: SynapseRuntime,
+    runtime: Arc<SynapseRuntime>,
     state: SynapseState,
     metadata: SynapseModelMetadata,
     models_list_envelope: Vec<u8>,
@@ -415,7 +506,19 @@ impl SynapseEmbeddingClient {
         if model.is_empty() {
             return Err(SynapseEmbeddingError::MissingModel);
         }
-        let runtime = SynapseRuntime::new()?;
+        let route_harness = config.route_harness.clone().unwrap_or_else(|| "aft".into());
+        let required_operations: &'static [&'static str] =
+            &[MODELS_LIST_OPERATION, QUERY_OPERATION, BATCH_OPERATION];
+        // This management route is unscoped: model and fingerprint travel in
+        // each request, and pause bookkeeping stays on the calling root's state.
+        // The bind root is only the first caller's diagnostic identity.
+        let connection = SynapseConnection::shared(ConnectionKey {
+            connection_file: std::fs::canonicalize(&connection_file)
+                .unwrap_or_else(|_| connection_file.clone()),
+            harness: route_harness.clone(),
+            operations: required_operations,
+        })?;
+        let runtime = Arc::clone(&connection.runtime);
         let mut state = SynapseState {
             connection_file,
             route_project_root: config
@@ -423,15 +526,11 @@ impl SynapseEmbeddingClient {
                 .clone()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from(".")),
-            route_harness: config
-                .route_harness
-                .clone()
-                .unwrap_or_else(|| "aft".to_string()),
+            route_harness,
             model: model.to_string(),
             call_timeout: Duration::from_millis(config.timeout_ms.max(1)),
-            required_operations: &[MODELS_LIST_OPERATION, QUERY_OPERATION, BATCH_OPERATION],
-            consumer: None,
-            route: None,
+            required_operations,
+            connection,
             consecutive_timeouts: 0,
             circuit_open_until: None,
         };
@@ -726,55 +825,67 @@ impl SynapseState {
             .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))?;
         let mut last_error = String::new();
         for attempt in 0..MAX_CALL_ATTEMPTS {
-            if let Err(error) = self.ensure_route().await {
-                last_error = error.to_string();
-            } else {
-                let request = self
-                    .consumer
-                    .as_ref()
-                    .expect("consumer exists when route exists")
-                    .request(
-                        self.route.as_ref().expect("route ensured"),
+            match self.ensure_route().await {
+                Err(error) => last_error = error.to_string(),
+                Ok(connection) => {
+                    // Do not hold the connection-slot lock across a request. The
+                    // SDK multiplexes up to 1024 requests on a management route.
+                    let request = connection.consumer.request(
+                        &connection.route,
                         body.clone(),
                         CallOptions::default(),
                     );
-                match tokio::time::timeout(timeout, request).await {
-                    Ok(Ok(response)) => {
-                        if response.len() > MAX_RESULT_PAGE_BYTES {
-                            return Err(SynapseEmbeddingError::InvalidEnvelope(format!(
-                                "{operation} response exceeded 512KiB page bound"
-                            )));
-                        }
-                        let result = decode_result_envelope_for_request(response, Some(&params));
-                        match &result {
-                            Err(SynapseEmbeddingError::LanePaused(pause)) => {
-                                lane_pauses()
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(self.route_project_root.clone(), pause.clone());
+                    match tokio::time::timeout(timeout, request).await {
+                        Ok(Ok(response)) => {
+                            if response.len() > MAX_RESULT_PAGE_BYTES {
+                                return Err(SynapseEmbeddingError::InvalidEnvelope(format!(
+                                    "{operation} response exceeded 512KiB page bound"
+                                )));
                             }
-                            _ => {
-                                self.consecutive_timeouts = 0;
-                                if operation != MODELS_LIST_OPERATION {
+                            let result =
+                                decode_result_envelope_for_request(response, Some(&params));
+                            match &result {
+                                Err(SynapseEmbeddingError::LanePaused(pause)) => {
                                     lane_pauses()
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .remove(&self.route_project_root);
+                                        .insert(self.route_project_root.clone(), pause.clone());
+                                }
+                                _ => {
+                                    self.consecutive_timeouts = 0;
+                                    if operation != MODELS_LIST_OPERATION {
+                                        lane_pauses()
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .remove(&self.route_project_root);
+                                    }
                                 }
                             }
+                            return result;
                         }
-                        return result;
-                    }
-                    Ok(Err(error)) => {
-                        last_error = error.to_string();
-                        self.reset_connection();
-                    }
-                    Err(_) => {
-                        last_error = format!("{operation} timed out");
-                        self.note_timeout();
-                        self.reset_connection();
-                        if self.circuit_open_until.is_some() {
-                            return Err(SynapseEmbeddingError::CircuitOpen);
+                        Ok(Err(error)) => {
+                            if matches!(error, CallError::Module(_)) {
+                                return Err(SynapseEmbeddingError::DaemonUnavailable(
+                                    error.to_string(),
+                                ));
+                            }
+                            last_error = error.to_string();
+                            if connection_is_gone(&error) {
+                                self.connection.reset(&connection).await;
+                            } else if error.outcome_cause() == Some(OutcomeUnknownCause::Deadline) {
+                                self.note_timeout();
+                                if self.circuit_open_until.is_some() {
+                                    return Err(SynapseEmbeddingError::CircuitOpen);
+                                }
+                                last_error = format!("{operation} timed out");
+                            }
+                        }
+                        Err(_) => {
+                            last_error = format!("{operation} timed out");
+                            self.note_timeout();
+                            if self.circuit_open_until.is_some() {
+                                return Err(SynapseEmbeddingError::CircuitOpen);
+                            }
                         }
                     }
                 }
@@ -792,9 +903,10 @@ impl SynapseState {
         }
     }
 
-    async fn ensure_route(&mut self) -> Result<(), SynapseEmbeddingError> {
-        if self.consumer.is_some() && self.route.is_some() {
-            return Ok(());
+    async fn ensure_route(&self) -> Result<Arc<ActiveConnection>, SynapseEmbeddingError> {
+        let mut active = self.connection.active.lock().await;
+        if let Some(connection) = active.as_ref() {
+            return Ok(Arc::clone(connection));
         }
         let options = ConsumerOptions {
             call_timeout: self.call_timeout,
@@ -830,14 +942,9 @@ impl SynapseState {
             )
             .await
             .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
-        self.consumer = Some(consumer);
-        self.route = Some(route);
-        Ok(())
-    }
-
-    fn reset_connection(&mut self) {
-        self.route = None;
-        self.consumer = None;
+        let connection = Arc::new(ActiveConnection { consumer, route });
+        *active = Some(Arc::clone(&connection));
+        Ok(connection)
     }
 
     fn note_timeout(&mut self) {
@@ -1548,7 +1655,7 @@ mod tests {
 /// Uses the embedding transport's daemon connection and management-route identity,
 /// but does not require embedding capabilities or retry an interactive rerank call.
 pub(crate) struct SynapseRerankTransport {
-    runtime: SynapseRuntime,
+    runtime: Arc<SynapseRuntime>,
     state: SynapseState,
 }
 
@@ -1559,7 +1666,8 @@ impl SynapseRerankTransport {
             .clone()
             .ok_or(SynapseEmbeddingError::MissingConnectionFile)?;
         validate_connection_file(&connection_file)?;
-        let runtime = SynapseRuntime::new()?;
+        let connection = SynapseConnection::new()?;
+        let runtime = Arc::clone(&connection.runtime);
         Ok(Self {
             runtime,
             state: SynapseState {
@@ -1573,8 +1681,7 @@ impl SynapseRerankTransport {
                 model: config.model.clone(),
                 call_timeout: Duration::from_millis(config.timeout_ms.max(1)),
                 required_operations: &[MODELS_LIST_OPERATION, "rerank.score"],
-                consumer: None,
-                route: None,
+                connection,
                 consecutive_timeouts: 0,
                 circuit_open_until: None,
             },
@@ -1594,21 +1701,22 @@ impl SynapseRerankTransport {
         self.runtime.block_on(async {
             // Include connect, catalog lookup, and route opening in the total budget.
             let result = tokio::time::timeout(remaining, async {
-                self.state.ensure_route().await?;
+                let connection = self.state.ensure_route().await?;
                 let body = serde_json::to_vec(&json!({"method":operation, "params":params}))
                     .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))?;
-                let response = self
-                    .state
+                let response = match connection
                     .consumer
-                    .as_ref()
-                    .expect("route ensured")
-                    .request(
-                        self.state.route.as_ref().expect("route ensured"),
-                        body,
-                        CallOptions::default(),
-                    )
+                    .request(&connection.route, body, CallOptions::default())
                     .await
-                    .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if connection_is_gone(&error) {
+                            self.state.connection.reset(&connection).await;
+                        }
+                        return Err(SynapseEmbeddingError::DaemonUnavailable(error.to_string()));
+                    }
+                };
                 if response.len() > MAX_RESULT_PAGE_BYTES {
                     return Err(SynapseEmbeddingError::InvalidEnvelope(
                         "rerank.score response exceeded 512KiB".into(),
@@ -1619,16 +1727,8 @@ impl SynapseRerankTransport {
             })
             .await;
             match result {
-                Ok(result) => {
-                    if result.is_err() {
-                        self.state.reset_connection();
-                    }
-                    result
-                }
-                Err(_) => {
-                    self.state.reset_connection();
-                    Err(SynapseEmbeddingError::Timeout(operation.into()))
-                }
+                Ok(result) => result,
+                Err(_) => Err(SynapseEmbeddingError::Timeout(operation.into())),
             }
         })
     }

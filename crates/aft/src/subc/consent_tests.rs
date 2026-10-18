@@ -3281,3 +3281,218 @@ async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy()
     assert!(f.worker_grants().is_empty(), "no worker grant is recorded");
     assert!(f.asks().is_empty(), "the declined ask is discarded");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consent_completed_and_failed_calls_close_scoped_routes() {
+    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let consumer = Arc::new(
+        subc_client_rs::SubcConsumer::connect(
+            &daemon.path,
+            subc_client_rs::ConsumerOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let transport = Arc::new(SubcConsentTransport::new(daemon.path.clone()));
+    *transport.consumer.lock().await = Some(Arc::clone(&consumer));
+    let call = |method| ConsentCall {
+        scope: selector(&stamp("worker", "worker", Some("head"))),
+        project_root: PathBuf::from("/project"),
+        session: "consent-close".into(),
+        method,
+        params: json!({}),
+        timeout: Duration::from_millis(100),
+    };
+    assert_eq!(
+        transport
+            .clone()
+            .send(call("consent.request"))
+            .await
+            .unwrap(),
+        json!({"ok":true})
+    );
+    daemon.wait_closed();
+    assert!(matches!(
+        transport.clone().send(call("consent.test_error")).await,
+        Err(ConsentError::Refused { .. })
+    ));
+    daemon.wait_closed();
+    assert!(matches!(
+        transport.clone().send(call("consent.test_timeout")).await,
+        Err(ConsentError::Unavailable(_))
+    ));
+    daemon.wait_closed();
+    assert_eq!(daemon.counts.0.lock().unwrap().opens, 3);
+    assert!(transport.routes.lock().unwrap().is_empty());
+    daemon.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consent_cancelled_call_releases_route_after_last_overlapping_call() {
+    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let consumer = Arc::new(
+        subc_client_rs::SubcConsumer::connect(
+            &daemon.path,
+            subc_client_rs::ConsumerOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let transport = Arc::new(SubcConsentTransport::new(daemon.path.clone()));
+    *transport.consumer.lock().await = Some(consumer);
+    let call = ConsentCall {
+        scope: selector(&stamp("worker", "worker", Some("head"))),
+        project_root: PathBuf::from("/project"),
+        session: "consent-overlap".into(),
+        method: "consent.test_timeout",
+        params: json!({}),
+        timeout: Duration::from_secs(5),
+    };
+    let first = tokio::spawn(transport.clone().send(call.clone()));
+    let second = tokio::spawn(transport.clone().send(call));
+    {
+        let (counts, _) = daemon
+            .counts
+            .1
+            .wait_timeout_while(
+                daemon.counts.0.lock().unwrap(),
+                Duration::from_secs(2),
+                |counts| counts.queries < 2,
+            )
+            .unwrap();
+        assert_eq!(counts.queries, 2);
+        assert_eq!(
+            counts.opens, 1,
+            "overlapping calls should lease the SDK's cached route"
+        );
+    }
+    first.abort();
+    let _ = first.await;
+    // A completed sibling must not close the route of the still-held await.
+    let sibling = ConsentCall {
+        scope: selector(&stamp("worker", "worker", Some("head"))),
+        project_root: PathBuf::from("/project"),
+        session: "consent-overlap".into(),
+        method: "consent.withdraw",
+        params: json!({}),
+        timeout: Duration::from_secs(1),
+    };
+    transport.clone().send(sibling).await.unwrap();
+    assert_eq!(daemon.counts.0.lock().unwrap().active, 1);
+
+    assert_eq!(transport.routes.lock().unwrap().len(), 1);
+    assert!(!second.is_finished());
+    second.abort();
+    let _ = second.await;
+    daemon.wait_closed();
+    assert_eq!(daemon.counts.0.lock().unwrap().closes, 1);
+    daemon.finish();
+}
+
+fn transport_consent_call(worker: &str, method: &'static str) -> ConsentCall {
+    ConsentCall {
+        scope: selector(&stamp(worker, "worker", Some("head"))),
+        project_root: PathBuf::from("/project"),
+        session: "consent-isolation".into(),
+        method,
+        params: json!({}),
+        timeout: Duration::from_secs(10),
+    }
+}
+
+async fn authenticated_consent_transport(
+    daemon: &crate::synapse_embed::route_tests::Daemon,
+) -> Arc<SubcConsentTransport> {
+    let consumer = subc_client_rs::SubcConsumer::connect(
+        &daemon.path,
+        subc_client_rs::ConsumerOptions::default(),
+    )
+    .await
+    .unwrap();
+    let transport = Arc::new(SubcConsentTransport::new(daemon.path.clone()));
+    *transport.consumer.lock().await = Some(Arc::new(consumer));
+    transport
+}
+
+async fn wait_consent_counts(
+    daemon: &crate::synapse_embed::route_tests::Daemon,
+    ready: impl Fn(&crate::synapse_embed::route_tests::Counts) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if ready(&daemon.counts.0.lock().unwrap()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected consent traffic did not reach the authenticated daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consent_held_open_does_not_block_another_scope_open_and_close() {
+    let held_call = transport_consent_call("worker-a", "consent.request");
+    let daemon = crate::synapse_embed::route_tests::Daemon::with_held_consent_open(
+        serde_json::to_value(&held_call.scope).unwrap(),
+    );
+    let transport = authenticated_consent_transport(&daemon).await;
+    let held = tokio::spawn(transport.clone().send(held_call));
+    wait_consent_counts(&daemon, |counts| counts.opens == 1).await;
+
+    let other = tokio::time::timeout(
+        Duration::from_secs(2),
+        transport
+            .clone()
+            .send(transport_consent_call("worker-b", "consent.request")),
+    )
+    .await;
+    // Keep the open reply gated until the independent call has finished and
+    // its Goodbye has reached the daemon, not merely until it has an answer.
+    assert!(other.is_ok(), "another scope stalled behind the held open");
+    assert_eq!(other.unwrap().unwrap(), json!({"ok":true}));
+    wait_consent_counts(&daemon, |counts| counts.closes == 1).await;
+    assert!(!held.is_finished(), "the route.open reply was not held");
+    assert_eq!(daemon.counts.0.lock().unwrap().opens, 2);
+    assert_eq!(daemon.counts.0.lock().unwrap().active, 1);
+
+    daemon.release_consent_open();
+    assert_eq!(held.await.unwrap().unwrap(), json!({"ok":true}));
+    daemon.wait_closed();
+    assert_eq!(daemon.counts.0.lock().unwrap().closes, 2);
+    assert!(transport.routes.lock().unwrap().is_empty());
+    daemon.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consent_answered_call_returns_while_another_scope_open_is_held() {
+    let held_call = transport_consent_call("worker-a", "consent.request");
+    let daemon = crate::synapse_embed::route_tests::Daemon::with_held_consent_open(
+        serde_json::to_value(&held_call.scope).unwrap(),
+    );
+    let transport = authenticated_consent_transport(&daemon).await;
+    let answered = tokio::spawn(
+        transport
+            .clone()
+            .send(transport_consent_call("worker-b", "consent.test_held")),
+    );
+    wait_consent_counts(&daemon, |counts| counts.queries == 1).await;
+    let held = tokio::spawn(transport.clone().send(held_call));
+    wait_consent_counts(&daemon, |counts| counts.opens == 2).await;
+    daemon.release_replies();
+
+    let result = tokio::time::timeout(Duration::from_secs(2), answered)
+        .await
+        .expect("an answered call could not release its route behind another scope's open");
+    assert_eq!(result.unwrap().unwrap(), json!({"ok":true}));
+    wait_consent_counts(&daemon, |counts| counts.closes == 1).await;
+    assert!(!held.is_finished(), "the route.open reply was not held");
+    assert_eq!(daemon.counts.0.lock().unwrap().active, 1);
+
+    daemon.release_consent_open();
+    held.await.unwrap().unwrap();
+    daemon.wait_closed();
+    assert_eq!(daemon.counts.0.lock().unwrap().closes, 2);
+    assert!(transport.routes.lock().unwrap().is_empty());
+    daemon.finish();
+}

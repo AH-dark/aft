@@ -161,6 +161,99 @@ fn declared_hold_budget(declared_reply: Option<Duration>) -> Duration {
 struct SubcConsentTransport {
     connection_file: PathBuf,
     consumer: tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>,
+    routes: StdMutex<HashMap<ConsentRouteKey, ConsentRouteEntry>>,
+}
+
+// subc-client-rs 0.28.0 consumer.rs: RouteKey and ScopeKey include the bind
+// identity and every selector field. Target, consumer identity, capabilities
+// and role versions are fixed for this transport's consent opens.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ConsentRouteKey {
+    project_root: PathBuf,
+    harness: String,
+    session: String,
+    scope_owner: String,
+    scope_ref: String,
+    scope_epoch: Option<u64>,
+}
+
+impl ConsentRouteKey {
+    fn new(identity: &subc_protocol::BindIdentity, scope: &ScopeSelector) -> Self {
+        Self {
+            project_root: identity.project_root.clone(),
+            harness: identity.harness.clone(),
+            session: identity.session.clone(),
+            scope_owner: serde_json::to_string(&scope.owner)
+                .unwrap_or_else(|_| format!("{:?}", scope.owner)),
+            scope_ref: scope.scope_ref.clone(),
+            scope_epoch: scope.scope_epoch,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConsentRouteState {
+    gate: tokio::sync::Mutex<()>,
+    leases: StdMutex<HashMap<subc_client_rs::RouteHandle, usize>>,
+}
+
+#[derive(Default)]
+struct ConsentRouteEntry {
+    state: Arc<ConsentRouteState>,
+    users: usize,
+}
+
+struct ConsentRouteIdentity {
+    transport: Arc<SubcConsentTransport>,
+    key: ConsentRouteKey,
+    state: Arc<ConsentRouteState>,
+}
+
+impl Drop for ConsentRouteIdentity {
+    fn drop(&mut self) {
+        let mut routes = self
+            .transport
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Queued opens retain the state too: removing it while a caller waits
+        // would let a new caller use a different lock for the same cached handle.
+        let entry = routes.get_mut(&self.key).expect("registered consent route");
+        entry.users -= 1;
+        if entry.users == 0 {
+            routes.remove(&self.key);
+        }
+    }
+}
+
+struct ConsentRoute {
+    consumer: Arc<subc_client_rs::SubcConsumer>,
+    route: Option<(subc_client_rs::RouteHandle, ConsentRouteIdentity)>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ConsentRoute {
+    async fn close(&mut self) {
+        if let Some((route, identity)) = self.route.take() {
+            let consumer = Arc::clone(&self.consumer);
+            // Finish decrement and close even if the consent call is cancelled.
+            let _ = self
+                .runtime
+                .spawn(async move { identity.release_route(&consumer, route).await })
+                .await;
+        }
+    }
+}
+
+impl Drop for ConsentRoute {
+    fn drop(&mut self) {
+        if let Some((route, identity)) = self.route.take() {
+            let consumer = Arc::clone(&self.consumer);
+            // A held consent.await can be cancelled when its asking route closes.
+            self.runtime
+                .spawn(async move { identity.release_route(&consumer, route).await });
+        }
+    }
 }
 
 impl SubcConsentTransport {
@@ -168,6 +261,7 @@ impl SubcConsentTransport {
         Self {
             connection_file,
             consumer: tokio::sync::Mutex::new(None),
+            routes: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -201,9 +295,59 @@ impl SubcConsentTransport {
             *slot = None;
         }
     }
+}
+
+impl ConsentRouteIdentity {
+    async fn release_route(
+        &self,
+        consumer: &subc_client_rs::SubcConsumer,
+        route: subc_client_rs::RouteHandle,
+    ) {
+        let _gate = self.state.gate.lock().await;
+        let last = {
+            let mut leases = self
+                .state
+                .leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(users) = leases.get_mut(&route) {
+                *users -= 1;
+                if *users == 0 {
+                    leases.remove(&route);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if last {
+            let _ = consumer
+                .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
+                .await;
+        }
+    }
+}
+
+impl SubcConsentTransport {
+    fn route_identity(self: &Arc<Self>, key: ConsentRouteKey) -> ConsentRouteIdentity {
+        let mut routes = self
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = routes.entry(key.clone()).or_default();
+        entry.users += 1;
+        ConsentRouteIdentity {
+            transport: Arc::clone(self),
+            key,
+            state: Arc::clone(&entry.state),
+        }
+    }
 
     async fn send(self: Arc<Self>, call: ConsentCall) -> Result<Value, ConsentError> {
         use subc_client_rs::{CallError, CallOptions};
+        let body = encode(call.method, &call.params)?;
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new(
             call.project_root.clone(),
@@ -219,6 +363,11 @@ impl SubcConsentTransport {
         // A refused scoped open is never retried unscoped: the daemon stamps
         // the asking route's scope onto Cingulate's route, and Cingulate reads
         // the asker and its head from that stamp.
+        // The SDK may return the same cached handle for overlapping calls with
+        // the same scope stamp. Lease it until the last call settles, then close
+        // immediately rather than leaving an idle consent route in the daemon.
+        let route_identity = self.route_identity(ConsentRouteKey::new(&identity, &call.scope));
+        let gate = route_identity.state.gate.lock().await;
         let route = match consumer
             .open_route_scoped(
                 RouteTarget::ManagementSurface {
@@ -238,16 +387,31 @@ impl SubcConsentTransport {
                 })
             }
             Err(error) => {
+                drop(gate);
                 self.forget(&consumer).await;
                 return Err(ConsentError::Unavailable(error.to_string()));
             }
         };
-        let body = encode(call.method, &call.params)?;
+        *route_identity
+            .state
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(route)
+            .or_default() += 1;
+        drop(gate);
+        let mut lease = ConsentRoute {
+            consumer: Arc::clone(&consumer),
+            route: Some((route, route_identity)),
+            runtime: tokio::runtime::Handle::current(),
+        };
         let options = CallOptions {
             timeout: call.timeout,
             ..CallOptions::default()
         };
-        match consumer.request(&route, body, options).await {
+        let reply = consumer.request(&route, body, options).await;
+        lease.close().await;
+        match reply {
             Ok(bytes) => decode_result(&bytes),
             Err(CallError::Module(body)) => Err(ConsentError::Refused {
                 code: body.code,
