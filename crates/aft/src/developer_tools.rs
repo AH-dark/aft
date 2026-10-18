@@ -158,6 +158,14 @@ impl Detector {
     /// dialog if run. Reuses marker reads while file metadata is unchanged;
     /// never executes the candidate.
     pub fn is_unusable_launcher(&self, path: &Path) -> bool {
+        self.is_unusable_launcher_with_reader(path, |path| std::fs::read(path))
+    }
+
+    fn is_unusable_launcher_with_reader(
+        &self,
+        path: &Path,
+        read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+    ) -> bool {
         if self.developer_tools_present || self.launcher_dirs.is_empty() {
             return false;
         }
@@ -187,11 +195,13 @@ impl Detector {
         #[cfg(test)]
         self.marker_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let decision = std::fs::read(&canonical)
-            .map(|bytes| contains_subslice(&bytes, XCSELECT_LIBRARY_MARKER))
-            // Unreadable file in /usr/bin on a Mac without tools: refusing it
-            // costs one feature; running it may open the dialog.
-            .unwrap_or(true);
+        let bytes = match read(&canonical) {
+            Ok(bytes) => bytes,
+            // Refuse an unreadable candidate because it may open the install
+            // dialog, but retry transient errors instead of caching a guess.
+            Err(_) => return true,
+        };
+        let decision = contains_subslice(&bytes, XCSELECT_LIBRARY_MARKER);
         cache.insert(canonical, (stamp, decision));
         decision
     }
@@ -347,6 +357,38 @@ pub fn is_unusable_launcher(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn u01_review_launcher_read_error_is_retried_without_metadata_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("git");
+        std::fs::write(&tool, b"a real tool without the launcher marker").unwrap();
+        let mut detector = Detector::new(vec![dir.path().to_path_buf()], false);
+        detector.require_xcselect_marker = true;
+        let before = LauncherStamp::from_metadata(&std::fs::metadata(&tool).unwrap());
+
+        assert!(detector.is_unusable_launcher_with_reader(&tool, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        }));
+        assert_eq!(
+            before,
+            LauncherStamp::from_metadata(&std::fs::metadata(&tool).unwrap())
+        );
+        assert!(!detector.is_unusable_launcher(&tool));
+        assert_eq!(
+            detector
+                .marker_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert!(!detector.is_unusable_launcher(&tool));
+        assert_eq!(
+            detector
+                .marker_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
 
     #[test]
     fn u01_launcher_marker_is_memoized_and_invalidated_by_file_replacement() {

@@ -186,7 +186,32 @@ pub fn pointer(path: &[&str]) -> String {
 /// Replace `path` with `contents` atomically: write a sibling temporary file,
 /// flush it, then rename it over the target. A reader sees either the old or
 /// the new file, never a partial write. Existing permissions are kept.
+/// A directory-sync failure after replacement is logged, not returned as an
+/// uncommitted write. Callers needing that warning use the richer internal API.
 pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(warning) = write_atomic_with_sync_warning(path, contents)? {
+        log::warn!(
+            "Config {} was updated, but syncing its directory failed: {warning}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Errors leave the target unchanged; success means the rename committed.
+/// A successful result may carry a warning that directory sync failed afterward.
+pub(crate) fn write_atomic_with_sync_warning(
+    path: &Path,
+    contents: &str,
+) -> std::io::Result<Option<std::io::Error>> {
+    write_atomic_with_sync_dir(path, contents, crate::durability::sync_dir)
+}
+
+pub(crate) fn write_atomic_with_sync_dir(
+    path: &Path,
+    contents: &str,
+    sync_dir: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<Option<std::io::Error>> {
     // Dotfile managers often link configs into a separate repository. Replace
     // the target file, not that link; a dangling link must fail without being lost.
     let resolved;
@@ -221,8 +246,9 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
             std::fs::set_permissions(&temp, metadata.permissions())?;
         }
         std::fs::rename(&temp, path)?;
-        crate::durability::sync_dir(parent)?;
-        Ok(())
+        // The rename is the commit point. A later durability failure cannot
+        // undo it, so callers must not treat that failure as an unapplied write.
+        Ok(sync_dir(parent).err())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -232,6 +258,43 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn u01_review_atomic_write_reports_committed_sync_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.jsonc");
+        std::fs::write(&path, "old").unwrap();
+        let warning = super::write_atomic_with_sync_dir(&path, "new", |_| {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory sync denied",
+            ))
+        })
+        .expect("the rename has already committed");
+        assert_eq!(
+            warning.unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn u01_review_atomic_write_pre_rename_failure_never_calls_directory_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.jsonc");
+        std::fs::create_dir(&path).unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = super::write_atomic_with_sync_dir(&path, "new", |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     use super::*;
     use serde_json::json;
 
