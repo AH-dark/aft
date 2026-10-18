@@ -7858,7 +7858,9 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
             .all(|push| push_seq(push) == Some(15)),
         "both bound routes should receive only the final status snapshot"
     );
-    send_route_goodbye(&mut stream, 7, 161).await;
+    // Keep route 7 bound through the sentinel: a third burst frame on either
+    // route would arrive before that route's sentinel and fail the check, so
+    // the one-frame-per-route claim covers frames queued after the first two.
     send_tool_call(
         &mut stream,
         6,
@@ -7872,11 +7874,14 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         160,
         "configure-burst-sentinel",
         "configure-burst",
-        HashSet::from([6]),
+        HashSet::from([6, 7]),
     )
     .await;
-    assert_eq!(sentinel_pushes.len(), 1);
-    assert_eq!(push_seq(&sentinel_pushes[0]), Some(16));
+    assert_eq!(sentinel_pushes.len(), 2);
+    assert!(sentinel_pushes
+        .iter()
+        .all(|push| push_seq(push) == Some(16)));
+    send_route_goodbye(&mut stream, 7, 161).await;
 
     send_connection_goodbye(&mut stream).await;
 }
