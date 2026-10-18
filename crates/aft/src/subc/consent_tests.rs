@@ -9,8 +9,25 @@ use crate::sandbox_spawn::{
 };
 
 /// Serializes the consent tests: they share the process-wide test transport
-/// and the test override for how long a call is held for an answer.
+/// and test overrides for the answer-hold and directory-probe budgets.
 static CONSENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(unix)]
+struct DirectoryScopeProbeBudgetOverride(u64);
+
+#[cfg(unix)]
+impl DirectoryScopeProbeBudgetOverride {
+    fn generous() -> Self {
+        Self(DIRECTORY_SCOPE_PROBE_OVERRIDE_MS.swap(10_000, Ordering::SeqCst))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryScopeProbeBudgetOverride {
+    fn drop(&mut self) {
+        DIRECTORY_SCOPE_PROBE_OVERRIDE_MS.store(self.0, Ordering::SeqCst);
+    }
+}
 
 #[derive(Default)]
 struct FakeState {
@@ -1152,14 +1169,16 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
 #[tokio::test]
 async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
+    const HANG_GUARD: Duration = Duration::from_secs(60);
     let f = fixture(FakeCingulate::up());
     let home = crate::environment::non_empty_os_var("HOME")
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .expect("an absolute home path for the scope probe");
-    let mut stalls = Vec::new();
-    let mut stalled_helpers = 0;
+    let gate = crate::bounded_io::stall_helper(&home);
+    let mut tasks = tokio::task::JoinSet::new();
     let started = Instant::now();
     // More requests than the shared filesystem pool can hold must still leave
     // room for unrelated reads while home canonicalization remains blocked.
@@ -1171,43 +1190,47 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
             operation: AccessOperation::Read,
         };
         let call = scope_probe_call(&f, &target);
-        let route = RouteHold::new(call.route);
-        let gate = crate::bounded_io::stall_helper(&home);
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            hold(&call, grant, Instant::now(), &route, None),
-        )
-        .await
-        .expect("a stalled or busy optional probe falls back without waiting");
-        assert!(matches!(result, Hold::Answer(_)));
-        stalled_helpers += usize::from(gate.reached.try_recv().is_ok());
-        stalls.push(gate);
-        let requests = f.fake.calls("consent.request");
-        let request = requests.last().expect("each request places a card");
-        assert_eq!(requests.len(), n + 1);
-        assert_eq!(request["pattern"], json!(target));
+        tasks.spawn(async move {
+            let route = RouteHold::new(call.route);
+            let result =
+                tokio::time::timeout(HANG_GUARD, hold(&call, grant, Instant::now(), &route, None))
+                    .await
+                    .expect("concurrent stalled probes must finish before the hang guard");
+            assert!(matches!(result, Hold::Answer(_)));
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 72);
+    for request in requests {
+        assert_eq!(request["pattern"], request["paths"][0]);
         assert_eq!(request["reason"], READ_FILE_SCOPE_REASON);
         assert_eq!(request["head_policy"], "allow");
         assert_eq!(request["operation"], "read");
     }
-    assert_eq!(
-        stalled_helpers, 1,
-        "timed-out home probes must retain the single-flight slot"
+    gate.reached
+        .try_recv()
+        .expect("one stalled home probe started");
+    assert!(
+        gate.reached.try_recv().is_err(),
+        "only one helper may probe the home"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "busy probes must not wait for another probe deadline"
+        started.elapsed() < HANG_GUARD,
+        "concurrent probes must share their wait, not take 72 serial probe budgets"
     );
     let unrelated = f.head_root.join("unrelated.txt");
     std::fs::write(&unrelated, "unrelated read").unwrap();
     let content = crate::bounded_io::run(
         &unrelated,
-        Some(Instant::now() + Duration::from_secs(1)),
+        Some(Instant::now() + HANG_GUARD),
         std::fs::read_to_string,
     )
     .expect("stalled home probes leave shared filesystem helpers available");
     assert_eq!(content, "unrelated read");
-    drop(stalls);
+    drop(gate);
     wait_for_scope_probe_idle().await;
     let next = AccessGrant {
         path: f.head_root.join("after-home-recovery.txt"),
@@ -1237,6 +1260,18 @@ async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
         grant: record.pending.unwrap(),
     };
     let call = Arc::new(scope_probe_call(&f, &target));
+    // Simulate a card answered after its directory memo has expired. A warm
+    // memo intentionally avoids filesystem work during settlement.
+    if let Some(probe) = DIRECTORY_SCOPE_PROBES
+        .lock()
+        .unwrap()
+        .probes
+        .get(&f.head_root)
+    {
+        if let Some((at, _)) = probe.answer.lock().unwrap().as_mut() {
+            *at -= DIRECTORY_SCOPE_MEMO_TTL;
+        }
+    }
     let gate = crate::bounded_io::stall_helper(&f.head_root);
     let running_call = Arc::clone(&call);
     let task = tokio::spawn(async move {
@@ -1431,6 +1466,261 @@ fn consent_scope_rejects_drive_and_unc_volume_boundaries() {
 
 #[cfg(unix)]
 #[test]
+fn consent_scope_four_concurrent_cards_share_directory_probe() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let threads = ["generate.py", "qr.json", "responder.json", "README.md"].map(|name| {
+        let grant = AccessGrant {
+            path: f.head_root.join(name),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let barrier = Arc::clone(&barrier);
+        let probes = Arc::clone(&probes);
+        std::thread::spawn(move || {
+            barrier.wait();
+            let scope = read_directory_scope_with(&grant, move |directory, root| {
+                if directory.ancestors().last() == Some(root) {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    // Keep the first probe open while sibling requests arrive.
+                    std::thread::sleep(Duration::from_millis(75));
+                }
+                Some(false)
+            });
+            (grant, scope)
+        })
+    });
+    let db = f.ctx.db().unwrap();
+    for thread in threads {
+        let (grant, scope) = thread.join().unwrap();
+        let Prep::Ask(prep) = prepare(
+            &db,
+            &f.ctx,
+            &f.worker,
+            "read",
+            &json!({"path": grant.path}),
+            &grant,
+            &scope,
+            None,
+        )
+        .unwrap() else {
+            panic!("expected a read card");
+        };
+        assert_eq!(
+            prep.request["pattern"],
+            json!(format!("{}/**", f.head_root.display()))
+        );
+        assert_eq!(prep.request["reason"], READ_TREE_SCOPE_REASON);
+    }
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        1,
+        "all four cards share one probe"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_sibling_card_reuses_memoized_probe() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    std::fs::create_dir_all(&parent).unwrap();
+    let probes = Arc::new(AtomicUsize::new(0));
+    let mut previous_count = 0;
+    for name in ["first.txt", "sibling.txt"] {
+        let counter = Arc::clone(&probes);
+        let scope = read_directory_scope_with(
+            &AccessGrant {
+                path: parent.join(name),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            },
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some(false)
+            },
+        );
+        assert_eq!(scope.path, parent);
+        assert_eq!(scope.kind, GrantKind::Subtree);
+        let count = probes.load(Ordering::SeqCst);
+        if previous_count > 0 {
+            assert_eq!(
+                count, previous_count,
+                "sibling must reuse the directory answer"
+            );
+        }
+        previous_count = count;
+    }
+    assert!(previous_count > 0, "the initial card must probe");
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_unknown_alias_answer_is_not_memoized() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    std::fs::create_dir_all(&parent).unwrap();
+    let probes = Arc::new(AtomicUsize::new(0));
+    for name in ["first.txt", "sibling.txt"] {
+        let grant = AccessGrant {
+            path: parent.join(name),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let counter = Arc::clone(&probes);
+        assert_eq!(
+            read_directory_scope_with(&grant, move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+            grant
+        );
+    }
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        2,
+        "unknown answers must be retried"
+    );
+    let state = DIRECTORY_SCOPE_PROBES.lock().unwrap();
+    assert_eq!(
+        state
+            .logged
+            .keys()
+            .filter(|(path, _)| path == &parent)
+            .count(),
+        1,
+        "repeat unknown fallbacks log only once per directory and reason"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    std::fs::create_dir_all(&parent).unwrap();
+    let grant = AccessGrant {
+        path: parent.join("first.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    assert_eq!(
+        read_directory_scope_with(&grant, |_, _| Some(false)).kind,
+        GrantKind::Subtree
+    );
+    let probe = Arc::clone(&DIRECTORY_SCOPE_PROBES.lock().unwrap().probes[&parent]);
+    probe.answer.lock().unwrap().as_mut().unwrap().0 -= DIRECTORY_SCOPE_MEMO_TTL;
+    let sibling = AccessGrant {
+        path: parent.join("sibling.txt"),
+        ..grant
+    };
+    assert_eq!(
+        read_directory_scope_with(&sibling, |_, _| Some(true)),
+        sibling,
+        "an expired safe answer must not hide a newly unsafe alias"
+    );
+    let other = AccessGrant {
+        path: parent.join("other.txt"),
+        ..sibling
+    };
+    assert_eq!(
+        read_directory_scope_with(&other, |_, _| panic!("unsafe answer should be memoized")),
+        other,
+        "a memoized file-only answer must keep the current caller's file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_waits_for_other_directory_probe_permit() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    std::fs::create_dir_all(&parent).unwrap();
+    let permit = DIRECTORY_SCOPE_PROBE_LIMITER.try_acquire().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(75));
+        drop(permit);
+    });
+    let scope = read_directory_scope_with(
+        &AccessGrant {
+            path: parent.join("file.txt"),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        },
+        |_, _| Some(false),
+    );
+    release.join().unwrap();
+    assert_eq!(scope.path, parent);
+    assert_eq!(scope.kind, GrantKind::Subtree);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_timed_out_probe_is_not_memoized() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    assert_eq!(directory_scope_probe_budget(), Duration::from_millis(250));
+    let dir = tempfile::tempdir().unwrap();
+    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    std::fs::create_dir_all(&parent).unwrap();
+    let grant = AccessGrant {
+        path: parent.join("first.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let probes = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&probes);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let first = grant.clone();
+    let scope = tokio::task::spawn_blocking(move || {
+        read_directory_scope_with(&first, move |_, _| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            Some(false)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(scope, grant, "timeout must fail toward the file-only grant");
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "the timed-out probe ran");
+    release_tx.send(()).unwrap();
+    wait_for_scope_probe_idle().await;
+    let count_before = probes.load(Ordering::SeqCst);
+    let counter = Arc::clone(&probes);
+    let sibling = AccessGrant {
+        path: parent.join("sibling.txt"),
+        ..grant
+    };
+    let scope = read_directory_scope_with(&sibling, move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some(false)
+    });
+    assert_eq!(scope.kind, GrantKind::Subtree);
+    assert!(
+        probes.load(Ordering::SeqCst) > count_before,
+        "timeout must not be memoized, even when its helper later succeeds"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -1521,8 +1811,8 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
         std::thread::yield_now();
     }
     // The alias scan finishing does not end the first probe: its helper still
-    // holds the process-wide probe slot until it returns. A busy slot yields a
-    // file-only scope by design, so recovery is only observable once it is free.
+    // holds the process-wide probe slot until it returns. Wait for that helper
+    // so the recovery check starts with its full filesystem-probe budget.
     while DIRECTORY_SCOPE_PROBE_LIMITER
         .in_flight
         .load(Ordering::Acquire)
