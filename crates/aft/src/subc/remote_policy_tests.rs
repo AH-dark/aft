@@ -1,5 +1,334 @@
 use super::*;
+use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
 use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+#[path = "confine_tests.rs"]
+mod confine_tests;
+
+#[test]
+fn confined_catalog_offers_only_root_readers() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "designer", 7, true);
+    let answer = catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &route,
+        &ctx,
+    )
+    .unwrap();
+    let names: std::collections::BTreeSet<_> = answer["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["read", "grep", "glob", "aft_outline"]
+            .into_iter()
+            .collect()
+    );
+}
+
+/// Run one read-only tool as the route's worker would, under its saved
+/// confinement, and return the native response.
+fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Response {
+    let _scope = crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(route)));
+    let _ask =
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
+            once: vec![],
+        }));
+    let format =
+        crate::subc_format::FormatContext::from_tool_call(name, &args, &route.project_root);
+    let tool_ctx = ToolCallContext {
+        project_root: route.project_root.clone(),
+        session_id: Some(route.session.clone()),
+        request_id: "confine-vector".into(),
+        diagnostics_on_edit: false,
+        preview: false,
+        edit_slot_survives: None,
+        report_registration_downgrade: false,
+        standard_edit_grammar: true,
+        disabled_tools: Some(route.disabled_tools.clone()),
+        worker_session: true,
+        host_tool_names: None,
+    };
+    with_call_policy(ctx, route, &tool_ctx.request_id, name, args, |args| {
+        let ToolCallOutcome::Unary(result) = run_tool_call(
+            name,
+            args,
+            &format,
+            &tool_ctx,
+            ctx,
+            &|request, ctx| match request.command.as_str() {
+                "read" => crate::commands::read::handle_read(&request, ctx),
+                "grep" => crate::commands::grep::handle_grep(&request, ctx),
+                "glob" => crate::commands::glob::handle_glob(&request, ctx),
+                "outline" => crate::commands::outline::handle_outline(&request, ctx),
+                _ => Response::success(&request.id, json!({"unexpected_dispatch": true})),
+            },
+            None,
+            None,
+        );
+        result.response
+    })
+    .unwrap_or_else(|response| response)
+}
+
+/// A confined glob without `path` walks from the canonicalized project root.
+/// On Windows that spelling keeps the `\\?\` prefix the read gate's root
+/// lacks; the tree's own ignore files must apply all the same, at the root
+/// and in a subdirectory.
+#[test]
+fn confined_glob_without_path_honors_the_trees_gitignore() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".gitignore"), "hidden.rs\n").unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::write(root.path().join("nested/.gitignore"), "deep_hidden.rs\n").unwrap();
+    for file in [
+        "visible.rs",
+        "hidden.rs",
+        "nested/deep_visible.rs",
+        "nested/deep_hidden.rs",
+    ] {
+        std::fs::write(root.path().join(file), "fn token() {}\n").unwrap();
+    }
+    let ctx = context(root.path(), storage.path(), None);
+    ctx.update_config(|config| config.restrict_to_project_root = false);
+    let route = identity(root.path(), "designer", 7, true);
+    catalog(
+        json!({"preset":"worker", "params":{"confine":"root"}}),
+        &route,
+        &ctx,
+    )
+    .unwrap();
+    let response = call(&ctx, &route, "glob", json!({"pattern": "**/*.rs"}));
+    assert!(response.success, "{response:?}");
+    let native = serde_json::to_string(&response).unwrap();
+    for expected in ["visible.rs", "deep_visible.rs"] {
+        assert!(native.contains(expected), "{expected} missing: {native}");
+    }
+    // `hidden.rs` also matches inside `deep_hidden.rs`.
+    assert!(
+        !native.contains("hidden.rs"),
+        "an ignored file was listed: {native}"
+    );
+}
+
+/// An unconfined answer is remembered, but saving `confine: "root"` for the
+/// worker, whether a catalog fetch asks for it or it is carried forward from
+/// an older epoch's saved policy, takes effect on the worker's very next call.
+#[test]
+fn remembered_unconfined_answer_cannot_outlive_a_confining_save() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    let unconfined_plan = || json!({"preset":"worker", "params":{"remote_exec":{"enabled":true}}});
+    // The newer epoch saves an unconfined plan; both epochs read as unconfined
+    // and are remembered so.
+    catalog(unconfined_plan(), &newer, &ctx).unwrap();
+    for route in [&older, &newer] {
+        assert_eq!(confined(&ctx, route), Ok(false));
+        assert_eq!(confinement_from_memory(&ctx, route), Some(Ok(false)));
+    }
+
+    // A confining fetch on the older epoch: its next call is confined,
+    // answered from memory without reading aft.db.
+    catalog(
+        json!({"preset":"worker", "params":{"confine":"root"}}),
+        &older,
+        &ctx,
+    )
+    .unwrap();
+    let reads = ctx.policy_confinement_reads_for_test();
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &older, "bash", None)
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
+
+    // The newer epoch's own row is still unconfined, so it reads (and is
+    // remembered) as unconfined until its next fetch carries the older
+    // epoch's fence forward onto that row.
+    assert_eq!(confined(&ctx, &newer), Ok(false));
+    assert_eq!(confinement_from_memory(&ctx, &newer), Some(Ok(false)));
+    catalog(unconfined_plan(), &newer, &ctx).unwrap();
+    let reads = ctx.policy_confinement_reads_for_test();
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", None)
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
+}
+
+/// A worker's later epoch with no saved row of its own reads the older
+/// epoch's row. If a save of `confine: "root"` for the older epoch lands
+/// during that read, even the racing call must observe the saved fence.
+#[test]
+fn unconfined_read_racing_a_confining_save_is_not_remembered() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    let delayed = identity(root.path(), "designer", 9, true);
+    let db = ctx.db().unwrap();
+    let delayed_key = key(&delayed, Some("worker")).unwrap();
+    let generation = ctx.policy_confinement_generation();
+    assert!(!store::confined(&db.lock().unwrap(), &delayed_key).unwrap());
+    let saving = older.clone();
+    ctx.after_next_policy_read_for_test(move |ctx| {
+        catalog(
+            json!({"preset":"worker", "params":{"confine":"root"}}),
+            &saving,
+            ctx,
+        )
+        .unwrap();
+    });
+    // No row is saved yet, so the newer epoch reads as unconfined; the older
+    // epoch's confining save then commits before that answer is remembered.
+    let read = confined(&ctx, &newer);
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", Some(&read))
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(read, Ok(true));
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 2);
+    assert_eq!(confinement_from_memory(&ctx, &older), Some(Ok(true)));
+    assert_eq!(confinement_from_memory(&ctx, &newer), Some(Ok(true)));
+    let reads = ctx.policy_confinement_reads_for_test();
+    assert_eq!(
+        admit_confined(&ctx, &newer, "bash").unwrap_err().code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", None)
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+
+    // The other read finished before the save, but has not been memoized yet.
+    // Even with read retries, memoization must reject a stale generation: a
+    // save can land after the retry's generation check and before remembering.
+    ctx.remember_unconfined_policy_key(delayed_key, generation, &db);
+    assert_eq!(
+        confinement_from_memory(&ctx, &delayed),
+        None,
+        "an unconfined answer read before a confining save was remembered"
+    );
+    assert_eq!(confined(&ctx, &delayed), Ok(true));
+}
+
+#[test]
+fn confine_bash_admission_racing_a_confining_save_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    ctx.after_next_policy_read_for_test(move |ctx| {
+        catalog(
+            json!({"preset":"worker", "params":{"confine":"root"}}),
+            &older,
+            ctx,
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        admit_confined(&ctx, &newer, "bash").unwrap_err().code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 2);
+}
+
+#[test]
+fn confine_lookup_fails_closed_when_generation_keeps_changing() {
+    fn invalidate_next_read(ctx: &AppContext, key: store::PolicyKey) {
+        ctx.after_next_policy_read_for_test(move |ctx| {
+            ctx.remember_confined_policy_key(key.clone());
+            invalidate_next_read(ctx, key);
+        });
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    invalidate_next_read(&ctx, key(&older, Some("worker")).unwrap());
+    let read = confined(&ctx, &newer);
+    assert_eq!(
+        read.as_ref().unwrap_err().code,
+        "confine_policy_unavailable"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 3);
+    assert_eq!(confinement_from_memory(&ctx, &newer), None);
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", Some(&read))
+            .unwrap_err()
+            .code,
+        "confine_policy_unavailable"
+    );
+}
+
+#[test]
+fn confine_lookup_never_waits_for_the_database_handle_slot_on_the_frame_loop() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context(root.path(), storage.path(), None));
+    let route = identity(root.path(), "designer", 7, true);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let app = ctx.app();
+    let holder = std::thread::spawn(move || {
+        app.with_database_slot_locked_for_test(|| {
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    let answer = confinement_from_memory(&ctx, &route);
+    let elapsed = started.elapsed();
+
+    let (answer_tx, answer_rx) = mpsc::channel();
+    let reading = Arc::clone(&ctx);
+    let background = std::thread::spawn(move || {
+        answer_tx.send(confined(&reading, &route)).unwrap();
+    });
+    let before_release = answer_rx.recv_timeout(Duration::from_millis(50));
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    background.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "frame loop waited {elapsed:?}"
+    );
+    assert_eq!(answer, None);
+    assert_eq!(before_release, Err(mpsc::RecvTimeoutError::Timeout));
+    assert_eq!(
+        answer_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Ok(false)
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
+}
 
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {
     let scope=serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"worker","scope_epoch":epoch,"kind":"worker","owner_authorized":true})).unwrap();
@@ -61,6 +390,119 @@ fn context_with_switch(
         crate::db::open(&storage.join("aft.db")).unwrap(),
     )));
     ctx
+}
+
+/// A context with no aft.db handle and persistence never configured. Tests
+/// move its database runtime state to opening or failed when they need to.
+fn context_without_database(root: &Path, storage: &Path) -> AppContext {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.into());
+    config.storage_dir = Some(storage.into());
+    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+}
+
+#[test]
+fn confine_lookup_without_configured_persistence_is_unconfined() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_without_database(root.path(), storage.path());
+    let route = identity(root.path(), "ordinary-worker", 7, true);
+    assert!(key(&route, Some("worker")).is_some());
+    assert!(!confined(&ctx, &route).unwrap());
+    assert!(!admit_confined(&ctx, &route, "bash").unwrap());
+    assert!(!admit_confined(&ctx, &route, "read").unwrap());
+}
+
+#[test]
+fn confine_lookup_refuses_while_database_opens_or_after_it_failed() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_without_database(root.path(), storage.path());
+    let route = identity(root.path(), "designer", 7, true);
+    ctx.mark_database_runtime_initializing_for_test();
+    assert!(awaits_policy_store(&ctx, &route));
+    assert!(!awaits_policy_store(
+        &ctx,
+        &identity(root.path(), "unscoped", 7, false)
+    ));
+    assert_eq!(
+        confined(&ctx, &route).unwrap_err().code,
+        "confine_policy_unavailable"
+    );
+    ctx.finish_database_runtime_error("database cannot open".into(), false);
+    assert!(!awaits_policy_store(&ctx, &route));
+    for name in ["read", "bash"] {
+        assert_eq!(
+            admit_confined(&ctx, &route, name).unwrap_err().code,
+            "confine_policy_unavailable",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn confine_lookup_takes_no_write_lock_and_copies_no_row() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &identity(root.path(), "designer", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    // A second process: nothing cached, its own connection, and no waiting
+    // for a lock, so a write transaction here fails at once.
+    let restarted = context(root.path(), storage.path(), None);
+    restarted
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .busy_timeout(Duration::ZERO)
+        .unwrap();
+    let writer = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let rebound = identity(root.path(), "designer", 8, true);
+    assert!(confined(&restarted, &rebound).unwrap());
+    assert_eq!(
+        admit_confined(&restarted, &rebound, "bash")
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    let copied: i64 = writer
+        .query_row(
+            "SELECT COUNT(*) FROM remote_exec_policies WHERE epoch='8'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copied, 0, "a per-call lookup carried a row forward");
+}
+
+#[test]
+fn confine_answer_is_kept_once_confined() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "designer", 7, true);
+    let ordinary = identity(root.path(), "ordinary-worker", 7, true);
+    catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &route,
+        &ctx,
+    )
+    .unwrap();
+    assert!(confined(&ctx, &route).unwrap());
+    assert!(!confined(&ctx, &ordinary).unwrap());
+    // With the store gone, only the remembered answer can keep the fence.
+    ctx.clear_db();
+    assert!(confined(&ctx, &route).unwrap());
+    ctx.mark_database_runtime_initializing_for_test();
+    assert!(!awaits_policy_store(&ctx, &route));
+    assert!(awaits_policy_store(&ctx, &ordinary));
 }
 
 fn plan(name: &str) -> Value {
@@ -756,6 +1198,13 @@ async fn exercise_catalog_remote_bash(
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root_id.clone(), Arc::new(ctx)));
     let routes = HashMap::from([(route_key(42, 1), bind)]);
+    // The frame loop reads the worker's saved confinement off the loop before
+    // admission; this route saved none.
+    let confinement = confined(
+        &executor.actor_context(&root_id).unwrap(),
+        &routes[&route_key(42, 1)],
+    );
+    assert_eq!(confinement, Ok(false));
     let call = Frame::build(
         FrameType::Request,
         control_flags(),
@@ -779,6 +1228,7 @@ async fn exercise_catalog_remote_bash(
         &writer,
         &call,
         None,
+        Some(confinement),
         PhaseTrace::new(Instant::now()),
         &routes,
         &HashMap::new(),
