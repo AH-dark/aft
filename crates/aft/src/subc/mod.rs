@@ -11041,7 +11041,14 @@ pub(crate) mod test_support {
             foreground_wait_window_ms: 200,
             ..Config::default()
         };
-        config.bash.worker_wait_max_ms = 200;
+        // `wait: true` uses this cap even for primary sessions. Only hand-back
+        // cases should race it; terminal cases use the outer timeout as a hang
+        // guard, not a 200 ms deadline competing with shell startup and exit.
+        config.bash.worker_wait_max_ms = if expected_status == "running" {
+            200
+        } else {
+            30_000
+        };
         let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         struct ShutdownOnDrop(crate::bash_background::BgTaskRegistry);
