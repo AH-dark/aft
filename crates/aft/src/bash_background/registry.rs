@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use crate::posix_spawn::Child;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(not(windows))]
 use std::ffi::OsString;
@@ -6,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(unix)]
@@ -200,7 +203,7 @@ fn terminate_piped_task(
     task_id: &str,
     pgid: Option<i32>,
     child_pid: Option<u32>,
-    child: Option<&mut Child>,
+    #[allow(unused_mut)] mut child: Option<&mut Child>,
 ) {
     #[cfg(all(test, unix))]
     if TERM_ONLY_KILL_TASKS
@@ -219,7 +222,11 @@ fn terminate_piped_task(
     {
         let _ = child_pid;
         if let Some(pgid) = pgid {
-            terminate_pgid(pgid, child);
+            super::process::terminate_pgid_with(pgid, || {
+                child
+                    .as_deref_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+            });
         }
     }
     #[cfg(windows)]
@@ -1207,6 +1214,8 @@ impl BgTaskRegistry {
     }
 
     pub fn new(progress_sender: SharedProgressSender) -> Self {
+        #[cfg(unix)]
+        crate::posix_spawn::initialize();
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         Self {
             inner: Arc::new(RegistryInner {
@@ -11551,7 +11560,7 @@ fn spawn_detached_child(
     capture_pipeline_status: bool,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
     #[cfg(unix)] identity_gate: LocalIdentityGate,
-) -> Result<std::process::Child, String> {
+) -> Result<Child, String> {
     #[cfg(windows)]
     let _ = capture_pipeline_status;
     #[cfg(not(windows))]
@@ -11632,23 +11641,22 @@ fn spawn_detached_child(
             crate::sandbox_spawn::CHILD_EXIT_FD,
             crate::sandbox_spawn::CHILD_FAILURE_FD,
         )?;
-        crate::sandbox_spawn::apply_marker_fd_allowlist(
-            &mut child_command,
-            exit.as_raw_fd(),
-            failure.as_raw_fd(),
-        )?;
-        child_command
-            .current_dir(workdir)
-            .stdin(match identity_gate {
-                LocalIdentityGate::Required => Stdio::piped(),
-                LocalIdentityGate::CommittedFallback => Stdio::null(),
-            })
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+        child_command.current_dir(workdir);
         crate::agent_child_env::apply_to_command(&mut child_command, env);
         crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
-        crate::sandbox_spawn::disclaim_command_for_plan(spawn_plan, &mut child_command, env)?;
-        let child = child_command.spawn().map_err(|error| {
+        let child = crate::sandbox_spawn::spawn_detached_for_plan(
+            spawn_plan,
+            &mut child_command,
+            env,
+            &crate::posix_spawn::PipeIo {
+                gated_stdin: matches!(identity_gate, LocalIdentityGate::Required),
+                stdout: &stdout,
+                stderr: &stderr,
+                exit: exit.as_raw_fd(),
+                failure: failure.as_raw_fd(),
+            },
+        )
+        .map_err(|error| {
             super::format_spawn_failure(
                 "failed to spawn background bash command",
                 Path::new(child_command.get_program()),
@@ -11850,6 +11858,10 @@ fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
         output.push_str(&report);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "spawn_tests.rs"]
+mod spawn_tests;
 
 #[cfg(test)]
 #[path = "default_kill_test.rs"]
@@ -12388,7 +12400,7 @@ mod tests {
             let mut state = task.lock_state().unwrap();
             state.metadata.mark_running(child.id(), child.id() as i32);
             state.metadata.timeout_ms = Some(0);
-            state.runtime = TaskRuntime::Piped(Some(child));
+            state.runtime = TaskRuntime::Piped(Some(child.into()));
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
         registry
@@ -14951,7 +14963,7 @@ mod tests {
 
     #[test]
     fn terminal_child_reaper_observes_exit_before_releasing_handle() {
-        let mut child = Some(spawn_dead_child());
+        let mut child = Some(spawn_dead_child().into());
 
         assert!(
             reap_piped_child(&mut child),
@@ -16044,7 +16056,7 @@ mod tests {
             .insert_rehydrated_task(metadata, layout.paths.clone(), false)
             .unwrap();
         let task = registry.task_for_session(&task_id, "session").unwrap();
-        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child));
+        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child.into()));
 
         // Sanity: task is still Running per metadata (replay/poll hasn't
         // observed the missing marker yet).
@@ -16185,7 +16197,7 @@ mod tests {
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             if matches!(state.runtime, TaskRuntime::Piped(None)) {
-                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child()));
+                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child().into()));
             }
         }
         *task.terminal_at.lock().unwrap() = None;
@@ -16341,7 +16353,7 @@ mod tests {
                 .expect("persist reset Running metadata");
             let zombie = spawn_unreaped_zombie();
             zombie_pid = zombie.id();
-            state.runtime = TaskRuntime::Piped(Some(zombie));
+            state.runtime = TaskRuntime::Piped(Some(zombie.into()));
         }
         *task.terminal_at.lock().unwrap() = None;
 
@@ -16571,7 +16583,7 @@ mod tests {
                 .expect("persist reset Running metadata");
             let zombie = spawn_unreaped_zombie();
             zombie_pid = zombie.id();
-            state.runtime = TaskRuntime::Piped(Some(zombie));
+            state.runtime = TaskRuntime::Piped(Some(zombie.into()));
         }
         *task.terminal_at.lock().unwrap() = None;
 

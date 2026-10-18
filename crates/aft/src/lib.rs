@@ -140,6 +140,8 @@ pub mod pattern_compile;
 pub mod persisted_format;
 pub mod pins;
 mod platform_tls;
+#[cfg(unix)]
+pub(crate) mod posix_spawn;
 mod privacy_spawn;
 #[doc(hidden)]
 pub mod private_storage;

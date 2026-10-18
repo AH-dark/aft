@@ -2778,6 +2778,20 @@ fn build_health_report_with_indexing(
         json!(backup_skipped_temp_path_total),
     );
     metrics.insert("reap".to_string(), dispatch_path_metrics.reap_snapshot());
+    #[cfg(unix)]
+    {
+        let spawn = crate::posix_spawn::health();
+        metrics.insert("bash_spawn".to_string(), spawn["backend"].clone());
+        metrics.insert(
+            "bash_spawn_missing_capability".to_string(),
+            spawn["missing_capability"].clone(),
+        );
+        metrics.insert(
+            "bash_spawn_fallback_spawns".to_string(),
+            spawn["fallback_spawns"].clone(),
+        );
+        metrics.insert("bash_pty_spawn".to_string(), spawn["pty_backend"].clone());
+    }
     metrics.insert(
         "cold_build_limiter".to_string(),
         render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),
@@ -4774,6 +4788,33 @@ mod tests {
         assert!(line.contains("state=executing"));
         assert!(line.contains("age_ms="));
         assert!(line.contains(&format!("root={root}")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_posix_spawn_health_reports_forced_fallback() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = crate::context::App::default_shared();
+        let cache = HealthRollupCache::new();
+        crate::posix_spawn::FORCE_FALLBACK.set(true);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::posix_spawn::FORCE_FALLBACK.set(false);
+            }
+        }
+        let _reset = Reset;
+        let health = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .unwrap();
+        assert_eq!(health["bash_spawn"], "fork_fallback");
+        assert!(health["bash_spawn_missing_capability"]
+            .as_str()
+            .unwrap()
+            .contains("test-forced"));
+        assert!(health["bash_spawn_fallback_spawns"].is_u64());
+        assert_eq!(health["bash_pty_spawn"], "fork");
     }
 
     #[test]

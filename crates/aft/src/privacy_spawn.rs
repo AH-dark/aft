@@ -1,9 +1,9 @@
 //! macOS privacy boundary for agent commands, not AFT's own file/index work.
 //!
-//! Keep Rust's child ownership, error pipe, stdio, cwd and existing pre-exec
-//! setup. The final pre-exec hook uses posix_spawn(SETEXEC) instead of execve:
-//! it replaces that same PID with responsibility disclaimed. There is no
-//! intermediate executable, nor agent-controlled code before the boundary.
+//! Pipe children apply the disclaim attribute directly to posix_spawn. Legacy
+//! std/PTY children use a final pre-exec posix_spawn(SETEXEC) instead of execve,
+//! retaining their PID and terminal setup. Neither path runs agent-controlled
+//! code before the privacy boundary.
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -27,6 +27,24 @@ pub(crate) fn install(
         return macos::install(command, environment_cleared, false);
     }
     let _ = (command, enabled, environment_cleared);
+    Ok(())
+}
+
+/// Apply the privacy boundary directly to an ordinary spawn's attributes.
+#[cfg(unix)]
+pub(crate) fn apply_spawn_attribute(
+    attrs: &mut libc::posix_spawnattr_t,
+    enabled: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if enabled {
+        let disclaim = macos::resolve().map_err(std::io::Error::other)?;
+        let rc = unsafe { disclaim(attrs, 1) };
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+    }
+    let _ = (attrs, enabled);
     Ok(())
 }
 
@@ -159,7 +177,7 @@ mod macos {
         pub(super) static HOOK: std::cell::Cell<Option<Option<Disclaim>>> = const { std::cell::Cell::new(None) };
     }
 
-    fn resolve() -> Result<Disclaim, String> {
+    pub(super) fn resolve() -> Result<Disclaim, String> {
         #[cfg(test)]
         if let Some(hook) = HOOK.get() {
             return hook
@@ -405,6 +423,58 @@ mod tests {
             let output = command.output().unwrap();
             assert_eq!(output.stdout, b"disclaimed");
             assert_eq!(output.status.code(), Some(23));
+        });
+    }
+    #[test]
+    fn native_pipe_spawn_applies_privacy_before_exec() {
+        hook(Some(capture), || {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::fs::File::create(dir.path().join("output")).unwrap();
+            use std::os::fd::AsRawFd;
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .env_clear()
+                .env("AFT_RESPONSIBILITY_CHILD", "1")
+                .args([
+                    "--exact",
+                    "privacy_spawn::tests::responsible_child",
+                    "--nocapture",
+                ]);
+            let mut child = crate::posix_spawn::try_spawn(
+                &command,
+                true,
+                true,
+                &crate::posix_spawn::PipeIo {
+                    gated_stdin: false,
+                    stdout: &output,
+                    stderr: &output,
+                    exit: output.as_raw_fd(),
+                    failure: output.as_raw_fd(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(FLAG.load(Ordering::SeqCst), 1);
+            assert!(
+                child.wait().unwrap().success(),
+                "{}",
+                std::fs::read_to_string(dir.path().join("output")).unwrap()
+            );
+        });
+    }
+    #[test]
+    fn native_pipe_spawn_missing_privacy_symbol_refuses() {
+        hook(None, || {
+            let mut attr = std::ptr::null_mut();
+            assert_eq!(unsafe { libc::posix_spawnattr_init(&mut attr) }, 0);
+            let result = apply_spawn_attribute(&mut attr, true);
+            unsafe {
+                libc::posix_spawnattr_destroy(&mut attr);
+            }
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("privacy disclaim unavailable"));
         });
     }
     #[test]
