@@ -89,13 +89,16 @@ fn run_checkout_verification_with_deadline(
 }
 
 /// When the watchdog's deadline starts. The real test bounds everything from
-/// the moment the worker is spawned. The watchdog's own self-test starts the
-/// clock at the worker's first phase report, so a runner slow to start the
-/// worker cannot turn "timed out during <phase>" into "during starting worker".
+/// the moment the worker is spawned. The watchdog's own self-tests start the
+/// clock later, under a generous setup guard, so a slow runner cannot turn
+/// "timed out during <phase>" into an earlier phase, and a short deadline
+/// keeps them fast: `FirstPhase` at the worker's first report, `AtPhase` once
+/// the named phase is reported.
 #[derive(Clone, Copy)]
 enum DeadlineStart {
     Spawn,
     FirstPhase,
+    AtPhase(&'static str),
 }
 
 /// Phases the verification worker has entered, in order. Consecutive reports
@@ -175,14 +178,31 @@ fn run_checkout_verification_watchdog(
         .expect("spawn inspect warm verification worker");
 
     let mut timeline = PhaseTimeline::default();
-    if matches!(start, DeadlineStart::FirstPhase) {
-        // A generous hang guard for the worker to start; the deadline under
-        // test begins only once it has reported its first phase.
-        match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Progress::Phase(first, at)) => timeline.enter(&first, at - started),
-            Ok(Progress::Finished(Ok(()))) => return,
-            Ok(Progress::Finished(Err(panic))) => std::panic::resume_unwind(panic),
-            Err(error) => panic!("inspect warm verification worker never started: {error}"),
+    if !matches!(start, DeadlineStart::Spawn) {
+        // A generous hang guard for setup; the deadline under test begins
+        // only once the worker reports the phase that starts it.
+        let setup_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let remaining = setup_deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(Progress::Phase(phase, at)) => {
+                    timeline.enter(&phase, at - started);
+                    let starts_deadline = match start {
+                        DeadlineStart::AtPhase(name) => phase == name,
+                        _ => true,
+                    };
+                    if starts_deadline {
+                        break;
+                    }
+                }
+                Ok(Progress::Finished(Ok(()))) => return,
+                Ok(Progress::Finished(Err(panic))) => std::panic::resume_unwind(panic),
+                Err(error) => panic!(
+                    "inspect warm verification never reached the phase that starts its deadline \
+                     ({error}); timeline: {}",
+                    timeline.render()
+                ),
+            }
         }
         deadline = Instant::now() + timeout;
     }
@@ -451,12 +471,12 @@ fn checkout_verification_deadline_names_the_stalled_publication_step() {
     let (project, storage, _job, request) = view_projection_fixture();
     let (release, held) = std::sync::mpsc::channel();
     let result = std::panic::catch_unwind(|| {
-        // Thirty seconds covers a two-file publication up to the hold (well
-        // under a second on an idle machine) even on a CI runner ten times
-        // slower; the hold then outlasts the deadline.
+        // The short deadline starts only when the held step reports, so a slow
+        // runner spends its time under the 60 s setup guard, not the deadline,
+        // and a passing run waits one second rather than a fixed long timeout.
         run_checkout_verification_watchdog(
-            Duration::from_secs(30),
-            DeadlineStart::FirstPhase,
+            Duration::from_secs(1),
+            DeadlineStart::AtPhase("publishing checkout view: after derived_clone"),
             move |phase| {
                 // The worker outlives the timeout, so it owns the fixture
                 // folders and removes them once the released publication ends.
@@ -476,7 +496,7 @@ fn checkout_verification_deadline_names_the_stalled_publication_step() {
     let message = panic.downcast_ref::<String>().unwrap();
     assert!(
         message.starts_with(
-            "inspect warm verification timed out after 30s during \
+            "inspect warm verification timed out after 1s during \
              publishing checkout view: after derived_clone; timeline: \
              publishing checkout view@"
         ),
