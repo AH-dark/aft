@@ -2135,6 +2135,33 @@ mod tests {
         assert!(spawns <= 132 && round_trips <= 132, "the fallback walk must reuse its bounded helper: spawns={spawns} round_trips={round_trips}");
     }
 
+    // Grep reads files on rayon workers, then stats each matched file on the
+    // thread that sorts the results. Called from a thread outside any rayon
+    // pool, the sorting thread reads no files itself. Each directory's access
+    // probe (`bounded_io::probe_directory`) must then reach it from the
+    // request's shared probe map, not from its own per-thread cache, or it
+    // spawns a filesystem helper thread again for every directory. In the
+    // pooled tests the sorting thread reads some directories itself, how many
+    // depending on rayon scheduling, which is why they failed only sometimes.
+    //
+    // With the default 5 s access cap, the fallback walk probes all 100 fixture
+    // directories inside its own helper, which spawns nothing. What is left is
+    // fixed work on the project root (its admission stat and listing, and the
+    // walk's helper): at most 32 helpers, the root allowance in the pooled
+    // tests' bound of 132 = 100 directories + 32. A helper per directory or
+    // per file here means a directory the request already probed was probed
+    // again.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ten_thousand_file_grep_sorts_matches_without_per_directory_respawns() {
+        let (_fixture, ctx) = grep_io_fixture();
+        *ctx.search_index().write().unwrap() = None;
+        let (_, spawns, round_trips) =
+            std::thread::scope(|scope| scope.spawn(|| measured_grep(&ctx)).join().unwrap());
+        assert!(spawns > 0);
+        assert!(spawns <= 32 && round_trips <= 32, "sorting on a thread that read no files must reuse the directory probes: spawns={spawns} round_trips={round_trips}");
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ten_thousand_file_grep_keeps_root_probe_budget_after_queueing() {
@@ -2187,6 +2214,11 @@ mod tests {
                 assert!(before_start.is_err());
                 started.expect("the fixture-root metadata helper must start");
                 assert!(before_release.is_err());
+                // In the fallback pass this test's 12 s root cap outlasts the
+                // 5 s default cap of each subdirectory probe, so the walk's
+                // helper on the root cannot run those probes itself (see
+                // `run_with_timeout`) and each of the 100 directories gets its
+                // own helper. That is still one helper per directory.
                 assert!(spawns <= 132 && round_trips <= 132,
                     "indexed={indexed}: directory probes, not per-file helpers: spawns={spawns} round_trips={round_trips}");
             });

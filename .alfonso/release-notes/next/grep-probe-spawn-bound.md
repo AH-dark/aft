@@ -1,0 +1,1 @@
+- A grep without a ready index no longer starts an extra filesystem helper thread for each directory when it sorts its matches; the directory checks made while reading the files are reused.

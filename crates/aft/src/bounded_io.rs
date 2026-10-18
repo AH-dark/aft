@@ -750,10 +750,41 @@ fn parent(path: &Path, at: Option<Instant>) -> io::Result<Access> {
 }
 fn cached_directory(path: &Path) -> Option<Access> {
     let id = CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.id))?;
-    DIRECTORIES.with(|dirs| {
+    let local = DIRECTORIES.with(|dirs| {
         let dirs = dirs.borrow();
         (dirs.0 == id).then(|| dirs.1.get(path).copied()).flatten()
-    })
+    });
+    if local.is_some() {
+        return local;
+    }
+    // Another thread of this request may already have probed the directory:
+    // grep reads files on rayon workers, then stats every match again on the
+    // thread that sorts the results. Reuse that finished probe, as
+    // `directory` would, instead of spawning a helper per directory this
+    // thread did not read itself. A probe still running is not waited for
+    // here; callers then take their normal bounded path.
+    let budget = current()?;
+    let probe = budget
+        .directories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .cloned()?;
+    let access = match probe.state.lock().unwrap_or_else(|e| e.into_inner()).result {
+        Some(Ok(access)) => access,
+        _ => return None,
+    };
+    // Remember it on this thread too, so later files under the same
+    // directory do not take the request-wide lock again.
+    DIRECTORIES.with(|dirs| {
+        let mut dirs = dirs.borrow_mut();
+        if dirs.0 != budget.id {
+            dirs.0 = budget.id;
+            dirs.1.clear();
+        }
+        dirs.1.insert(path.to_path_buf(), access);
+    });
+    Some(access)
 }
 fn traversal_parent(path: &Path) -> Option<&Path> {
     path.parent().map(|parent| {

@@ -204,6 +204,47 @@ fn canonicalize_warms_sibling_traversal_shared_only_within_the_request() {
     assert_eq!(blocked.1.load(Ordering::Relaxed), 0);
 }
 
+// A directory probed by one thread of a request answers a stat below it on any
+// other thread of the same request. Grep reads files on rayon workers, then
+// stats every matched file again on the thread that sorts the results; that
+// thread must not spawn a helper per directory it did not read itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn directory_probed_on_another_thread_answers_child_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(local_filesystem(&root).unwrap());
+    let file = root.join("file");
+    std::fs::write(&file, "contents").unwrap();
+    let budget = Budget::after(IO_BUDGET);
+    let worker_budget = budget.clone();
+    let worker_root = root.clone();
+    std::thread::spawn(move || {
+        with_budget(Some(worker_budget), || {
+            probe_directory(&worker_root, None).unwrap();
+        });
+    })
+    .join()
+    .unwrap();
+    assert_eq!(budget.measurements(), (1, 1), "one directory probe");
+    with_budget(Some(budget.clone()), || {
+        assert!(metadata(&file).unwrap().is_file());
+        assert!(canonicalize(&root).is_ok());
+        assert!(probe_target(&root).is_ok());
+    });
+    assert_eq!(
+        budget.measurements(),
+        (1, 1),
+        "the request's finished directory probe must be reused on every thread"
+    );
+    // A new request does not inherit that probe.
+    let fresh_budget = Budget::after(IO_BUDGET);
+    with_budget(Some(fresh_budget.clone()), || {
+        assert!(metadata(&file).unwrap().is_file());
+    });
+    assert_eq!(fresh_budget.measurements(), (1, 1));
+}
+
 #[test]
 fn failed_stats_do_not_warm_traversal() {
     let dir = tempfile::tempdir().unwrap();
