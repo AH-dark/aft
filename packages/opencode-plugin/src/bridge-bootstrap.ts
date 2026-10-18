@@ -110,6 +110,8 @@ export interface BridgeBootstrapDependencies {
   ensureOnnxRuntime(storageDir: string): Promise<string | null>;
   /**
    * Seeds the LSP entries of `configOverrides` and starts background installs.
+   * `onPathsChanged` receives the full cache directory list each time one
+   * server's cache becomes ready while other work is still running.
    * Resolves to the refreshed cache directories when installs ran, else null.
    */
   startLspAutoInstall(
@@ -117,6 +119,7 @@ export interface BridgeBootstrapDependencies {
     config: AftConfig,
     configOverrides: Record<string, unknown>,
     notify: BootstrapNotify,
+    onPathsChanged?: (paths: readonly string[]) => void,
   ): Promise<string[] | null> | null;
   pushLspPaths(
     pool: Pick<AftTransportPool, "setConfigureOverride" | "reconfigure">,
@@ -198,6 +201,7 @@ function startLspAutoInstall(
   config: AftConfig,
   configOverrides: Record<string, unknown>,
   notify: BootstrapNotify,
+  onPathsChanged: (paths: readonly string[]) => void = () => {},
 ): Promise<string[] | null> | null {
   // Discover which LSPs the project needs and surface every already-cached
   // binary directory to Rust as `lsp_paths_extra`; the Rust resolver checks
@@ -232,7 +236,9 @@ function startLspAutoInstall(
       disabled,
     });
     // Publish per-server paths as they settle so one process-held lock cannot
-    // delay unrelated servers behind the aggregate completion promise.
+    // delay unrelated servers behind the aggregate completion promise. The
+    // caller owns publication: `configOverrides` was already copied by the
+    // transport pool if one exists, so writing it here would reach no bridge.
     let getGithubCacheDirs: (() => Promise<string[]>) | undefined;
     let cachePathRefresh = Promise.resolve();
     const refreshCachePaths = (newlyReadyDir?: string) => {
@@ -247,8 +253,7 @@ function startLspAutoInstall(
               ...(newlyReadyDir ? [newlyReadyDir] : []),
             ]),
           ];
-          if (updatedPaths.length > 0) configOverrides.lsp_paths_extra = updatedPaths;
-          else delete configOverrides.lsp_paths_extra;
+          onPathsChanged(updatedPaths);
         })
         .catch((err) => {
           warn(`[lsp] incremental cache-path refresh failed: ${err}`);
@@ -285,15 +290,11 @@ function startLspAutoInstall(
     // Once installs settle, refresh the cached directories and send ONE
     // summary listing only reasons the user can act on ("grace blocked":
     // pin a version; "install failed": check the log), never routine skips.
+    // The caller publishes the returned directories.
     const completion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
-      .then(async () => {
-        const updatedPaths = [
-          ...new Set([...npmResult.getCachedBinDirs(), ...(await ghResult.getCachedBinDirs())]),
-        ];
-        if (updatedPaths.length > 0) configOverrides.lsp_paths_extra = updatedPaths;
-        else delete configOverrides.lsp_paths_extra;
-        return updatedPaths;
-      })
+      .then(async () => [
+        ...new Set([...npmResult.getCachedBinDirs(), ...(await ghResult.getCachedBinDirs())]),
+      ])
       .then((updatedPaths) => {
         const routine = new Set([
           "auto_install: false",
@@ -569,12 +570,47 @@ export async function prepareBridgeEnvironment(
     });
   }
 
+  // LSP cache directories change once per server whose cache becomes ready
+  // while other work is still running, and once more when every install has
+  // settled. All of them go through this one function. Before the pool is
+  // attached they go into `configOverrides`, which the pool copies when it is
+  // created; the latest list is also kept and pushed at attach, in case the
+  // pool was created before it arrived. After attach they go to the pool's
+  // own overrides and its live bridges. Pushes run one at a time in call
+  // order, so an older list never overwrites a newer one.
+  let attachedPool: Pick<AftTransportPool, "setConfigureOverride" | "reconfigure"> | null = null;
+  let pathsBeforeAttach: readonly string[] | null = null;
+  let lspPathPush = Promise.resolve();
+  const publishLspPaths = (paths: readonly string[]): void => {
+    const pool = attachedPool;
+    if (!pool) {
+      if (paths.length > 0) configOverrides.lsp_paths_extra = [...paths];
+      else delete configOverrides.lsp_paths_extra;
+      pathsBeforeAttach = paths;
+      return;
+    }
+    lspPathPush = lspPathPush
+      .then(() => dependencies.pushLspPaths(pool, options.lspDirectory, paths))
+      .then(
+        () => {
+          log(`[lsp] lsp_paths_extra updated: ${paths.length} dirs pushed to live bridges`);
+        },
+        (err) => {
+          warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
+        },
+      );
+  };
+
   const lspCompletion = dependencies.startLspAutoInstall(
     options.lspDirectory,
     config,
     configOverrides,
     notify,
+    publishLspPaths,
   );
+  lspCompletion?.then((updatedPaths) => {
+    if (updatedPaths) publishLspPaths(updatedPaths);
+  });
 
   return {
     storageDir,
@@ -605,19 +641,8 @@ export async function prepareBridgeEnvironment(
           if (reason) notify(onnxInstallFailureMessage(reason));
         }
       });
-      lspCompletion?.then((updatedPaths) => {
-        if (!updatedPaths) return;
-        dependencies
-          .pushLspPaths(pool, options.lspDirectory, updatedPaths)
-          .then(() => {
-            log(
-              `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
-            );
-          })
-          .catch((err) => {
-            warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
-          });
-      });
+      attachedPool = pool;
+      if (pathsBeforeAttach) publishLspPaths(pathsBeforeAttach);
     },
   };
 }

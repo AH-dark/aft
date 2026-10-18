@@ -18,6 +18,7 @@ import { writeSmokeBinary } from "./smoke-binary.js";
 
 interface Installer {
   __githubBinaryHashCountForTests: () => number;
+  abortInFlightGithubInstalls: () => Promise<void>;
   _extractArchiveSafelyForTesting: (
     archive: string,
     destination: string,
@@ -43,6 +44,42 @@ interface Installer {
     installsComplete: Promise<void>;
     getCachedBinDirs: () => Promise<string[]>;
   };
+}
+
+/**
+ * Start a separate process that creates the install lock file at `lock` and
+ * holds it until a line arrives on its stdin, so the lock is owned by another
+ * live process, as it is when a second plugin instance is installing.
+ */
+export async function startInstallLockOwner(lock: string) {
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+        const fs = require("node:fs");
+        const path = ${JSON.stringify(lock)};
+        fs.mkdirSync(require("node:path").dirname(path), { recursive: true });
+        fs.writeFileSync(path, process.pid + "\\n" + new Date().toISOString() + "\\nfixture-owner\\n", { flag: "wx" });
+        process.stdout.write("locked");
+        process.stdin.once("data", () => { fs.unlinkSync(path); process.exit(0); });
+      `,
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const exited = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) =>
+      code === 0 ? resolve() : reject(new Error(`lock owner exited ${code}`)),
+    );
+  });
+  await Promise.race([
+    new Promise<void>((resolve) => child.stdout!.once("data", () => resolve())),
+    exited.then(() => {
+      throw new Error("lock owner exited before readiness");
+    }),
+  ]);
+  return { child, exited };
 }
 
 export function githubLayoutTests(installer: Installer): void {
@@ -86,36 +123,6 @@ export function githubLayoutTests(installer: Installer): void {
       releaseEnv();
       rmSync(root, { recursive: true, force: true });
     }
-  }
-  async function startInstallLockOwner(lock: string) {
-    const child = spawn(
-      process.execPath,
-      [
-        "-e",
-        `
-          const fs = require("node:fs");
-          const path = ${JSON.stringify(lock)};
-          fs.mkdirSync(require("node:path").dirname(path), { recursive: true });
-          fs.writeFileSync(path, process.pid + "\\n" + new Date().toISOString() + "\\nfixture-owner\\n", { flag: "wx" });
-          process.stdout.write("locked");
-          process.stdin.once("data", () => { fs.unlinkSync(path); process.exit(0); });
-        `,
-      ],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
-    const exited = new Promise<void>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (code) =>
-        code === 0 ? resolve() : reject(new Error(`lock owner exited ${code}`)),
-      );
-    });
-    await Promise.race([
-      new Promise<void>((resolve) => child.stdout!.once("data", () => resolve())),
-      exited.then(() => {
-        throw new Error("lock owner exited before readiness");
-      }),
-    ]);
-    return { child, exited };
   }
   test.skipIf(process.platform === "win32")(
     "recorded smoke verdict exposes the stamped cache synchronously without spawning",
@@ -519,6 +526,77 @@ export function githubLayoutTests(installer: Installer): void {
             reason: "install lock held by another process for 10 minutes",
           });
           expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
+        } finally {
+          if (child.exitCode === null) child.stdin!.end("release");
+          await exited.catch(() => {});
+        }
+      });
+    },
+  );
+  test.skipIf(process.platform === "win32")(
+    "shutdown abort ends a busy GitHub cache wait while the lock is still held",
+    async () => {
+      const script = "#!/bin/sh\nexit 0\n";
+      await withCachedServer(script, async (binary, root) => {
+        const lock = join(
+          root,
+          "lsp-packages",
+          encodeURIComponent("latex-lsp/texlab"),
+          ".aft-installing",
+        );
+        const { child, exited } = await startInstallLockOwner(lock);
+        try {
+          // Both a server that would install and one that only validates its
+          // cache must stop waiting when shutdown aborts in-flight work.
+          const configs = [
+            { servers: new Set<string>(), config: withoutInstall },
+            {
+              servers: new Set(["texlab"]),
+              config: {
+                ...withoutInstall,
+                autoInstall: true,
+                versions: { "latex-lsp/texlab": "1.0.0" },
+              },
+            },
+          ];
+          for (const { servers, config } of configs) {
+            let fetches = 0;
+            const fetchImpl = (async () => {
+              fetches += 1;
+              throw new Error("an aborted cache wait must not start an install");
+            }) as unknown as typeof fetch;
+            // The default ten-minute lock wait stays in force: only the abort
+            // can end this wait within the bound below.
+            const held = installer.runGithubAutoInstall(servers, config, fetchImpl);
+            expect(held.cachedBinDirs).not.toContain(dirname(binary));
+            const started = Date.now();
+            let timeout: ReturnType<typeof setTimeout>;
+            const bound = new Promise<never>((_, reject) => {
+              timeout = setTimeout(
+                () => reject(new Error("installsComplete did not settle after abort")),
+                2_000,
+              );
+            });
+            try {
+              // abortInFlightGithubInstalls also awaits the aborted work, so it
+              // sits inside the bound too.
+              await Promise.race([
+                Promise.all([installer.abortInFlightGithubInstalls(), held.installsComplete]),
+                bound,
+              ]);
+            } finally {
+              clearTimeout(timeout!);
+            }
+            expect(Date.now() - started).toBeLessThan(2_000);
+            expect(child.exitCode).toBeNull();
+            expect(existsSync(lock)).toBe(true);
+            expect(held.cachedBinDirs).not.toContain(dirname(binary));
+            expect(held.skipped).not.toContainEqual({
+              id: "texlab",
+              reason: "install lock held by another process for 10 minutes",
+            });
+            expect(fetches).toBe(0);
+          }
         } finally {
           if (child.exitCode === null) child.stdin!.end("release");
           await exited.catch(() => {});

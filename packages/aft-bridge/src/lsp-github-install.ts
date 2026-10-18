@@ -1559,6 +1559,20 @@ export function createGithubInstaller(services: GithubInstallerHost) {
 
   /* ─────────────────────────── public entrypoint ─────────────────────────── */
 
+  /** Wait `ms` milliseconds, or less if `signal` aborts first. */
+  function sleepUntilAborted(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      signal.addEventListener("abort", finish, { once: true });
+    });
+  }
+
   interface InFlightGithubInstall {
     controller: AbortController;
     promise: Promise<void>;
@@ -1622,16 +1636,26 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       }
     }
 
+    /**
+     * Re-validate a cache whose install lock another process holds, polling
+     * until the lock frees or the wait deadline passes. Returns null when the
+     * cache could not be validated. An aborted signal (plugin shutdown) ends
+     * the wait at once and returns null without recording a lock-timeout skip,
+     * because the lock never timed out.
+     */
     async function retryBusyCacheValidation(
       spec: GithubServerSpec,
       platform: Platform,
+      signal: AbortSignal,
     ): Promise<boolean | null> {
       const deadline = Date.now() + lockWaitTimeoutMs;
       while (true) {
+        if (signal.aborted) return null;
         const validation = await withInstallLock(spec.githubRepo, async () =>
           validateCachedGithubInstallUnderLock(spec, platform),
         );
         if (validation !== null) return validation;
+        if (signal.aborted) return null;
 
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {
@@ -1641,9 +1665,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
           });
           return null;
         }
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.min(lockPollIntervalMs, remainingMs)),
-        );
+        await sleepUntilAborted(Math.min(lockPollIntervalMs, remainingMs), signal);
       }
     }
 
@@ -1661,13 +1683,16 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     }
 
     for (const spec of GITHUB_LSP_TABLE) {
+      // One controller per server covers both the busy-lock cache wait and
+      // the install that follows it, so shutdown can cancel either one.
+      const controller = new AbortController();
       const validation = isGithubInstalled(spec, host.platform)
         ? validateCachedGithubInstall(spec, host.platform)
         : false;
       if (validation === true) cachedBinDirs.push(ghBinDir(spec));
       const cacheReady = (
         validation === null
-          ? retryBusyCacheValidation(spec, host.platform)
+          ? retryBusyCacheValidation(spec, host.platform, controller.signal)
           : Promise.resolve(validation)
       ).then((healthy) => {
         if (healthy && validation !== true) {
@@ -1677,7 +1702,14 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         }
         return healthy;
       });
-      installPromises.push(cacheReady.then(() => {}));
+      // Track the cache wait on its own: servers skipped below (disabled,
+      // auto-install off, not relevant) still wait on a busy lock.
+      installPromises.push(
+        trackInFlightGithubInstall(
+          controller,
+          cacheReady.then(() => {}),
+        ),
+      );
 
       if (config.disabled.has(spec.id)) {
         skipped.push({ id: spec.id, reason: "disabled by config" });
@@ -1696,7 +1728,6 @@ export function createGithubInstaller(services: GithubInstallerHost) {
 
       installsStarted += 1;
       if (services.reportInstallingBinaries) installingBinaries.push(spec.binary);
-      const controller = new AbortController();
       const promise = cacheReady
         .then((healthy) =>
           validation === null && healthy === null
