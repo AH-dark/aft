@@ -4238,12 +4238,7 @@ pub(crate) fn apply_marker_fd_allowlist(
 ) -> Result<(RawFd, RawFd), String> {
     use std::os::unix::process::CommandExt;
 
-    let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    let fd_limit = if fd_limit > 0 {
-        (fd_limit as RawFd).min(65_536)
-    } else {
-        1_024
-    };
+    let fd_limit = descriptor_sweep_limit()?;
     unsafe {
         command.pre_exec(move || {
             let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 6);
@@ -4266,16 +4261,60 @@ pub(crate) fn apply_marker_fd_allowlist(
             }
             libc::close(exit_copy);
             libc::close(failure_copy);
-            for fd in (CHILD_FAILURE_FD + 1)..fd_limit {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-                }
-            }
-            Ok(())
+            mark_extra_fds_cloexec(fd_limit)
         });
     }
     Ok((CHILD_EXIT_FD, CHILD_FAILURE_FD))
+}
+
+#[cfg(unix)]
+fn descriptor_sweep_limit() -> Result<RawFd, String> {
+    // Use the hard limit as well: another pre-exec hook may raise the soft
+    // limit, and descriptors opened before it was lowered still exist.
+    let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let maximum = if limit.rlim_max == libc::RLIM_INFINITY {
+        if open_max <= 0 {
+            return Err("could not resolve the descriptor sweep range".to_string());
+        }
+        open_max as u64
+    } else {
+        (limit.rlim_max as u64).max(open_max.max(0) as u64)
+    };
+    Ok(maximum.min(RawFd::MAX as u64) as RawFd)
+}
+
+#[cfg(unix)]
+fn mark_extra_fds_cloexec(fd_limit: RawFd) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    // CLOEXEC leaves Rust's spawn-error pipe usable until exec succeeds and
+    // preserves the two marker descriptors below the range.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            (CHILD_FAILURE_FD + 1) as u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    mark_extra_fds_cloexec_fallback(fd_limit)
+}
+
+#[cfg(unix)]
+fn mark_extra_fds_cloexec_fallback(fd_limit: RawFd) -> std::io::Result<()> {
+    for fd in (CHILD_FAILURE_FD + 1)..fd_limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4903,6 +4942,82 @@ pub(crate) mod environment_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn marker_allowlist_closes_high_fds_and_preserves_markers() {
+        use std::os::unix::process::CommandExt;
+        let exit = tempfile::tempfile().unwrap();
+        let failure = tempfile::tempfile().unwrap();
+        let source = tempfile::tempfile().unwrap();
+        let source_fd = source.as_raw_fd();
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "test ! -e /proc/self/fd/70000 || exit 99; printf exit >&3; printf failure >&4",
+        ]);
+        // Create the deliberately inheritable descriptor only in the child so
+        // concurrent tests cannot accidentally inherit it.
+        unsafe {
+            command.pre_exec(move || {
+                let mut limit = std::mem::zeroed::<libc::rlimit>();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_max;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(source_fd, 70_000) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        apply_marker_fd_allowlist(&mut command, exit.as_raw_fd(), failure.as_raw_fd()).unwrap();
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "high descriptor leaked: {output:?}"
+        );
+        let mut exit_text = String::new();
+        let mut failure_text = String::new();
+        let mut exit = exit;
+        let mut failure = failure;
+        exit.seek(SeekFrom::Start(0)).unwrap();
+        failure.seek(SeekFrom::Start(0)).unwrap();
+        exit.read_to_string(&mut exit_text).unwrap();
+        failure.read_to_string(&mut failure_text).unwrap();
+        assert_eq!(exit_text, "exit");
+        assert_eq!(failure_text, "failure");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_sweep_covers_high_descriptor_range() {
+        use std::os::unix::process::CommandExt;
+        let source = tempfile::tempfile().unwrap();
+        let source_fd = source.as_raw_fd();
+        let fd_limit = descriptor_sweep_limit().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "test ! -e /proc/self/fd/70000"]);
+        unsafe {
+            command.pre_exec(move || {
+                let mut limit = std::mem::zeroed::<libc::rlimit>();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_max;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0
+                    || libc::dup2(source_fd, 70_000) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                mark_extra_fds_cloexec_fallback(fd_limit)
+            });
+        }
+        assert!(command.status().unwrap().success());
+    }
 
     #[test]
     fn shell_containment_requires_strict_native_plan() {

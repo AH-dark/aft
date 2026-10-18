@@ -1373,6 +1373,14 @@ pub fn write_terminal_log_sync(message: &str) -> io::Result<()> {
     if let Some(mut writer) = sink.writer.take() {
         writer.flush()?;
     }
+    write_terminal_line(&sink, &mut io::stderr(), message)
+}
+
+fn write_terminal_line(
+    sink: &RotatingFile,
+    stderr: &mut impl Write,
+    message: &str,
+) -> io::Result<()> {
     let mut line = Vec::new();
     write_log_line(
         &mut line,
@@ -1381,7 +1389,8 @@ pub fn write_terminal_log_sync(message: &str) -> io::Result<()> {
         "aft",
         &format_args!("{message}"),
     )?;
-    let _ = io::stderr().write_all(&line);
+    let line = crate::log_redact::aft_redact_bytes(&line);
+    let _ = stderr.write_all(&line);
     let mut file = open_private_log_file(&sink.path, false)?;
     file.write_all(&line)?;
     file.sync_all()?;
@@ -2358,6 +2367,28 @@ fn perf_tick_interval() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_sync_redacts_both_sinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terminal.log");
+        let sink = super::RotatingFile::unopened(path.clone(), 1024, 1, 1);
+        let mut stderr = Vec::new();
+        super::write_terminal_line(
+            &sink,
+            &mut stderr,
+            "Authorization: Bearer terminal-secret-value",
+        )
+        .unwrap();
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(file, stderr);
+        let line = String::from_utf8(file).unwrap();
+        assert!(!line.contains("terminal-secret-value"), "{line}");
+        assert!(
+            line.contains(crate::log_redact::SECRET_PLACEHOLDER),
+            "{line}"
+        );
+    }
+
     use super::*;
     use filetime::{set_file_mtime, FileTime};
     use tempfile::TempDir;

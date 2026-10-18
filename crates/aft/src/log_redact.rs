@@ -122,7 +122,7 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     if text.contains("github_pat_") {
         out = replace_in(out, &GITHUB_PAT, SECRET_PLACEHOLDER);
     }
-    if text.contains("gh") {
+    if needs_github_token_scan(text) {
         out = replace_in(out, &GITHUB_TOKEN, SECRET_PLACEHOLDER);
     }
     if text.contains("sk-") {
@@ -159,6 +159,12 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
         });
     }
     out
+}
+
+fn needs_github_token_scan(text: &str) -> bool {
+    ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+        .iter()
+        .any(|prefix| text.contains(prefix))
 }
 
 /// Byte-level entry point for the log sink. Invalid UTF-8 is decoded with
@@ -241,6 +247,26 @@ fn replace_in<'a, R: Replacer>(text: Cow<'a, str>, pattern: &Regex, replacer: R)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn github_prefilter_only_scans_actual_token_prefixes() {
+        for ordinary in [
+            "high throughput",
+            "right path",
+            "bright light",
+            "github repository",
+        ] {
+            assert!(
+                !super::needs_github_token_scan(ordinary),
+                "unnecessary scan: {ordinary}"
+            );
+        }
+        for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
+            let token = format!("{prefix}1234567890abcdefghij");
+            assert!(super::needs_github_token_scan(&token));
+            assert_eq!(super::aft_redactor(&token), super::SECRET_PLACEHOLDER);
+        }
+    }
+
     use super::*;
 
     #[derive(serde::Deserialize)]
