@@ -159,4 +159,30 @@ describe.serial("Pi migration bootstrap", () => {
     await expect(read()).rejects.toThrow(/AFT storage migration failed.*exit 5/);
     expect(transport).not.toHaveBeenCalled();
   });
+
+  test("pi_subc_migration_receives_the_plugin_version_without_a_binary", async () => {
+    createLegacyRoot();
+    const connectionFile = join(tempDir, "subc.json");
+    writeFileSync(connectionFile, "{}");
+    writeFileSync(
+      join(process.env.HOME as string, ".pi", "agent", "aft.json"),
+      JSON.stringify({
+        subc: { connection_file: connectionFile },
+        lsp: { auto_install: false },
+        indexes: { semantic: false },
+      }),
+    );
+    const migrate = spyOn(bridge, "ensureStorageMigrated").mockRejectedValue(
+      new Error("migration options captured"),
+    );
+    const read = await prepareFirstRead(await loadPlugin());
+    await expect(read()).rejects.toThrow("migration options captured");
+    expect(migrate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        harness: "pi",
+        binaryPath: undefined,
+        expectedVersion: PLUGIN_VERSION,
+      }),
+    );
+  });
 });

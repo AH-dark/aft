@@ -547,6 +547,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       await ensureStorageMigrated({
         harness: "pi",
         binaryPath: binaryPath ?? undefined,
+        expectedVersion: PLUGIN_VERSION,
         logger: bridgeLogger,
       });
       return createAftTransportPool({

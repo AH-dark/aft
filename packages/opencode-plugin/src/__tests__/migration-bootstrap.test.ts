@@ -1,9 +1,11 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { registerShutdownCleanup } from "../shutdown-hooks.js";
@@ -59,6 +61,8 @@ describe.serial("OpenCode migration bootstrap", () => {
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
       HOME: join(tempDir, "home"),
       XDG_DATA_HOME: join(tempDir, "data"),
+      XDG_CONFIG_HOME: join(tempDir, "config"),
+      XDG_STATE_HOME: join(tempDir, "state"),
       XDG_CACHE_HOME: xdgCacheHome,
       OPENCODE_CONFIG_DIR: opencodeConfigDir,
       AFT_MIGRATION_ARGS_LOG: argsLog,
@@ -151,4 +155,63 @@ describe.serial("OpenCode migration bootstrap", () => {
       plugin({ directory: tempDir, client: {} } as Parameters<OpenCodePlugin>[0]),
     ).rejects.toThrow(/AFT storage migration failed.*exit 5/);
   });
+
+  for (const entry of ["dist/index.js", "dist/entry/server.js"]) {
+    test(`bundled ${entry} migrates legacy storage in subc mode without a supplied binary`, async () => {
+      const legacyRoot = createLegacyRoot();
+      const connectionFile = join(tempDir, "subc.json");
+      writeFileSync(connectionFile, "{}");
+      writeFileSync(
+        join(process.env.OPENCODE_CONFIG_DIR as string, "aft.json"),
+        JSON.stringify({
+          subc: { connection_file: connectionFile },
+          lsp: { auto_install: false },
+          indexes: { semantic: false },
+        }),
+      );
+      const packageRoot = join(tempDir, "bundled-plugin");
+      mkdirSync(packageRoot);
+      writeFileSync(
+        join(packageRoot, "package.json"),
+        readFileSync(resolve(import.meta.dir, "../../package.json")),
+      );
+      symlinkSync(
+        resolve(import.meta.dir, "../../node_modules"),
+        join(packageRoot, "node_modules"),
+        "junction",
+      );
+      const build = await Bun.build({
+        entrypoints: [
+          resolve(import.meta.dir, "../index.ts"),
+          resolve(import.meta.dir, "../entry/server.mjs"),
+        ],
+        outdir: join(packageRoot, "dist"),
+        target: "node",
+        format: "esm",
+        external: ["effect"],
+      });
+      expect(build.success).toBe(true);
+      const runner = `
+        const bundled = await import(${JSON.stringify(pathToFileURL(join(packageRoot, entry)).href)});
+        const plugin = ${entry.endsWith("server.js") ? "bundled.default.server" : "bundled.default"};
+        const hooks = await plugin({ directory: ${JSON.stringify(tempDir)}, client: {} });
+        await hooks.dispose?.();
+        process.exit(0);
+      `;
+      const child = spawnSync(process.execPath, ["--eval", runner], {
+        encoding: "utf8",
+        env: { ...process.env },
+        timeout: 15_000,
+      });
+      expect(child.error).toBeUndefined();
+      expect({ status: child.status, stderr: child.stderr }).toEqual({
+        status: 0,
+        stderr: expect.any(String),
+      });
+      const argv = readFileSync(argsLog, "utf8").trim().split("\n");
+      expect(argv).toContain("migrate-storage");
+      expect(argv).toContain(legacyRoot);
+      expect(argv).toContain("opencode");
+    });
+  }
 });

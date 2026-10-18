@@ -101,7 +101,7 @@ export interface BridgeBootstrapDependencies {
   migrateConfigLocations(directory: string): string[];
   resolveBinary(version: string): Promise<string>;
   /** `binaryPath` is null when the subc daemon owns the binary; migration then resolves one only if it has work. */
-  ensureStorageMigrated(binaryPath: string | null): Promise<void>;
+  ensureStorageMigrated(binaryPath: string | null, pluginVersion: string): Promise<void>;
   resolveStorageRoot(): string;
   buildConfigureParams(
     directory: string,
@@ -317,10 +317,11 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   migrateConfigLocations: (directory) =>
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   resolveBinary: resolveBinaryWithWarmup,
-  ensureStorageMigrated: (binaryPath) =>
+  ensureStorageMigrated: (binaryPath, pluginVersion) =>
     ensureStorageMigrated({
       harness: "opencode",
       binaryPath: binaryPath ?? undefined,
+      expectedVersion: pluginVersion,
       logger: bridgeLogger,
     }),
   resolveStorageRoot: resolveCortexKitStorageRoot,
@@ -510,7 +511,7 @@ export async function prepareBridgeEnvironment(
   const usesSubc = Boolean(config.subc?.connection_file?.trim());
   const binaryPath = usesSubc ? null : await dependencies.resolveBinary(options.pluginVersion);
   // Must complete before anything reads or writes the storage root.
-  await dependencies.ensureStorageMigrated(binaryPath);
+  await dependencies.ensureStorageMigrated(binaryPath, options.pluginVersion);
 
   // Flat params are plugin-computed process state shared by every bridge.
   // Core-domain config flows only through the `config` tiers; per-project

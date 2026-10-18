@@ -81,6 +81,8 @@ export type MigrationHarness = "opencode" | "pi";
 export interface MigrationOptions {
   harness: MigrationHarness;
   binaryPath?: string;
+  /** Caller-known version for fallback resolution when the host bundles the bridge. */
+  expectedVersion?: string;
   logger?: {
     warn?: (msg: string) => void;
     info?: (msg: string) => void;
@@ -652,7 +654,7 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
   }
 
   const logPath = migrationLogPath(newRoot, opts.harness, opts.logger);
-  const binaryPath = opts.binaryPath ?? (await findBinary());
+  const binaryPath = opts.binaryPath ?? (await findBinary(opts.expectedVersion));
   const startMs = Date.now();
   info?.(
     `AFT storage migration starting for ${opts.harness}: ${legacyRoot} -> ${newRoot} ` +
