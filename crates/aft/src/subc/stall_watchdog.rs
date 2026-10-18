@@ -1281,7 +1281,11 @@ mod tests {
         let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
         let started = Instant::now();
         let mut frames = 0;
-        while started.elapsed() < TEST_THRESHOLD * 5 {
+        // Keep sending until the burst is both long in time and long in
+        // frames. A 2 ms sleep lasts a whole timer tick (about 15.6 ms) on
+        // Windows, and a loaded runner stretches each ping further, so time
+        // alone can end the loop after too few frames to be a real burst.
+        while started.elapsed() < TEST_THRESHOLD * 5 || frames <= 50 {
             frames += 1;
             fixture.ping(frames).await;
             // Use I/O and a paced stream of frames, not synthetic CPU load.
