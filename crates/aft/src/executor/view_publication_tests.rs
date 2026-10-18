@@ -144,9 +144,8 @@ pub(super) fn phase_gate(id: u64, root: &Path, phase: &str) {
     };
     if let Some(gate) = gate {
         let _ = gate.started.send(id);
-        gate.release
-            .recv_timeout(Duration::from_secs(60))
-            .expect("release publication gate");
+        // Only dropping Gate releases the build, even if a test's hang guard fires.
+        gate.release.recv().expect("release publication gate");
     }
 }
 struct Gate {
@@ -836,7 +835,6 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
         == fixture.job_root().as_path().to_string_lossy().as_ref()
         && job["phase"] == "derived"
         && job["barrier_holder"] == false));
-    let start = Instant::now();
     let bind = fixture.executor.submit(
         fixture.root.clone(),
         Lane::Mutating,
@@ -860,32 +858,26 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
             Response::success("view.read", serde_json::json!({}))
         }),
     );
-    let bound = bind.recv_timeout(Duration::from_secs(1));
-    let read_result = read.recv_timeout(Duration::from_secs(1).saturating_sub(start.elapsed()));
-    let elapsed = start.elapsed();
-    eprintln!(
-        "bind+read during gated publication: {} ms",
-        elapsed.as_millis()
+    // Completion before releasing the build proves it holds neither the writer
+    // barrier nor a reader reservation. These timeouts only guard against hangs;
+    // thread scheduling and pointer fsync latency are not the property under test.
+    let bound = bind
+        .recv_timeout(Duration::from_secs(60))
+        .expect("same-root bind must complete while publication is held");
+    assert!(bound.success, "same-root bind failed: {bound:?}");
+    let read_result = read
+        .recv_timeout(Duration::from_secs(60))
+        .expect("same-root read must complete while publication is held");
+    assert!(
+        read_result.success,
+        "previous view read failed: {read_result:?}"
     );
-    let previous = fixture.view.current_generation().unwrap();
+    assert_eq!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
     drop(gate);
     fixture.wait_idle();
-    // The barrier-excludes-the-build proof is the bind+read above completing
-    // while `derived` was gated, not this number. The CAS timing is a liveness
-    // ceiling only: its fsync+rename exceeded 50 ms on a contended Windows
-    // runner, which says nothing about whether the build ran under the barrier.
-    let cas_timings = CAS_TIMINGS.lock()[fixture.job_root().as_path()].clone();
-    assert!(
-        cas_timings
-            .iter()
-            .all(|elapsed| *elapsed < Duration::from_secs(2)),
-        "pointer CAS exceeded the liveness ceiling: {cas_timings:?}"
-    );
-    assert!(
-        bound.is_ok() && read_result.is_ok() && elapsed < Duration::from_secs(1),
-        "bind+read blocked for {elapsed:?}"
-    );
-    assert_eq!(previous.as_deref(), Some(fixture.initial.as_str()));
     assert_ne!(
         fixture.view.current_generation().unwrap().as_deref(),
         Some(fixture.initial.as_str())
