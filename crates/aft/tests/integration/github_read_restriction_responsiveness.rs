@@ -209,7 +209,8 @@ fn isolated_restriction_probe() {
             github: enabled_gh_read(),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     if case == "untrusted-mcp" {
         ctx.set_harness(Harness::Mcp {
             client: "restriction-probe".to_string(),

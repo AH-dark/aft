@@ -94,19 +94,22 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
     let canonical_root = std::fs::canonicalize(root.path()).expect("canonical project root");
 
     let app = App::default_shared();
-    let ctx = Arc::new(AppContext::from_app(
-        app,
-        crate::context_storage::isolate(Config {
-            project_root: Some(canonical_root.clone()),
-            storage_dir: Some(storage.path().to_path_buf()),
-            indexes: aft::config::IndexesConfig {
-                trigram: true,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        }),
-    ));
+    let ctx = Arc::new(
+        AppContext::from_app(
+            app,
+            crate::context_storage::isolate(Config {
+                project_root: Some(canonical_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                indexes: aft::config::IndexesConfig {
+                    trigram: true,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store(),
+    );
     ctx.set_canonical_cache_root(canonical_root.clone());
 
     let cache_dir = resolve_cache_dir(&canonical_root, Some(storage.path()));

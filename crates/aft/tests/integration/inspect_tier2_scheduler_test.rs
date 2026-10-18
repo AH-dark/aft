@@ -55,7 +55,8 @@ fn configured_context_with_storage(
             storage_dir: Some(storage_dir.to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let configure = request(json!({
         "id": "configure",
         "command": "configure",

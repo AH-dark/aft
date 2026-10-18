@@ -89,7 +89,8 @@ fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
             project_root: Some(root.to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     notify_and_wait_for_publish(&ctx, &source, "export const open = 2;\n");
@@ -182,7 +183,8 @@ fn restricted_move_file_moves_symlink_instead_of_its_target() {
             restrict_to_project_root: true,
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let req: RawRequest = serde_json::from_value(json!({
         "id": "move-restricted-symlink",
         "command": "move_file",

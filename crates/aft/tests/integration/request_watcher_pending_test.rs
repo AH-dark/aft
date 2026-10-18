@@ -80,7 +80,8 @@ fn request_watcher_burst_discloses_unapplied_index_changes() {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
         },
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_heavy_root_work_allowed(true);
     ctx.set_harness(aft::harness::Harness::Opencode);
     let project_key = ctx.memoized_artifact_cache_key(&root);

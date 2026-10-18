@@ -404,7 +404,8 @@ fn handle_grep_attaches_envelope_when_capped() {
     let ctx = aft::context::AppContext::from_app(
         aft::context::App::default_shared(),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
 
     let req = aft::protocol::RawRequest {
         id: "grep-live-1".into(),

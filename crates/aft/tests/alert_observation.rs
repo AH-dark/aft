@@ -285,7 +285,8 @@ fn post_edit_wait_does_not_start_a_server_on_a_cold_root() {
     let context = AppContext::from_app(
         App::default_shared(),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
 
     let outcome = context.lsp_notify_and_collect_diagnostics(
         &file,

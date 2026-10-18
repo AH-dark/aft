@@ -61,7 +61,8 @@ fn ready_context() -> (tempfile::TempDir, AppContext) {
             project_root: Some(project.path().to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let index = SearchIndex::build(project.path());
     *ctx.search_index()
         .write()

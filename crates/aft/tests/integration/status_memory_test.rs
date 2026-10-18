@@ -25,20 +25,26 @@ fn status_memory_attributes_every_registered_root_and_exposes_residual() {
     let first_root = std::fs::canonicalize(first.path()).expect("canonical first root");
     let second_root = std::fs::canonicalize(second.path()).expect("canonical second root");
     let app = App::default_shared();
-    let first_ctx = Arc::new(AppContext::from_app(
-        Arc::clone(&app),
-        crate::context_storage::isolate(Config {
-            project_root: Some(first_root.clone()),
-            ..Config::default()
-        }),
-    ));
-    let second_ctx = Arc::new(AppContext::from_app(
-        app,
-        crate::context_storage::isolate(Config {
-            project_root: Some(second_root.clone()),
-            ..Config::default()
-        }),
-    ));
+    let first_ctx = Arc::new(
+        AppContext::from_app(
+            Arc::clone(&app),
+            crate::context_storage::isolate(Config {
+                project_root: Some(first_root.clone()),
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store(),
+    );
+    let second_ctx = Arc::new(
+        AppContext::from_app(
+            app,
+            crate::context_storage::isolate(Config {
+                project_root: Some(second_root.clone()),
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store(),
+    );
     let executor = Executor::new();
     assert!(executor.register_actor(
         ProjectRootId::from_path(&first_root).expect("first root id"),

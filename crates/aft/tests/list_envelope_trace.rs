@@ -592,7 +592,8 @@ fn setup_real_callgraph_context() -> (tempfile::TempDir, aft::context::AppContex
     let ctx = aft::context::AppContext::from_app(
         aft::context::App::default_shared(),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     *ctx.callgraph_store().write().unwrap() = Some(std::sync::Arc::new(readonly_store));
 
     (temp, ctx)

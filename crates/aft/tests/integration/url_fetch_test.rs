@@ -899,7 +899,8 @@ fn reply_ceiling_finalization_bounds_late_text() {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Default::default()
         },
-    );
+    )
+    .with_test_checkpoint_store();
     let mut response = aft::protocol::Response::success("late", json!({}));
     let mut text = "界".repeat(5 * 1024 * 1024 / 3);
     aft::response_finalize::finalize_tool_response(

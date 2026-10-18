@@ -720,7 +720,8 @@ fn nl_identifier_facts_join_exact_retrieval_without_rerouting_the_shape() {
                 project_root: Some(dir.path().to_path_buf()),
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -781,7 +782,8 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
             project_root: Some(dir.path().to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     *ctx.search_index()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SearchIndex::build(dir.path()));
@@ -868,7 +870,8 @@ fn code_literal_query_bounds_single_line_json_output_and_ranks_source_first() {
             project_root: Some(dir.path().to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     *ctx.search_index()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SearchIndex::build(dir.path()));

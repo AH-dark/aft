@@ -35,7 +35,8 @@ fn app_context_with_fake_lsp() -> AppContext {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx

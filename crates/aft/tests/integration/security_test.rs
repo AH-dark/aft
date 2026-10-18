@@ -34,6 +34,7 @@ fn restricted_context(root: &Path) -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn configure_restricted(aft: &mut AftProcess, root: &Path) {
@@ -328,7 +329,8 @@ fn validate_path_returns_canonical_path_that_write_uses() {
             restrict_to_project_root: true,
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
 
     let validated = match ctx.validate_path("validate-path", &requested) {
         Ok(path) => path,

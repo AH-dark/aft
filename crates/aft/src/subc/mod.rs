@@ -10185,6 +10185,31 @@ pub(crate) mod test_support {
         ))
     }
 
+    #[test]
+    fn test_context_checkpoint_locks_are_independent() {
+        let first = test_ctx();
+        let second = test_ctx();
+        assert_ne!(first.storage_dir(), second.storage_dir());
+        let lock_path = first.checkpoint().lock().lock_path_for_test().to_path_buf();
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(1))
+            .expect("hold the first context's checkpoint lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(second.checkpoint().lock().list("isolation"))
+                .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        // Release before joining so a shared-lock regression fails instead of
+        // waiting for the checkpoint store's full lock timeout.
+        drop(held);
+        worker.join().unwrap();
+        assert!(result
+            .expect("another context's checkpoint list must not wait for the held lock")
+            .expect("list the second context's checkpoints")
+            .is_empty());
+    }
+
     pub(super) fn inspect_context(root: &Path) -> Arc<AppContext> {
         inspect_context_with_timeout(root, None)
     }

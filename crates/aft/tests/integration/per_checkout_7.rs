@@ -1473,10 +1473,13 @@ mod production {
         // The previous release: views off, which builds and saves the
         // legacy semantic index.
         {
-            let legacy = Arc::new(AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                crate::context_storage::isolate(Config::default()),
-            ));
+            let legacy = Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(Config::default()),
+                )
+                .with_test_checkpoint_store(),
+            );
             send_configure(&legacy, &root, &storage, &server.base_url, false);
             aft::runtime_drain::drain_deferred_configure_maintenance(&legacy);
             wait_until(&legacy, "the legacy semantic index", |ctx| {
@@ -1499,10 +1502,13 @@ mod production {
 
         // The new release, views on. Holding the context's only
         // maintenance-build slot parks the import at its admission point.
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config::default()),
-        ));
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
         ctx.isolate_cold_build_limiter_for_test(1);
         let slot = ctx.take_cold_build_slot_for_test().unwrap();
         let started = Instant::now();

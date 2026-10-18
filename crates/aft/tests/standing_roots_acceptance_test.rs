@@ -95,6 +95,7 @@ fn session_context(project_root: &Path, storage: &Path) -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn daemonless_context(project_root: &Path, storage: &Path) -> AppContext {

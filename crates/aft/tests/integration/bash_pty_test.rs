@@ -539,7 +539,8 @@ fn pty_write_to_cat() {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Default::default()
         },
-    );
+    )
+    .with_test_checkpoint_store();
     let registry = ctx.bash_background();
     let task_id = spawn_pty_task(
         &registry,
@@ -578,7 +579,8 @@ fn pty_interactive_shell_keeps_terminal_stdin() {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Default::default()
         },
-    );
+    )
+    .with_test_checkpoint_store();
     let registry = ctx.bash_background();
     let task_id = spawn_pty_task(
         registry,
@@ -753,7 +755,8 @@ fn pty_write_too_large() {
             storage_dir: Some(project.path().join("storage")),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let req: RawRequest = serde_json::from_value(json!({
         "id": "write-large",
         "command": "bash_write",
@@ -782,7 +785,8 @@ fn pty_true_implies_background() {
             storage_dir: Some(project.path().join("storage")),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let req: RawRequest = serde_json::from_value(json!({
         "id": "pty-implies-bg",
         "command": "bash",
@@ -809,7 +813,8 @@ fn pty_status_output_mode_validation() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     let req: RawRequest = serde_json::from_value(json!({
         "id": "bad-output-mode",
         "command": "bash_status",
@@ -832,7 +837,8 @@ fn pty_status_accepts_output_modes() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     for output_mode in ["screen", "raw", "both"] {
         let req: RawRequest = serde_json::from_value(json!({
             "id": format!("mode-{output_mode}"),

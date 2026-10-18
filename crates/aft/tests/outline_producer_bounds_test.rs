@@ -12,7 +12,8 @@ fn outline(root: &std::path::Path) -> serde_json::Value {
             project_root: Some(root.to_path_buf()),
             ..Default::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let response = handle_outline(
         &RawRequest {
             id: "bounds".into(),

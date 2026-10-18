@@ -132,10 +132,13 @@ fn request(value: Value) -> RawRequest {
 }
 
 fn configure(root: &Path, storage: &Path) -> Arc<AppContext> {
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     let configured = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-borrowed-callgraph",

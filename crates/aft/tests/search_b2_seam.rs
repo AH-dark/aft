@@ -72,7 +72,8 @@ fn all_ready_context(base_url: String) -> (tempfile::TempDir, AppContext) {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
 
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
@@ -324,7 +325,8 @@ fn path_fact_context(base_url: String) -> (tempfile::TempDir, AppContext) {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let files = [named_file.clone(), other_file.clone()];
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);

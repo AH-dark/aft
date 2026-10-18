@@ -1999,11 +1999,12 @@ mod mutation_index_membership_tests {
         std::fs::write(&deleted, "const value = 'deleted_token';\n").unwrap();
         let ctx = AppContext::new(
             aft::context::default_language_provider_factory(),
-            aft::config::Config {
+            crate::context_storage::isolate(aft::config::Config {
                 project_root: Some(root.clone()),
                 ..aft::config::Config::default()
-            },
-        );
+            }),
+        )
+        .with_test_checkpoint_store();
         ctx.set_canonical_cache_root(root.clone());
         *ctx.search_index().write().unwrap() = Some(aft::search_index::SearchIndex::build(&root));
         let request: RawRequest = serde_json::from_str(
@@ -2050,10 +2051,13 @@ mod core_framing_tests {
         DEFERRED_RESPONSE_WAKER
             .set(wake_tx)
             .expect("only this test installs the standalone waker");
-        let ctx = Arc::new(AppContext::new(
-            Box::new(aft::parser::TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config::default()),
-        ));
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(aft::parser::TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
         let req: RawRequest = serde_json::from_value(
             serde_json::json!({"id":"wake", "command":"echo", "message":"finished"}),
         )
@@ -2073,7 +2077,8 @@ mod core_framing_tests {
         let ctx = AppContext::new(
             Box::new(aft::parser::TreeSitterProvider::new()),
             crate::context_storage::isolate(Config::default()),
-        );
+        )
+        .with_test_checkpoint_store();
         let mut pending = PendingResponses::default();
         pending.register(
             PendingResponse::polling(
@@ -2228,17 +2233,21 @@ mod pending_response_tests {
                 ..Config::default()
             }),
         )
+        .with_test_checkpoint_store()
     }
 
     fn make_runtime_registry(root: &Path) -> RuntimeRegistry {
         let app = App::default_shared();
-        let ctx = Arc::new(AppContext::from_app(
-            Arc::clone(&app),
-            crate::context_storage::isolate(Config {
-                project_root: Some(root.to_path_buf()),
-                ..Config::default()
-            }),
-        ));
+        let ctx = Arc::new(
+            AppContext::from_app(
+                Arc::clone(&app),
+                crate::context_storage::isolate(Config {
+                    project_root: Some(root.to_path_buf()),
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
         RuntimeRegistry::standalone(app, ctx)
     }
 
@@ -2412,7 +2421,8 @@ mod pending_response_tests {
                 storage_dir: Some(storage.path().to_path_buf()),
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         let frames = Arc::new(Mutex::new(Vec::<PushFrame>::new()));
         let frames_for_sender = Arc::clone(&frames);
         ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
@@ -2814,26 +2824,29 @@ mod deferred_semantic_search_tests {
     }
 
     fn semantic_context(root: &Path, base_url: String) -> Arc<AppContext> {
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config {
-                project_root: Some(root.to_path_buf()),
-                indexes: aft::config::IndexesConfig {
-                    trigram: false,
-                    semantic: true,
-                    callgraph: true,
-                },
-                semantic: SemanticBackendConfig {
-                    backend: SemanticBackend::OpenAiCompatible,
-                    model: "test-embedding".to_string(),
-                    base_url: Some(base_url),
-                    api_key_env: None,
-                    query_timeout_ms: 3_000,
-                    ..SemanticBackendConfig::default()
-                },
-                ..Config::default()
-            }),
-        ));
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config {
+                    project_root: Some(root.to_path_buf()),
+                    indexes: aft::config::IndexesConfig {
+                        trigram: false,
+                        semantic: true,
+                        callgraph: true,
+                    },
+                    semantic: SemanticBackendConfig {
+                        backend: SemanticBackend::OpenAiCompatible,
+                        model: "test-embedding".to_string(),
+                        base_url: Some(base_url),
+                        api_key_env: None,
+                        query_timeout_ms: 3_000,
+                        ..SemanticBackendConfig::default()
+                    },
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
@@ -3034,18 +3047,21 @@ mod deferred_semantic_search_tests {
         std::env::set_var("AFT_WAIT_FOR_SEMANTIC_READY_MS", "5000");
         let _wait_env = SemanticReadyWaitEnv;
         let root = tempfile::tempdir().expect("create search project");
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config {
-                project_root: Some(root.path().to_path_buf()),
-                indexes: aft::config::IndexesConfig {
-                    trigram: false,
-                    semantic: true,
-                    callgraph: true,
-                },
-                ..Config::default()
-            }),
-        ));
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config {
+                    project_root: Some(root.path().to_path_buf()),
+                    indexes: aft::config::IndexesConfig {
+                        trigram: false,
+                        semantic: true,
+                        callgraph: true,
+                    },
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
@@ -3125,13 +3141,16 @@ mod deferred_semantic_search_tests {
         )
         .expect("write parity fixture");
         let make_ctx = || {
-            Arc::new(AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                crate::context_storage::isolate(Config {
-                    project_root: Some(root.path().to_path_buf()),
-                    ..Config::default()
-                }),
-            ))
+            Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(Config {
+                        project_root: Some(root.path().to_path_buf()),
+                        ..Config::default()
+                    }),
+                )
+                .with_test_checkpoint_store(),
+            )
         };
         let make_request = || {
             request(
@@ -3186,13 +3205,16 @@ mod deferred_semantic_search_tests {
         std::fs::write(root.path().join("fixture.rs"), "fn inspect_parity() {}\n")
             .expect("write parity fixture");
         let make_ctx = || {
-            Arc::new(AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                crate::context_storage::isolate(Config {
-                    project_root: Some(root.path().to_path_buf()),
-                    ..Config::default()
-                }),
-            ))
+            Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(Config {
+                        project_root: Some(root.path().to_path_buf()),
+                        ..Config::default()
+                    }),
+                )
+                .with_test_checkpoint_store(),
+            )
         };
         let make_request = || {
             request(
@@ -3283,10 +3305,13 @@ mod deferred_semantic_search_tests {
             config
                 .checker
                 .insert("typescript".to_string(), "tsc".to_string());
-            Arc::new(AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                crate::context_storage::isolate(config),
-            ))
+            Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(config),
+                )
+                .with_test_checkpoint_store(),
+            )
         };
         let make_request = || {
             request(
@@ -3347,17 +3372,23 @@ mod deferred_semantic_search_tests {
 
     #[test]
     fn only_validating_mutations_offload_the_checker() {
-        let full = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config {
-                validate_on_edit: Some("full".to_string()),
-                ..Config::default()
-            }),
-        ));
-        let off = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::context_storage::isolate(Config::default()),
-        ));
+        let full = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config {
+                    validate_on_edit: Some("full".to_string()),
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let off = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
         let edit_tool = request(
             "t",
             "tool_call",
@@ -3402,10 +3433,13 @@ mod signal_handler_tests {
     #[test]
     fn signal_bg_registry_collection_includes_standalone_actor() {
         let app = App::default_shared();
-        let ctx = Arc::new(AppContext::from_app(
-            Arc::clone(&app),
-            crate::context_storage::isolate(Config::default()),
-        ));
+        let ctx = Arc::new(
+            AppContext::from_app(
+                Arc::clone(&app),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
         let storage = ctx
             .config()
             .storage_dir
@@ -3430,14 +3464,17 @@ mod graceful_shutdown_search_index_tests {
 
     fn make_runtime_registry(root: &Path, storage: &Path) -> RuntimeRegistry {
         let app = App::default_shared();
-        let ctx = Arc::new(AppContext::from_app(
-            Arc::clone(&app),
-            Config {
-                project_root: Some(root.to_path_buf()),
-                storage_dir: Some(storage.to_path_buf()),
-                ..Config::default()
-            },
-        ));
+        let ctx = Arc::new(
+            AppContext::from_app(
+                Arc::clone(&app),
+                Config {
+                    project_root: Some(root.to_path_buf()),
+                    storage_dir: Some(storage.to_path_buf()),
+                    ..Config::default()
+                },
+            )
+            .with_test_checkpoint_store(),
+        );
         ctx.set_canonical_cache_root(std::fs::canonicalize(root).expect("canonical root"));
         RuntimeRegistry::standalone(app, ctx)
     }
@@ -3787,6 +3824,7 @@ mod watcher_filter_tests {
                 ..Config::default()
             }),
         )
+        .with_test_checkpoint_store()
     }
 
     fn install_watcher_rx(ctx: &AppContext) -> crossbeam_channel::Sender<WatcherDispatchEvent> {
@@ -4023,7 +4061,8 @@ mod watcher_filter_tests {
                 },
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.set_harness(Harness::Opencode);
         ctx.set_canonical_cache_root(root.to_path_buf());
         ctx.set_cache_role(false, None);
@@ -4242,7 +4281,8 @@ mod watcher_filter_tests {
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             crate::context_storage::isolate(config),
-        );
+        )
+        .with_test_checkpoint_store();
         for command in [
             "undo",
             "undo_preview",
@@ -4540,7 +4580,8 @@ mod watcher_filter_tests {
                 },
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.set_canonical_cache_root(root.clone());
         aft::root_cache::configure_artifact_access(
             &root,
@@ -4662,7 +4703,8 @@ mod watcher_filter_tests {
                 },
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.set_canonical_cache_root(root.clone());
         aft::root_cache::configure_artifact_access(
             &root,
@@ -4825,7 +4867,8 @@ mod watcher_filter_tests {
                 },
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.set_canonical_cache_root(root.clone());
         aft::root_cache::configure_artifact_access(
             &root,
@@ -5083,7 +5126,8 @@ mod watcher_filter_tests {
                 },
                 ..Config::default()
             }),
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.set_canonical_cache_root(root.clone());
         ctx.rebuild_gitignore();
         *ctx.semantic_index()
@@ -5533,7 +5577,8 @@ mod config_pin_tests {
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             crate::context_storage::isolate(Config::default()),
-        );
+        )
+        .with_test_checkpoint_store();
         assert!(!ctx.config().restrict_to_project_root);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_in_probe = Arc::clone(&seen);

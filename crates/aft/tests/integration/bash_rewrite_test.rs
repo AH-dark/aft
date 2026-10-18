@@ -41,6 +41,7 @@ fn context(root: &std::path::Path, enabled: bool) -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> AppContext {
@@ -54,6 +55,7 @@ fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> A
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn request(command: &str, params: Value) -> RawRequest {

@@ -904,7 +904,8 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
@@ -1217,7 +1218,8 @@ fn root_keyed_migration_disk_floor_skips_to_legacy_fallback_without_cold_build()
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
@@ -1291,7 +1293,8 @@ fn root_keyed_migration_backup_budget_failure_serves_legacy_without_cold_build()
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
@@ -1384,7 +1387,8 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     retry_ctx.set_harness(Harness::Opencode);
     retry_ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
@@ -1473,7 +1477,8 @@ fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() 
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
@@ -1532,7 +1537,8 @@ fn app_context_revalidates_to_newer_published_generation() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     ctx.set_cache_role(true, None);
@@ -1603,7 +1609,8 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(dir.path().to_path_buf());
     aft::root_cache::configure_artifact_access(
@@ -1653,7 +1660,8 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     worktree_ctx.set_harness(Harness::Opencode);
     worktree_ctx.set_canonical_cache_root(dir.path().to_path_buf());
     aft::root_cache::configure_artifact_access(
@@ -1677,7 +1685,8 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     unavailable_ctx.set_harness(Harness::Opencode);
     unavailable_ctx.set_canonical_cache_root(unavailable_dir.path().to_path_buf());
     aft::root_cache::configure_artifact_access(
@@ -2188,7 +2197,8 @@ fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppCo
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.to_path_buf());
     let project_key = artifact_cache_key_for_test(root);
@@ -2866,7 +2876,8 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);

@@ -12,7 +12,8 @@ fn read_response(root: &Path, file: &Path, extra: Value) -> Response {
             project_root: Some(root.to_path_buf()),
             ..Default::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let mut params = extra.as_object().cloned().unwrap();
     params.insert("file".into(), json!(file));
     handle_read(

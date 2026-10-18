@@ -70,7 +70,8 @@ fn finalization_appends_one_server_reminder_without_a_status_bar_envelope() {
             project_root: Some(root_path.to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let mut alerts = AlertEngine::default();
     alerts.observe_authoritative("session", root_path, "server", Vec::new());
     alerts.observe_authoritative(

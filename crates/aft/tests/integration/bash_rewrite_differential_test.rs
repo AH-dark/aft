@@ -352,7 +352,8 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     assert!(try_rewrite_for_request(
         "cat note.txt",
         "sandbox-lock",
