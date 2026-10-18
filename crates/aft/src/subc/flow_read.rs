@@ -131,13 +131,21 @@ pub(super) async fn dispatch(
         active,
         control,
         persistence::WAIT_BUDGET,
+        #[cfg(test)]
+        DispatchHooks::default(),
     )
     .await
 }
 
-/// `parent_wait` is the read's time limit: it bounds the wait for the parent
-/// head's database and scope registration, and every wait for the aft.db
-/// lock to read the parent's access policy. Tests shorten it.
+#[cfg(test)]
+#[derive(Default)]
+struct DispatchHooks {
+    submitted: Option<oneshot::Sender<()>>,
+    before_read: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// `parent_wait` bounds the entire dispatch, including daemon admission,
+/// parent-policy readiness, and the executor's queue and run. Tests shorten it.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_with_wait(
     tx: &WriterSender,
@@ -150,7 +158,9 @@ async fn dispatch_with_wait(
     active: &ActiveToolCalls,
     control: Option<&Arc<readiness::DaemonControl>>,
     parent_wait: Duration,
+    #[cfg(test)] hooks: DispatchHooks,
 ) -> Result<(), SubcError> {
+    let limit = Instant::now() + parent_wait;
     let admit = || {
         if envelope.get("op").and_then(Value::as_str) != Some(file_read_exact::OPERATION) {
             return Err(Refusal::RouteNotAdmitted("operation"));
@@ -160,9 +170,10 @@ async fn dispatch_with_wait(
         let control = control
             .cloned()
             .ok_or(Refusal::RouteNotAdmitted("parent"))?;
-        Ok((parent, control))
+        let expiry = read_deadline(stamp)?;
+        Ok((parent, control, expiry.min(limit), expiry <= limit))
     };
-    let (parent, control) = match admit() {
+    let (parent, control, deadline, expires_first) = match admit() {
         Ok(admitted) => admitted,
         Err(error) => return send_provider_error(tx, metrics, frame, error.error()).await,
     };
@@ -194,60 +205,95 @@ async fn dispatch_with_wait(
         active.clone(),
     );
     tokio::spawn(async move {
-        // The frame loop must remain free to deliver this control RPC's answer.
-        let parent_stamp = parent.scope.as_ref().expect("parent route was checked");
-        let admission = match control.describe(parent_stamp).await {
-            Ok(reply) => live_parent(parent_stamp, &reply)
-                .and_then(|_| unexpired(identity.scope.as_ref().unwrap())),
-            Err(_) => Err(Refusal::RouteNotAdmitted("parent")),
-        };
-        let result = match admission {
-            Err(error) => Err(error.error()),
-            Ok(()) => {
-                let child = identity.scope.as_ref().expect("child route was checked");
-                let mut deadline = Instant::now() + parent_wait;
-                if let Ok(expiry) = read_deadline(child) {
-                    deadline = deadline.min(expiry);
-                }
-                if let Some(ctx) = executor.actor_context(&parent.root) {
-                    wait_for_parent_policy(&ctx, access_grants::scope_key(&parent), deadline).await;
-                }
-                if !active_tool_call_is_registered(&active, route, corr) {
-                    return;
-                }
-                let request_id = format!("flow-read-{}-{corr}", route.channel);
-                let job_id = request_id.clone();
-                let rx = resubmit_active_tool_call(
-                    &executor,
-                    &active,
-                    route,
-                    corr,
-                    parent.root.clone(),
-                    Lane::PureRead,
-                    request_id.clone(),
-                    file_read_exact::OPERATION,
-                    Box::new(move |ctx| {
-                        let result = read_as_parent(&identity, &parent, &envelope, ctx, deadline);
-                        Response::success(
-                            job_id,
-                            match result {
-                                Ok(value) => json!({"answer": value}),
-                                Err(error) => json!({"error": error.error()}),
-                            },
-                        )
-                    }),
-                );
-                let response = await_executor_response(rx, request_id).await;
-                if let Some(value) = response.data.get("answer") {
-                    Ok(value.clone())
-                } else if let Some(error) = response.data.get("error") {
-                    Err(serde_json::from_value::<ErrorBody>(error.clone())
-                        .unwrap_or_else(|_| Refusal::IoError.error()))
-                } else {
-                    Err(Refusal::IoError.error())
+        let child = identity
+            .scope
+            .as_ref()
+            .expect("child route was checked")
+            .clone();
+        let dispatch = async {
+            // The frame loop must remain free to deliver this control RPC's answer.
+            let parent_stamp = parent.scope.as_ref().expect("parent route was checked");
+            let admission = match control.describe(parent_stamp).await {
+                Ok(reply) => live_parent(parent_stamp, &reply)
+                    .and_then(|_| unexpired(identity.scope.as_ref().unwrap())),
+                Err(_) => Err(Refusal::RouteNotAdmitted("parent")),
+            };
+            match admission {
+                Err(error) => Err(error.error()),
+                Ok(()) => {
+                    if let Some(ctx) = executor.actor_context(&parent.root) {
+                        wait_for_parent_policy(&ctx, access_grants::scope_key(&parent), deadline)
+                            .await;
+                    }
+                    if !active_tool_call_is_registered(&active, route, corr) {
+                        return Err(Refusal::IoError.error());
+                    }
+                    let request_id = format!("flow-read-{}-{corr}", route.channel);
+                    let job_id = request_id.clone();
+                    let rx = resubmit_active_tool_call(
+                        &executor,
+                        &active,
+                        route,
+                        corr,
+                        parent.root.clone(),
+                        Lane::PureRead,
+                        request_id.clone(),
+                        file_read_exact::OPERATION,
+                        Box::new(move |ctx| {
+                            #[cfg(test)]
+                            if let Some(before_read) = hooks.before_read {
+                                before_read();
+                            }
+                            let result =
+                                read_as_parent(&identity, &parent, &envelope, ctx, deadline);
+                            Response::success(
+                                job_id,
+                                match result {
+                                    Ok(value) => json!({"answer": value}),
+                                    Err(error) => json!({"error": error.error()}),
+                                },
+                            )
+                        }),
+                    );
+                    #[cfg(test)]
+                    if let Some(submitted) = hooks.submitted {
+                        let _ = submitted.send(());
+                    }
+                    let response = await_executor_response(rx, request_id).await;
+                    if let Some(value) = response.data.get("answer") {
+                        Ok(value.clone())
+                    } else if let Some(error) = response.data.get("error") {
+                        Err(serde_json::from_value::<ErrorBody>(error.clone())
+                            .unwrap_or_else(|_| Refusal::IoError.error()))
+                    } else {
+                        Err(Refusal::IoError.error())
+                    }
                 }
             }
         };
+        let result =
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), dispatch).await
+            {
+                Ok(result) if Instant::now() < deadline => result,
+                _ => {
+                    let job = active
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&(route, corr))
+                        .map(|call| (call.root_id.clone(), call.cancellation.clone()));
+                    if let Some((root, cancellation)) = job {
+                        // Remove queued work before it can start. Running reads retain
+                        // their inputs but their response receiver has been dropped.
+                        executor.cancel_job_before_execution(&root, &cancellation);
+                    }
+                    let error = if expires_first || unexpired(&child).is_err() {
+                        Refusal::RouteNotAdmitted("expiry")
+                    } else {
+                        Refusal::PolicyTimeout
+                    };
+                    Err(error.error())
+                }
+            };
         if !claim_active_tool_call(&active, route, corr) {
             return;
         }
@@ -395,16 +441,12 @@ fn lock_by(
 /// wake-up, in case the row was written by a path that sends none.
 const SCOPE_RECHECK: Duration = Duration::from_millis(100);
 
-/// How long past the deadline a parent-policy probe may take to start on the
-/// blocking pool before the wait stops waiting for it.
-const PROBE_START_GRACE: Duration = Duration::from_millis(100);
-
 /// The parent head's bind is acknowledged before its database opens and its
 /// scope row is registered, and both happen in queued jobs that this read's
 /// pure-read lane can overtake. Wait, up to `deadline`, until the database is
-/// open and the parent's scope row exists. The wait never decides the
-/// outcome: the read itself still refuses if either is missing afterwards,
-/// and a failed or unconfigured database ends the wait at once.
+/// open and the parent's scope row exists. The dispatch deadline ends the
+/// request if readiness never arrives; a failed or unconfigured database
+/// ends this wait at once so the read can report that failure.
 ///
 /// This runs on the read's own async task, not on an executor worker, and
 /// each look at the row runs on a blocking thread so a held database lock
@@ -425,24 +467,15 @@ async fn wait_for_parent_policy(
             return;
         }
         let (probe_ctx, probe_key) = (ctx.clone(), key.clone());
-        // The probe gives up on a busy lock at the deadline itself. The outer
-        // timeout, a little later, only covers a blocking pool too busy to
-        // start the probe at all; an earlier one could abandon a probe that
-        // is holding the lock for its brief read, and the read that follows
-        // would then find the lock busy at its deadline and time out. A probe
-        // abandoned here only returns its snapshot to a dropped handle: the
-        // reply is sent by this task alone.
-        let probe = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline + PROBE_START_GRACE),
-            tokio::task::spawn_blocking(move || {
-                parent_policy_snapshot(&probe_ctx, &probe_key, deadline)
-            }),
-        )
+        // The dispatch deadline also bounds a probe waiting to start on the
+        // blocking pool. An abandoned probe only returns to a dropped handle;
+        // this async task alone owns the terminal reply.
+        let probe = tokio::task::spawn_blocking(move || {
+            parent_policy_snapshot(&probe_ctx, &probe_key, deadline)
+        })
         .await;
         // Only a missing row is worth waiting for; any other answer is final.
-        // A probe that timed out ends the wait too, and the read then reports
-        // the timeout itself.
-        if !matches!(probe, Ok(Ok(Err(Refusal::AccessDenied)))) {
+        if !matches!(probe, Ok(Err(Refusal::AccessDenied))) {
             return;
         }
         let now = Instant::now();

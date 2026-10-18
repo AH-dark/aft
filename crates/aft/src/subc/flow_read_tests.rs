@@ -295,6 +295,7 @@ async fn wire(identity: RouteIdentity, body: Value) -> Value {
         &writer,
         &frame,
         None,
+        None,
         PhaseTrace::new(Instant::now()),
         &routes,
         &HashMap::new(),
@@ -728,6 +729,29 @@ async fn start_live_read(
     child: RouteIdentity,
     parent_wait: Duration,
 ) -> mpsc::Receiver<WriterFrame> {
+    let (output, pending, corr) = start_read(
+        executor,
+        parent,
+        child,
+        parent_wait,
+        DispatchHooks::default(),
+    )
+    .await;
+    confirm_live(&pending, corr, parent);
+    output
+}
+
+async fn start_read(
+    executor: &Arc<Executor>,
+    parent: &RouteIdentity,
+    child: RouteIdentity,
+    parent_wait: Duration,
+    hooks: DispatchHooks,
+) -> (
+    mpsc::Receiver<WriterFrame>,
+    readiness::PendingControlReplies,
+    u64,
+) {
     let routes = HashMap::from([
         (route_key(41, 1), child.clone()),
         (route_key(42, 1), parent.clone()),
@@ -767,6 +791,7 @@ async fn start_live_read(
         &active,
         Some(&control),
         parent_wait,
+        hooks,
     )
     .await
     .unwrap();
@@ -774,18 +799,244 @@ async fn start_live_read(
         .await
         .unwrap()
         .unwrap();
+    (output, pending, request.header.corr)
+}
+
+fn confirm_live(pending: &readiness::PendingControlReplies, corr: u64, parent: &RouteIdentity) {
     assert!(pending.resolve(
         Frame::build(
             FrameType::Response,
             control_flags(),
             0,
             0,
-            request.header.corr,
+            corr,
             serde_json::to_vec(&reply(parent.scope.as_ref().unwrap(), ScopeStatus::Live)).unwrap()
         )
         .unwrap()
     ));
-    output
+}
+
+fn dispatch_limit(child: &mut RouteIdentity, expires: bool) -> Duration {
+    if expires {
+        Arc::get_mut(&mut child.0)
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap()
+            .expires_at_ms = Some(crate::db::call_ledger::now_ms() as u64 + 400);
+        Duration::from_secs(10)
+    } else {
+        Duration::from_millis(400)
+    }
+}
+
+async fn deadline_error(output: &mut mpsc::Receiver<WriterFrame>, expires: bool, started: Instant) {
+    let answer = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(started + Duration::from_millis(1400)),
+        output.recv(),
+    )
+    .await
+    .expect("the read must answer at its deadline while its blocker is still held")
+    .expect("one terminal frame");
+    assert!(
+        started.elapsed() >= Duration::from_millis(399),
+        "the read must not time out before its deadline"
+    );
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(answer.header.ty, FrameType::Error, "{body}");
+    if expires {
+        assert_eq!(body["code"], "file_read_exact_route_not_admitted");
+        assert_eq!(body["message"], "Route not admitted: expiry.");
+    } else {
+        assert_eq!(body["code"], "file_read_exact_io_error");
+        assert_eq!(
+            body["message"],
+            "The parent head's access policy could not be read within the read's time limit."
+        );
+    }
+}
+
+async fn no_second_frame(output: &mut mpsc::Receiver<WriterFrame>) {
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), output.recv())
+            .await
+            .expect("the response task releases its writer after answering")
+            .is_none(),
+        "a read must send exactly one terminal frame"
+    );
+}
+
+struct ReadRunProbe {
+    ran: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for ReadRunProbe {
+    fn drop(&mut self) {
+        let _ = self.dropped.take().unwrap().send(());
+    }
+}
+
+#[tokio::test]
+async fn flow_read_queued_job_deadline_cancels_before_start_and_replies_once() {
+    for lane in [Lane::Mutating, Lane::PureRead] {
+        for expires in [false, true] {
+            let (_dir, ctx, parent, mut child) = read_fixture();
+            let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+                pool_size: 2,
+                read_cap: 1,
+                actor_cap: 1,
+                ..Default::default()
+            }));
+            executor.register_actor(parent.root.clone(), ctx);
+            let (started, running) = oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = executor.submit_async(
+                parent.root.clone(),
+                lane,
+                "blocker".into(),
+                Box::new(move |_| {
+                    let _ = started.send(());
+                    let _ = held.recv();
+                    Response::success("blocker", json!({}))
+                }),
+            );
+            running.await.unwrap();
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (dropped, job_dropped) = oneshot::channel();
+            let probe = ReadRunProbe {
+                ran: ran.clone(),
+                dropped: Some(dropped),
+            };
+            let (submitted, queued) = oneshot::channel();
+            let started_at = Instant::now();
+            let limit = dispatch_limit(&mut child, expires);
+            let (mut output, pending, corr) = start_read(
+                &executor,
+                &parent,
+                child,
+                limit,
+                DispatchHooks {
+                    submitted: Some(submitted),
+                    before_read: Some(Box::new(move || {
+                        probe.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                        drop(probe);
+                    })),
+                },
+            )
+            .await;
+            confirm_live(&pending, corr, &parent);
+            tokio::time::timeout(Duration::from_secs(2), queued)
+                .await
+                .expect("read submitted behind the blocker")
+                .unwrap();
+            deadline_error(&mut output, expires, started_at).await;
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), job_dropped)
+                .await
+                .expect("cancelled read closure must be dropped")
+                .unwrap();
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "a read cancelled in the queue must never run after the blocker releases"
+            );
+            no_second_frame(&mut output).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn flow_read_describe_deadline_replies_once_without_daemon_answer() {
+    for expires in [false, true] {
+        let (_dir, ctx, parent, mut child) = read_fixture();
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(parent.root.clone(), ctx);
+        let started_at = Instant::now();
+        let limit = dispatch_limit(&mut child, expires);
+        let (mut output, pending, corr) =
+            start_read(&executor, &parent, child, limit, DispatchHooks::default()).await;
+        deadline_error(&mut output, expires, started_at).await;
+        // A late daemon reply cannot restart dispatch or send another terminal frame.
+        let _ = pending.resolve(
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                corr,
+                serde_json::to_vec(&reply(parent.scope.as_ref().unwrap(), ScopeStatus::Live))
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        no_second_frame(&mut output).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_read_running_job_deadline_discards_answer_without_cancelling() {
+    for expires in [false, true] {
+        let (_dir, ctx, parent, mut child) = read_fixture();
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(parent.root.clone(), ctx);
+        let (started, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let started_at = Instant::now();
+        let limit = dispatch_limit(&mut child, expires);
+        let (mut output, pending, corr) = start_read(
+            &executor,
+            &parent,
+            child,
+            limit,
+            DispatchHooks {
+                submitted: None,
+                before_read: Some(Box::new(move || {
+                    let _ = started.send(crate::executor::current_job_cancellation().unwrap());
+                    let _ = held.recv();
+                })),
+            },
+        )
+        .await;
+        confirm_live(&pending, corr, &parent);
+        let cancellation = tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("read is executing before its deadline")
+            .unwrap();
+        deadline_error(&mut output, expires, started_at).await;
+        assert!(
+            !cancellation.cancel_already_requested(),
+            "running reads finish normally"
+        );
+        release.send(()).unwrap();
+        let drained = executor.submit_async(
+            parent.root.clone(),
+            Lane::Mutating,
+            "drained".into(),
+            Box::new(|_| Response::success("drained", json!({}))),
+        );
+        tokio::time::timeout(Duration::from_secs(2), drained)
+            .await
+            .expect("the late read releases its executor reservation")
+            .unwrap();
+        no_second_frame(&mut output).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_read_dispatch_normal_read_succeeds_once() {
+    let (_dir, ctx, parent, child) = read_fixture();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(parent.root.clone(), ctx);
+    let mut output = start_live_read(&executor, &parent, child, Duration::from_secs(10)).await;
+    let answer = tokio::time::timeout(Duration::from_secs(2), output.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(body["bytes_base64"], "YWJj");
+    no_second_frame(&mut output).await;
 }
 
 /// No answer may arrive within `quiet`: the read is still waiting.
@@ -847,7 +1098,11 @@ async fn flow_read_refuses_after_bound_when_parent_never_registers() {
     assert!(started.elapsed() >= bound, "refused before the wait bound");
     let body: Value = serde_json::from_slice(&answer.body).unwrap();
     assert_eq!(answer.header.ty, FrameType::Error, "{body}");
-    assert_eq!(body["code"], "file_read_exact_access_denied");
+    assert_eq!(body["code"], "file_read_exact_io_error");
+    assert_eq!(
+        body["message"],
+        "The parent head's access policy could not be read within the read's time limit."
+    );
 
     let (_dir, ctx, executor, parent, child) = unregistered_parent();
     let started = Instant::now();
