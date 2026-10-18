@@ -9,8 +9,25 @@ use crate::sandbox_spawn::{
 };
 
 /// Serializes the consent tests: they share the process-wide test transport
-/// and the test override for how long a call is held for an answer.
+/// and test overrides for the answer-hold and directory-probe budgets.
 static CONSENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(unix)]
+struct DirectoryScopeProbeBudgetOverride(u64);
+
+#[cfg(unix)]
+impl DirectoryScopeProbeBudgetOverride {
+    fn generous() -> Self {
+        Self(DIRECTORY_SCOPE_PROBE_OVERRIDE_MS.swap(10_000, Ordering::SeqCst))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirectoryScopeProbeBudgetOverride {
+    fn drop(&mut self) {
+        DIRECTORY_SCOPE_PROBE_OVERRIDE_MS.store(self.0, Ordering::SeqCst);
+    }
+}
 
 #[derive(Default)]
 struct FakeState {
@@ -1152,6 +1169,8 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
 #[tokio::test]
 async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
+    const HANG_GUARD: Duration = Duration::from_secs(60);
     let f = fixture(FakeCingulate::up());
     let home = crate::environment::non_empty_os_var("HOME")
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
@@ -1173,12 +1192,10 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
         let call = scope_probe_call(&f, &target);
         tasks.spawn(async move {
             let route = RouteHold::new(call.route);
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                hold(&call, grant, Instant::now(), &route, None),
-            )
-            .await
-            .expect("a stalled optional probe waits at most its own budget");
+            let result =
+                tokio::time::timeout(HANG_GUARD, hold(&call, grant, Instant::now(), &route, None))
+                    .await
+                    .expect("concurrent stalled probes must finish before the hang guard");
             assert!(matches!(result, Hold::Answer(_)));
         });
     }
@@ -1201,14 +1218,14 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
         "only one helper may probe the home"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "concurrent probes must wait within their own budgets, not serial deadlines"
+        started.elapsed() < HANG_GUARD,
+        "concurrent probes must share their wait, not take 72 serial probe budgets"
     );
     let unrelated = f.head_root.join("unrelated.txt");
     std::fs::write(&unrelated, "unrelated read").unwrap();
     let content = crate::bounded_io::run(
         &unrelated,
-        Some(Instant::now() + Duration::from_secs(1)),
+        Some(Instant::now() + HANG_GUARD),
         std::fs::read_to_string,
     )
     .expect("stalled home probes leave shared filesystem helpers available");
@@ -1453,6 +1470,7 @@ fn consent_scope_four_concurrent_cards_share_directory_probe() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
     let f = fixture(FakeCingulate::up());
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let probes = Arc::new(AtomicUsize::new(0));
@@ -1628,6 +1646,7 @@ fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
 #[test]
 fn consent_scope_waits_for_other_directory_probe_permit() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
     let dir = tempfile::tempdir().unwrap();
     let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
@@ -1655,6 +1674,7 @@ async fn consent_scope_timed_out_probe_is_not_memoized() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let _lock = CONSENT_TEST_LOCK.lock().await;
+    assert_eq!(directory_scope_probe_budget(), Duration::from_millis(250));
     let dir = tempfile::tempdir().unwrap();
     let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();

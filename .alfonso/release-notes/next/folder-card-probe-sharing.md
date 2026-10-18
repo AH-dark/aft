@@ -1,1 +1,1 @@
-Concurrent sibling reads now share a bounded directory-scope probe and briefly reuse its answer, keeping safe folder permission cards consistent while logging uncertain file-only fallbacks.
+Reading several files in one folder at the same time now offers folder-wide read approval on every permission card, instead of file-only approval for all but one.

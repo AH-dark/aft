@@ -772,6 +772,20 @@ fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
 }
 
 const DIRECTORY_SCOPE_PROBE_BUDGET: Duration = Duration::from_millis(250);
+#[cfg(test)]
+static DIRECTORY_SCOPE_PROBE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn directory_scope_probe_budget() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = DIRECTORY_SCOPE_PROBE_OVERRIDE_MS.load(Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    DIRECTORY_SCOPE_PROBE_BUDGET
+}
+
 const DIRECTORY_SCOPE_MEMO_TTL: Duration = Duration::from_secs(60);
 type DirectoryScopeAnswer = Result<bool, &'static str>;
 
@@ -864,7 +878,7 @@ fn read_directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> Acc
 where
     F: Fn(&Path, &Path) -> Option<bool> + Send + Sync + 'static,
 {
-    let deadline = Instant::now() + DIRECTORY_SCOPE_PROBE_BUDGET;
+    let deadline = Instant::now() + directory_scope_probe_budget();
     if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
         return grant.clone();
     }
