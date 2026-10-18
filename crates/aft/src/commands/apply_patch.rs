@@ -110,8 +110,22 @@ fn relative_path(abs: &Path, root: Option<&Path>) -> String {
         // configured root can already be non-verbatim. Normalize both sides
         // before `strip_prefix` so patch responses stay project-relative.
         let root = crate::inspect::job::canonicalize_normalized(root);
-        if let Ok(rel) = abs.strip_prefix(root) {
+        if let Ok(rel) = abs.strip_prefix(&root) {
             return display_slash(rel);
+        }
+        // A deleted or moved-away file cannot be canonicalized. Resolve its
+        // nearest existing ancestor so an aliased root still compares equal,
+        // without changing the operation's filePath or the absolute fallback.
+        for ancestor in abs.ancestors().skip(1) {
+            if let Ok(canonical) = fs::canonicalize(ancestor) {
+                let comparison = crate::inspect::job::normalize_path(
+                    &canonical.join(abs.strip_prefix(ancestor).unwrap()),
+                );
+                if let Ok(rel) = comparison.strip_prefix(&root) {
+                    return display_slash(rel);
+                }
+                break;
+            }
         }
     }
     display_slash(&abs)
@@ -1159,6 +1173,77 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn short_path(path: &Path) -> PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: the input is NUL-terminated; a null output queries the buffer size.
+        let size = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_ne!(
+            size,
+            0,
+            "GetShortPathNameW: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0; size as usize];
+        // SAFETY: the output buffer has the capacity reported by the first call.
+        let written = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), size) };
+        assert!(written > 0 && written < size, "GetShortPathNameW failed");
+        PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written as usize]))
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn metadata_relative_paths_stay_relative_under_an_aliased_root() {
+        let temp = tempfile::tempdir().expect("create temporary project");
+        let root = temp.path().join("project with a long name");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(&root);
+        #[cfg(unix)]
+        let alias = {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let alias = short_path(&root);
+        assert_ne!(
+            alias, root,
+            "the fixture must exercise a distinct root spelling"
+        );
+        assert_eq!(crate::inspect::job::canonicalize_normalized(&alias), root);
+
+        fs::write(root.join("src/live.ts"), "export const value = 1;\n").unwrap();
+        fs::write(root.join("src/deleted.ts"), "before\n").unwrap();
+        fs::remove_file(root.join("src/deleted.ts")).unwrap();
+        fs::create_dir_all(root.join("removed/nested")).unwrap();
+        fs::write(root.join("removed/nested/gone.ts"), "before\n").unwrap();
+        fs::remove_dir_all(root.join("removed")).unwrap();
+
+        for rel in ["src/live.ts", "src/deleted.ts", "removed/nested/gone.ts"] {
+            let file_path = alias.join(rel);
+            let applied = [AppliedHunkResult {
+                index: 0,
+                file_path: file_path.clone(),
+                display_path: file_path.clone(),
+                move_path: None,
+                kind: "delete",
+                before: "before\n".into(),
+                after: String::new(),
+                delete_lines: Some(1),
+            }];
+            let (_, files) = metadata_files(&applied, Some(&root), &HashMap::new());
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0]["filePath"], path_string(&file_path));
+            assert_eq!(files[0]["relativePath"], rel, "metadata for {rel}");
+            assert_eq!(relative_path(&root.join(rel), Some(&alias)), rel);
+            #[cfg(windows)]
+            assert_eq!(relative_path(&file_path, Some(&verbatim_path(&root))), rel);
+        }
+    }
 
     #[cfg(windows)]
     fn verbatim_path(path: &Path) -> PathBuf {

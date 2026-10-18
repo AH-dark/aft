@@ -21,8 +21,10 @@ fn syntax_notice(line: usize) -> String {
 }
 
 fn configured(root: &Path) -> AftProcess {
+    // Keep fixture paths stable across temp-directory aliases and Windows short names.
+    let root = fs::canonicalize(root).expect("canonical temporary project root");
     let mut aft = AftProcess::spawn();
-    let configured = aft.configure(root);
+    let configured = aft.configure(&root);
     assert_eq!(configured["success"], true, "{configured:?}");
     aft
 }
