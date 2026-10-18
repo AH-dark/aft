@@ -1799,6 +1799,14 @@ impl SearchLaneStatus {
         [("trigram", &self.trigram), ("semantic", &self.semantic)]
             .into_iter()
             .map(|(name, lane)| {
+                if name == "semantic" && !lane.is_ready() && lane.effective != IndexEffective::Off {
+                    let backend = ctx.semantic_backend_health_snapshot();
+                    if !backend.available && backend.paused_until_ms.is_some() {
+                        // A scheduled pause is not an ordinary unavailable-index
+                        // state, even when no lane is ready to run this request.
+                        return PAUSED_EMBEDDING_DETAIL.to_string();
+                    }
+                }
                 let state = match lane.effective {
                     IndexEffective::Unavailable
                         if lane.unavailable_reason.as_deref()
@@ -8869,6 +8877,44 @@ mod tests {
                 response["note"],
                 "Semantic search unavailable: the embedding model is paused; using keyword search only."
             );
+        });
+    }
+
+    #[test]
+    fn lane_paused_trigram_building_search_shows_approved_sentence() {
+        use crate::synapse_embed::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |_clock| {
+            let project = tempfile::tempdir().unwrap();
+            let ctx = test_context(project.path());
+            ctx.set_canonical_cache_root(project.path().to_path_buf());
+            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+                stage: "embedding".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            let (publish, receiver) = crossbeam_channel::unbounded::<SearchIndex>();
+            ctx.install_search_index_rx(receiver, ctx.configure_generation());
+            record_pause_for_root(project.path());
+
+            // Keeping the publication sender alive holds the trigram lane in its
+            // building state while the search reply is rendered.
+            let response =
+                with_first_search_index_load_wait_budget_for_test(Duration::ZERO, || {
+                    handle_semantic_search(
+                        &semantic_request("where remix panel mounted option switching handled", 5),
+                        &ctx,
+                    )
+                });
+            let text = crate::subc_format::format_response("search", &response, false);
+            assert!(text.lines().any(|line| {
+                line == "Semantic search unavailable: the embedding model is paused; using keyword search only."
+            }), "{text}");
+            assert!(
+                text.lines().any(|line| line == "trigram: building"),
+                "{text}"
+            );
+            drop(publish);
         });
     }
 
