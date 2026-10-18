@@ -39,6 +39,7 @@ import {
   findBinarySync,
   formatConfigErrorMessage,
   formatConfigParseErrorMessage,
+  GITHUB_LSP_TABLE,
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isOrtAutoDownloadSupported,
@@ -46,7 +47,6 @@ import {
   resolveCortexKitStorageRoot,
   subcConnectionFileError,
 } from "@cortexkit/aft-bridge";
-
 import {
   type AftConfig,
   buildConfigTierConfigureParams,
@@ -65,7 +65,6 @@ import { bridgeLogger, error, log, warn } from "./logger.js";
 import { pushLspPathsAfterAutoInstall, runAutoInstall } from "./lsp-auto-install.js";
 import { type AutoInstallPassLease, claimLspAutoInstallPass } from "./lsp-cache.js";
 import { discoverRelevantGithubServers, runGithubAutoInstall } from "./lsp-github-install.js";
-import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
 import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import { openCodeHashlineDowngrade, openCodeHashlineEditRegistered } from "./tool-registration.js";
 

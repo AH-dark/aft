@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { assertSafeVersion, pickEligibleRelease, stripTagV } from "../lsp-github-probe.js";
+import { assertSafeVersion, pickEligibleRelease, stripTagV } from "@cortexkit/aft-bridge";
 
 const NOW = Date.parse("2025-01-15T12:00:00Z");
 const DAY_MS = 24 * 60 * 60 * 1000;

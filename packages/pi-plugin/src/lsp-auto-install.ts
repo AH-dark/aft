@@ -31,8 +31,10 @@ import { existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } fr
 import { join } from "node:path";
 import {
   type AftTransportPool,
+  assertSafeVersion,
   cachedFileSha256,
   cachedFileSha256Sync,
+  isSafeVersion,
   npmInvocation,
   npmSpawnEnv,
   resolveNpm,
@@ -53,7 +55,6 @@ import {
   writeInstalledMeta,
   writeVersionCheck,
 } from "./lsp-cache.js";
-import { assertSafeVersion, isSafeVersion } from "./lsp-github-probe.js";
 import { isVersionSupported, NPM_LSP_TABLE, type NpmServerSpec } from "./lsp-npm-table.js";
 import {
   hasPackageJsonDep,

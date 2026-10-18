@@ -11,7 +11,7 @@
  * all of them), we filter on that. Pre-releases are skipped by default.
  */
 
-import { warn } from "./logger.js";
+import { warn as defaultWarn } from "./active-logger.js";
 
 interface GithubRelease {
   tag_name: string;
@@ -87,6 +87,7 @@ export async function probeGithubReleases(
   githubRepo: string,
   graceDays: number,
   fetchImpl: typeof fetch = fetch,
+  warn: (message: string) => void = defaultWarn,
 ): Promise<GithubVersionPickResult | null> {
   const url = `https://api.github.com/repos/${githubRepo}/releases?per_page=30`;
   try {
@@ -131,6 +132,10 @@ const SAFE_VERSION_RE = /^[A-Za-z0-9._+-]+$/;
 
 /**
  * Throw if `version` contains anything outside the safe allowlist.
+ *
+ * Call this at every boundary where a version string is about to be
+ * concatenated into a path, command, or URL — defense-in-depth even
+ * when the surrounding code uses execFile (no shell).
  */
 export function assertSafeVersion(version: string): void {
   if (!SAFE_VERSION_RE.test(version)) {
@@ -140,7 +145,15 @@ export function assertSafeVersion(version: string): void {
   }
 }
 
-/** Non-throwing predicate for the cache-miss-on-corruption flow. */
+/**
+ * Non-throwing version of {@link assertSafeVersion}. Returns true when
+ * `version` is a non-null, non-empty string that matches the allowlist.
+ *
+ * Callers that read version strings from disk caches
+ * (where corruption is possible but not necessarily an attack) prefer
+ * this over throwing — they degrade to "treat as cache miss" instead of
+ * crashing the plugin.
+ */
 export function isSafeVersion(version: string | null | undefined): version is string {
   return typeof version === "string" && version.length > 0 && SAFE_VERSION_RE.test(version);
 }
@@ -149,8 +162,9 @@ export function isSafeVersion(version: string | null | undefined): version is st
  * Strip a leading `v` from a release tag to get a clean version for asset
  * templates that don't include the `v` prefix.
  *
- * Asserts the tag is safe via {@link assertSafeVersion} so callers can
- * pass it into paths and command arguments without additional validation.
+ * The returned value is asserted safe via {@link assertSafeVersion} so
+ * callers can pass it into paths and command arguments without
+ * additional validation.
  */
 export function stripTagV(tag: string): string {
   assertSafeVersion(tag);

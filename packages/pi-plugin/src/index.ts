@@ -40,6 +40,7 @@ import {
   findBinary,
   findBinarySync,
   formatDroppedKeyWarnings,
+  GITHUB_LSP_TABLE,
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isHomeDirectoryRoot,
@@ -83,7 +84,6 @@ import {
   discoverRelevantGithubServers,
   runGithubAutoInstall,
 } from "./lsp-github-install.js";
-import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
 import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import {
   type ConfigureWarning,

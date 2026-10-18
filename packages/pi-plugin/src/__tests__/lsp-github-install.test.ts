@@ -14,7 +14,9 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { findGithubServerById } from "@cortexkit/aft-bridge";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { writeSmokeBinary } from "../../../aft-bridge/src/__tests__/test-utils/smoke-binary.js";
 import { getAftLspBinariesDir } from "../../../aft-bridge/src/cache-paths.js";
 import {
   detectHostPlatform,
@@ -23,7 +25,6 @@ import {
   isGithubInstalled,
   runGithubAutoInstall,
 } from "../lsp-github-install.js";
-import { findGithubServerById } from "../lsp-github-table.js";
 
 let tmpRoot = "";
 let projectRoot = "";
@@ -148,20 +149,17 @@ describe("isGithubInstalled", () => {
 
 describe("runGithubAutoInstall", () => {
   test("auto_install: false skips everything but still surfaces cached bin dirs", async () => {
-    const clangd = findGithubServerById("clangd");
-    if (!clangd) throw new Error("clangd missing");
+    const texlab = findGithubServerById("texlab");
+    if (!texlab) throw new Error("texlab missing");
     const platform = process.platform === "win32" ? "win32" : process.platform;
     if (platform !== "darwin" && platform !== "linux" && platform !== "win32") {
       // Skip on unsupported hosts.
       return;
     }
-    const bin = ghBinaryPath(clangd, platform as "darwin" | "linux" | "win32");
+    const bin = ghBinaryPath(texlab, platform as "darwin" | "linux" | "win32");
     mkdirSync(join(bin, ".."), { recursive: true });
-    const binContent = "fake";
-    writeFileSync(bin, binContent);
-    // Lane F's TOFU validation needs a valid `.aft-installed` whose
-    // recorded sha256 matches the binary, otherwise the cached entry is
-    // quarantined and won't appear in cachedBinDirs.
+    const binContent = readFileSync(writeSmokeBinary(bin));
+    // Cached installs must have matching metadata and pass the runtime smoke command.
     const sha256 = createHash("sha256").update(binContent).digest("hex");
     // ghPackageDir is not exported, but the layout is <pkg>/bin/<binary>,
     // so dirname twice from the binary path gives us the package dir.
@@ -176,7 +174,7 @@ describe("runGithubAutoInstall", () => {
     }) as unknown as typeof fetch;
 
     const result = await runGithubAutoInstall(
-      new Set(["clangd"]),
+      new Set(["texlab"]),
       {
         autoInstall: false,
         graceDays: 7,
@@ -188,7 +186,7 @@ describe("runGithubAutoInstall", () => {
     expect(result.cachedBinDirs.length).toBeGreaterThan(0);
     expect(result.installsStarted).toBe(0);
     expect(
-      result.skipped.some((s) => s.id === "clangd" && s.reason === "auto_install: false"),
+      result.skipped.some((s) => s.id === "texlab" && s.reason === "auto_install: false"),
     ).toBe(true);
   });
 
