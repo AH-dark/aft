@@ -77,9 +77,13 @@ fn views_tier2_published_plane_never_refreshes_legacy() {
     );
 }
 
+/// Reports the phase the verification worker is entering. It is shared, so a
+/// thread-local observer installed during a phase can report steps itself.
+type PhaseReport = Arc<dyn Fn(&str) + Send + Sync>;
+
 fn run_checkout_verification_with_deadline(
     timeout: Duration,
-    verify: impl FnOnce(&dyn Fn(&'static str)) + Send + 'static,
+    verify: impl FnOnce(&PhaseReport) + Send + 'static,
 ) {
     run_checkout_verification_watchdog(timeout, DeadlineStart::Spawn, verify);
 }
@@ -94,38 +98,88 @@ enum DeadlineStart {
     FirstPhase,
 }
 
+/// Phases the verification worker has entered, in order. Consecutive reports
+/// of the same phase (one per source file read, for example) share one row.
+/// The deadline covers every phase, so the phase named at a timeout is only
+/// the one still running: these offsets show which phase used up the time.
+#[derive(Default)]
+struct PhaseTimeline {
+    rows: Vec<(String, Duration, Duration, usize)>,
+}
+
+impl PhaseTimeline {
+    fn enter(&mut self, phase: &str, at: Duration) {
+        match self.rows.last_mut() {
+            Some((last, _, latest, count)) if last == phase => {
+                *latest = at;
+                *count += 1;
+            }
+            _ => self.rows.push((phase.to_owned(), at, at, 1)),
+        }
+    }
+
+    fn current(&self) -> &str {
+        self.rows
+            .last()
+            .map_or("starting worker", |(phase, ..)| phase.as_str())
+    }
+
+    fn render(&self) -> String {
+        self.rows
+            .iter()
+            .map(|(phase, first, latest, count)| {
+                if *count == 1 {
+                    format!("{phase}@{:.1}s", first.as_secs_f64())
+                } else {
+                    format!(
+                        "{phase}@{:.1}s (x{count}, last@{:.1}s)",
+                        first.as_secs_f64(),
+                        latest.as_secs_f64()
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn run_checkout_verification_watchdog(
     timeout: Duration,
     start: DeadlineStart,
-    verify: impl FnOnce(&dyn Fn(&'static str)) + Send + 'static,
+    verify: impl FnOnce(&PhaseReport) + Send + 'static,
 ) {
     enum Progress {
-        Phase(&'static str),
+        Phase(String, Instant),
         Finished(std::thread::Result<()>),
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut deadline = started + timeout;
     std::thread::Builder::new()
         .name("inspect-warm-verification".into())
         .spawn(move || {
             // Keep the fixture, thread-local IO counters, and assertions on one
             // thread. Report completion only after fixture cleanup has finished.
+            let report: PhaseReport = {
+                let tx = tx.clone();
+                Arc::new(move |phase: &str| {
+                    let _ = tx.send(Progress::Phase(phase.to_owned(), Instant::now()));
+                })
+            };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                verify(&|phase| {
-                    let _ = tx.send(Progress::Phase(phase));
-                });
+                verify(&report);
             }));
             let _ = tx.send(Progress::Finished(result));
         })
         .expect("spawn inspect warm verification worker");
 
-    let mut phase = "starting worker";
+    let mut timeline = PhaseTimeline::default();
     if matches!(start, DeadlineStart::FirstPhase) {
         // A generous hang guard for the worker to start; the deadline under
         // test begins only once it has reported its first phase.
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Progress::Phase(first)) => phase = first,
+            Ok(Progress::Phase(first, at)) => timeline.enter(&first, at - started),
             Ok(Progress::Finished(Ok(()))) => return,
             Ok(Progress::Finished(Err(panic))) => std::panic::resume_unwind(panic),
             Err(error) => panic!("inspect warm verification worker never started: {error}"),
@@ -137,14 +191,30 @@ fn run_checkout_verification_watchdog(
         // progress cannot extend it. Do not join a worker that may be blocked.
         let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
-            Ok(Progress::Phase(next)) if !remaining.is_zero() => phase = next,
-            Ok(Progress::Finished(Ok(()))) => return,
+            Ok(Progress::Phase(next, at)) if !remaining.is_zero() => {
+                timeline.enter(&next, at - started);
+            }
+            Ok(Progress::Finished(Ok(()))) => {
+                eprintln!(
+                    "inspect warm verification finished in {:.1}s; timeline: {}",
+                    started.elapsed().as_secs_f64(),
+                    timeline.render()
+                );
+                return;
+            }
             Ok(Progress::Finished(Err(panic))) => std::panic::resume_unwind(panic),
-            Ok(Progress::Phase(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("inspect warm verification timed out after {timeout:?} during {phase}");
+            Ok(Progress::Phase(..)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "inspect warm verification timed out after {timeout:?} during {}; timeline: {}",
+                    timeline.current(),
+                    timeline.render()
+                );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("inspect warm verification worker disconnected during {phase}");
+                panic!(
+                    "inspect warm verification worker disconnected during {}",
+                    timeline.current()
+                );
             }
         }
     }
@@ -166,9 +236,15 @@ fn checkout_verification_deadline_reports_last_phase() {
     // Release the simulated stall even when the assertion below fails.
     let _ = release.send(());
     let panic = result.expect_err("a blocked verification must fail before the libtest timeout");
-    assert_eq!(
-        panic.downcast_ref::<String>().unwrap(),
-        "inspect warm verification timed out after 1s during injected blocked operation"
+    let message = panic.downcast_ref::<String>().unwrap();
+    // The timeline after the phase name records when each phase began, which
+    // varies from run to run; only its shape is fixed.
+    assert!(
+        message.starts_with(
+            "inspect warm verification timed out after 1s during injected blocked operation; \
+             timeline: injected blocked operation@"
+        ),
+        "{message}"
     );
 }
 
@@ -190,7 +266,7 @@ fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
     run_checkout_verification_with_deadline(Duration::from_secs(180), verify_checkout_view_corpus);
 }
 
-fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
+fn verify_checkout_view_corpus(phase: &PhaseReport) {
     // IO counters and refusal reports are thread-local. Invalidation tickets
     // are keyed by this private project directory, which has no watcher, so
     // other libtest threads cannot move this fixture's ticket or counters.
@@ -230,7 +306,7 @@ fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
         &crate::alias::head_tree_entries(&job.project_root).unwrap(),
     );
     phase("publishing checkout view");
-    crate::views::assembly::publish_checkout(&request).unwrap();
+    publish_checkout_reporting_steps(&request, phase);
     phase("walking published source files");
     job.scope_files = crate::callgraph::walk_project_files(&job.project_root).collect();
     phase("creating inspect snapshot and manager");
@@ -324,6 +400,26 @@ fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
         .is_none());
     assert!(crate::views::read::take_verification_io().files_read > 0);
     phase("dropping fixture and manager");
+}
+
+/// `publish_checkout`, reporting each publication step to the watchdog. A
+/// stall then names the step it happened in rather than the whole publication.
+fn publish_checkout_reporting_steps(
+    request: &crate::views::assembly::AssemblyRequest,
+    phase: &PhaseReport,
+) {
+    // Steps report as they finish, so a stall is in the step after the last one.
+    let _observer = crate::views::observe_publication_phases_for_test({
+        let phase = Arc::clone(phase);
+        move |step| phase(&format!("publishing checkout view: after {step}"))
+    });
+    let mut prepared = crate::views::assembly::prepare_checkout(request, &mut |stage| {
+        phase(&format!("publishing checkout view: {stage}"));
+        Ok(())
+    })
+    .unwrap();
+    phase("publishing checkout view: committing generation pointer");
+    prepared.commit().unwrap();
 }
 
 #[test]

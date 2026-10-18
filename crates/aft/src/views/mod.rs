@@ -19,6 +19,8 @@ pub(crate) mod io;
 pub mod lazy_read_benchmark;
 pub mod materialization;
 mod profile;
+#[cfg(test)]
+pub(crate) use profile::observe_publication_phases_for_test;
 pub(crate) mod read;
 
 // Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
