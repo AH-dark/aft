@@ -15,7 +15,7 @@ fn snapshot_corpus_matches_ai_tokenizer_claude_counts() {
 
     for (idx, entry) in corpus.iter().enumerate() {
         assert_eq!(
-            count_tokens(&entry.input),
+            count_tokens(&entry.input).unwrap(),
             entry.expected,
             "corpus entry #{idx} failed for input {:?}",
             entry.input

@@ -13,66 +13,70 @@ const NO_RANK: u32 = u32::MAX;
 
 static PATTERN_REGEX: OnceLock<Regex> = OnceLock::new();
 static STRING_ENCODER: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
-static BINARY_ENCODER: OnceLock<HashMap<Vec<u8>, u32>> = OnceLock::new();
+static BINARY_ENCODER: OnceLock<HashMap<&'static [u8], u32>> = OnceLock::new();
 
 /// Count Claude tokens in `text`.
-pub fn count_tokens(text: &str) -> usize {
+///
+/// # Errors
+///
+/// Returns [`crate::TokenizationError`] when pre-tokenization fails, including
+/// regex backtracking or stack limits. Never returns an estimate or partial count.
+pub fn count_tokens(text: &str) -> Result<usize, crate::TokenizationError> {
     if text.is_empty() {
-        return 0;
+        return Ok(0);
     }
     // Keep the same direct-token shortcut and pre-tokenizer as encoding, but
     // accumulate counts instead of allocating a final token-ID vector.
-    if text.encode_utf16().take(10).count() < 10 && string_encoder().contains_key(text) {
-        return 1;
-    }
     let mut count = 0;
-    for piece in pattern_regex().find_iter(text) {
-        let piece = piece
-            .expect("Claude pre-tokenizer regex should not fail")
-            .as_str();
-        if string_encoder().contains_key(piece) {
-            count += 1;
-        } else {
-            visit_byte_pair_tokens(piece.as_bytes(), |_| count += 1);
-        }
-    }
-    count
+    emit_tokens(text, pattern_regex(), |_| count += 1)?;
+    Ok(count)
 }
 
 /// Encode `text` into Claude token IDs.
-pub fn encode(text: &str) -> Vec<u32> {
+///
+/// # Errors
+///
+/// Returns [`crate::TokenizationError`] when pre-tokenization fails, including
+/// regex backtracking or stack limits. Never returns a partial vector or invented IDs.
+pub fn encode(text: &str) -> Result<Vec<u32>, crate::TokenizationError> {
     if text.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     encode_internal(text)
 }
 
-fn encode_internal(text: &str) -> Vec<u32> {
+fn encode_internal(text: &str) -> Result<Vec<u32>, crate::TokenizationError> {
+    let mut result = Vec::new();
+    emit_tokens(text, pattern_regex(), |rank| result.push(rank))?;
+    #[cfg(test)]
+    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + result.capacity() * 4));
+    Ok(result)
+}
+
+fn emit_tokens(
+    text: &str,
+    regex: &Regex,
+    mut emit: impl FnMut(u32),
+) -> Result<(), crate::TokenizationError> {
     // ai-tokenizer checks direct rank before pre-tokenizing for short strings.
     if text.encode_utf16().take(10).count() < 10 {
         if let Some(&rank) = string_encoder().get(text) {
-            #[cfg(test)]
-            TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + 4));
-            return vec![rank];
+            emit(rank);
+            return Ok(());
         }
     }
 
-    let mut result = Vec::new();
-    for piece in pattern_regex().find_iter(text) {
-        let piece = piece
-            .expect("Claude pre-tokenizer regex should not fail")
-            .as_str();
+    for piece in regex.find_iter(text) {
+        let piece = piece?.as_str();
 
         if let Some(&rank) = string_encoder().get(piece) {
-            result.push(rank);
+            emit(rank);
             continue;
         }
 
-        result.extend(byte_pair_merge(piece.as_bytes()));
+        visit_byte_pair_tokens(piece.as_bytes(), &mut emit);
     }
-    #[cfg(test)]
-    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + result.capacity() * 4));
-    result
+    Ok(())
 }
 
 fn pattern_regex() -> &'static Regex {
@@ -83,28 +87,18 @@ fn string_encoder() -> &'static HashMap<&'static str, u32> {
     STRING_ENCODER.get_or_init(|| STRING_ENCODER_ENTRIES.iter().copied().collect())
 }
 
-fn binary_encoder() -> &'static HashMap<Vec<u8>, u32> {
-    BINARY_ENCODER.get_or_init(|| {
-        BINARY_ENCODER_ENTRIES
-            .iter()
-            .map(|(bytes, rank)| (bytes.to_vec(), *rank))
-            .collect()
-    })
-}
-
-fn byte_pair_merge(piece: &[u8]) -> Vec<u32> {
-    #[cfg(test)]
-    if LEGACY_BPE.with(|legacy| legacy.get()) {
-        return byte_pair_merge_legacy(piece);
-    }
-    let mut output = Vec::new();
-    visit_byte_pair_tokens(piece, |rank| output.push(rank));
-    #[cfg(test)]
-    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + output.capacity() * 4));
-    output
+fn binary_encoder() -> &'static HashMap<&'static [u8], u32> {
+    BINARY_ENCODER.get_or_init(|| BINARY_ENCODER_ENTRIES.iter().copied().collect())
 }
 
 fn visit_byte_pair_tokens(piece: &[u8], mut emit: impl FnMut(u32)) {
+    #[cfg(test)]
+    if LEGACY_BPE.with(|legacy| legacy.get()) {
+        for rank in byte_pair_merge_legacy(piece) {
+            emit(rank);
+        }
+        return;
+    }
     let len = piece.len();
     // Byte offsets are stable node IDs. Removing a boundary only relinks its
     // neighbours; it never shifts the remaining offsets or pending candidates.
@@ -132,6 +126,8 @@ fn visit_byte_pair_tokens(piece: &[u8], mut emit: impl FnMut(u32)) {
     while left < len {
         let right = next[left];
         let rank = get_rank_for_slice(&piece[left..right]);
+        // Every byte has a vocabulary rank; merges only combine ranked slices.
+        debug_assert_ne!(rank, NO_RANK, "unranked final BPE piece");
         if rank != NO_RANK {
             emit(rank);
         }
@@ -262,6 +258,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_apis_report_regex_failure_without_panicking() {
+        let text = format!("prefix{}suffix", " ".repeat(1_000_001));
+        assert!(pattern_regex().find_iter(&text).any(|piece| piece.is_err()));
+        let count_error = std::panic::catch_unwind(|| count_tokens(&text))
+            .expect("counting must not panic")
+            .expect_err("counting must report the regex failure");
+        let encode_error = std::panic::catch_unwind(|| encode(&text))
+            .expect("encoding must not panic")
+            .expect_err("encoding must report the regex failure");
+        assert!(matches!(
+            count_error,
+            crate::TokenizationError::RuntimeError(_)
+        ));
+        assert!(matches!(
+            encode_error,
+            crate::TokenizationError::RuntimeError(_)
+        ));
+    }
+
+    #[test]
+    fn emission_reports_genuine_low_budget_regex_failure() {
+        let regex = fancy_regex::RegexBuilder::new(PAT_STR)
+            .backtrack_limit(1)
+            .build()
+            .unwrap();
+        let text = format!("prefix{}suffix", " ".repeat(1024));
+        assert!(regex.find_iter(&text).any(|piece| piece.is_err()));
+        let result = std::panic::catch_unwind(|| emit_tokens(&text, &regex, |_| {}));
+        let error = result
+            .expect("emission must not panic")
+            .expect_err("regex error must propagate");
+        assert!(matches!(error, crate::TokenizationError::RuntimeError(_)));
+    }
+
+    #[test]
+    fn binary_encoder_borrows_static_keys() {
+        let (bytes, rank) = BINARY_ENCODER_ENTRIES[0];
+        let stored = binary_encoder()
+            .keys()
+            .find(|key| &key[..] == bytes)
+            .unwrap();
+        assert_eq!(stored.as_ptr(), bytes.as_ptr());
+        assert_eq!(binary_encoder().get(bytes), Some(&rank));
+    }
+
+    #[test]
+    fn vocabulary_covers_every_single_byte() {
+        for byte in 0..=u8::MAX {
+            assert_ne!(get_rank_for_slice(&[byte]), NO_RANK, "byte {byte}");
+        }
+    }
+
+    #[test]
     fn a02_count_only_does_not_materialize_token_vectors() {
         let lossy = String::from_utf8_lossy(&[0xff, b'a', 0x80, b'\n']).into_owned();
         let corpus = [
@@ -274,10 +323,10 @@ mod tests {
             lossy,
         ];
         for text in corpus {
-            let reference = encode(&text).len();
+            let reference = encode(&text).unwrap().len();
             TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(0));
             assert_eq!(
-                count_tokens(&text),
+                count_tokens(&text).unwrap(),
                 reference,
                 "exact encoding length for {text:?}"
             );
@@ -300,7 +349,7 @@ mod tests {
                 end -= 1;
             }
             text.truncate(end);
-            let expected = encode(&text).len();
+            let expected = encode(&text).unwrap().len();
             let mut elapsed = Vec::new();
             let mut encoded_elapsed = Vec::new();
             let mut count_bytes = 0;
@@ -308,12 +357,12 @@ mod tests {
             for _ in 0..16 {
                 TOKEN_VECTOR_BYTES.with(|count| count.set(0));
                 let start = std::time::Instant::now();
-                assert_eq!(count_tokens(std::hint::black_box(&text)), expected);
+                assert_eq!(count_tokens(std::hint::black_box(&text)).unwrap(), expected);
                 elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 count_bytes += TOKEN_VECTOR_BYTES.with(|count| count.get());
                 TOKEN_VECTOR_BYTES.with(|count| count.set(0));
                 let start = std::time::Instant::now();
-                assert_eq!(encode(std::hint::black_box(&text)).len(), expected);
+                assert_eq!(encode(std::hint::black_box(&text)).unwrap().len(), expected);
                 encoded_elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 encode_bytes += TOKEN_VECTOR_BYTES.with(|count| count.get());
             }
@@ -328,14 +377,14 @@ mod tests {
 
     #[test]
     fn empty_input_has_no_tokens() {
-        assert!(encode("").is_empty());
-        assert_eq!(count_tokens(""), 0);
+        assert!(encode("").unwrap().is_empty());
+        assert_eq!(count_tokens("").unwrap(), 0);
     }
 
     #[test]
     fn direct_ascii_token() {
-        assert_eq!(encode("!"), vec![5]);
-        assert_eq!(count_tokens("!"), 1);
+        assert_eq!(encode("!").unwrap(), vec![5]);
+        assert_eq!(count_tokens("!").unwrap(), 1);
     }
 
     #[test]
@@ -358,14 +407,14 @@ mod tests {
         for (index, text) in corpus.iter().enumerate() {
             LEGACY_BPE.with(|legacy| legacy.set(true));
             BPE_WORK.with(|work| work.set(0));
-            let reference = encode(text);
+            let reference = encode(text).unwrap();
             let before = BPE_WORK.with(|work| work.get());
             LEGACY_BPE.with(|legacy| legacy.set(false));
             BPE_WORK.with(|work| work.set(0));
-            let actual = encode(text);
+            let actual = encode(text).unwrap();
             let after = BPE_WORK.with(|work| work.get());
             assert_eq!(actual, reference, "corpus item {index}");
-            assert_eq!(count_tokens(text), reference.len());
+            assert_eq!(count_tokens(text).unwrap(), reference.len());
             if index < 4 {
                 eprintln!(
                     "BPE corpus {index}: comparisons + shifts {before} -> {after}, {} tokens",
@@ -379,7 +428,7 @@ mod tests {
             );
         }
         for text in ["=".repeat(128 * 1024), "\n".repeat(128 * 1024)] {
-            assert!(!encode(&text).is_empty());
+            assert!(!encode(&text).unwrap().is_empty());
         }
     }
 }

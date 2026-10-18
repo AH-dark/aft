@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -381,11 +381,6 @@ pub fn observation_summary(observation: &Observation) -> Value {
         "filesystem_entries": observation.filesystem.len(),
         "structured": observation.structured,
     })
-}
-
-#[allow(dead_code)]
-fn _normalize_path(root: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
 #[cfg(test)]

@@ -475,15 +475,16 @@ pub struct BgCompletion {
     /// more.
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_truncated: bool,
-    /// Token count for raw stdout+stderr before compression. Omitted when any
-    /// stream exceeds the 128 KiB tokenization cap.
+    /// Token count for the capped raw stdout+stderr payload before compression.
+    /// Omitted when capture or tokenization fails, or the exact count will not fit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_tokens: Option<u32>,
     /// Token count for the compressed output generated from the same capped
-    /// raw payload. Omitted when raw tokenization is skipped.
+    /// raw payload. Omitted when either token count is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compressed_tokens: Option<u32>,
-    /// True when a stream exceeded the tokenization cap and counts are absent.
+    /// True when exact token counts are unavailable, including capture/read
+    /// failures, pre-tokenizer errors and counts that cannot be represented.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9434,18 +9435,7 @@ impl BgTaskRegistry {
             return CompletionTokenCounts::skipped();
         };
 
-        let original_tokens = token_count_u32(&raw_output);
-        let original_bytes = raw_output.len() as i64;
-        let compressed_output = rendered_output.unwrap_or(&raw_output);
-        let compressed_tokens = token_count_u32(compressed_output);
-        let compressed_bytes = compressed_output.len() as i64;
-        CompletionTokenCounts {
-            original_tokens: Some(original_tokens),
-            compressed_tokens: Some(compressed_tokens),
-            original_bytes: Some(original_bytes),
-            compressed_bytes: Some(compressed_bytes),
-            tokens_skipped: false,
-        }
+        completion_counts_for_text(&raw_output, rendered_output, token_count_u32)
     }
 
     pub(crate) fn maybe_emit_long_running_reminder(&self, task: &Arc<BgTask>) {
@@ -10644,10 +10634,33 @@ fn completion_status_text(status: &BgTaskStatus, exit_code: Option<i64>) -> Stri
     }
 }
 
-fn token_count_u32(text: &str) -> u32 {
-    aft_tokenizer::count_tokens(text)
-        .try_into()
-        .unwrap_or(u32::MAX)
+fn completion_counts_for_text(
+    raw_output: &str,
+    rendered_output: Option<&str>,
+    mut count: impl FnMut(&str) -> Option<u32>,
+) -> CompletionTokenCounts {
+    let Some(original_tokens) = count(raw_output) else {
+        return CompletionTokenCounts::skipped();
+    };
+    let compressed_output = rendered_output.unwrap_or(raw_output);
+    let compressed_tokens = match rendered_output {
+        Some(text) => match count(text) {
+            Some(tokens) => tokens,
+            None => return CompletionTokenCounts::skipped(),
+        },
+        None => original_tokens,
+    };
+    CompletionTokenCounts {
+        original_tokens: Some(original_tokens),
+        compressed_tokens: Some(compressed_tokens),
+        original_bytes: Some(raw_output.len() as i64),
+        compressed_bytes: Some(compressed_output.len() as i64),
+        tokens_skipped: false,
+    }
+}
+
+fn token_count_u32(text: &str) -> Option<u32> {
+    aft_tokenizer::count_tokens(text).ok()?.try_into().ok()
 }
 
 impl Default for BgTaskRegistry {
@@ -11884,6 +11897,64 @@ pub(crate) mod default_kill_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_tokenization_failure_skips_all_metrics() {
+        for failed in ["raw", "rendered"] {
+            let counts = super::completion_counts_for_text("raw", Some("rendered"), |text| {
+                if text == failed {
+                    None
+                } else {
+                    Some(7)
+                }
+            });
+            assert!(counts.tokens_skipped, "failed counting {failed}");
+            assert_eq!(counts.original_tokens, None);
+            assert_eq!(counts.compressed_tokens, None);
+            assert_eq!(counts.original_bytes, None);
+            assert_eq!(counts.compressed_bytes, None);
+        }
+    }
+
+    #[test]
+    fn completion_regex_failure_marks_metrics_unavailable() {
+        let rendered = format!("prefix{}suffix", " ".repeat(1_000_001));
+        let counts =
+            super::completion_counts_for_text("raw", Some(&rendered), super::token_count_u32);
+        assert!(counts.tokens_skipped);
+        assert_eq!(counts.original_tokens, None);
+        assert_eq!(counts.compressed_tokens, None);
+        assert_eq!(counts.original_bytes, None);
+        assert_eq!(counts.compressed_bytes, None);
+    }
+
+    #[test]
+    fn completion_without_rendering_tokenizes_once() {
+        let mut calls = Vec::new();
+        let counts = super::completion_counts_for_text("raw", None, |text| {
+            calls.push(text.to_string());
+            Some(7)
+        });
+        assert_eq!(counts.original_tokens, Some(7));
+        assert_eq!(counts.compressed_tokens, Some(7));
+        assert_eq!(counts.original_bytes, Some(3));
+        assert_eq!(counts.compressed_bytes, Some(3));
+        assert_eq!(calls, ["raw"]);
+    }
+
+    #[test]
+    fn completion_with_rendering_counts_both_texts() {
+        let mut calls = Vec::new();
+        let counts = super::completion_counts_for_text("raw", Some("rendered"), |text| {
+            calls.push(text.to_string());
+            Some(text.len() as u32)
+        });
+        assert_eq!(counts.original_tokens, Some(3));
+        assert_eq!(counts.compressed_tokens, Some(8));
+        assert_eq!(counts.original_bytes, Some(3));
+        assert_eq!(counts.compressed_bytes, Some(8));
+        assert_eq!(calls, ["raw", "rendered"]);
+    }
+
     #[test]
     fn windows_relaxed_warning_survives_pipe_and_pty_capture() {
         let root = tempfile::tempdir().unwrap();

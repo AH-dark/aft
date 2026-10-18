@@ -15,7 +15,7 @@ fn bench_128kb_tokenization(c: &mut Criterion) {
     let mut group = c.benchmark_group("claude_tokenizer");
     group.throughput(Throughput::Bytes(input.len() as u64));
     group.bench_function("count_128kb", |b| {
-        b.iter(|| count_tokens(black_box(&input)))
+        b.iter(|| count_tokens(black_box(&input)).expect("benchmark fixture should tokenize"))
     });
     group.finish();
 }
