@@ -268,6 +268,26 @@ fn cstring(value: &OsStr) -> io::Result<CString> {
         )
     })
 }
+
+fn default_search_path() -> io::Result<OsString> {
+    let length = unsafe { libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0) };
+    if length == 0 {
+        return Err(io::Error::other(
+            "default executable search path unavailable",
+        ));
+    }
+    let mut buffer = vec![0u8; length];
+    let written =
+        unsafe { libc::confstr(libc::_CS_PATH, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if written != length {
+        return Err(io::Error::other(
+            "default executable search path changed during lookup",
+        ));
+    }
+    let path = CStr::from_bytes_with_nul(&buffer)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(OsStr::from_bytes(path.to_bytes()).to_owned())
+}
 struct Attributes(libc::posix_spawnattr_t);
 impl Drop for Attributes {
     fn drop(&mut self) {
@@ -341,8 +361,19 @@ fn spawn_native(
     let path = if Path::new(program).is_absolute() {
         Path::new(program).to_owned()
     } else {
-        which::which_in(program, environment.get(OsStr::new("PATH")), &cwd)
-            .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
+        // execvp searches the system default only when PATH is absent. An
+        // explicitly empty PATH still searches cwd, without exporting a default.
+        let search_path = environment
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(default_search_path)?;
+        if search_path.is_empty() {
+            cwd.join(program)
+        } else {
+            which::which_in(program, Some(search_path), &cwd)
+                .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
+        }
     };
     let path = cstring(path.as_os_str())?;
     let cwd = cstring(cwd.as_os_str())?;
@@ -382,12 +413,17 @@ fn spawn_native(
         let flags = libc::POSIX_SPAWN_SETSID | libc::POSIX_SPAWN_SETSIGDEF;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let flags = libc::POSIX_SPAWN_SETSIGDEF;
+        let flags = flags | libc::POSIX_SPAWN_SETSIGMASK;
         check(libc::posix_spawnattr_setflags(&mut attr.0, flags as i16))?;
         let mut defaults = std::mem::zeroed();
         libc::sigemptyset(&mut defaults);
         libc::sigaddset(&mut defaults, libc::SIGPIPE);
         check(libc::posix_spawnattr_setsigdefault(&mut attr.0, &defaults))?;
-        // Pipe commands inherit the parent's signal mask, as std::Command does.
+        // Match std::Command: signal-handling threads may block signals that
+        // must remain deliverable to children, so start with an empty mask.
+        let mut mask = std::mem::zeroed();
+        check(libc::sigemptyset(&mut mask))?;
+        check(libc::posix_spawnattr_setsigmask(&mut attr.0, &mask))?;
         crate::privacy_spawn::apply_spawn_attribute(&mut attr.0, disclaim)?;
         let mut actions = std::mem::zeroed();
         check(libc::posix_spawn_file_actions_init(&mut actions))?;
@@ -490,6 +526,119 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.path().join("exit")).unwrap(), b"exit");
         assert_eq!(std::fs::read(dir.path().join("failure")).unwrap(), b"fail");
+    }
+
+    #[test]
+    fn native_spawn_signal_mask_probe_child() {
+        if std::env::var_os("AFT_NATIVE_SIGNAL_MASK_PROBE").is_none() {
+            return;
+        }
+        let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) },
+            0
+        );
+        let blocked = (1..=64)
+            .filter(|signal| unsafe { libc::sigismember(&mask, *signal) } == 1)
+            .collect::<Vec<_>>();
+        println!("child blocked signals: {blocked:?}");
+        assert!(
+            blocked.is_empty(),
+            "child inherited blocked signals: {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn native_spawn_clears_spawning_thread_signal_mask() {
+        struct RestoreMask(libc::sigset_t);
+        impl Drop for RestoreMask {
+            fn drop(&mut self) {
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut())
+                    },
+                    0
+                );
+            }
+        }
+        initialize();
+        assert_eq!(health()["backend"], "posix_spawn");
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .current_dir(dir.path())
+            .env_clear()
+            .env("AFT_NATIVE_SIGNAL_MASK_PROBE", "1")
+            .args([
+                "--exact",
+                "posix_spawn::tests::native_spawn_signal_mask_probe_child",
+                "--nocapture",
+            ]);
+        let (mut child, _files) = {
+            let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            unsafe {
+                assert_eq!(libc::sigemptyset(&mut blocked), 0);
+                assert_eq!(libc::sigaddset(&mut blocked, libc::SIGTERM), 0);
+                assert_eq!(libc::sigaddset(&mut blocked, libc::SIGINT), 0);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous),
+                    0
+                );
+            }
+            let _restore = RestoreMask(previous);
+            let mut observed = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut observed)
+                },
+                0
+            );
+            assert_eq!(unsafe { libc::sigismember(&observed, libc::SIGTERM) }, 1);
+            assert_eq!(unsafe { libc::sigismember(&observed, libc::SIGINT) }, 1);
+            spawn(&command, dir.path(), false)
+        };
+        let status = child.wait().unwrap();
+        let output = std::fs::read_to_string(dir.path().join("out")).unwrap();
+        assert!(
+            status.success(),
+            "{} {}",
+            output,
+            std::fs::read_to_string(dir.path().join("err")).unwrap()
+        );
+        assert!(
+            output.contains("child blocked signals: []"),
+            "probe did not report an empty mask: {output}"
+        );
+    }
+
+    #[test]
+    fn native_spawn_absent_path_uses_default_search_but_empty_path_uses_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shadow = dir.path().join("env");
+        std::fs::write(&shadow, b"#!/bin/sh\nprintf cwd-shadow").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (path, expected) in [
+            (None, "NATIVE_TOKEN=default-search\n"),
+            (Some(""), "cwd-shadow"),
+        ] {
+            let mut command = Command::new("env");
+            command
+                .current_dir(dir.path())
+                .env_clear()
+                .env("NATIVE_TOKEN", "default-search");
+            if let Some(path) = path {
+                command.env("PATH", path);
+            }
+            let (mut child, _files) = spawn(&command, dir.path(), false);
+            assert!(child.wait().unwrap().success());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("out")).unwrap(),
+                expected,
+                "PATH={path:?}"
+            );
+        }
     }
 
     #[test]
