@@ -231,14 +231,43 @@ function startLspAutoInstall(
       versions,
       disabled,
     });
+    // Publish per-server paths as they settle so one process-held lock cannot
+    // delay unrelated servers behind the aggregate completion promise.
+    let getGithubCacheDirs: (() => Promise<string[]>) | undefined;
+    let cachePathRefresh = Promise.resolve();
+    const refreshCachePaths = (newlyReadyDir?: string) => {
+      const getCachedBinDirs = getGithubCacheDirs;
+      if (!getCachedBinDirs) return;
+      cachePathRefresh = cachePathRefresh
+        .then(async () => {
+          const updatedPaths = [
+            ...new Set([
+              ...npmResult.getCachedBinDirs(),
+              ...(await getCachedBinDirs()),
+              ...(newlyReadyDir ? [newlyReadyDir] : []),
+            ]),
+          ];
+          if (updatedPaths.length > 0) configOverrides.lsp_paths_extra = updatedPaths;
+          else delete configOverrides.lsp_paths_extra;
+        })
+        .catch((err) => {
+          warn(`[lsp] incremental cache-path refresh failed: ${err}`);
+        });
+    };
     // GitHub-distributed servers gate on relevance separately because the
     // binaries are heavier (10-100 MB).
-    const ghResult = runGithubAutoInstall(discoverRelevantGithubServers(directory), {
-      autoInstall: runSharedAutoInstall,
-      graceDays,
-      versions,
-      disabled,
-    });
+    const ghResult = runGithubAutoInstall(
+      discoverRelevantGithubServers(directory),
+      {
+        autoInstall: runSharedAutoInstall,
+        graceDays,
+        versions,
+        disabled,
+      },
+      undefined,
+      { onCachedBinDirsChanged: refreshCachePaths },
+    );
+    getGithubCacheDirs = ghResult.getCachedBinDirs;
 
     const mergedBinDirs = [...npmResult.cachedBinDirs, ...ghResult.cachedBinDirs];
     if (mergedBinDirs.length > 0) configOverrides.lsp_paths_extra = mergedBinDirs;

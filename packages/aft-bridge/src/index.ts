@@ -233,6 +233,7 @@ export {
 export type { Logger, LogMeta } from "./logger.js";
 export {
   createGithubInstaller,
+  type GithubAutoInstallOptions,
   type GithubAutoInstallResult,
   type GithubInstallConfig,
   type GithubInstallerHost,

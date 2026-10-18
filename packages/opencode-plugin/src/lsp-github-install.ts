@@ -1,4 +1,9 @@
-import { createGithubInstaller } from "@cortexkit/aft-bridge";
+import {
+  createGithubInstaller,
+  type GithubAutoInstallOptions,
+  type GithubAutoInstallResult,
+  type GithubInstallConfig,
+} from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
   acquireInstallLock,
@@ -18,21 +23,7 @@ export type {
 } from "@cortexkit/aft-bridge";
 export { detectHostPlatform, findGithubServerById, GITHUB_LSP_TABLE } from "@cortexkit/aft-bridge";
 
-export const {
-  ghBinaryPath,
-  isGithubInstalled,
-  __githubBinaryHashCountForTests,
-  validateExtraction,
-  precheckArchiveContents,
-  abortInFlightGithubInstalls,
-  runGithubAutoInstall,
-  discoverRelevantGithubServers,
-  _assertAllowedDownloadUrlForTesting,
-  _downloadFileForTesting,
-  _extractArchiveSafelyForTesting,
-  _precheckArchiveSizeForTesting,
-  _runArchiveToolForTesting,
-} = createGithubInstaller({
+const githubInstaller = createGithubInstaller({
   acquireInstallLock,
   log,
   warn,
@@ -45,3 +36,25 @@ export const {
   relevantExtensionsInProject,
   reportInstallingBinaries: true,
 });
+
+export const {
+  ghBinaryPath,
+  isGithubInstalled,
+  __githubBinaryHashCountForTests,
+  validateExtraction,
+  precheckArchiveContents,
+  abortInFlightGithubInstalls,
+  discoverRelevantGithubServers,
+  _assertAllowedDownloadUrlForTesting,
+  _downloadFileForTesting,
+  _extractArchiveSafelyForTesting,
+  _precheckArchiveSizeForTesting,
+  _runArchiveToolForTesting,
+} = githubInstaller;
+
+export const runGithubAutoInstall: (
+  relevantServers: ReadonlySet<string>,
+  config: GithubInstallConfig,
+  fetchImpl?: typeof fetch,
+  options?: GithubAutoInstallOptions,
+) => GithubAutoInstallResult = githubInstaller.runGithubAutoInstall;

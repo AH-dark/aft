@@ -96,6 +96,14 @@ export interface GithubAutoInstallResult {
   getCachedBinDirs: () => Promise<string[]>;
 }
 
+export interface GithubAutoInstallOptions {
+  /** Refresh host configuration when one server's cached path becomes ready. */
+  onCachedBinDirsChanged?: (directory?: string) => void;
+  /** Shorter lock waits let shared tests cover timeout behavior without waiting minutes. */
+  __lockWaitTimeoutMsForTests?: number;
+  __lockPollIntervalMsForTests?: number;
+}
+
 export interface GithubInstallerHost {
   log(message: string): void;
   warn(message: string): void;
@@ -154,6 +162,11 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   const INSTALLED_META_FILE = ".aft-installed";
   const INSTALL_FAILED_FILE = ".aft-install-failed.json";
   const INSTALL_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
+  // Downloads and extraction can take several minutes, but a background refresh
+  // should not wait forever for a lock another process may have abandoned.
+  const INSTALL_LOCK_WAIT_MS = 10 * 60 * 1000;
+  const INSTALL_LOCK_POLL_INTERVAL_MS = 1_000;
+  const INSTALL_LOCK_WAIT_TIMEOUT_REASON = "install lock held by another process for 10 minutes";
 
   interface GithubInstallFailureMarker {
     release: string;
@@ -1585,12 +1598,54 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     relevantServers: ReadonlySet<string>,
     config: GithubInstallConfig,
     fetchImpl: typeof fetch = fetch,
+    options: GithubAutoInstallOptions = {},
   ): GithubAutoInstallResult {
     const cachedBinDirs: string[] = [];
     const skipped: Array<{ id: string; reason: string }> = [];
     const installPromises: Promise<void>[] = [];
     const installingBinaries: string[] = [];
     let installsStarted = 0;
+    const lockWaitTimeoutMs = Math.max(
+      0,
+      options.__lockWaitTimeoutMsForTests ?? INSTALL_LOCK_WAIT_MS,
+    );
+    const lockPollIntervalMs = Math.max(
+      1,
+      options.__lockPollIntervalMsForTests ?? INSTALL_LOCK_POLL_INTERVAL_MS,
+    );
+
+    function notifyCachedBinDirsChanged(directory?: string): void {
+      try {
+        options.onCachedBinDirsChanged?.(directory);
+      } catch (err) {
+        warn(`[lsp] github cache path refresh callback failed: ${err}`);
+      }
+    }
+
+    async function retryBusyCacheValidation(
+      spec: GithubServerSpec,
+      platform: Platform,
+    ): Promise<boolean | null> {
+      const deadline = Date.now() + lockWaitTimeoutMs;
+      while (true) {
+        const validation = await withInstallLock(spec.githubRepo, async () =>
+          validateCachedGithubInstallUnderLock(spec, platform),
+        );
+        if (validation !== null) return validation;
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          skipped.push({
+            id: spec.id,
+            reason: INSTALL_LOCK_WAIT_TIMEOUT_REASON,
+          });
+          return null;
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(lockPollIntervalMs, remainingMs)),
+        );
+      }
+    }
 
     const host = detectHostPlatform();
     if (!host) {
@@ -1609,12 +1664,20 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       const validation = isGithubInstalled(spec, host.platform)
         ? validateCachedGithubInstall(spec, host.platform)
         : false;
-      if (validation === null) skipped.push({ id: spec.id, reason: "another install in progress" });
       if (validation === true) cachedBinDirs.push(ghBinDir(spec));
-      const cacheReady = Promise.resolve(validation).then((healthy) => {
-        if (healthy && validation !== true) cachedBinDirs.push(ghBinDir(spec));
+      const cacheReady = (
+        validation === null
+          ? retryBusyCacheValidation(spec, host.platform)
+          : Promise.resolve(validation)
+      ).then((healthy) => {
+        if (healthy && validation !== true) {
+          const directory = ghBinDir(spec);
+          cachedBinDirs.push(directory);
+          notifyCachedBinDirsChanged(directory);
+        }
+        return healthy;
       });
-      installPromises.push(cacheReady);
+      installPromises.push(cacheReady.then(() => {}));
 
       if (config.disabled.has(spec.id)) {
         skipped.push({ id: spec.id, reason: "disabled by config" });
@@ -1635,15 +1698,17 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       if (services.reportInstallingBinaries) installingBinaries.push(spec.binary);
       const controller = new AbortController();
       const promise = cacheReady
-        .then(() =>
-          ensureGithubInstalled(
-            spec,
-            config,
-            fetchImpl,
-            host.platform,
-            host.arch,
-            controller.signal,
-          ),
+        .then((healthy) =>
+          validation === null && healthy === null
+            ? { started: false, reason: undefined as string | undefined }
+            : ensureGithubInstalled(
+                spec,
+                config,
+                fetchImpl,
+                host.platform,
+                host.arch,
+                controller.signal,
+              ),
         )
         .then(
           (outcome) => {
@@ -1651,12 +1716,14 @@ export function createGithubInstaller(services: GithubInstallerHost) {
             if (outcome.reason && outcome.reason !== "already installed") {
               skipped.push({ id: spec.id, reason: outcome.reason });
             }
+            notifyCachedBinDirsChanged();
           },
           (err) => {
             installsStarted -= 1;
             const reason = err instanceof Error ? err.message : String(err);
             skipped.push({ id: spec.id, reason: `install error: ${reason}` });
             error(`[lsp] github install ${spec.id} promise rejected: ${reason}`);
+            notifyCachedBinDirsChanged();
           },
         );
       installPromises.push(trackInFlightGithubInstall(controller, promise));

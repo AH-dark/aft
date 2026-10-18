@@ -667,17 +667,45 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         versions: lspVersions,
         disabled: lspDisabled,
       });
+      // Publish per-server paths as they settle so one process-held lock cannot
+      // delay unrelated servers behind the aggregate completion promise.
+      let getGithubCacheDirs: (() => Promise<string[]>) | undefined;
+      let cachePathRefresh = Promise.resolve();
+      const refreshCachePaths = (newlyReadyDir?: string) => {
+        const getCachedBinDirs = getGithubCacheDirs;
+        if (!getCachedBinDirs) return;
+        cachePathRefresh = cachePathRefresh
+          .then(async () => {
+            const updatedPaths = [
+              ...new Set([
+                ...npmResult.getCachedBinDirs(),
+                ...(await getCachedBinDirs()),
+                ...(newlyReadyDir ? [newlyReadyDir] : []),
+              ]),
+            ];
+            await pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths);
+          })
+          .catch((err) => {
+            warn(`[lsp] incremental cache-path refresh failed: ${err}`);
+          });
+      };
       // The relevance scan only feeds install decisions, so skip the walk when
       // no install can start.
       const relevantGithub = runSharedAutoInstall
         ? discoverRelevantGithubServers(projectRoot)
         : new Set<string>();
-      const ghResult = runGithubAutoInstall(relevantGithub, {
-        autoInstall: runSharedAutoInstall,
-        graceDays: lspGraceDays,
-        versions: lspVersions,
-        disabled: lspDisabled,
-      });
+      const ghResult = runGithubAutoInstall(
+        relevantGithub,
+        {
+          autoInstall: runSharedAutoInstall,
+          graceDays: lspGraceDays,
+          versions: lspVersions,
+          disabled: lspDisabled,
+        },
+        undefined,
+        { onCachedBinDirsChanged: refreshCachePaths },
+      );
+      getGithubCacheDirs = ghResult.getCachedBinDirs;
       // The pool copied `configOverrides` when it was created, so the paths
       // found here reach new bridges through the pool's own overrides.
       const mergedBinDirs = [...npmResult.cachedBinDirs, ...ghResult.cachedBinDirs];

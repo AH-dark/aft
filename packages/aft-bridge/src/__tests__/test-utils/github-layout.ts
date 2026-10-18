@@ -32,6 +32,11 @@ interface Installer {
       disabled: ReadonlySet<string>;
     },
     fetchImpl: typeof fetch,
+    options?: {
+      onCachedBinDirsChanged?: (directory?: string) => void;
+      __lockWaitTimeoutMsForTests?: number;
+      __lockPollIntervalMsForTests?: number;
+    },
   ) => {
     cachedBinDirs: string[];
     skipped: Array<{ id: string; reason: string }>;
@@ -81,6 +86,36 @@ export function githubLayoutTests(installer: Installer): void {
       releaseEnv();
       rmSync(root, { recursive: true, force: true });
     }
+  }
+  async function startInstallLockOwner(lock: string) {
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        `
+          const fs = require("node:fs");
+          const path = ${JSON.stringify(lock)};
+          fs.mkdirSync(require("node:path").dirname(path), { recursive: true });
+          fs.writeFileSync(path, process.pid + "\\n" + new Date().toISOString() + "\\nfixture-owner\\n", { flag: "wx" });
+          process.stdout.write("locked");
+          process.stdin.once("data", () => { fs.unlinkSync(path); process.exit(0); });
+        `,
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    const exited = new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) =>
+        code === 0 ? resolve() : reject(new Error(`lock owner exited ${code}`)),
+      );
+    });
+    await Promise.race([
+      new Promise<void>((resolve) => child.stdout!.once("data", () => resolve())),
+      exited.then(() => {
+        throw new Error("lock owner exited before readiness");
+      }),
+    ]);
+    return { child, exited };
   }
   test.skipIf(process.platform === "win32")(
     "recorded smoke verdict exposes the stamped cache synchronously without spawning",
@@ -333,7 +368,83 @@ export function githubLayoutTests(installer: Installer): void {
     },
   );
   test.skipIf(process.platform === "win32")(
-    "validation defers to another process holding the install lock without quarantine",
+    "busy GitHub cache validation retries after lock release without spawning",
+    async () => {
+      const script = '#!/bin/sh\nprintf x >> "${0}.runs"\nexit 0\n';
+      await withCachedServer(script, async (binary, root) => {
+        const first = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        await first.installsComplete;
+        rmSync(`${binary}.runs`, { force: true });
+        const luaBinDir = join(root, "lsp-binaries", "lua-ls", "extracted", "bin");
+        const luaBinary = join(luaBinDir, "lua-language-server");
+        const luaScript = '#!/bin/sh\nprintf x >> "${0}.runs"\nexit 0\n';
+        const luaDigest = createHash("sha256").update(luaScript).digest("hex");
+        mkdirSync(luaBinDir, { recursive: true });
+        writeFileSync(luaBinary, luaScript, { mode: 0o755 });
+        writeStampedFileDigest(luaBinary, luaDigest);
+        mkdirSync(join(dirname(luaBinDir), "script"));
+        writeFileSync(join(dirname(luaBinDir), "main.lua"), "-- runtime\n");
+        writeFileSync(
+          join(root, "lsp-binaries", "lua-ls", ".aft-installed"),
+          JSON.stringify({
+            version: "3.19.1",
+            installedAt: "now",
+            sha256: luaDigest,
+            binarySha256: luaDigest,
+            layout: "distribution",
+          }),
+        );
+        const lock = join(
+          root,
+          "lsp-packages",
+          encodeURIComponent("latex-lsp/texlab"),
+          ".aft-installing",
+        );
+        const { child, exited } = await startInstallLockOwner(lock);
+        try {
+          let otherServerReady!: () => void;
+          const otherServerReadyPromise = new Promise<void>((resolve) => {
+            otherServerReady = resolve;
+          });
+          const held = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch, {
+            onCachedBinDirsChanged: (directory) => {
+              if (directory === luaBinDir) otherServerReady();
+            },
+          });
+          expect(held.cachedBinDirs).not.toContain(dirname(binary));
+          let completed = false;
+          const installsComplete = held.installsComplete.then(() => {
+            completed = true;
+          });
+          let timeout: ReturnType<typeof setTimeout>;
+          const notifyTimeout = new Promise<void>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error("LuaLS did not validate")), 3_000);
+          });
+          try {
+            await Promise.race([otherServerReadyPromise, notifyTimeout]);
+          } finally {
+            clearTimeout(timeout!);
+          }
+          expect(held.cachedBinDirs).toContain(luaBinDir);
+          expect(completed).toBe(false);
+          const hashes = installer.__githubBinaryHashCountForTests();
+          child.stdin!.end("release");
+          await exited;
+          await installsComplete;
+          expect(held.cachedBinDirs).toContain(dirname(binary));
+          expect(await held.getCachedBinDirs()).toContain(dirname(binary));
+          expect(existsSync(`${binary}.runs`)).toBe(false);
+          expect(installer.__githubBinaryHashCountForTests()).toBe(hashes);
+          expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
+        } finally {
+          if (child.exitCode === null) child.stdin!.end("release");
+          await exited.catch(() => {});
+        }
+      });
+    },
+  );
+  test.skipIf(process.platform === "win32")(
+    "busy GitHub cache validation publishes an upgrade after the lock is released",
     async () => {
       const script = "#!/bin/sh\nexit 0\n";
       await withCachedServer(script, async (binary, root) => {
@@ -345,51 +456,71 @@ export function githubLayoutTests(installer: Installer): void {
           encodeURIComponent("latex-lsp/texlab"),
           ".aft-installing",
         );
-        const child = spawn(
-          process.execPath,
-          [
-            "-e",
-            `
-          const fs = require("node:fs");
-          const path = ${JSON.stringify(lock)};
-          fs.mkdirSync(require("node:path").dirname(path), { recursive: true });
-          fs.writeFileSync(path, process.pid + "\\n" + new Date().toISOString() + "\\nfixture-owner\\n", { flag: "wx" });
-          process.stdout.write("locked");
-          process.stdin.once("data", () => { fs.unlinkSync(path); process.exit(0); });
-        `,
-          ],
-          { stdio: ["pipe", "pipe", "pipe"] },
-        );
-        const exited = new Promise<void>((resolve, reject) => {
-          child.once("error", reject);
-          child.once("exit", (code) =>
-            code === 0 ? resolve() : reject(new Error(`lock owner exited ${code}`)),
-          );
-        });
+        const { child, exited } = await startInstallLockOwner(lock);
         try {
-          await Promise.race([
-            new Promise<void>((resolve) => child.stdout!.once("data", () => resolve())),
-            exited.then(() => {
-              throw new Error("lock owner exited before readiness");
-            }),
-          ]);
           const held = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
           expect(held.cachedBinDirs).not.toContain(dirname(binary));
-          expect(held.skipped).toContainEqual({
-            id: "texlab",
-            reason: "another install in progress",
-          });
-          await held.installsComplete;
-          writeFileSync(binary, `${script}# upgrade in progress\n`, { mode: 0o755 });
-          expect(await held.getCachedBinDirs()).not.toContain(dirname(binary));
-          expect(existsSync(binary)).toBe(true);
-          expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
-          writeFileSync(binary, script, { mode: 0o755 });
+
+          const upgraded = `${script}# upgraded while locked\n`;
+          const digest = createHash("sha256").update(upgraded).digest("hex");
+          writeFileSync(binary, upgraded, { mode: 0o755 });
+          writeStampedFileDigest(binary, digest);
+          writeFileSync(
+            join(dirname(binary), "..", ".aft-installed"),
+            JSON.stringify({
+              version: "2.0.0",
+              installedAt: "now",
+              sha256: digest,
+              binarySha256: digest,
+              layout: "standalone",
+              smoke: { binarySha256: digest, verdict: "passed" },
+            }),
+          );
+
           child.stdin!.end("release");
           await exited;
+          await held.installsComplete;
+          expect(held.cachedBinDirs).toContain(dirname(binary));
           expect(await held.getCachedBinDirs()).toContain(dirname(binary));
+          expect(
+            JSON.parse(readFileSync(join(dirname(binary), "..", ".aft-installed"), "utf8")),
+          ).toMatchObject({ version: "2.0.0", binarySha256: digest });
+          expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
         } finally {
-          if (child.exitCode === null) child.kill();
+          if (child.exitCode === null) child.stdin!.end("release");
+          await exited.catch(() => {});
+        }
+      });
+    },
+  );
+  test.skipIf(process.platform === "win32")(
+    "busy GitHub cache validation reports a bounded lock wait timeout",
+    async () => {
+      const script = "#!/bin/sh\nexit 0\n";
+      await withCachedServer(script, async (binary, root) => {
+        const lock = join(
+          root,
+          "lsp-packages",
+          encodeURIComponent("latex-lsp/texlab"),
+          ".aft-installing",
+        );
+        const { child, exited } = await startInstallLockOwner(lock);
+        try {
+          const started = Date.now();
+          const timedOut = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch, {
+            __lockWaitTimeoutMsForTests: 500,
+            __lockPollIntervalMsForTests: 10,
+          });
+          expect(Date.now() - started).toBeLessThan(200);
+          expect(timedOut.cachedBinDirs).not.toContain(dirname(binary));
+          await timedOut.installsComplete;
+          expect(timedOut.skipped).toContainEqual({
+            id: "texlab",
+            reason: "install lock held by another process for 10 minutes",
+          });
+          expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
+        } finally {
+          if (child.exitCode === null) child.stdin!.end("release");
           await exited.catch(() => {});
         }
       });
