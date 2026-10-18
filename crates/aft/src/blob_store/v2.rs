@@ -527,14 +527,28 @@ impl FamilyStore {
             ..TouchReport::default()
         };
         {
+            // WITHOUT ROWID stores the payload in the primary-key tree. Even
+            // an unchanged UPDATE can read and rebuild its overflow pages.
+            // Most touches are in the same GC epoch; use the narrow covering
+            // index to check both presence and epoch before visiting that tree.
+            let mut lookup = tx.prepare(
+                "SELECT ref_epoch FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
+            )?;
             let mut update = tx.prepare(
                 "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
             )?;
             for key in keys {
-                if update.execute(params![key.as_bytes().as_slice(), epoch as i64])? == 1 {
-                    report.touched += 1;
-                } else {
-                    report.missing.push(*key);
+                let stored: Option<i64> = lookup
+                    .query_row(params![key.as_bytes().as_slice()], |row| row.get(0))
+                    .optional()?;
+                match stored {
+                    Some(stored) => {
+                        if stored < epoch as i64 {
+                            update.execute(params![key.as_bytes().as_slice(), epoch as i64])?;
+                        }
+                        report.touched += 1;
+                    }
+                    None => report.missing.push(*key),
                 }
             }
         }
@@ -1255,3 +1269,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod read_tests;
