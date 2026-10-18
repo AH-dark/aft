@@ -21,6 +21,8 @@ use std::cell::RefCell;
 #[cfg(any(test, target_os = "linux"))]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
+#[cfg(unix)]
+use std::collections::{HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
 use std::ffi::{OsStr, OsString};
@@ -39,6 +41,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Condvar;
 use std::sync::{Mutex, OnceLock};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -2619,17 +2623,155 @@ struct GitPolicy {
 }
 
 #[cfg(unix)]
-#[derive(Clone)]
-struct CachedGitPolicy {
-    policy: GitPolicy,
-    inputs: GitPolicyInputs,
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct GitPolicyCacheKey {
+    worktree: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    environment: Vec<(OsString, OsString)>,
     worker: bool,
 }
 
 #[cfg(unix)]
-fn git_policy_cache() -> &'static Mutex<HashMap<PathBuf, CachedGitPolicy>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedGitPolicy>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+const GIT_POLICY_CACHE_CAPACITY: usize = 256;
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct CachedGitPolicy {
+    policy: GitPolicy,
+    inputs: GitPolicyInputs,
+}
+
+#[cfg(unix)]
+struct GitPolicyCache {
+    entries: HashMap<GitPolicyCacheKey, Arc<CachedGitPolicy>>,
+    least_recent: VecDeque<GitPolicyCacheKey>,
+    in_flight: HashSet<GitPolicyCacheKey>,
+}
+
+#[cfg(unix)]
+struct GitPolicyFlightGuard {
+    key: GitPolicyCacheKey,
+}
+
+#[cfg(unix)]
+impl Drop for GitPolicyFlightGuard {
+    fn drop(&mut self) {
+        git_policy_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            .remove(&self.key);
+        git_policy_cache_changed().notify_all();
+    }
+}
+
+#[cfg(unix)]
+impl GitPolicyCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            least_recent: VecDeque::new(),
+            in_flight: HashSet::new(),
+        }
+    }
+
+    fn get(&mut self, key: &GitPolicyCacheKey) -> Option<Arc<CachedGitPolicy>> {
+        let cached = self.entries.get(key).cloned()?;
+        self.least_recent.retain(|candidate| candidate != key);
+        self.least_recent.push_front(key.clone());
+        Some(cached)
+    }
+
+    fn remove(&mut self, key: &GitPolicyCacheKey) {
+        self.entries.remove(key);
+        self.least_recent.retain(|candidate| candidate != key);
+    }
+
+    fn remove_if_same(&mut self, key: &GitPolicyCacheKey, cached: &Arc<CachedGitPolicy>) {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, cached))
+        {
+            self.remove(key);
+        }
+    }
+
+    fn insert(&mut self, key: GitPolicyCacheKey, cached: CachedGitPolicy) {
+        self.remove(&key);
+        self.least_recent.push_front(key.clone());
+        self.entries.insert(key, Arc::new(cached));
+        while self.entries.len() > GIT_POLICY_CACHE_CAPACITY {
+            let Some(expired) = self.least_recent.pop_back() else {
+                break;
+            };
+            self.entries.remove(&expired);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn git_policy_cache() -> &'static Mutex<GitPolicyCache> {
+    static CACHE: OnceLock<Mutex<GitPolicyCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(GitPolicyCache::new()))
+}
+
+#[cfg(unix)]
+fn git_policy_cache_changed() -> &'static Condvar {
+    static CHANGED: OnceLock<Condvar> = OnceLock::new();
+    CHANGED.get_or_init(Condvar::new)
+}
+
+#[cfg(all(test, unix))]
+const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(all(not(test), unix))]
+const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(all(test, unix))]
+struct GitPolicyTestUncachedGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<bool>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Default)]
+struct GitPolicyTestState {
+    environment: Vec<(OsString, OsString)>,
+    calls: usize,
+    delay_ms: u64,
+    uncached_gate: Option<GitPolicyTestUncachedGate>,
+    waiter_signal: Option<std::sync::mpsc::Sender<()>>,
+    after_config_listing: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(all(test, unix))]
+fn git_policy_test_states() -> &'static Mutex<HashMap<PathBuf, GitPolicyTestState>> {
+    static STATES: OnceLock<Mutex<HashMap<PathBuf, GitPolicyTestState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(all(test, unix))]
+fn with_git_policy_test_state<R>(
+    project_root: &Path,
+    run: impl FnOnce(&mut GitPolicyTestState) -> R,
+) -> Option<R> {
+    // Aliases of a fixture share its state; unrelated roots never see it.
+    let root = project_root.canonicalize().ok()?;
+    git_policy_test_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_mut(&root)
+        .map(run)
+}
+
+#[cfg(all(test, unix))]
+fn signal_git_policy_waiter_for_test(project_root: &Path) {
+    let signal =
+        with_git_policy_test_state(project_root, |state| state.waiter_signal.take()).flatten();
+    if let Some(signal) = signal {
+        let _ = signal.send(());
+    }
 }
 
 #[cfg(unix)]
@@ -2704,13 +2846,16 @@ impl GitPolicyInputs {
                     .entry(ancestor.to_path_buf())
                     .or_insert(git_input_identity(ancestor).ok()?);
             }
-            self.resolved_paths.push((path.to_path_buf(), target));
+            let resolved = (path.to_path_buf(), target);
+            if !self.resolved_paths.contains(&resolved) {
+                self.resolved_paths.push(resolved);
+            }
         }
         Some(())
     }
 
-    fn unchanged(&self) -> bool {
-        self.environment == git_policy_environment()
+    fn unchanged(&self, project_root: &Path) -> bool {
+        self.environment == git_policy_environment(project_root)
             && git_policy_executable().as_ref() == Some(&self.executable)
             && self.files.iter().all(|(path, identity)| {
                 git_input_identity(path).is_ok_and(|current| current == *identity)
@@ -2723,9 +2868,11 @@ impl GitPolicyInputs {
 }
 
 #[cfg(unix)]
-fn git_policy_environment() -> Vec<(OsString, OsString)> {
+fn git_policy_environment(_project_root: &Path) -> Vec<(OsString, OsString)> {
     #[cfg(test)]
-    if let Some(environment) = GIT_POLICY_TEST_ENV.with(|value| value.borrow().clone()) {
+    if let Some(environment) =
+        with_git_policy_test_state(_project_root, |state| state.environment.clone())
+    {
         return environment;
     }
     let mut environment = std::env::vars_os()
@@ -2739,10 +2886,76 @@ fn git_policy_environment() -> Vec<(OsString, OsString)> {
 }
 
 #[cfg(unix)]
-fn mentions_git_include(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"include".len())
-        .any(|word| word.eq_ignore_ascii_case(b"include"))
+fn git_policy_cache_key(
+    project_root: &Path,
+    environment: &[(OsString, OsString)],
+    worker: bool,
+) -> Option<GitPolicyCacheKey> {
+    if environment.iter().any(|(key, _)| {
+        matches!(
+            key.to_str(),
+            Some("GIT_DIR" | "GIT_COMMON_DIR" | "GIT_WORK_TREE")
+        )
+    }) {
+        return None;
+    }
+
+    let dot_git = project_root.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    let git_dir = if metadata.is_dir() {
+        dot_git.canonicalize().ok()?
+    } else if metadata.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let pointer = pointer.trim().strip_prefix("gitdir:")?.trim();
+        if pointer.is_empty() {
+            return None;
+        }
+        let pointer = PathBuf::from(pointer);
+        let pointer = if pointer.is_absolute() {
+            pointer
+        } else {
+            project_root.join(pointer)
+        };
+        pointer.canonicalize().ok()?
+    } else {
+        return None;
+    };
+    if !git_dir.is_dir() {
+        return None;
+    }
+
+    let commondir = git_dir.join("commondir");
+    let common_dir = match std::fs::read_to_string(&commondir) {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let value = PathBuf::from(value);
+            let value = if value.is_absolute() {
+                value
+            } else {
+                git_dir.join(value)
+            };
+            value.canonicalize().ok()?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Err(_) => return None,
+    };
+    if !common_dir.is_dir() {
+        return None;
+    }
+
+    Some(GitPolicyCacheKey {
+        worktree: project_root.canonicalize().ok()?,
+        git_dir,
+        common_dir,
+        environment: environment.to_vec(),
+        worker,
+    })
 }
 
 #[cfg(unix)]
@@ -2776,13 +2989,6 @@ fn git_policy_inputs(
             key.to_str(),
             Some("GIT_DIR" | "GIT_COMMON_DIR" | "GIT_WORK_TREE")
         )
-    }) {
-        return None;
-    }
-    // Command-scope includes can load arbitrary files too. Treat any mention
-    // conservatively, including comments and inactive includeIf directives.
-    if environment.iter().any(|(key, value)| {
-        key.to_string_lossy().starts_with("GIT_CONFIG") && mentions_git_include(&os_bytes(value))
     }) {
         return None;
     }
@@ -2836,31 +3042,168 @@ fn git_policy_inputs(
     }
     inputs.watch(&project_root.join(".git"))?;
     inputs.watch(&git_dir.join("commondir"))?;
-    // Capture the identity before reading: a concurrent rewrite during either
-    // config inspection or policy resolution must not publish a cache entry.
+    // onbranch includes depend on this worktree's symbolic HEAD, not config.
+    // Watch it unconditionally: one stat avoids parsing condition semantics.
+    inputs.watch(&git_dir.join("HEAD"))?;
     for config in configs {
         inputs.watch(&config)?;
-        match std::fs::read(&config) {
-            Ok(bytes) if mentions_git_include(&bytes) => return None,
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
+    }
+    let discovered = git_policy_config_inputs(project_root, &mut inputs)?;
+    // Includes are discovered after Git reads them. Repeat discovery with every
+    // first-pass file already watched so an edit cannot hide a new dependency.
+    let mut verified = inputs.clone();
+    let rediscovered = git_policy_config_inputs(project_root, &mut verified)?;
+    if discovered != rediscovered
+        || inputs.files != verified.files
+        || inputs.resolved_paths != verified.resolved_paths
+        || !inputs.unchanged(project_root)
+    {
+        return None;
     }
     Some(inputs)
 }
 
+#[cfg(unix)]
+fn git_policy_config_inputs(
+    project_root: &Path,
+    inputs: &mut GitPolicyInputs,
+) -> Option<HashSet<PathBuf>> {
+    let output = git_policy_output(
+        project_root,
+        &["config", "--includes", "--show-origin", "--null", "--list"],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    #[cfg(test)]
+    if let Some(hook) =
+        with_git_policy_test_state(project_root, |state| state.after_config_listing.take())
+            .flatten()
+    {
+        hook();
+    }
+
+    let mut discovered = HashSet::new();
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    loop {
+        let Some(origin) = fields.next() else {
+            break;
+        };
+        if origin.is_empty() {
+            break;
+        }
+        let record = fields.next()?;
+        // With --null, a valueless boolean has no key/value newline at all.
+        let (key, value) = match record.iter().position(|byte| *byte == b'\n') {
+            Some(separator) => (&record[..separator], &record[separator + 1..]),
+            None => (record, &b""[..]),
+        };
+        let origin_file = git_config_origin_path(project_root, origin);
+        if let Some(path) = &origin_file {
+            inputs.watch(path)?;
+            discovered.insert(path.clone());
+        }
+        if key == b"include.path" || (key.starts_with(b"includeif.") && key.ends_with(b".path")) {
+            if let Some(condition) = key.strip_prefix(b"includeif.") {
+                // gitdir conditions use the watched Git-directory topology;
+                // hasconfig uses remote URLs in these same config inputs (or
+                // the watched environment). HEAD covers onbranch. New condition
+                // types stay uncached until their dependencies are understood.
+                if ![
+                    b"gitdir:".as_slice(),
+                    b"gitdir/i:",
+                    b"onbranch:",
+                    b"hasconfig:remote.*.url:",
+                ]
+                .iter()
+                .any(|prefix| condition.starts_with(prefix))
+                {
+                    return None;
+                }
+            }
+            let origin_file = origin_file?;
+            let include = git_include_path(project_root, &origin_file, value, &inputs.environment)?;
+            inputs.watch(&include)?;
+            discovered.insert(include);
+        }
+    }
+    Some(discovered)
+}
+
+#[cfg(unix)]
+fn git_config_origin_path(project_root: &Path, origin: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = origin.strip_prefix(b"file:")?;
+    if path.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+    Some(if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    })
+}
+
+#[cfg(unix)]
+fn git_include_path(
+    project_root: &Path,
+    origin: &Path,
+    value: &[u8],
+    environment: &[(OsString, OsString)],
+) -> Option<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let value = OsString::from_vec(value.to_vec());
+    let value_path = PathBuf::from(&value);
+    if value_path.is_absolute() {
+        return Some(value_path);
+    }
+    if let Some(value) = value.to_str() {
+        if let Some(suffix) = value.strip_prefix('~') {
+            if !suffix.is_empty() && !suffix.starts_with('/') {
+                return None;
+            }
+            let home = environment
+                .iter()
+                .find(|(key, _)| key == "HOME")
+                .map(|(_, value)| PathBuf::from(value))?;
+            return Some(home.join(suffix.trim_start_matches('/')));
+        }
+    } else if value.as_bytes().starts_with(b"~") {
+        return None;
+    }
+    origin.parent().map(|parent| {
+        let path = parent.join(value_path);
+        if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        }
+    })
+}
+
 #[cfg(all(test, unix))]
 thread_local! {
-    static GIT_POLICY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static GIT_POLICY_TEST_ENV: RefCell<Option<Vec<(OsString, OsString)>>> = const { RefCell::new(None) };
     static GIT_POLICY_BENCH_OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(unix)]
 fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     #[cfg(test)]
-    GIT_POLICY_CALLS.with(|count| count.set(count.get() + 1));
+    {
+        let delay = with_git_policy_test_state(project_root, |state| {
+            state.calls += 1;
+            state.delay_ms
+        })
+        .unwrap_or(0);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
     let command = crate::effective_path::new_command("git");
     #[cfg(test)]
     let mut command = command;
@@ -2869,8 +3212,10 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
         command.env("PATH", crate::effective_path::effective_path());
     }
     #[cfg(test)]
-    GIT_POLICY_TEST_ENV.with(|value| {
-        if let Some(environment) = value.borrow().as_ref() {
+    {
+        if let Some(environment) =
+            with_git_policy_test_state(project_root, |state| state.environment.clone())
+        {
             for (key, _) in
                 std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
             {
@@ -2878,7 +3223,7 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
             }
             command.envs(environment.iter().cloned());
         }
-    });
+    }
     #[cfg(test)]
     let mut command = if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
         command.build_unresolved()
@@ -2892,40 +3237,89 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
 
 #[cfg(unix)]
 fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
-    let environment = git_policy_environment();
+    let environment = git_policy_environment(project_root);
     let worker = worker_jail_active();
-    let cached = git_policy_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(project_root)
-        .cloned();
-    // Neither filesystem inspection nor a git subprocess runs under this lock.
-    // Concurrent cold misses may duplicate queries rather than block other roots.
-    if let Some(cached) = cached {
-        if cached.worker == worker
-            && cached.inputs.environment == environment
-            && cached.inputs.unchanged()
-        {
-            return Ok(cached.policy);
+    let Some(key) = git_policy_cache_key(project_root, &environment, worker) else {
+        return resolve_git_policy_uncached(project_root, environment, worker)
+            .map(|(policy, _)| policy);
+    };
+    let wait_deadline = Instant::now() + GIT_POLICY_FLIGHT_WAIT_TIMEOUT;
+
+    loop {
+        let (cached, flight_guard, waiter_timed_out) = {
+            let mut cache = git_policy_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(cached) = cache.get(&key) {
+                (Some(cached), None, false)
+            } else if cache.in_flight.contains(&key) {
+                let remaining = wait_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    (None, None, true)
+                } else {
+                    #[cfg(test)]
+                    signal_git_policy_waiter_for_test(project_root);
+                    let (cache, timeout) = git_policy_cache_changed()
+                        .wait_timeout(cache, remaining)
+                        .unwrap_or_else(|error| error.into_inner());
+                    drop(cache);
+                    (
+                        None,
+                        None,
+                        timeout.timed_out() || Instant::now() >= wait_deadline,
+                    )
+                }
+            } else {
+                cache.in_flight.insert(key.clone());
+                (None, Some(GitPolicyFlightGuard { key: key.clone() }), false)
+            }
+        };
+
+        if let Some(cached) = cached {
+            if cached.inputs.unchanged(project_root) {
+                return Ok(cached.policy.clone());
+            }
+            git_policy_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove_if_same(&key, &cached);
+            continue;
         }
-    }
-    let (policy, inputs) = resolve_git_policy_uncached(project_root, environment, worker)?;
-    let entry = inputs
-        .filter(GitPolicyInputs::unchanged)
-        .map(|inputs| CachedGitPolicy {
-            policy: policy.clone(),
-            inputs,
-            worker,
+        if waiter_timed_out {
+            return resolve_git_policy_uncached(project_root, environment, worker)
+                .map(|(policy, _)| policy);
+        }
+        let Some(flight_guard) = flight_guard else {
+            continue;
+        };
+
+        // The in-flight marker serializes misses for this exact worktree and
+        // input environment; filesystem checks and git subprocesses stay unlocked.
+        let result = resolve_git_policy_uncached(project_root, environment.clone(), worker);
+        let entry = result.as_ref().ok().and_then(|(policy, inputs)| {
+            let current_key = git_policy_cache_key(project_root, &environment, worker);
+            (current_key.as_ref() == Some(&key))
+                .then(|| inputs.clone())
+                .flatten()
+                .filter(|inputs| inputs.unchanged(project_root))
+                .map(|inputs| CachedGitPolicy {
+                    policy: policy.clone(),
+                    inputs,
+                })
         });
-    let mut cache = git_policy_cache()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if let Some(entry) = entry {
-        cache.insert(project_root.to_path_buf(), entry);
-    } else {
-        cache.remove(project_root);
+        {
+            let mut cache = git_policy_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(entry) = entry {
+                cache.insert(key.clone(), entry);
+            } else {
+                cache.remove(&key);
+            }
+        }
+        drop(flight_guard);
+        return result.map(|(policy, _)| policy);
     }
-    Ok(policy)
 }
 
 #[cfg(unix)]
@@ -2934,6 +3328,17 @@ fn resolve_git_policy_uncached(
     environment: Vec<(OsString, OsString)>,
     worker: bool,
 ) -> Result<(GitPolicy, Option<GitPolicyInputs>), String> {
+    #[cfg(test)]
+    let test_gate =
+        with_git_policy_test_state(project_root, |state| state.uncached_gate.take()).flatten();
+    #[cfg(test)]
+    if let Some(gate) = test_gate {
+        let _ = gate.entered.send(());
+        if gate.release.recv().unwrap() {
+            panic!("test-injected panic during Git policy resolution");
+        }
+    }
+
     let dot_git = project_root.join(".git");
     let dot_git_identity = git_input_identity(&dot_git).ok();
     let metadata = match std::fs::symlink_metadata(&dot_git) {
@@ -5949,6 +6354,7 @@ mod git_policy_cache_tests {
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
+        roots: Mutex<HashSet<PathBuf>>,
     }
 
     impl Fixture {
@@ -5970,16 +6376,29 @@ mod git_policy_cache_tests {
                     root.join("system").into_os_string(),
                 ),
             ];
-            GIT_POLICY_TEST_ENV.with(|value| *value.borrow_mut() = Some(environment));
+            git_policy_test_states()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    root.clone(),
+                    GitPolicyTestState {
+                        environment,
+                        ..Default::default()
+                    },
+                );
             let output = git_policy_output(&root, &["init", "--quiet"]).unwrap();
             assert!(
                 output.status.success(),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let fixture = Self { _dir: dir, root };
+            let fixture = Self {
+                _dir: dir,
+                roots: Mutex::new(HashSet::from([root.clone()])),
+                root,
+            };
             fixture.hooks("first-hooks");
-            GIT_POLICY_CALLS.with(|count| count.set(0));
+            fixture.state(|state| state.calls = 0);
             fixture
         }
 
@@ -5995,17 +6414,94 @@ mod git_policy_cache_tests {
         }
 
         fn resolve(&self) -> (GitPolicy, usize) {
-            let before = GIT_POLICY_CALLS.with(|count| count.get());
-            let policy = with_worker_jail(true, || resolve_git_policy(&self.root)).unwrap();
-            (policy, GIT_POLICY_CALLS.with(|count| count.get()) - before)
+            self.resolve_at(&self.root)
+        }
+
+        fn resolve_at(&self, root: &Path) -> (GitPolicy, usize) {
+            self.register_root(root);
+            let before = with_git_policy_test_state(root, |state| state.calls).unwrap();
+            let policy = with_worker_jail(true, || resolve_git_policy(root)).unwrap();
+            (
+                policy,
+                with_git_policy_test_state(root, |state| state.calls).unwrap() - before,
+            )
+        }
+
+        fn state<R>(&self, run: impl FnOnce(&mut GitPolicyTestState) -> R) -> R {
+            with_git_policy_test_state(&self.root, run).unwrap()
+        }
+
+        fn register_root(&self, root: &Path) {
+            let root = root.canonicalize().unwrap();
+            let environment = self.state(|state| state.environment.clone());
+            git_policy_test_states()
+                .lock()
+                .unwrap()
+                .entry(root.clone())
+                .or_insert_with(|| GitPolicyTestState {
+                    environment,
+                    ..Default::default()
+                });
+            self.roots.lock().unwrap().insert(root);
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            git_policy_cache().lock().unwrap().remove(&self.root);
-            GIT_POLICY_TEST_ENV.with(|value| *value.borrow_mut() = None);
+            for root in self.roots.lock().unwrap().iter() {
+                let environment = git_policy_environment(root);
+                for worker in [false, true] {
+                    if let Some(key) = git_policy_cache_key(root, &environment, worker) {
+                        git_policy_cache().lock().unwrap().remove(&key);
+                    }
+                }
+                git_policy_test_states().lock().unwrap().remove(root);
+            }
         }
+    }
+
+    #[test]
+    fn git_policy_cache_is_bounded_and_evicts_least_recent_entries() {
+        fn key(index: usize) -> GitPolicyCacheKey {
+            GitPolicyCacheKey {
+                worktree: PathBuf::from(format!("worktree-{index}")),
+                git_dir: PathBuf::from(format!("git-{index}")),
+                common_dir: PathBuf::from(format!("common-{index}")),
+                environment: Vec::new(),
+                worker: false,
+            }
+        }
+
+        fn value() -> CachedGitPolicy {
+            CachedGitPolicy {
+                policy: GitPolicy {
+                    read_roots: Vec::new(),
+                    hooks: Vec::new(),
+                    linked: None,
+                    configured_paths: Vec::new(),
+                    metadata_allow: Vec::new(),
+                },
+                inputs: GitPolicyInputs {
+                    environment: Vec::new(),
+                    executable: PathBuf::new(),
+                    files: BTreeMap::new(),
+                    resolved_paths: Vec::new(),
+                },
+            }
+        }
+
+        let mut cache = GitPolicyCache::new();
+        for index in 0..=256 {
+            cache.insert(key(index), value());
+        }
+        assert_eq!(cache.entries.len(), 256);
+        assert!(cache.entries.contains_key(&key(256)));
+        assert!(!cache.entries.contains_key(&key(0)));
+
+        assert!(cache.get(&key(1)).is_some());
+        cache.insert(key(257), value());
+        assert!(cache.entries.contains_key(&key(1)));
+        assert!(!cache.entries.contains_key(&key(2)));
     }
 
     #[test]
@@ -6016,6 +6512,319 @@ mod git_policy_cache_tests {
         let (second, warm) = fixture.resolve();
         assert_eq!(second.hooks, first.hooks);
         assert_eq!(warm, 0, "unchanged policy must not spawn git");
+    }
+
+    #[test]
+    fn git_policy_cache_review_branch_switch_refreshes_hooks() {
+        let fixture = Fixture::new();
+        let included = fixture.root.join("branch-config");
+        std::fs::write(&included, "[core]\n hooksPath = branch-hooks\n").unwrap();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!(
+            "[includeIf \"onbranch:review-selected\"]\n path = {}\n",
+            included.display()
+        ));
+        std::fs::write(config, contents).unwrap();
+        // An unborn branch is enough: checkout updates HEAD without a commit.
+        for worker in [false, true] {
+            for (branch, hooks) in [
+                ("review-other", "first-hooks"),
+                ("review-selected", "branch-hooks"),
+                ("review-other", "first-hooks"),
+            ] {
+                let output =
+                    git_policy_output(&fixture.root, &["checkout", "--quiet", "--orphan", branch])
+                        .unwrap();
+                assert!(output.status.success(), "{:?}", output);
+                let policy =
+                    with_worker_jail(worker, || resolve_git_policy(&fixture.root)).unwrap();
+                assert_eq!(policy.hooks, vec![fixture.root.join(hooks)]);
+                let before = fixture.state(|state| state.calls);
+                with_worker_jail(worker, || resolve_git_policy(&fixture.root)).unwrap();
+                assert_eq!(fixture.state(|state| state.calls), before);
+            }
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_review_include_discovery_race_is_not_published() {
+        let fixture = Fixture::new();
+        let included = fixture.root.join("included");
+        let old = fixture.root.join("old-include");
+        let new = fixture.root.join("new-include");
+        std::fs::write(&old, "[core]\n hooksPath = old-hooks\n").unwrap();
+        std::fs::write(&new, "[core]\n hooksPath = new-hooks\n").unwrap();
+        std::fs::write(&included, format!("[include]\n path = {}\n", old.display())).unwrap();
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            format!("[include]\n path = {}\n", included.display()),
+        )
+        .unwrap();
+        fixture.state(|state| {
+            state.after_config_listing = Some(Box::new(move || {
+                std::fs::write(included, format!("[include]\n path = {}\n", new.display()))
+                    .unwrap();
+            }))
+        });
+        assert_eq!(
+            fixture.resolve().0.hooks,
+            vec![fixture.root.join("new-hooks")]
+        );
+        assert!(
+            fixture.resolve().1 > 0,
+            "changed discovery must not publish a cache entry"
+        );
+        assert_eq!(
+            fixture.resolve().1,
+            0,
+            "stable discovery should cache again"
+        );
+        std::fs::write(
+            fixture.root.join("new-include"),
+            "[core]\n hooksPath = changed-new-hooks\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.resolve().0.hooks,
+            vec![fixture.root.join("changed-new-hooks")]
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_review_unrelated_roots_cannot_consume_injections() {
+        let fixture = Fixture::new();
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path().canonicalize().unwrap();
+        assert!(git_policy_output(&other_root, &["init", "--quiet"])
+            .unwrap()
+            .status
+            .success());
+        fixture.state(|state| {
+            state.environment.extend([
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                (
+                    "GIT_CONFIG_KEY_0".into(),
+                    "aftcachefixture.isolatedvalue".into(),
+                ),
+                ("GIT_CONFIG_VALUE_0".into(), "fixture-only-value".into()),
+            ])
+        });
+        let before = fixture.state(|state| state.calls);
+        let output = git_policy_output(
+            &other_root,
+            &["config", "--get", "aftcachefixture.isolatedvalue"],
+        )
+        .unwrap();
+        let calls_unchanged = fixture.state(|state| state.calls) == before;
+        let environment_isolated = !output.status.success();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::channel();
+        release_tx.send(true).unwrap();
+        fixture.state(|state| {
+            state.uncached_gate = Some(GitPolicyTestUncachedGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+            state.waiter_signal = Some(waiter_tx);
+            state.delay_ms = 30;
+        });
+        signal_git_policy_waiter_for_test(&other_root);
+        let result = std::panic::catch_unwind(|| resolve_git_policy(&other_root));
+        let gate_isolated = entered_rx.try_recv().is_err();
+        let waiter_isolated = waiter_rx.try_recv().is_err();
+        let delay_isolated =
+            with_git_policy_test_state(&other_root, |state| state.delay_ms).is_none();
+        assert_eq!(
+            (
+                calls_unchanged,
+                environment_isolated,
+                result.is_ok(),
+                gate_isolated,
+                waiter_isolated,
+                delay_isolated
+            ),
+            (true, true, true, true, true, true),
+            "unrelated launches must not use another root's test state"
+        );
+        let alias = fixture.root.join("root-alias");
+        std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+        assert_eq!(
+            git_policy_environment(&alias),
+            git_policy_environment(&fixture.root)
+        );
+        assert_eq!(
+            with_git_policy_test_state(&alias, |state| state.delay_ms),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_include_identity_change_during_second_discovery_is_not_published() {
+        let fixture = Fixture::new();
+        let included = fixture.root.join("included");
+        std::fs::write(&included, "[core]\n hooksPath = old-hooks\n").unwrap();
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            format!("[include]\n path = {}\n", included.display()),
+        )
+        .unwrap();
+        let root = fixture.root.clone();
+        fixture.state(|state| {
+            state.after_config_listing = Some(Box::new(move || {
+                with_git_policy_test_state(&root, |state| {
+                    state.after_config_listing = Some(Box::new(move || {
+                        std::fs::write(included, "[core]\n hooksPath = changed-hooks\n").unwrap();
+                    }));
+                })
+                .unwrap();
+            }))
+        });
+        assert_eq!(
+            fixture.resolve().0.hooks,
+            vec![fixture.root.join("changed-hooks")]
+        );
+        assert!(
+            fixture.resolve().1 > 0,
+            "changed include identity must not publish a cache entry"
+        );
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_removed_include_during_discovery_is_not_published() {
+        let fixture = Fixture::new();
+        let included = fixture.root.join("included");
+        let removed = fixture.root.join("removed");
+        std::fs::write(&removed, "[core]\n hooksPath = old-hooks\n").unwrap();
+        std::fs::write(
+            &included,
+            format!("[include]\n path = {}\n", removed.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            format!("[include]\n path = {}\n", included.display()),
+        )
+        .unwrap();
+        fixture.state(|state| {
+            state.after_config_listing = Some(Box::new(move || {
+                std::fs::write(included, "").unwrap();
+            }))
+        });
+        assert_eq!(
+            fixture.resolve().0.hooks,
+            vec![fixture.root.join(".git/hooks")]
+        );
+        assert!(
+            fixture.resolve().1 > 0,
+            "removed discovery dependency must not publish a cache entry"
+        );
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_review_valueless_boolean_is_cached() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[core]\n logAllRefUpdates\n");
+        std::fs::write(config, contents).unwrap();
+        let (policy, cold) = fixture.resolve();
+        assert!(cold > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("first-hooks")]);
+        assert_eq!(
+            fixture.resolve().1,
+            0,
+            "valueless booleans must not disable caching"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_gitdir_conditions_track_metadata_location() {
+        for condition in ["gitdir", "gitdir/i"] {
+            let fixture = Fixture::new();
+            let included = fixture.root.join("location-config");
+            std::fs::write(&included, "[core]\n hooksPath = location-hooks\n").unwrap();
+            let config = fixture.root.join(".git/config");
+            let mut contents = std::fs::read_to_string(&config).unwrap();
+            let pattern = fixture.root.join(".git").to_str().unwrap().to_owned();
+            let pattern = if condition == "gitdir/i" {
+                pattern.to_uppercase()
+            } else {
+                pattern
+            };
+            contents.push_str(&format!(
+                "[includeIf \"{condition}:{pattern}\"]\n path = {}\n",
+                included.display()
+            ));
+            std::fs::write(config, contents).unwrap();
+            assert_eq!(
+                fixture.resolve().0.hooks,
+                vec![fixture.root.join("location-hooks")]
+            );
+            assert_eq!(fixture.resolve().1, 0);
+            std::fs::rename(fixture.root.join(".git"), fixture.root.join("moved-git")).unwrap();
+            std::fs::write(fixture.root.join(".git"), "gitdir: moved-git\n").unwrap();
+            let (policy, calls) = fixture.resolve();
+            assert!(calls > 0);
+            assert_eq!(policy.hooks, vec![fixture.root.join("first-hooks")]);
+            assert_eq!(fixture.resolve().1, 0);
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_hasconfig_remote_urls_track_config_files() {
+        for in_include in [false, true] {
+            let fixture = Fixture::new();
+            let included = fixture.root.join("remote-hooks-config");
+            std::fs::write(&included, "[core]\n hooksPath = remote-hooks\n").unwrap();
+            let config = fixture.root.join(".git/config");
+            let mut contents = std::fs::read_to_string(&config).unwrap();
+            contents.push_str(&format!(
+                "[includeIf \"hasconfig:remote.*.url:https://example.invalid/**\"]\n path = {}\n",
+                included.display()
+            ));
+            let remote_config = if in_include {
+                let remote_config = fixture.root.join("remote-urls");
+                std::fs::write(&remote_config, "").unwrap();
+                contents.push_str(&format!("[include]\n path = {}\n", remote_config.display()));
+                std::fs::write(&config, contents).unwrap();
+                remote_config
+            } else {
+                std::fs::write(&config, &contents).unwrap();
+                config
+            };
+            let baseline = std::fs::read_to_string(&remote_config).unwrap();
+            for (url, expected) in [
+                ("https://elsewhere.invalid/repo", "first-hooks"),
+                ("https://example.invalid/repo", "remote-hooks"),
+                ("https://elsewhere.invalid/repo", "first-hooks"),
+            ] {
+                std::fs::write(
+                    &remote_config,
+                    format!("{baseline}[remote \"origin\"]\n url = {url}\n"),
+                )
+                .unwrap();
+                let (policy, calls) = fixture.resolve();
+                assert!(calls > 0);
+                assert_eq!(policy.hooks, vec![fixture.root.join(expected)]);
+                assert_eq!(fixture.resolve().1, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_unknown_include_conditions_are_not_cached() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents
+            .push_str("[includeIf \"future-condition:untracked-state\"]\n path = future-config\n");
+        std::fs::write(config, contents).unwrap();
+        assert!(fixture.resolve().1 > 0);
+        assert!(fixture.resolve().1 > 0);
     }
 
     #[test]
@@ -6037,7 +6846,7 @@ mod git_policy_cache_tests {
     }
 
     #[test]
-    fn git_policy_cache_include_directives_always_recompute() {
+    fn git_policy_cache_include_file_changes_invalidate_cached_policy() {
         let fixture = Fixture::new();
         let included = fixture.root.join("included");
         std::fs::write(&included, "[core]\n hooksPath = included-hooks\n").unwrap();
@@ -6050,9 +6859,10 @@ mod git_policy_cache_tests {
         let (first, cold) = fixture.resolve();
         assert_eq!(first.hooks, vec![fixture.root.join("included-hooks")]);
         assert!(cold > 0);
-        assert!(
-            fixture.resolve().1 > 0,
-            "include config must never be cached"
+        assert_eq!(
+            fixture.resolve().1,
+            0,
+            "unchanged include config should be cached"
         );
         std::fs::write(
             &included,
@@ -6099,8 +6909,8 @@ mod git_policy_cache_tests {
         assert!(calls > 0);
         assert_eq!(policy.hooks, vec![fixture.root.join("worktree-hooks")]);
         assert_eq!(fixture.resolve().1, 0);
-        GIT_POLICY_TEST_ENV.with(|value| {
-            value.borrow_mut().as_mut().unwrap().extend([
+        fixture.state(|state| {
+            state.environment.extend([
                 ("GIT_CONFIG_COUNT".into(), "1".into()),
                 ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
                 ("GIT_CONFIG_VALUE_0".into(), "environment-hooks".into()),
@@ -6110,6 +6920,261 @@ mod git_policy_cache_tests {
         assert!(calls > 0);
         assert_eq!(policy.hooks, vec![fixture.root.join("environment-hooks")]);
         assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_keeps_linked_worktrees_separate() {
+        let fixture = Fixture::new();
+        fixture.hooks("main-hooks");
+        let main_config = fixture.root.join(".git/config");
+        let mut config = std::fs::read_to_string(&main_config).unwrap();
+        config.push_str("[extensions]\n worktreeConfig = true\n");
+        std::fs::write(main_config, config).unwrap();
+
+        let commit = git_policy_output(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=Cache Test",
+                "-c",
+                "user.email=cache@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "cache fixture",
+            ],
+        )
+        .unwrap();
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let linked = fixture.root.join("linked-worktree");
+        let added = git_policy_output(
+            &fixture.root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--quiet",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let pointer = std::fs::read_to_string(linked.join(".git")).unwrap();
+        let git_dir = PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            linked.join(git_dir)
+        };
+        std::fs::write(
+            git_dir.join("config.worktree"),
+            format!(
+                "[core]\n hooksPath = {}\n",
+                linked.join("linked-hooks").display()
+            ),
+        )
+        .unwrap();
+
+        let (main_policy, main_cold) = fixture.resolve_at(&fixture.root);
+        let (linked_policy, linked_cold) = fixture.resolve_at(&linked);
+        assert!(main_cold > 0);
+        assert!(linked_cold > 0);
+        assert_eq!(main_policy.hooks, vec![fixture.root.join("main-hooks")]);
+        assert_eq!(linked_policy.hooks, vec![linked.join("linked-hooks")]);
+        assert_eq!(fixture.resolve_at(&fixture.root).1, 0);
+        assert_eq!(fixture.resolve_at(&linked).1, 0);
+
+        let branch_config = fixture.root.join("linked-branch-config");
+        std::fs::write(
+            &branch_config,
+            format!(
+                "[core]\n hooksPath = {}\n",
+                linked.join("branch-hooks").display()
+            ),
+        )
+        .unwrap();
+        let worktree_config = git_dir.join("config.worktree");
+        let mut contents = std::fs::read_to_string(&worktree_config).unwrap();
+        contents.push_str(&format!(
+            "[includeIf \"onbranch:linked-policy\"]\n path = {}\n",
+            branch_config.display()
+        ));
+        std::fs::write(worktree_config, contents).unwrap();
+        assert_eq!(fixture.resolve_at(&linked).0.hooks, linked_policy.hooks);
+        assert_eq!(fixture.resolve_at(&linked).1, 0);
+        let checkout =
+            git_policy_output(&linked, &["checkout", "--quiet", "-b", "linked-policy"]).unwrap();
+        assert!(checkout.status.success(), "{:?}", checkout);
+        let (policy, calls) = fixture.resolve_at(&linked);
+        assert!(calls > 0);
+        assert_eq!(policy.hooks, vec![linked.join("branch-hooks")]);
+        assert_eq!(fixture.resolve_at(&linked).1, 0);
+        assert_eq!(
+            fixture.resolve_at(&fixture.root).1,
+            0,
+            "linked HEAD must not invalidate the main worktree"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_single_flights_concurrent_cold_misses() {
+        let fixture = Fixture::new();
+        let expected_queries = fixture.resolve().1;
+        assert!(expected_queries > 0);
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(&fixture.root), true)
+            .unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
+        fixture.state(|state| {
+            state.calls = 0;
+            state.delay_ms = 30;
+        });
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let root = fixture.root.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    with_worker_jail(true, || resolve_git_policy(&root))
+                        .unwrap()
+                        .hooks
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        fixture.state(|state| state.delay_ms = 0);
+
+        assert_eq!(results[0], results[1]);
+        assert_eq!(
+            fixture.state(|state| state.calls),
+            expected_queries,
+            "concurrent cold misses should run one complete Git query batch"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_owner_panic_releases_waiting_callers() {
+        let fixture = Fixture::new();
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(&fixture.root), true)
+            .unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        fixture.state(|state| {
+            state.uncached_gate = Some(GitPolicyTestUncachedGate {
+                entered: entered_tx,
+                release: release_rx,
+            })
+        });
+        let owner_root = fixture.root.clone();
+        let owner =
+            std::thread::spawn(move || with_worker_jail(true, || resolve_git_policy(&owner_root)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("miss owner did not enter uncached resolution");
+
+        let (waiter_signal_tx, waiter_signal_rx) = std::sync::mpsc::channel();
+        fixture.state(|state| state.waiter_signal = Some(waiter_signal_tx));
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::channel();
+        let waiter_root = fixture.root.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = with_worker_jail(true, || resolve_git_policy(&waiter_root))
+                .map(|policy| policy.hooks);
+            let _ = waiter_result_tx.send(result);
+        });
+        waiter_signal_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("same-key caller did not wait for the miss owner");
+
+        release_tx.send(true).unwrap();
+        assert!(
+            owner.join().is_err(),
+            "test hook should panic the miss owner"
+        );
+        let completed_before_cleanup =
+            waiter_result_rx.recv_timeout(GIT_POLICY_FLIGHT_WAIT_TIMEOUT + Duration::from_secs(3));
+        let stranded = git_policy_cache().lock().unwrap().in_flight.contains(&key);
+        if stranded {
+            git_policy_cache().lock().unwrap().in_flight.remove(&key);
+            git_policy_cache_changed().notify_all();
+        }
+        let waiter_result = completed_before_cleanup
+            .or_else(|_| waiter_result_rx.recv_timeout(Duration::from_secs(3)))
+            .expect("waiter did not finish after flight cleanup")
+            .expect("waiter policy resolution failed");
+        waiter.join().unwrap();
+
+        assert!(!stranded, "panicked owner left a permanent in-flight key");
+        assert!(!waiter_result.is_empty());
+    }
+
+    #[test]
+    fn git_policy_cache_waiter_resolves_uncached_after_owner_stalls() {
+        let fixture = Fixture::new();
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(&fixture.root), true)
+            .unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        fixture.state(|state| {
+            state.uncached_gate = Some(GitPolicyTestUncachedGate {
+                entered: entered_tx,
+                release: release_rx,
+            })
+        });
+        let owner_root = fixture.root.clone();
+        let owner =
+            std::thread::spawn(move || with_worker_jail(true, || resolve_git_policy(&owner_root)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("miss owner did not enter uncached resolution");
+
+        let (waiter_signal_tx, waiter_signal_rx) = std::sync::mpsc::channel();
+        fixture.state(|state| state.waiter_signal = Some(waiter_signal_tx));
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::channel();
+        let waiter_root = fixture.root.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = with_worker_jail(true, || resolve_git_policy(&waiter_root))
+                .map(|policy| policy.hooks);
+            let _ = waiter_result_tx.send(result);
+        });
+        waiter_signal_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("same-key caller did not wait for the miss owner");
+
+        let completed_before_release =
+            waiter_result_rx.recv_timeout(GIT_POLICY_FLIGHT_WAIT_TIMEOUT + Duration::from_secs(3));
+        let waiter_finished_without_owner = completed_before_release.is_ok();
+        release_tx.send(false).unwrap();
+        owner.join().unwrap().expect("miss owner resolution failed");
+        let waiter_result = completed_before_release
+            .or_else(|_| waiter_result_rx.recv_timeout(Duration::from_secs(3)))
+            .expect("waiter did not finish after owner release")
+            .expect("waiter policy resolution failed");
+        waiter.join().unwrap();
+
+        assert!(
+            waiter_finished_without_owner,
+            "waiter must resolve uncached before a stalled owner is released"
+        );
+        assert!(!waiter_result.is_empty());
     }
 
     #[test]
@@ -6158,7 +7223,7 @@ mod git_policy_cache_tests {
     }
 
     #[test]
-    fn git_policy_cache_include_if_even_inactive_disables_caching() {
+    fn git_policy_cache_tracks_inactive_include_candidates() {
         let fixture = Fixture::new();
         let config = fixture.root.join(".git/config");
         let mut contents = std::fs::read_to_string(&config).unwrap();
@@ -6166,17 +7231,24 @@ mod git_policy_cache_tests {
             .push_str("[includeIf \"gitdir:/nonexistent-aft-repo/\"]\n path = absent-include\n");
         std::fs::write(config, contents).unwrap();
         assert!(fixture.resolve().1 > 0);
-        assert!(fixture.resolve().1 > 0);
+        assert_eq!(fixture.resolve().1, 0);
+        std::fs::write(
+            fixture.root.join(".git/absent-include"),
+            "[core]\n hooksPath = never-active-hooks\n",
+        )
+        .unwrap();
+        assert!(
+            fixture.resolve().1 > 0,
+            "creating include candidate must invalidate"
+        );
     }
 
     #[test]
     fn git_policy_cache_redirected_git_directory_is_never_cached() {
         let fixture = Fixture::new();
-        GIT_POLICY_TEST_ENV.with(|value| {
-            value
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
+        fixture.state(|state| {
+            state
+                .environment
                 .push(("GIT_DIR".into(), fixture.root.join(".git").into_os_string()))
         });
         assert!(fixture.resolve().1 > 0);
@@ -6198,7 +7270,7 @@ mod git_policy_cache_tests {
             &fixture.root,
             &fixture.root.join(".git"),
             &fixture.root.join(".git"),
-            git_policy_environment()
+            git_policy_environment(&fixture.root)
         )
         .is_some());
         let commit = git_policy_output(
@@ -6296,7 +7368,13 @@ mod git_policy_cache_tests {
                 );
             });
             measure(&format!("jail_policy_cold/{label}"), || {
-                git_policy_cache().lock().unwrap().remove(&fixture.root);
+                if let Some(key) = git_policy_cache_key(
+                    &fixture.root,
+                    &git_policy_environment(&fixture.root),
+                    true,
+                ) {
+                    git_policy_cache().lock().unwrap().remove(&key);
+                }
                 fixture.resolve();
             });
             fixture.resolve();

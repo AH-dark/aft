@@ -1,0 +1,1 @@
+- Sandboxed bash reuses Git policy results until repository or Git configuration inputs change.
