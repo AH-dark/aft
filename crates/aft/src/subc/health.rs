@@ -1644,6 +1644,8 @@ impl HealthDiagnosticRollup {
                 "sweeps_skipped_total": crate::db::compression_events::retention_sweep_skip_counts().0,
                 "consecutive_skips": crate::db::compression_events::retention_sweep_skip_counts().1,
                 "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
+                "disk_sweeps": serde_json::to_value(crate::bash_background::persisted_gc_health())
+                    .unwrap_or(Value::Null),
             },
             "storage_retention": Value::Null,
             "storage_retention_totals": Value::Null,
@@ -2254,6 +2256,9 @@ fn bash_task_retention_metrics(shared_app: &App) -> Value {
         "sweeps_skipped_total": sweeps_skipped_total,
         "consecutive_skips": consecutive_skips,
         "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
+        // Progress of the sweep over persisted task folders, per storage root.
+        "disk_sweeps": serde_json::to_value(crate::bash_background::persisted_gc_health())
+            .unwrap_or(Value::Null),
     })
 }
 
@@ -3908,6 +3913,13 @@ mod tests {
             retention["steady_state_ceiling"].as_u64(),
             Some(crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS as u64)
         );
+        // Totals for the sweep over task folders, fixed in size however many
+        // storage roots the process has swept.
+        assert!(
+            retention["disk_sweeps"]["roots_out_of_budget"].is_u64(),
+            "{retention}"
+        );
+        assert!(retention["disk_sweeps"]["roots_failing"].is_u64());
     }
 
     #[test]

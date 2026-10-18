@@ -16,23 +16,55 @@ pub(crate) struct Batch {
     pub names: Vec<OsString>,
 }
 
+#[derive(Default)]
+pub(crate) struct BatchResult {
+    pub batches: Vec<Batch>,
+    pub unreadable_sessions: usize,
+    pub unreadable_session_paths: Vec<PathBuf>,
+    pub directory_read_errors: usize,
+    pub root_directory_read_error: bool,
+    /// The first walk error in this lap, retained when the cursor resumes.
+    pub first_error: Option<String>,
+}
+
 pub(crate) struct Cursor {
+    root: PathBuf,
     sessions: Entries,
     tasks: Option<(PathBuf, Entries)>,
+    first_error: Option<String>,
     pub finished: bool,
+}
+
+const MAX_ERROR_MESSAGE_BYTES: usize = 512;
+
+fn bounded_error_message(message: String) -> String {
+    if message.len() <= MAX_ERROR_MESSAGE_BYTES {
+        return message;
+    }
+    let mut end = MAX_ERROR_MESSAGE_BYTES - '…'.len_utf8();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &message[..end])
 }
 
 impl Cursor {
     pub fn new(root: &Path) -> std::io::Result<Self> {
         Ok(Self {
+            root: root.to_path_buf(),
             sessions: Entries::open(root)?,
             tasks: None,
+            first_error: None,
             finished: false,
         })
     }
 
-    pub fn next_batch(&mut self) -> Vec<Batch> {
+    pub fn next_batch(&mut self) -> BatchResult {
         let mut batches: Vec<Batch> = Vec::new();
+        let mut unreadable_sessions = 0usize;
+        let mut unreadable_session_paths = Vec::new();
+        let mut directory_read_errors = 0usize;
+        let mut root_directory_read_error = false;
         let mut ids = BTreeSet::new();
         for _ in 0..GC_ENTRY_BUDGET {
             if let Some((session, entries)) = &mut self.tasks {
@@ -49,8 +81,19 @@ impl Cursor {
                     self.tasks = None;
                     continue;
                 };
-                let Ok(entry) = entry else {
-                    continue;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        directory_read_errors = directory_read_errors.saturating_add(1);
+                        unreadable_session_paths.push(session.clone());
+                        if self.first_error.is_none() {
+                            self.first_error = Some(bounded_error_message(format!(
+                                "failed to read session {}: {error}",
+                                session.display()
+                            )));
+                        }
+                        continue;
+                    }
                 };
                 let name = entry.file_name();
                 let batch = batches.last_mut().expect("session batch");
@@ -72,18 +115,59 @@ impl Cursor {
                     self.finished = true;
                     break;
                 };
-                let Ok(entry) = entry else {
-                    continue;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        directory_read_errors = directory_read_errors.saturating_add(1);
+                        root_directory_read_error = true;
+                        if self.first_error.is_none() {
+                            self.first_error = Some(bounded_error_message(format!(
+                                "failed to read {}: {error}",
+                                self.root.display()
+                            )));
+                        }
+                        continue;
+                    }
                 };
-                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    continue;
+                let session = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(error) => {
+                        directory_read_errors = directory_read_errors.saturating_add(1);
+                        unreadable_session_paths.push(session.clone());
+                        if self.first_error.is_none() {
+                            self.first_error = Some(bounded_error_message(format!(
+                                "failed to inspect session entry {}: {error}",
+                                session.display()
+                            )));
+                        }
+                        continue;
+                    }
                 }
-                if let Ok(entries) = Entries::open(&entry.path()) {
-                    self.tasks = Some((entry.path(), entries));
+                match Entries::open(&session) {
+                    Ok(entries) => self.tasks = Some((session, entries)),
+                    Err(error) => {
+                        unreadable_sessions = unreadable_sessions.saturating_add(1);
+                        unreadable_session_paths.push(session.clone());
+                        if self.first_error.is_none() {
+                            self.first_error = Some(bounded_error_message(format!(
+                                "failed to read session {}: {error}",
+                                session.display()
+                            )));
+                        }
+                    }
                 }
             }
         }
-        batches
+        BatchResult {
+            batches,
+            unreadable_sessions,
+            unreadable_session_paths,
+            directory_read_errors,
+            root_directory_read_error,
+            first_error: self.first_error.clone(),
+        }
     }
 }
 

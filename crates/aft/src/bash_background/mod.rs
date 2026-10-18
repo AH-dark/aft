@@ -6,6 +6,7 @@ pub mod buffer;
 #[cfg(unix)]
 mod exit_observer;
 mod gc_cursor;
+mod gc_memo;
 pub mod output;
 pub mod persistence;
 pub mod process;
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use gc_memo::{persisted_gc_health, PersistedGcFailure, PersistedGcHealth, PersistedGcSummary};
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
 #[cfg(all(test, unix))]

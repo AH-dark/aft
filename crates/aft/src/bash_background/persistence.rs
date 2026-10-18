@@ -27,9 +27,9 @@ use super::process::LiveDescendant;
 use super::BgTaskStatus;
 
 pub const SCHEMA_VERSION: u32 = 7;
-const CONTROL_DIR: &str = "control";
+pub(crate) const CONTROL_DIR: &str = "control";
 const IO_DIR: &str = "io";
-const METADATA_FILE: &str = "metadata.json";
+pub(crate) const METADATA_FILE: &str = "metadata.json";
 const TASK_LAYOUT_NOT_FOUND: &str = "background task layout not found";
 pub const COMMAND_FILE: &str = "command.sh";
 pub const WRAPPER_FILE: &str = "wrapper.sh";
