@@ -573,10 +573,13 @@ mod tests {
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
         let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
         let script = format!(
-            "$child = Start-Process -FilePath {} -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath {} -Value $child.Id; Start-Sleep -Seconds 30",
+            "$child = Start-Process -FilePath {} -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 120' -PassThru; Set-Content -LiteralPath {} -Value $child.Id; Start-Sleep -Seconds 120",
             quote(&powershell),
             quote(&pid_file),
         );
+        // Two nested PowerShell starts can take many seconds on a loaded Windows
+        // runner, so the deadline must leave room for the grandchild to exist and
+        // record its pid before the timeout kills the tree.
         let start = Instant::now();
         let result = read_gh(
             &powershell,
@@ -586,14 +589,16 @@ mod tests {
                 "-Command".into(),
                 script,
             ],
-            start + Duration::from_secs(5),
+            start + Duration::from_secs(20),
             1024,
         );
         assert!(result.unwrap_err().contains("deadline"));
-        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(start.elapsed() < Duration::from_secs(35));
 
-        let pid: u32 = std::fs::read_to_string(pid_file)
-            .unwrap()
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|error| {
+                panic!("the grandchild never recorded its pid before the deadline: {error}")
+            })
             .trim()
             .parse()
             .unwrap();
