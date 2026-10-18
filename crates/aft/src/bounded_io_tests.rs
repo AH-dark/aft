@@ -9,10 +9,13 @@ struct HelperGate {
 
 static HELPER_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static RUNNING_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(unix)]
 pub(crate) struct HelperStall {
     path: PathBuf,
+    gates: &'static Mutex<HashMap<PathBuf, HelperGate>>,
     pub(crate) reached: Receiver<()>,
     release: Sender<()>,
     finished: Receiver<()>,
@@ -21,7 +24,7 @@ pub(crate) struct HelperStall {
 #[cfg(unix)]
 impl Drop for HelperStall {
     fn drop(&mut self) {
-        HELPER_GATES.lock().unwrap().remove(&self.path);
+        self.gates.lock().unwrap().remove(&self.path);
         if self.release.send(()).is_ok() {
             let _ = self.finished.recv_timeout(IO_BUDGET);
         }
@@ -30,10 +33,23 @@ impl Drop for HelperStall {
 
 #[cfg(unix)]
 pub(crate) fn stall_helper(path: &Path) -> HelperStall {
+    stall_helper_at(path, &HELPER_GATES)
+}
+
+#[cfg(unix)]
+pub(crate) fn stall_running_helper(path: &Path) -> HelperStall {
+    stall_helper_at(path, &RUNNING_GATES)
+}
+
+#[cfg(unix)]
+fn stall_helper_at(
+    path: &Path,
+    gates: &'static Mutex<HashMap<PathBuf, HelperGate>>,
+) -> HelperStall {
     let (reached, reached_rx) = channel();
     let (release, release_rx) = channel();
     let (finished, finished_rx) = channel();
-    HELPER_GATES.lock().unwrap().insert(
+    gates.lock().unwrap().insert(
         path.to_path_buf(),
         HelperGate {
             reached,
@@ -43,6 +59,7 @@ pub(crate) fn stall_helper(path: &Path) -> HelperStall {
     );
     HelperStall {
         path: path.to_path_buf(),
+        gates,
         reached: reached_rx,
         release,
         finished: finished_rx,
@@ -53,7 +70,15 @@ static BLOCKED_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> 
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(super) fn before_helper(path: &Path) {
-    let gate = HELPER_GATES.lock().unwrap().remove(path);
+    wait_at_gate(path, &HELPER_GATES);
+}
+
+pub(super) fn after_helper_start(path: &Path) {
+    wait_at_gate(path, &RUNNING_GATES);
+}
+
+fn wait_at_gate(path: &Path, gates: &Mutex<HashMap<PathBuf, HelperGate>>) {
+    let gate = gates.lock().unwrap().remove(path);
     if let Some(gate) = gate {
         let _ = gate.reached.send(());
         let _ = gate.release.recv();
@@ -394,6 +419,93 @@ fn saturated_limiter_is_queue_timeout_and_does_not_start_work() {
         response.data["code"], "read_io_queue_timeout",
         "{response:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_time_does_not_consume_running_access_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued-then-healthy");
+    let gate = stall_helper(&path);
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        result_tx
+            .send(with_budget(
+                Some(Budget::after(Duration::from_secs(5))),
+                || {
+                    run_with_timeout(
+                        &path,
+                        None,
+                        Arc::new(Limiter::new(1)),
+                        Duration::from_secs(1),
+                        move |_| {
+                            started_tx.send(()).unwrap();
+                            let _ = release_rx.recv();
+                            Ok(42)
+                        },
+                    )
+                },
+            ))
+            .unwrap();
+    });
+    gate.reached.recv_timeout(IO_BUDGET).unwrap();
+    // Model a loaded runner that schedules the helper late, then a healthy
+    // operation taking less than its own access budget, but not the leftover.
+    assert!(result_rx.recv_timeout(Duration::from_millis(750)).is_err());
+    drop(gate);
+    let started = started_rx.recv_timeout(IO_BUDGET);
+    let early = result_rx.recv_timeout(Duration::from_millis(500));
+    let _ = release_tx.send(());
+    caller.join().unwrap();
+    started.expect("the filesystem operation must actually start");
+    let result = early.unwrap_or_else(|_| result_rx.recv_timeout(IO_BUDGET).unwrap());
+    assert_eq!(
+        result.unwrap(),
+        42,
+        "queueing must not exhaust the access cap"
+    );
+}
+
+#[test]
+fn running_access_keeps_shorter_request_deadline() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (finished_tx, finished_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        with_budget(Some(Budget::after(Duration::from_millis(80))), || {
+            run_with_timeout(
+                Path::new("running-past-request"),
+                None,
+                Arc::new(Limiter::new(1)),
+                Duration::from_secs(1),
+                move |_| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    let _ = finished_tx.send(());
+                    Ok(())
+                },
+            )
+        })
+    });
+    let started = started_rx.recv_timeout(IO_BUDGET);
+    let error = caller.join().unwrap().unwrap_err();
+    let _ = release_tx.send(());
+    finished_rx.recv_timeout(IO_BUDGET).unwrap();
+    started.expect("the filesystem operation must actually start");
+    assert_eq!(timeout_code(&error), "read_blocked");
+    let message = error.to_string();
+    let duration = message
+        .split_once("within ")
+        .unwrap()
+        .1
+        .split_once(" s")
+        .unwrap()
+        .0
+        .parse::<f64>()
+        .unwrap();
+    assert!((0.0..=0.080).contains(&duration), "{error}");
 }
 
 #[test]
