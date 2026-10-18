@@ -53,11 +53,27 @@ pub fn project_scope_key(project_root: &Path) -> String {
 /// Inputs are canonical policy identities, including home aliases and native
 /// volume roots. Exclude root-level system directories and all home ancestors.
 pub(crate) fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
-    directory.is_absolute()
+    project_root_path_is_narrow(directory, home, volume)
         && directory.parent().and_then(Path::parent).is_some()
+        && directory.parent() != Some(volume)
+}
+
+/// Decide whether a canonical project root admits watching and indexing.
+/// A volume's direct children can be ordinary projects, unlike permission-card
+/// directory scopes, which also exclude root-level containers.
+/// Unknown protected-directory identities must not admit background work.
+pub(crate) fn project_root_is_narrow(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
+    if !project_root_path_is_narrow(directory, home, volume) {
+        return Some(false);
+    }
+    protected_directory_alias(directory, home, volume).map(|protected| !protected)
+}
+
+fn project_root_path_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
+    directory.is_absolute()
+        && directory.parent().is_some()
         && !home.starts_with(directory)
         && directory != volume
-        && directory.parent() != Some(volume)
 }
 
 /// Bind mounts can preserve a protected directory's identity without preserving
@@ -68,18 +84,33 @@ pub(crate) fn directory_is_protected_alias(
     home: &Path,
     volume: &Path,
 ) -> Option<bool> {
+    if protected_directory_alias(directory, home, volume)? {
+        return Some(true);
+    }
+    Some(directory_identity(directory.parent()?)? == directory_identity(volume)?)
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let identity = |path: &Path| {
-        let metadata = std::fs::metadata(path).ok()?;
-        Some((metadata.dev(), metadata.ino()))
-    };
-    let candidate = identity(directory)?;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn protected_directory_alias(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
+    let candidate = directory_identity(directory)?;
     for ancestor in home.ancestors().chain(std::iter::once(volume)) {
-        if identity(ancestor)? == candidate {
+        if directory_identity(ancestor)? == candidate {
             return Some(true);
         }
     }
-    Some(identity(directory.parent()?)? == identity(volume)?)
+    Some(false)
+}
+
+#[cfg(not(unix))]
+fn protected_directory_alias(_directory: &Path, _home: &Path, _volume: &Path) -> Option<bool> {
+    Some(false)
 }
 
 #[cfg(not(unix))]
@@ -125,6 +156,138 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_root_volume_children_are_not_permission_scopes() {
+        let volume = tempfile::tempdir().unwrap();
+        let volume = volume.path().canonicalize().unwrap();
+        let home = volume.join("users/person");
+        std::fs::create_dir_all(&home).unwrap();
+        for name in ["app", "workspace", "src", "code"] {
+            let project = volume.join(name);
+            std::fs::create_dir(&project).unwrap();
+            assert_eq!(
+                super::project_root_is_narrow(&project, &home, &volume),
+                Some(true),
+                "a project directly below a volume must stay enabled: {name}"
+            );
+            assert!(
+                !super::directory_scope_is_narrow(&project, &home, &volume),
+                "permission-card scopes must remain stricter than project roots"
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                super::directory_is_protected_alias(&project, &home, &volume),
+                Some(true)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_root_paths_allow_container_roots_but_not_protected_roots() {
+        let home = std::path::Path::new("/home/person");
+        let volume = std::path::Path::new("/");
+        for project in ["/app", "/workspace", "/src", "/code"] {
+            assert!(super::project_root_path_is_narrow(
+                std::path::Path::new(project),
+                home,
+                volume
+            ));
+        }
+        for protected in ["/", "/home", "/home/person"] {
+            assert!(!super::project_root_path_is_narrow(
+                std::path::Path::new(protected),
+                home,
+                volume
+            ));
+        }
+        let mounted_volume = std::path::Path::new("/Volumes/Work");
+        assert!(!super::project_root_path_is_narrow(
+            mounted_volume,
+            home,
+            mounted_volume
+        ));
+        assert!(super::project_root_path_is_narrow(
+            std::path::Path::new("/Volumes/Work/app"),
+            home,
+            mounted_volume,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_root_paths_allow_drive_children_but_not_protected_roots() {
+        let home = std::path::Path::new(r"C:\Users\person");
+        let volume = std::path::Path::new(r"C:\");
+        for project in [r"C:\app", r"C:\workspace", r"C:\src", r"C:\code"] {
+            assert!(super::project_root_path_is_narrow(
+                std::path::Path::new(project),
+                home,
+                volume
+            ));
+        }
+        for protected in [volume, home, home.parent().unwrap()] {
+            assert!(!super::project_root_path_is_narrow(protected, home, volume));
+        }
+    }
+
+    #[test]
+    fn project_root_protected_directories_remain_disabled() {
+        let volume = tempfile::tempdir().unwrap();
+        let volume = volume.path().canonicalize().unwrap();
+        let home = volume.join("users/person");
+        std::fs::create_dir_all(&home).unwrap();
+        for root in [
+            &volume,
+            &home,
+            home.parent().unwrap(),
+            volume.ancestors().last().unwrap(),
+        ] {
+            assert_eq!(
+                super::project_root_is_narrow(root, &home, &volume),
+                Some(false)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_root_unknown_identity_is_not_admitted() {
+        let volume = tempfile::tempdir().unwrap();
+        let volume = volume.path().canonicalize().unwrap();
+        let home = volume.join("users/person");
+        std::fs::create_dir_all(&home).unwrap();
+        let missing = volume.join("missing/project");
+        assert_eq!(
+            super::project_root_is_narrow(&missing, &home, &volume),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_root_protected_aliases_remain_disabled() {
+        let volume = tempfile::tempdir().unwrap();
+        let volume = volume.path().canonicalize().unwrap();
+        let home = volume.join("users/person");
+        std::fs::create_dir_all(&home).unwrap();
+        // Following symlinks gives the same inode identities as protected
+        // directories without requiring privileged bind mounts in the test.
+        for (name, target) in [
+            ("app", home.as_path()),
+            ("workspace", home.parent().unwrap()),
+            ("code", volume.as_path()),
+        ] {
+            let alias = volume.join(name);
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            assert!(super::project_root_path_is_narrow(&alias, &home, &volume));
+            assert_eq!(
+                super::project_root_is_narrow(&alias, &home, &volume),
+                Some(false)
+            );
+        }
+    }
+
     use super::*;
     use std::fs;
 

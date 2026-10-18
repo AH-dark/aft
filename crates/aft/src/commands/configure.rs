@@ -3188,15 +3188,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .filter(|home| home.is_dir())
                     .map(crate::access_policy::policy_path)
                     .unwrap_or_else(|| volume.clone());
-                !crate::path_identity::directory_scope_is_narrow(
+                crate::path_identity::project_root_is_narrow(
                     &root_identity,
                     &home_identity,
                     &volume,
-                ) || crate::path_identity::directory_is_protected_alias(
-                    &root_identity,
-                    &home_identity,
-                    &volume,
-                ) != Some(false)
+                ) != Some(true)
             });
     if root_too_broad {
         degraded_reasons.push("root_too_broad".to_string());
@@ -3400,9 +3396,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
-    // The shared directory-scope rule rejects home ancestors, volume roots and
-    // root-level containers. Apply that result before discovering repositories
-    // or scheduling indexes, and retain it for every later heavy-work lane.
+    // Reject filesystem/volume roots, home and its ancestors before discovering
+    // repositories or scheduling indexes. Direct children of a volume can be
+    // ordinary projects; retain this project-specific admission for later work.
     if root_too_broad {
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
@@ -18342,6 +18338,17 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
         let ctx = test_context();
+        // Treat the temporary project's parent as an injected volume root to
+        // exercise /app-style admission without creating a host root directory.
+        let canonical_project = project.path().canonicalize().unwrap();
+        assert_eq!(
+            crate::path_identity::project_root_is_narrow(
+                &canonical_project,
+                &ctx._storage.path().canonicalize().unwrap(),
+                canonical_project.parent().unwrap(),
+            ),
+            Some(true),
+        );
         let req = configure_request_with_params(json!({
             "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
             "config": [user_tier(json!({
