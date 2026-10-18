@@ -528,7 +528,7 @@ impl WriterLease {
         key: &str,
         project_root: &Path,
     ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
-        Self::acquire_shared_inner(domain, cache_dir, key, project_root, None)
+        Self::acquire_shared_inner(domain, cache_dir, key, project_root, None, true)
     }
 
     /// Acquire a process-shared writer lease without waiting past `timeout`.
@@ -543,7 +543,25 @@ impl WriterLease {
         project_root: &Path,
         timeout: Duration,
     ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
-        Self::acquire_shared_inner(domain, cache_dir, key, project_root, Some(timeout))
+        Self::acquire_shared_inner(
+            domain,
+            cache_dir,
+            key,
+            project_root,
+            Some(fs_lock::acquisition_now() + timeout),
+            timeout.is_zero(),
+        )
+    }
+
+    /// Keep preparation and both contention waits within the same retry budget.
+    pub(crate) fn acquire_shared_until(
+        domain: RootCacheDomain,
+        cache_dir: &Path,
+        key: &str,
+        project_root: &Path,
+        deadline: Instant,
+    ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
+        Self::acquire_shared_inner(domain, cache_dir, key, project_root, Some(deadline), false)
     }
 
     fn acquire_shared_inner(
@@ -551,9 +569,9 @@ impl WriterLease {
         cache_dir: &Path,
         key: &str,
         project_root: &Path,
-        timeout: Option<Duration>,
+        deadline: Option<Instant>,
+        filesystem_single_attempt: bool,
     ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let access = ArtifactAccess::for_root(project_root);
         if !access.allows_writer_lease(domain, key, &writer_lease_path(cache_dir)) {
             return Ok(None);
@@ -578,13 +596,11 @@ impl WriterLease {
                         )));
                     }
                     Err(TryLockError::WouldBlock) => {
-                        let now = Instant::now();
+                        let now = fs_lock::acquisition_now();
                         if now >= deadline {
                             return Err(fs_lock::AcquireError::Timeout);
                         }
-                        std::thread::sleep(
-                            Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
-                        );
+                        fs_lock::sleep_until_retry(Some(deadline), 10)?;
                     }
                 }
             }
@@ -601,10 +617,12 @@ impl WriterLease {
 
         run_acquire_shared_hook_for_test(domain, cache_dir, key);
 
-        let filesystem_timeout = deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::ZERO);
-        let lease = Arc::new(Self::acquire(domain, cache_dir, key, filesystem_timeout)?);
+        let lease = Arc::new(Self::acquire(
+            domain,
+            cache_dir,
+            key,
+            deadline.filter(|_| !filesystem_single_attempt),
+        )?);
         process_leases()
             .lock()
             .map_err(|_| {
@@ -619,7 +637,7 @@ impl WriterLease {
         domain: RootCacheDomain,
         cache_dir: &Path,
         key: &str,
-        timeout: Duration,
+        deadline: Option<Instant>,
     ) -> Result<Self, fs_lock::AcquireError> {
         if !storage_allows_root_keyed(cache_dir)? {
             return Err(fs_lock::AcquireError::Io(io::Error::new(
@@ -639,7 +657,10 @@ impl WriterLease {
             )?;
         }
         crate::private_storage::open_keyed_dir(cache_dir, domain.as_str())?;
-        let guard = fs_lock::try_acquire(&writer_lease_path(cache_dir), timeout)?;
+        let guard = match deadline {
+            Some(deadline) => fs_lock::try_acquire_until(&writer_lease_path(cache_dir), deadline)?,
+            None => fs_lock::try_acquire_once(&writer_lease_path(cache_dir))?,
+        };
         if !guard.verify_writer_epoch()? {
             return Err(fs_lock::AcquireError::Io(io::Error::other(
                 "writer lease epoch changed immediately after acquisition",
@@ -1675,6 +1696,25 @@ mod tests {
             assert_eq!(lease.path(), path.as_path());
             assert!(lease.verify().unwrap());
         }
+    }
+
+    #[test]
+    fn zero_timeout_writer_lease_keeps_one_shot_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("inspect").join("project");
+        configure_artifact_access(&cache_dir, "project", false);
+        let clock = fs_lock::retry_clock::Guard::install(Duration::ZERO);
+        let lease = WriterLease::acquire_shared_with_timeout(
+            RootCacheDomain::Inspect,
+            &cache_dir,
+            "project",
+            &cache_dir,
+            Duration::ZERO,
+        )
+        .expect("zero timeout still attempts the filesystem lease once")
+        .expect("writer access allowed");
+        assert!(lease.verify().unwrap());
+        assert_eq!(clock.observations(), (Duration::ZERO, vec![], 1));
     }
 
     #[test]

@@ -184,6 +184,15 @@ pub fn try_acquire(path: &Path, timeout: Duration) -> Result<LockGuard, AcquireE
     acquire_with_config(path, Some(timeout), LockConfig::default())
 }
 
+/// Preserve a caller's deadline across filesystem preparation instead of
+/// starting a fresh timeout after that work has finished.
+pub(crate) fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGuard, AcquireError> {
+    crate::production_storage::refuse_write(path)?;
+    #[cfg(test)]
+    retry_clock::before_acquire();
+    acquire_with_deadline(path, Some(deadline), false, true, LockConfig::default())
+}
+
 /// Try one lock acquisition attempt, then check once whether an existing stale
 /// lock can be taken over.
 ///
@@ -370,7 +379,25 @@ fn acquire_with_config(
     config: LockConfig,
 ) -> Result<LockGuard, AcquireError> {
     crate::production_storage::refuse_write(path)?;
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    #[cfg(test)]
+    retry_clock::before_acquire();
+    let deadline = timeout.map(|timeout| acquisition_now() + timeout);
+    acquire_with_deadline(
+        path,
+        deadline,
+        timeout == Some(Duration::ZERO),
+        false,
+        config,
+    )
+}
+
+fn acquire_with_deadline(
+    path: &Path,
+    deadline: Option<Instant>,
+    allow_malformed_grace: bool,
+    strict_deadline: bool,
+    config: LockConfig,
+) -> Result<LockGuard, AcquireError> {
     let hostname = current_hostname();
     let mut warned_live_owner = false;
     let mut warned_stale_live_owner = false;
@@ -383,16 +410,18 @@ fn acquire_with_config(
     let mut malformed_grace_used = false;
 
     loop {
-        if attempted_once {
-            if immediate_retry_budget > 0 {
+        if attempted_once || strict_deadline {
+            if immediate_retry_budget > 0 && !strict_deadline {
                 immediate_retry_budget -= 1;
             } else if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
+                if acquisition_now() >= deadline {
                     return Err(AcquireError::Timeout);
                 }
             }
         }
         attempted_once = true;
+        #[cfg(test)]
+        retry_clock::note_attempt();
 
         match create_new_lock(path, &hostname, config) {
             Ok(guard) => return Ok(guard),
@@ -447,7 +476,7 @@ fn acquire_with_config(
                 // Zero-timeout callers also need this one grace read to reach
                 // reclaim, but must not loop if another actor keeps corrupting
                 // the lease or prevents its removal.
-                if timeout == Some(Duration::ZERO) && !malformed_grace_used {
+                if allow_malformed_grace && !malformed_grace_used {
                     malformed_grace_used = true;
                     sleep_until_retry(None, config.poll_interval_ms)?;
                 } else {
@@ -1477,11 +1506,114 @@ fn note_retry_sleep_for_test() {
     });
 }
 
-fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result<(), AcquireError> {
+pub(crate) fn acquisition_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = retry_clock::now() {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+pub(crate) mod retry_clock {
+    use super::*;
+
+    struct State {
+        started: Instant,
+        now: Instant,
+        preparation_delay: Duration,
+        sleeps: Vec<Duration>,
+        attempts: usize,
+    }
+
+    thread_local! {
+        static CLOCK: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Guard {
+        pub(crate) fn install(preparation_delay: Duration) -> Self {
+            CLOCK.with(|clock| {
+                let mut clock = clock.borrow_mut();
+                assert!(clock.is_none(), "retry clock already installed");
+                let started = Instant::now();
+                *clock = Some(State {
+                    started,
+                    now: started,
+                    preparation_delay,
+                    sleeps: Vec::new(),
+                    attempts: 0,
+                });
+            });
+            Self
+        }
+
+        pub(crate) fn observations(&self) -> (Duration, Vec<Duration>, usize) {
+            CLOCK.with(|clock| {
+                let clock = clock.borrow();
+                let state = clock.as_ref().unwrap();
+                (
+                    state.now - state.started,
+                    state.sleeps.clone(),
+                    state.attempts,
+                )
+            })
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| *clock.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn now() -> Option<Instant> {
+        CLOCK.with(|clock| clock.borrow().as_ref().map(|state| state.now))
+    }
+
+    pub(super) fn before_acquire() {
+        CLOCK.with(|clock| {
+            if let Some(state) = clock.borrow_mut().as_mut() {
+                // Model filesystem preparation after the caller chose its deadline.
+                state.now += std::mem::take(&mut state.preparation_delay);
+            }
+        });
+    }
+
+    pub(super) fn note_attempt() {
+        CLOCK.with(|clock| {
+            if let Some(state) = clock.borrow_mut().as_mut() {
+                state.attempts += 1;
+            }
+        });
+    }
+
+    pub(super) fn sleep(duration: Duration) -> bool {
+        CLOCK.with(|clock| {
+            let mut clock = clock.borrow_mut();
+            let Some(state) = clock.as_mut() else {
+                return false;
+            };
+            state.sleeps.push(duration);
+            state.now += duration;
+            assert!(
+                state.sleeps.len() <= 1_000,
+                "retry loop ignored its deadline"
+            );
+            true
+        })
+    }
+}
+
+pub(crate) fn sleep_until_retry(
+    deadline: Option<Instant>,
+    poll_interval_ms: u64,
+) -> Result<(), AcquireError> {
     let poll = Duration::from_millis(poll_interval_ms);
     let sleep_for = match deadline {
         Some(deadline) => {
-            let now = Instant::now();
+            let now = acquisition_now();
             if now >= deadline {
                 return Err(AcquireError::Timeout);
             }
@@ -1491,6 +1623,10 @@ fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result
     };
     #[cfg(test)]
     note_retry_sleep_for_test();
+    #[cfg(test)]
+    if retry_clock::sleep(sleep_for) {
+        return Ok(());
+    }
     thread::sleep(sleep_for);
     Ok(())
 }
