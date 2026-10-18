@@ -309,6 +309,14 @@ async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_
     let legacy = open(&consumer, &project, "e2e-legacy", None)
         .await
         .expect("open a legacy route");
+    let unknown_op = request(
+        &consumer,
+        &legacy,
+        json!({"op": "example.not_served", "params": {}}),
+    )
+    .await
+    .expect_err("an operation the provider does not serve returns an error frame");
+    assert_eq!(refusal_code(&unknown_op).as_deref(), Some("unknown_op"));
     let other_role = open(
         &consumer,
         &project,

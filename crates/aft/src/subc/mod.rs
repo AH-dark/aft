@@ -8406,7 +8406,22 @@ async fn handle_tool_call(
         }
     }
 
-    let operation = envelope.get("op").and_then(Value::as_str).or_else(|| {
+    let explicit_operation = envelope.get("op").and_then(Value::as_str);
+    // health.digest and bg_events use legacy handlers outside the v1 operation
+    // table, and flow reads were intercepted above, so neither reaches here as
+    // an unknown op.
+    if let Some(operation) = explicit_operation.filter(|operation| {
+        !tool_provider::recognized_operation(operation)
+            && *operation != crate::commands::health_digest::HEALTH_DIGEST_OPERATION
+            && *operation != "bg_events"
+    }) {
+        let error = subc_protocol::ErrorBody::new(
+            "unknown_op",
+            format!("aft does not serve op {operation:?} on this route"),
+        );
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
+    let operation = explicit_operation.or_else(|| {
         envelope
             .get("name")
             .and_then(Value::as_str)
