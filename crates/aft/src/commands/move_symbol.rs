@@ -862,6 +862,78 @@ mod audit_regressions {
     use super::*;
 
     #[test]
+    fn explicit_javascript_imports_resolve_typescript_sources() {
+        let consumer = Path::new("project/consumer.ts");
+        for (module, target) in [
+            ("./foo.js", "project/foo.ts"),
+            ("./foo.js", "project/foo.tsx"),
+            ("./foo.mjs", "project/foo.mts"),
+            ("./foo.cjs", "project/foo.cts"),
+            ("./foo.jsx", "project/foo.tsx"),
+            ("./user.service.js", "project/user.service.ts"),
+        ] {
+            assert!(
+                import_path_matches_file(module, consumer, Path::new(target)),
+                "{module} should resolve {target}"
+            );
+        }
+        for (module, target) in [
+            ("./user.service", "project/user.ts"),
+            ("./foo.mjs", "project/foo.cts"),
+            ("./foo.cjs", "project/foo.mts"),
+            ("./foo.jsx", "project/foo.ts"),
+        ] {
+            assert!(
+                !import_path_matches_file(module, consumer, Path::new(target)),
+                "{module} must not resolve {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_move_rewrites_explicit_js_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = dir.path().join("foo.ts");
+        let destination = dir.path().join("moved.ts");
+        let consumer = dir.path().join("consumer.ts");
+        std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
+        std::fs::write(
+            &consumer,
+            "import { moved } from './foo.js';\nconsole.log(moved());\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "move-js-consumer", "command": "move_symbol", "file": source,
+            "destination": destination, "symbol": "moved"
+        }))
+        .unwrap();
+        let response = handle_move_symbol(&request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["consumers_updated"], 1);
+        let updated = std::fs::read_to_string(consumer).unwrap();
+        assert!(updated.contains("from './moved'"), "{updated}");
+        assert!(!updated.contains("./foo.js"), "{updated}");
+        assert!(std::fs::read_to_string(destination)
+            .unwrap()
+            .contains("function moved"));
+        assert!(!std::fs::read_to_string(source)
+            .unwrap()
+            .contains("function moved"));
+    }
+
+    #[test]
     fn repeated_symbol_moves_keep_distinct_recovery_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.ts");
@@ -960,7 +1032,23 @@ fn import_path_matches_file(import_module: &str, consumer_file: &Path, target_fi
         return true;
     }
 
-    // Try adding common extensions
+    // TypeScript consumers can name the emitted JavaScript file while the
+    // declaration still lives in a TypeScript source file.
+    let source_extensions: &[&str] = match resolved.extension().and_then(|ext| ext.to_str()) {
+        Some("js") => &["ts", "tsx"],
+        Some("mjs") => &["mts"],
+        Some("cjs") => &["cts"],
+        Some("jsx") => &["tsx"],
+        _ => &[],
+    };
+    for extension in source_extensions {
+        if paths_equivalent(&resolved.with_extension(extension), target_file) {
+            return true;
+        }
+    }
+
+    // Append rather than replace arbitrary dotted basename suffixes, such as
+    // `.service` in an import of `./user.service`.
     for ext in &["ts", "tsx", "js", "jsx"] {
         let mut name = resolved.as_os_str().to_os_string();
         name.push(format!(".{ext}"));
