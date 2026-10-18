@@ -12452,14 +12452,16 @@ mod tests {
                 write_frame(&mut daemon, &frame)
                     .await
                     .map_err(|e| e.to_string())?;
-                // Releasing the locks lets the standing work they held back run
-                // first: the startup reconciliation, which creates and migrates
-                // a fresh aft.db, and the refused bind's configure, which this
-                // bind queues behind on the root. Neither waits on a timer, but
-                // the database creation is disk-bound and has taken seconds on a
-                // loaded machine, so wait for the reply itself. The relay
-                // timeout only guards against a hang: AFT answers every bind by
-                // its own deadline, which ends before it.
+                // Releasing the standing actor's locks first lets the work they
+                // held back finish: the actor's one-time startup reconciliation,
+                // which creates and migrates a fresh aft.db, and the configure of
+                // the bind refused above, which still occupies this project
+                // root's executor lane, so this bind queues behind it. Neither
+                // waits on a timer, but creating the database is disk-bound and
+                // has taken seconds on a loaded machine, so wait for the reply
+                // itself. DAEMON_BIND_RELAY_TIMEOUT only guards against a hang:
+                // AFT answers or refuses every bind by ROUTE_BIND_DEADLINE,
+                // which is shorter.
                 let response =
                     tokio::time::timeout(DAEMON_BIND_RELAY_TIMEOUT, read_frame(&mut daemon))
                         .await
