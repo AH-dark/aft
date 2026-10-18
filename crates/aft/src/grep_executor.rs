@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -58,10 +58,18 @@ pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct FallbackWalkOutcome {
     pub files: Vec<PathBuf>,
+    pub(crate) walked_mtimes: HashMap<PathBuf, Option<SystemTime>>,
     pub walk_truncated: bool,
     /// Foreign filesystem mounts skipped before a recursive fallback could open them.
     pub skipped_foreign_mounts: usize,
     pub entries_visited: usize,
+}
+
+#[derive(Default)]
+struct FallbackWalkSnapshot {
+    files: Vec<PathBuf>,
+    mtimes: HashMap<PathBuf, Option<SystemTime>>,
+    resolved_filter_root: PathBuf,
 }
 
 /// Counts are updated before include/exclude filtering. Empty-scope probes count
@@ -1291,6 +1299,7 @@ pub(crate) fn source_first_fallback_walk_files(
     }
     FallbackWalkOutcome {
         files,
+        walked_mtimes: HashMap::new(),
         walk_truncated,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
@@ -1336,7 +1345,7 @@ fn bounded_fallback_walk_files_with_limits_target(
     let filters = filters.clone();
     // The walker shares matches as it finds them, so a walk the request stops
     // waiting for still returns what it found.
-    let found = Arc::new(Mutex::new(Vec::new()));
+    let found = Arc::new(Mutex::new(FallbackWalkSnapshot::default()));
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let walk_found = Arc::clone(&found);
     let walk_skipped = Arc::clone(&skipped_foreign_mounts);
@@ -1363,19 +1372,28 @@ fn bounded_fallback_walk_files_with_limits_target(
             entries_visited,
         }) => {
             if let Some(stall) = stall {
-                let kept = !found.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+                let kept = !found
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .files
+                    .is_empty();
                 stall.record(kept);
             }
             (true, entries_visited)
         }
         Err(_) => (true, 0),
     };
-    let mut files = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
-    // Sorted here rather than in the walker: sorting stats every match without
-    // reporting progress, and a stopped walk's partial list needs the same order.
-    sort_walked_paths_by_mtime_desc(&mut files, walk_filter_root(filter_root, search_root));
+    let FallbackWalkSnapshot {
+        mut files,
+        mtimes,
+        resolved_filter_root,
+    } = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+    // Only in-memory keys are used here: the filesystem may have stopped
+    // responding while the walker was collecting the last match's mtime.
+    sort_walked_paths_by_mtime_desc(&mut files, &resolved_filter_root, &mtimes);
     FallbackWalkOutcome {
         files,
+        walked_mtimes: mtimes,
         walk_truncated,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
@@ -1400,7 +1418,7 @@ fn walk_files_unbounded(
     max_files: usize,
     ignored_target: bool,
     control: &WalkControl,
-    found: &Mutex<Vec<PathBuf>>,
+    found: &Mutex<FallbackWalkSnapshot>,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> (bool, usize) {
     // Built before the file test below, which would stat the starting path.
@@ -1412,6 +1430,11 @@ fn walk_files_unbounded(
         return (false, 0);
     };
     let filter_root = walk_filter_root(filter_root, search_root);
+    let resolved_filter_root = crate::inspect::job::canonicalize_normalized(filter_root);
+    found
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resolved_filter_root = resolved_filter_root;
     let mut matched = 0usize;
     let mut walk_truncated = false;
     let mut entries_visited = 0usize;
@@ -1442,7 +1465,22 @@ fn walk_files_unbounded(
                 break;
             }
             matched += 1;
-            found.lock().unwrap_or_else(|e| e.into_inner()).push(path);
+            {
+                let mut found = found.lock().unwrap_or_else(|e| e.into_inner());
+                found.files.push(path.clone());
+                found.mtimes.insert(path.clone(), None);
+            }
+            // Publish the match before metadata, and never hold the snapshot
+            // lock across I/O: a stalled stat must not hide a discovered file.
+            let mtime = control
+                .metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            found
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mtimes
+                .insert(path, mtime);
         }
     }
     (walk_truncated || control.cut_short(), entries_visited)
@@ -2709,6 +2747,68 @@ mod tests {
     }
 
     #[test]
+    fn fallback_walk_keeps_discovered_file_when_its_mtime_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::canonicalize(dir.path()).unwrap().join("found.rs");
+        std::fs::write(&file, "pub fn found() {}\n").unwrap();
+        let blocked = crate::bounded_io::block_stat(&file);
+        crate::search_index::audit_work_reset();
+        let started = Instant::now();
+        let (outcome, response) =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(100), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(2))),
+                    || {
+                        let outcome =
+                            bounded_fallback_walk_files(&file, &file, &PathFilters::default());
+                        let response = crate::bounded_io::finish_response(Response::success(
+                            "walk",
+                            serde_json::json!({"files": outcome.files}),
+                        ));
+                        (outcome, response)
+                    },
+                )
+            });
+        let elapsed = started.elapsed();
+        blocked
+            .reached
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop(blocked);
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(outcome.files, vec![file]);
+        assert!(outcome.walk_truncated, "the mtime lookup did not finish");
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(crate::search_index::audit_work().sort_stats, 0);
+    }
+
+    #[test]
+    fn complete_fallback_walk_orders_by_mtime_then_display_path_without_restatting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for (name, seconds) in [
+            ("a-old.rs", 1_700_000_000),
+            ("z-new.rs", 1_700_000_002),
+            ("z-tie.rs", 1_700_000_001),
+            ("nested/a-tie.rs", 1_700_000_001),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "pub fn f() {}\n").unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(seconds, 0))
+                .unwrap();
+        }
+        crate::search_index::audit_work_reset();
+        let outcome = bounded_fallback_walk_files(&root, &root, &PathFilters::default());
+        assert!(!outcome.walk_truncated);
+        assert_eq!(
+            outcome.files,
+            ["z-new.rs", "nested/a-tie.rs", "z-tie.rs", "a-old.rs"].map(|name| root.join(name))
+        );
+        assert_eq!(crate::search_index::audit_work().sort_stats, 0);
+    }
+
+    #[test]
     fn fallback_project_walk_prunes_large_ignored_trees() {
         // build is also a fixed directory skip; vendor makes sure Git's own
         // directory pruning, rather than only that backstop, is exercised.
@@ -3388,7 +3488,7 @@ mod tests {
     fn expired_fallback_walk_stops_reading_entries_and_frees_its_slot() {
         let (_dir, root) = crate::bounded_io::many_entry_tree();
         let hook = crate::bounded_io::expire_walk_after_entries(&root, EXPIRE_AFTER_ENTRY_CHECKS);
-        let found = Arc::new(Mutex::new(Vec::new()));
+        let found = Arc::new(Mutex::new(FallbackWalkSnapshot::default()));
         let walk_found = Arc::clone(&found);
         // The hook expires the walk; the deadline and the 10 s stall window
         // only guard against a hang, so a loaded runner cannot move the point
@@ -3429,7 +3529,7 @@ mod tests {
             panic!("the expired walk must end on its own, not be abandoned");
         };
         assert!(truncated, "an expired walk is truncated");
-        let found = found.lock().unwrap().clone();
+        let found = found.lock().unwrap().files.clone();
         let missed = hook.files_missed_before_expiry(&found);
         assert!(missed <= 1, "{missed} files checked in time were dropped");
         // The count covers the root (never filtered, so never hooked) plus

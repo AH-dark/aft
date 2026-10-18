@@ -18,6 +18,7 @@ use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResoluti
 struct GlobDiscovery {
     files: Vec<PathBuf>,
     indexed_mtimes: HashMap<PathBuf, SystemTime>,
+    walked_mtimes: HashMap<PathBuf, Option<SystemTime>>,
     walk_truncated: bool,
     source: &'static str,
     entries_visited: usize,
@@ -104,6 +105,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let total_started = Instant::now();
     let mut parent_gaps = Vec::new();
     let mut indexed_mtimes = HashMap::new();
+    let mut walked_mtimes = HashMap::new();
     let ignored_targets = search_roots
         .iter()
         .map(|root| {
@@ -160,6 +162,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .map(|_| req.session()),
         );
         indexed_mtimes = discovery.indexed_mtimes;
+        walked_mtimes = discovery.walked_mtimes;
         (
             discovery.files,
             discovery.walk_truncated,
@@ -201,6 +204,12 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "mixed/fallback"
         };
         for discovery in &discoveries {
+            walked_mtimes.extend(
+                discovery
+                    .walked_mtimes
+                    .iter()
+                    .map(|(path, time)| (path.clone(), *time)),
+            );
             indexed_mtimes.extend(
                 discovery
                     .indexed_mtimes
@@ -208,7 +217,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .map(|(path, time)| (path.clone(), *time)),
             );
         }
-        let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
+        let files = merge_glob_files(
+            discoveries.into_iter().flat_map(|d| d.files).collect(),
+            &walked_mtimes,
+        );
         (
             files,
             walk_truncated,
@@ -230,16 +242,18 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     // Glob's public contract is newest-first. Sort before truncating so the cap
     // keeps the most recently modified matches instead of the lexically first.
-    sort_paths_by_cached_mtime_desc(&mut files, &project_root, &indexed_mtimes);
+    sort_paths_by_cached_mtime_desc(&mut files, &project_root, &indexed_mtimes, &walked_mtimes);
     // Backstop against a stale index (for example a borrowed snapshot that
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
-    // from the following matches, so present files keep their order.
-    let presence = crate::search_index::take_present_on_disk(
+    // from the following matches, so present files keep their order. Walked
+    // paths were just observed; checking them again could stall after discovery.
+    let presence = crate::search_index::take_present_on_disk_with_presence(
         files,
         DEFAULT_MAX_RESULTS,
         |path| path.as_path(),
         "glob",
+        |path| !walked_mtimes.contains_key(path) && crate::search_index::path_missing_on_disk(path),
     );
     let missing_on_disk = presence.dropped;
     let presence_budget_exhausted = presence.budget_exhausted;
@@ -386,6 +400,7 @@ fn glob_root(
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
+            walked_mtimes: HashMap::new(),
             walk_truncated: false,
             source: "task-output",
             entries_visited,
@@ -426,6 +441,7 @@ fn glob_root(
             entries_visited,
             files,
             indexed_mtimes,
+            walked_mtimes: HashMap::new(),
             walk_truncated: false,
             source: "index",
             walk_time: Duration::ZERO,
@@ -464,6 +480,7 @@ fn glob_root(
                     return GlobDiscovery {
                         files: outcome.files,
                         indexed_mtimes: HashMap::new(),
+                        walked_mtimes: outcome.walked_mtimes,
                         walk_truncated: outcome.walk_truncated,
                         source: "fallback",
                         entries_visited: outcome.entries_visited,
@@ -503,11 +520,19 @@ pub(crate) fn glob_root_files_for_test(
     (discovery.files, discovery.source, discovery.entries_visited)
 }
 
-fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
+fn merge_glob_files(
+    files: Vec<PathBuf>,
+    walked_mtimes: &HashMap<PathBuf, Option<SystemTime>>,
+) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for file in files {
-        if seen.insert(canonical_key(&file)) {
+        let key = if walked_mtimes.contains_key(&file) {
+            crate::inspect::job::normalize_path(&file)
+        } else {
+            crate::inspect::job::normalize_path(&canonical_key(&file))
+        };
+        if seen.insert(key) {
             deduped.push(file);
         }
     }
@@ -538,6 +563,7 @@ fn fallback_glob(
     GlobDiscovery {
         files: outcome.files,
         indexed_mtimes: HashMap::new(),
+        walked_mtimes: outcome.walked_mtimes,
         walk_truncated: outcome.walk_truncated,
         source: "fallback",
         entries_visited: outcome.entries_visited,
@@ -964,6 +990,36 @@ mod tests {
             cfg!(target_os = "macos"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn fallback_glob_does_not_reopen_discovered_paths_after_a_stall() {
+        let (_dir, ctx, registry) = registry_fixture(1);
+        let file = registry.join("crate-000/src/lib.rs");
+        let mut stall = crate::bounded_io::stall_walk_entry(&file);
+        let request = glob_request(&file, "*.rs");
+        crate::search_index::audit_work_reset();
+        let started = Instant::now();
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(100), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(2))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        let elapsed = started.elapsed();
+        stall.blocked.recv_timeout(Duration::from_secs(1)).unwrap();
+        stall.release();
+        let body = &response.data;
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert!(response.success, "{body}");
+        assert_eq!(body["files"], serde_json::json!([file]), "{body}");
+        assert_eq!(body["walk_truncated"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        let work = crate::search_index::audit_work();
+        assert_eq!(work.sort_stats, 0, "{work:?}");
+        assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
+        assert_eq!(work.presence_checks, 0, "{work:?}");
     }
 
     #[test]

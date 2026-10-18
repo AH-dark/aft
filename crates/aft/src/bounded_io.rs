@@ -804,6 +804,20 @@ impl WalkControl {
         regression_tests::before_walk_entry(path);
         self.expired()
     }
+    /// Stat a discovered match as entry progress, not as another directory
+    /// access. The request can stop waiting if this one metadata call stalls.
+    pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+        if self.entry(path) {
+            self.cut.store(true, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the walk reached its deadline before metadata",
+            ));
+        }
+        let result = stat(path.to_path_buf());
+        self.step();
+        result
+    }
     /// True when a call inside the walk was refused at the walk's deadline.
     pub(crate) fn cut_short(&self) -> bool {
         self.cut.load(Ordering::Relaxed)

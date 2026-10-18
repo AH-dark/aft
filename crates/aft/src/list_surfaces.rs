@@ -169,7 +169,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits, take_present_on_disk_with_presence",
             },
         ],
     },
@@ -202,12 +202,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, fallback_glob_does_not_reopen_discovered_paths_after_a_stall, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, rendered_glob_file_count, take_present_on_disk_with_presence",
             },
         ],
     },
