@@ -8,7 +8,7 @@
   },
   "measured_on": {
     "platform": "linux-x86_64",
-    "provenance": "local --write-baseline on linux-x86_64"
+    "provenance": "workflow run 39088711411 (OSS index cost gate, workflow_dispatch write_baseline=true), 2026-10-18, github-hosted ubuntu-24.04 runner image 20261012.334.1, head 44f7009c9460ea83fa6bc4d2920d8a1e6367ff8c; minimum observed value per metric over the run's two passes; uploaded as artifact oss-cost-gate-39088711411"
   },
   "repos": {
     "redox": {

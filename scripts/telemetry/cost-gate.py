@@ -675,6 +675,26 @@ def repo_metrics_from_runs(name: str, config: dict[str, Any], runs: list[RunData
     return metrics
 
 
+def write_baseline_provenance() -> str:
+    """Name where a blessed baseline was measured, so a reviewer can trace it.
+
+    On a GitHub-hosted runner this is the workflow run, the runner image and
+    the commit, which together identify the machine class the nightly gate
+    compares against. Elsewhere it says the numbers came from a local run.
+    """
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not run_id:
+        return f"local --write-baseline on {current_platform()}"
+    image = os.environ.get("ImageOS", "unknown image")
+    image_version = os.environ.get("ImageVersion", "unknown version")
+    commit = os.environ.get("GITHUB_SHA", "unknown commit")
+    return (
+        f"workflow run {run_id} ({os.environ.get('GITHUB_WORKFLOW', 'unknown workflow')}), "
+        f"{date.today().isoformat()}, github-hosted {image} runner image {image_version}, "
+        f"head {commit}; minimum observed value per metric over the run's two passes"
+    )
+
+
 def write_baseline(
     path: Path,
     old_payload: dict[str, Any],
@@ -693,7 +713,7 @@ def write_baseline(
     }
     payload[PLATFORM_KEY] = {
         "platform": current_platform(),
-        "provenance": f"local --write-baseline on {current_platform()}",
+        "provenance": write_baseline_provenance(),
     }
     for name in names:
         runs = runs_by_repo[name]
