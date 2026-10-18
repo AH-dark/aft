@@ -418,7 +418,7 @@ fn publish_checkout_reporting_steps(
 }
 
 /// As [`publish_checkout_reporting_steps`]. With `hold`, publication stops
-/// right after the named step until the receiver gets a message (or a minute
+/// right after the named step until the receiver gets a message (or two minutes
 /// passes), which simulates a stall in the step that follows it.
 fn publish_checkout_reporting_steps_with_hold(
     request: &crate::views::assembly::AssemblyRequest,
@@ -432,7 +432,7 @@ fn publish_checkout_reporting_steps_with_hold(
             phase(&format!("publishing checkout view: after {step}"));
             if let Some((held_step, release)) = &hold {
                 if step == *held_step {
-                    let _ = release.recv_timeout(Duration::from_secs(60));
+                    let _ = release.recv_timeout(Duration::from_secs(120));
                 }
             }
         }
@@ -451,10 +451,11 @@ fn checkout_verification_deadline_names_the_stalled_publication_step() {
     let (project, storage, _job, request) = view_projection_fixture();
     let (release, held) = std::sync::mpsc::channel();
     let result = std::panic::catch_unwind(|| {
-        // Ten seconds covers a two-file publication up to the hold even on a
-        // slow runner; the hold then outlasts the deadline.
+        // Thirty seconds covers a two-file publication up to the hold (well
+        // under a second on an idle machine) even on a CI runner ten times
+        // slower; the hold then outlasts the deadline.
         run_checkout_verification_watchdog(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             DeadlineStart::FirstPhase,
             move |phase| {
                 // The worker outlives the timeout, so it owns the fixture
@@ -475,7 +476,7 @@ fn checkout_verification_deadline_names_the_stalled_publication_step() {
     let message = panic.downcast_ref::<String>().unwrap();
     assert!(
         message.starts_with(
-            "inspect warm verification timed out after 10s during \
+            "inspect warm verification timed out after 30s during \
              publishing checkout view: after derived_clone; timeline: \
              publishing checkout view@"
         ),
