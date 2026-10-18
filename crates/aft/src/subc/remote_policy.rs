@@ -266,7 +266,9 @@ pub(super) type ConfinementRead = Result<bool, subc_protocol::ErrorBody>;
 
 /// A policy answer carried across admission waits. An unconfined answer is
 /// valid only until a confining save advances the context's policy generation;
-/// that save may fence a later epoch through its fallback to an older row.
+/// a worker epoch without its own saved row inherits an older epoch's policy.
+/// Saving confinement for the older epoch therefore invalidates carried
+/// unconfined answers for the later epoch too.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct CarriedConfinement {
     pub(super) read: ConfinementRead,
