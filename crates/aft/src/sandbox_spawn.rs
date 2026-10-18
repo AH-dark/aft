@@ -2861,7 +2861,9 @@ thread_local! {
 fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     #[cfg(test)]
     GIT_POLICY_CALLS.with(|count| count.set(count.get() + 1));
-    let mut command = crate::effective_path::new_command("git");
+    let command = crate::effective_path::new_command("git");
+    #[cfg(test)]
+    let mut command = command;
     #[cfg(test)]
     if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
         command.env("PATH", crate::effective_path::effective_path());
@@ -2877,6 +2879,14 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
             command.envs(environment.iter().cloned());
         }
     });
+    #[cfg(test)]
+    let mut command = if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
+        command.build_unresolved()
+    } else {
+        command.build()
+    };
+    #[cfg(not(test))]
+    let mut command = command.build();
     command.arg("-C").arg(project_root).args(args).output()
 }
 
@@ -4284,7 +4294,8 @@ pub(crate) fn detached_command_for_plan(
         task_marker,
         Some((exit_fd, failure_fd)),
     )?;
-    let mut command = crate::effective_path::new_command(program);
+    // Session setup requires pre_exec, so execvp can resolve the final child PATH.
+    let mut command = crate::effective_path::new_command(program).build_unresolved();
     command.args(args);
     crate::bash_background::process::start_new_session(&mut command);
     Ok((command, profile_handle))
@@ -4596,7 +4607,8 @@ pub(crate) fn probe_command_for_plan(
 ) -> Result<Command, String> {
     let (program, args, _profile_handle) =
         command_argv_for_plan(plan, program, args, Path::new(""), None)?;
-    let mut command = crate::effective_path::new_command(program);
+    // Session setup requires pre_exec, so execvp can resolve the final child PATH.
+    let mut command = crate::effective_path::new_command(program).build_unresolved();
     command.args(args).current_dir(cwd);
     crate::agent_child_env::apply_to_command(&mut command, env);
     apply_sandbox_environment(plan, &mut command, env);
@@ -5902,6 +5914,7 @@ mod git_policy_cache_tests {
                 if old {
                     command.env("PATH", crate::effective_path::effective_path());
                 }
+                let mut command = command.build();
                 command.args(["-c", "true"]);
                 crate::bash_background::process::start_new_session(&mut command);
                 apply_marker_fd_allowlist(&mut command, marker.as_raw_fd(), marker.as_raw_fd())

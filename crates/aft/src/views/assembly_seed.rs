@@ -97,6 +97,7 @@ pub(super) fn sibling_checkout_seed(
 /// Every worktree of the repository `root` belongs to, main worktree first.
 pub(in crate::views) fn worktree_roots(root: &Path) -> Option<Vec<PathBuf>> {
     let child = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(root)
         .args(["worktree", "list", "--porcelain", "-z"])

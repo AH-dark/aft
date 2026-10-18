@@ -312,6 +312,7 @@ fn find_git_toplevel(path: &Path) -> Result<Option<PathBuf>, ScopedKeyError> {
         return Ok(None);
     }
     let output = crate::effective_path::new_command("git")
+        .build()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--show-toplevel"])

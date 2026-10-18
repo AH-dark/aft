@@ -3151,6 +3151,7 @@ fn origin_remote(cwd: &Path) -> Option<String> {
         return None;
     }
     let output = crate::effective_path::new_command("git")
+        .build()
         .current_dir(cwd)
         .args(["remote", "get-url", "origin"])
         .output()

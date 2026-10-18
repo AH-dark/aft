@@ -11,6 +11,10 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::collections::HashSet;
 #[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
@@ -112,31 +116,200 @@ pub fn log_startup_probe_result() {
     }
 }
 
-/// Create a new `Command` with the effective PATH set on Unix.
+/// Configure the child environment before resolving its executable with [`CommandBuilder::build`].
 #[cfg(unix)]
-pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
+pub fn new_command<S: AsRef<OsStr>>(program: S) -> CommandBuilder {
     command_with_path(program.as_ref(), effective_path())
 }
 
 #[cfg(unix)]
-fn command_with_path(program: &OsStr, path: &OsStr) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
+fn command_with_path(program: &OsStr, path: &OsStr) -> CommandBuilder {
+    let mut builder = CommandBuilder::new(program);
     // Startup exports the effective PATH before threads start. Reapplying even
     // the same value marks PATH as changed in Rust's Command and disables
     // posix_spawn for bare executable names, forcing a costly daemon fork.
-    // Library callers that have not initialized process PATH still need the
-    // override to preserve executable lookup and the child's environment.
     if std::env::var_os("PATH").as_deref() != Some(path) {
-        cmd.env("PATH", path);
+        builder.env("PATH", path);
     }
-    cmd
+    builder
+}
+
+/// The environment-only construction phase of a child command.
+///
+/// Apply all environment overrides here, then call [`Self::build`] before
+/// configuring arguments, working directory, I/O, or process-group settings.
+/// Resolving sooner would ignore a configured PATH that selects another tool.
+pub struct CommandBuilder {
+    environment: std::process::Command,
+    clear_environment: bool,
+}
+
+impl CommandBuilder {
+    fn new(program: &OsStr) -> Self {
+        Self {
+            environment: std::process::Command::new(program),
+            clear_environment: false,
+        }
+    }
+
+    pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, value: V) -> &mut Self {
+        self.environment.env(key, value);
+        self
+    }
+
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.environment.envs(vars);
+        self
+    }
+
+    pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+        self.environment.env_remove(key);
+        self
+    }
+
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.environment.env_clear();
+        self.clear_environment = true;
+        self
+    }
+
+    /// Finish environment configuration and resolve against the final child PATH.
+    /// Only non-environment command settings should be applied after this point.
+    pub fn build(&self) -> std::process::Command {
+        let program = self.environment.get_program();
+        // An absolute executable lets std use posix_spawn even with a changed
+        // PATH; a bare name would require fork+exec to search the child PATH.
+        #[cfg(unix)]
+        let resolved = self
+            .environment
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, path)| path)
+            .and_then(|path| resolve_in_path(program, path));
+        #[cfg(unix)]
+        let mut command = match resolved {
+            Some(resolved) => {
+                let mut command = std::process::Command::new(resolved);
+                command.arg0(program);
+                command
+            }
+            // Inherited PATH needs no pre-resolution. A removed PATH must use
+            // execvp's platform default, not AFT's effective PATH. Relative or
+            // empty entries likewise need lookup in the child's working directory.
+            None => std::process::Command::new(program),
+        };
+        #[cfg(not(unix))]
+        let mut command = std::process::Command::new(program);
+        if self.clear_environment {
+            command.env_clear();
+        }
+        for (key, value) in self.environment.get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command
+    }
+
+    /// Leave lookup to execvp when a mandatory pre_exec hook requires fork anyway.
+    /// The returned command may still receive environment changes before spawning.
+    #[cfg(unix)]
+    pub(crate) fn build_unresolved(self) -> std::process::Command {
+        self.environment
+    }
+}
+
+/// Find `program` in `path`, skipping executable scripts whose interpreter is
+/// known to be unavailable. Returns `None`, leaving lookup to the child, for
+/// names that are already paths and for a PATH with an empty or relative entry,
+/// because those entries resolve against the child's working directory.
+///
+/// Apple's `exec(3)` continues PATH search after `ENOENT`, `ENOTDIR`, and
+/// `EACCES`; glibc's `posix/execvpe.c` also skips `ESTALE`, `ENODEV`, and
+/// `ETIMEDOUT`. This preflight recognizes only deterministic missing or
+/// non-executable interpreter cases; later spawn failures are returned as-is.
+#[cfg(unix)]
+fn resolve_in_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    if program.is_empty() || program.as_bytes().contains(&b'/') {
+        return None;
+    }
+    if !std::env::split_paths(path).all(|directory| directory.is_absolute()) {
+        return None;
+    }
+    std::env::split_paths(path).find_map(|directory| {
+        let candidate = directory.join(program);
+        (executable_file(&candidate) && script_interpreter_is_available(&candidate))
+            .then_some(candidate)
+    })
+}
+
+#[cfg(unix)]
+fn executable_file(path: &Path) -> bool {
+    let Ok(text) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        // SAFETY: `text` is a valid NUL-terminated path for the call.
+        && unsafe { libc::access(text.as_ptr(), libc::X_OK) } == 0
+}
+
+#[cfg(unix)]
+fn script_interpreter_is_available(script: &Path) -> bool {
+    const SHEBANG_LIMIT: usize = 256;
+
+    let Ok(mut file) = File::open(script) else {
+        return true;
+    };
+    let mut bytes = [0_u8; SHEBANG_LIMIT];
+    let mut length = 0;
+    while length < bytes.len() {
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(_) => return true,
+        }
+    }
+    if length < 2 || &bytes[..2] != b"#!" {
+        return true;
+    }
+    // A truncated, unterminated first line cannot be parsed reliably; let the
+    // kernel decide whether this script is executable.
+    let first_line = &bytes[2..length];
+    let line_end = first_line
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(first_line.len());
+    let complete_line = length < bytes.len() || line_end < first_line.len();
+    if !complete_line && !first_line.iter().any(|byte| byte.is_ascii_whitespace()) {
+        return true;
+    }
+    let mut words = first_line[..line_end]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|word| !word.is_empty());
+    let Some(interpreter) = words.next() else {
+        return true;
+    };
+    let interpreter = Path::new(OsStr::from_bytes(interpreter));
+    if !interpreter.is_absolute() {
+        return true;
+    }
+    if !executable_file(interpreter) {
+        return false;
+    }
+    true
 }
 
 /// On Windows the process PATH is already correct (registry-backed
 /// environment block); pass through without touching the child env.
 #[cfg(not(unix))]
-pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
-    std::process::Command::new(program)
+pub fn new_command<S: AsRef<OsStr>>(program: S) -> CommandBuilder {
+    CommandBuilder::new(program.as_ref())
 }
 
 /// Return the cached PATH that subprocesses should inherit.
@@ -776,13 +949,48 @@ fn reap_child_in_background(mut child: Child) {
         });
 }
 
+/// Test seam that tells which spawn mechanism std used for a `Command`.
+///
+/// A `pthread_atfork` prepare handler counts fork() calls made by the current
+/// thread. std's fork+exec fallback calls libc `fork`, which runs the handler;
+/// its `posix_spawn` path (a syscall on macOS, a CLONE_VFORK clone on glibc)
+/// does not. The count is per thread, so parallel tests that fork do not
+/// disturb each other.
+#[cfg(all(test, unix))]
+pub(crate) mod fork_counter {
+    use std::cell::Cell;
+    use std::sync::Once;
+
+    thread_local! {
+        static FORKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    extern "C" fn count_fork() {
+        FORKS.with(|forks| forks.set(forks.get() + 1));
+    }
+
+    /// Run `body` and return its result with the number of forks this thread
+    /// made meanwhile.
+    pub(crate) fn forks_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| {
+            // SAFETY: the handler only touches a const-initialized thread-local.
+            let rc = unsafe { libc::pthread_atfork(Some(count_fork), None, None) };
+            assert_eq!(rc, 0, "pthread_atfork failed");
+        });
+        let before = FORKS.with(Cell::get);
+        let value = body();
+        (value, FORKS.with(Cell::get) - before)
+    }
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
     #[test]
     fn helpers_do_not_override_inherited_path() {
         let path = std::env::var_os("PATH").unwrap();
-        let command = super::command_with_path(std::ffi::OsStr::new("git"), &path);
+        let command = super::command_with_path(std::ffi::OsStr::new("git"), &path).build();
         assert!(
             !command.get_envs().any(|(key, _)| key == "PATH"),
             "an explicit PATH, even unchanged, forces Rust's macOS Command to fork"
@@ -792,10 +1000,229 @@ mod tests {
     #[test]
     fn helpers_preserve_distinct_effective_path() {
         let path = std::ffi::OsStr::new("/aft-test-distinct-path");
-        let command = super::command_with_path(std::ffi::OsStr::new("git"), path);
+        let command = super::command_with_path(std::ffi::OsStr::new("git"), path).build();
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "PATH" && value == Some(path)));
+    }
+
+    #[test]
+    fn path_set_after_construction_selects_the_child_cargo() {
+        let effective_tools = tempfile::tempdir().unwrap();
+        let child_tools = tempfile::tempdir().unwrap();
+        write_executable_shim(
+            &effective_tools.path().join("cargo"),
+            "#!/bin/sh\nprintf 'effective-path cargo'\n",
+        );
+        write_executable_shim(
+            &child_tools.path().join("cargo"),
+            "#!/bin/sh\nprintf 'configured cargo:%s' \"$PATH\"\n",
+        );
+        let mut command =
+            command_with_path(OsStr::new("cargo"), effective_tools.path().as_os_str());
+        command.env("PATH", child_tools.path());
+
+        let (output, forks) = fork_counter::forks_during(|| command.build().output().unwrap());
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("configured cargo:{}", child_tools.path().display())
+        );
+        assert_eq!(forks, 0, "configured PATH forced a fork+exec spawn");
+    }
+
+    #[test]
+    fn path_removed_after_construction_uses_execvp_default() {
+        let tools = tempfile::tempdir().unwrap();
+        write_executable_shim(
+            &tools.path().join("sh"),
+            "#!/bin/sh\nprintf 'effective-path shell'\n",
+        );
+        let mut command = command_with_path(OsStr::new("sh"), tools.path().as_os_str());
+        command.env_remove("PATH");
+
+        let output = command
+            .build()
+            .args(["-c", "printf 'default-path shell'"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "default-path shell"
+        );
+    }
+
+    #[test]
+    fn environment_cleared_after_construction_uses_execvp_default() {
+        let tools = tempfile::tempdir().unwrap();
+        write_executable_shim(
+            &tools.path().join("sh"),
+            "#!/bin/sh\nprintf 'effective-path shell'\n",
+        );
+        let mut command = command_with_path(OsStr::new("sh"), tools.path().as_os_str());
+        command.env_clear();
+
+        let output = command
+            .build()
+            .args(["-c", "printf 'default-path shell'"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "default-path shell"
+        );
+    }
+
+    #[test]
+    fn configured_relative_path_uses_the_child_working_directory() {
+        let effective_tools = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        fs::create_dir(workdir.path().join("bin")).unwrap();
+        write_executable_shim(
+            &effective_tools.path().join("cargo"),
+            "#!/bin/sh\nprintf 'effective-path cargo'\n",
+        );
+        write_executable_shim(
+            &workdir.path().join("bin/cargo"),
+            "#!/bin/sh\nprintf 'relative-path cargo'\n",
+        );
+        for path in ["bin", ":bin", "bin:"] {
+            let output = command_with_path(OsStr::new("cargo"), effective_tools.path().as_os_str())
+                .env("PATH", path)
+                .build()
+                .current_dir(workdir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{path}: {output:?}");
+            assert_eq!(output.stdout, b"relative-path cargo", "{path}");
+        }
+    }
+
+    /// A PATH that differs from the process PATH must not push bare-name
+    /// helpers (git above all) onto std's fork+exec fallback, and the child
+    /// must still find the tool on, and inherit, that PATH.
+    #[test]
+    fn distinct_effective_path_spawns_bare_names_without_fork() {
+        let tools = tempfile::tempdir().unwrap();
+        let tool = tools.path().join("aft-path-probe-tool");
+        fs::write(&tool, "#!/bin/sh\nprintf '%s' \"$PATH\"\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let path =
+            std::env::join_paths([tools.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
+
+        let workdir = tempfile::tempdir().unwrap();
+        let (output, forks) = fork_counter::forks_during(|| {
+            let mut command = command_with_path(OsStr::new("aft-path-probe-tool"), &path).build();
+            command.current_dir(workdir.path()).output().unwrap()
+        });
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            path.as_bytes(),
+            "child keeps the effective PATH"
+        );
+        assert_eq!(
+            forks, 0,
+            "bare-name spawn under a distinct PATH used fork+exec"
+        );
+
+        // The fork counter must see the fork of a pre_exec spawn; otherwise the
+        // zero forks asserted above would not show that posix_spawn was used.
+        let (_, control) = fork_counter::forks_during(|| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            // SAFETY: the closure does nothing.
+            unsafe { command.pre_exec(|| Ok(())) };
+            command.status().unwrap()
+        });
+        assert_eq!(control, 1, "fork counter missed a pre_exec spawn");
+    }
+
+    #[test]
+    fn path_resolution_defers_relative_entries_and_paths_to_the_child() {
+        let tools = tempfile::tempdir().unwrap();
+        let tool = tools.path().join("aft-path-probe-tool");
+        fs::write(&tool, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let absolute = std::env::join_paths([tools.path()]).unwrap();
+        assert_eq!(
+            resolve_in_path(OsStr::new("aft-path-probe-tool"), &absolute),
+            Some(tool.clone())
+        );
+        let with_relative = std::env::join_paths([Path::new("bin"), tools.path()]).unwrap();
+        assert_eq!(
+            resolve_in_path(OsStr::new("aft-path-probe-tool"), &with_relative),
+            None
+        );
+        assert_eq!(resolve_in_path(tool.as_os_str(), &absolute), None);
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            resolve_in_path(OsStr::new("aft-path-probe-tool"), &absolute),
+            None,
+            "a non-executable entry is skipped, as execvp would"
+        );
+    }
+
+    #[test]
+    fn distinct_effective_path_skips_a_script_with_a_missing_interpreter() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let name = "aft-path-probe-tool";
+        write_executable_shim(
+            &first.path().join(name),
+            "#!/aft-test-missing-interpreter\nprintf 'wrong first candidate'\n",
+        );
+        write_executable_shim(
+            &second.path().join(name),
+            "#!/bin/sh\nprintf 'later candidate ran'\n",
+        );
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
+
+        let output = command_with_path(OsStr::new(name), &path)
+            .build()
+            .output()
+            .expect("run the later executable after the broken script");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"later candidate ran");
+    }
+
+    #[test]
+    fn distinct_effective_path_preserves_env_script_execvp_behavior() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let name = "aft-path-probe-env-tool";
+        let missing = format!("aft-env-target-missing-{}", std::process::id());
+        write_executable_shim(
+            &first.path().join(name),
+            &format!("#!/usr/bin/env {missing}\nprintf 'wrong first candidate'\n"),
+        );
+        write_executable_shim(
+            &second.path().join(name),
+            "#!/bin/sh\nprintf 'later candidate ran'\n",
+        );
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
+
+        let output = command_with_path(OsStr::new(name), &path)
+            .build()
+            .output()
+            .expect("the first candidate's env interpreter can start");
+        let shell_output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(name)
+            .env("PATH", &path)
+            .output()
+            .expect("run the same bare name through shell PATH lookup");
+
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+        assert_eq!(shell_output.status.code(), Some(127), "{shell_output:?}");
+        assert_eq!(output.stdout, shell_output.stdout);
+        assert_eq!(output.stderr, shell_output.stderr);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&missing));
     }
 
     use super::*;

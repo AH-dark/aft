@@ -911,19 +911,10 @@ impl LspClient {
         if !is_batch_file {
             command.args(args);
         }
-        #[cfg(not(windows))]
-        command.args(args);
-        command
-            .current_dir(&root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Drain stderr on a background thread so failed shims/crashes have
-            // actionable diagnostics without risking pipe-buffer deadlock.
-            .stderr(Stdio::piped())
-            // Git status may run in server descendants such as build scripts.
-            // Disable its optional index lock so killing a check cannot leave
-            // a stale lock behind; per-server env entries below may override it.
-            .env("GIT_OPTIONAL_LOCKS", "0");
+        // Git status may run in server descendants such as build scripts.
+        // Disable its optional index lock so killing a check cannot leave
+        // a stale lock behind; per-server env entries below may override it.
+        command.env("GIT_OPTIONAL_LOCKS", "0");
         for (key, value) in env {
             #[cfg(windows)]
             if is_batch_file && crate::windows_command::is_batch_internal_env(key, args.len()) {
@@ -934,6 +925,17 @@ impl LspClient {
             }
             command.env(key, value);
         }
+        #[cfg(not(windows))]
+        let mut command = command.build();
+        #[cfg(not(windows))]
+        command.args(args);
+        command
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Drain stderr on a background thread so failed shims/crashes have
+            // actionable diagnostics without risking pipe-buffer deadlock.
+            .stderr(Stdio::piped());
 
         // Put each LSP child in its own process group so we can SIGKILL the
         // whole group on shutdown. Critical for npm-wrapped servers like

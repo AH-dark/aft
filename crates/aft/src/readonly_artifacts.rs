@@ -514,6 +514,7 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
         return Err("not_a_git_root".to_string());
     }
     let output = crate::effective_path::new_command("git")
+        .build()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base_dir)
         .output()

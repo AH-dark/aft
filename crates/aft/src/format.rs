@@ -100,18 +100,18 @@ impl std::fmt::Display for FormatError {
 /// Without this, killing the immediate child (`sh`) leaves `sleep`
 /// holding stdout/stderr pipes open, and the reader threads block
 /// until `sleep` terminates — turning a 2s timeout into a 60s hang.
+///
+/// The child leads a new process group whose id is its pid, which is all
+/// `kill_process_tree` needs for `killpg`. Use `process_group(0)`, never a
+/// `pre_exec` closure (such as a `setsid` call): std turns `process_group`
+/// into a `posix_spawn` attribute, while any `pre_exec` closure forces the
+/// fork+exec fallback. On macOS a fork of the large, many-threaded daemon
+/// takes every malloc zone lock, so every formatter run on an edit would
+/// stall allocation across the whole process.
 #[cfg(unix)]
 pub(crate) fn isolate_in_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: setsid is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    cmd.process_group(0);
 }
 
 #[cfg(not(unix))]
@@ -166,7 +166,7 @@ fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, Format
         });
     }
 
-    let mut cmd = crate::effective_path::new_command(command);
+    let mut cmd = crate::effective_path::new_command(command).build();
     cmd.args(args);
     Ok(cmd)
 }
@@ -2986,6 +2986,144 @@ mod tests {
             }
             other => panic!("expected NotFound, got: {:?}", other),
         }
+    }
+
+    /// Formatters and checkers run on every edit. Their spawn must stay on
+    /// std's posix_spawn path: a fork of the multi-GiB daemon on macOS takes
+    /// every malloc zone lock. Any `pre_exec` closure in the builder (for
+    /// example one that calls `setsid`) silently brings the fork back.
+    #[cfg(unix)]
+    #[test]
+    fn external_tools_spawn_without_fork() {
+        let workdir = tempfile::tempdir().unwrap();
+        let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
+            run_external_tool("/bin/sh", &["-c", "pwd"], Some(workdir.path()), 30)
+        });
+        let result = result.unwrap();
+        let expected = std::fs::canonicalize(workdir.path()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(result.stdout.trim()).unwrap(),
+            expected,
+            "the tool runs in the requested directory"
+        );
+        assert_eq!(forks, 0, "run_external_tool used fork+exec");
+
+        let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
+            run_external_tool_capture("/bin/sh", &["-c", "exit 3"], Some(workdir.path()), 30)
+        });
+        assert_eq!(result.unwrap().exit_code, 3);
+        assert_eq!(forks, 0, "run_external_tool_capture used fork+exec");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn process_state_for_test(pid: u32) -> String {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("read process state with ps");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "ps failed: {output:?}"
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_state_for_test(pid: u32) -> String {
+        // Sandboxed macOS tests cannot spawn the setuid ps binary. A nonzero
+        // PROC_PIDTBSDINFO argument includes zombies in the native lookup.
+        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer points to a proc_bsdinfo with its exact size.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read == size {
+            // SAFETY: the successful full-size query initialized the structure.
+            let info = unsafe { info.assume_init() };
+            return if info.pbi_status == libc::SZOMB {
+                "Z".to_string()
+            } else {
+                info.pbi_status.to_string()
+            };
+        }
+        let query_error = std::io::Error::last_os_error();
+        // A failed query is not proof of exit; only ESRCH confirms absence.
+        // SAFETY: signal zero checks existence without signalling the process.
+        let absent = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        assert!(absent, "proc_pidinfo({pid}) returned {read}: {query_error}");
+        String::new()
+    }
+
+    #[cfg(unix)]
+    fn process_is_running_for_test(pid: u32) -> bool {
+        // kill(pid, 0) also succeeds for exited processes awaiting reaping.
+        // Container PID 1 may leave those zombies around indefinitely.
+        let state = process_state_for_test(pid);
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_is_running_excludes_unreaped_zombies() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = process_state_for_test(pid);
+        while !state.starts_with('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            state = process_state_for_test(pid);
+        }
+        let running = process_is_running_for_test(pid);
+        child.wait().unwrap();
+        assert!(
+            state.starts_with('Z'),
+            "expected an unreaped zombie, got {state:?}"
+        );
+        assert!(!running, "an unreaped zombie is not running");
+        assert!(
+            !process_is_running_for_test(pid),
+            "a reaped child is not running"
+        );
+    }
+
+    /// The timeout kill reaches the tool's own children through its process
+    /// group, so a grandchild cannot keep the output pipes open.
+    #[cfg(unix)]
+    #[test]
+    fn run_external_tool_timeout_kills_grandchildren() {
+        let workdir = tempfile::tempdir().unwrap();
+        let pid_file = workdir.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let result = run_external_tool("/bin/sh", &["-c", &script], None, 1);
+        assert!(
+            matches!(result, Err(FormatError::Timeout { .. })),
+            "{result:?}"
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_running_for_test(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_is_running_for_test(pid),
+            "grandchild {pid} survived the timeout kill"
+        );
     }
 
     #[test]
