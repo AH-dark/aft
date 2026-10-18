@@ -11,6 +11,10 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::collections::HashSet;
 #[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
@@ -134,6 +138,10 @@ fn command_with_path(program: &OsStr, path: &OsStr) -> std::process::Command {
     // lookup itself on the fork+exec path (execvp after installing the new
     // environment), so resolve the bare name here, against the same PATH, and
     // spawn the absolute path. argv[0] keeps the bare name, as execvp would.
+    // This preflight can skip deterministic script-interpreter failures before
+    // constructing a posix_spawn command. A race or another failure after the
+    // check still comes back from spawn: retrying then would require a custom
+    // spawn API for every caller of this Command-returning helper.
     let mut cmd = match resolve_in_path(program, path) {
         Some(resolved) => {
             let mut cmd = std::process::Command::new(resolved);
@@ -146,28 +154,112 @@ fn command_with_path(program: &OsStr, path: &OsStr) -> std::process::Command {
     cmd
 }
 
-/// Find `program` the way execvp would search `path`: the first directory
-/// holding an entry this process may execute. Returns `None`, leaving the
-/// lookup to the child, for names that are already paths, and for a PATH with
-/// an empty or relative entry, because execvp resolves those against the
-/// child's working directory, which may differ from ours.
+/// Find `program` in `path`, skipping executable scripts whose interpreter is
+/// known to be unavailable. Returns `None`, leaving lookup to the child, for
+/// names that are already paths and for a PATH with an empty or relative entry,
+/// because those entries resolve against the child's working directory.
+///
+/// Apple's `exec(3)` continues PATH search after `ENOENT`, `ENOTDIR`, and
+/// `EACCES`; glibc's `posix/execvpe.c` also skips `ESTALE`, `ENODEV`, and
+/// `ETIMEDOUT`. This preflight recognizes only deterministic missing or
+/// non-executable interpreter cases; later spawn failures are returned as-is.
 #[cfg(unix)]
 fn resolve_in_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
     if program.is_empty() || program.as_bytes().contains(&b'/') {
         return None;
     }
-    let directories = std::env::split_paths(path).collect::<Vec<_>>();
-    if directories.iter().any(|directory| !directory.is_absolute()) {
+    if !std::env::split_paths(path).all(|directory| directory.is_absolute()) {
         return None;
     }
-    directories.into_iter().find_map(|directory| {
+    std::env::split_paths(path).find_map(|directory| {
         let candidate = directory.join(program);
-        let text = std::ffi::CString::new(candidate.as_os_str().as_bytes()).ok()?;
-        let executable_file = std::fs::metadata(&candidate).is_ok_and(|meta| meta.is_file())
-            // SAFETY: `text` is a valid NUL-terminated path for the call.
-            && unsafe { libc::access(text.as_ptr(), libc::X_OK) } == 0;
-        executable_file.then_some(candidate)
+        (executable_file(&candidate) && script_interpreter_is_available(&candidate, path))
+            .then_some(candidate)
     })
+}
+
+#[cfg(unix)]
+fn executable_file(path: &Path) -> bool {
+    let Ok(text) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        // SAFETY: `text` is a valid NUL-terminated path for the call.
+        && unsafe { libc::access(text.as_ptr(), libc::X_OK) } == 0
+}
+
+#[cfg(unix)]
+fn script_interpreter_is_available(script: &Path, path: &OsStr) -> bool {
+    const SHEBANG_LIMIT: usize = 256;
+
+    let Ok(mut file) = File::open(script) else {
+        return true;
+    };
+    let mut bytes = [0_u8; SHEBANG_LIMIT];
+    let mut length = 0;
+    while length < bytes.len() {
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(_) => return true,
+        }
+    }
+    if length < 2 || &bytes[..2] != b"#!" {
+        return true;
+    }
+    // A truncated, unterminated first line cannot be parsed reliably; let the
+    // kernel decide whether this script is executable.
+    let first_line = &bytes[2..length];
+    let line_end = first_line
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(first_line.len());
+    let complete_line = length < bytes.len() || line_end < first_line.len();
+    if !complete_line && !first_line.iter().any(|byte| byte.is_ascii_whitespace()) {
+        return true;
+    }
+    let mut words = first_line[..line_end]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|word| !word.is_empty());
+    let Some(interpreter) = words.next() else {
+        return true;
+    };
+    let interpreter = Path::new(OsStr::from_bytes(interpreter));
+    if !interpreter.is_absolute() {
+        return true;
+    }
+    if !executable_file(interpreter) {
+        return false;
+    }
+
+    // `/usr/bin/env NAME` starts env successfully even when NAME is absent, so
+    // check that bare tool against the same effective PATH before choosing the
+    // script. Other env option forms are left to the kernel and env itself.
+    if interpreter == Path::new("/usr/bin/env") && complete_line {
+        if let Some(name) = words.next() {
+            let has_extra_words = words.next().is_some();
+            if !has_extra_words
+                && !name.starts_with(b"-")
+                && !name.contains(&b'=')
+                && !name.contains(&b'/')
+                && !executable_named_in_path(OsStr::from_bytes(name), path)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn executable_named_in_path(program: &OsStr, path: &OsStr) -> bool {
+    if program.is_empty() || program.as_bytes().contains(&b'/') {
+        return false;
+    }
+    if !std::env::split_paths(path).all(|directory| directory.is_absolute()) {
+        return false;
+    }
+    std::env::split_paths(path).any(|directory| executable_file(&directory.join(program)))
 }
 
 /// On Windows the process PATH is already correct (registry-backed
@@ -935,6 +1027,53 @@ mod tests {
             None,
             "a non-executable entry is skipped, as execvp would"
         );
+    }
+
+    #[test]
+    fn distinct_effective_path_skips_a_script_with_a_missing_interpreter() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let name = "aft-path-probe-tool";
+        write_executable_shim(
+            &first.path().join(name),
+            "#!/aft-test-missing-interpreter\nprintf 'wrong first candidate'\n",
+        );
+        write_executable_shim(
+            &second.path().join(name),
+            "#!/bin/sh\nprintf 'later candidate ran'\n",
+        );
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
+
+        let output = command_with_path(OsStr::new(name), &path)
+            .output()
+            .expect("run the later executable after the broken script");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"later candidate ran");
+    }
+
+    #[test]
+    fn distinct_effective_path_skips_env_script_with_a_missing_tool() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let name = "aft-path-probe-env-tool";
+        let missing = format!("aft-env-target-missing-{}", std::process::id());
+        write_executable_shim(
+            &first.path().join(name),
+            &format!("#!/usr/bin/env {missing}\nprintf 'wrong first candidate'\n"),
+        );
+        write_executable_shim(
+            &second.path().join(name),
+            "#!/bin/sh\nprintf 'later candidate ran'\n",
+        );
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
+
+        let output = command_with_path(OsStr::new(name), &path)
+            .output()
+            .expect("the env executable itself can start");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"later candidate ran");
     }
 
     use super::*;

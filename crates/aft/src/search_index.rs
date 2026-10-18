@@ -7310,12 +7310,12 @@ fn cached_root_commit(project_root: &Path, stamp: &RootCommitStamp) -> Option<St
 /// The repository state that decides `git rev-list --max-parents=0 HEAD`.
 ///
 /// History is immutable, so the root set changes only when HEAD names another
-/// commit or the history view changes. HEAD and the loose ref it points to are
-/// kept by content (the commit id itself); packed refs, shallow boundaries,
-/// grafts and replace refs by file identity. Anything this does not model
-/// (environment overrides of the repository location or history view, a
-/// `.git` file it cannot follow, or a symlink among the watched paths) makes
-/// `capture` return `None`, and the caller then asks git on every lookup.
+/// commit or the history view changes. HEAD, its loose branch ref, the local
+/// config, and loose replace-ref contents are kept by content; packed refs,
+/// shallow boundaries, grafts and the replace-ref directory use file identity.
+/// Config includes and unmodeled Git environment overrides make `capture`
+/// decline caching, so Git is asked on every lookup instead of serving a stale
+/// root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RootCommitStamp {
     git_marker: Option<RootCommitFileIdentity>,
@@ -7323,6 +7323,8 @@ struct RootCommitStamp {
     commondir_text: Option<Vec<u8>>,
     head: Vec<u8>,
     head_ref: Option<Vec<u8>>,
+    config_contents: Vec<Option<Vec<u8>>>,
+    replace_ref_contents: Vec<(PathBuf, Vec<u8>)>,
     watched: Vec<Option<RootCommitFileIdentity>>,
 }
 
@@ -7452,15 +7454,42 @@ impl RootCommitStamp {
             }
             None => None,
         };
-        let mut watched = Vec::new();
+        let mut config_paths = vec![common_dir.join("config")];
+        let worktree_config = git_dir.join("config.worktree");
+        if !config_paths.contains(&worktree_config) {
+            config_paths.push(worktree_config);
+        }
+        let mut config_contents = Vec::with_capacity(config_paths.len());
+        let mut watched = Vec::with_capacity(config_paths.len() + 4);
+        for path in config_paths {
+            let identity = RootCommitFileIdentity::of(&path, false)?;
+            let contents = match fs::read(&path) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return None,
+            };
+            // Git can include configuration from outside the repository. Its
+            // contents would affect replace-ref handling without being covered
+            // by this stamp, so conservatively disable caching for includes.
+            if contents
+                .as_deref()
+                .is_some_and(config_may_include_external_files)
+            {
+                return None;
+            }
+            config_contents.push(contents);
+            watched.push(identity);
+        }
+        let replace_dir = common_dir.join("refs").join("replace");
+        let replace_ref_contents = read_loose_replace_refs(&replace_dir)?;
         for path in [
             common_dir.join("packed-refs"),
             common_dir.join("shallow"),
             common_dir.join("info").join("grafts"),
-            common_dir.join("refs").join("replace"),
+            replace_dir,
         ] {
-            // `refs/replace` holds one file per replacement, so its entry
-            // list is exactly what matters there.
+            // The directory catches additions and removals; each loose ref's
+            // bytes above catch retargeting an existing replacement.
             watched.push(RootCommitFileIdentity::of(&path, true)?);
         }
         Some(Self {
@@ -7469,9 +7498,41 @@ impl RootCommitStamp {
             commondir_text,
             head,
             head_ref,
+            config_contents,
+            replace_ref_contents,
             watched,
         })
     }
+}
+
+fn config_may_include_external_files(contents: &[u8]) -> bool {
+    // Config section names are case-insensitive. Matching this token anywhere
+    // may reject harmless text in comments or values, but cannot miss an
+    // include directive whose source would not otherwise be stamped.
+    contents
+        .windows(b"include".len())
+        .any(|window| window.eq_ignore_ascii_case(b"include"))
+}
+
+fn read_loose_replace_refs(directory: &Path) -> Option<Vec<(PathBuf, Vec<u8>)>> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        _ => return None,
+    }
+
+    let mut replace_refs = Vec::new();
+    for entry in fs::read_dir(directory).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        replace_refs.push((PathBuf::from(entry.file_name()), fs::read(path).ok()?));
+    }
+    replace_refs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Some(replace_refs)
 }
 
 #[cfg(test)]
@@ -10961,6 +11022,143 @@ mod tests {
             RootCommitResolution::Commit(commit) if commit == first));
         assert_eq!(root_commit_git_runs_for_test(&root), 2);
         let _ = repo_root_commit_with_retry(&root);
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+    }
+
+    #[test]
+    fn root_commit_cache_tracks_replace_ref_configuration() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| root_commit_test_git(&root, args);
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "original root"]);
+        let original_root = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "child"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        git(&["checkout", "--quiet", "--orphan", "replacement"]);
+        git(&[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "replacement root",
+        ]);
+        let replacement = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--quiet", "--detach", &head]);
+        git(&["replace", &head, &replacement]);
+        git(&["config", "core.useReplaceRefs", "false"]);
+
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == original_root));
+        assert_eq!(root_commit_git_runs_for_test(&root), 1);
+
+        // The replacement makes HEAD a root only when Git honors replace refs.
+        git(&["config", "core.useReplaceRefs", "true"]);
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == head));
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == head));
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+    }
+
+    #[test]
+    fn root_commit_cache_bypasses_an_external_config_include() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let external_config_dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let external_config = external_config_dir.path().join("included.gitconfig");
+        let external_config_arg = external_config.to_str().unwrap();
+        let git = |args: &[&str]| root_commit_test_git(&root, args);
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "original root"]);
+        let original_root = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "child"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        git(&["checkout", "--quiet", "--orphan", "replacement"]);
+        git(&[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "replacement root",
+        ]);
+        let replacement = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--quiet", "--detach", &head]);
+        git(&["replace", &head, &replacement]);
+        git(&["config", "--local", "include.path", external_config_arg]);
+        let set_external_setting = |value: &str| {
+            let output = git_command_for_test(&root)
+                .args([
+                    "config",
+                    "--file",
+                    external_config_arg,
+                    "core.useReplaceRefs",
+                    value,
+                ])
+                .output()
+                .expect("run git config for the included file");
+            assert!(output.status.success(), "{output:?}");
+        };
+
+        set_external_setting("false");
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == original_root));
+        assert_eq!(root_commit_git_runs_for_test(&root), 1);
+
+        set_external_setting("true");
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == head));
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+    }
+
+    #[test]
+    fn root_commit_cache_tracks_retargeted_loose_replace_refs() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| root_commit_test_git(&root, args);
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "original root"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "original child"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        git(&["checkout", "--quiet", "--orphan", "replacement"]);
+        git(&[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "replacement root",
+        ]);
+        let replacement_root = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "replacement child",
+        ]);
+        let replacement_child = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--quiet", "--detach", &head]);
+        git(&["replace", &head, &replacement_root]);
+
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == head));
+        assert_eq!(root_commit_git_runs_for_test(&root), 1);
+
+        // Retargeting this same loose ref changes its bytes, not the directory entries.
+        let replace_ref = root.join(".git/refs/replace").join(&head);
+        fs::write(&replace_ref, format!("{replacement_child}\n")).unwrap();
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == replacement_root));
         assert_eq!(root_commit_git_runs_for_test(&root), 2);
     }
 
