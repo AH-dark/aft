@@ -105,5 +105,27 @@ class CpuPrecisionTests(unittest.TestCase):
         self.assertIn("CPU measurement gap: /proc/<pid>/stat unavailable during sampling", sampler.gaps)
 
 
+
+class BaselineProvenanceTests(unittest.TestCase):
+    """A blessed baseline must say where it was measured."""
+
+    def test_github_run_records_run_image_and_commit(self):
+        env = {
+            "GITHUB_RUN_ID": "39088711411",
+            "GITHUB_WORKFLOW": "OSS index cost gate",
+            "ImageOS": "ubuntu24",
+            "ImageVersion": "20261012.334.1",
+            "GITHUB_SHA": "44f7009c9460ea83fa6bc4d2920d8a1e6367ff8c",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            provenance = gate.write_baseline_provenance()
+        for part in env.values():
+            self.assertIn(part, provenance)
+
+    def test_local_run_says_it_is_local(self):
+        with patch.dict("os.environ", {}, clear=True):
+            provenance = gate.write_baseline_provenance()
+        self.assertTrue(provenance.startswith("local --write-baseline on "), provenance)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
