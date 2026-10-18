@@ -479,6 +479,57 @@ fn experimental_keys_auto_migrate_user_once_via_doctor_mapping() {
 const RETIRED_USER_FILE: &str =
     "{\n  // my settings\n  \"search_index\": false,\n  \"hoist_builtin_tools\": false\n}\n";
 
+#[test]
+fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    let expected = migrate_config_text(RETIRED_USER_FILE, FixTier::User)
+        .unwrap()
+        .text;
+    let outcome = auto_migrate_user_config_with_writer(&path, |target, contents| {
+        jsonc_edit::write_atomic_with_sync_dir(target, contents, |_| {
+            assert_eq!(std::fs::read_to_string(target).unwrap(), expected);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory sync denied",
+            ))
+        })
+    })
+    .expect("reported migration");
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_eq!(
+        backups(dir.path()).len(),
+        1,
+        "the committed write must retain its backup"
+    );
+    let UserConfigMigration::Migrated { backup, notice, .. } = outcome else {
+        panic!("a committed write must be reported as applied: {outcome:?}");
+    };
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), RETIRED_USER_FILE);
+    assert!(notice.contains("directory sync denied"), "{notice}");
+    assert!(notice.contains("updated"), "{notice}");
+    assert_eq!(auto_migrate_user_config(&path), None);
+}
+
+#[test]
+fn migration_pre_rename_error_preserves_original_and_removes_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    let outcome = auto_migrate_user_config_with_writer(&path, |_, _| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "rename denied",
+        ))
+    })
+    .expect("reported failure");
+    assert!(matches!(outcome, UserConfigMigration::NotMigrated { .. }));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert!(backups(dir.path()).is_empty());
+}
+
 fn backups(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()

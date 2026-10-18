@@ -284,7 +284,7 @@ fn changing_or_creating_a_recorded_rc_file_invalidates_the_cache() {
 }
 
 #[test]
-fn timed_out_probe_is_cached_and_second_binary_start_is_fast() {
+fn timed_out_probe_is_retried_on_second_binary_start() {
     let fixture = tempfile::tempdir().unwrap();
     let storage = fixture.path().join("storage");
     let home = fixture.path().join("home");
@@ -315,8 +315,8 @@ fn timed_out_probe_is_cached_and_second_binary_start_is_fast() {
     let count_after_second = read_counter(&marker);
     let delta = count_after_second - count_after_first;
     assert_eq!(
-        delta, 0,
-        "cached timeout started another login-shell probe (counter delta {delta})"
+        delta, 1,
+        "a cached timeout must allow another login-shell probe (counter delta {delta})"
     );
 }
 

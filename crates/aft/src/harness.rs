@@ -21,7 +21,9 @@ impl Harness {
             Harness::Mcp { client } => format!("mcp--{}", sanitize_client(client)),
             Harness::Fed { fingerprint } => format!(
                 "fed--{}--{}",
-                &fingerprint[..FED_SLUG_READABLE_HEX_LEN],
+                fingerprint
+                    .get(..FED_SLUG_READABLE_HEX_LEN)
+                    .unwrap_or(fingerprint),
                 hash_hex_prefix(fingerprint, FED_SLUG_HASH_HEX_LEN)
             ),
         }
@@ -191,6 +193,18 @@ impl std::str::FromStr for Harness {
 #[cfg(test)]
 mod tests {
     use super::{sanitize_client, Harness};
+
+    #[test]
+    fn directly_constructed_fed_storage_segment_handles_invalid_utf8_boundaries() {
+        for fingerprint in ["short", "0123456789abcde€rest"] {
+            let harness = Harness::Fed {
+                fingerprint: fingerprint.to_string(),
+            };
+            let segment = harness.storage_segment();
+            assert!(segment.starts_with("fed--"));
+            assert_eq!(segment, harness.storage_segment());
+        }
+    }
     use std::str::FromStr;
 
     #[test]

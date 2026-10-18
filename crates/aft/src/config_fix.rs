@@ -586,10 +586,19 @@ fn write_backup(target: &Path, text: &str) -> std::io::Result<PathBuf> {
 /// loaders rewrites the file and reports it. A symlinked file is rewritten at
 /// its target so the link survives. A read-only file, a debug build pointed at
 /// the account's own config directory (see
-/// [`crate::production_storage::config_write_refusal`]), or any failure leaves
-/// the file as it was and returns [`UserConfigMigration::NotMigrated`]; the
-/// caller's in-memory translation still applies its current equivalents.
+/// [`crate::production_storage::config_write_refusal`]), or a failure before
+/// replacement leaves the file as it was and returns
+/// [`UserConfigMigration::NotMigrated`]; the caller's in-memory translation still
+/// applies its current equivalents. A directory-sync failure after replacement
+/// keeps the backup and returns [`UserConfigMigration::Migrated`] with a warning.
 pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
+    auto_migrate_user_config_with_writer(path, jsonc_edit::write_atomic_with_sync_warning)
+}
+
+fn auto_migrate_user_config_with_writer(
+    path: &Path,
+    write: impl FnOnce(&Path, &str) -> std::io::Result<Option<std::io::Error>>,
+) -> Option<UserConfigMigration> {
     let text = std::fs::read_to_string(path).ok()?;
     let translation = retired_key_translation(&text)?;
     let display = path.display().to_string();
@@ -638,17 +647,26 @@ pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
             return not_migrated(format!("could not write a backup: {error}"), &translation);
         }
     };
-    if let Err(error) = jsonc_edit::write_atomic(&target, &migration.text) {
-        let _ = std::fs::remove_file(&backup);
-        return not_migrated(format!("could not write it: {error}"), &translation);
+    let sync_warning = match write(&target, &migration.text) {
+        Ok(warning) => warning,
+        Err(error) => {
+            let _ = std::fs::remove_file(&backup);
+            return not_migrated(format!("could not write it: {error}"), &translation);
+        }
+    };
+    let mut notice = feature_config::user_config_migrated_notice(
+        &display,
+        &backup.display().to_string(),
+        &translation,
+    );
+    if let Some(warning) = sync_warning {
+        notice.push_str(&format!(
+            " Warning: the config was updated, but syncing its directory failed: {warning}. The backup was kept."
+        ));
     }
     Some(UserConfigMigration::Migrated {
         path: path.to_path_buf(),
-        notice: feature_config::user_config_migrated_notice(
-            &display,
-            &backup.display().to_string(),
-            &translation,
-        ),
+        notice,
         backup,
     })
 }

@@ -24,9 +24,10 @@
 //! user whose PATH finds a real git first (Homebrew, MacPorts, Nix) keeps
 //! every git feature even without the Xcode tools.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Test seam, read at runtime because integration tests drive the production
 /// binary: `absent` or `present` replaces the developer-directory lookup.
@@ -57,6 +58,35 @@ pub const MISSING_DEVELOPER_TOOLS_REASON: &str =
      `xcode-select --install`, or put another git (for example Homebrew's) on PATH, \
      then restart AFT.";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LauncherStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64, u32),
+}
+
+impl LauncherStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.mode(),
+            ),
+        }
+    }
+}
+
+type LauncherCache = Arc<Mutex<HashMap<PathBuf, (LauncherStamp, bool)>>>;
+
 /// Inputs to the launcher decision, separated from the process so tests can
 /// inject a "no developer tools" machine and a fake launcher directory.
 #[derive(Clone, Debug)]
@@ -67,6 +97,9 @@ pub struct Detector {
     /// test can use a shell script.
     require_xcselect_marker: bool,
     developer_tools_present: bool,
+    launcher_cache: LauncherCache,
+    #[cfg(test)]
+    marker_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Detector {
@@ -77,6 +110,9 @@ impl Detector {
             launcher_dirs: canonical_dirs(launcher_dirs),
             require_xcselect_marker: false,
             developer_tools_present,
+            launcher_cache: Default::default(),
+            #[cfg(test)]
+            marker_reads: Default::default(),
         }
     }
 
@@ -108,6 +144,9 @@ impl Detector {
             launcher_dirs,
             require_xcselect_marker,
             developer_tools_present,
+            launcher_cache: Default::default(),
+            #[cfg(test)]
+            marker_reads: Default::default(),
         }
     }
 
@@ -116,8 +155,17 @@ impl Detector {
     }
 
     /// True when `path` is an Apple launcher that would open the install
-    /// dialog if run. Reads the file at most once; never executes it.
+    /// dialog if run. Reuses marker reads while file metadata is unchanged;
+    /// never executes the candidate.
     pub fn is_unusable_launcher(&self, path: &Path) -> bool {
+        self.is_unusable_launcher_with_reader(path, |path| std::fs::read(path))
+    }
+
+    fn is_unusable_launcher_with_reader(
+        &self,
+        path: &Path,
+        read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+    ) -> bool {
         if self.developer_tools_present || self.launcher_dirs.is_empty() {
             return false;
         }
@@ -131,11 +179,31 @@ impl Detector {
         if !self.require_xcselect_marker {
             return true;
         }
-        std::fs::read(&canonical)
-            .map(|bytes| contains_subslice(&bytes, XCSELECT_LIBRARY_MARKER))
-            // Unreadable file in /usr/bin on a Mac without tools: refusing it
-            // costs one feature; running it may open the dialog.
-            .unwrap_or(true)
+        let Ok(metadata) = std::fs::metadata(&canonical) else {
+            return true;
+        };
+        let stamp = LauncherStamp::from_metadata(&metadata);
+        let mut cache = self
+            .launcher_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((cached_stamp, decision)) = cache.get(&canonical) {
+            if cached_stamp == &stamp {
+                return *decision;
+            }
+        }
+        #[cfg(test)]
+        self.marker_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = match read(&canonical) {
+            Ok(bytes) => bytes,
+            // Refuse an unreadable candidate because it may open the install
+            // dialog, but retry transient errors instead of caching a guess.
+            Err(_) => return true,
+        };
+        let decision = contains_subslice(&bytes, XCSELECT_LIBRARY_MARKER);
+        cache.insert(canonical, (stamp, decision));
+        decision
     }
 
     /// Decide whether `git` found on `path_var` may run.
@@ -289,6 +357,76 @@ pub fn is_unusable_launcher(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn launcher_read_error_is_retried_without_metadata_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("git");
+        std::fs::write(&tool, b"a real tool without the launcher marker").unwrap();
+        let mut detector = Detector::new(vec![dir.path().to_path_buf()], false);
+        detector.require_xcselect_marker = true;
+        let before = LauncherStamp::from_metadata(&std::fs::metadata(&tool).unwrap());
+
+        assert!(detector.is_unusable_launcher_with_reader(&tool, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        }));
+        assert_eq!(
+            before,
+            LauncherStamp::from_metadata(&std::fs::metadata(&tool).unwrap())
+        );
+        assert!(!detector.is_unusable_launcher(&tool));
+        assert_eq!(
+            detector
+                .marker_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert!(!detector.is_unusable_launcher(&tool));
+        assert_eq!(
+            detector
+                .marker_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn launcher_marker_is_memoized_and_invalidated_by_file_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("git");
+        std::fs::write(&launcher, XCSELECT_LIBRARY_MARKER).unwrap();
+        let mut detector = Detector::new(vec![dir.path().to_path_buf()], false);
+        detector.require_xcselect_marker = true;
+        assert!(detector.is_unusable_launcher(&launcher));
+        assert!(detector.clone().is_unusable_launcher(&launcher));
+        assert_eq!(
+            detector
+                .marker_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, vec![b'x'; XCSELECT_LIBRARY_MARKER.len()]).unwrap();
+        // Equal size and mtime must not hide a replacement inode from the cache.
+        let original_time = std::fs::metadata(&launcher).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(original_time)
+            .unwrap();
+        std::fs::remove_file(&launcher).unwrap();
+        std::fs::rename(&replacement, &launcher).unwrap();
+        assert!(!detector.is_unusable_launcher(&launcher));
+        assert!(!detector.is_unusable_launcher(&launcher));
+        assert_eq!(
+            detector
+                .marker_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
 
     fn executable(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
