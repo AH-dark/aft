@@ -81,13 +81,31 @@ fn run_checkout_verification_with_deadline(
     timeout: Duration,
     verify: impl FnOnce(&dyn Fn(&'static str)) + Send + 'static,
 ) {
+    run_checkout_verification_watchdog(timeout, DeadlineStart::Spawn, verify);
+}
+
+/// When the watchdog's deadline starts. The real test bounds everything from
+/// the moment the worker is spawned. The watchdog's own self-test starts the
+/// clock at the worker's first phase report, so a runner slow to start the
+/// worker cannot turn "timed out during <phase>" into "during starting worker".
+#[derive(Clone, Copy)]
+enum DeadlineStart {
+    Spawn,
+    FirstPhase,
+}
+
+fn run_checkout_verification_watchdog(
+    timeout: Duration,
+    start: DeadlineStart,
+    verify: impl FnOnce(&dyn Fn(&'static str)) + Send + 'static,
+) {
     enum Progress {
         Phase(&'static str),
         Finished(std::thread::Result<()>),
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     std::thread::Builder::new()
         .name("inspect-warm-verification".into())
         .spawn(move || {
@@ -103,6 +121,17 @@ fn run_checkout_verification_with_deadline(
         .expect("spawn inspect warm verification worker");
 
     let mut phase = "starting worker";
+    if matches!(start, DeadlineStart::FirstPhase) {
+        // A generous hang guard for the worker to start; the deadline under
+        // test begins only once it has reported its first phase.
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Progress::Phase(first)) => phase = first,
+            Ok(Progress::Finished(Ok(()))) => return,
+            Ok(Progress::Finished(Err(panic))) => std::panic::resume_unwind(panic),
+            Err(error) => panic!("inspect warm verification worker never started: {error}"),
+        }
+        deadline = Instant::now() + timeout;
+    }
     loop {
         // One absolute deadline includes setup, verification, and cleanup;
         // progress cannot extend it. Do not join a worker that may be blocked.
@@ -125,10 +154,14 @@ fn run_checkout_verification_with_deadline(
 fn checkout_verification_deadline_reports_last_phase() {
     let (release, blocked) = std::sync::mpsc::channel();
     let result = std::panic::catch_unwind(|| {
-        run_checkout_verification_with_deadline(Duration::from_secs(1), move |phase| {
-            phase("injected blocked operation");
-            blocked.recv_timeout(Duration::from_secs(10)).unwrap();
-        });
+        run_checkout_verification_watchdog(
+            Duration::from_secs(1),
+            DeadlineStart::FirstPhase,
+            move |phase| {
+                phase("injected blocked operation");
+                blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+            },
+        );
     });
     // Release the simulated stall even when the assertion below fails.
     let _ = release.send(());
@@ -154,10 +187,7 @@ fn checkout_verification_deadline_preserves_assertion_panics() {
 
 #[test]
 fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
-    run_checkout_verification_with_deadline(
-        Duration::from_secs(180),
-        verify_checkout_view_corpus,
-    );
+    run_checkout_verification_with_deadline(Duration::from_secs(180), verify_checkout_view_corpus);
 }
 
 fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
@@ -168,43 +198,107 @@ fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
     let (_project, _storage, mut job, mut request) = view_projection_fixture();
     phase("writing 3000 source files");
     for i in 0..3000 {
-        write_projection_cache_file(&job.project_root.join(format!("source_{i}.ts")), &format!("export function source_{i}() {{ return {i}; }}\n"));
+        write_projection_cache_file(
+            &job.project_root.join(format!("source_{i}.ts")),
+            &format!("export function source_{i}() {{ return {i}; }}\n"),
+        );
     }
-    for args in [vec!["add", "."], vec!["-c", "user.name=AFT", "-c", "user.email=aft@example.com", "commit", "--quiet", "-m", "large fixture"]] {
-        phase(if args[0] == "add" { "git add corpus" } else { "git commit corpus" });
+    for args in [
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=AFT",
+            "-c",
+            "user.email=aft@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "large fixture",
+        ],
+    ] {
+        phase(if args[0] == "add" {
+            "git add corpus"
+        } else {
+            "git commit corpus"
+        });
         let mut git = std::process::Command::new("git");
         crate::test_env::apply_hermetic_git_env(git.current_dir(&job.project_root));
         assert!(git.args(args).status().unwrap().success());
     }
     phase("reading HEAD tree");
-    request.desired_head = crate::views::assembly::head_tree_fingerprint(&crate::alias::head_tree_entries(&job.project_root).unwrap());
+    request.desired_head = crate::views::assembly::head_tree_fingerprint(
+        &crate::alias::head_tree_entries(&job.project_root).unwrap(),
+    );
     phase("publishing checkout view");
     crate::views::assembly::publish_checkout(&request).unwrap();
     phase("walking published source files");
     job.scope_files = crate::callgraph::walk_project_files(&job.project_root).collect();
     phase("creating inspect snapshot and manager");
-    let snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
+    let snapshot = InspectSnapshot::new_with_capabilities(
+        job.project_root.clone(),
+        job.inspect_dir.clone(),
+        job.config.clone(),
+        job.symbol_cache.clone(),
+        false,
+        false,
+    );
     let manager = InspectManager::new();
     phase("collecting source stats");
-    let stats = job.scope_files.iter().map(|path| {
-        let metadata = std::fs::metadata(path).unwrap();
-        (path.clone(), metadata.len(), metadata.modified().unwrap())
-    }).collect::<Vec<_>>();
+    let stats = job
+        .scope_files
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (path.clone(), metadata.len(), metadata.modified().unwrap())
+        })
+        .collect::<Vec<_>>();
     crate::views::read::take_verification_io();
     phase("cold checkout verification");
     let cold_view = manager.current_checkout_view(&snapshot, Some(&stats));
-    assert!(cold_view.is_some(), "cold checkout view refused: {:?}; root={:?} desired_head={} observed_files={}", take_checkout_view_refusal(), job.project_root, request.desired_head, stats.len());
+    assert!(
+        cold_view.is_some(),
+        "cold checkout view refused: {:?}; root={:?} desired_head={} observed_files={}",
+        take_checkout_view_refusal(),
+        job.project_root,
+        request.desired_head,
+        stats.len()
+    );
     let cold = crate::views::read::take_verification_io();
     phase("warm checkout verification with known stats");
-    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_some(), "warm checkout view refused: {:?}", take_checkout_view_refusal());
+    assert!(
+        manager
+            .current_checkout_view(&snapshot, Some(&stats))
+            .is_some(),
+        "warm checkout view refused: {:?}",
+        take_checkout_view_refusal()
+    );
     let warm = crate::views::read::take_verification_io();
-    eprintln!("inspect_view_verification fixture_files={} cold={cold:?} warm={warm:?}", job.scope_files.len());
-    assert_eq!(warm.files_read, 0, "unchanged view verification reread source files: {warm:?}");
-    assert_eq!(warm.bytes_hashed, 0, "unchanged view verification rehashed source bytes: {warm:?}");
-    assert_eq!(warm.files_statd, 0, "blocking inspection must reuse the root stats it already collected");
-    assert_eq!(cold.files_read, 3002, "first verification must actually read the entire source set");
+    eprintln!(
+        "inspect_view_verification fixture_files={} cold={cold:?} warm={warm:?}",
+        job.scope_files.len()
+    );
+    assert_eq!(
+        warm.files_read, 0,
+        "unchanged view verification reread source files: {warm:?}"
+    );
+    assert_eq!(
+        warm.bytes_hashed, 0,
+        "unchanged view verification rehashed source bytes: {warm:?}"
+    );
+    assert_eq!(
+        warm.files_statd, 0,
+        "blocking inspection must reuse the root stats it already collected"
+    );
+    assert_eq!(
+        cold.files_read, 3002,
+        "first verification must actually read the entire source set"
+    );
     phase("standalone checkout verification");
-    assert!(manager.current_checkout_view(&snapshot, None).is_some(), "standalone checkout view refused: {:?}", take_checkout_view_refusal());
+    assert!(
+        manager.current_checkout_view(&snapshot, None).is_some(),
+        "standalone checkout view refused: {:?}",
+        take_checkout_view_refusal()
+    );
     let standalone = crate::views::read::take_verification_io();
     eprintln!("inspect_view_verification standalone={standalone:?}");
     assert_eq!(standalone.files_statd, 3002);
@@ -216,11 +310,18 @@ fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
     let modified = std::fs::metadata(&edited).unwrap().modified().unwrap();
     std::fs::write(&edited, "export function source_0() { return 9; }\n").unwrap();
     // Windows requires write access to change a file's timestamps.
-    std::fs::OpenOptions::new().write(true).open(&edited).unwrap().set_modified(modified).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&edited)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
     phase("invalidating verification memo");
     crate::cache_freshness::invalidate_verify_memo(&job.project_root);
     phase("checkout verification after invalidation");
-    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_none());
+    assert!(manager
+        .current_checkout_view(&snapshot, Some(&stats))
+        .is_none());
     assert!(crate::views::read::take_verification_io().files_read > 0);
     phase("dropping fixture and manager");
 }
@@ -233,61 +334,119 @@ fn inspect_checkout_view_lookup_never_creates_a_view_folder() {
         .join("views")
         .join(crate::path_identity::project_scope_key(&job.project_root));
     let _ = std::fs::remove_dir_all(&view_dir);
-    let snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
-    assert!(InspectManager::new().current_checkout_view(&snapshot, None).is_none());
+    let snapshot = InspectSnapshot::new_with_capabilities(
+        job.project_root.clone(),
+        job.inspect_dir.clone(),
+        job.config.clone(),
+        job.symbol_cache.clone(),
+        false,
+        false,
+    );
+    assert!(InspectManager::new()
+        .current_checkout_view(&snapshot, None)
+        .is_none());
     // A folder made by a reader has no binding and no registry member; it
     // would be left behind as an orphan once the checkout is gone.
-    assert!(!view_dir.exists(), "a projection lookup created {view_dir:?}");
+    assert!(
+        !view_dir.exists(),
+        "a projection lookup created {view_dir:?}"
+    );
 }
 
 #[test]
 fn inspect_checkout_view_refusal_diagnostics_name_compared_values() {
     let (_project, storage, job, request) = view_projection_fixture();
-    let mut snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
+    let mut snapshot = InspectSnapshot::new_with_capabilities(
+        job.project_root.clone(),
+        job.inspect_dir.clone(),
+        job.config.clone(),
+        job.symbol_cache.clone(),
+        false,
+        false,
+    );
     let manager = InspectManager::new();
     let refusal = |snapshot: &InspectSnapshot, stats: Option<&[(PathBuf, u64, SystemTime)]>| {
         assert!(manager.current_checkout_view(snapshot, stats).is_none());
         take_checkout_view_refusal().expect("every checkout refusal must name its branch")
     };
     let unpublished = refusal(&snapshot, None);
-    assert!(unpublished.contains("projection_unpublished:") && unpublished.contains("current_generation=None"), "{unpublished}");
+    assert!(
+        unpublished.contains("projection_unpublished:")
+            && unpublished.contains("current_generation=None"),
+        "{unpublished}"
+    );
     crate::views::assembly::publish_checkout(&request).unwrap();
 
     Arc::make_mut(&mut snapshot.config).views.enabled = false;
     let disabled = refusal(&snapshot, None);
-    assert!(disabled.contains("config_gate: views.enabled=false indexes.callgraph=true"), "{disabled}");
+    assert!(
+        disabled.contains("config_gate: views.enabled=false indexes.callgraph=true"),
+        "{disabled}"
+    );
     Arc::make_mut(&mut snapshot.config).views.enabled = true;
 
     crate::views::cache_head_fingerprint(job.project_root.clone(), "different-head".to_string());
     let head = refusal(&snapshot, None);
-    assert!(head.contains("projection_head_mismatch:") && head.contains(&request.desired_head) && head.contains("cached_head=different-head"), "{head}");
+    assert!(
+        head.contains("projection_head_mismatch:")
+            && head.contains(&request.desired_head)
+            && head.contains("cached_head=different-head"),
+        "{head}"
+    );
     crate::views::cache_head_fingerprint(job.project_root.clone(), request.desired_head.clone());
 
     // Windows separators are escaped by Debug. Exercise escaping on Unix too,
     // where a backslash is a legal character in a filename.
-    let outside = storage.path().join(if cfg!(windows) { "outside.ts" } else { "outside\\fixture.ts" });
+    let outside = storage.path().join(if cfg!(windows) {
+        "outside.ts"
+    } else {
+        "outside\\fixture.ts"
+    });
     let stats = [(outside.clone(), 0, UNIX_EPOCH)];
     let root = refusal(&snapshot, Some(&stats));
     // The diagnostics print Debug paths, not raw path strings. Match their
     // escaping without changing any path used by the production comparison.
-    assert!(root.contains("coverage_root_mismatch:") && root.contains(&format!("path={outside:?}")) && root.contains(&format!("root={:?}", job.project_root)), "{root}");
+    assert!(
+        root.contains("coverage_root_mismatch:")
+            && root.contains(&format!("path={outside:?}"))
+            && root.contains(&format!("root={:?}", job.project_root)),
+        "{root}"
+    );
 
     let added = job.project_root.join("untracked.ts");
     write_projection_cache_file(&added, "export function untracked() {}\n");
     let metadata = std::fs::metadata(&added).unwrap();
     let stats = [(added.clone(), metadata.len(), metadata.modified().unwrap())];
     let coverage = refusal(&snapshot, Some(&stats));
-    assert!(coverage.contains("coverage_manifest_missing:") && coverage.contains(&format!("path={added:?}")) && coverage.contains("manifest_files=2 observed_files=1"), "{coverage}");
+    assert!(
+        coverage.contains("coverage_manifest_missing:")
+            && coverage.contains(&format!("path={added:?}"))
+            && coverage.contains("manifest_files=2 observed_files=1"),
+        "{coverage}"
+    );
 
     // Supply only the published paths so the untracked-file coverage guard
     // does not hide the source-key comparison we want to diagnose next.
-    write_projection_cache_file(&job.project_root.join("target.ts"), "export function changed() {}\n");
-    let stats = job.scope_files.iter().map(|path| {
-        let metadata = std::fs::metadata(path).unwrap();
-        (path.clone(), metadata.len(), metadata.modified().unwrap())
-    }).collect::<Vec<_>>();
+    write_projection_cache_file(
+        &job.project_root.join("target.ts"),
+        "export function changed() {}\n",
+    );
+    let stats = job
+        .scope_files
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (path.clone(), metadata.len(), metadata.modified().unwrap())
+        })
+        .collect::<Vec<_>>();
     let source = refusal(&snapshot, Some(&stats));
-    assert!(source.contains("verification_source_key_mismatch:") && source.contains("target.ts") && source.contains("expected_key=") && source.contains("actual_key="), "{source}");
+    assert!(
+        source.contains("verification_source_key_mismatch:")
+            && source.contains("target.ts")
+            && source.contains("expected_key=")
+            && source.contains("actual_key="),
+        "{source}"
+    );
 }
 
 #[test]
@@ -509,7 +668,8 @@ fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
             "a generation without call graph data must not project an empty graph"
         );
     }
-    let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&job);
+    let aggregate =
+        crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&job);
     assert_eq!(aggregate["callgraph_available"], false);
     assert_eq!(
         aggregate["callgraph_unavailable_reason"],
@@ -519,7 +679,8 @@ fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
     // With the index itself off, the reason names that configuration setting.
     let mut off = job.clone();
     Arc::make_mut(&mut off.config).indexes.callgraph = false;
-    let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&off);
+    let aggregate =
+        crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&off);
     assert_eq!(
         aggregate["callgraph_unavailable_reason"],
         "call graph is disabled (indexes.callgraph=false)"
