@@ -4355,7 +4355,10 @@ mod tests {
     fn outline_portability_goldens_stay_lf_with_autocrlf() {
         let temp = tempfile::tempdir().unwrap();
         let prefix = format!("{}/", path_to_slash(temp.path()));
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("canonicalize repository root");
         for (name, expected) in [
             (
                 "test_free.txt",
@@ -4372,9 +4375,10 @@ mod tests {
         ] {
             let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
             let output = std::process::Command::new("git")
+                .args(["-c", "safe.directory=", "-c", "core.autocrlf=true"])
+                .arg("-c")
+                .arg(format!("safe.directory={}", root.display()))
                 .args([
-                    "-c",
-                    "core.autocrlf=true",
                     "checkout-index",
                     "--force",
                     &format!("--prefix={prefix}"),

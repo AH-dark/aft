@@ -1078,6 +1078,16 @@ fn check_remote_backend_for_root(
     }
 }
 
+/// Start a controlled in-flight probe so command tests need no network route.
+#[cfg(test)]
+pub(crate) fn start_remote_backend_probe_for_test(
+    root: &Path,
+    base_url: &str,
+    probe: fn(&str) -> Result<(), String>,
+) {
+    let _ = check_remote_backend_for_root(root, base_url, probe);
+}
+
 /// Write a probe result into the backend health that status and search read.
 /// An outage the build itself recorded is never replaced or cleared here.
 fn apply_remote_backend_probe_outcome(root: &Path, outcome: &Result<(), String>) {

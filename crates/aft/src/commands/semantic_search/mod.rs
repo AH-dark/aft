@@ -8422,7 +8422,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
@@ -9520,15 +9520,33 @@ mod tests {
         }
     }
 
-    /// A backend address that silently drops packets (a VPN address, a
-    /// firewalled port) must not make `status` or `search` wait: both read the
-    /// cached probe result and say the backend is being checked while the
-    /// probe is still out.
+    static BLOCKING_BACKEND_PROBE: OnceLock<
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    > = OnceLock::new();
+
+    fn block_backend_probe_for_test(_: &str) -> Result<(), String> {
+        let (started, release) = BLOCKING_BACKEND_PROBE
+            .get()
+            .and_then(|gate| {
+                gate.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            })
+            .expect("install blocking backend probe channels");
+        started
+            .send(())
+            .expect("signal blocked backend probe start");
+        // Bounded so a regression that makes status or search wait on this
+        // probe fails the test's elapsed-time check instead of hanging it.
+        let _ = release.recv_timeout(Duration::from_secs(5));
+        Ok(())
+    }
+
+    /// A backend probe that is still waiting must not make `status` or `search`
+    /// wait; both should report the cached in-progress probe state.
     #[test]
     fn blackholed_backend_never_blocks_status_or_search() {
-        // Reserved private address with nothing behind it: a connect sits
-        // until its timeout instead of being refused.
-        let base_url = "http://10.255.255.1:1234/v1".to_string();
+        let base_url = "http://127.0.0.1:1/v1".to_string();
         let project = tempfile::tempdir().expect("create project dir");
         let ctx =
             lexical_ready_context_with_semantic(project.path(), building("loading_artifacts"));
@@ -9536,16 +9554,26 @@ mod tests {
             config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
             config.semantic.base_url = Some(base_url.clone());
         });
+        let (probe_started, probe_started_rx) = std::sync::mpsc::channel();
+        let (release_probe, release_probe_rx) = std::sync::mpsc::channel();
+        *BLOCKING_BACKEND_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((probe_started, release_probe_rx));
+        let probe_root = ctx.canonical_cache_root_opt().expect("semantic probe root");
+        crate::semantic_index::start_remote_backend_probe_for_test(
+            &probe_root,
+            &base_url,
+            block_backend_probe_for_test,
+        );
+        probe_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for the backend probe to block");
+
         let request: RawRequest =
             serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
                 .expect("status request");
-        // The proof that neither call waited is that both answered while the
-        // probe was still out: status reports the check in progress and search
-        // says so (asserted below). A connect to a blackholed address only ends
-        // at the probe's 2 s timeout, so a call that waited on it would also
-        // take at least that long. The wall-clock bound sits well below the
-        // timeout but far above a loaded machine's scheduling delay, which made
-        // a 200 ms bound flaky without testing anything more.
         let bound = Duration::from_millis(1_000);
 
         let started = std::time::Instant::now();
@@ -9557,7 +9585,6 @@ mod tests {
             &ctx,
         ));
         let search_elapsed = started.elapsed();
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
 
         assert!(status_elapsed < bound, "status took {status_elapsed:?}");
         assert!(search_elapsed < bound, "search took {search_elapsed:?}");
@@ -9573,6 +9600,15 @@ mod tests {
             )),
             "{text}"
         );
+
+        release_probe
+            .send(())
+            .expect("release the blocked backend probe");
+        let _ = poll_for_backend_verdict(
+            || response_value(crate::commands::status::handle_status(&request, &ctx)),
+            |status| status["semantic_index"]["stage"] != "checking_embedding_backend",
+        );
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
     }
 
     /// The sidebar polls `status` without searching; that path must find the
