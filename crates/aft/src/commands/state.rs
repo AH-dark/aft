@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -61,8 +63,10 @@ pub fn handle_db_get_state(req: &RawRequest, ctx: &AppContext) -> Response {
         None => {}
     }
 
-    let value = legacy_harness_path(ctx, harness, &params.key)
-        .and_then(|path| fs::read_to_string(path).ok());
+    let value = with_legacy_harness_file(ctx, harness, &params.key, |path| {
+        fs::read_to_string(path).ok()
+    })
+    .flatten();
     Response::success(&req.id, json!({ "value": value }))
 }
 
@@ -113,15 +117,15 @@ pub fn handle_db_set_state(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    if let Some(path) = legacy_harness_path(ctx, harness, &params.key) {
-        if let Err(error) = atomic_write(&path, value.as_bytes()) {
+    let _ = with_legacy_harness_file(ctx, harness, &params.key, |path| {
+        if let Err(error) = atomic_write(path, value.as_bytes()) {
             log::warn!(
                 "db_set_state legacy write failed for {}: {}",
                 path.display(),
                 error
             );
         }
-    }
+    });
 
     Response::success(&req.id, json!({ "ok": true }))
 }
@@ -234,22 +238,21 @@ fn write_legacy_harness_state(
     key: &str,
     value: &str,
 ) -> Response {
-    let Some(path) = legacy_harness_path(ctx, harness, key) else {
-        return db_unavailable_without_fallback(request_id, "db_set_state", key);
-    };
-
-    match atomic_write(&path, value.as_bytes()) {
-        Ok(()) => Response::success(request_id, json!({ "ok": true })),
-        Err(error) => Response::error(
-            request_id,
-            "state_persistence_error",
-            format!(
-                "db_set_state JSON fallback write failed for {}: {}",
-                path.display(),
-                error
+    with_legacy_harness_file(ctx, harness, key, |path| {
+        match atomic_write(path, value.as_bytes()) {
+            Ok(()) => Response::success(request_id, json!({ "ok": true })),
+            Err(error) => Response::error(
+                request_id,
+                "state_persistence_error",
+                format!(
+                    "db_set_state JSON fallback write failed for {}: {}",
+                    path.display(),
+                    error
+                ),
             ),
-        ),
-    }
+        }
+    })
+    .unwrap_or_else(|| db_unavailable_without_fallback(request_id, "db_set_state", key))
 }
 
 fn write_legacy_host_state(request_id: &str, ctx: &AppContext, key: &str, value: &str) -> Response {
@@ -286,21 +289,53 @@ fn parse_params(req: &RawRequest, command: &str) -> Result<StateParams, Response
     })
 }
 
+fn legacy_harness_file_name(key: &str) -> Option<&'static str> {
+    match key {
+        "last_announced_version" => Some("last_announced_version"),
+        "last_update_check" => Some("last-update-check.json"),
+        "warned_tools" => Some("warned_tools.json"),
+        _ => None,
+    }
+}
+
+fn legacy_state_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+fn with_legacy_harness_file<T>(
+    ctx: &AppContext,
+    harness: Harness,
+    key: &str,
+    access: impl FnOnce(&Path) -> T,
+) -> Option<T> {
+    let file_name = legacy_harness_file_name(key)?;
+    // Harnesses can compete for the same root file during repair. Key the lock
+    // by that shared source, and keep it through the read or atomic write so a
+    // failed repair cannot leave a writer using a source another repair moves.
+    let lock = legacy_state_lock(&ctx.storage_dir().join(file_name));
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = legacy_harness_path(ctx, harness, key)?;
+    Some(access(&path))
+}
+
 fn legacy_harness_path(ctx: &AppContext, harness: Harness, key: &str) -> Option<PathBuf> {
     let dir = ctx.storage_dir().join(harness.storage_segment());
-    match key {
-        "last_announced_version" => Some(repair_root_scoped_harness_file(
-            ctx,
-            &dir,
-            "last_announced_version",
-        )),
-        "last_update_check" => Some(repair_root_scoped_harness_file(
-            ctx,
-            &dir,
-            "last-update-check.json",
-        )),
-        "warned_tools" => Some(dir.join("warned_tools.json")),
-        _ => None,
+    let file_name = legacy_harness_file_name(key)?;
+    if key == "warned_tools" {
+        Some(dir.join(file_name))
+    } else {
+        Some(repair_root_scoped_harness_file(ctx, &dir, file_name))
     }
 }
 
@@ -334,12 +369,21 @@ fn repair_root_scoped_harness_file(
     // that crosses volumes falls back to a copy instead of failing. If the
     // move fails before publication, keep using the root file. A failure after
     // publication must not redirect writes to a stale source copy.
+    #[cfg(test)]
+    repair_test_hook("before_move");
     match crate::cross_volume::move_path(&root_path, &harness_path) {
         Ok(moved) => {
             moved.warn_if_incomplete(&root_path, &harness_path);
+            #[cfg(test)]
+            repair_test_hook("after_move");
             harness_path
         }
         Err(error) => {
+            // Another repair may have published the destination after our
+            // existence checks. Never recreate a root file that readers ignore.
+            if harness_path.exists() {
+                return harness_path;
+            }
             crate::slog_warn!(
                 "keeping {} at the storage root: cannot move it to {}: {}",
                 root_path.display(),
@@ -349,6 +393,22 @@ fn repair_root_scoped_harness_file(
             root_path
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPAIR_TEST_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn repair_test_hook(step: &str) {
+    REPAIR_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(step);
+        }
+    });
 }
 
 fn legacy_host_path(ctx: &AppContext, key: &str) -> Option<PathBuf> {
@@ -495,6 +555,130 @@ mod tests {
         assert_eq!(path, harness_dir.join("last_announced_version"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.40.0");
         assert!(!temp.path().join("last_announced_version").exists());
+    }
+
+    #[test]
+    fn legacy_state_lock_covers_repair_and_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.storage_dir = Some(temp.path().to_path_buf());
+        });
+        ctx.set_harness(Harness::Opencode);
+        let source = temp.path().join("last_announced_version");
+        fs::write(&source, "old").unwrap();
+        let lock = legacy_state_lock(&source);
+        let repair_lock = Arc::clone(&lock);
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let repair_steps = Arc::clone(&steps);
+        REPAIR_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |step| {
+                assert!(
+                    matches!(
+                        repair_lock.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "repair must hold the state file lock"
+                );
+                repair_steps.lock().unwrap().push(step.to_string());
+            }));
+        });
+        with_legacy_harness_file(&ctx, Harness::Opencode, "last_announced_version", |path| {
+            assert!(
+                matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "the lock must remain held through the write"
+            );
+            atomic_write(path, b"new").unwrap();
+        })
+        .unwrap();
+        REPAIR_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(*steps.lock().unwrap(), ["before_move", "after_move"]);
+        let request = state_request("db_get_state", json!({ "key": "last_announced_version" }));
+        assert_eq!(handle_db_get_state(&request, &ctx).data["value"], "new");
+    }
+
+    #[test]
+    fn concurrent_legacy_repairs_preserve_successful_state_write() {
+        concurrent_legacy_repairs_preserve_state_write(false);
+    }
+
+    #[test]
+    fn cross_volume_concurrent_legacy_repairs_preserve_successful_state_write() {
+        concurrent_legacy_repairs_preserve_state_write(true);
+    }
+
+    fn concurrent_legacy_repairs_preserve_state_write(cross_volume: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.storage_dir = Some(temp.path().to_path_buf());
+        });
+        ctx.set_harness(Harness::Opencode);
+        assert!(ctx.db().is_none(), "exercise the file fallback");
+        let root_path = temp.path().join("last_announced_version");
+        fs::write(&root_path, "old").unwrap();
+        let harness_dir = temp.path().join("opencode");
+        fs::create_dir_all(&harness_dir).unwrap();
+        let _volume = cross_volume.then(|| {
+            crate::walk_boundary::simulated_volumes::simulate(&harness_dir, u64::MAX - 24)
+        });
+
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel();
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let timeout = std::time::Duration::from_secs(10);
+        std::thread::scope(|scope| {
+            let writer_ctx = &ctx;
+            let writer = scope.spawn(move || {
+                REPAIR_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |step| {
+                        if step == "before_move" {
+                            checked_tx.send(()).unwrap();
+                            moved_rx.recv_timeout(timeout).unwrap();
+                        }
+                    }));
+                });
+                let request = state_request(
+                    "db_set_state",
+                    json!({ "key": "last_announced_version", "value": "new" }),
+                );
+                let response = handle_db_set_state(&request, writer_ctx);
+                written_tx.send(()).unwrap();
+                assert!(response.success, "{response:?}");
+            });
+            checked_rx.recv_timeout(timeout).unwrap();
+            let repair_ctx = &ctx;
+            let repair = scope.spawn(move || {
+                // Use the unguarded repair helper to model a competing process,
+                // which cannot participate in the in-process state file lock.
+                REPAIR_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |step| {
+                        if step == "after_move" {
+                            // Both repairs passed their checks. Keep the winning repair
+                            // paused until the competing repair and fallback write finish.
+                            moved_tx.send(()).unwrap();
+                            written_rx.recv_timeout(timeout).unwrap();
+                        }
+                    }));
+                });
+                legacy_harness_path(repair_ctx, Harness::Opencode, "last_announced_version")
+                    .unwrap()
+            });
+            writer.join().unwrap();
+            assert_eq!(
+                repair.join().unwrap(),
+                temp.path().join("opencode/last_announced_version")
+            );
+        });
+
+        let request = state_request("db_get_state", json!({ "key": "last_announced_version" }));
+        let response = handle_db_get_state(&request, &ctx);
+        assert!(response.success);
+        assert_eq!(response.data["value"], "new");
+        assert!(
+            !root_path.exists(),
+            "writes must not recreate the legacy root"
+        );
     }
 
     #[test]
