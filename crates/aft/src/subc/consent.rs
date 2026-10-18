@@ -161,6 +161,35 @@ fn declared_hold_budget(declared_reply: Option<Duration>) -> Duration {
 struct SubcConsentTransport {
     connection_file: PathBuf,
     consumer: tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>,
+    routes: tokio::sync::Mutex<HashMap<subc_client_rs::RouteHandle, usize>>,
+}
+
+struct ConsentRoute {
+    transport: Arc<SubcConsentTransport>,
+    consumer: Arc<subc_client_rs::SubcConsumer>,
+    route: Option<subc_client_rs::RouteHandle>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ConsentRoute {
+    async fn close(&mut self) {
+        if let Some(route) = self.route {
+            self.transport.release_route(&self.consumer, route).await;
+            self.route = None;
+        }
+    }
+}
+
+impl Drop for ConsentRoute {
+    fn drop(&mut self) {
+        if let Some(route) = self.route.take() {
+            let transport = Arc::clone(&self.transport);
+            let consumer = Arc::clone(&self.consumer);
+            // A held consent.await can be cancelled when its asking route closes.
+            self.runtime
+                .spawn(async move { transport.release_route(&consumer, route).await });
+        }
+    }
 }
 
 impl SubcConsentTransport {
@@ -168,6 +197,7 @@ impl SubcConsentTransport {
         Self {
             connection_file,
             consumer: tokio::sync::Mutex::new(None),
+            routes: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -202,8 +232,26 @@ impl SubcConsentTransport {
         }
     }
 
+    async fn release_route(
+        &self,
+        consumer: &subc_client_rs::SubcConsumer,
+        route: subc_client_rs::RouteHandle,
+    ) {
+        let mut routes = self.routes.lock().await;
+        if let Some(users) = routes.get_mut(&route) {
+            *users -= 1;
+            if *users == 0 {
+                routes.remove(&route);
+                let _ = consumer
+                    .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
+                    .await;
+            }
+        }
+    }
+
     async fn send(self: Arc<Self>, call: ConsentCall) -> Result<Value, ConsentError> {
         use subc_client_rs::{CallError, CallOptions};
+        let body = encode(call.method, &call.params)?;
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new(
             call.project_root.clone(),
@@ -219,6 +267,10 @@ impl SubcConsentTransport {
         // A refused scoped open is never retried unscoped: the daemon stamps
         // the asking route's scope onto Cingulate's route, and Cingulate reads
         // the asker and its head from that stamp.
+        // The SDK may return the same cached handle for overlapping calls with
+        // the same scope stamp. Lease it until the last call settles, then close
+        // immediately rather than leaving an idle consent route in the daemon.
+        let mut routes = self.routes.lock().await;
         let route = match consumer
             .open_route_scoped(
                 RouteTarget::ManagementSurface {
@@ -238,16 +290,26 @@ impl SubcConsentTransport {
                 })
             }
             Err(error) => {
+                drop(routes);
                 self.forget(&consumer).await;
                 return Err(ConsentError::Unavailable(error.to_string()));
             }
         };
-        let body = encode(call.method, &call.params)?;
+        *routes.entry(route).or_default() += 1;
+        let mut lease = ConsentRoute {
+            transport: Arc::clone(&self),
+            consumer: Arc::clone(&consumer),
+            route: Some(route),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        drop(routes);
         let options = CallOptions {
             timeout: call.timeout,
             ..CallOptions::default()
         };
-        match consumer.request(&route, body, options).await {
+        let reply = consumer.request(&route, body, options).await;
+        lease.close().await;
+        match reply {
             Ok(bytes) => decode_result(&bytes),
             Err(CallError::Module(body)) => Err(ConsentError::Refused {
                 code: body.code,
