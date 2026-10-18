@@ -1461,6 +1461,7 @@ const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL
 // SUBC caches at most 16 KiB; reserve 4 KiB for its envelope and future counters.
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
+const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
 
 fn encoded_health_metrics_len(metrics: &serde_json::Map<String, Value>) -> usize {
     #[cfg(test)]
@@ -1711,6 +1712,8 @@ pub(super) struct HealthRollupCache {
     breakers:
         std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
+    allocator: std::sync::Mutex<Option<(u64, crate::memory::AllocatorObservation)>>,
+    census_rows: std::sync::Mutex<crate::commands::memory_census::CensusRootRows>,
 }
 
 impl HealthRollupCache {
@@ -1727,7 +1730,31 @@ impl HealthRollupCache {
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             breakers: std::sync::Mutex::new(HashMap::new()),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
+            allocator: std::sync::Mutex::new(None),
+            census_rows: std::sync::Mutex::new(Default::default()),
         }
+    }
+
+    fn allocator_observation(&self) -> crate::memory::AllocatorObservation {
+        let mut cached = self
+            .allocator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_at_ms, observation)) = cached.as_ref() {
+            let elapsed_ms = self.now_ms().saturating_sub(*cached_at_ms);
+            let age_ms = observation.age_ms.unwrap_or(0).saturating_add(elapsed_ms);
+            if age_ms <= HEALTH_ALLOCATOR_MAX_AGE_MS {
+                let mut reused = observation.clone();
+                // Unsupported platforms keep a null age, not a measured zero.
+                reused.age_ms = observation.age_ms.map(|_| age_ms);
+                return reused;
+            }
+        }
+        let observation = crate::memory::AllocatorObservation::measure();
+        // The observation already includes time spent walking the allocator.
+        // Start the reuse clock after that walk so its duration is not counted twice.
+        *cached = Some((self.now_ms(), observation.clone()));
+        observation
     }
 
     /// Assemble outside the cache lock. Probe readers never wait for a refresh.
@@ -2081,10 +2108,8 @@ const ALLOCATOR_SLACK_KIND: &str = "address_space_not_resident";
 
 /// Build the compact memory rollup from pre-aggregated root counters. Rich
 /// subsystem detail is never constructed for roots omitted by the top-N cap.
-fn memory_rollup_metrics(
-    roots: Option<std::collections::BTreeMap<String, crate::memory::RootMemoryRollup>>,
-) -> Value {
-    let Some(roots) = roots else {
+fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) -> Value {
+    let Some(snapshot) = snapshot else {
         return json!({
             "status": "busy",
             "roots": Value::Null,
@@ -2103,7 +2128,6 @@ fn memory_rollup_metrics(
             "last_relief_rss_drop_bytes": Value::Null,
         });
     };
-    let snapshot = crate::memory::MemoryRollupSnapshot::new("ready", roots);
     let per_root: Value = snapshot
         .roots
         .iter()
@@ -2583,10 +2607,26 @@ fn build_health_diagnostic_rollup_from_actors(
     let root_count = root_details_omitted.saturating_add(roots.len());
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
-    let memory = memory_rollup_metrics(Some(memory_roots));
-    let census_snapshot = crate::memory::MemorySnapshot::new_uncapped("ready", census_roots);
-    let mut memory_census =
-        crate::commands::memory_census::render_memory_census(&census_snapshot, None);
+    let allocator = cache.allocator_observation();
+    let memory = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::new(
+        "ready",
+        memory_roots,
+        allocator.clone(),
+    )));
+    let census_snapshot = crate::memory::MemorySnapshot::new_uncapped_with_allocator(
+        "ready",
+        census_roots,
+        allocator,
+    );
+    let census_rows = cache
+        .census_rows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .render(&census_snapshot);
+    let mut memory_census = crate::commands::memory_census::render_memory_census_with_roots(
+        &census_snapshot,
+        census_rows,
+    );
     if let Some(rows) = memory_census
         .get_mut("roots")
         .and_then(Value::as_object_mut)
@@ -4242,7 +4282,10 @@ mod tests {
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let cache = HealthRollupCache::new();
         let app = crate::context::App::default_shared();
-        time("full rollup (1 root)", &|| cache.refresh(&executor, &app));
+        time("full rollup (1 root)", &|| {
+            cache.refresh_for_test(&executor, &app);
+            assert_eq!(cache.snapshot().0.metrics["root_count"], 1);
+        });
     }
 
     #[test]
@@ -4542,6 +4585,81 @@ mod tests {
         });
     }
 
+    fn allocator_rollup(cache: &HealthRollupCache) -> HealthDiagnosticRollup {
+        build_health_diagnostic_rollup_from_actors(
+            cache,
+            &Executor::new(),
+            &crate::context::App::default_shared(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn rollup_allocator_both_surfaces_share_one_measurement() {
+        let cache = HealthRollupCache::new();
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        let rollup = allocator_rollup(&cache);
+        assert_eq!(
+            crate::memory::allocator_snapshot_calls_for_test() - before,
+            1
+        );
+        assert_eq!(
+            rollup.metrics["memory"]["allocator_observation_age_ms"],
+            rollup.memory_census["process"]["allocator_observation_age_ms"]
+        );
+        assert_eq!(
+            rollup.metrics["memory"]["allocator_slack_bytes"],
+            rollup.memory_census["process"]["allocator_slack_bytes"]
+        );
+    }
+
+    #[test]
+    fn rollup_allocator_reuses_measurement_across_refreshes() {
+        let cache = HealthRollupCache::new();
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        for now_ms in [0, 3_000, 6_000, 12_000, 24_000, 27_000] {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            allocator_rollup(&cache);
+        }
+        assert_eq!(
+            crate::memory::allocator_snapshot_calls_for_test() - before,
+            1
+        );
+    }
+
+    #[test]
+    fn rollup_allocator_remeasures_expired_observation() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        allocator_rollup(&cache);
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        cache.clock_ms.store(30_001, Ordering::Relaxed);
+        allocator_rollup(&cache);
+        assert_eq!(
+            crate::memory::allocator_snapshot_calls_for_test() - before,
+            1
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn rollup_allocator_reports_reused_age_on_both_surfaces() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        let first = allocator_rollup(&cache);
+        let first_age = first.metrics["memory"]["allocator_observation_age_ms"]
+            .as_u64()
+            .expect("measured observation age");
+        cache.clock_ms.store(12_000, Ordering::Relaxed);
+        let reused = allocator_rollup(&cache);
+        for age in [
+            &reused.metrics["memory"]["allocator_observation_age_ms"],
+            &reused.memory_census["process"]["allocator_observation_age_ms"],
+        ] {
+            assert_eq!(age.as_u64(), Some(first_age + 12_000));
+        }
+    }
+
     #[test]
     fn a_rollup_estimates_each_roots_memory_once() {
         let (storage, root) = test_root("health-memory-once");
@@ -4620,10 +4738,11 @@ mod tests {
             "a new walk must reset the age: {changed_age} >= {reused_age}"
         );
         let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
-        let rendered = memory_rollup_metrics(Some(std::collections::BTreeMap::from([(
-            "/rollup-shape".to_string(),
-            rollup,
-        )])));
+        let rendered = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::new(
+            "ready",
+            std::collections::BTreeMap::from([("/rollup-shape".to_string(), rollup)]),
+            crate::memory::AllocatorObservation::measure(),
+        )));
         assert!(
             rendered["roots"]["/rollup-shape"]["memory_measured_age_ms"].is_u64(),
             "the per-root memory row must carry its age: {rendered}"
