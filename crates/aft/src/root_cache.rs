@@ -781,6 +781,7 @@ pub fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
 
 /// Sweep every generation marker below a cache directory, reusing the same
 /// PID-authoritative and cross-host-TTL liveness rules as generation GC.
+#[cfg(test)]
 pub(crate) fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
     let readers = cache_dir.join("readers");
     let entries = match fs::read_dir(&readers) {

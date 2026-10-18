@@ -1,0 +1,1 @@
+- Background bash token counts are left out when they cannot be computed, instead of panicking or reporting made-up numbers, and the tokenizer keeps Unicode input intact.

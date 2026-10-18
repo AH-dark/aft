@@ -80,11 +80,12 @@ const REFRESH_WRITER_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// A root removed from `cache-keys.json` cannot be reached by a future checkout.
 /// Wait the same seven-day grace period as cache-key eviction before deleting its
 /// callgraph directory so an interrupted configuration never loses recent data.
+#[cfg(test)]
 const CALLGRAPH_ROOT_ORPHAN_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// One publish must not spend unbounded time walking a large artifact store. The
-/// cursor resumes after this many root-keyed directories on the next publication.
-const CALLGRAPH_ROOT_SWEEP_LIMIT: usize = 200;
+/// Fixture deadline prevents a slow artifact store from monopolizing a sweep pass.
+#[cfg(test)]
 const CALLGRAPH_ROOT_SWEEP_BUDGET: Duration = Duration::from_secs(5);
+#[cfg(test)]
 static CALLGRAPH_ROOT_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 // Cold-build working-set limits are implementation constants rather than user
@@ -12009,6 +12010,7 @@ fn remove_sidecar_files(path: &Path) {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct CallgraphRootSweepSummary {
     scanned: usize,
     removed: usize,
@@ -12024,17 +12026,20 @@ struct CallgraphRootSweepSummary {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct CallgraphRootFileStats {
     newest: Option<SystemTime>,
     bytes: u64,
 }
 
+#[cfg(test)]
 enum CallgraphRootWalk {
     Complete(CallgraphRootFileStats),
     BudgetExceeded,
     Failed,
 }
 
+#[cfg(test)]
 enum CallgraphRootCandidate {
     Removed { bytes: u64 },
     GenerationGc,
@@ -12047,58 +12052,10 @@ enum CallgraphRootCandidate {
     BudgetExceeded,
 }
 
-/// Sweep root-keyed callgraph directories that were detached when cache-key
-/// eviction forgot a checkout. Generation GC alone only runs while a root
-/// publishes, so inactive roots otherwise keep every obsolete generation forever.
-///
-/// The pass reuses the index-cache liveness boundary and takes each directory's
-/// writer lease before mutating it. A current memo entry remains eligible only for
-/// superseded-generation GC; an absent entry is eligible for whole-directory
-/// deletion after the conservative age threshold.
-// Retained for the isolated age-policy fixtures. Production scheduling uses
-// storage_retention, which requires durable bind history and root absence.
-#[allow(dead_code)]
-fn sweep_orphaned_callgraph_root_dirs(callgraph_dir: &Path) {
-    let Some(storage_root) = root_storage_dir(callgraph_dir) else {
-        return;
-    };
-    let root_dir = storage_root.join(crate::root_cache::RootCacheDomain::Callgraph.as_str());
-    let memo_keys = match crate::search_index::referenced_artifact_cache_keys(&storage_root) {
-        Ok(keys) => keys,
-        Err(error) => {
-            crate::slog_warn!(
-                "callgraph root sweep root={} scanned=0 removed=0 bytes=0 generation_gc=0 skipped_memo=0 skipped_derived=0 skipped_fresh=0 skipped_reader=0 skipped_lease=0 skipped_unreadable=0 budget_exhausted=false memo_unreadable=true error={}",
-                root_dir.display(),
-                error
-            );
-            return;
-        }
-    };
-    let derived_keys = crate::search_index::derived_artifact_cache_keys();
-    let summary = sweep_callgraph_root_dirs_with_limits(
-        &root_dir,
-        &memo_keys,
-        &derived_keys,
-        CALLGRAPH_ROOT_SWEEP_BUDGET,
-        CALLGRAPH_ROOT_SWEEP_LIMIT,
-    );
-    crate::slog_info!(
-        "callgraph root sweep root={} scanned={} removed={} bytes={} generation_gc={} skipped_memo={} skipped_derived={} skipped_fresh={} skipped_reader={} skipped_lease={} skipped_unreadable={} budget_exhausted={}",
-        root_dir.display(),
-        summary.scanned,
-        summary.removed,
-        summary.bytes,
-        summary.generation_gc,
-        summary.skipped_memo,
-        summary.skipped_derived,
-        summary.skipped_fresh,
-        summary.skipped_reader,
-        summary.skipped_lease,
-        summary.skipped_unreadable,
-        summary.budget_exhausted
-    );
-}
-
+// Fixture-only sweep of aged cache roots, bounded by directory count and deadline.
+// Production eviction uses storage_retention's persistent binding history and
+// root-absence checks to avoid treating a temporarily unavailable root as orphaned.
+#[cfg(test)]
 fn sweep_callgraph_root_dirs_with_limits(
     root_dir: &Path,
     memo_keys: &HashSet<String>,
@@ -12212,6 +12169,7 @@ fn sweep_callgraph_root_dirs_with_limits(
     summary
 }
 
+#[cfg(test)]
 fn callgraph_root_candidate(
     cache_dir: &Path,
     project_key: &str,
@@ -12285,6 +12243,7 @@ fn callgraph_root_candidate(
     }
 }
 
+#[cfg(test)]
 fn sweep_live_callgraph_root_generations(
     cache_dir: &Path,
     project_key: &str,
@@ -12331,6 +12290,7 @@ fn sweep_live_callgraph_root_generations(
     }
 }
 
+#[cfg(test)]
 fn callgraph_root_file_stats(
     cache_dir: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
@@ -12354,11 +12314,13 @@ fn callgraph_root_file_stats(
     }
 }
 
+#[cfg(test)]
 enum CallgraphRootWalkError {
     BudgetExceeded,
     Failed,
 }
 
+#[cfg(test)]
 fn callgraph_root_file_stats_inner(
     directory: &Path,
     cache_dir: &Path,
@@ -12419,6 +12381,7 @@ fn callgraph_root_file_stats_inner(
     Ok(())
 }
 
+#[cfg(test)]
 fn merge_newest_callgraph_root_mtime(
     stats: &mut CallgraphRootFileStats,
     modified: Option<SystemTime>,
@@ -12430,6 +12393,7 @@ fn merge_newest_callgraph_root_mtime(
     }
 }
 
+#[cfg(test)]
 fn artifact_key_looks_valid(key: &str) -> bool {
     key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
