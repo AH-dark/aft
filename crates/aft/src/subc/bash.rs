@@ -2969,7 +2969,7 @@ mod grant_path_tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
 
@@ -3288,6 +3288,30 @@ mod grant_path_tests {
         )
     }
 
+    // The deferred result is only useful after spawn; publish its task id so
+    // the test can wait for the corresponding registry transition.
+    static PENDING_MESSAGE_TASK_ID_TX: std::sync::LazyLock<
+        std::sync::Mutex<Option<oneshot::Sender<String>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+    fn running_bash_stub_with_task_id(req: RawRequest, ctx: &AppContext) -> Response {
+        let response = running_bash_stub(req, ctx);
+        if let Some(sender) = PENDING_MESSAGE_TASK_ID_TX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let task_id = response
+                .data
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let _ = sender.send(task_id);
+        }
+        response
+    }
+
     fn observe_worker_jail(req: RawRequest, _ctx: &AppContext) -> Response {
         Response::error_with_data(
             &req.id,
@@ -3546,8 +3570,18 @@ mod grant_path_tests {
         deadline_test_call_received(executor, root, dispatch, arguments, Instant::now())
     }
 
+    fn pending_message_command() -> &'static str {
+        // Windows can select cmd.exe, PowerShell, or Git Bash at runtime.
+        if cfg!(windows) {
+            "ping -n 2 127.0.0.1"
+        } else {
+            "sleep 1"
+        }
+    }
+
     #[tokio::test]
     async fn pending_message_detach_preserves_subc_wait_mode_eligibility() {
+        const HANG_GUARD: Duration = Duration::from_secs(60);
         for wait in [true, false] {
             let (_dir, root) = super::super::test_support::test_root("pending-bash-message");
             let ctx = super::super::test_support::test_ctx();
@@ -3555,14 +3589,43 @@ mod grant_path_tests {
             registry.request_wait_mode_detach("deadline-session");
             let executor = Arc::new(Executor::new());
             executor.register_actor(root.clone(), ctx);
-            let mut arguments = json!({"command": "sleep 1", "timeout": 10_000});
+            let (task_id_tx, task_id_rx) = oneshot::channel();
+            *PENDING_MESSAGE_TASK_ID_TX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task_id_tx);
+            let mut arguments = json!({"command": pending_message_command(), "timeout": 10_000});
             if wait {
                 arguments["wait"] = json!(true);
             }
-            let mut replies = deadline_test_call(&executor, &root, running_bash_stub, arguments);
-            let completion = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            let mut replies =
+                deadline_test_call(&executor, &root, running_bash_stub_with_task_id, arguments);
+            let task_id = tokio::time::timeout(HANG_GUARD, task_id_rx)
                 .await
-                .unwrap()
+                .expect("bash stub did not publish the spawned task id")
+                .expect("bash stub dropped the task id sender");
+            assert!(!task_id.is_empty(), "bash stub did not start a task");
+            if wait {
+                tokio::time::timeout(HANG_GUARD, async {
+                    while !registry.wait_mode_detach_pending("deadline-session")
+                        && replies.is_empty()
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("pending detach was neither attached to the wait nor answered");
+            } else {
+                tokio::time::timeout(HANG_GUARD, async {
+                    while !registry.is_task_terminal(&task_id) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("bash task did not reach a terminal state");
+            }
+            let completion = tokio::time::timeout(HANG_GUARD, replies.recv())
+                .await
+                .expect("deferred bash response did not follow the task state transition")
                 .unwrap();
             let response = completion.result.unwrap().response;
             if let Some(task_id) = response.data["task_id"].as_str() {
