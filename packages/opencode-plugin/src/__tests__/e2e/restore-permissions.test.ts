@@ -142,7 +142,7 @@ describe.skipIf(!binary.binaryPath)("checkpoint restore permissions", () => {
       harnesses.push(h);
       await prepareScopedCheckpoint(h);
 
-      const { result, requests } = await executeScopedRestore(h, host, "public.txt");
+      const { result, requests } = await executeScopedRestore(h, host, { path: "public.txt" });
 
       expect(result).toContain("checkpoint restored permissions");
       expect(await Bun.file(h.path("public.txt")).text()).toBe("snapshot public.txt\n");
@@ -152,12 +152,40 @@ describe.skipIf(!binary.binaryPath)("checkpoint restore permissions", () => {
       expect(requests).toEqual([{ permission: "edit", patterns: ["public.txt"] }]);
     }, 60_000);
 
+    test(`${host} scoped restore of a file URL path asks only for public.txt`, async () => {
+      const h = await createHarness(binary);
+      harnesses.push(h);
+      await prepareScopedCheckpoint(h);
+
+      const { result, requests } = await executeScopedRestore(h, host, {
+        path: `file://${h.path("public.txt")}`,
+      });
+
+      expect(result).toContain("checkpoint restored permissions");
+      expect(await Bun.file(h.path("public.txt")).text()).toBe("snapshot public.txt\n");
+      expect(requests).toEqual([{ permission: "edit", patterns: ["public.txt"] }]);
+    }, 60_000);
+
+    test(`${host} scoped restore of file URL files asks only for public.txt`, async () => {
+      const h = await createHarness(binary);
+      harnesses.push(h);
+      await prepareScopedCheckpoint(h);
+
+      const { result, requests } = await executeScopedRestore(h, host, {
+        files: [`file://${h.path("public.txt")}`],
+      });
+
+      expect(result).toContain("checkpoint restored permissions");
+      expect(await Bun.file(h.path("public.txt")).text()).toBe("snapshot public.txt\n");
+      expect(requests).toEqual([{ permission: "edit", patterns: ["public.txt"] }]);
+    }, 60_000);
+
     test(`${host} scoped denied restore of secrets/x writes nothing`, async () => {
       const h = await createHarness(binary);
       harnesses.push(h);
       await prepareScopedCheckpoint(h);
 
-      const { result, requests } = await executeScopedRestore(h, host, "secrets/x");
+      const { result, requests } = await executeScopedRestore(h, host, { path: "secrets/x" });
 
       expect(result.toLowerCase()).toContain("denied");
       expect(await Bun.file(h.path("public.txt")).text()).toBe("current public\n");
@@ -190,11 +218,11 @@ async function prepareScopedCheckpoint(h: E2EHarness): Promise<void> {
 async function executeScopedRestore(
   h: E2EHarness,
   host: "V1" | "V2",
-  path: string,
+  scope: { path?: string; files?: string[] },
 ): Promise<{ result: string; requests: Array<{ permission: string; patterns: string[] }> }> {
   const definition = safetyTools(pluginContext(h)).aft_safety;
   const requests: Array<{ permission: string; patterns: string[] }> = [];
-  const args = { op: "restore" as const, name: "permissions", path };
+  const args = { op: "restore" as const, name: "permissions", ...scope };
 
   if (host === "V1") {
     const ask: ToolContext["ask"] = async (input) => {
