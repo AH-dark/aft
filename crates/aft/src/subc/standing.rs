@@ -117,6 +117,12 @@ impl StandingActor {
         while_held();
     }
 
+    /// Whether the one-time startup reconciliation has finished.
+    #[cfg(test)]
+    pub(super) fn startup_reconciled_for_test(&self) -> bool {
+        self.startup.is_completed()
+    }
+
     pub(super) fn new(app: Arc<App>, executor: Arc<Executor>) -> Self {
         let config = Config::default();
         #[cfg(test)]
