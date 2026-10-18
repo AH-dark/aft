@@ -266,22 +266,45 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         }
     };
 
-    let (bytes_written, write_error) = append_bytes(&mut file_handle, append_content.as_bytes());
-    let mut warnings = Vec::new();
-    if let Some(error) = write_error {
-        if bytes_written == 0 && existed {
-            return Response::error(
-                &req.id,
-                "write_error",
-                format!("edit_match append: no bytes written to {}: {}", file, error),
-            );
+    let original_len = match file_handle.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return Response::error(&req.id, "write_error", error.to_string()),
+    };
+    if let Err((error, restore_error)) =
+        append_with_rollback(&mut file_handle, append_content.as_bytes(), |file| {
+            restore_append_length(file, original_len)
+        })
+    {
+        let restored = restore_error.is_none();
+        drop(file_handle);
+        let removal_error = if !existed && restored {
+            std::fs::remove_file(path.as_path()).err()
+        } else {
+            None
+        };
+        let restore_error = restore_error.or(removal_error);
+        if restore_error.is_none() {
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), op_id);
         }
-        warnings.push(format!(
-            "Append {}wrote {} of {} bytes to {} before failing: {}. Inspect the file or undo before retrying.",
-            if existed { "" } else { "created the file and " },
-            bytes_written, append_content.len(), file, error,
-        ));
+        return Response::error(
+            &req.id,
+            "write_error",
+            format!(
+                "edit_match append: failed to write {}: {}{}",
+                file,
+                error,
+                restore_error
+                    .map(|error| format!(
+                        "; restore failed: {error}; inspect the file or undo before retrying"
+                    ))
+                    .unwrap_or_default(),
+            ),
+        );
     }
+    let bytes_written = append_content.len();
+    let mut warnings = Vec::new();
 
     #[cfg(unix)]
     if !existed {
@@ -433,6 +456,47 @@ fn append_bytes(writer: &mut impl Write, content: &[u8]) -> (usize, Option<std::
         }
     }
     (written, None)
+}
+
+fn append_with_rollback<W: Write>(
+    writer: &mut W,
+    content: &[u8],
+    restore: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> Result<(), (std::io::Error, Option<std::io::Error>)> {
+    match append_bytes(writer, content).1 {
+        Some(error) => Err((error, restore(writer).err())),
+        None => Ok(()),
+    }
+}
+
+fn restore_append_length(file: &std::fs::File, len: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            ReOpenFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Append-only handles cannot truncate on Windows. Reopen the same file
+        // object for rollback instead of resolving its mutable path again.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle() as _,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rollback = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        rollback.set_len(len)
+    }
+    #[cfg(not(windows))]
+    {
+        file.set_len(len)
+    }
 }
 
 /// Returns true if the file path contains glob characters. This is only a
@@ -1631,6 +1695,73 @@ mod replace_all_tests {
 
 #[cfg(test)]
 mod audit_regressions {
+    use super::*;
+
+    struct PartialWriter {
+        file: std::fs::File,
+        wrote: bool,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.wrote {
+                return Err(std::io::Error::other("injected partial write failure"));
+            }
+            self.wrote = true;
+            self.file.write(&bytes[..1])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    #[test]
+    fn failed_append_truncates_partial_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut writer = PartialWriter {
+            file: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            wrote: false,
+        };
+        let error = append_with_rollback(&mut writer, b"after", |writer| {
+            restore_append_length(&writer.file, 6)
+        })
+        .unwrap_err();
+        assert!(error.1.is_none(), "{:?}", error.1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn failed_append_reports_restore_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut writer = PartialWriter {
+            file: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            wrote: false,
+        };
+        let error = append_with_rollback(&mut writer, b"after", |_| {
+            Err(std::io::Error::other("restore"))
+        })
+        .unwrap_err();
+        assert_eq!(error.1.unwrap().to_string(), "restore");
+    }
+
+    #[test]
+    fn ambiguity_context_is_bounded_after_source_shortens() {
+        let index = edit::SourceLineIndex::new("é\r\ntext\n");
+        assert_eq!(index.context(0, 0), "é");
+        assert_eq!(index.context(99, 2), "");
+        assert_eq!(index.context(usize::MAX, usize::MAX), "é\ntext");
+    }
+
     #[test]
     fn fuzzy_crlf_separator_is_not_duplicated() {
         let source = "a\r\nb\r\nc\r\n";

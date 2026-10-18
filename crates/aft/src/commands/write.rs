@@ -60,8 +60,8 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // writes (file content byte-identical to original) and emit honest
     // `no_op: true` for UIs. Used by diff metadata too when requested.
     // See GitHub #45.
-    let (original, observation) = if existed {
-        match edit::read_edit_source(path.as_path()) {
+    let (original_bytes, observation) = if existed {
+        match edit::read_edit_bytes(path.as_path()) {
             Ok((content, observation)) => (content, Some(observation)),
             Err(error) => {
                 crate::slog_warn!(
@@ -69,12 +69,15 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
                     file,
                     error
                 );
-                (String::new(), None)
+                return Response::error(&req.id, "io_error", error.to_string());
             }
         }
     } else {
-        (String::new(), None)
+        (std::sync::Arc::<[u8]>::from([]), None)
     };
+    // Binary originals participate in identity and recovery, but cannot supply
+    // an honest text-diff baseline.
+    let original = std::str::from_utf8(&original_bytes).ok();
 
     if edit::wants_preview(&req.params) {
         let mut result = serde_json::json!({
@@ -82,14 +85,16 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             "created": !existed,
             "formatted": false,
         });
-        if existed && original == content {
+        if existed && original_bytes.as_ref() == content.as_bytes() {
             result["no_op"] = serde_json::json!(true);
         }
-        edit::attach_preview_diff(&mut result, &req.params, file, &original, content);
+        if let Some(original) = original {
+            edit::attach_preview_diff(&mut result, &req.params, file, original, content);
+        }
         return Response::success(&req.id, result);
     }
 
-    if existed && original == content {
+    if existed && original_bytes.as_ref() == content.as_bytes() {
         return edit::no_change_response(&req.id);
     }
 
@@ -155,13 +160,13 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Write, format, and validate via shared pipeline
-    let written = if let Some(observation) = observation.as_ref() {
+    let written = if let (Some(observation), Some(original)) = (observation.as_ref(), original) {
         edit::write_format_validate_observed(
             path.as_path(),
             content,
             &ctx.config(),
             &req.params,
-            &original,
+            original,
             observation,
         )
     } else {
@@ -241,10 +246,70 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     let final_content = write_result
         .final_content(path.as_path())
         .unwrap_or(content);
-    if existed && original == final_content {
+    if existed && original_bytes.as_ref() == final_content.as_bytes() {
         result["no_op"] = serde_json::json!(true);
     }
 
-    edit::attach_edit_diff(&mut result, &req.params, file, &original, final_content);
+    if let Some(original) = original {
+        edit::attach_edit_diff(&mut result, &req.params, file, original, final_content);
+    }
     Response::success(&req.id, result)
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn binary_write_reuses_observed_backup_and_restores_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.txt");
+        let original = [0xff, 0xfe, b'\n'];
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        crate::backup::reset_capture_read_count(&path);
+        let request: RawRequest = serde_json::from_value(serde_json::json!({"id": "binary-undo", "command": "write", "file": path, "content": "after"})).unwrap();
+        let response = handle_write(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        #[cfg(unix)]
+        assert_eq!(crate::backup::capture_read_count(&path), 1);
+        // DiskFileVersion only proves identity on Unix. Windows must read a
+        // fresh backup rather than trust bytes captured without an identity token.
+        #[cfg(windows)]
+        assert_eq!(crate::backup::capture_read_count(&path), 2);
+        let mut store = ctx.backup().lock();
+        let history = store.history(request.session(), &path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content_bytes.as_ref(), original);
+        store.record_post_mutation_states();
+        store.restore_last_operation(request.session()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn binary_write_of_empty_content_is_not_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.txt");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({"id": "binary-write", "command": "write", "file": path, "content": ""})).unwrap();
+        let response = handle_write(&request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_ne!(response.data["no_op"], true);
+        assert!(response.data.get("diff").is_none());
+    }
 }

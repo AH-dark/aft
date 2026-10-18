@@ -323,8 +323,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 captures.insert(dest_path.to_path_buf(), capture);
                 content
             }
-            Ok(None) => std::fs::read_to_string(dest_path).unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(None) => match std::fs::read_to_string(dest_path) {
+                Ok(content) => content,
+                Err(error) => return Response::error(&req.id, "io_error", error.to_string()),
+            },
+            Err(error) => return Response::error(&req.id, "io_error", error.to_string()),
         }
     } else {
         String::new()
@@ -483,7 +486,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Create checkpoint (D105) ---
-    let checkpoint_name = format!("move_symbol-{symbol_name}");
+    let checkpoint_name = format!("move_symbol-{symbol_name}-{op_id}");
     {
         let mut all_files: Vec<PathBuf> = vec![source_path.to_path_buf()];
         if dest_path.exists() {
@@ -854,6 +857,93 @@ fn compute_relative_dir(from: &Path, to: &Path) -> String {
     }
 }
 
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn repeated_symbol_moves_keep_distinct_recovery_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.ts");
+        let middle = dir.path().join("middle.ts");
+        let destination = dir.path().join("destination.ts");
+        std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let mut names = Vec::new();
+        for (from, to) in [(&source, &middle), (&middle, &destination)] {
+            let request = serde_json::from_value(serde_json::json!({"id": "move", "command": "move_symbol", "file": from, "destination": to, "symbol": "moved"})).unwrap();
+            let response = handle_move_symbol(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            names.push(
+                response.data["checkpoint_name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn move_symbol_preserves_non_utf8_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.ts");
+        let destination = dir.path().join("destination.ts");
+        let original = "export function moved() { return 1; }\n";
+        std::fs::write(&source, original).unwrap();
+        std::fs::write(&destination, [0xff, 0xfe]).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({"id": "binary-destination", "command": "move_symbol", "file": source, "destination": destination, "symbol": "moved"})).unwrap();
+        let response = handle_move_symbol(&request, &ctx);
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(std::fs::read(&destination).unwrap(), [0xff, 0xfe]);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), original);
+    }
+
+    #[test]
+    fn dotted_module_names_resolve_without_losing_suffix() {
+        let consumer = Path::new("project/consumer.ts");
+        assert!(import_path_matches_file(
+            "./user.service",
+            consumer,
+            Path::new("project/user.service.ts")
+        ));
+        assert!(!import_path_matches_file(
+            "./user.service",
+            consumer,
+            Path::new("project/user.ts")
+        ));
+        assert!(import_path_matches_file(
+            "./user.service.ts",
+            consumer,
+            Path::new("project/user.service.ts")
+        ));
+        assert!(import_path_matches_file(
+            "./user.service",
+            consumer,
+            Path::new("project/user.service/index.ts")
+        ));
+    }
+}
+
 /// Check if a path string refers to the same file as `target`, accounting for
 /// relative path variations (with or without extension, ./ prefix, etc.).
 fn import_path_matches_file(import_module: &str, consumer_file: &Path, target_file: &Path) -> bool {
@@ -872,7 +962,9 @@ fn import_path_matches_file(import_module: &str, consumer_file: &Path, target_fi
 
     // Try adding common extensions
     for ext in &["ts", "tsx", "js", "jsx"] {
-        let with_ext = resolved.with_extension(ext);
+        let mut name = resolved.as_os_str().to_os_string();
+        name.push(format!(".{ext}"));
+        let with_ext = std::path::PathBuf::from(name);
         if paths_equivalent(&with_ext, target_file) {
             return true;
         }

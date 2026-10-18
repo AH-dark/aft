@@ -1305,6 +1305,41 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     response
 }
 
+struct ReadWindow {
+    start: u32,
+    end: Option<u64>,
+    limit: u32,
+}
+
+/// Normalize zero placeholders and line bounds once so physical reads and
+/// hashline snapshots select the same 1-based window.
+fn read_window(req: &RawRequest) -> Result<ReadWindow, Response> {
+    let positive = |field: &str| -> Result<Option<u32>, Response> {
+        req.params
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    Response::error(
+                        &req.id,
+                        "invalid_request",
+                        format!(
+                            "read: '{field}' exceeds the maximum line value {}",
+                            u32::MAX
+                        ),
+                    )
+                })
+            })
+            .transpose()
+    };
+    Ok(ReadWindow {
+        start: positive("start_line")?.unwrap_or(1),
+        end: positive("end_line")?.map(u64::from),
+        limit: positive("limit")?.unwrap_or(DEFAULT_LIMIT),
+    })
+}
+
 fn read_selection(
     req: &RawRequest,
     response: &Response,
@@ -1327,23 +1362,13 @@ fn read_selection(
         };
     }
 
-    let start = req
-        .params
-        .get("start_line")
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as usize;
-    let explicit_end = req
-        .params
-        .get("end_line")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0);
+    let Ok(window) = read_window(req) else {
+        return crate::hashline::snapshot::ReadSelection::WholeFile;
+    };
+    let start = window.start as usize;
+    let explicit_end = window.end;
     if req.params.get("start_line").is_some() || explicit_end.is_some() {
-        let limit = req
-            .params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_LIMIT as u64) as usize;
+        let limit = window.limit as usize;
         let end = explicit_end
             .map(|value| value as usize)
             .unwrap_or_else(|| start.saturating_add(limit).saturating_sub(1));
@@ -1353,12 +1378,7 @@ fn read_selection(
     if response.data.get("total_lines").and_then(Value::as_u64) == Some(0) {
         crate::hashline::snapshot::ReadSelection::WholeFile
     } else {
-        crate::hashline::snapshot::ReadSelection::Head(
-            req.params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_LIMIT as u64) as usize,
-        )
+        crate::hashline::snapshot::ReadSelection::Head(window.limit as usize)
     }
 }
 
@@ -1551,26 +1571,13 @@ fn handle_text_or_binary_read(
     // Parse range parameters. Zero is outside the 1-based domain of every
     // range field, so a `0` placeholder counts as absent rather than selecting
     // an empty window (a zero limit or end line would read no lines at all).
-    let limit = req
-        .params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .filter(|v| *v > 0)
-        .map(|v| v as u32)
-        .unwrap_or(DEFAULT_LIMIT);
-
-    let start_line = req
-        .params
-        .get("start_line")
-        .and_then(|v| v.as_u64())
-        .map(|v| v.max(1) as u32)
-        .unwrap_or(1);
-
-    let explicit_end_line = req
-        .params
-        .get("end_line")
-        .and_then(|v| v.as_u64())
-        .filter(|v| *v > 0);
+    let window = match read_window(req) {
+        Ok(window) => window,
+        Err(response) => return response,
+    };
+    let limit = window.limit;
+    let start_line = window.start;
+    let explicit_end_line = window.end;
     let has_explicit_range = req.params.get("start_line").is_some()
         || explicit_end_line.is_some()
         || req.params.get("limit").is_some();
@@ -2153,7 +2160,9 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         .or_else(|| number("offset"))
         .unwrap_or(1)
         .max(1);
-    let requested_limit = number("limit").unwrap_or(MAX_DIRECTORY_ENTRIES as u64);
+    let requested_limit = number("limit")
+        .filter(|value| *value > 0)
+        .unwrap_or(MAX_DIRECTORY_ENTRIES as u64);
     let limit = requested_limit.min(MAX_DIRECTORY_ENTRIES as u64) as usize;
     let end = number("end_line").or_else(|| number("endLine"));
     let count = end
@@ -2704,6 +2713,63 @@ mod tests {
             !text.contains("File is large"),
             "ranged read must not carry the soft note, got: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+    use crate::hashline::snapshot::ReadSelection;
+
+    #[test]
+    fn zero_read_parameters_select_the_physical_read_window() {
+        let response = Response::success("selection", serde_json::json!({"total_lines": 2}));
+        let request = serde_json::from_value(
+            serde_json::json!({"id": "selection", "command": "read", "start_line": 0, "limit": 2}),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_selection(&request, &response),
+            ReadSelection::Range { start: 1, end: 2 }
+        ));
+        let request = serde_json::from_value(
+            serde_json::json!({"id": "selection", "command": "read", "limit": 0}),
+        )
+        .unwrap();
+        assert!(
+            matches!(read_selection(&request, &response), ReadSelection::Head(lines) if lines == DEFAULT_LIMIT as usize)
+        );
+    }
+
+    #[test]
+    fn oversized_read_parameters_do_not_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, "first\nsecond\n").unwrap();
+        for field in ["start_line", "end_line", "limit"] {
+            let mut value = serde_json::json!({"id": "oversized", "command": "read"});
+            value[field] = serde_json::json!(u64::from(u32::MAX) + 2);
+            let request = serde_json::from_value(value).unwrap();
+            let response = handle_text_or_binary_read(&request, &path, 13, false, &mut None);
+            assert!(
+                !response.success,
+                "{field} must be rejected: {:?}",
+                response.data
+            );
+        }
+    }
+
+    #[test]
+    fn zero_directory_limit_uses_default_window() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("entry.txt"), "text").unwrap();
+        let request = serde_json::from_value(
+            serde_json::json!({"id": "directory", "command": "read", "limit": 0}),
+        )
+        .unwrap();
+        let response = handle_directory(&request, dir.path());
+        assert!(response.success);
+        assert_eq!(response.data["entries"][0], "entry.txt");
     }
 }
 
