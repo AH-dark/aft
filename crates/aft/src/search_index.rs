@@ -6503,6 +6503,7 @@ pub fn artifact_cache_key_with_memo(
 pub(crate) struct ArtifactCacheKeyTimings {
     pub(crate) git_usable: Duration,
     pub(crate) rev_list: Duration,
+    /// Git processes actually started, including unborn-branch verification.
     pub(crate) git_spawns: usize,
     pub(crate) retry_wait: Duration,
     pub(crate) memo_wait: Duration,
@@ -7659,7 +7660,6 @@ fn git_root_commit_once_real(
     if !time_cache_key_work(&mut timings.git_usable, crate::developer_tools::git_usable) {
         return RootCommitProbe::NotARepo;
     }
-    timings.git_spawns += 1;
     #[cfg(test)]
     ROOT_COMMIT_GIT_RUNS.with(|runs| {
         *runs
@@ -7668,10 +7668,13 @@ fn git_root_commit_once_real(
             .or_default() += 1;
     });
     // The rev_list timing also covers the extra Git checks that verify an
-    // unborn branch, since they are part of deciding this probe's answer.
+    // unborn branch, since they are part of deciding this probe's answer, and
+    // git_spawns counts every Git process the probe actually started.
+    let mut spawned = 0;
     let result = time_cache_key_work(&mut timings.rev_list, || {
-        crate::git_probe::root_commits(project_root)
+        crate::git_probe::root_commits(project_root, &mut spawned)
     });
+    timings.git_spawns += spawned;
     match result {
         Ok(stdout) => canonicalize_root_commit_output(&stdout),
         Err(crate::git_probe::ProbeError::Spawn(error)) => {
@@ -9262,10 +9265,13 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        let mut timings = ArtifactCacheKeyTimings::default();
         assert!(matches!(
-            git_root_commit_once_real(dir.path(), &mut ArtifactCacheKeyTimings::default()),
+            git_root_commit_once_real(dir.path(), &mut timings),
             RootCommitProbe::NoCommit
         ));
+        // rev-list, then git-dir, verify, symbolic-ref and two git-path checks.
+        assert_eq!(timings.git_spawns, 6);
         assert!(matches!(
             repo_root_commit_with_retry(dir.path()),
             RootCommitResolution::NotARepo

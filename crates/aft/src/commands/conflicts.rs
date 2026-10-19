@@ -31,7 +31,7 @@ fn git_toplevel(base_path: &Path) -> Result<PathBuf, String> {
     if !crate::developer_tools::git_usable() {
         return Err(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
     }
-    let stdout = match crate::git_probe::toplevel(working_dir) {
+    let stdout = match crate::git_probe::toplevel_in_directory(working_dir) {
         Ok(stdout) => stdout,
         Err(crate::git_probe::ProbeError::Spawn(error)) => {
             return Err(format!("failed to run git: {error}"));
@@ -83,19 +83,20 @@ fn discover_conflicted_files(
     let mut seen = HashSet::new();
     let mut unmerged_files = HashSet::new();
 
-    let output = match crate::git_probe::probe(&toplevel, &["ls-files", "--unmerged", "-z"]) {
-        Ok(stdout) => stdout,
-        Err(crate::git_probe::ProbeError::Spawn(error)) => {
-            return Err(format!("failed to run git: {error}"));
-        }
-        Err(crate::git_probe::ProbeError::Failed { kind, output }) => {
-            if kind == crate::git_probe::FailureKind::NotRepository {
-                return Err("not a git repository".to_string());
+    let output =
+        match crate::git_probe::probe_in_directory(&toplevel, &["ls-files", "--unmerged", "-z"]) {
+            Ok(stdout) => stdout,
+            Err(crate::git_probe::ProbeError::Spawn(error)) => {
+                return Err(format!("failed to run git: {error}"));
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("git ls-files failed: {}", stderr.trim()));
-        }
-    };
+            Err(crate::git_probe::ProbeError::Failed { kind, output }) => {
+                if kind == crate::git_probe::FailureKind::NotRepository {
+                    return Err("not a git repository".to_string());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("git ls-files failed: {}", stderr.trim()));
+            }
+        };
 
     for record in output.split(|byte| *byte == b'\0') {
         // Format: "<mode> <hash> <stage>\t<filename>\0"
@@ -438,6 +439,21 @@ mod tests {
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
     use crate::protocol::RawRequest;
+
+    /// With a relative PATH entry, `git` must still be found relative to the
+    /// project folder, where this probe has always started its child.
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entry_finds_git_from_the_project_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_for_test(&dir.path().join("bin"), "/stub-toplevel");
+        let path = crate::git_probe::relative_bin_path_for_test();
+        let toplevel = crate::git_probe::with_child_env_for_test(&[("PATH", &path)], || {
+            git_toplevel(dir.path())
+        })
+        .unwrap();
+        assert_eq!(toplevel, PathBuf::from("/stub-toplevel"));
+    }
 
     /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
     /// repository" message. That is damaged metadata, not proof of absence.

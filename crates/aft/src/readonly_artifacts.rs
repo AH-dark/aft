@@ -513,7 +513,7 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
     if !crate::developer_tools::git_usable() {
         return Err("not_a_git_root".to_string());
     }
-    let stdout = match crate::git_probe::toplevel(base_dir) {
+    let stdout = match crate::git_probe::toplevel_in_directory(base_dir) {
         Ok(stdout) => stdout,
         Err(crate::git_probe::ProbeError::Spawn(error)) => {
             return Err(format!("failed to run git: {error}"));
@@ -549,6 +549,21 @@ mod tests {
     use crate::context::BORROWED_INDEX_CACHE_CAPACITY;
     use crate::search_index::artifact_cache_key;
     use crate::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
+
+    /// With a relative PATH entry, `git` must still be found relative to the
+    /// project folder, where this probe has always started its child.
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entry_finds_git_from_the_project_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_for_test(&dir.path().join("bin"), "/stub-toplevel");
+        let path = crate::git_probe::relative_bin_path_for_test();
+        let toplevel = crate::git_probe::with_child_env_for_test(&[("PATH", &path)], || {
+            git_toplevel(dir.path())
+        })
+        .unwrap();
+        assert_eq!(toplevel, PathBuf::from("/stub-toplevel"));
+    }
 
     /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
     /// repository" message. That is damaged metadata, not proof of absence.
