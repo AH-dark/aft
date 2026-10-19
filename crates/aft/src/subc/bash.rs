@@ -980,6 +980,13 @@ pub(super) fn submit_deferred_bash(
 ) {
     let reply_budget = reply_budget.into();
     let received_at = reply_budget.received_at;
+    // Granted permissions resume a call after a prompt, which may outlast the
+    // startup allowance. Start admission now, but keep the caller's reply clock.
+    let startup_started_at = if permissions_granted.is_some() {
+        Instant::now()
+    } else {
+        received_at
+    };
     #[cfg(test)]
     let timing_for_test = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone());
     #[cfg(test)]
@@ -1094,7 +1101,8 @@ pub(super) fn submit_deferred_bash(
         )
     }
     .min(20_000);
-    let startup_deadline = reply_budget.cap(received_at + Duration::from_millis(startup_window));
+    let startup_deadline =
+        reply_budget.cap(startup_started_at + Duration::from_millis(startup_window));
     let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(startup_deadline));
     let receipt_for_spawn = Arc::clone(&receipt);
     let admitted = Arc::new(AtomicBool::new(false));
@@ -5763,6 +5771,124 @@ mod grant_path_tests {
         with_task_io_fault(TaskIoFault::StartingHook(hold_startup_checkpoint), || {
             running_bash_stub(req, ctx)
         })
+    }
+
+    #[cfg(unix)]
+    async fn approved_startup_call(client_window: Duration) -> StartupCall {
+        let (dir, root) = super::super::test_support::test_root("bash-approved-startup");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let route = route_key(1, 1);
+        // A first-party spawn principal isolates startup timing from the native
+        // sandbox helper executable, which is not built by lib-only tests.
+        let identity = super::super::test_support::route_identity(&root, DEADLINE_SESSION);
+        // Backdate receipt instead of sleeping through the permission prompt.
+        let received_at = Instant::now() - Duration::from_secs(25);
+        let reply_budget = crate::commands::blocking_wait::ReplyBudget::new(
+            received_at,
+            Some(received_at + client_window),
+        );
+        let prompt_deadline = received_at + Duration::from_secs(60);
+        assert!(Instant::now() < prompt_deadline);
+        let mut pending = HashMap::from([(
+            ReverseCorrKey { route, corr: 2 },
+            PendingBashAsk {
+                route,
+                tool_corr: 1,
+                tool_flags: control_flags(),
+                tool_ver: PROTOCOL_VERSION,
+                root: root.clone(),
+                project_root: root.as_path().into(),
+                session_id: identity.session.clone(),
+                spawn_principal: identity.spawn_principal.clone(),
+                edit_slot_survives: None,
+                call_key: None,
+                request_id: "approved-startup".into(),
+                arguments: json!({
+                    "command": "printf ran > started-command; printf approval-complete",
+                    "timeout": 5000,
+                    "wait": true,
+                }),
+                format_context: crate::subc_format::FormatContext::default(),
+                cancel: BashWaitCancel {
+                    run_scope: None,
+                    scope: None,
+                    late_results: false,
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                grants: Vec::new(),
+                repeat: None,
+                worker_session: false,
+                worker_preset: false,
+                reply_budget,
+                asked_at: received_at,
+                expires_at: reply_budget.cap(prompt_deadline),
+            },
+        )]);
+        let approval = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Response,
+            control_flags(),
+            route.channel,
+            route.epoch,
+            2,
+            serde_json::to_vec(&json!({"decision": "allow"})).unwrap(),
+        )
+        .unwrap();
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
+        let (completion_tx, rx) = mpsc::channel(8);
+        let (touch_tx, _) = mpsc::channel(8);
+        handle_bash_elicitation_reply(
+            &writer_tx,
+            &approval,
+            &mut pending,
+            &HashMap::from([(route, identity)]),
+            &mut HashMap::new(),
+            &executor,
+            &Arc::new(Notify::new()),
+            &completion_tx,
+            &touch_tx,
+            &Arc::new(DispatchPathMetrics::new()),
+            &mut HashMap::new(),
+            running_bash_stub,
+        )
+        .await
+        .unwrap();
+        assert!(pending.is_empty(), "approval must consume the pending ask");
+        StartupCall { dir, ctx, rx }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_approval_after_25_seconds_starts_within_60_second_prompt_limit() {
+        let mut call = approved_startup_call(Duration::from_secs(180)).await;
+        let done = first_reply(&mut call, Duration::from_secs(10)).await;
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("approval-complete"));
+        assert!(call.dir.path().join("started-command").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_approval_without_reply_budget_refuses_startup() {
+        // A 48 s client window reserves half for reply delivery, leaving no
+        // startup time when approval arrives at 25 s, even before prompt expiry.
+        let mut call = approved_startup_call(Duration::from_secs(48)).await;
+        let done = first_reply(&mut call, Duration::from_secs(10)).await;
+        assert_not_started_refusal(done.response_for_test());
+        assert_never_started(&call);
     }
 
     fn startup_call(
