@@ -407,6 +407,13 @@ fn read_bounded_to_string<R: Read>(mut reader: R, limit: usize) -> (String, bool
 /// TTL for tool availability and resolution cache entries.
 const TOOL_CACHE_TTL: Duration = Duration::from_secs(60);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuffAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ToolCacheKey {
     command: String,
@@ -417,8 +424,9 @@ static TOOL_RESOLUTION_CACHE: std::sync::LazyLock<
     Mutex<HashMap<ToolCacheKey, (Option<PathBuf>, Instant)>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static TOOL_AVAILABILITY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (bool, Instant)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static TOOL_AVAILABILITY_CACHE: std::sync::LazyLock<
+    Mutex<HashMap<String, (RuffAvailability, Instant)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn tool_cache_key(command: &str, project_root: Option<&Path>) -> ToolCacheKey {
     ToolCacheKey {
@@ -676,41 +684,54 @@ pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Optio
     resolve_tool_uncached(tool, project_root).is_some()
 }
 
-fn ruff_format_available(project_root: Option<&Path>) -> bool {
+fn ruff_format_available(project_root: Option<&Path>) -> RuffAvailability {
+    ruff_format_availability_with_probe(project_root, || {
+        ruff_format_available_uncached(project_root)
+    })
+}
+
+fn ruff_format_availability_with_probe(
+    project_root: Option<&Path>,
+    probe: impl FnOnce() -> RuffAvailability,
+) -> RuffAvailability {
     let key = availability_cache_key("ruff-format", project_root);
     if let Ok(cache) = TOOL_AVAILABILITY_CACHE.lock() {
-        if let Some((available, checked_at)) = cache.get(&key) {
+        if let Some((availability, checked_at)) = cache.get(&key) {
             if checked_at.elapsed() < TOOL_CACHE_TTL {
-                return *available;
+                return *availability;
             }
         }
     }
 
-    let result = ruff_format_available_uncached(project_root);
-    if let Ok(mut cache) = TOOL_AVAILABILITY_CACHE.lock() {
-        cache.insert(key, (result, Instant::now()));
+    let result = probe();
+    if result != RuffAvailability::Unknown {
+        if let Ok(mut cache) = TOOL_AVAILABILITY_CACHE.lock() {
+            cache.insert(key, (result, Instant::now()));
+        }
     }
     result
 }
 
-fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
+fn ruff_format_available_uncached(project_root: Option<&Path>) -> RuffAvailability {
     let command = match resolve_tool("ruff", project_root) {
         Some(command) => command,
-        None => return false,
+        None => return RuffAvailability::Unavailable,
     };
     let version_command = match external_tool_command(&command, &["--version"]) {
         Ok(command) => command,
-        Err(_) => return false,
+        Err(_) => return RuffAvailability::Unavailable,
     };
     ruff_version_command_available(version_command, Instant::now() + AVAILABILITY_PROBE_BUDGET)
 }
 
-fn ruff_version_command_available(version_command: Command, deadline: Instant) -> bool {
+fn ruff_version_command_available(version_command: Command, deadline: Instant) -> RuffAvailability {
     let output = match capture_probe_command(version_command, "ruff", deadline, || {
         crate::executor::current_job_cancelled()
     }) {
-        Ok(output) if !output.truncated => output,
-        _ => return false,
+        Ok(output) if output.truncated => return RuffAvailability::Unknown,
+        Ok(output) => output,
+        Err(FormatError::Timeout { .. }) => return RuffAvailability::Unknown,
+        Err(_) => return RuffAvailability::Unavailable,
     };
 
     let version_str = output.stdout;
@@ -732,19 +753,20 @@ fn ruff_version_command_available(version_command: Command, deadline: Instant) -
                 "ruff formatter version check could not parse {:?}; require >= 0.1.2",
                 version_part
             );
-            return false;
+            return RuffAvailability::Unavailable;
         }
     };
 
     // Require >= 0.1.2 where ruff format became stable.
-    let available = (major, minor, patch) >= (0, 1, 2);
-    if !available {
+    if (major, minor, patch) < (0, 1, 2) {
         crate::slog_warn!(
             "ruff formatter version {} is too old for `ruff format`; require >= 0.1.2",
             version_part
         );
+        RuffAvailability::Unavailable
+    } else {
+        RuffAvailability::Available
     }
-    available
 }
 
 fn resolve_candidate_tool(
@@ -1617,6 +1639,8 @@ fn formatter_excluded_path(stderr: &str) -> bool {
 ///   detected for the language in the project
 /// - `"formatter_not_installed"` — configured formatter binary missing on
 ///   PATH and not in project's `node_modules/.bin`
+/// - `"formatter_version_check_timeout"` — Ruff did not answer its version check
+///   before the probe deadline
 /// - `"formatter_excluded_path"` — formatter ran but refused to process this
 ///   path because the project formatter config (e.g. biome.json `files.includes`,
 ///   prettier `.prettierignore`) excludes it. NOT an error in AFT or the user's
@@ -1670,12 +1694,24 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     // immediately before the user/agent-initiated format operation—not during
     // configure or warm-time availability detection. The availability cache
     // makes a burst of formats probe once for this project generation.
-    if formatter_tool == "ruff" && !ruff_format_available(config.project_root.as_deref()) {
-        crate::slog_warn!(
-            "format: {} (skipped: formatter_not_installed: ruff; version gate requires >= 0.1.2)",
-            path.display()
-        );
-        return (false, Some("formatter_not_installed".to_string()));
+    if formatter_tool == "ruff" {
+        match ruff_format_available(config.project_root.as_deref()) {
+            RuffAvailability::Available => {}
+            RuffAvailability::Unavailable => {
+                crate::slog_warn!(
+                    "format: {} (skipped: formatter_not_installed: ruff; version gate requires >= 0.1.2)",
+                    path.display()
+                );
+                return (false, Some("formatter_not_installed".to_string()));
+            }
+            RuffAvailability::Unknown => {
+                crate::slog_warn!(
+                    "format: {} (skipped: formatter_version_check_timeout: ruff)",
+                    path.display()
+                );
+                return (false, Some("formatter_version_check_timeout".to_string()));
+            }
+        }
     }
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -2787,7 +2823,10 @@ mod tests {
     fn ruff_availability_does_not_accept_a_probe_after_its_deadline() {
         let mut command = Command::new("sh");
         command.args(["-c", "printf 'ruff 0.1.2\\n'"]);
-        assert!(!ruff_version_command_available(command, Instant::now()));
+        assert_eq!(
+            ruff_version_command_available(command, Instant::now()),
+            RuffAvailability::Unknown
+        );
     }
 
     #[cfg(unix)]
@@ -2798,10 +2837,84 @@ mod tests {
             "-c",
             "printf 'ruff 0.1.2\\n'; head -c 5000 /dev/zero | tr '\\000' ' '",
         ]);
-        assert!(!ruff_version_command_available(
-            command,
-            Instant::now() + AVAILABILITY_PROBE_BUDGET
-        ));
+        assert_eq!(
+            ruff_version_command_available(command, Instant::now() + AVAILABILITY_PROBE_BUDGET),
+            RuffAvailability::Unknown
+        );
+    }
+
+    #[test]
+    fn ruff_availability_unknown_result_is_not_cached() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+
+        assert_eq!(
+            ruff_format_availability_with_probe(Some(dir.path()), || {
+                calls += 1;
+                RuffAvailability::Unknown
+            }),
+            RuffAvailability::Unknown
+        );
+        assert_eq!(
+            ruff_format_availability_with_probe(Some(dir.path()), || {
+                calls += 1;
+                RuffAvailability::Available
+            }),
+            RuffAvailability::Available
+        );
+        assert_eq!(calls, 2, "the unknown probe must be retried");
+    }
+
+    #[test]
+    fn ruff_availability_completed_negative_result_is_cached() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+
+        for _ in 0..2 {
+            assert_eq!(
+                ruff_format_availability_with_probe(Some(dir.path()), || {
+                    calls += 1;
+                    RuffAvailability::Unavailable
+                }),
+                RuffAvailability::Unavailable
+            );
+        }
+        assert_eq!(calls, 1, "a completed unavailable result should be cached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_format_ruff_version_check_timeout_has_distinct_skip_reason() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ruff.toml"), "\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("ruff");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exec sleep 10; fi\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("main.py");
+        fs::write(&path, "print('hello')\n").unwrap();
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            format_on_edit: true,
+            ..Config::default()
+        };
+
+        let (formatted, reason) = auto_format(&path, &config);
+        assert!(!formatted);
+        assert_eq!(reason.as_deref(), Some("formatter_version_check_timeout"));
     }
 
     #[cfg(unix)]
@@ -4229,7 +4342,10 @@ C:\repo\other.go:1:1: other file
             ..Config::default()
         };
 
-        assert!(!ruff_format_available(config.project_root.as_deref()));
+        assert_eq!(
+            ruff_format_available(config.project_root.as_deref()),
+            RuffAvailability::Unavailable
+        );
         let (cmd, args) = detect_type_checker(&path, LangId::Python, &config).unwrap();
         assert!(cmd.ends_with("ruff"), "expected ruff checker, got: {cmd}");
         assert_eq!(args[0], "check");
