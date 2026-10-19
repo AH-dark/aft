@@ -207,12 +207,13 @@ fn perf_sweep_native_child_deadline_and_output_bound() {
     let start = Instant::now();
     let error = child_output(
         Path::new("/bin/sh"),
-        &["-c", "sleep 5"],
+        &["-c", "printf 'sampler stalled' >&2; sleep 5"],
         start + Duration::from_millis(100),
         100,
     )
     .unwrap_err();
     assert!(error.starts_with("timeout:"), "{error}");
+    assert!(error.contains("sampler stalled"), "{error}");
     assert!(start.elapsed() < Duration::from_secs(2));
     let error = child_output(
         Path::new("/bin/sh"),
@@ -233,45 +234,196 @@ fn perf_sweep_native_child_deadline_and_output_bound() {
         b"12345678"
     );
 }
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
-#[ignore = "requires a built aft CLI and macOS sampling permission"]
-fn perf_sweep_macos_profile_child_no_daemon_fork() {
+fn perf_sweep_child_stderr_tail_keeps_cause_and_stdout_separate() {
+    let payload = format!(
+        "discarded-head{}specific sampler failure",
+        "x".repeat(STDERR_BYTES * 4)
+    );
+    let error = child_output(
+        Path::new("/bin/sh"),
+        &["-c", "printf '%s' \"$1\" >&2; exit 17", "sh", &payload],
+        Instant::now() + Duration::from_secs(2),
+        128,
+    )
+    .unwrap_err();
+    assert!(error.starts_with("exit: child"), "{error}");
+    assert!(error.contains("stderr tail (truncated)"), "{error}");
+    assert!(error.ends_with("specific sampler failure"), "{error}");
+    assert!(!error.contains("discarded-head"));
+    assert!(error.len() <= STDERR_BYTES + 128);
+    let bytes = child_output(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "printf 'debug artifact warning' >&2; printf '{\"threads\":[]}'",
+        ],
+        Instant::now() + Duration::from_secs(2),
+        128,
+    )
+    .unwrap();
+    assert_eq!(profile_result(Ok(bytes)).unwrap(), json!({"threads":[]}));
+}
+
+#[cfg(unix)]
+#[test]
+fn perf_sweep_symbolication_failure_is_named_gap_with_stderr_and_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("daemon.log");
+    std::fs::write(&log, FIXTURE).unwrap();
+    let report = collect(
+        &Args {
+            since_ms: SINCE,
+            profile_seconds: 1,
+        },
+        &log,
+        LOG_BYTES,
+        LOG_LINES,
+        || {
+            profile_result(child_output(Path::new("/bin/sh"), &["-c", "printf 'could not find a DWARF/debug file; the unsymbolicated sample was kept at /tmp/sample.txt' >&2; exit 1"], Instant::now() + Duration::from_secs(2), 128))
+        },
+    );
+    let gap = report["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["name"] == "profile_symbolication_failed")
+        .expect("symbolication failure must be a named gap");
+    assert!(gap["detail"]
+        .as_str()
+        .unwrap()
+        .contains("stderr tail:\ncould not find a DWARF/debug file"));
+    assert_eq!(report["threads"], json!([]));
+    assert_eq!(report["log"]["error"], 1);
+    assert!(report["rss_bytes"].as_u64().unwrap() > 0);
+}
+
+#[cfg(target_os = "macos")]
+fn host_executable() -> PathBuf {
+    let supplied = PathBuf::from(
+        std::env::var_os("AFT_PERF_TEST_EXE").expect("set AFT_PERF_TEST_EXE to the built aft CLI"),
+    );
+    std::fs::canonicalize(&supplied)
+        .or_else(|_| {
+            // cargo test normally starts in the member crate, but the documented
+            // relative target path is rooted at the workspace that built the CLI.
+            std::fs::canonicalize(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(&supplied),
+            )
+        })
+        .expect("AFT_PERF_TEST_EXE must name a built aft CLI")
+}
+
+#[cfg(target_os = "macos")]
+struct HostTarget(std::process::Child);
+#[cfg(target_os = "macos")]
+impl Drop for HostTarget {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+#[cfg(target_os = "macos")]
+fn host_profile(exe: &Path, root: &Path, dsym: &Path) -> Result<Value, String> {
     use std::process::{Command, Stdio};
     // libtest cannot answer the profiler's --version probe. Keep a real CLI
-    // waiting on stdin as the target, with an explicit local debug artifact.
-    let exe =
-        std::env::var_os("AFT_PERF_TEST_EXE").expect("set AFT_PERF_TEST_EXE to the built aft CLI");
-    let dir = tempfile::tempdir().unwrap();
-    let mut target = Command::new(&exe)
-        .current_dir(dir.path())
-        .env("AFT_STORAGE_DIR", dir.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    // waiting on stdin as the target, with an isolated working/storage directory.
+    let target = HostTarget(
+        Command::new(exe)
+            .current_dir(root)
+            .env("AFT_STORAGE_DIR", root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
-        child_output(
-            Path::new(&exe),
+        profile_result(child_output(
+            exe,
             &[
                 "profile",
                 "--pid",
-                &target.id().to_string(),
+                &target.0.id().to_string(),
                 "--seconds",
                 "1",
                 "--dsym",
-                Path::new(&exe).to_str().unwrap(),
+                dsym.to_str().unwrap(),
                 "--json",
             ],
             Instant::now() + Duration::from_secs(20),
             PROFILE_BYTES,
-        )
+        ))
     });
-    let _ = target.kill();
-    let _ = target.wait();
     assert_eq!(forks, 0, "the daemon must never fork to sample itself");
-    let profile: Value =
-        serde_json::from_slice(&result.expect("real profile child must return JSON")).unwrap();
+    result
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a built aft CLI, dsymutil and macOS sampling permission"]
+fn perf_sweep_macos_profile_child_no_daemon_fork() {
+    let exe = host_executable();
+    let dir = tempfile::tempdir().unwrap();
+    let dsym = dir.path().join("aft.dSYM");
+    let output = std::process::Command::new("/usr/bin/dsymutil")
+        .arg(&exe)
+        .arg("-o")
+        .arg(&dsym)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dsymutil: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let profile =
+        host_profile(&exe, dir.path(), &dsym).expect("real profile child must return JSON");
     assert!(!summarize_profile(profile).unwrap().0.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a built aft CLI and macOS sampling permission"]
+fn perf_sweep_macos_profile_child_missing_dsym_is_named_gap() {
+    let exe = host_executable();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("daemon.log");
+    std::fs::write(&log, FIXTURE).unwrap();
+    // An explicitly empty bundle bypasses staged caches and downloads, making
+    // the missing-artifact case deterministic without altering production lookup.
+    let missing = dir.path().join("empty.dSYM");
+    std::fs::create_dir(&missing).unwrap();
+    let report = collect(
+        &Args {
+            since_ms: SINCE,
+            profile_seconds: 1,
+        },
+        &log,
+        LOG_BYTES,
+        LOG_LINES,
+        || host_profile(&exe, dir.path(), &missing),
+    );
+    let gap = report["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["name"] == "profile_symbolication_failed")
+        .expect("missing dSYM must be reported as a named gap");
+    let detail = gap["detail"].as_str().unwrap();
+    assert!(detail.contains("stderr tail:"), "{detail}");
+    assert!(
+        detail.contains("could not find a DWARF/debug file"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("unsymbolicated sample was kept"),
+        "{detail}"
+    );
+    assert_eq!(report["threads"], json!([]));
+    assert_eq!(report["log"]["error"], 1);
+    assert!(report["rss_bytes"].as_u64().unwrap() > 0);
 }

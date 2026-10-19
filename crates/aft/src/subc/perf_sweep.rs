@@ -16,6 +16,8 @@ pub(super) const DISPATCH_BUDGET: Duration = Duration::from_secs(55);
 const LOG_BYTES: u64 = 8 * 1024 * 1024;
 const LOG_LINES: usize = 100_000;
 const PROFILE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(unix)]
+const STDERR_BYTES: usize = 16 * 1024;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static IMAGE: OnceLock<Result<RunningImage, String>> = OnceLock::new();
 struct RunningImage {
@@ -435,7 +437,7 @@ fn profile(seconds: u32, limit: Instant) -> Result<Value, String> {
     }
     let exe = &image.path;
     let deadline = (Instant::now() + Duration::from_secs(u64::from(seconds) + 5)).min(limit);
-    let bytes = child_output(
+    profile_result(child_output(
         &exe,
         &[
             "profile",
@@ -447,8 +449,19 @@ fn profile(seconds: u32, limit: Instant) -> Result<Value, String> {
         ],
         deadline,
         PROFILE_BYTES,
-    )
-    .map_err(|gap| format!("profile_{gap}"))?;
+    ))
+}
+
+fn profile_result(result: Result<Vec<u8>, String>) -> Result<Value, String> {
+    let bytes = result.map_err(|error| {
+        // The CLI preserves an unsymbolicated sample only after debug-artifact
+        // lookup or symbolication fails. Sampling failures keep their own cause.
+        if error.starts_with("exit:") && error.contains("unsymbolicated sample") {
+            format!("profile_symbolication_failed: {error}")
+        } else {
+            format!("profile_{error}")
+        }
+    })?;
     serde_json::from_slice(&bytes).map_err(|e| format!("profile_invalid: {e}"))
 }
 
@@ -497,23 +510,107 @@ fn child_output(_: &Path, _: &[&str], _: Instant, _: usize) -> Result<Vec<u8>, S
 }
 
 #[cfg(unix)]
+struct ChildCapture {
+    read: File,
+    bytes: Vec<u8>,
+    cap: usize,
+    tail: bool,
+    truncated: bool,
+    eof: bool,
+}
+
+#[cfg(unix)]
+impl ChildCapture {
+    fn pair(cap: usize, tail: bool) -> io::Result<(Self, File)> {
+        use std::os::fd::OwnedFd;
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        read.set_nonblocking(true)?;
+        Ok((
+            Self {
+                read: File::from(OwnedFd::from(read)),
+                bytes: Vec::new(),
+                cap,
+                tail,
+                truncated: false,
+                eof: false,
+            },
+            File::from(OwnedFd::from(write)),
+        ))
+    }
+
+    /// Bound each turn so a noisy stderr cannot starve stdout or the deadline.
+    fn drain(&mut self, deadline: Instant) -> Result<bool, String> {
+        if self.eof {
+            return Ok(false);
+        }
+        let mut buffer = [0u8; 8192];
+        for _ in 0..4 {
+            if Instant::now() >= deadline {
+                return Err("timeout: child exceeded its hard deadline".into());
+            }
+            let limit = if self.tail {
+                buffer.len()
+            } else {
+                self.cap
+                    .saturating_sub(self.bytes.len())
+                    .saturating_add(1)
+                    .min(buffer.len())
+            };
+            match self.read.read(&mut buffer[..limit]) {
+                Ok(0) => {
+                    self.eof = true;
+                    return Ok(false);
+                }
+                Ok(n) if self.tail => {
+                    let omitted = (self.bytes.len() + n).saturating_sub(self.cap);
+                    self.truncated |= omitted > 0;
+                    if n >= self.cap {
+                        self.bytes.clear();
+                        self.bytes.extend_from_slice(&buffer[n - self.cap..n]);
+                    } else {
+                        self.bytes.drain(..omitted);
+                        self.bytes.extend_from_slice(&buffer[..n]);
+                    }
+                }
+                Ok(n) => {
+                    if self.bytes.len() + n > self.cap {
+                        return Err(format!("output_limit: child exceeded {} bytes", self.cap));
+                    }
+                    self.bytes.extend_from_slice(&buffer[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("read: {e}")),
+            }
+        }
+        Ok(true)
+    }
+
+    fn failure(&self, reason: String) -> String {
+        if self.bytes.is_empty() {
+            return format!("{reason}; stderr: <empty>");
+        }
+        format!(
+            "{reason}; stderr tail{}:\n{}",
+            if self.truncated { " (truncated)" } else { "" },
+            String::from_utf8_lossy(&self.bytes)
+        )
+    }
+}
+
+#[cfg(unix)]
 fn child_output(
     exe: &Path,
     args: &[&str],
     deadline: Instant,
     cap: usize,
 ) -> Result<Vec<u8>, String> {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     // An explicit native-only spawn refuses unavailable backends rather than
     // silently forking a daemon thread that may hold allocator locks.
-    let (read, write) =
-        std::os::unix::net::UnixStream::pair().map_err(|e| format!("spawn: {e}"))?;
-    read.set_nonblocking(true)
-        .map_err(|e| format!("spawn: {e}"))?;
-    let (mut read, write) = (
-        File::from(OwnedFd::from(read)),
-        File::from(OwnedFd::from(write)),
-    );
+    let (mut stdout, out) = ChildCapture::pair(cap, false).map_err(|e| format!("spawn: {e}"))?;
+    let (mut stderr, err) =
+        ChildCapture::pair(STDERR_BYTES, true).map_err(|e| format!("spawn: {e}"))?;
     let null = File::options()
         .read(true)
         .write(true)
@@ -527,84 +624,59 @@ fn child_output(
         false,
         &crate::posix_spawn::PipeIo {
             gated_stdin: false,
-            stdout: &write,
-            stderr: &null,
+            stdout: &out,
+            stderr: &err,
             exit: null.as_raw_fd(),
             failure: null.as_raw_fd(),
         },
     )
     .ok_or("spawn: posix_spawn backend unavailable (fork refused)")?
     .map_err(|e| format!("spawn: {e}"))?;
-    drop(write);
+    drop((out, err));
     let result = (|| {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 8192];
-        let mut eof = false;
         loop {
+            stderr.drain(deadline)?;
+            stdout.drain(deadline)?;
             if Instant::now() >= deadline {
                 return Err("timeout: child exceeded its hard deadline".into());
             }
-            loop {
-                let remaining = cap
-                    .saturating_sub(output.len())
-                    .saturating_add(1)
-                    .min(buffer.len());
-                match read.read(&mut buffer[..remaining]) {
-                    Ok(0) => {
-                        eof = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        if output.len() + n > cap {
-                            return Err(format!("output_limit: child exceeded {cap} bytes"));
-                        }
-                        output.extend_from_slice(&buffer[..n]);
-                        if Instant::now() >= deadline {
-                            return Err("timeout: child exceeded its hard deadline".into());
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(format!("read: {e}")),
-                }
-            }
             if let Some(status) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
+                // The child may have written between the preceding drain and
+                // waitpid. Drain available bytes, without waiting on descendants.
+                while stderr.drain(deadline)? {}
+                while stdout.drain(deadline)? {}
                 if !status.success() {
                     return Err(format!("exit: child {status}"));
                 }
-                // A reaped child has closed stdout. Drain the bounded pipe once
-                // more to include bytes written between read and waitpid.
-                loop {
-                    let remaining = cap
-                        .saturating_sub(output.len())
-                        .saturating_add(1)
-                        .min(buffer.len());
-                    match read.read(&mut buffer[..remaining]) {
-                        Ok(0) => return Ok(output),
-                        Ok(n) => {
-                            if output.len() + n > cap {
-                                return Err(format!("output_limit: child exceeded {cap} bytes"));
-                            }
-                            output.extend_from_slice(&buffer[..n]);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(output),
-                        Err(e) => return Err(format!("read: {e}")),
-                    }
-                }
+                return Ok(());
             }
-            let mut poll = libc::pollfd {
-                fd: if eof { -1 } else { read.as_raw_fd() },
-                events: libc::POLLIN,
-                revents: 0,
-            };
+            let mut poll = [
+                libc::pollfd {
+                    fd: if stdout.eof {
+                        -1
+                    } else {
+                        stdout.read.as_raw_fd()
+                    },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: if stderr.eof {
+                        -1
+                    } else {
+                        stderr.read.as_raw_fd()
+                    },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
             let wait_ms = deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis()
                 .min(50) as i32;
-            // SAFETY: poll points to one initialized descriptor for this call.
+            // SAFETY: poll points to the two initialized descriptors for this call.
             unsafe {
-                libc::poll(&mut poll, 1, wait_ms);
+                libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, wait_ms);
             }
         }
     })();
@@ -617,6 +689,8 @@ fn child_output(
     }
     let _ = child.wait();
     result
+        .map(|()| stdout.bytes)
+        .map_err(|reason| stderr.failure(reason))
 }
 
 #[cfg(test)]

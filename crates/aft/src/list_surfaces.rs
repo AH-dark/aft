@@ -402,9 +402,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/perf_sweep.rs",
-        enclosing_item: "summarize_profile, child_output",
+        enclosing_item: "summarize_profile, child_output, ChildCapture::drain",
         location_or_primitive: "top eight threads, first stack, leaf frame and child-output ceilings",
-        reason: "flow-only profile summary preserves the sweep script's preview limits with threads_total; bounded child output is refused as a named gap rather than returned partially",
+        reason: "flow-only profile summary preserves the sweep script's preview limits with threads_total; bounded child stdout is refused as a named gap rather than returned partially, and a marked bounded stderr tail preserves the failure cause",
     },
     ExclusionEntry {
         file: "url_fetch.rs",
