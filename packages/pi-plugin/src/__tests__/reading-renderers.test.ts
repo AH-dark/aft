@@ -183,4 +183,40 @@ describe("reading renderers", () => {
     expect(rendered).toContain("export function run() {}");
     expect(rendered).toContain("symbol not found");
   });
+
+  test("renderZoomResult caps call annotations and labels caller scope", () => {
+    const calls = (prefix: string, count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        name: `${prefix}${String(index + 1).padStart(2, "0")}`,
+        line: index + 1,
+      }));
+    const rendered = renderToString(
+      renderZoomResult(
+        makeResult("", {
+          name: "target",
+          kind: "function",
+          range: { start_line: 1, end_line: 1 },
+          content: "function target() {}",
+          annotations: {
+            calls_out: calls("callee", 17),
+            called_by: calls("caller", 18),
+          },
+        }),
+        { path: "sample.ts", symbol: "target" },
+        mockTheme,
+        makeContext({ path: "sample.ts", symbol: "target" }),
+      ),
+    );
+
+    expect(rendered).toContain("callee01:1");
+    expect(rendered).toContain("callee15:15");
+    expect(rendered).not.toContain("callee16:16");
+    expect(rendered).toContain("+2 more");
+    expect(rendered).toContain("caller01:1");
+    expect(rendered).toContain("caller15:15");
+    expect(rendered).not.toContain("caller16:16");
+    expect(rendered).toContain("+3 more");
+    expect(rendered).toContain("called_by (this file)");
+    expect(rendered.indexOf("calls out")).toBeLessThan(rendered.indexOf("called_by (this file)"));
+  });
 });

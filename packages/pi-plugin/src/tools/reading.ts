@@ -138,6 +138,25 @@ function zoomExtraCallSites(call: Record<string, unknown>): string {
     : "";
 }
 
+const ZOOM_CALL_ANNOTATION_LIMIT = 15;
+
+function renderZoomAnnotationSection(
+  label: string,
+  calls: Record<string, unknown>[],
+  theme: Theme,
+): string {
+  const rendered = calls
+    .slice(0, ZOOM_CALL_ANNOTATION_LIMIT)
+    .map(
+      (call) =>
+        `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
+    );
+  if (calls.length > ZOOM_CALL_ANNOTATION_LIMIT) {
+    rendered.push(`  +${calls.length - ZOOM_CALL_ANNOTATION_LIMIT} more`);
+  }
+  return `${theme.fg("muted", label)}\n${rendered.join("\n")}`;
+}
+
 /** Exported for renderer unit tests. */
 export function buildOutlineSections(text: string, theme: Theme): string[] {
   const trimmed = text.trim();
@@ -178,26 +197,10 @@ function renderZoomRecord(
   const callsOut = annotations ? asRecords(annotations.calls_out) : [];
   const calledBy = annotations ? asRecords(annotations.called_by) : [];
   if (callsOut.length > 0) {
-    lines.push(
-      `${theme.fg("muted", "calls out")}`,
-      callsOut
-        .map(
-          (call) =>
-            `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
-        )
-        .join("\n"),
-    );
+    lines.push(renderZoomAnnotationSection("calls out", callsOut, theme));
   }
   if (calledBy.length > 0) {
-    lines.push(
-      `${theme.fg("muted", "called by")}`,
-      calledBy
-        .map(
-          (call) =>
-            `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
-        )
-        .join("\n"),
-    );
+    lines.push(renderZoomAnnotationSection("called_by (this file)", calledBy, theme));
   }
 
   return lines.join("\n");
