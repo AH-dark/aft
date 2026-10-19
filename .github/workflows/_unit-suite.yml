@@ -1137,6 +1137,15 @@ jobs:
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
 
+      # Reuse the just-linked library harness before uploading the archive, which
+      # omits its PDB. Keep both subprocess probes serial and out of the shards
+      # so the backtrace assertion has local symbols without a second build.
+      - name: Run the serial TLS probe from the archive build
+        run: cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess
+
+      - name: Run the serial backtrace probe with local PDB
+        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
@@ -1235,10 +1244,6 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Rust libtest shard (nextest archive)
-        # Run `platform_verifier_tls_client_subprocess` once in shard one before
-        # hash partitioning. Its spawned system-trust check can hang when other
-        # tests contend with machine trust evaluation.
-        #
         # The gate writes AFT_GATE_LOG itself; do not pipe it through `tee`.
         # On Windows a process a test leaks inherits the write end of every
         # pipe above it, so `tee` never saw end-of-file and the step hung past
@@ -1249,7 +1254,7 @@ jobs:
           AFT_GATE_LOG: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
-          AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
+          AFT_GATE_PHASES: lib-shard
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"

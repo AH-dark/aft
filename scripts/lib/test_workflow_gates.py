@@ -232,6 +232,39 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertNotIn("paths", workflow_gates.on_section(workflow)["push"])
 
 
+class WindowsUnitWorkflowTests(unittest.TestCase):
+    def test_windows_serial_probes_run_once_in_archive_builder(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        archive = suite["jobs"]["unit-windows-nextest-archive"]
+        commands = [step.get("run", "") for step in archive["steps"]]
+        build = next(i for i, command in enumerate(commands) if command.startswith("cargo nextest archive "))
+        proof = commands.index("python scripts/rust-test-inventory-proof.py")
+
+        for probe in (
+            "platform_verifier_tls_client_subprocess",
+            "panic_hook_preserves_default_backtrace_behavior_and_persists",
+        ):
+            command = f"cargo test -p agent-file-tools --lib {probe}"
+            self.assertEqual(commands.count(command), 1, f"archive must run {probe} exactly once")
+            self.assertLess(build, commands.index(command))
+            self.assertLess(commands.index(command), proof)
+            for job_id in suite["jobs"]:
+                if job_id.startswith("unit-windows-") and job_id != "unit-windows-nextest-archive":
+                    self.assertNotIn(probe, workflow_job(job_id))
+
+    def test_windows_libtest_shards_select_only_archive_partitions(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        shard = suite["jobs"]["unit-windows-libtest-shard"]
+        gate = next(step for step in shard["steps"] if "./scripts/rust-test-gate.sh" in step.get("run", ""))
+        self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "lib-shard")
+        self.assertEqual(gate["env"]["AFT_UNIT_TEST_RUNNER"], "nextest")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/3")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/windows-nextest.tar.zst")
+        self.assertEqual(shard["needs"], "unit-windows-nextest-archive")
+
+
 class MacOSUnitWorkflowTests(unittest.TestCase):
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
