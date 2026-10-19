@@ -14556,6 +14556,10 @@ mod tests {
             SemanticIndex::build(&root, std::slice::from_ref(&source), &mut local_embed, 64)
                 .expect("build baseline semantic index");
         let config = semantic_refresh_test_config(&server.base_url);
+        // Answer embeddings immediately: a refresh that wrongly embeds the
+        // file then completes and fails the input-count assertion below,
+        // instead of hanging on a held response.
+        server.release_responses();
         let ctx = test_context();
         let generation = ctx.configure_generation();
         let (request_tx, request_rx) = crossbeam_channel::unbounded();
@@ -14567,7 +14571,10 @@ mod tests {
                 .expect("construct semantic refresh model"),
             config.max_batch_size,
             config.max_files,
-            Duration::from_millis(300),
+            // Far longer than any scheduler stall, so the restore below always
+            // lands inside the window. The test closes the window itself by
+            // disconnecting the request channel, which ends the wait at once.
+            Duration::from_secs(600),
             true,
             None,
             request_rx,
@@ -14588,28 +14595,46 @@ mod tests {
                 paths: vec![source.clone()],
             })
             .expect("queue file refresh");
+        // Correctness does not depend on this pause. It gives a worker that
+        // skipped the quiet window time to read the transient content, so
+        // that regression fails here rather than racing the restore.
         std::thread::sleep(Duration::from_millis(100));
         std::fs::write(&source, original).expect("restore original source");
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "the worker must not start a file refresh before its quiet window closes"
+        );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        drop(request_tx);
+        // Hang guard only: the window is already closed, so the refresh runs
+        // now and normally completes in milliseconds.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut completed = false;
-        while Instant::now() < deadline {
-            match event_rx.recv_timeout(Duration::from_millis(100)) {
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match event_rx.recv_timeout(remaining) {
                 Ok(SemanticRefreshEvent::Completed { .. }) => {
                     completed = true;
                     break;
                 }
-                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Ok(SemanticRefreshEvent::Failed { error, .. }) => {
+                    panic!("quiet-window file refresh failed: {error}")
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
-        assert!(completed, "quiet-window file refresh did not complete");
+        assert!(
+            completed,
+            "quiet-window file refresh did not complete within the 60 s hang guard"
+        );
         assert_eq!(
             server.non_probe_input_count(),
             0,
             "content restored before the quiet window closed must reuse cached vectors"
         );
-        drop(request_tx);
         worker.join().expect("semantic refresh worker joins");
     }
 
