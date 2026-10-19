@@ -910,6 +910,13 @@ impl SynapseState {
         }
         let options = ConsumerOptions {
             call_timeout: self.call_timeout,
+            // AFT replaces the consumer and route together under the shared slot
+            // lock. Disable SDK reconnects so a retired consumer cannot race that
+            // replacement by authenticating a second, unused connection.
+            reconnect_backoff: subc_client_rs::RetryBackoff {
+                max_attempts: 0,
+                ..Default::default()
+            },
             ..ConsumerOptions::default()
         };
         let consumer = SubcConsumer::connect(&self.connection_file, options)
