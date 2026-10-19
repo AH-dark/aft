@@ -1321,7 +1321,11 @@ fn format_glob_skip_reasons_note(reasons: Option<&Value>) -> Option<String> {
         .filter(|reason| {
             matches!(
                 *reason,
-                "formatter_not_installed" | "formatter_excluded_path" | "timeout" | "error"
+                "formatter_not_installed"
+                    | "formatter_version_check_timeout"
+                    | "formatter_excluded_path"
+                    | "timeout"
+                    | "error"
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -4976,5 +4980,22 @@ mod run_scope_status_tests {
             false,
         );
         assert_eq!(ordinary, "Task bash-dead: killed");
+    }
+}
+
+#[cfg(test)]
+mod glob_skip_reason_note_tests {
+    use super::format_glob_skip_reasons_note;
+    use serde_json::json;
+
+    #[test]
+    fn version_check_timeout_is_reported_in_the_glob_note() {
+        let note = format_glob_skip_reasons_note(Some(&json!([
+            "formatter_version_check_timeout",
+            "unsupported_language"
+        ])))
+        .expect("a version-check timeout is actionable");
+        assert!(note.contains("formatter_version_check_timeout"), "{note}");
+        assert!(!note.contains("unsupported_language"), "{note}");
     }
 }
