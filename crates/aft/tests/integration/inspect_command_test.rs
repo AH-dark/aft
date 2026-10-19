@@ -5226,6 +5226,46 @@ fn external_error(file: &Path) -> StoredDiagnostic {
 }
 
 #[test]
+fn scoped_diagnostics_external_directory_without_workspace_marker_counts_unchecked_files() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root) = fixture_project();
+    let files = [
+        write_file(&external_root, "first.ts", "export const first = 1;\n"),
+        write_file(&external_root, "second.ts", "export const second = 2;\n"),
+    ];
+    let ctx = configured_context(&root);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-rootless-directory",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": external_root,
+            "topK": 20,
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    for file in files {
+        let file = crate::helpers::canonicalize_like_product(&file);
+        assert!(
+            response["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "uncovered_file"
+                    && gap["file"] == diagnostic_path(&file)
+                    && gap["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("outside_project_root_unverified"))
+                    && gap["cause"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("no workspace root marker found"))
+            }),
+            "{response:#}"
+        );
+    }
+}
+
+#[test]
 fn scoped_diagnostics_external_directory_counts_reported_files_and_keeps_rows() {
     let (_temp, root) = fixture_project();
     let (_external, external_root, broken) = external_typescript_fixture();
@@ -5251,12 +5291,28 @@ fn scoped_diagnostics_external_directory_counts_reported_files_and_keeps_rows() 
     );
 
     assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["scope_files"], 4, "{response:#}");
     assert_eq!(
-        response["summary"]["diagnostics"]["errors"], 1,
+        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"], 1,
         "{response:#}"
     );
-    assert_eq!(response["complete"], true, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], false, "{response:#}");
+    for name in ["package.json", "tsconfig.json"] {
+        assert!(
+            response["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "uncovered_file"
+                    && gap["file"] == diagnostic_path(&external_root.join(name))
+                    && gap["cause"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("no workspace root marker found"))
+            }),
+            "rootless JSON producer must remain unchecked: {response:#}"
+        );
+    }
     assert!(
         response["details"]["diagnostics"]
             .as_array()
@@ -5292,7 +5348,7 @@ fn scoped_diagnostics_external_directory_names_unreported_file_gap() {
     );
 
     assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["scope_files"], 4, "{response:#}");
     assert_eq!(response["complete"], false, "{response:#}");
     assert!(
         response["gaps"].as_array().unwrap().iter().any(|gap| {
@@ -5332,12 +5388,16 @@ fn scoped_diagnostics_external_directory_and_file_are_counted_once() {
     );
 
     assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["scope_files"], 4, "{response:#}");
     assert_eq!(
-        response["summary"]["diagnostics"]["errors"], 1,
+        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"], 1,
         "{response:#}"
     );
-    assert_eq!(response["complete"], true, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], false, "{response:#}");
 }
 
 #[test]

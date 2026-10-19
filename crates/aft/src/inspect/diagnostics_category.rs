@@ -1,7 +1,8 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
@@ -169,6 +170,7 @@ struct DiagnosticsCollection {
     /// gap, so it never makes the payload incomplete.
     not_applicable: BTreeMap<String, String>,
     scope_coverage_gaps: Vec<ScopedCoverageGap>,
+    scope_walk_truncated: bool,
     /// Whether the producer wait has ended. Settlement alone does not prove
     /// diagnostics authority: a quiescent server may not have reported yet.
     producers_settled: bool,
@@ -219,7 +221,7 @@ pub(crate) fn run_diagnostics_category(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     scope_was_provided: bool,
-    scope_candidates: Option<&[PathBuf]>,
+    scope_candidates: Option<&ScopedCoverageCandidates>,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
     not_applicable: &[NotApplicableServer],
@@ -234,9 +236,10 @@ pub(crate) fn run_diagnostics_category(
     let scoped = scope_was_provided.then(|| {
         let candidates = scope_candidates.map_or_else(
             || scoped_coverage_candidates(snapshot, scope, &snapshot.config, sweep_deadline),
-            <[PathBuf]>::to_vec,
+            Clone::clone,
         );
         let producer_keys = candidates
+            .files
             .iter()
             .flat_map(|file| producer_keys_for_file(file, &snapshot.config, &snapshot.project_root))
             .collect::<HashSet<_>>();
@@ -280,6 +283,7 @@ pub(crate) fn run_diagnostics_category(
                 &snapshot.config,
                 &snapshot.project_root,
                 &candidates
+                    .files
                     .iter()
                     .filter(|file| !saved.values().any(|check| check.covers(file)))
                     .cloned()
@@ -307,7 +311,9 @@ pub(crate) fn run_diagnostics_category(
             snapshot,
             expected_producers,
             scoped.as_ref().map(|(_, producer_keys)| producer_keys),
-            scoped.as_ref().map(|(files, _)| files.as_slice()),
+            scoped
+                .as_ref()
+                .map(|(candidates, _)| candidates.files.as_slice()),
         )
     };
     collection.indexing_gaps = indexing_gaps
@@ -394,9 +400,13 @@ pub(crate) fn run_diagnostics_category(
             .diagnostics
             .retain(|row| !check.covers(&row.diagnostic.file));
         if let Some((candidates, _)) = &scoped {
-            collection
-                .saved_files
-                .extend(candidates.iter().filter(|file| check.covers(file)).cloned());
+            collection.saved_files.extend(
+                candidates
+                    .files
+                    .iter()
+                    .filter(|file| check.covers(file))
+                    .cloned(),
+            );
         }
         for (file, diagnostics) in check.diagnostics {
             let rows = diagnostics
@@ -450,10 +460,10 @@ pub(crate) fn run_diagnostics_category(
 
     if let Some((candidates, _)) = &scoped {
         collection.apply_scope(scope);
-        collection.record_scope_coverage_gaps(ctx, snapshot, candidates, sweep.as_ref());
-        // Per-file coverage gaps make the scoped verdict self-certifying:
-        // every scoped file is either covered by an authoritative report or
-        // named as a gap, so the payload is honest without waiting on global
+        collection.scope_walk_truncated = !candidates.walk_complete;
+        collection.record_scope_coverage_gaps(ctx, snapshot, &candidates.files, sweep.as_ref());
+        // Per-file gaps account for enumerated files; a truncated walk adds a
+        // separate gap for files we could not inventory. Neither needs global
         // quiescence signals that may describe files outside the scope.
         let uncovered = collection
             .scope_coverage_gaps
@@ -466,7 +476,7 @@ pub(crate) fn run_diagnostics_category(
         // File inventory is independent of analysis: warm collection performs
         // no sweep, and another scanner may exhaust its budget before reporting
         // a count. Keep uncovered files from being mistaken for an empty scope.
-        payload["scope_files"] = serde_json::json!(candidates.len());
+        payload["scope_files"] = serde_json::json!(candidates.files.len());
         if let Some(sweep) = sweep.as_mut() {
             // Files with authoritative diagnostics, counted the same way the
             // gap list is built, so the coverage line and the gap lines
@@ -700,12 +710,64 @@ fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> Scope
     ScopedFileCoverage::NoReport
 }
 
+#[derive(Clone)]
+pub(crate) struct ScopedCoverageCandidates {
+    pub files: Vec<PathBuf>,
+    pub walk_complete: bool,
+}
+
+/// Track budget rejection separately from iterator exhaustion: both end a walk,
+/// but only exhaustion proves the inventory is complete.
+#[derive(Clone)]
+pub(crate) struct ScopeWalkBudget {
+    deadline: Instant,
+    entry_limit: usize,
+    visited: Arc<AtomicUsize>,
+    truncated: Arc<AtomicBool>,
+}
+
+impl ScopeWalkBudget {
+    pub(crate) fn new(deadline: Option<Instant>) -> Self {
+        Self::with_entry_limit(deadline, 200_000)
+    }
+
+    fn with_entry_limit(deadline: Option<Instant>, entry_limit: usize) -> Self {
+        Self {
+            deadline: deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)),
+            entry_limit,
+            visited: Arc::new(AtomicUsize::new(0)),
+            truncated: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn keep_walking(&self) -> bool {
+        let allowed = Instant::now() < self.deadline
+            && self.visited.fetch_add(1, Ordering::Relaxed) < self.entry_limit;
+        if !allowed {
+            self.truncated.store(true, Ordering::Relaxed);
+        }
+        allowed
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        !self.truncated.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn scope_walk_gap() -> Value {
+    serde_json::json!({
+        "kind": "analysis_incomplete",
+        "producer": "scoped file walk",
+        "reason": "scope_walk_truncated: the scoped file walk reached its entry limit or deadline; file counts are lower bounds and unvisited files remain unchecked; narrow scope or retry aft_inspect",
+    })
+}
+
 /// Enumerate the files a scoped diagnostics verdict must cover.
 ///
 /// Explicit file roots are always candidates: naming a file is a direct claim
 /// on its diagnostics, including the "no producer applies" case. Directory
 /// roots use the bounded project-file walker and the same ignore rules as the
-/// project census;
+/// project census and the language-server discovery exclusions;
 /// only files with a registered producer are candidates there, because
 /// directories inevitably contain non-code files nobody expects diagnostics
 /// for. In-root files a tsconfig excludes are skipped. Explicit external files
@@ -715,7 +777,16 @@ pub(crate) fn scoped_coverage_candidates(
     scope: &JobScope,
     config: &Config,
     deadline: Option<Instant>,
-) -> Vec<PathBuf> {
+) -> ScopedCoverageCandidates {
+    scoped_coverage_candidates_with_budget(snapshot, scope, config, ScopeWalkBudget::new(deadline))
+}
+
+fn scoped_coverage_candidates_with_budget(
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+    config: &Config,
+    budget: ScopeWalkBudget,
+) -> ScopedCoverageCandidates {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
     } else {
@@ -728,10 +799,7 @@ pub(crate) fn scoped_coverage_candidates(
     let mut candidates = BTreeSet::new();
     // A directory's raw entries, not just its recognized source files, must
     // consume the budget so an ignored or unsupported tree cannot stall inspect.
-    let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
-    let visited = std::sync::Arc::new(AtomicUsize::new(0));
     let mut tsconfig_membership = TsconfigMembershipCache::new();
-    const WALK_ENTRY_LIMIT: usize = 200_000;
     for root in roots {
         if root.is_file() {
             if root.starts_with(&snapshot.project_root)
@@ -742,21 +810,23 @@ pub(crate) fn scoped_coverage_candidates(
             candidates.insert(root);
             continue;
         }
-        if Instant::now() >= deadline {
-            continue;
-        }
-
-        let walk_visited = std::sync::Arc::clone(&visited);
-        let walker = crate::callgraph::walk_project_paths_while(&root, move || {
-            Instant::now() < deadline
-                && walk_visited.fetch_add(1, Ordering::Relaxed) < WALK_ENTRY_LIMIT
-        });
+        let walk_budget = budget.clone();
+        let walk_root = root.clone();
+        let walker = crate::callgraph::walk_project_paths_while(
+            &root,
+            move |path| {
+                let depth = path
+                    .strip_prefix(&walk_root)
+                    .map_or(0, |path| path.components().count());
+                !crate::lsp::roots::skip_in_server_walk(
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    depth,
+                )
+            },
+            move || walk_budget.keep_walking(),
+        );
         for path in walker {
-            let has_producer = if path.starts_with(&snapshot.project_root) {
-                !servers_for_file(&path, config).is_empty()
-            } else {
-                !producer_keys_for_file(&path, config, &snapshot.project_root).is_empty()
-            };
+            let has_producer = !servers_for_file(&path, config).is_empty();
             if tsconfig_membership.should_skip_diagnostics(&path) || !has_producer {
                 continue;
             }
@@ -764,7 +834,10 @@ pub(crate) fn scoped_coverage_candidates(
         }
     }
 
-    candidates.into_iter().collect()
+    ScopedCoverageCandidates {
+        files: candidates.into_iter().collect(),
+        walk_complete: budget.complete(),
+    }
 }
 
 /// The language servers that would analyze the files of a request scope.
@@ -773,6 +846,7 @@ pub(crate) fn scope_producer_keys(
     scope: &JobScope,
 ) -> HashSet<ServerKey> {
     scoped_coverage_candidates(snapshot, scope, &snapshot.config, None)
+        .files
         .iter()
         .flat_map(|file| producer_keys_for_file(file, &snapshot.config, &snapshot.project_root))
         .collect()
@@ -819,7 +893,7 @@ impl DiagnosticsCollection {
 
     fn record_unscoped_failure_files(&mut self, snapshot: &InspectSnapshot, scope: &JobScope) {
         let candidates = scoped_coverage_candidates(snapshot, scope, &snapshot.config, None);
-        for file in candidates {
+        for file in candidates.files {
             for key in producer_keys_for_file(&file, &snapshot.config, &snapshot.project_root) {
                 if self.producer_failures_by_key.contains_key(&key) {
                     self.producer_failure_files
@@ -1037,6 +1111,7 @@ impl DiagnosticsCollection {
         self.is_reportable()
             && self.producer_failures.is_empty()
             && self.scope_coverage_gaps.is_empty()
+            && !self.scope_walk_truncated
             && self.checking_producers.is_empty()
     }
 
@@ -1166,6 +1241,9 @@ impl DiagnosticsCollection {
                 },
             })
         }));
+        if self.scope_walk_truncated {
+            gaps.push(scope_walk_gap());
+        }
         for (producer, root) in self.servers_pending {
             let reason = self
                 .indexing_gaps
@@ -2003,7 +2081,8 @@ mod ignore_rule_candidate_tests {
             &snapshot.config,
             None,
         );
-        fixture::relative_set(&root, &files)
+        assert!(files.walk_complete);
+        fixture::relative_set(&root, &files.files)
     }
 
     #[test]
@@ -2016,5 +2095,94 @@ mod ignore_rule_candidate_tests {
         let plain_files = candidates(plain.path());
         fixture::assert_honours_ignore_rules(&plain_files, "non-git diagnostics candidates");
         assert_eq!(plain_files, candidates(git.path()));
+    }
+
+    #[test]
+    fn scoped_candidate_entry_limit_reports_incomplete_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        for index in 0..10 {
+            std::fs::write(root.join(format!("unsupported-{index}.txt")), "text").unwrap();
+        }
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-inspect"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let scope = JobScope::for_project(root);
+        let files = super::scoped_coverage_candidates_with_budget(
+            &snapshot,
+            &scope,
+            &snapshot.config,
+            super::ScopeWalkBudget::with_entry_limit(None, 4),
+        );
+        assert!(files.files.is_empty());
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let outcome = super::run_diagnostics_category(
+            &ctx,
+            &snapshot,
+            &scope,
+            true,
+            Some(&files),
+            true,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            Vec::new(),
+        );
+        let crate::inspect::job::JobOutcome::Fresh { payload } = outcome else {
+            panic!("expected diagnostics payload");
+        };
+        assert_eq!(payload["complete"], false, "{payload:#}");
+        assert!(
+            payload["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "analysis_incomplete" && gap["producer"] == "scoped file walk"
+            }),
+            "{payload:#}"
+        );
+    }
+
+    #[test]
+    fn scoped_candidate_deadline_retains_incomplete_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-inspect"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let files = scoped_coverage_candidates(
+            &snapshot,
+            &JobScope::for_project(root),
+            &snapshot.config,
+            Some(std::time::Instant::now()),
+        );
+        assert!(files.files.is_empty());
+        assert!(!files.walk_complete);
+    }
+
+    #[test]
+    fn scoped_candidates_skip_nested_server_fixture_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("main.ts"), "export const main = 1;").unwrap();
+        for directory in ["fixtures", "testdata", "spikes"] {
+            let nested = temp.path().join(directory).join("workspace");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("package.json"), "{}").unwrap();
+            std::fs::write(nested.join("nested.ts"), "export const nested = 1;").unwrap();
+        }
+        assert_eq!(candidates(temp.path()), ["main.ts".to_string()].into());
+        assert_eq!(
+            candidates(&temp.path().join("fixtures/workspace")),
+            ["nested.ts".to_string(), "package.json".to_string()].into(),
+        );
     }
 }

@@ -431,6 +431,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded filesystem fallback and empty-scope exclusion probe; ignored directories are pruned and counted once, and an exhausted probe reports unknown/incomplete rather than claiming an empty filesystem",
     },
     ExclusionEntry {
+        file: "inspect/diagnostics_category.rs",
+        enclosing_item: "ScopeWalkBudget, scoped_coverage_candidates_with_budget",
+        location_or_primitive: "200_000 entry limit and scoped walk deadline",
+        reason: "internal scoped-file inventory, not a paginated findings list; budget rejection is retained separately from iterator exhaustion and adds an analysis_incomplete gap with unknown diagnostic totals",
+    },
+    ExclusionEntry {
+        file: "commands/inspect.rs",
+        enclosing_item: "scoped_in_root_file_count, build_inspect_payload_with_offset",
+        location_or_primitive: "ScopeWalkBudget scoped file count",
+        reason: "internal corpus census, not a paginated findings list; an incomplete walk reports a named gap, marks scope_files_complete false, and renders the count as a lower bound",
+    },
+    ExclusionEntry {
         file: "storage_retention.rs",
         enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings",
         location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",

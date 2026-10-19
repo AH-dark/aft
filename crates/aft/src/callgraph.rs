@@ -3879,12 +3879,14 @@ pub(crate) fn walk_project_files_while(
 }
 
 /// Walk all non-excluded files under a root, using the same bounded iterator
-/// and ignore rules as the source-file census.
+/// and ignore rules as the source-file census. Caller-excluded paths are pruned
+/// before descent.
 pub(crate) fn walk_project_paths_while(
     root: &Path,
+    include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
-    walk_project_paths_filtered_while_with_builder(root, |_| true, keep_walking, |_| {})
+    walk_project_paths_filtered_while_with_builder(root, include, keep_walking, |_| {})
 }
 
 fn walk_project_files_filtered_while(
