@@ -180,8 +180,6 @@ pub fn apply_update_chunks(
         if chunk.old_lines.is_empty() {
             let insertion_idx = if change_context.is_some() {
                 line_index
-            } else if original_lines.last().is_some_and(String::is_empty) {
-                original_lines.len() - 1
             } else {
                 original_lines.len()
             };
@@ -713,5 +711,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.as_bytes(), b"beta\r\n\r\n");
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn context_free_append_keeps_real_final_blank_before_inserted_lines() {
+        let chunk = UpdateFileChunk {
+            old_lines: Vec::new(),
+            new_lines: vec!["new".into()],
+            change_context: None,
+            is_end_of_file: false,
+        };
+        for (source, expected) in [
+            ("\u{feff}old\r\n\r\n", "\u{feff}old\r\n\r\nnew\r\n"),
+            ("old\n\n", "old\n\nnew\n"),
+        ] {
+            let content =
+                apply_update_chunks(source, "file.txt", std::slice::from_ref(&chunk)).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("file.txt");
+            let config = crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            };
+            crate::edit::write_format_validate(&path, &content, &config, &serde_json::json!({}))
+                .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+        }
     }
 }
