@@ -7,8 +7,8 @@
 //! observation, register commit gating, and `op_id` emission.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::backup::{new_op_id, BackupStore};
@@ -1091,39 +1091,7 @@ fn ensure_parent_dirs(path: &Path) -> io::Result<()> {
 /// Write bytes via temp + fsync + rename so a crash cannot leave a torn target.
 fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ensure_parent_dirs(path)?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let temp_name = {
-        let mut name = std::ffi::OsString::from(".aft-hashline-");
-        name.push(file_name);
-        name.push(".tmp");
-        name
-    };
-    let temp_path = parent.join(temp_name);
-
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-            .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
-        fs::rename(&temp_path, path)?;
-        // Best-effort directory durability after the rename.
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    write_result
+    crate::edit::atomic_write_source(path, bytes)
 }
 
 // ── Outcome helpers ──────────────────────────────────────────────────────────
@@ -2289,5 +2257,31 @@ mod tests {
         // Backup is taken before baseline recheck, so op_id must be present.
         assert!(envelope.op_id.is_some());
         assert_eq!(fs::read(&a).unwrap(), b"changed\n");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod audit11_regressions {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_write_preserves_mode_and_does_not_touch_shared_temp_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script");
+        fs::write(&path, b"old\r\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+        let unrelated = dir.path().join(".aft-hashline-script.tmp");
+        fs::write(&unrelated, b"unrelated").unwrap();
+        let updated = b"\xef\xbb\xbfnew\r\n\xfflast";
+        durable_write(&path, updated).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), updated);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }
