@@ -65,6 +65,38 @@ struct ReconciliationFailureLog {
     suppressed_repeats: u64,
 }
 
+#[derive(Default)]
+struct ReconciliationBackoff {
+    snapshot: Option<(
+        Option<std::path::PathBuf>,
+        Vec<crate::config::IndexRootConfig>,
+    )>,
+    retry_at: Option<std::time::Instant>,
+    failures: u32,
+}
+
+impl ReconciliationBackoff {
+    fn ready(&mut self, config: &Config, now: std::time::Instant) -> bool {
+        let snapshot = (config.storage_dir.clone(), config.index.roots.clone());
+        if self.snapshot.as_ref() != Some(&snapshot) {
+            *self = Self {
+                snapshot: Some(snapshot),
+                ..Self::default()
+            };
+        }
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn failed(&mut self, config: &Config, now: std::time::Instant) {
+        self.snapshot = Some((config.storage_dir.clone(), config.index.roots.clone()));
+        let seconds = 60_u64
+            .saturating_mul(1_u64 << self.failures.min(4))
+            .min(900);
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + std::time::Duration::from_secs(seconds));
+    }
+}
+
 impl ReconciliationFailureLog {
     fn record_failure(&mut self, error: &str) -> ReconciliationLogAction {
         match self.last_error.take() {
@@ -108,6 +140,7 @@ pub(super) struct StandingActor {
     startup_config: Config,
     observed_config: Mutex<Config>,
     reconciliation_failures: Mutex<ReconciliationFailureLog>,
+    reconciliation_backoff: Mutex<ReconciliationBackoff>,
     /// Root ids registered solely to host unbound standing work. Session actors
     /// are never removed by this owner.
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
@@ -143,6 +176,7 @@ impl StandingActor {
             startup_config: config.clone(),
             observed_config: Mutex::new(config),
             reconciliation_failures: Mutex::new(ReconciliationFailureLog::default()),
+            reconciliation_backoff: Mutex::new(ReconciliationBackoff::default()),
             owned_actors: Mutex::new(HashMap::new()),
         }
     }
@@ -226,8 +260,14 @@ impl StandingActor {
         ctx.begin_configure_ack_step("startup_reconcile");
         self.reconcile_startup_once();
         ctx.begin_configure_ack_step("snapshot_reconcile");
+        // A new bind is an explicit retry; idle maintenance uses the backoff.
+        *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
         if let Err(error) = self.roots.reconcile(&snapshot) {
-            log::warn!("standing roots bind reconciliation refused: {error}");
+            self.record_reconciliation_failure(
+                &snapshot,
+                &error.to_string(),
+                std::time::Instant::now(),
+            );
             return;
         }
         let entries = self.roots.entries();
@@ -267,33 +307,28 @@ impl StandingActor {
     /// Entry order and `search`, `semantic`, `callgraph` kind order are retained
     /// by `StandingRoots::entries` and `IndexKind::ALL` respectively.
     pub(super) fn tick(&self) {
+        self.tick_at(std::time::Instant::now());
+    }
+
+    fn tick_at(&self, now: std::time::Instant) {
         let _reconciliation = self.reconciliation.lock();
         self.reconcile_startup_once();
         self.observe_config_snapshot();
         let snapshot = self.observed_config.lock().clone();
+        if !self.reconciliation_backoff.lock().ready(&snapshot, now) {
+            return;
+        }
         if !snapshot.index.roots.is_empty() {
             self.handoff_required.store(true, Ordering::Release);
         }
         let report = match self.roots.reconcile(&snapshot) {
             Ok(report) => report,
             Err(error) => {
-                let error = error.to_string();
-                let action = self.reconciliation_failures.lock().record_failure(&error);
-                match action {
-                    ReconciliationLogAction::WarnFirst => {
-                        log::warn!("standing roots reconciliation refused: {error}");
-                    }
-                    ReconciliationLogAction::WarnChanged {
-                        previous_error,
-                        suppressed_repeats,
-                    } => log::warn!(
-                        "standing roots reconciliation refused: {error} ({suppressed_repeats} repeats of previous error suppressed: {previous_error})"
-                    ),
-                    ReconciliationLogAction::Suppress => {}
-                }
+                self.record_reconciliation_failure(&snapshot, &error.to_string(), now);
                 return;
             }
         };
+        *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
         if let Some((previous_error, suppressed_repeats)) =
             self.reconciliation_failures.lock().record_success()
         {
@@ -308,6 +343,20 @@ impl StandingActor {
             if !contended.contains(&entry.artifact_key) {
                 self.submit_entry_pass(entry, &snapshot);
             }
+        }
+    }
+
+    fn record_reconciliation_failure(
+        &self,
+        snapshot: &Config,
+        error: &str,
+        now: std::time::Instant,
+    ) {
+        self.reconciliation_backoff.lock().failed(snapshot, now);
+        match self.reconciliation_failures.lock().record_failure(error) {
+            ReconciliationLogAction::WarnFirst => log::warn!("standing roots reconciliation refused: {error}"),
+            ReconciliationLogAction::WarnChanged { previous_error, suppressed_repeats } => log::warn!("standing roots reconciliation refused: {error} ({suppressed_repeats} repeats of previous error suppressed: {previous_error})"),
+            ReconciliationLogAction::Suppress => {}
         }
     }
 
@@ -551,8 +600,18 @@ mod startup_storage_tests {
         };
         let storage = tempfile::tempdir().unwrap();
         if std::env::var_os("AFT_TEST_STANDING_GIT_LOG").is_some() {
+            let project = storage.path().join("recorder-control");
+            std::fs::create_dir(&project).unwrap();
+            assert!(crate::effective_path::new_command("git")
+                .build()
+                .arg("init")
+                .arg("-q")
+                .arg(&project)
+                .status()
+                .unwrap()
+                .success());
             let before = git_commands();
-            crate::scoped_key::resolve_standing_root(storage.path().to_str().unwrap()).unwrap();
+            crate::scoped_key::resolve_standing_root(project.to_str().unwrap()).unwrap();
             assert!(
                 git_commands() > before,
                 "the recorder must observe real resolver Git commands"
@@ -767,6 +826,57 @@ fn root_fingerprint(root: &std::path::Path) -> Option<(u64, Option<u128>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standing_refusal_backoff_counts_attempts_over_time() {
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = super::super::test_support::test_ctx();
+        let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()))
+            .with_startup_storage_dir(storage.path());
+        actor.reconcile_at_startup();
+        let project = storage.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(
+            storage.path().join("cache-keys.json"),
+            b"unreadable repository memo",
+        )
+        .unwrap();
+        let mut config = actor.observed_config.lock();
+        config.storage_dir = Some(storage.path().to_path_buf());
+        config.index.roots = vec![crate::config::IndexRootConfig {
+            path: project.display().to_string(),
+            indexes: vec![IndexKind::Search],
+        }];
+        drop(config);
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            let resolutions = || crate::standing_roots::reconciliation_work_for_test()[4];
+            let before = resolutions();
+            let now = std::time::Instant::now();
+            for tick in 0..240 {
+                actor.tick_at(now + std::time::Duration::from_millis(tick * 250));
+            }
+            assert!(
+                actor
+                    .reconciliation_failures
+                    .lock()
+                    .last_error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("identity")),
+                "the fixture must reach an identity refusal, not successful reconciliation"
+            );
+            assert_eq!(
+                resolutions() - before,
+                1,
+                "a refused root was resolved on every maintenance tick"
+            );
+            actor.tick_at(now + std::time::Duration::from_secs(60));
+            assert_eq!(resolutions() - before, 2);
+            actor.tick_at(now + std::time::Duration::from_secs(179));
+            assert_eq!(resolutions() - before, 2);
+            actor.tick_at(now + std::time::Duration::from_secs(180));
+            assert_eq!(resolutions() - before, 3);
+        });
+    }
+
     use super::*;
 
     #[tokio::test]

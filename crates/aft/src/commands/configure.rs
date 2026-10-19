@@ -3826,6 +3826,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let format_tool_cache_clear_needed = effective_configure_changed;
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    // Choose a durable identity at the first bind that needs an artifact key.
+    // With all three indexes off, keep the no-key, no-Git-probe fast path.
     let artifact_key_needed = !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
@@ -8422,6 +8424,11 @@ fn delay_configure_storage_sweeps_for_debug() {
 }
 
 fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
+    // Without usable Git, keep callgraph cold builds on demand. An idle
+    // configure must not start a corpus-scale build just because Git is missing.
+    if !crate::developer_tools::git_usable() {
+        return false;
+    }
     // Integration fixtures disable the watcher and historically expect their
     // tiny non-repository callgraphs to be ready before the first request.
     if std::env::var_os("AFT_TEST_DISABLE_FILE_WATCHER").is_some() {
@@ -8464,6 +8471,25 @@ mod tests {
             "{}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn gitless_configure_keeps_callgraph_warming_on_demand() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root.path()).unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| config.project_root = Some(root.clone()));
+        let _probe = crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root],
+            "Git unavailable",
+        );
+        crate::developer_tools::with_git_usable_for_test(true, || {
+            assert!(super::callgraph_configure_warm_allowed(&ctx))
+        });
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            assert!(!super::callgraph_configure_warm_allowed(&ctx))
+        });
     }
 
     /// The watcher only sees changes made after it subscribes, so its start

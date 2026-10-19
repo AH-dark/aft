@@ -7020,69 +7020,167 @@ pub(crate) fn artifact_cache_key_with_memo_profiled(
     git_common_dir: Option<&Path>,
     timings: &mut ArtifactCacheKeyTimings,
 ) -> Result<String, ArtifactCacheKeyProbeError> {
-    let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
-    let git_marker_state = root_git_marker_state(probe_root, git_common_dir);
-    if git_marker_state == GitMarkerState::Absent {
-        return Ok(artifact_path_identity_key(probe_root));
-    }
+    let identity = resolve_root_identity(
+        probe_root,
+        memo_root,
+        storage_root,
+        git_common_dir,
+        timings,
+        true,
+    )?;
+    let key = identity.key(probe_root, false);
+    record_derived_cache_key(memo_root, &key);
+    Ok(key)
+}
 
-    match repo_root_commit_with_retry_profiled(probe_root, timings) {
-        RootCommitResolution::Commit(root_commit) => {
-            let key = session_artifact_key_from_git_identity(probe_root, &root_commit);
-            record_derived_cache_key(memo_root, &key);
-            if let Err(error) = record_artifact_cache_key_memo_profiled(
-                storage_root,
-                &memo_root_key,
-                &key,
-                &root_commit,
-                timings,
-            ) {
-                crate::slog_warn!(
-                    "artifact cache key: failed to persist memo for {} in {}: {}",
-                    memo_root.display(),
-                    storage_root.display(),
-                    error
-                );
-            }
-            Ok(key)
+fn legacy_identity_memo(
+    root: &Path,
+    raw_key: &str,
+    storage: &Path,
+) -> std::io::Result<Option<ArtifactCacheKeyMemoEntry>> {
+    let entries: BTreeMap<String, ArtifactCacheKeyMemoEntry> =
+        match fs::read(artifact_cache_key_memo_path(storage)) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    let canonical = crate::root_identity::canonical_root(root);
+    let mut found: Option<ArtifactCacheKeyMemoEntry> = None;
+    for (spelling, entry) in entries {
+        if spelling != raw_key
+            && crate::root_identity::canonical_root(Path::new(&spelling)) != canonical
+        {
+            continue;
         }
-        RootCommitResolution::NotARepo => Ok(artifact_path_identity_key(probe_root)),
-        RootCommitResolution::Failed(detail) => {
-            if let Some(entry) =
-                lookup_artifact_cache_key_memo_profiled(storage_root, &memo_root_key, timings)
-            {
-                // Re-derive from the memoized repository identity rather than
-                // trusting the memoized key: memos written by older versions
-                // hold the whole-repository key even for subfolder roots, and
-                // reusing it would let a subfolder session overwrite the
-                // repository's shared artifact again.
-                let key =
-                    session_artifact_key_from_git_identity(probe_root, &entry.git_root_commit);
-                crate::slog_warn!(
-                    "artifact cache key: probe failed, using memoized identity (key {}) for {}",
-                    key,
-                    memo_root.display()
-                );
-                return Ok(key);
-            }
-
-            match git_marker_state {
-                GitMarkerState::Absent => Ok(artifact_path_identity_key(probe_root)),
-                GitMarkerState::Present => Err(ArtifactCacheKeyProbeError {
-                    root: memo_root.to_path_buf(),
-                    detail,
-                }),
-                GitMarkerState::Unknown(marker_detail) => Err(ArtifactCacheKeyProbeError {
-                    root: memo_root.to_path_buf(),
-                    detail: format!("{detail}; {marker_detail}"),
-                }),
-            }
+        if !artifact_key_looks_valid(&entry.key) || entry.git_root_commit.trim().is_empty() {
+            return Err(std::io::Error::other(
+                "legacy repository identity memo is invalid",
+            ));
         }
-        RootCommitResolution::Cancelled => Err(ArtifactCacheKeyProbeError {
-            root: memo_root.to_path_buf(),
-            detail: "artifact cache key probe cancelled".to_string(),
-        }),
+        if found
+            .as_ref()
+            .is_some_and(|previous| previous.git_root_commit != entry.git_root_commit)
+        {
+            return Err(std::io::Error::other(
+                "canonical root aliases have conflicting repository identities",
+            ));
+        }
+        found = Some(entry);
     }
+    Ok(found)
+}
+
+/// Session configure and StandingRoots::reconcile use the same stored path-or-Git
+/// identity. With `persist=false`, health reports inspect it without creating a record.
+pub(crate) fn resolve_root_identity(
+    probe_root: &Path,
+    memo_root: &Path,
+    storage_root: &Path,
+    git_common_dir: Option<&Path>,
+    timings: &mut ArtifactCacheKeyTimings,
+    persist: bool,
+) -> Result<crate::root_identity::Identity, ArtifactCacheKeyProbeError> {
+    let choose = |pinned_path: bool| -> std::io::Result<crate::root_identity::Identity> {
+        use crate::root_identity::Identity;
+        let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
+        let canonical_key =
+            artifact_cache_key_memo_root_key(&crate::root_identity::canonical_root(probe_root));
+        let cached = crate::developer_tools::git_usable()
+            .then(|| {
+                lookup_artifact_cache_key_memo_profiled(storage_root, &canonical_key, timings)
+                    .or_else(|| {
+                        lookup_artifact_cache_key_memo_profiled(
+                            storage_root,
+                            &memo_root_key,
+                            timings,
+                        )
+                    })
+            })
+            .flatten();
+        let memo = if cached.is_some() && !pinned_path {
+            cached
+        } else {
+            match legacy_identity_memo(probe_root, &memo_root_key, storage_root) {
+                Ok(memo) => memo,
+                Err(error) if crate::developer_tools::git_usable() && !pinned_path => {
+                    crate::slog_warn!(
+                        "legacy identity memo unavailable; verify the repository with Git: {error}"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if pinned_path {
+            if memo.is_some() {
+                return Err(std::io::Error::other("a standing path identity conflicts with an existing repository memo; explicit identity migration is required"));
+            }
+            return Ok(Identity::Path);
+        }
+        if !crate::developer_tools::git_usable() {
+            return match memo {
+                Some(entry) => {
+                    let identity = Identity::git(probe_root, entry.git_root_commit)?;
+                    if crate::root_identity::nearest_git_marker(probe_root)?.is_none()
+                        && identity.key(probe_root, false) != entry.key
+                    {
+                        return Err(std::io::Error::other(
+                            "legacy repository scope cannot be recovered without Git",
+                        ));
+                    }
+                    Ok(identity)
+                }
+                None => Ok(Identity::Path),
+            };
+        }
+        let marker = if crate::root_identity::nearest_git_marker(probe_root)?.is_some() {
+            GitMarkerState::Present
+        } else {
+            root_git_marker_state(probe_root, git_common_dir)
+        };
+        if marker == GitMarkerState::Absent && memo.is_none() {
+            return Ok(Identity::Path);
+        }
+        match repo_root_commit_with_retry_profiled(probe_root, timings) {
+            RootCommitResolution::Commit(root_commit) => {
+                let key = session_artifact_key_from_git_identity(probe_root, &root_commit);
+                if let Err(error) = record_artifact_cache_key_memo_profiled(
+                    storage_root,
+                    &memo_root_key,
+                    &key,
+                    &root_commit,
+                    timings,
+                ) {
+                    crate::slog_warn!(
+                        "artifact cache key: could not update legacy Git memo: {error}"
+                    );
+                }
+                Identity::git(probe_root, root_commit)
+            }
+            RootCommitResolution::NotARepo if memo.is_none() => Ok(Identity::Path),
+            RootCommitResolution::NotARepo | RootCommitResolution::Failed(_) if memo.is_some() => {
+                Identity::git(probe_root, memo.unwrap().git_root_commit)
+            }
+            RootCommitResolution::Failed(detail) => Err(std::io::Error::other(detail)),
+            RootCommitResolution::Cancelled => {
+                Err(std::io::Error::other("artifact cache key probe cancelled"))
+            }
+            RootCommitResolution::NotARepo => unreachable!("memo cases covered"),
+        }
+    };
+    let result = if persist {
+        crate::root_identity::bind(probe_root, storage_root, choose)
+    } else {
+        match crate::root_identity::read(probe_root, storage_root) {
+            Ok(Some(identity)) => Ok(identity),
+            Ok(None) => crate::root_identity::select(probe_root, storage_root, choose),
+            Err(error) => Err(error),
+        }
+    };
+    result.map_err(|error| ArtifactCacheKeyProbeError {
+        root: memo_root.to_path_buf(),
+        detail: format!("{error}; an existing identity was not replaced. Restore unreadable identity metadata or perform an explicit identity migration. {}", if crate::developer_tools::git_usable() { "" } else { crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON }),
+    })
 }
 
 /// In-process root→key map recorded at every successful cache-key
@@ -12775,6 +12873,126 @@ mod tests {
             .expect("non-git root keeps legacy path identity fallback");
 
         assert_eq!(key, artifact_path_identity_key(&root));
+    }
+
+    #[test]
+    fn gitless_first_bind_records_sticky_path_identity() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let expected = artifact_path_identity_key(&root);
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+                expected
+            );
+        });
+        assert!(fs::read_dir(storage.join("root-identities"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")));
+        let mut commits = BTreeMap::new();
+        commits.insert(
+            root.clone(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+        let _probe = force_git_root_commit_probe_commits_for_test(commits);
+        crate::developer_tools::with_git_usable_for_test(true, || {
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+                expected,
+                "installing Git must not retag a path-bound root"
+            );
+            let standing = crate::scoped_key::resolve_standing_root_in_storage(
+                root.to_str().unwrap(),
+                &storage,
+                true,
+            )
+            .unwrap();
+            assert_eq!(standing.artifact_key, expected);
+            assert_eq!(standing.resolved_git_toplevel, None);
+        });
+    }
+
+    #[test]
+    fn recorded_repository_identity_survives_gitless_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let root = git_like_root(&dir, "repo");
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let expected = artifact_key_from_git_identity(&commit);
+        write_cache_key_memo(
+            &storage,
+            &BTreeMap::from([(
+                root.parent()
+                    .unwrap()
+                    .join(".")
+                    .join("repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                ArtifactCacheKeyMemoEntry {
+                    key: expected.clone(),
+                    git_root_commit: commit,
+                    recorded_at_ms: current_time_millis(),
+                },
+            )]),
+        );
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+                expected
+            );
+            fs::remove_file(storage.join(ARTIFACT_CACHE_KEY_MEMO_FILE)).unwrap();
+            artifact_cache_key_memo_state()
+                .lock()
+                .unwrap()
+                .by_storage_root
+                .remove(&storage);
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+                expected,
+                "the durable repository identity must survive without the legacy memo"
+            );
+            assert_ne!(expected, artifact_path_identity_key(&root));
+            let standing = crate::scoped_key::resolve_standing_root_in_storage(
+                root.to_str().unwrap(),
+                &storage,
+                true,
+            )
+            .unwrap();
+            assert_eq!(standing.artifact_key, expected);
+            assert!(standing.resolved_git_toplevel.is_some());
+        });
+    }
+
+    #[test]
+    fn plain_standing_root_resolves_without_usable_git() {
+        let root = tempfile::tempdir().unwrap();
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            let resolved =
+                crate::scoped_key::resolve_standing_root(root.path().to_str().unwrap()).unwrap();
+            assert_eq!(
+                resolved.artifact_key,
+                artifact_path_identity_key(root.path())
+            );
+            assert_eq!(resolved.resolved_git_toplevel, None);
+        });
+        crate::developer_tools::with_git_usable_for_test(true, || {
+            crate::git_probe::with_child_env_for_test(
+                &[("PATH", std::ffi::OsStr::new(""))],
+                || {
+                    assert!(
+                        crate::scoped_key::resolve_standing_root(root.path().to_str().unwrap())
+                            .is_ok(),
+                        "a plain folder must resolve even when any Git spawn would fail"
+                    );
+                },
+            );
+        });
     }
 
     #[test]

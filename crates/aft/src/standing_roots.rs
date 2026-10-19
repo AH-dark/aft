@@ -16,9 +16,7 @@ use parking_lot::{Condvar, Mutex};
 use crate::config::{Config, IndexKind};
 use crate::db::standing_roots::{self, StandingRootRecord};
 use crate::root_cache::{ArtifactPublishEpoch, WriterLease};
-use crate::scoped_key::{
-    reject_duplicate_artifact_keys, resolve_standing_root, ResolvedStandingRoot,
-};
+use crate::scoped_key::{reject_duplicate_artifact_keys, ResolvedStandingRoot};
 
 /// Configuration snapshots are observed only at standing maintenance-pass
 /// boundaries. This keeps a pass internally coherent while allowing the next
@@ -297,7 +295,6 @@ impl StandingRoots {
         &self,
         config: &Config,
     ) -> Result<StandingReconcileReport, StandingRootsError> {
-        let entries = resolve_entries(config)?;
         let configured_db_path =
             crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
         // An empty snapshot removes entries from the last observed user-tier
@@ -305,7 +302,7 @@ impl StandingRoots {
         // and leave durable rows behind in the former namespace.
         let db_path = {
             let mut current = self.inner.database_path.lock();
-            let path = if entries.is_empty() {
+            let path = if config.index.roots.is_empty() {
                 current.clone().unwrap_or(configured_db_path)
             } else {
                 configured_db_path
@@ -319,7 +316,7 @@ impl StandingRoots {
         let benchmark_baseline = false;
         // Nonempty lists keep the database-open-before-state-lock path; the
         // extra mutex check is needed only to skip recurring empty-list work.
-        if !benchmark_baseline && entries.is_empty() {
+        if !benchmark_baseline && config.index.roots.is_empty() {
             #[cfg(test)]
             RECONCILE_PREOPEN_STATE_LOCKS.with(|count| count.set(count.get() + 1));
             let state = self.inner.state.lock();
@@ -327,9 +324,9 @@ impl StandingRoots {
             // previously configured roots must still delete their rows and stop
             // their background builds. Only after an empty root list was applied
             // successfully is there no database work left until roots are added.
-            if entries.is_empty() && state.entries.is_empty() && state.reconciled_empty {
+            if state.entries.is_empty() && state.reconciled_empty {
                 return Ok(StandingReconcileReport {
-                    active_entries: entries,
+                    active_entries: Vec::new(),
                     added: Vec::new(),
                     removed: Vec::new(),
                     replaced: Vec::new(),
@@ -347,6 +344,9 @@ impl StandingRoots {
                 return Err(error.into());
             }
         };
+        // Validate the storage namespace before persisting first-bind identities.
+        // A failed namespace switch must not inherit an earlier empty fast path.
+        let entries = resolve_entries(config)?;
         #[cfg(test)]
         conn.trace(Some(|sql| {
             if sql == "BEGIN IMMEDIATE" {
@@ -694,18 +694,20 @@ pub(crate) fn reconciliation_work_for_test() -> [i64; 6] {
 
 fn counted_resolve_standing_root(
     path: &str,
+    storage: &Path,
 ) -> Result<ResolvedStandingRoot, crate::scoped_key::ScopedKeyError> {
     #[cfg(test)]
     ROOT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-    resolve_standing_root(path)
+    crate::scoped_key::resolve_standing_root_in_storage(path, storage, true)
 }
 
 fn resolve_entries(config: &Config) -> Result<Vec<StandingRootEntry>, StandingRootsError> {
+    let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
     let resolved = config
         .index
         .roots
         .iter()
-        .map(|root| counted_resolve_standing_root(&root.path))
+        .map(|root| counted_resolve_standing_root(&root.path, &storage))
         .collect::<Result<Vec<ResolvedStandingRoot>, _>>()?;
     reject_duplicate_artifact_keys(&resolved)?;
     Ok(config

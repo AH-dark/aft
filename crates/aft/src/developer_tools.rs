@@ -332,7 +332,28 @@ pub fn git_availability() -> &'static GitAvailability {
 /// a directory is a repository or which index data belongs to it. Preserve that
 /// uncertainty rather than using it to choose another identity or delete data.
 pub fn git_usable() -> bool {
+    #[cfg(test)]
+    if let Some(usable) = TEST_GIT_USABLE.with(|value| value.get()) {
+        return usable;
+    }
     matches!(git_availability(), GitAvailability::Usable)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_USABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_git_usable_for_test<T>(usable: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_GIT_USABLE.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_GIT_USABLE.with(|value| value.replace(Some(usable))));
+    run()
 }
 
 /// Status payload describing whether git features are on.

@@ -603,7 +603,7 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn unavailable_git_is_uncertainty_without_launching_the_installer() {
+    fn unavailable_git_binds_new_roots_without_launching_the_installer() {
         const CHILD_DIR: &str = "AFT_STORAGE_GIT_UNAVAILABLE_ROOT";
         if let Some(base) = std::env::var_os(CHILD_DIR) {
             let base = PathBuf::from(base);
@@ -625,14 +625,16 @@ mod tests {
             let outcomes = [
                 matches!(result, Err(GitRootResolutionError::Other(_))),
                 matches!(probe, Err(crate::git_probe::ProbeError::Spawn(_))),
-                matches!(
-                    standing,
-                    Err(crate::scoped_key::ScopedKeyError::GitProbe { .. })
-                ),
-                cache.is_err(),
+                standing.is_ok_and(|root| {
+                    root.artifact_key
+                        == crate::search_index::artifact_path_identity_key(&base.join("requested"))
+                }),
+                cache.is_ok_and(|key| {
+                    key == crate::search_index::artifact_path_identity_key(&base.join("requested"))
+                }),
                 !base.join("launched").exists(),
             ];
-            assert_eq!(outcomes, [true; 5], "unavailable Git must preserve readonly/probe/standing/cache uncertainty and never launch the installer");
+            assert_eq!(outcomes, [true; 5], "unavailable Git must preserve typed uncertainty, bind new roots by path and never launch the installer");
             return;
         }
         let base = tempfile::tempdir().unwrap();
@@ -654,7 +656,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "readonly_artifacts::tests::unavailable_git_is_uncertainty_without_launching_the_installer"])
+            .args(["--exact", "readonly_artifacts::tests::unavailable_git_binds_new_roots_without_launching_the_installer"])
             .env(CHILD_DIR, base.path()).env("PATH", &launcher).env("AFT_TEST_RAW_PATH", "1")
             .env("AFT_TEST_DEVELOPER_TOOLS", "absent").env("AFT_TEST_XCODE_LAUNCHER_DIRS", &launcher)
             .output().unwrap();

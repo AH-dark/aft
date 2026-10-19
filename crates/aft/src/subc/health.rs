@@ -7511,9 +7511,9 @@ fn standing_health_entries(
     let database = crate::db::open_readonly(&database_path).ok();
     let mut entries = std::collections::BTreeMap::new();
     for root in &config.index.roots {
-        entries
-            .entry(root.path.clone())
-            .or_insert_with(|| standing_health_entry(root, database.as_ref()));
+        entries.entry(root.path.clone()).or_insert_with(|| {
+            standing_health_entry(root, database.as_ref(), database_path.parent().unwrap())
+        });
     }
     entries.into_values().collect()
 }
@@ -7521,13 +7521,14 @@ fn standing_health_entries(
 fn standing_health_entry(
     root: &crate::config::IndexRootConfig,
     database: Option<&crate::db::TrackedConnection>,
+    storage: &Path,
 ) -> StandingHealthEntry {
     let recorded = database
         .and_then(|database| {
             crate::db::standing_roots::get_standing_root(database, &root.path).ok()
         })
         .flatten();
-    match crate::scoped_key::resolve_standing_root(&root.path) {
+    match crate::scoped_key::resolve_standing_root_in_storage(&root.path, storage, false) {
         Ok(resolved) => {
             let refusal = recorded
                 .as_ref()

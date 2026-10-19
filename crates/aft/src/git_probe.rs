@@ -46,6 +46,7 @@ pub(crate) fn command() -> Command {
 
 /// `git rev-parse --show-toplevel`, run with `-C root` from AFT's own working
 /// directory.
+#[cfg(test)]
 pub(crate) fn toplevel(root: &Path) -> Result<Vec<u8>, ProbeError> {
     Probe::new(root, ChildDirectory::Inherited).run(&["rev-parse", "--show-toplevel"])
 }
