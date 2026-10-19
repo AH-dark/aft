@@ -5,14 +5,7 @@ import { Error as ToolError } from "@opencode/plugin/promise/tool";
 import { Cause, Effect } from "effect";
 
 import { makeServerEffect } from "../entry/server-runtime.mjs";
-import {
-  decidePermission,
-  PermissionDeniedError,
-  PermissionRulesUnavailableError,
-  requestPermission,
-  type V2PermissionHostContext,
-  type V2PermissionRule,
-} from "../permissions/v2.js";
+import { requestPermission, type V2PermissionHostContext } from "../permissions/v2.js";
 import { astTools } from "../tools/ast.js";
 import { projectV2Tool, type V2DefinitionRuntime } from "../tools/definitions/v2.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
@@ -23,6 +16,7 @@ import { classifyPermissionError } from "../tools/permissions.js";
 import { readingTools } from "../tools/reading.js";
 import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
+import { permissionHost, type V2PermissionRule } from "./v2-permission-host.js";
 
 const request = {
   permission: "edit",
@@ -52,57 +46,8 @@ const ruleRequest = {
   metadata: { filepath: "/work/project/file.ts", diff: "@@ -1 +1 @@" },
 };
 
-interface FixtureOptions {
-  agentRules?: readonly V2PermissionRule[];
-  sessionRules?: readonly V2PermissionRule[];
-  sessionAgent?: string;
-  agentFailure?: Error;
-  sessionFailure?: Error;
-  rejection?: Error;
-}
-
-function fixture(options: FixtureOptions = {}) {
-  const calls: unknown[] = [];
-  const agents: string[] = [];
-  const sessions: string[] = [];
-  const agentRules = Object.hasOwn(options, "agentRules")
-    ? options.agentRules
-    : [{ action: "edit", resource: "src/a.ts", effect: "ask" as const }];
-  const host: V2PermissionHostContext = {
-    agent: {
-      get: ({ agentID }) =>
-        Effect.suspend(() => {
-          agents.push(agentID);
-          if (options.agentFailure) return Effect.fail(options.agentFailure);
-          return Effect.succeed({
-            data: agentRules === undefined ? {} : { permissions: agentRules },
-          });
-        }),
-    },
-    session: {
-      get: ({ sessionID }) =>
-        Effect.suspend(() => {
-          sessions.push(sessionID);
-          if (options.sessionFailure) return Effect.fail(options.sessionFailure);
-          return Effect.succeed({
-            ...(options.sessionAgent === undefined ? {} : { agent: options.sessionAgent }),
-            ...(options.sessionRules === undefined ? {} : { permissions: options.sessionRules }),
-          });
-        }),
-    },
-    permission: {
-      assert: (input) =>
-        Effect.suspend(() => {
-          calls.push(input);
-          return options.rejection instanceof ToolError
-            ? Effect.fail(options.rejection)
-            : options.rejection
-              ? Effect.die(options.rejection)
-              : Effect.void;
-        }),
-    },
-  };
-  return { host, calls, agents, sessions };
+function fixture(options: Parameters<typeof permissionHost>[0] = {}) {
+  return permissionHost(options);
 }
 
 function pluginContext(
@@ -191,23 +136,6 @@ function artifactReadTool(
 }
 
 describe("OpenCode 2 in-process permission assertion", () => {
-  test("configured allow skips assert", async () => {
-    const { host, calls } = fixture({
-      agentRules: [{ action: "edit", resource: "src/a.ts", effect: "allow" }],
-      rejection: new Error("must not ask"),
-    });
-    await requestPermission(host, request, context);
-    expect(calls).toEqual([]);
-  });
-
-  test("configured deny skips assert and reports the rule", async () => {
-    const { host, calls } = fixture({
-      agentRules: [{ action: "edit", resource: "src/a.ts", effect: "deny" }],
-    });
-    await expect(requestPermission(host, request, context)).rejects.toThrow('"src/a.ts"');
-    expect(calls).toEqual([]);
-  });
-
   test("ask awaits assert and preserves edit diff and source mapping", async () => {
     const { host, calls } = fixture();
     let finish!: () => void;
@@ -240,176 +168,18 @@ describe("OpenCode 2 in-process permission assertion", () => {
     expect(completed).toBe(true);
   });
 
-  test("allows requests under OpenCode's default rules without asserting", async () => {
-    const { host, calls, agents, sessions } = fixture({ agentRules: defaultRules });
-    await requestPermission(host, ruleRequest, context);
-
-    expect(agents).toEqual(["build"]);
-    expect(sessions).toEqual(["ses_test"]);
-    expect(calls).toEqual([]);
-  });
-
-  test("reads inside the project root need no permission under the default ruleset", async () => {
-    const { host, calls } = fixture({ agentRules: defaultRules });
-    await requestPermission(
-      host,
-      { permission: "read", patterns: ["src/index.ts"], always: ["*"], metadata: {} },
-      context,
-    );
-
-    expect(calls).toEqual([]);
-  });
-
-  test("keeps the host's dotenv ask rules and the example-file allow exception", async () => {
-    const { host, calls } = fixture({ agentRules: defaultRules });
-    const read = (resource: string) =>
-      requestPermission(
-        host,
-        { permission: "read", patterns: [resource], always: ["*"], metadata: {} },
-        context,
-      );
-
-    await read(".env");
-    await read(".env.local");
-    await read(".env.example");
-
-    expect(calls).toHaveLength(2);
-    expect(calls.map((call) => (call as { resources: string[] }).resources)).toEqual([
-      [".env"],
-      [".env.local"],
-    ]);
-  });
-
-  test("denies with the deciding rule and never asserts", async () => {
-    const { host, calls } = fixture({
-      agentRules: [
-        { action: "*", resource: "*", effect: "allow" },
-        { action: "edit", resource: "file.ts", effect: "deny" },
-      ],
-    });
-    const error = await requestPermission(host, ruleRequest, context).catch(
-      (caught: unknown) => caught as Error,
-    );
-
-    expect(error).toBeInstanceOf(PermissionDeniedError);
-    expect(error.message).toContain('"edit" on "file.ts" is "deny"');
-    expect(calls).toEqual([]);
-  });
-
-  test("lets a session rule override the agent rule that precedes it", async () => {
-    const { host, calls } = fixture({
-      agentRules: [{ action: "*", resource: "*", effect: "allow" }],
-      sessionRules: [{ action: "edit", resource: "*", effect: "deny" }],
-    });
-
-    await expect(requestPermission(host, ruleRequest, context)).rejects.toBeInstanceOf(
-      PermissionDeniedError,
-    );
-    expect(calls).toEqual([]);
-  });
-
-  test("falls back to the session's agent when the call names none", async () => {
-    const { host, agents } = fixture({
+  test("asserts once with every resource and lets the host resolve session rules", async () => {
+    const { host, calls, prompts } = fixture({
       agentRules: defaultRules,
-      sessionAgent: "agent-from-session",
+      sessionRules: [{ action: "edit", resource: "file.ts", effect: "deny" }],
     });
-
-    await requestPermission(host, ruleRequest, { ...context, agent: undefined });
-
-    expect(agents).toEqual(["agent-from-session"]);
-  });
-
-  test("refuses with the reason when agent permission rules cannot be read", async () => {
-    const unreadable = fixture({
-      agentRules: defaultRules,
-      agentFailure: new Error("agent lookup exploded"),
-    });
-    const agentFailure = await requestPermission(unreadable.host, ruleRequest, context).catch(
-      (caught: unknown) => caught as Error,
-    );
-    expect(agentFailure).toBeInstanceOf(PermissionRulesUnavailableError);
-    expect(agentFailure.message).toContain("could not read this session's OpenCode permission");
-    expect(agentFailure.message).toContain("agent lookup exploded");
-
-    const nameless = fixture({ agentRules: defaultRules });
-    await expect(
-      requestPermission(nameless.host, ruleRequest, { ...context, agent: undefined }),
-    ).rejects.toBeInstanceOf(PermissionRulesUnavailableError);
-
-    const ruleless = fixture({ agentRules: undefined });
-    await expect(requestPermission(ruleless.host, ruleRequest, context)).rejects.toBeInstanceOf(
-      PermissionRulesUnavailableError,
-    );
-  });
-
-  test("refuses with the reason when session rules cannot be read", async () => {
-    const { host } = fixture({
-      agentRules: defaultRules,
-      sessionFailure: new Error("session lookup exploded"),
-    });
-
     await expect(requestPermission(host, ruleRequest, context)).rejects.toThrow(
-      "session lookup exploded",
+      "Permission denied: edit",
     );
-  });
-
-  test("matches actions and resources with the host's wildcard rules", () => {
-    const rules: readonly V2PermissionRule[] = [
-      { action: "*", resource: "*", effect: "allow" },
-      { action: "bash", resource: "git push *", effect: "ask" },
-    ];
-    const decide = (permission: string, resource: string) =>
-      decidePermission({ permission, patterns: [resource], always: [], metadata: {} }, rules)
-        .effect;
-
-    expect(decide("bash", "git push")).toBe("ask");
-    expect(decide("bash", "git push --force origin main")).toBe("ask");
-    expect(decide("bash", "git status")).toBe("allow");
-  });
-
-  test("denies a mixed-resource request when any resource is denied", async () => {
-    const rules: readonly V2PermissionRule[] = [
-      { action: "edit", resource: "a.ts", effect: "allow" },
-      { action: "edit", resource: "b.ts", effect: "deny" },
-    ];
-    const { host, calls } = fixture({ agentRules: rules });
-    const mixedRequest = { ...ruleRequest, patterns: ["a.ts", "b.ts"] };
-    const decision = decidePermission(mixedRequest, rules);
-
-    expect(decision).toMatchObject({ effect: "deny", resource: "b.ts" });
-    await expect(requestPermission(host, mixedRequest, context)).rejects.toBeInstanceOf(
-      PermissionDeniedError,
-    );
-    expect(calls).toEqual([]);
-  });
-
-  test("skips assert for a mixed-resource request whose resources are all allowed", async () => {
-    const { host, calls } = fixture({
-      agentRules: [
-        { action: "edit", resource: "a.ts", effect: "allow" },
-        { action: "edit", resource: "b.ts", effect: "allow" },
-      ],
-    });
-
-    await requestPermission(host, { ...ruleRequest, patterns: ["a.ts", "b.ts"] }, context);
-
-    expect(calls).toEqual([]);
-  });
-
-  test("asserts exactly once for a mixed request that resolves to ask", async () => {
-    const { host, calls } = fixture({
-      agentRules: [
-        { action: "edit", resource: "a.ts", effect: "allow" },
-        { action: "edit", resource: "b.ts", effect: "ask" },
-      ],
-    });
-
-    await requestPermission(host, { ...ruleRequest, patterns: ["a.ts", "b.ts"] }, context);
-
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ action: "edit", resources: ["a.ts", "b.ts"] });
+    expect(calls[0]?.resources).toEqual(["file.ts"]);
+    expect(prompts).toEqual([]);
   });
-
   test("hoisted edit preserves its generated PatchDiff metadata for the permission consumer", async () => {
     const seen: unknown[] = [];
     const { host } = fixture({ agentRules: defaultRules });
@@ -452,23 +222,23 @@ describe("OpenCode 2 in-process permission assertion", () => {
     });
   });
 
-  test("a session-owned bash artifact is read without asserting permission", async () => {
+  test("a session-owned bash artifact skips external_directory but still evaluates read", async () => {
     const { read, artifact, calls, ownershipQueries } = artifactReadTool(true);
 
     await executeProjected(read, { path: artifact });
 
-    expect(calls).toEqual([]);
+    expect(calls.map((call) => (call as { action: string }).action)).toEqual(["read"]);
     expect(ownershipQueries).toEqual([{ path: artifact, session_id: "ses_test" }]);
   });
 
-  test("an artifact this session does not own asks for external_directory", async () => {
+  test("an artifact this session does not own evaluates external_directory and read", async () => {
     const { read, artifact, calls } = artifactReadTool(false);
 
     await executeProjected(read, { path: artifact });
 
-    expect(calls).toHaveLength(1);
     expect(calls.map((call) => (call as { action: string }).action)).toEqual([
       "external_directory",
+      "read",
     ]);
   });
 
@@ -558,7 +328,7 @@ describe("OpenCode 2 in-process permission assertion", () => {
     }
   });
 
-  test("aft_delete and aft_move include the rule that denied them", async () => {
+  test("aft_delete and aft_move preserve the host's denial reason", async () => {
     for (const name of ["aft_delete", "aft_move"] as const) {
       const { host } = fixture({
         agentRules: [{ action: "edit", resource: "*", effect: "deny" }],
@@ -573,8 +343,7 @@ describe("OpenCode 2 in-process permission assertion", () => {
       );
 
       expect(denied).toBeInstanceOf(Error);
-      expect((denied as Error).message).toContain("Permission denied");
-      expect((denied as Error).message).toContain('"edit" on "*" is "deny"');
+      expect((denied as Error).message).toContain("Permission denied: edit");
     }
   });
 

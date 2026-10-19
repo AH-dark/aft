@@ -11,7 +11,11 @@ import {
   optionalInt,
   resolvePathArg,
 } from "./_shared.js";
-import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
+import {
+  assertExternalDirectoryPermission,
+  assertV2ReadPermission,
+  permissionDeniedResponse,
+} from "./permissions.js";
 
 const z = tool.schema;
 
@@ -115,6 +119,8 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
             serverValidatedRead: true,
           });
           if (denial) return permissionDeniedResponse(denial);
+          const readDenial = await assertV2ReadPermission(context, target);
+          if (readDenial) return permissionDeniedResponse(readDenial);
         }
 
         const rawArgs: Record<string, unknown> = {

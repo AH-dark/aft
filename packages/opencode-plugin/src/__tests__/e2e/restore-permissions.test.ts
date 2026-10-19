@@ -4,11 +4,11 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { Effect } from "effect";
-import type { V2PermissionHostContext } from "../../permissions/v2.js";
 import { projectV2Tool, type V2PermissionRequest } from "../../tools/definitions/v2.js";
 import { hoistedV2ToolConsumers } from "../../tools/hoisted/v2.js";
 import { safetyTools } from "../../tools/safety.js";
 import type { PluginContext } from "../../types.js";
+import { permissionHost as createPermissionHost } from "../v2-permission-host.js";
 import { cleanupHarnesses, createHarness, type E2EHarness, prepareBinary } from "./helpers.js";
 
 const binary = await prepareBinary();
@@ -71,26 +71,16 @@ describe.skipIf(!binary.binaryPath)("checkpoint restore permissions", () => {
             } as ToolContext),
           );
         } else {
-          const permissionHost: V2PermissionHostContext = {
-            agent: {
-              get: () =>
-                Effect.succeed({
-                  data: {
-                    permissions: [
-                      { action: "*", resource: "*", effect: "allow" as const },
-                      { action: "edit", resource: "secrets/*", effect },
-                    ],
-                  },
-                }),
+          const permissionHost = createPermissionHost({
+            agentRules: [
+              { action: "*", resource: "*", effect: "allow" },
+              { action: "edit", resource: "secrets/*", effect },
+            ],
+            evaluate: (input, decision) => {
+              if (decision === "ask") prompts.push([...input.resources]);
+              return decision;
             },
-            session: { get: () => Effect.succeed({}) },
-            permission: {
-              assert: (input) => {
-                prompts.push([...input.resources]);
-                return Effect.void;
-              },
-            },
-          };
+          }).host;
           const consumers = hoistedV2ToolConsumers(permissionHost);
           const tool = projectV2Tool(
             "aft_safety",
@@ -118,7 +108,7 @@ describe.skipIf(!binary.binaryPath)("checkpoint restore permissions", () => {
         }
 
         if (effect === "deny") {
-          expect(result).toMatch(/secrets\/(?:x|deleted)/);
+          if (host === "V1") expect(result).toMatch(/secrets\/(?:x|deleted)/);
           expect(result.toLowerCase()).toContain("denied");
           expect(await Bun.file(h.path("public.txt")).text()).toBe("current public\n");
           expect(await Bun.file(h.path("secrets/x")).text()).toBe("current secret\n");
@@ -249,21 +239,12 @@ async function executeScopedRestore(
     return { result, requests };
   }
 
-  const permissionHost: V2PermissionHostContext = {
-    agent: {
-      get: () =>
-        Effect.succeed({
-          data: {
-            permissions: [
-              { action: "*", resource: "*", effect: "allow" as const },
-              { action: "edit", resource: "secrets/*", effect: "deny" as const },
-            ],
-          },
-        }),
-    },
-    session: { get: () => Effect.succeed({}) },
-    permission: { assert: () => Effect.void },
-  };
+  const permissionHost = createPermissionHost({
+    agentRules: [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "edit", resource: "secrets/*", effect: "deny" },
+    ],
+  }).host;
   const consumers = hoistedV2ToolConsumers(permissionHost);
   const tool = projectV2Tool(
     "aft_safety",

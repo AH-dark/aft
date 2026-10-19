@@ -8,20 +8,18 @@
  * `{action: "edit", resource: "src/*"}` covered part of the class the user
  * thought it covered and silently missed the rest.
  *
- * The rule evaluation below reuses `decidePermission`, which carries the
- * host's own wildcard matching, rather than a second copy of those semantics
- * written for this test.
+ * A test-only ruleset model checks these resource strings independently of
+ * the production adapter, which delegates all decisions to the host.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import * as path from "node:path";
 import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
-
-import { decidePermission, type V2PermissionRule } from "../permissions/v2.js";
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
+import { decidePermission, type V2PermissionRule } from "./v2-permission-host.js";
 
 type AskCall = {
   permission?: string;
@@ -208,10 +206,7 @@ async function statedResources(
 
 /** How a ruleset answers a mutation that stated these resources. */
 function ruleEffect(resources: string[], rules: V2PermissionRule[]): string {
-  return decidePermission(
-    { permission: "edit", patterns: resources, always: ["*"], metadata: {} },
-    rules,
-  ).effect;
+  return decidePermission({ permission: "edit", patterns: resources }, rules).effect;
 }
 
 describe("filesystem mutations state one permission resource shape", () => {

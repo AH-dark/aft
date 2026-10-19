@@ -511,6 +511,25 @@ describe("permission audit regressions", () => {
     expect(deniedCalls).toEqual([]);
   });
 
+  test("OpenCode 2 external search re-evaluates each call instead of caching a decision", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+    const sdkCtx = Object.assign(createSdkContext(project, recordingAsk(askCalls)), {
+      hostVersion: 2 as const,
+    });
+    await tools.aft_search.execute({ query: "TODO", path: external }, sdkCtx);
+    sdkCtx.ask = recordingAsk(askCalls, {
+      permission: "aft_search_external",
+      message: "policy changed",
+    });
+    const denied = await tools.aft_search.execute({ query: "TODO", path: external }, sdkCtx);
+    expect(denied).toContain("policy changed");
+    expect(parsePermissionDenied(denied).message).toBe("policy changed");
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(2);
+    expect(calls).toHaveLength(1);
+  });
+
   test("aft_search rule denial explains the rule and falls back to the project index", async () => {
     const { project, external } = await makeIndependentProjectAndExternalDirs();
     const askCalls: AskCall[] = [];

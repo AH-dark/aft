@@ -17,6 +17,10 @@
         "reason": "unsupported_language"
       }
     ],
+    "content_files": [
+      "<fixture>/pin/only.rs",
+      "<fixture>/pin/open/kept.rs"
+    ],
     "skipped_denied": 2
   },
   "text": "only.rs\n  - fn   pinned_token 1:1\nopen/\n  kept.rs\n    - fn   pinned_token 1:1\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)\n\nSkipped 1 file(s) with no supported language."
