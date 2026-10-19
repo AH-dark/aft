@@ -1542,6 +1542,7 @@ const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL
 // SUBC caches at most 16 KiB; reserve 4 KiB for its envelope and future counters.
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
+const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
 const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
 
 fn encoded_health_metrics_len(metrics: &serde_json::Map<String, Value>) -> usize {
@@ -1722,6 +1723,7 @@ impl HealthDiagnosticRollup {
             "memory": memory_rollup_metrics(None),
             "bash_task_retention": {
                 "eligible_but_unpruned_rows": Value::Null,
+                "eligible_but_unpruned_rows_measured_age_ms": Value::Null,
                 "last_sweep_skip_reason": Value::Null,
                 "sweeps_skipped_total": crate::db::compression_events::retention_sweep_skip_counts().0,
                 "consecutive_skips": crate::db::compression_events::retention_sweep_skip_counts().1,
@@ -1773,6 +1775,12 @@ struct PlaneTiming {
     progress_signature: String,
 }
 
+struct RetentionCountSample {
+    database: std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>,
+    measured_at_ms: u64,
+    rows: usize,
+}
+
 pub(super) struct HealthRollupCache {
     origin: Instant,
     #[cfg(test)]
@@ -1794,6 +1802,9 @@ pub(super) struct HealthRollupCache {
         std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
     allocator: std::sync::Mutex<Option<(u64, crate::memory::AllocatorObservation)>>,
+    retention_count: std::sync::Mutex<Option<RetentionCountSample>>,
+    #[cfg(test)]
+    retention_count_reads: AtomicU64,
     census_rows: std::sync::Mutex<crate::commands::memory_census::CensusRootRows>,
 }
 
@@ -1812,6 +1823,9 @@ impl HealthRollupCache {
             breakers: std::sync::Mutex::new(HashMap::new()),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
             allocator: std::sync::Mutex::new(None),
+            retention_count: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            retention_count_reads: AtomicU64::new(0),
             census_rows: std::sync::Mutex::new(Default::default()),
         }
     }
@@ -1836,6 +1850,54 @@ impl HealthRollupCache {
         // Start the reuse clock after that walk so its duration is not counted twice.
         *cached = Some((self.now_ms(), observation.clone()));
         observation
+    }
+
+    fn retention_count(
+        &self,
+        database: Option<&Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
+        now_ms: i64,
+    ) -> (Option<usize>, Option<u64>) {
+        let mut cached = self
+            .retention_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(database) = database else {
+            *cached = None;
+            return (None, None);
+        };
+        if let Some(sample) = cached.as_ref() {
+            let age_ms = self.now_ms().saturating_sub(sample.measured_at_ms);
+            if age_ms < HEALTH_RETENTION_COUNT_MAX_AGE_MS
+                && sample
+                    .database
+                    .upgrade()
+                    .is_some_and(|old| Arc::ptr_eq(&old, database))
+            {
+                return (Some(sample.rows), Some(age_ms));
+            }
+        }
+        // COUNT visits every eligible row even with the retention index. A large
+        // history must not be recounted every three seconds. Time-based expiry
+        // also picks up rows that become eligible without a database write.
+        let measured_at_ms = self.now_ms();
+        #[cfg(test)]
+        self.retention_count_reads.fetch_add(1, Ordering::Relaxed);
+        let rows = crate::db::compression_events::terminal_rows_eligible_count_nonblocking(
+            database, now_ms,
+        )
+        .ok()
+        .flatten();
+        *cached = rows.map(|rows| RetentionCountSample {
+            database: Arc::downgrade(database),
+            measured_at_ms,
+            rows,
+        });
+        // Failed or contended reads remain unknown and are retried next tick;
+        // never give an old count a fresh timestamp after an unsuccessful read.
+        (
+            rows,
+            rows.map(|_| self.now_ms().saturating_sub(measured_at_ms)),
+        )
     }
 
     /// Assemble outside the cache lock. Probe readers never wait for a refresh.
@@ -2337,26 +2399,24 @@ fn bash_db_hint_metrics() -> Value {
     }
 }
 
-fn bash_task_retention_metrics(shared_app: &App) -> Value {
+fn bash_task_retention_metrics(cache: &HealthRollupCache, shared_app: &App) -> Value {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
-    let (eligible_but_unpruned_rows, last_sweep_skip_reason) = match shared_app.db() {
-        Some(db) => (
-            crate::db::compression_events::terminal_rows_eligible_count_nonblocking(&db, now_ms)
-                .ok()
-                .flatten(),
-            crate::db::compression_events::last_retention_sweep_skip_reason(&db)
-                .map(|reason| reason.as_str()),
-        ),
-        None => (None, None),
-    };
+    let database = shared_app.db();
+    let (eligible_but_unpruned_rows, measured_age_ms) =
+        cache.retention_count(database.as_ref(), now_ms);
+    let last_sweep_skip_reason = database.as_ref().and_then(|db| {
+        crate::db::compression_events::last_retention_sweep_skip_reason(db)
+            .map(|reason| reason.as_str())
+    });
     let (sweeps_skipped_total, consecutive_skips) =
         crate::db::compression_events::retention_sweep_skip_counts();
     json!({
         "eligible_but_unpruned_rows": eligible_but_unpruned_rows,
+        "eligible_but_unpruned_rows_measured_age_ms": measured_age_ms,
         "last_sweep_skip_reason": last_sweep_skip_reason,
         "sweeps_skipped_total": sweeps_skipped_total,
         "consecutive_skips": consecutive_skips,
@@ -2380,12 +2440,25 @@ fn build_health_diagnostic_rollup(
     ))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "health_rollup_bench.rs"]
+mod rollup_bench;
+
+macro_rules! rollup_mark {
+    ($timer:ident, $step:literal) => {
+        #[cfg(all(test, target_os = "linux"))]
+        $timer.mark($step);
+    };
+}
+
 fn build_health_diagnostic_rollup_from_actors(
     cache: &HealthRollupCache,
     executor: &Executor,
     shared_app: &App,
     actor_entries: Vec<(ProjectRootId, Arc<AppContext>)>,
 ) -> HealthDiagnosticRollup {
+    #[cfg(all(test, target_os = "linux"))]
+    let mut timer = rollup_bench::Timer::new();
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
@@ -2407,6 +2480,7 @@ fn build_health_diagnostic_rollup_from_actors(
         .map(|(_, context)| Arc::clone(context))
         .collect::<Vec<_>>();
     let standing_entries = standing_health_entries(&actor_entries);
+    rollup_mark!(timer, "standing roots / database open");
     let mut standing_matched = vec![false; standing_entries.len()];
     let actor_count = actor_entries.len();
     let mut memory_roots = std::collections::BTreeMap::new();
@@ -2464,7 +2538,9 @@ fn build_health_diagnostic_rollup_from_actors(
             .as_ref()
             .and_then(|entry| entry.artifact_key.clone())
             .unwrap_or_else(|| root_label.clone());
+        rollup_mark!(timer, "root setup / retention scheduling");
         let (census_memory, memory) = ctx.memory_root_snapshot_and_rollup();
+        rollup_mark!(timer, "per-root memory census");
         census_ages.insert(root_label.clone(), memory.measured_age_ms);
         census_roots.insert(root_label.clone(), census_memory);
         let memory = if standing.is_some() {
@@ -2529,7 +2605,9 @@ fn build_health_diagnostic_rollup_from_actors(
                     .map_or(backend.since_ms, |since| since.min(backend.since_ms)),
             );
         }
+        rollup_mark!(timer, "root disk probes / breaker / callgraph");
         let health_summary = ctx.try_health_summary();
+        rollup_mark!(timer, "index readiness / view status");
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
         candidates.push(RootCandidate {
@@ -2544,6 +2622,7 @@ fn build_health_diagnostic_rollup_from_actors(
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
         });
+        rollup_mark!(timer, "root summary assembly");
     }
 
     // A refusal can prevent an entry from owning an actor. Keep it visible in
@@ -2688,7 +2767,9 @@ fn build_health_diagnostic_rollup_from_actors(
     let root_count = root_details_omitted.saturating_add(roots.len());
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
+    rollup_mark!(timer, "root JSON assembly");
     let allocator = cache.allocator_observation();
+    rollup_mark!(timer, "allocator observation");
     let memory = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::new(
         "ready",
         memory_roots,
@@ -2699,6 +2780,7 @@ fn build_health_diagnostic_rollup_from_actors(
         census_roots,
         allocator,
     );
+    rollup_mark!(timer, "process memory snapshots");
     let census_rows = cache
         .census_rows
         .lock()
@@ -2718,7 +2800,9 @@ fn build_health_diagnostic_rollup_from_actors(
             }
         }
     }
+    rollup_mark!(timer, "census JSON rendering");
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
+    rollup_mark!(timer, "lifecycle OS probes");
     shared_app.publish_lifecycle_census(lifecycle.clone());
     let detail = if busy_roots > 0 {
         Some(format!(
@@ -2745,6 +2829,9 @@ fn build_health_diagnostic_rollup_from_actors(
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let storage_retention_totals = retention_report_totals(&storage_retention);
+    rollup_mark!(timer, "storage retention snapshots");
+    let bash_retention = bash_task_retention_metrics(cache, shared_app);
+    rollup_mark!(timer, "bash retention database count");
     let mut metrics = json!({
         "actor_count": actor_count,
         "root_count": root_count,
@@ -2767,7 +2854,7 @@ fn build_health_diagnostic_rollup_from_actors(
             "since_ms": embedding_backend_since_ms,
         },
         "memory": memory,
-        "bash_task_retention": bash_task_retention_metrics(shared_app),
+        "bash_task_retention": bash_retention,
         "storage_retention": storage_retention,
         "storage_retention_totals": storage_retention_totals,
         "storage_retention_reports_omitted": 0,
@@ -2778,6 +2865,7 @@ fn build_health_diagnostic_rollup_from_actors(
         "roots": roots,
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
+    rollup_mark!(timer, "metrics JSON assembly");
     HealthDiagnosticRollup {
         status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
@@ -2854,6 +2942,16 @@ fn build_health_report_with_indexing(
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
+    // The count's age is recorded at assembly; include time spent serving this
+    // rollup too, including when scheduler contention delays the next census.
+    if let Some(age) = metrics
+        .get_mut("bash_task_retention")
+        .and_then(|retention| retention.get_mut("eligible_but_unpruned_rows_measured_age_ms"))
+    {
+        if let Some(measured_age_ms) = age.as_u64() {
+            *age = json!(measured_age_ms.saturating_add(snapshot_age_ms.unwrap_or(0)));
+        }
+    }
     let lsp_children = metrics.remove("lsp_children").unwrap_or(Value::Null);
     // Read the Mutating lanes fresh, without waiting on the scheduler, so an
     // operator sees what holds a root and for how long right now, not as of
@@ -4145,6 +4243,108 @@ mod tests {
     }
 
     #[test]
+    fn health_retention_count_reuses_sql_for_30s_with_honest_age() {
+        let storage = tempfile::tempdir().unwrap();
+        let db = Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        db.lock().unwrap().execute_batch(
+            "INSERT INTO bash_tasks
+             (harness, session_id, task_id, project_key, command, cwd, status, started_at, completed_at, completion_delivered)
+             VALUES ('opencode', 'session', 'old-task', 'project', 'true', '.', 'completed', 0, 1, 1);"
+        ).unwrap();
+        let app = App::default_shared();
+        app.set_db(Arc::clone(&db));
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        let executor = Executor::new();
+        cache.refresh_for_test(&executor, &app);
+        let first = cache.snapshot().0.metrics["bash_task_retention"].clone();
+        assert_eq!(first["eligible_but_unpruned_rows"], 1);
+        assert_eq!(cache.retention_count_reads.load(Ordering::Relaxed), 1);
+
+        db.lock()
+            .unwrap()
+            .execute("DELETE FROM bash_tasks", [])
+            .unwrap();
+        cache.clock_ms.store(29_999, Ordering::Relaxed);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(
+            report.metrics.unwrap()["bash_task_retention"]
+                ["eligible_but_unpruned_rows_measured_age_ms"],
+            29_999
+        );
+        let reused = bash_task_retention_metrics(&cache, &app);
+        assert_eq!(
+            cache.retention_count_reads.load(Ordering::Relaxed),
+            1,
+            "unchanged health ticks must not recount retention rows"
+        );
+        assert_eq!(reused["eligible_but_unpruned_rows"], 1);
+        assert_eq!(first["eligible_but_unpruned_rows_measured_age_ms"], 0);
+        assert_eq!(reused["eligible_but_unpruned_rows_measured_age_ms"], 29_999);
+
+        cache.clock_ms.store(30_000, Ordering::Relaxed);
+        let refreshed = bash_task_retention_metrics(&cache, &app);
+        assert_eq!(cache.retention_count_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(refreshed["eligible_but_unpruned_rows"], 0);
+        assert_eq!(refreshed["eligible_but_unpruned_rows_measured_age_ms"], 0);
+    }
+
+    #[test]
+    fn health_retention_count_invalidates_on_database_change_and_retries_unknown() {
+        let storage = tempfile::tempdir().unwrap();
+        let db = Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        assert_eq!(
+            cache.retention_count(Some(&db), i64::MAX),
+            (Some(0), Some(0))
+        );
+        let other = Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.path().join("other.db")).unwrap(),
+        ));
+        assert_eq!(
+            cache.retention_count(Some(&other), i64::MAX),
+            (Some(0), Some(0))
+        );
+        assert_eq!(cache.retention_count_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.retention_count(None, i64::MAX), (None, None));
+        assert_eq!(
+            cache.retention_count(Some(&other), i64::MAX),
+            (Some(0), Some(0))
+        );
+        assert_eq!(cache.retention_count_reads.load(Ordering::Relaxed), 3);
+
+        cache.clock_ms.store(30_000, Ordering::Relaxed);
+        let held = other.lock().unwrap();
+        assert_eq!(cache.retention_count(Some(&other), i64::MAX), (None, None));
+        drop(held);
+        assert_eq!(
+            cache.retention_count(Some(&other), i64::MAX),
+            (Some(0), Some(0))
+        );
+        assert_eq!(cache.retention_count_reads.load(Ordering::Relaxed), 5);
+        other
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE bash_tasks")
+            .unwrap();
+        cache.clock_ms.store(60_000, Ordering::Relaxed);
+        assert_eq!(cache.retention_count(Some(&other), i64::MAX), (None, None));
+        assert_eq!(cache.retention_count(Some(&other), i64::MAX), (None, None));
+        assert_eq!(cache.retention_count_reads.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
     fn health_check_reports_eligible_but_unpruned_bash_task_rows() {
         let storage = tempfile::tempdir().expect("storage tempdir");
         let conn = crate::db::open(&storage.path().join("aft.db")).expect("open database");
@@ -4179,6 +4379,7 @@ mod tests {
         let retention = &report.metrics.expect("health metrics")["bash_task_retention"];
 
         assert_eq!(retention["eligible_but_unpruned_rows"].as_u64(), Some(2));
+        assert!(retention["eligible_but_unpruned_rows_measured_age_ms"].is_u64());
         assert!(retention["last_sweep_skip_reason"].is_null());
         assert_eq!(
             retention["steady_state_ceiling"].as_u64(),
