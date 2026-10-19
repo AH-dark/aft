@@ -405,7 +405,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 #[cfg(test)]
-mod approved_contract_tests {
+mod contract_tests {
     use super::*;
 
     #[test]

@@ -29,7 +29,7 @@ pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
     "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
 #[cfg(test)]
-mod approved_contract_tests {
+mod contract_tests {
     use super::*;
 
     #[test]

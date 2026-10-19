@@ -303,7 +303,7 @@ fn build_batch_output(
 ///
 /// Returns one or more resolved edits on success, or `Err(Response)` on validation failure.
 #[cfg(test)]
-mod approved_contract_tests {
+mod contract_tests {
     use super::*;
 
     #[test]

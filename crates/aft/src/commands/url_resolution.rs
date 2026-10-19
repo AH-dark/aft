@@ -45,7 +45,7 @@ fn resolve_with_fetch(
 }
 
 #[cfg(test)]
-mod approved_url_tests {
+mod url_tests {
     use super::*;
 
     #[test]

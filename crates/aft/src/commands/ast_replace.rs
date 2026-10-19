@@ -532,10 +532,10 @@ mod audit_regressions {
 
 #[cfg(test)]
 #[path = "../../tests/helpers/fake_lsp.rs"]
-mod approved_fake_lsp;
+mod fake_lsp;
 
 #[cfg(test)]
-mod approved_lsp_tests {
+mod lsp_tests {
     use super::*;
     use crate::lsp::client::LspEvent;
     use crate::lsp::position::uri_for_path;
@@ -585,7 +585,7 @@ mod approved_lsp_tests {
         );
         {
             let mut manager = ctx.lsp();
-            manager.override_binary(ServerKind::Rust, approved_fake_lsp::fake_server_binary());
+            manager.override_binary(ServerKind::Rust, fake_lsp::fake_server_binary());
             manager.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
             manager.set_extra_env("AFT_FAKE_LSP_ECHO_CHANGES", "1");
             assert_eq!(

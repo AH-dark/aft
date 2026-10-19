@@ -860,7 +860,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod approved_ordering_probe {
+mod ordering_probe {
     #[test]
     fn glob_page_cap_keeps_newest_eligible_discovered_files() {
         let dir = tempfile::tempdir().unwrap();

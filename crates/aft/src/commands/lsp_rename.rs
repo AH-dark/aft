@@ -723,7 +723,7 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
 }
 
 #[cfg(test)]
-mod approved_rollback_tests {
+mod rollback_tests {
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, PathBuf, AppContext, RenameRollback) {

@@ -1615,7 +1615,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-mod approved_unicode_tests {
+mod unicode_tests {
     use super::*;
 
     #[test]

@@ -1049,7 +1049,7 @@ fn is_simple_identifier(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod approved_unicode_tests {
+mod unicode_tests {
     #[test]
     fn mixed_unicode_indent_is_stripped_on_character_boundaries() {
         assert_eq!(
