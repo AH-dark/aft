@@ -133,7 +133,9 @@ fn hash16(path: &Path) -> String {
 
 /// Resolve lexical dot components without touching the filesystem. Leading
 /// relative parents remain significant; rooted paths cannot escape their root.
-fn lexical_normalize(path: &Path) -> PathBuf {
+/// This is not containment validation, and comparison callers apply any
+/// Windows verbatim-prefix policy before passing their path here.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let mut result = PathBuf::new();

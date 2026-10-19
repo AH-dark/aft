@@ -1514,19 +1514,7 @@ fn absolute_path(project_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !result.pop() {
-                    result.push(component.as_os_str());
-                }
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
+    crate::path_identity::lexical_normalize(path)
 }
 
 fn relative_string(project_root: &Path, path: &Path) -> String {
@@ -1576,6 +1564,19 @@ mod tests {
     use crate::config::Config;
     use crate::inspect::JobKey;
     use crate::parser::SymbolCache;
+
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::normalize_path(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
 
     fn fixture_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let temp_dir = tempfile::tempdir().expect("tempdir");

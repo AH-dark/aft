@@ -490,19 +490,7 @@ fn sorted_read_dir(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component);
-                }
-            }
-            Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
+    crate::path_identity::lexical_normalize(path)
 }
 
 #[cfg(unix)]
@@ -526,6 +514,19 @@ mod tests {
     use std::panic::catch_unwind;
     use std::time::UNIX_EPOCH;
     use tempfile::TempDir;
+
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::lexical_normalize(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn legacy_partition_guard_matches_exact_domains() {

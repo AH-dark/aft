@@ -311,44 +311,65 @@ fn find_git_toplevel(path: &Path) -> Result<Option<PathBuf>, ScopedKeyError> {
     if !crate::developer_tools::git_usable() {
         return Ok(None);
     }
-    let output = crate::effective_path::new_command("git")
-        .build()
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
+    let stdout = match crate::git_probe::toplevel(path) {
+        Ok(stdout) => stdout,
+        Err(crate::git_probe::ProbeError::Spawn(error)) => {
+            return Err(ScopedKeyError::GitProbe {
+                path: path.to_path_buf(),
+                detail: format!("spawn failed: {error}"),
+            });
+        }
+        Err(crate::git_probe::ProbeError::Failed { kind, output }) => {
+            if kind == crate::git_probe::FailureKind::NotRepository {
+                return Ok(None);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ScopedKeyError::GitProbe {
+                path: path.to_path_buf(),
+                detail: format!("exit {:?}: {}", output.status.code(), stderr.trim()),
+            });
+        }
+    };
+    let output = String::from_utf8(stdout).map_err(|_| ScopedKeyError::GitProbe {
+        path: path.to_path_buf(),
+        detail: "git returned a non-Unicode toplevel".to_string(),
+    })?;
+    let toplevel = output.trim_end_matches(['\r', '\n']);
+    std::fs::canonicalize(toplevel)
+        .map(Some)
         .map_err(|error| ScopedKeyError::GitProbe {
             path: path.to_path_buf(),
-            detail: format!("spawn failed: {error}"),
-        })?;
-    if output.status.success() {
-        let output = String::from_utf8(output.stdout).map_err(|_| ScopedKeyError::GitProbe {
-            path: path.to_path_buf(),
-            detail: "git returned a non-Unicode toplevel".to_string(),
-        })?;
-        let toplevel = output.trim_end_matches(['\r', '\n']);
-        return std::fs::canonicalize(toplevel).map(Some).map_err(|error| {
-            ScopedKeyError::GitProbe {
-                path: path.to_path_buf(),
-                detail: error.to_string(),
-            }
-        });
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("not a git repository") {
-        return Ok(None);
-    }
-    Err(ScopedKeyError::GitProbe {
-        path: path.to_path_buf(),
-        detail: format!("exit {:?}: {}", output.status.code(), stderr.trim()),
-    })
+            detail: error.to_string(),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// A `.git` folder without HEAD (for example only `info/exclude`) is not a
+    /// repository to Git, so the scope stays a plain folder.
+    #[test]
+    fn stub_git_directory_is_a_plain_folder() {
+        assert!(crate::developer_tools::git_usable());
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_directory_for_test(dir.path());
+        assert!(matches!(find_git_toplevel(dir.path()), Ok(None)));
+    }
+
+    /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
+    /// repository" message. That is damaged metadata, not proof of absence.
+    #[test]
+    fn corrupt_repository_metadata_is_a_probe_error_not_absence() {
+        assert!(crate::developer_tools::git_usable());
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
+        assert!(matches!(
+            find_git_toplevel(dir.path()),
+            Err(ScopedKeyError::GitProbe { .. })
+        ));
+    }
 
     #[test]
     fn scoped_v1_has_domain_separation_and_stable_bytes() {

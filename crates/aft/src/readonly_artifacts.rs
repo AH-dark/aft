@@ -513,22 +513,21 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
     if !crate::developer_tools::git_usable() {
         return Err("not_a_git_root".to_string());
     }
-    let output = crate::effective_path::new_command("git")
-        .build()
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(base_dir)
-        .output()
-        .map_err(|error| format!("failed to run git: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not a git repository") {
-            return Err("not_a_git_root".to_string());
+    let stdout = match crate::git_probe::toplevel_in_directory(base_dir) {
+        Ok(stdout) => stdout,
+        Err(crate::git_probe::ProbeError::Spawn(error)) => {
+            return Err(format!("failed to run git: {error}"));
         }
-        return Err(format!("git rev-parse failed: {}", stderr.trim()));
-    }
+        Err(crate::git_probe::ProbeError::Failed { kind, output }) => {
+            if kind == crate::git_probe::FailureKind::NotRepository {
+                return Err("not_a_git_root".to_string());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git rev-parse failed: {}", stderr.trim()));
+        }
+    };
 
-    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let toplevel = String::from_utf8_lossy(&stdout).trim().to_string();
     if toplevel.is_empty() {
         return Err("git rev-parse returned an empty toplevel".to_string());
     }
@@ -550,6 +549,32 @@ mod tests {
     use crate::context::BORROWED_INDEX_CACHE_CAPACITY;
     use crate::search_index::artifact_cache_key;
     use crate::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
+
+    /// With a relative PATH entry, `git` must still be found relative to the
+    /// project folder, where this probe has always started its child.
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entry_finds_git_from_the_project_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_for_test(&dir.path().join("bin"), "/stub-toplevel");
+        let path = crate::git_probe::relative_bin_path_for_test();
+        let toplevel = crate::git_probe::with_child_env_for_test(&[("PATH", &path)], || {
+            git_toplevel(dir.path())
+        })
+        .unwrap();
+        assert_eq!(toplevel, PathBuf::from("/stub-toplevel"));
+    }
+
+    /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
+    /// repository" message. That is damaged metadata, not proof of absence.
+    #[test]
+    fn corrupt_repository_metadata_is_a_git_failure_not_absence() {
+        assert!(crate::developer_tools::git_usable());
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
+        let error = git_toplevel(dir.path()).unwrap_err();
+        assert!(error.starts_with("git rev-parse failed:"), "{error}");
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct FileSnapshot {

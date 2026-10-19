@@ -6533,6 +6533,7 @@ pub fn artifact_cache_key_with_memo(
 pub(crate) struct ArtifactCacheKeyTimings {
     pub(crate) git_usable: Duration,
     pub(crate) rev_list: Duration,
+    /// Git processes actually started, including unborn-branch verification.
     pub(crate) git_spawns: usize,
     pub(crate) retry_wait: Duration,
     pub(crate) memo_wait: Duration,
@@ -7689,7 +7690,6 @@ fn git_root_commit_once_real(
     if !time_cache_key_work(&mut timings.git_usable, crate::developer_tools::git_usable) {
         return RootCommitProbe::NotARepo;
     }
-    timings.git_spawns += 1;
     #[cfg(test)]
     ROOT_COMMIT_GIT_RUNS.with(|runs| {
         *runs
@@ -7697,37 +7697,32 @@ fn git_root_commit_once_real(
             .entry(project_root.to_path_buf())
             .or_default() += 1;
     });
-    let output = match time_cache_key_work(&mut timings.rev_list, || {
-        crate::effective_path::new_command("git")
-            .build()
-            .arg("-C")
-            .arg(project_root)
-            .args(["rev-list", "--max-parents=0", "HEAD"])
-            .output()
-    }) {
-        Ok(output) => output,
-        Err(error) => return RootCommitProbe::Transient(format!("spawn failed: {error}")),
-    };
-
-    if output.status.success() {
-        return canonicalize_root_commit_output(&output.stdout);
+    // The rev_list timing also covers the extra Git checks that verify an
+    // unborn branch, since they are part of deciding this probe's answer, and
+    // git_spawns counts every Git process the probe actually started.
+    let mut spawned = 0;
+    let result = time_cache_key_work(&mut timings.rev_list, || {
+        crate::git_probe::root_commits(project_root, &mut spawned)
+    });
+    timings.git_spawns += spawned;
+    match result {
+        Ok(stdout) => canonicalize_root_commit_output(&stdout),
+        Err(crate::git_probe::ProbeError::Spawn(error)) => {
+            RootCommitProbe::Transient(format!("spawn failed: {error}"))
+        }
+        Err(crate::git_probe::ProbeError::Failed { kind, output }) => match kind {
+            crate::git_probe::FailureKind::NotRepository => RootCommitProbe::NotARepo,
+            crate::git_probe::FailureKind::NoCommit => RootCommitProbe::NoCommit,
+            crate::git_probe::FailureKind::Other => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                RootCommitProbe::Transient(format!(
+                    "exit {:?}: {}",
+                    output.status.code(),
+                    stderr.trim().chars().take(200).collect::<String>()
+                ))
+            }
+        },
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("not a git repository") {
-        return RootCommitProbe::NotARepo;
-    }
-    if stderr.contains("unknown revision")
-        || stderr.contains("bad revision")
-        || stderr.contains("ambiguous argument 'HEAD'")
-    {
-        return RootCommitProbe::NoCommit;
-    }
-    RootCommitProbe::Transient(format!(
-        "exit {:?}: {}",
-        output.status.code(),
-        stderr.trim().chars().take(200).collect::<String>()
-    ))
 }
 
 #[cfg(test)]
@@ -8068,19 +8063,7 @@ fn normalized_display_sort_key(project_root: Option<&Path>, path: &Path) -> Stri
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                if !result.pop() {
-                    result.push(component);
-                }
-            }
-            Component::CurDir => {}
-            _ => result.push(component),
-        }
-    }
-    result
+    crate::path_identity::lexical_normalize(path)
 }
 
 fn canonicalize_existing_or_deleted_path_with_memo(
@@ -9252,6 +9235,78 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::normalize_path(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
+
+    /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
+    /// repository" message. That is damaged metadata, not proof of absence, so
+    /// the root-commit probe must stay retryable instead of choosing the
+    /// path-derived cache identity reserved for real non-repositories.
+    #[test]
+    fn corrupt_root_commit_metadata_is_not_path_identity_fallback() {
+        assert!(crate::developer_tools::git_usable());
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
+        assert!(matches!(
+            git_root_commit_once_real(dir.path(), &mut ArtifactCacheKeyTimings::default()),
+            RootCommitProbe::Transient(_)
+        ));
+    }
+
+    /// A `.git` folder without HEAD (for example only `info/exclude`) is not a
+    /// repository to Git, so it keeps the path-derived identity of a plain folder.
+    #[test]
+    fn stub_git_directory_root_commit_is_not_a_repository() {
+        assert!(crate::developer_tools::git_usable());
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_directory_for_test(dir.path());
+        assert!(matches!(
+            git_root_commit_once_real(dir.path(), &mut ArtifactCacheKeyTimings::default()),
+            RootCommitProbe::NotARepo
+        ));
+        assert!(matches!(
+            repo_root_commit_with_retry(dir.path()),
+            RootCommitResolution::NotARepo
+        ));
+    }
+
+    /// A verified repository without commits keeps its intentional mapping to
+    /// the path-derived identity.
+    #[test]
+    fn unborn_root_commit_retains_the_intentional_non_repository_mapping() {
+        assert!(crate::developer_tools::git_usable());
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let mut timings = ArtifactCacheKeyTimings::default();
+        assert!(matches!(
+            git_root_commit_once_real(dir.path(), &mut timings),
+            RootCommitProbe::NoCommit
+        ));
+        // rev-list, then git-dir, verify, symbolic-ref and two git-path checks.
+        assert_eq!(timings.git_spawns, 6);
+        assert!(matches!(
+            repo_root_commit_with_retry(dir.path()),
+            RootCommitResolution::NotARepo
+        ));
+    }
 
     fn transient_search_cache_test_dir(root: &Path, name: &str, contents: &[u8]) -> PathBuf {
         let path = root.join(name);
