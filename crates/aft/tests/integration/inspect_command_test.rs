@@ -5247,6 +5247,10 @@ fn scoped_diagnostics_external_directory_without_workspace_marker_counts_uncheck
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["scope_files"], 2, "{response:#}");
     assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
     for file in files {
         let file = crate::helpers::canonicalize_like_product(&file);
         assert!(
@@ -5291,28 +5295,12 @@ fn scoped_diagnostics_external_directory_counts_reported_files_and_keeps_rows() 
     );
 
     assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["scope_files"], 4, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
     assert_eq!(
-        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"], 1,
+        response["summary"]["diagnostics"]["errors"], 1,
         "{response:#}"
     );
-    assert!(
-        response["summary"]["diagnostics"]["errors"].is_null(),
-        "{response:#}"
-    );
-    assert_eq!(response["complete"], false, "{response:#}");
-    for name in ["package.json", "tsconfig.json"] {
-        assert!(
-            response["gaps"].as_array().unwrap().iter().any(|gap| {
-                gap["kind"] == "uncovered_file"
-                    && gap["file"] == diagnostic_path(&external_root.join(name))
-                    && gap["cause"]["reason"]
-                        .as_str()
-                        .is_some_and(|reason| reason.contains("no workspace root marker found"))
-            }),
-            "rootless JSON producer must remain unchecked: {response:#}"
-        );
-    }
+    assert_eq!(response["complete"], true, "{response:#}");
     assert!(
         response["details"]["diagnostics"]
             .as_array()
@@ -5348,8 +5336,12 @@ fn scoped_diagnostics_external_directory_names_unreported_file_gap() {
     );
 
     assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["scope_files"], 4, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
     assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
     assert!(
         response["gaps"].as_array().unwrap().iter().any(|gap| {
             gap["kind"] == "uncovered_file"
@@ -5388,16 +5380,76 @@ fn scoped_diagnostics_external_directory_and_file_are_counted_once() {
     );
 
     assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["scope_files"], 4, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
     assert_eq!(
-        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"], 1,
+        response["summary"]["diagnostics"]["errors"], 1,
         "{response:#}"
     );
+    assert_eq!(response["complete"], true, "{response:#}");
+}
+
+#[test]
+fn scoped_diagnostics_external_biome_workspace_counts_json_with_authoritative_reports() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, broken) = external_typescript_fixture();
+    write_file(&external_root, "biome.json", "{}\n");
+    let clean = write_file(&external_root, "clean.ts", "export const clean = 1;\n");
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(
+        &ctx,
+        &external_root,
+        &broken,
+        vec![external_error(&broken)],
+    );
+    publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
+    let inspect_workspace = |id: &str| {
+        inspect(
+            &ctx,
+            json!({
+                "id": id, "command": "inspect", "sections": ["diagnostics"], "scope": external_root,
+            }),
+        )
+    };
+    let unchecked = inspect_workspace("inspect-outside-biome-unchecked");
+    assert_eq!(unchecked["success"], true, "{unchecked:#}");
+    assert_eq!(unchecked["scope_files"], 5, "{unchecked:#}");
+    assert_eq!(unchecked["complete"], false, "{unchecked:#}");
     assert!(
-        response["summary"]["diagnostics"]["errors"].is_null(),
+        unchecked["summary"]["diagnostics"]["errors"].is_null(),
+        "{unchecked:#}"
+    );
+    for name in ["package.json", "tsconfig.json", "biome.json"] {
+        assert!(
+            unchecked["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "uncovered_file"
+                    && gap["file"] == diagnostic_path(&external_root.join(name))
+            }),
+            "{unchecked:#}"
+        );
+    }
+    for name in ["package.json", "tsconfig.json", "biome.json"] {
+        ctx.lsp().diagnostics_store_mut_for_test().publish(
+            ServerKey {
+                kind: ServerKind::Biome,
+                root: external_root.clone(),
+            },
+            crate::helpers::canonicalize_like_product(&external_root.join(name)),
+            Vec::new(),
+        );
+    }
+    let response = inspect_workspace("inspect-outside-biome-reported");
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 5, "{response:#}");
+    assert_eq!(response["complete"], true, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
         "{response:#}"
     );
-    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["biome"]["errors"], 0,
+        "{response:#}"
+    );
+    assert!(response.get("gaps").is_none(), "{response:#}");
 }
 
 #[test]

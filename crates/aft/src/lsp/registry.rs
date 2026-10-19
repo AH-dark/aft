@@ -940,9 +940,9 @@ pub(crate) fn servers_for_file_with_mode(
         .collect()
 }
 
-/// Biome analyzes only the files its configuration's `files.includes` lists
-/// and publishes nothing for the rest. Treating Biome as a producer for an
-/// excluded file (this repository's biome.json lists only package sources,
+/// Biome applies only when its project configuration exists, and analyzes only
+/// the files that configuration's `files.includes` lists. Treating it as a
+/// producer for an excluded file (this repository's biome.json lists only package sources,
 /// so every `.json` under `crates/` is excluded) left that file a permanent
 /// "published no diagnostics" gap in every scoped inspect. A configuration
 /// without `files.includes`, or one that cannot be read, includes every file.
@@ -951,7 +951,7 @@ fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) ->
         return false;
     }
     let Some(root) = server.workspace_root_with_mode(path, None, mode) else {
-        return false;
+        return true;
     };
     let Some(config_path) = ["biome.json", "biome.jsonc"]
         .iter()
@@ -961,7 +961,7 @@ fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) ->
             candidate.is_file()
         })
     else {
-        return false;
+        return true;
     };
     let Some(includes) = biome_includes(&config_path) else {
         return false;
@@ -1588,6 +1588,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn biome_requires_its_config_even_with_git_marker() {
+        for worktree in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let file = root.join("package.json");
+            write_file(&file, "{}");
+            if worktree {
+                write_file(
+                    &root.join(".git"),
+                    "gitdir: ../main/.git/worktrees/external\n",
+                );
+            } else {
+                std::fs::create_dir(root.join(".git")).unwrap();
+            }
+            assert!(servers_for_file(&file, &Config::default()).is_empty());
+            for marker in ["biome.json", "biome.jsonc"] {
+                write_file(&root.join(marker), "{}");
+                let servers = servers_for_file(&file, &Config::default());
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].kind, ServerKind::Biome);
+                assert_eq!(
+                    servers[0].workspace_root_for_file(&file),
+                    Some(crate::inspect::job::canonicalize_normalized(root)),
+                );
+                std::fs::remove_file(root.join(marker)).unwrap();
+            }
+        }
+    }
+
     /// Biome is not a producer for a file its `files.includes` leaves out, so
     /// such a file is not an eternal "no diagnostics published" gap.
     #[test]
@@ -1825,8 +1855,8 @@ mod tests {
 
     #[test]
     fn test_servers_for_typescript_file() {
-        // TS files match TypeScript (primary) plus Biome / Oxlint / Eslint
-        // co-servers. The full set is asserted in `test_typescript_co_servers`.
+        // TypeScript applies without root markers. Configured co-servers are
+        // asserted separately in `test_typescript_co_servers`.
         let kinds = matching_kinds("/tmp/file.ts", &Config::default());
         assert!(
             kinds.contains(&ServerKind::TypeScript),
@@ -1890,7 +1920,10 @@ mod tests {
 
     #[test]
     fn test_typescript_co_servers() {
-        let kinds = matching_kinds("/tmp/file.ts", &Config::default());
+        let temp = tempfile::tempdir().unwrap();
+        write_file(&temp.path().join("biome.json"), "{}");
+        let file = temp.path().join("file.ts");
+        let kinds = matching_kinds(file.to_str().unwrap(), &Config::default());
         assert!(kinds.contains(&ServerKind::TypeScript));
         assert!(kinds.contains(&ServerKind::Biome));
         assert!(kinds.contains(&ServerKind::Oxlint));
@@ -1907,9 +1940,12 @@ mod tests {
             disabled_lsp: disabled,
             ..Config::default()
         };
+        let temp = tempfile::tempdir().unwrap();
+        write_file(&temp.path().join("biome.json"), "{}");
+        let file = temp.path().join("file.ts");
 
         assert_eq!(
-            matching_kinds("/tmp/file.ts", &config),
+            matching_kinds(file.to_str().unwrap(), &config),
             vec![ServerKind::TypeScript]
         );
     }

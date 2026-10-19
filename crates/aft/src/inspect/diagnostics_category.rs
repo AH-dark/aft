@@ -2170,6 +2170,53 @@ mod ignore_rule_candidate_tests {
     }
 
     #[test]
+    fn scoped_candidates_share_applicability_inside_and_outside_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let other = tempfile::tempdir().unwrap();
+        let other_root = crate::inspect::job::canonicalize_normalized(other.path());
+        for (name, content) in [
+            ("package.json", "{}"),
+            ("tsconfig.json", "{\"include\":[\"*.ts\"]}"),
+            ("first.ts", "export const first = 1;"),
+            ("second.ts", "export const second = 2;"),
+        ] {
+            std::fs::write(root.join(name), content).unwrap();
+        }
+        let selected_files = |project_root: &Path| {
+            let snapshot = InspectSnapshot::new(
+                project_root.to_path_buf(),
+                project_root.join(".aft-inspect"),
+                Arc::new(Config::default()),
+                Arc::new(RwLock::new(SymbolCache::new())),
+            );
+            let candidates = scoped_coverage_candidates(
+                &snapshot,
+                &JobScope::from_roots(project_root.to_path_buf(), vec![root.clone()]),
+                &snapshot.config,
+                None,
+            );
+            assert!(candidates.walk_complete);
+            fixture::relative_set(&root, &candidates.files)
+        };
+        let typescript_only = ["first.ts".to_string(), "second.ts".to_string()].into();
+        assert_eq!(selected_files(&root), typescript_only);
+        assert_eq!(selected_files(&other_root), typescript_only);
+        std::fs::write(root.join("biome.json"), "{}").unwrap();
+        let with_json = [
+            "first.ts",
+            "second.ts",
+            "package.json",
+            "tsconfig.json",
+            "biome.json",
+        ]
+        .map(str::to_string)
+        .into();
+        assert_eq!(selected_files(&root), with_json);
+        assert_eq!(selected_files(&other_root), with_json);
+    }
+
+    #[test]
     fn scoped_candidates_skip_nested_server_fixture_workspaces() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("main.ts"), "export const main = 1;").unwrap();
@@ -2182,7 +2229,7 @@ mod ignore_rule_candidate_tests {
         assert_eq!(candidates(temp.path()), ["main.ts".to_string()].into());
         assert_eq!(
             candidates(&temp.path().join("fixtures/workspace")),
-            ["nested.ts".to_string(), "package.json".to_string()].into(),
+            ["nested.ts".to_string()].into(),
         );
     }
 }
