@@ -4444,7 +4444,11 @@ pub struct SemanticChunk {
 #[derive(Debug, Clone)]
 pub struct EmbeddingEntry {
     chunk: SemanticChunk,
-    vector: Vec<f32>,
+    /// Shared, immutable floats. Entries that carry the same vector (a chunk
+    /// reused unchanged by a refresh or a view fill, or a run deduplicated by
+    /// the semantic arena) point at one allocation instead of each holding a
+    /// copy. The on-disk formats still write the floats inline.
+    vector: Arc<[f32]>,
     /// Cached L2 norm so searches only recompute the query norm. Remote embedding
     /// backends do not guarantee unit vectors, so keep the actual norm instead of
     /// assuming it is 1.0.
@@ -4456,7 +4460,8 @@ impl EmbeddingEntry {
         &self.chunk.file
     }
 
-    fn new(chunk: SemanticChunk, vector: Vec<f32>) -> Self {
+    fn new(chunk: SemanticChunk, vector: impl Into<Arc<[f32]>>) -> Self {
+        let vector = vector.into();
         let norm = vector_norm(&vector);
         Self {
             chunk,
@@ -4607,13 +4612,19 @@ impl SemanticVectors {
     /// Bytes held by the vectors and chunk text of this run. The arena counts
     /// each run once however many views reference it.
     pub fn resident_bytes(&self) -> u64 {
+        self.vectors()
+            .fold(0u64, |bytes, vector| {
+                bytes.saturating_add(vector_bytes(vector))
+            })
+            .saturating_add(self.resident_bytes_without_vectors())
+    }
+
+    /// Bytes held by this run apart from its vectors, which other runs may
+    /// share.
+    pub fn resident_bytes_without_vectors(&self) -> u64 {
         self.entries.iter().fold(0u64, |bytes, entry| {
             let chunk = &entry.chunk;
             bytes
-                .saturating_add(
-                    crate::memory::usize_to_u64(entry.vector.len())
-                        .saturating_mul(std::mem::size_of::<f32>() as u64),
-                )
                 .saturating_add(crate::memory::path_bytes(&chunk.file))
                 .saturating_add(crate::memory::usize_to_u64(chunk.name.len()))
                 .saturating_add(crate::memory::usize_to_u64(
@@ -4624,6 +4635,23 @@ impl SemanticVectors {
                 .saturating_add(std::mem::size_of::<EmbeddingEntry>() as u64)
         })
     }
+
+    /// Each chunk's vector, in run order.
+    pub fn vectors(&self) -> impl Iterator<Item = &Arc<[f32]>> {
+        self.entries.iter().map(|entry| &entry.vector)
+    }
+
+    /// Each chunk's vector, for swapping in an equal vector held elsewhere.
+    /// Replacing a vector with one of different floats would leave the cached
+    /// norm stale, so callers may only substitute bit-identical vectors.
+    pub(crate) fn vectors_mut(&mut self) -> impl Iterator<Item = &mut Arc<[f32]>> {
+        self.entries.iter_mut().map(|entry| &mut entry.vector)
+    }
+}
+
+/// Bytes of floats in one vector allocation.
+pub fn vector_bytes(vector: &[f32]) -> u64 {
+    crate::memory::usize_to_u64(vector.len()).saturating_mul(std::mem::size_of::<f32>() as u64)
 }
 
 #[derive(Debug)]
@@ -4916,7 +4944,10 @@ pub(crate) fn files_with_changed_content(
 
 /// The semantic index — stores embeddings for all symbols in a project.
 /// Roots borrowing a frozen corpus retain an Arc plus file-local deltas.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is written by hand: a clone is a private, mutable copy, so it folds
+/// any `view_runs` into its own `entries` (see [`Self::materialize_view_runs`]).
+#[derive(Debug)]
 pub struct SemanticIndex {
     entries: Vec<EmbeddingEntry>,
     /// Track which files are indexed and their mtime for staleness detection
@@ -4934,6 +4965,13 @@ pub struct SemanticIndex {
     shared_base: Option<Arc<SharedSemanticBase>>,
     /// Relative base file identities hidden by local replacements or deletions.
     tombstones: HashSet<PathBuf>,
+    /// Replacement runs of a view overlay, held by `Arc` from the family
+    /// arena instead of copied. Chunk paths inside them are relative to
+    /// `project_root`, as in the base, and tombstones never hide them. They
+    /// read after the base and before `entries`. Only an index built by
+    /// [`Self::for_view`] has any; anything that mutates entries first moves
+    /// them into `entries` with absolute paths.
+    view_runs: Vec<Arc<SemanticVectors>>,
     /// Paths whose complete persisted rows must replace prior rows. `None` is
     /// reserved for indexes created by callers that cannot report mutations.
     dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
@@ -4943,6 +4981,38 @@ pub struct SemanticIndex {
     skipped_rows: usize,
     #[cfg(test)]
     removal_retain_passes: usize,
+}
+
+impl Clone for SemanticIndex {
+    fn clone(&self) -> Self {
+        let mut clone = Self {
+            entries: self.entries.clone(),
+            file_mtimes: self.file_mtimes.clone(),
+            file_sizes: self.file_sizes.clone(),
+            any_missing_sizes: self.any_missing_sizes,
+            file_hashes: self.file_hashes.clone(),
+            dimension: self.dimension,
+            fingerprint: self.fingerprint.clone(),
+            project_root: self.project_root.clone(),
+            deferred_files: self.deferred_files.clone(),
+            shared_base: self.shared_base.clone(),
+            tombstones: self.tombstones.clone(),
+            view_runs: self.view_runs.clone(),
+            dirty_paths: Arc::clone(&self.dirty_paths),
+            persistence: Arc::clone(&self.persistence),
+            last_append_read_bytes: Arc::clone(&self.last_append_read_bytes),
+            skipped_rows: self.skipped_rows,
+            #[cfg(test)]
+            removal_retain_passes: self.removal_retain_passes,
+        };
+        // A view's overlay index is only ever read through an `Arc`. A clone
+        // is the one way to get a copy that can be refreshed or edited (the
+        // parent-folder engine installs one as a root's legacy index), so it
+        // owns its replacement entries outright, exactly as an overlay held
+        // them before runs were shared. Vectors stay shared either way.
+        clone.materialize_view_runs();
+        clone
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5008,7 +5078,7 @@ pub struct InvalidatedFilesRefresh {
 #[derive(Debug, Clone)]
 struct ReusableEmbedding {
     embed_text: String,
-    vector: Vec<f32>,
+    vector: Arc<[f32]>,
 }
 
 type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbedding>>>;
@@ -5069,7 +5139,10 @@ fn extend_reuse_map_from_semantic_blob(
             .or_default()
             .entry(blake3::hash(embed_text.as_bytes()))
             .or_default()
-            .push(ReusableEmbedding { embed_text, vector });
+            .push(ReusableEmbedding {
+                embed_text,
+                vector: vector.into(),
+            });
     }
     if reader.bytes_read() != payload.len() {
         return Err("trailing bytes after semantic blob payload".to_string());
@@ -5228,7 +5301,7 @@ fn semantic_entry_persistence_eq(left: &EmbeddingEntry, right: &EmbeddingEntry) 
         && left
             .vector
             .iter()
-            .zip(&right.vector)
+            .zip(right.vector.iter())
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
@@ -5311,6 +5384,7 @@ impl SemanticIndex {
             skipped_rows: shared_base.skipped_rows,
             shared_base: Some(Arc::clone(&shared_base)),
             tombstones: HashSet::new(),
+            view_runs: Vec::new(),
             #[cfg(test)]
             removal_retain_passes: 0,
         }
@@ -5492,11 +5566,14 @@ impl SemanticIndex {
 
     // Base paths are relative; delta paths are absolute. Iteration preserves the
     // old retain-then-append order, including the score comparator's index ties.
+    // A view overlay's shared replacement runs read between the two, where its
+    // copied replacement entries used to sit.
     fn live_entries(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, Path>, &EmbeddingEntry)> {
         self.shared_base
             .iter()
             .flat_map(|base| base.entries())
             .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .chain(self.view_run_entries())
             .map(|entry| {
                 (
                     std::borrow::Cow::Owned(self.project_root.join(&entry.chunk.file)),
@@ -5509,6 +5586,36 @@ impl SemanticIndex {
                     entry,
                 )
             }))
+    }
+
+    /// Entries of the view overlay's shared replacement runs, paths relative.
+    fn view_run_entries(&self) -> impl Iterator<Item = &EmbeddingEntry> {
+        self.view_runs.iter().flat_map(|run| run.entries.iter())
+    }
+
+    fn view_run_entry_count(&self) -> usize {
+        self.view_runs.iter().map(|run| run.entries.len()).sum()
+    }
+
+    /// Turns shared replacement runs into owned entries with absolute paths,
+    /// placed ahead of any existing own entries so iteration order (and with
+    /// it score tie-breaking) is unchanged. Vectors are shared, not copied.
+    /// A no-op for every index not built by [`Self::for_view`].
+    fn materialize_view_runs(&mut self) {
+        if self.view_runs.is_empty() {
+            return;
+        }
+        let runs = std::mem::take(&mut self.view_runs);
+        let mut entries = Vec::with_capacity(
+            runs.iter().map(|run| run.entries.len()).sum::<usize>() + self.entries.len(),
+        );
+        for entry in runs.iter().flat_map(|run| run.entries.iter()) {
+            let mut entry = entry.clone();
+            entry.chunk.file = self.project_root.join(&entry.chunk.file);
+            entries.push(entry);
+        }
+        entries.append(&mut self.entries);
+        self.entries = entries;
     }
 
     fn metadata_value<'a, T>(
@@ -5564,6 +5671,8 @@ impl SemanticIndex {
     }
 
     fn hide_base_files<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        // Every caller next edits `entries`; shared runs must be owned first.
+        self.materialize_view_runs();
         if let Some(base) = &self.shared_base {
             for path in paths {
                 if let Ok(relative) = path.strip_prefix(&self.project_root) {
@@ -5591,6 +5700,7 @@ impl SemanticIndex {
             deferred_files: HashSet::new(),
             shared_base: None,
             tombstones: HashSet::new(),
+            view_runs: Vec::new(),
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -5609,6 +5719,7 @@ impl SemanticIndex {
     pub fn entry_count(&self) -> usize {
         if self.tombstones.is_empty() {
             return self.shared_base.as_ref().map_or(0, |base| base.entry_count)
+                + self.view_run_entry_count()
                 + self.entries.len();
         }
         self.shared_base
@@ -5616,6 +5727,7 @@ impl SemanticIndex {
             .flat_map(|base| base.entries())
             .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
             .count()
+            + self.view_run_entry_count()
             + self.entries.len()
     }
 
@@ -5637,9 +5749,12 @@ impl SemanticIndex {
 
     /// Estimate resident semantic-index bytes from the vectors and metadata
     /// actually held by each entry. This intentionally excludes allocator and
-    /// hash-table bucket overhead, which are not cheaply observable.
+    /// hash-table bucket overhead, which are not cheaply observable. A view
+    /// overlay's shared replacement runs are counted by the family arena that
+    /// holds them, so here they cost only their `Arc` handles.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
         if self.entries.is_empty()
+            && self.view_runs.is_empty()
             && self.file_mtimes.is_empty()
             && self.file_sizes.is_empty()
             && self.file_hashes.is_empty()
@@ -5683,7 +5798,11 @@ impl SemanticIndex {
                 .saturating_add(crate::memory::usize_to_u64(chunk.snippet.len()))
         });
         let entry_metadata_bytes = crate::memory::usize_to_u64(self.entries.len())
-            .saturating_mul(std::mem::size_of::<EmbeddingEntry>() as u64);
+            .saturating_mul(std::mem::size_of::<EmbeddingEntry>() as u64)
+            .saturating_add(
+                crate::memory::usize_to_u64(self.view_runs.len())
+                    .saturating_mul(std::mem::size_of::<Arc<SemanticVectors>>() as u64),
+            );
         let file_metadata_bytes = self
             .file_mtimes
             .keys()
@@ -5729,7 +5848,10 @@ impl SemanticIndex {
             "shared_base_entries",
             self.shared_base.as_ref().map_or(0, |base| base.entry_count),
         )
-        .count("overlay_entries", self.entries.len())
+        .count(
+            "overlay_entries",
+            self.entries.len() + self.view_run_entry_count(),
+        )
         .count("tombstoned_files", self.tombstones.len())
         .count("dimensions", self.dimension)
         .count("indexed_files", self.indexed_file_count())
@@ -5920,7 +6042,7 @@ impl SemanticIndex {
                 .or_default()
                 .push(ReusableEmbedding {
                     embed_text: entry.chunk.embed_text.clone(),
-                    vector: entry.vector.clone(),
+                    vector: Arc::clone(&entry.vector),
                 });
         }
 
@@ -5931,6 +6053,7 @@ impl SemanticIndex {
     /// payloads must be copied before tombstoning: other roots still own the
     /// immutable base and must not lose their embeddings.
     fn take_chunk_reuse_map(&mut self, files: &[PathBuf]) -> ChunkReuseMap {
+        self.materialize_view_runs();
         let requested: HashSet<PathBuf> = files.iter().cloned().collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
         if let Some(base) = &self.shared_base {
@@ -5957,7 +6080,7 @@ impl SemanticIndex {
                     .or_default()
                     .push(ReusableEmbedding {
                         embed_text: entry.chunk.embed_text.clone(),
-                        vector: entry.vector.clone(),
+                        vector: Arc::clone(&entry.vector),
                     });
             }
         }
@@ -6020,14 +6143,14 @@ impl SemanticIndex {
     fn reusable_vector_for_chunk(
         reuse_map: &ChunkReuseMap,
         chunk: &SemanticChunk,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<Arc<[f32]>> {
         let hash = blake3::hash(chunk.embed_text.as_bytes());
         reuse_map
             .get(&chunk.file)?
             .get(&hash)?
             .iter()
             .find(|candidate| candidate.embed_text == chunk.embed_text)
-            .map(|candidate| candidate.vector.clone())
+            .map(|candidate| Arc::clone(&candidate.vector))
     }
 
     fn entries_for_chunks_with_reuse<F, P>(
@@ -6091,7 +6214,8 @@ impl SemanticIndex {
                 {
                     let mut chunk = chunk;
                     chunk.embed_text = saved.chunk.embed_text.clone();
-                    entries[chunk_index] = Some(EmbeddingEntry::new(chunk, saved.vector.clone()));
+                    entries[chunk_index] =
+                        Some(EmbeddingEntry::new(chunk, Arc::clone(&saved.vector)));
                 } else {
                     misses.push((chunk_index, chunk));
                 }
@@ -6222,6 +6346,7 @@ impl SemanticIndex {
                 deferred_files: HashSet::new(),
                 shared_base: None,
                 tombstones: HashSet::new(),
+                view_runs: Vec::new(),
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -6389,6 +6514,7 @@ impl SemanticIndex {
             deferred_files: HashSet::new(),
             shared_base: None,
             tombstones: HashSet::new(),
+            view_runs: Vec::new(),
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -7436,11 +7562,14 @@ impl SemanticIndex {
     where
         F: Fn(&Path) -> bool,
     {
+        // `true` marks a path relative to the root (base and shared view
+        // runs); `false` an absolute own-entry path.
         let entries = self
             .shared_base
             .iter()
             .flat_map(|base| base.entries())
             .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .chain(self.view_run_entries())
             .map(|entry| (entry, true))
             .chain(self.entries.iter().map(|entry| (entry, false)))
             .collect::<Vec<_>>();
@@ -7675,6 +7804,21 @@ impl SemanticIndex {
         self.shared_base.is_some()
     }
 
+    /// The shared replacement runs a view overlay reads, in order.
+    #[cfg(test)]
+    pub(crate) fn view_runs_for_test(&self) -> &[Arc<SemanticVectors>] {
+        &self.view_runs
+    }
+
+    /// Every vector a search would score, as the shared handles themselves,
+    /// so a test can compare allocations with `Arc::ptr_eq`.
+    #[cfg(test)]
+    pub(crate) fn live_vectors_for_test(&self) -> Vec<Arc<[f32]>> {
+        self.live_entries()
+            .map(|(_, entry)| Arc::clone(&entry.vector))
+            .collect()
+    }
+
     /// Every entry as `(absolute file, symbol name, vector)`, sorted, so a test
     /// can check that vectors survived an operation bit-for-bit.
     #[cfg(test)]
@@ -7685,7 +7829,7 @@ impl SemanticIndex {
                 (
                     path.into_owned(),
                     entry.chunk.name.clone(),
-                    entry.vector.clone(),
+                    entry.vector.to_vec(),
                 )
             })
             .collect::<Vec<_>>();
@@ -9116,7 +9260,7 @@ impl SemanticIndex {
             write_counted(writer, embed_bytes, &mut bytes_written)?;
 
             // Vector (f32 array)
-            for &val in &entry.vector {
+            for &val in entry.vector.iter() {
                 write_counted(writer, &val.to_le_bytes(), &mut bytes_written)?;
             }
         }
@@ -9388,7 +9532,7 @@ impl SemanticIndex {
             let vector = vector_bytes
                 .chunks_exact(F32_BYTES)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                .collect();
+                .collect::<Arc<[f32]>>();
 
             entries.push(EmbeddingEntry::new(
                 SemanticChunk {
@@ -9439,6 +9583,7 @@ impl SemanticIndex {
                 deferred_files: HashSet::new(),
                 shared_base: None,
                 tombstones: HashSet::new(),
+                view_runs: Vec::new(),
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
@@ -10385,10 +10530,12 @@ impl SemanticVectors {
             if vector_bytes.len() % 4 != 0 {
                 return Err("semantic view vector has an invalid byte length".to_string());
             }
+            // Collected straight into the shared slice: one allocation per
+            // vector, not a `Vec` that is then copied into an `Arc`.
             let vector = vector_bytes
                 .chunks_exact(4)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
-                .collect::<Vec<_>>();
+                .collect::<Arc<[f32]>>();
             match dimension {
                 None => dimension = Some(vector.len()),
                 Some(expected) if expected != vector.len() => {
@@ -10646,9 +10793,10 @@ impl SemanticIndex {
     /// Reads a checkout through the overlay: `base` supplies the generation's
     /// shared runs, `tombstones` (paths relative to `project_root`) hide the
     /// base files that are superseded, deleted or no longer members, and
-    /// `replacements` become this checkout's own entries. Only the
-    /// replacements are copied, so private memory grows with edits, not with
-    /// the size of the checkout.
+    /// `replacements` are this checkout's own runs. Replacements are held by
+    /// `Arc`, like the base, so the overlay copies no entries: its private
+    /// memory is the tombstones and one handle per replaced file. Paths are
+    /// joined to `project_root` only when a result is built.
     pub(crate) fn for_view(
         project_root: PathBuf,
         base: &ViewSemanticBase,
@@ -10657,15 +10805,7 @@ impl SemanticIndex {
     ) -> Self {
         let mut index = Self::from_shared_base(project_root, Arc::clone(&base.base));
         index.tombstones = tombstones;
-        index.entries = replacements
-            .iter()
-            .flat_map(|run| run.entries.iter())
-            .map(|entry| {
-                let mut entry = entry.clone();
-                entry.chunk.file = index.project_root.join(&entry.chunk.file);
-                entry
-            })
-            .collect();
+        index.view_runs = replacements.to_vec();
         if base.base.entry_count == 0 {
             if let Some(dimension) = replacements.iter().find_map(|run| run.dimension()) {
                 index.dimension = dimension;
@@ -13272,7 +13412,7 @@ Connection: close
                 snippet: format!("fn {name}() {{}}"),
             },
             norm: vector_norm(&[1.0, 2.0, 3.0]),
-            vector: vec![1.0, 2.0, 3.0],
+            vector: vec![1.0, 2.0, 3.0].into(),
         };
         index.entries.push(entry("one"));
         let one_entry = index.estimated_memory().estimated_bytes.unwrap();
@@ -13367,7 +13507,7 @@ Connection: close
             buf.extend_from_slice(&(embed_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(embed_bytes);
 
-            for &val in &entry.vector {
+            for &val in entry.vector.iter() {
                 buf.extend_from_slice(&val.to_le_bytes());
             }
         }
@@ -13482,7 +13622,7 @@ Connection: close
                 snippet: "pub fn shared_symbol() -> bool { true }".to_string(),
             },
             norm: vector_norm(&[1.0, 0.0, 0.0]),
-            vector: vec![1.0, 0.0, 0.0],
+            vector: vec![1.0, 0.0, 0.0].into(),
         });
         index.file_mtimes.insert(
             owner_file.clone(),
@@ -13591,7 +13731,7 @@ Connection: close
                 snippet: "pub fn hash_guard() {}".to_string(),
             },
             norm: vector_norm(&[1.0, 0.0]),
-            vector: vec![1.0, 0.0],
+            vector: vec![1.0, 0.0].into(),
         });
         index.file_mtimes.insert(
             owner_file.clone(),
@@ -13626,7 +13766,7 @@ Connection: close
 
         let changed_vector = vec![0.0, 1.0];
         index.entries[0].norm = vector_norm(&changed_vector);
-        index.entries[0].vector = changed_vector;
+        index.entries[0].vector = changed_vector.into();
         index
             .fingerprint
             .as_mut()
@@ -14079,7 +14219,7 @@ Connection: close
                 snippet: "outside".to_string(),
             },
             norm: vector_norm(&[1.0, 0.0, 0.0]),
-            vector: vec![1.0, 0.0, 0.0],
+            vector: vec![1.0, 0.0, 0.0].into(),
         });
 
         let bytes = index.to_bytes();
@@ -14478,9 +14618,12 @@ Connection: close
             let file = root.join(format!("src/file_{}.rs", ordinal % 200));
             add_invalidation_fixture_entry(&mut index, file, ordinal);
             let entry = index.entries.last_mut().unwrap();
-            entry.vector = (0..384).map(|lane| (lane as f32 - 192.0) / 17.0).collect();
-            entry.vector[0] = -0.0;
-            entry.vector[1] = f32::from_bits(1);
+            let mut vector = (0..384)
+                .map(|lane| (lane as f32 - 192.0) / 17.0)
+                .collect::<Vec<_>>();
+            vector[0] = -0.0;
+            vector[1] = f32::from_bits(1);
+            entry.vector = vector.into();
             entry.norm = vector_norm(&entry.vector);
         }
         let bytes = index.to_bytes();
@@ -14649,7 +14792,7 @@ Connection: close
                     snippet: format!("fn {name}() {{}}"),
                 },
                 norm: vector_norm(&vector),
-                vector,
+                vector: vector.into(),
             });
         }
 
@@ -14742,7 +14885,7 @@ Connection: close
                 snippet: "fn handle_request() {\n  // ...\n}".to_string(),
             },
             norm: vector_norm(&[0.1, 0.2, 0.3, 0.4]),
-            vector: vec![0.1, 0.2, 0.3, 0.4],
+            vector: vec![0.1, 0.2, 0.3, 0.4].into(),
         });
         index.dimension = 4;
         index
@@ -14763,7 +14906,10 @@ Connection: close
 
         assert_eq!(restored.entries.len(), 1);
         assert_eq!(restored.entries[0].chunk.name, "handle_request");
-        assert_eq!(restored.entries[0].vector, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(
+            restored.entries[0].vector.to_vec(),
+            vec![0.1, 0.2, 0.3, 0.4]
+        );
         assert_eq!(
             restored.entries[0].norm,
             vector_norm(&restored.entries[0].vector)
@@ -14803,7 +14949,7 @@ Connection: close
                 snippet: "pub fn alpha() {}".to_string(),
             },
             norm: vector_norm(&[0.1, 0.2, 0.3]),
-            vector: vec![0.1, 0.2, 0.3],
+            vector: vec![0.1, 0.2, 0.3].into(),
         });
         index.entries.push(EmbeddingEntry {
             chunk: SemanticChunk {
@@ -14818,7 +14964,7 @@ Connection: close
                 snippet: "pub fn beta() {}".to_string(),
             },
             norm: vector_norm(&[0.4, 0.5, 0.6]),
-            vector: vec![0.4, 0.5, 0.6],
+            vector: vec![0.4, 0.5, 0.6].into(),
         });
         let fingerprint = SemanticIndexFingerprint {
             backend: "fastembed".to_string(),
@@ -14959,7 +15105,7 @@ Connection: close
                     snippet: format!("fn {}() {{}}", name),
                 },
                 norm: vector_norm(&vec),
-                vector: vec,
+                vector: vec.into(),
             });
         }
 
@@ -15521,7 +15667,7 @@ public class Greeter {
                 snippet: "fn main() {}".to_string(),
             },
             norm: vector_norm(&[1.0; DEFAULT_DIMENSION]),
-            vector: vec![1.0; DEFAULT_DIMENSION],
+            vector: vec![1.0; DEFAULT_DIMENSION].into(),
         });
         index
             .file_mtimes
@@ -17022,7 +17168,7 @@ public class Greeter {
                 snippet: "fn handle_request() {}".to_string(),
             },
             norm: vector_norm(&[0.1, 0.2, 0.3]),
-            vector: vec![0.1, 0.2, 0.3],
+            vector: vec![0.1, 0.2, 0.3].into(),
         });
         index.dimension = 3;
         index
@@ -17148,7 +17294,7 @@ public class Greeter {
                 snippet: "fn handle_request() {}".to_string(),
             },
             norm: vector_norm(&[0.1, 0.2, 0.3]),
-            vector: vec![0.1, 0.2, 0.3],
+            vector: vec![0.1, 0.2, 0.3].into(),
         });
         index.dimension = 3;
         index

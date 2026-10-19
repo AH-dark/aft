@@ -11,6 +11,11 @@
 //! The arena also makes embedding single-flight across views. A fill claims
 //! each key it is about to embed; another view that needs the same key while
 //! the claim is held waits for it instead of calling the model a second time.
+//!
+//! Vectors are shared below the run level too. A run entering the arena has
+//! each vector swapped for a bit-identical one already resident, so a fill
+//! that reuses an unchanged chunk of an edited file, or two keys that embed
+//! the same text, hold one allocation instead of one per run.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,6 +38,8 @@ pub struct SemanticArena {
     storage: PathBuf,
     family: String,
     runs: Mutex<HashMap<FamilyKey, Arc<SemanticVectors>>>,
+    /// Every distinct vector held by a resident run, by content digest.
+    vectors: Mutex<VectorPool>,
     inflight: Mutex<HashSet<FamilyKey>>,
     released: Condvar,
     decodes: AtomicU64,
@@ -41,12 +48,69 @@ pub struct SemanticArena {
 }
 
 /// Resident arena memory. Every key is counted once, whatever the number of
-/// views that reference it.
+/// views that reference it, and every vector allocation once, whatever the
+/// number of runs that share it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArenaMemory {
     pub runs: usize,
     pub chunks: usize,
     pub bytes: u64,
+    /// Distinct vector allocations, at most `chunks`.
+    pub vectors: usize,
+    /// Bytes of floats in those allocations; part of `bytes`.
+    pub vector_bytes: u64,
+}
+
+/// Weak handles to the arena's vectors, keyed by a digest of their bits.
+///
+/// A dead `Weak` keeps its allocation until it is dropped, so dead handles
+/// are pruned whenever `trim` releases runs and whenever the table has
+/// doubled since the last prune.
+#[derive(Debug, Default)]
+struct VectorPool {
+    by_digest: HashMap<blake3::Hash, Weak<[f32]>>,
+    live_after_prune: usize,
+    scratch: Vec<u8>,
+}
+
+impl VectorPool {
+    /// Points every vector of `run` at an equal resident vector when there is
+    /// one, and records the rest. Equality is bitwise, so scores computed
+    /// from a shared vector are exactly those of the vector it replaced.
+    fn share(&mut self, run: &mut SemanticVectors) {
+        for vector in run.vectors_mut() {
+            self.scratch.clear();
+            for value in vector.iter() {
+                self.scratch
+                    .extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            let digest = blake3::hash(&self.scratch);
+            match self.by_digest.get(&digest).and_then(Weak::upgrade) {
+                Some(resident) if same_bits(&resident, vector) => *vector = resident,
+                // A digest collision between different floats: keep both.
+                Some(_) => {}
+                None => {
+                    self.by_digest.insert(digest, Arc::downgrade(vector));
+                }
+            }
+        }
+        if self.by_digest.len() > self.live_after_prune.max(1024).saturating_mul(2) {
+            self.prune();
+        }
+    }
+
+    fn prune(&mut self) {
+        self.by_digest.retain(|_, vector| vector.strong_count() > 0);
+        self.live_after_prune = self.by_digest.len();
+    }
+}
+
+fn same_bits(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
 type Registry = HashMap<(PathBuf, String), Weak<SemanticArena>>;
@@ -75,6 +139,7 @@ pub fn arena_for(storage: &Path, family: &str) -> Arc<SemanticArena> {
         storage: key.0.clone(),
         family: key.1.clone(),
         runs: Mutex::new(HashMap::new()),
+        vectors: Mutex::new(VectorPool::default()),
         inflight: Mutex::new(HashSet::new()),
         released: Condvar::new(),
         decodes: AtomicU64::new(0),
@@ -154,8 +219,16 @@ impl SemanticArena {
 
     /// Makes a run that was just stored resident without decoding it again.
     /// When another view installed the key first, its run is kept and
-    /// returned, so the key never has two resident copies.
-    pub fn install(&self, key: FamilyKey, run: SemanticVectors) -> Arc<SemanticVectors> {
+    /// returned, so the key never has two resident copies. A new run's
+    /// vectors are shared with equal ones already resident.
+    pub fn install(&self, key: FamilyKey, mut run: SemanticVectors) -> Arc<SemanticVectors> {
+        if let Some(resident) = self.get(&key) {
+            return resident;
+        }
+        // Digesting a run takes a moment; do it outside the run table lock.
+        // A run that then loses the race is dropped, and the handles it
+        // recorded are pruned with the rest.
+        lock(&self.vectors).share(&mut run);
         Arc::clone(lock(&self.runs).entry(key).or_insert_with(|| Arc::new(run)))
     }
 
@@ -190,22 +263,41 @@ impl SemanticArena {
     /// Drops runs no view references any more, after a view unbinds or moves
     /// to another generation. Returns how many runs were released.
     pub fn trim(&self) -> usize {
-        let mut runs = lock(&self.runs);
-        let before = runs.len();
-        runs.retain(|_, run| Arc::strong_count(run) > 1);
-        before - runs.len()
+        let released = {
+            let mut runs = lock(&self.runs);
+            let before = runs.len();
+            runs.retain(|_, run| Arc::strong_count(run) > 1);
+            before - runs.len()
+        };
+        if released > 0 {
+            lock(&self.vectors).prune();
+        }
+        released
     }
 
     pub fn memory(&self) -> ArenaMemory {
         let runs = lock(&self.runs);
-        ArenaMemory {
+        let mut seen = HashSet::new();
+        let mut memory = ArenaMemory {
             runs: runs.len(),
-            chunks: runs.values().map(|run| run.chunk_count()).sum(),
-            bytes: runs
-                .values()
-                .map(|run| run.resident_bytes())
-                .fold(0u64, u64::saturating_add),
+            ..ArenaMemory::default()
+        };
+        for run in runs.values() {
+            memory.chunks += run.chunk_count();
+            memory.bytes = memory
+                .bytes
+                .saturating_add(run.resident_bytes_without_vectors());
+            for vector in run.vectors() {
+                if seen.insert(Arc::as_ptr(vector).cast::<f32>()) {
+                    memory.vectors += 1;
+                    memory.vector_bytes = memory
+                        .vector_bytes
+                        .saturating_add(crate::semantic_index::vector_bytes(vector));
+                }
+            }
         }
+        memory.bytes = memory.bytes.saturating_add(memory.vector_bytes);
+        memory
     }
 
     /// Payloads decoded from the store since the arena was created. Queries
