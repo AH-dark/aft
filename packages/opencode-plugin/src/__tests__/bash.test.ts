@@ -2946,7 +2946,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     // longest it may, and any value only makes it return sooner.
     expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg" })');
     expect(result as string).toContain(
-      "without a timeout it waits up to the worker wait limit (`bash.worker_wait_max_ms`, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline), then reports it is still running; watch again to keep waiting",
+      "without a timeout it waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting",
     );
     expect(result as string).not.toContain("waits until the command finishes");
     // A subagent is never woken after its turn ends, so nothing may promise
@@ -3057,7 +3057,7 @@ describe("bash tool description (agent-facing wording)", () => {
     // One description serves both roles, so it states both defaults.
     expect(desc).toContain("default to 30s in a main session");
     expect(desc).toContain(
-      "in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline), then reports it is still running; watch again to keep waiting",
+      "in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting",
     );
     expect(desc).toContain("bash({background:true})");
     expect(desc).toContain("Never loop bash_status");

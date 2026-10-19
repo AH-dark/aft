@@ -4,17 +4,32 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-// The legacy worker transport window is declared by subc/tool_provider.rs:
-// default worker_wait_max_ms (1,800,000) + WORKER_REPLY_MARGIN_MS (30,000).
-// Broca timed out at that 1,830-second window despite a 30-minute AFT wait.
-const LEGACY_TRANSPORT_MS: u64 = 1_830_000;
-pub(crate) const MAX_BLOCKING_WAIT_MS: u64 = 1_647_000;
+// Calls without an explicit client deadline use the catalog's default window.
+// Share its constants so enlarging the transport declaration also preserves
+// the ordinary worker wait inside the same reply-budget rule.
+const LEGACY_TRANSPORT_MS: u64 =
+    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS + crate::subc::WORKER_REPLY_MARGIN_MS;
+pub(crate) const MAX_BLOCKING_WAIT_MS: u64 =
+    LEGACY_TRANSPORT_MS - safety_margin_ms(LEGACY_TRANSPORT_MS);
 
-fn safety_margin(window: Duration) -> Duration {
+const fn safety_margin_ms(window_ms: u64) -> u64 {
     // Thirty seconds proved insufficient for dispatch and reply delivery. Keep
     // at least twice that, or 10% for long calls. Short transport classes retain
     // half their original window instead of losing it all to the 60-second floor.
-    Duration::from_secs(60).max(window / 10).min(window / 2)
+    let fraction = window_ms / 10;
+    let margin = if fraction > 60_000 { fraction } else { 60_000 };
+    let half = window_ms / 2;
+    if margin < half {
+        margin
+    } else {
+        half
+    }
+}
+
+fn safety_margin(window: Duration) -> Duration {
+    Duration::from_millis(safety_margin_ms(
+        window.as_millis().min(u64::MAX as u128) as u64
+    ))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,25 +102,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_worker_wait_keeps_full_thirty_minutes() {
+        let configured = crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS;
+        assert_eq!(
+            crate::commands::bash_orchestrate::blocking_wait_cap_ms(true, configured),
+            Some(1_800_000),
+        );
+        let receipt = Instant::now();
+        let budget = ReplyBudget::new(receipt, None);
+        let ordinary_wait = receipt + Duration::from_millis(configured);
+        assert_eq!(budget.cap(ordinary_wait), ordinary_wait);
+        assert_eq!(budget.deadline - receipt, Duration::from_millis(1_836_000));
+    }
+
+    #[test]
+    fn older_admitted_client_window_still_has_headroom() {
+        let receipt = Instant::now();
+        let budget = ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(1_830)));
+        let ordinary_wait = receipt + Duration::from_secs(1_800);
+        assert_eq!(
+            budget.cap(ordinary_wait) - receipt,
+            Duration::from_secs(1_647)
+        );
+    }
+
+    #[test]
     fn no_client_deadline_clamps_even_oversized_worker_limits() {
         let receipt = Instant::now();
         let budget = ReplyBudget::new(receipt, None);
-        assert_eq!(budget.deadline - receipt, Duration::from_millis(1_647_000));
-        assert_eq!(clamp_worker_wait_ms(u64::MAX), 1_647_000);
+        assert_eq!(budget.deadline - receipt, Duration::from_millis(1_836_000));
+        assert_eq!(clamp_worker_wait_ms(u64::MAX), 1_836_000);
         assert_eq!(clamp_worker_wait_ms(60_000), 60_000);
     }
 
     #[test]
     fn queue_time_consumes_the_original_reply_window() {
         let receipt = Instant::now();
-        let client = receipt + Duration::from_secs(1_830);
+        let client = receipt + Duration::from_secs(2_040);
         let budget = ReplyBudget::new(receipt, Some(client));
         let queued_for = Duration::from_secs(120);
         assert_eq!(
             budget.deadline - (receipt + queued_for),
-            Duration::from_secs(1_527)
+            Duration::from_secs(1_716)
         );
-        assert_eq!(client - budget.deadline, Duration::from_secs(183));
+        assert_eq!(client - budget.deadline, Duration::from_secs(204));
         let short = ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(10)));
         assert_eq!(short.deadline - receipt, Duration::from_secs(5));
     }

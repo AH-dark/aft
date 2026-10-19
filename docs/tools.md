@@ -495,12 +495,17 @@ call (`wait: true`, or any foreground call when
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
 background, not killed, and the reply gives its task id, including on the tool-provider/v1 route.
 The head preset declares a reply deadline for `bash`; the worker preset declares it for `bash`
-and `bash_watch`. Both use the resolved `bash.worker_wait_max_ms` plus 30 seconds for spawn,
+and `bash_watch`. Both use the resolved `bash.worker_wait_max_ms` plus 240 seconds for spawn,
 terminal handoff and reply delivery. A watch does not spawn a command, but retains the same
 margin for admission, observing terminal state, and delivering its reply under load. Head
 catalogs do not serve `bash_watch` (heads receive completion wakes); reader catalogs serve neither
 shell tool and declare no deadline. If the sum exceeds the role contract's 24-hour maximum, the catalog
 still serves the tools but omits their reply metadata, leaving callers' fallback in force.
+Broca freezes the declared window when a session is admitted: new sessions get the longer
+window, while running sessions keep their admitted window. A shorter client deadline can
+still shorten a wait so the reply arrives safely before that deadline. No `hold_argument`
+is declared, so the transport window follows the resolved configuration rather than each
+call's own wait; a future `hold_argument` declaration could make it follow each call.
 The wait limit is not the task's kill
 deadline: every reply that hands a task back (launch, promotion, detach) and every `bash_watch`
 result also names the task's own deadline (for example, "AFT kills this task at 2026-09-10 10:30:00Z, when it has run 30 minutes (its default background limit); about 12 minutes remain", or the `timeout` you passed), and a task killed by it is reported by

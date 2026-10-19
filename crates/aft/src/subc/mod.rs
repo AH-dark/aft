@@ -219,6 +219,8 @@ mod standing;
 mod tool_provider;
 mod wire;
 
+pub(crate) use self::tool_provider::WORKER_REPLY_MARGIN_MS;
+
 use self::health::{
     build_health_report, route_bind_deadline_refusal, warn_slow_pending_binds,
     warn_slow_running_interactive_jobs, DeferredBashWaitGuard, DispatchPathMetrics,

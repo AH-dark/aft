@@ -47,7 +47,7 @@ export const LONGEST_TIMER_DELAY_MS = 2_147_483_647;
  * the same for every user.
  */
 export const WORKER_WAIT_LIMIT_PHRASE =
-  "the worker wait limit (`bash.worker_wait_max_ms`, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline)";
+  "the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default)";
 
 /**
  * Description of the bash_watch tool's sync-wait defaults, embedded in both
@@ -55,14 +55,14 @@ export const WORKER_WAIT_LIMIT_PHRASE =
  * has to state both roles' real behaviour.
  */
 export const WATCH_SYNC_DEFAULTS_DESCRIPTION =
-  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit";
+  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit";
 
 /**
  * Description of the bash_watch timeout parameter. Every caller sees the same
  * schema, so it has to be true for both roles.
  */
 export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
-  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.";
+  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.";
 
 /**
  * Effective sync bash_watch deadline in milliseconds.

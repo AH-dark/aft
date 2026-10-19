@@ -935,7 +935,11 @@ fn worker_reply_deadlines_track_resolved_config_only() {
     let ctx = context(root.path(), storage.path(), None);
     let route = identity(root.path(), "reply-deadline", 7, false);
     let mut previous = None;
-    for (cap, expected) in [(60_000, 90_000), (300_000, 330_000)] {
+    for (cap, expected) in [
+        (60_000, 300_000),
+        (300_000, 540_000),
+        (1_800_000, 2_040_000),
+    ] {
         ctx.update_config(|config| config.bash.worker_wait_max_ms = cap);
         for preset in ["worker", "reader"] {
             let answer = catalog(json!({"preset":preset}), &route, &ctx).unwrap();
@@ -968,7 +972,11 @@ fn head_reply_deadline_tracks_resolved_config_only() {
     let ctx = context(root.path(), storage.path(), None);
     let route = identity(root.path(), "head-reply-deadline", 7, false);
     let mut previous = None;
-    for (cap, expected) in [(60_000, 90_000), (300_000, 330_000)] {
+    for (cap, expected) in [
+        (60_000, 300_000),
+        (300_000, 540_000),
+        (1_800_000, 2_040_000),
+    ] {
         ctx.update_config(|config| config.bash.worker_wait_max_ms = cap);
         let answer = catalog(json!({"preset":"head"}), &route, &ctx).unwrap();
         for tool in answer["tools"].as_array().unwrap() {
