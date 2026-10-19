@@ -90,6 +90,7 @@ pub struct SweepReport {
     pub reclaimed_pins: usize,
     pub reclaimed_read_markers: usize,
     pub reclaim_deferred: bool,
+    pub space_reclaim: crate::blob_store::reclaim::ReclaimReport,
 }
 
 /// Collect unreferenced payloads older than the age floor even below the disk
@@ -187,10 +188,9 @@ fn sweep_planes_bounded(
         )?;
     }
     drop(_barrier);
-    // Compaction can be large. It must not hold pin/bind admission while it
-    // runs; SQLite's own locks protect the rows and concurrent readers here.
+    // Reclaim runs outside pin/bind admission; SQLite's own locks protect rows.
     let reclaim_control = SweepControl {
-        deadline: Instant::now() + Duration::from_secs(60),
+        deadline: Instant::now() + crate::blob_store::reclaim::PASS_BUDGET,
         cancelled,
     };
     for &plane in planes {
@@ -203,22 +203,14 @@ fn sweep_planes_bounded(
         if !path.exists() {
             continue;
         }
-        if reclaim_plane(
-            &path,
-            &reclaim_control,
-            report.deleted_blobs > 0 || pending.exists(),
-        )
-        .is_err()
-        {
-            report.reclaim_deferred = true;
-            fs::create_dir_all(
-                pending
-                    .parent()
-                    .ok_or_else(|| std::io::Error::other("missing vacuum parent"))?,
-            )?;
-            fs::write(&pending, b"true\n")?;
-        } else {
-            let _ = fs::remove_file(pending);
+        match reclaim_plane(&path, &reclaim_control) {
+            Ok(reclaimed) => {
+                report.reclaim_deferred |= reclaimed.deferred;
+                report.space_reclaim.merge(reclaimed);
+                // Old retry markers no longer bypass free-space eligibility.
+                let _ = fs::remove_file(pending);
+            }
+            Err(_) => report.reclaim_deferred = true,
         }
     }
     Ok(report)
@@ -426,29 +418,17 @@ fn sweep_plane(
     Ok(())
 }
 
-fn reclaim_plane(path: &Path, control: &SweepControl<'_>, force: bool) -> Result<(), SweepError> {
-    control.check()?;
+fn reclaim_plane(
+    path: &Path,
+    control: &SweepControl<'_>,
+) -> Result<crate::blob_store::reclaim::ReclaimReport, SweepError> {
     let connection = crate::db::file_identity::IdentityConnection::open(path, "gc::reclaim_plane")?;
-    unsafe {
-        rusqlite::ffi::sqlite3_progress_handler(
-            connection.handle(),
-            1000,
-            Some(abort_sweep),
-            (control as *const SweepControl<'_>).cast_mut().cast(),
-        );
-    }
     connection.busy_timeout(Duration::from_millis(100))?;
-    let free_bytes: u64 = connection.query_row("SELECT (SELECT freelist_count FROM pragma_freelist_count) * (SELECT page_size FROM pragma_page_size)", [], |row| row.get(0))?;
-    if free_bytes == 0 || (!force && free_bytes < 128 * 1024 * 1024) {
-        return Ok(());
-    }
-    let auto_vacuum: u32 = connection.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
-    connection.execute_batch(if auto_vacuum == 2 {
-        "PRAGMA incremental_vacuum"
-    } else {
-        "VACUUM"
-    })?;
-    Ok(())
+    Ok(crate::blob_store::reclaim::reclaim(
+        &connection,
+        Some(control.deadline),
+        control.cancelled,
+    )?)
 }
 
 fn plane_path(storage: &Path, family: &str, plane: BlobPlane) -> PathBuf {
@@ -610,7 +590,7 @@ mod storage_retention_tests {
     }
 
     #[test]
-    fn storage_retention_blob_compaction_returns_free_pages() {
+    fn storage_retention_blob_deletion_keeps_legacy_free_pages_reusable() {
         let temp = tempfile::tempdir().unwrap();
         let path = plane_path(temp.path(), "family", BlobPlane::Callgraph);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -635,6 +615,8 @@ mod storage_retention_tests {
         .unwrap();
         assert_eq!(report.deleted_blobs, 1);
         assert!(!report.reclaim_deferred);
-        assert!(fs::metadata(path).unwrap().len() < before);
+        assert_eq!(report.space_reclaim.legacy_stores, 1);
+        assert_eq!(report.space_reclaim.reclaimed_pages, 0);
+        assert_eq!(fs::metadata(path).unwrap().len(), before);
     }
 }

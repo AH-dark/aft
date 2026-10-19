@@ -1686,23 +1686,12 @@ mod tests {
         drop(admitted);
     }
 
-    fn plane_file_bytes(storage: &Path, plane: FamilyPlane) -> u64 {
-        let path = crate::blob_store::v2::plane_path(storage, FAMILY, plane).unwrap();
-        ["", "-wal"]
-            .iter()
-            .map(|suffix| {
-                let mut name = path.as_os_str().to_owned();
-                name.push(suffix);
-                fs::metadata(PathBuf::from(name)).map_or(0, |metadata| metadata.len())
-            })
-            .sum()
-    }
-
     /// A key two views rely on is counted once and belongs to neither
     /// view's exclusive share. Evicting one view then reclaims exactly its
-    /// exclusive keys, and the store files really get smaller.
+    /// exclusive keys and segment file. A small database keeps the deleted
+    /// payload's pages as reusable reserve instead of compacting on every pass.
     #[test]
-    fn shared_keys_count_once_and_eviction_shrinks_the_files() {
+    fn shared_keys_count_once_and_eviction_preserves_small_database_reserve() {
         let storage = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let shared = text(100, 60_000);
@@ -1753,7 +1742,8 @@ mod tests {
 
         drop(a);
         registry.set_disk_budget(budget(0, u64::MAX));
-        let plane_before = plane_file_bytes(storage.path(), FamilyPlane::Trigram);
+        let plane_before = store.usage().unwrap();
+        assert!(plane_before.file_bytes < 256 * 1024 * 1024);
         let report = enforce(&registry, EnforceOptions::default()).unwrap();
 
         assert_eq!(evicted(&report), ["a"]);
@@ -1771,11 +1761,11 @@ mod tests {
             report.before.family_store.file_bytes,
             report.after.family_store.file_bytes
         );
-        let plane_after = plane_file_bytes(storage.path(), FamilyPlane::Trigram);
-        assert!(
-            plane_after < plane_before,
-            "the trigram database itself shrinks: {plane_before} -> {plane_after}"
-        );
+        let plane_after = store.usage().unwrap();
+        assert_eq!(plane_after.file_bytes, plane_before.file_bytes);
+        assert!(plane_after.freelist_pages > plane_before.freelist_pages);
+        assert_eq!(sweep.space_reclaim.reclaimed_pages, 0);
+        assert_eq!(sweep.space_reclaim.steps, 0);
         let after = account_keys(&registry, None).unwrap();
         assert_eq!(after.shared_bytes, 0);
         assert_eq!(after.referenced_bytes, shared_key + b_key + b_segment);

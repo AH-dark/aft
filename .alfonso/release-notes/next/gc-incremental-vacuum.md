@@ -1,0 +1,1 @@
+- Storage cleanup no longer rewrites whole multi-gigabyte cache databases to free space; it now returns space a little at a time in the background, and per-checkout caches actually release the free space they were stranding.

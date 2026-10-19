@@ -649,28 +649,26 @@ impl FamilyStore {
         Ok(deleted == 1)
     }
 
-    /// Returns freed pages to the filesystem.
+    /// Reclaims one bounded batch of eligible free pages.
     pub fn incremental_vacuum(&self) -> StoreResult<()> {
-        lock(&self.inner.connection).execute_batch("PRAGMA incremental_vacuum;")?;
+        self.reclaim_space_bounded(None)?;
         Ok(())
     }
 
-    /// Shrinks the store's files after rows were deleted: `incremental_vacuum`
-    /// moves the freed pages out of the database, and a TRUNCATE checkpoint
-    /// copies that change from the write-ahead log into the main file and
-    /// empties the log. In WAL mode the main file only gets shorter at that
-    /// checkpoint. Both go through this store's own connection; opening the
-    /// files any other way would drop the locks SQLite holds on them.
-    ///
-    /// Returns `false` when another connection kept the checkpoint from
-    /// finishing. The freed pages are still out of the database then, and
-    /// the next checkpoint returns them.
+    /// Reclaims a bounded batch, returning false if eligible work remains.
+    /// Uses the store's own connection to preserve SQLite's file locks. Normal
+    /// WAL checkpoints eventually shorten the main file; reclamation never
+    /// forces a potentially unbounded TRUNCATE checkpoint of an existing WAL.
     pub fn reclaim_space(&self) -> StoreResult<bool> {
+        Ok(!self.reclaim_space_bounded(None)?.deferred)
+    }
+
+    pub(crate) fn reclaim_space_bounded(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> StoreResult<super::reclaim::ReclaimReport> {
         let connection = lock(&self.inner.connection);
-        connection.execute_batch("PRAGMA incremental_vacuum;")?;
-        let busy: i64 =
-            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-        Ok(busy == 0)
+        Ok(super::reclaim::reclaim(&connection, deadline, &|| false)?)
     }
 
     pub fn usage(&self) -> StoreResult<StoreUsage> {
@@ -1237,6 +1235,61 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(Arc::ptr_eq(&first.inner, &reader.inner));
+    }
+
+    #[test]
+    fn family_gc_retries_large_freelists_without_new_deletions_in_bounded_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::views::registry::FamilyRegistry::open(dir.path(), "family").unwrap();
+        let store = FamilyStore::open(&access(dir.path()), FamilyPlane::Semantic).unwrap();
+        {
+            // Overflow pages model a large deleted payload without allocating
+            // a matching Rust buffer. Keep the real production reclaim policy.
+            let connection = lock(&store.inner.connection);
+            connection
+                .execute_batch(
+                    "CREATE TABLE reclaim_fixture (data BLOB);
+                INSERT INTO reclaim_fixture VALUES (zeroblob(335544320));
+                DELETE FROM reclaim_fixture;",
+                )
+                .unwrap();
+        }
+        let initial = store.usage().unwrap().file_bytes;
+        for _ in 0..3 {
+            let before = store.usage().unwrap().file_bytes;
+            let report = crate::gc::family::sweep_family(
+                &registry,
+                None,
+                crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+                None,
+            )
+            .unwrap();
+            let after = store.usage().unwrap().file_bytes;
+            assert_eq!(report.deleted_blobs, 0);
+            assert_eq!(report.space_reclaim.examined_stores, 1);
+            assert!(report.space_reclaim.reclaimed_pages > 0);
+            assert!(report.space_reclaim.reclaimed_pages <= 4096);
+            assert!(before > after);
+            assert!(
+                before - after <= 4102 * 4096,
+                "one pass exceeded its page budget"
+            );
+            assert!(report.reclaim_deferred);
+        }
+        assert!(store.usage().unwrap().file_bytes > initial - 3 * 4102 * 4096);
+        let connection = lock(&store.inner.connection);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "busy_timeout", |r| r.get::<_, u64>(0))
+                .unwrap(),
+            super::super::BUSY_TIMEOUT_MS
+        );
     }
 
     #[test]
