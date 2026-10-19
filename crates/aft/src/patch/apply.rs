@@ -4,8 +4,8 @@
 //! `packages/opencode-plugin/src/patch-parser.ts`.
 
 use crate::patch::matcher::{
-    find_nearest_miss, seek_sequence_tiered, NearestMiss, NearestMissSearch, SequenceMatch,
-    NEAREST_MISS_MAX_FILE_BYTES,
+    find_nearest_miss, seek_sequence_tiered, seek_sequence_tiered_checked, NearestMiss,
+    NearestMissSearch, SequenceMatch, NEAREST_MISS_MAX_FILE_BYTES,
 };
 use crate::patch::parser::UpdateFileChunk;
 
@@ -31,10 +31,10 @@ fn seek_sequence_tiered_strings(
     pattern: &[String],
     start_index: usize,
     eof: bool,
-) -> Option<SequenceMatch> {
+) -> Result<Option<SequenceMatch>, &'static str> {
     let line_refs = line_refs(lines);
     let pattern_refs: Vec<&str> = pattern.iter().map(String::as_str).collect();
-    seek_sequence_tiered(&line_refs, &pattern_refs, start_index, eof)
+    seek_sequence_tiered_checked(&line_refs, &pattern_refs, start_index, eof)
 }
 
 fn seek_sequence_strings(
@@ -161,6 +161,8 @@ pub fn apply_update_chunks(
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut line_index = 0;
 
+    let ambiguous =
+        |message| format!("{message} in {file_path}; add unique context or an EOF anchor");
     for chunk in chunks {
         let change_context = chunk
             .change_context
@@ -170,7 +172,8 @@ pub fn apply_update_chunks(
             let line_refs = line_refs(&original_lines);
             let context_pattern = [context.as_str()];
             let Some(context_match) =
-                seek_sequence_tiered(&line_refs, &context_pattern, line_index, false)
+                seek_sequence_tiered_checked(&line_refs, &context_pattern, line_index, false)
+                    .map_err(ambiguous)?
             else {
                 return Err(format!("Failed to find context '{context}' in {file_path}"));
             };
@@ -194,7 +197,8 @@ pub fn apply_update_chunks(
             &pattern,
             line_index,
             chunk.is_end_of_file,
-        );
+        )
+        .map_err(ambiguous)?;
 
         if matched.is_none() && pattern.last().is_some_and(String::is_empty) {
             pattern.pop();
@@ -206,7 +210,8 @@ pub fn apply_update_chunks(
                 &pattern,
                 line_index,
                 chunk.is_end_of_file,
-            );
+            )
+            .map_err(ambiguous)?;
         }
 
         if let Some(sequence_match) = matched {
@@ -742,5 +747,41 @@ mod audit11_regressions {
                 .unwrap();
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn ambiguous_later_hunk_does_not_commit_an_earlier_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let original = "\u{feff}head\r\n  target\r\nother\r\n\ttarget\r\n";
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let chunks = [
+            UpdateFileChunk {
+                old_lines: vec!["\u{feff}head".into()],
+                new_lines: vec!["\u{feff}changed".into()],
+                change_context: None,
+                is_end_of_file: false,
+            },
+            UpdateFileChunk {
+                old_lines: vec!["target".into()],
+                new_lines: vec!["replacement".into()],
+                change_context: None,
+                is_end_of_file: false,
+            },
+        ];
+        let result = apply_update_chunks(original, "a.txt", &chunks);
+        if let Ok(changed) = &result {
+            std::fs::write(&path, changed.as_bytes()).unwrap();
+        }
+        assert!(
+            result.is_err(),
+            "ambiguous fallback must refuse before commit"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
     }
 }

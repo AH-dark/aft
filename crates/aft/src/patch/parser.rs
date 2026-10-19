@@ -172,7 +172,10 @@ pub fn parse_update_file_chunks(lines: &[&str], start_idx: usize) -> (Vec<Update
                     break;
                 }
 
-                if let Some(content) = change_line.strip_prefix(' ') {
+                if change_line.is_empty() {
+                    old_lines.push(String::new());
+                    new_lines.push(String::new());
+                } else if let Some(content) = change_line.strip_prefix(' ') {
                     old_lines.push(content.to_owned());
                     new_lines.push(content.to_owned());
                 } else if let Some(content) = change_line.strip_prefix('-') {
@@ -198,7 +201,97 @@ pub fn parse_update_file_chunks(lines: &[&str], start_idx: usize) -> (Vec<Update
     (chunks, i)
 }
 
-/// Parse an opencode apply_patch envelope; mirrors `patch-parser.ts:148-201`.
+fn invalid_patch_line(index: usize, detail: &str) -> String {
+    format!("Invalid patch at line {}: {}", index + 1, detail)
+}
+
+/// Validate every operation before a caller can begin writing. Empty update
+/// rows are compatible blank context; Add File's existing blank-row policy stays unchanged.
+fn validate_patch_structure(lines: &[&str], begin: usize, end: usize) -> Result<(), String> {
+    if let Some(index) = (0..begin).find(|index| !lines[*index].trim().is_empty()) {
+        return Err(invalid_patch_line(
+            index,
+            "unexpected content before *** Begin Patch",
+        ));
+    }
+    if let Some(index) = (end + 1..lines.len()).find(|index| !lines[*index].trim().is_empty()) {
+        return Err(invalid_patch_line(
+            index,
+            "unexpected content after *** End Patch",
+        ));
+    }
+    let mut i = begin + 1;
+    while i < end {
+        if lines[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let operation = i;
+        let header = parse_patch_header(lines, i)
+            .ok_or_else(|| invalid_patch_line(i, "invalid file operation header"))?;
+        if header.move_path.as_deref() == Some("") {
+            return Err(invalid_patch_line(
+                i + 1,
+                "move destination must not be empty",
+            ));
+        }
+        i = header.next_idx;
+        if lines[operation].starts_with("*** Add File:") {
+            while i < end && !lines[i].starts_with("***") {
+                if !lines[i].is_empty() && !lines[i].starts_with('+') {
+                    return Err(invalid_patch_line(
+                        i,
+                        "Add File content must start with '+'",
+                    ));
+                }
+                i += 1;
+            }
+        } else if lines[operation].starts_with("*** Update File:") {
+            let mut in_chunk = false;
+            let mut saw_chunk = false;
+            while i < end {
+                let line = lines[i];
+                if line == "*** End of File" && in_chunk {
+                    in_chunk = false;
+                    i += 1;
+                    continue;
+                }
+                if line.starts_with("***") {
+                    break;
+                }
+                if line.starts_with("@@") {
+                    in_chunk = true;
+                    saw_chunk = true;
+                    i += 1;
+                    continue;
+                }
+                if line.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                if !in_chunk {
+                    return Err(invalid_patch_line(i, "expected an @@ update hunk header"));
+                }
+                if !line.starts_with([' ', '+', '-']) {
+                    return Err(invalid_patch_line(
+                        i,
+                        "unrecognized update payload; expected space, '+', or '-' prefix",
+                    ));
+                }
+                i += 1;
+            }
+            if !saw_chunk && header.move_path.is_none() {
+                return Err(invalid_patch_line(
+                    operation,
+                    "update operation requires an @@ hunk",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse an apply_patch envelope, rejecting malformed operations before any writes.
 ///
 /// The size guard uses `patch_text.len()` bytes. TypeScript uses string length,
 /// but the port intentionally guards bytes so Rust bounds actual allocation size.
@@ -237,6 +330,7 @@ pub fn parse_patch(patch_text: &str) -> Result<Vec<Hunk>, String> {
         );
     }
 
+    validate_patch_structure(&lines, begin_idx, end_idx)?;
     let mut i = begin_idx + 1;
     while i < end_idx {
         let Some(header) = parse_patch_header(&lines, i) else {
@@ -304,10 +398,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_patch_ignores_empty_add_header_matches_patch_parser_test_15_17() {
-        assert_eq!(
-            parse_patch("*** Begin Patch\n*** Add File:\n+hello\n*** End Patch").unwrap(),
-            vec![]
+    fn parse_patch_rejects_empty_add_header_before_any_operation() {
+        assert_parse_error(
+            "*** Begin Patch\n*** Add File:\n+hello\n*** End Patch",
+            "Invalid patch at line 2: invalid file operation header",
         );
     }
 
@@ -336,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_patch_invalid_heredoc_matches_patch_parser_test_40_56() {
+    fn parse_patch_rejects_unclosed_heredoc_and_prefix_noise() {
         let wrapped_patch = [
             "<<EOF",
             "*** Begin Patch",
@@ -347,14 +441,13 @@ mod tests {
         ]
         .join("\n");
 
-        let expected = vec![Hunk::Add {
-            path: "hello.txt".to_owned(),
-            contents: "hello world".to_owned(),
-        }];
-        assert_eq!(parse_patch(&wrapped_patch).unwrap(), expected);
-        assert_eq!(
-            parse_patch(&format!("prefix\n{wrapped_patch}")).unwrap(),
-            expected
+        assert_parse_error(
+            &wrapped_patch,
+            "Invalid patch at line 1: unexpected content before *** Begin Patch",
+        );
+        assert_parse_error(
+            &format!("prefix\n{wrapped_patch}"),
+            "Invalid patch at line 1: unexpected content before *** Begin Patch",
         );
     }
 
@@ -513,6 +606,56 @@ mod tests {
                     }],
                 },
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn malformed_update_payload_and_headers_report_locations() {
+        for (patch, line) in [
+            ("*** Begin Patch\n*** Update File: a.txt\n@@\n-old\ngarbage\n+new\n*** End Patch", 5),
+            ("*** Begin Patch\n*** Update Fiel: a.txt\n@@\n-old\n+new\n*** End Patch", 2),
+            ("*** Begin Patch\n*** Update File: a.txt\n-old\n+new\n*** End Patch", 3),
+            ("*** Begin Patch\n*** Update File: a.txt\n*** Move to:\n@@\n-old\n+new\n*** End Patch", 3),
+        ] {
+            let error = parse_patch(patch).expect_err("malformed input must not be silently dropped");
+            assert!(error.contains(&format!("line {line}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn bare_blank_update_context_preserves_exact_crlf_and_bom_bytes() {
+        let patch = "*** Begin Patch\r\n*** Update File: a.txt\r\n@@\r\n-\u{feff}old\r\n+\u{feff}new\r\n\r\n tail\r\n*** End Patch";
+        let hunks = parse_patch(patch).unwrap();
+        let Hunk::Update { chunks, .. } = &hunks[0] else {
+            panic!("update expected")
+        };
+        assert_eq!(chunks[0].old_lines, ["\u{feff}old", "", "tail"]);
+        let changed = crate::patch::apply::apply_update_chunks(
+            "\u{feff}old\r\n\r\ntail\r\n",
+            "a.txt",
+            chunks,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        crate::edit::write_format_validate(
+            &path,
+            &changed,
+            &crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            "\u{feff}new\r\n\r\ntail\r\n".as_bytes()
         );
     }
 }

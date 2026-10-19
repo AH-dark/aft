@@ -346,84 +346,93 @@ pub fn find_reflow_match(
     first_match
 }
 
-/// Run the first-hit-wins Exact/Rstrip/Trim/Indent/Unicode/Reflow ladder; mirrors `patch-parser.ts:353-399`.
+/// Keep exact first-hit matching, but refuse ambiguous non-exact fallbacks.
 pub fn seek_sequence_tiered(
     lines: &[&str],
     pattern: &[&str],
     start_index: usize,
     eof: bool,
 ) -> Option<SequenceMatch> {
+    seek_sequence_tiered_checked(lines, pattern, start_index, eof)
+        .ok()
+        .flatten()
+}
+
+fn unique_match(
+    first: Option<usize>,
+    next: impl FnOnce(usize) -> Option<usize>,
+) -> Result<Option<usize>, &'static str> {
+    if let Some(first) = first {
+        if next(first + 1).is_some() {
+            return Err("Ambiguous non-exact match");
+        }
+    }
+    Ok(first)
+}
+
+pub(crate) fn seek_sequence_tiered_checked(
+    lines: &[&str],
+    pattern: &[&str],
+    start_index: usize,
+    eof: bool,
+) -> Result<Option<SequenceMatch>, &'static str> {
     if pattern.is_empty() {
-        return None;
+        return Ok(None);
     }
-
+    let matched = |found, tier| {
+        Some(SequenceMatch {
+            found,
+            tier,
+            line_count: pattern.len(),
+        })
+    };
     if let Some(found) = try_match(lines, pattern, start_index, |a, b| a == b, eof) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Exact,
-            line_count: pattern.len(),
-        });
+        return Ok(matched(found, MatchTier::Exact));
     }
-
-    if let Some(found) = try_match(
-        lines,
-        pattern,
-        start_index,
-        |a, b| a.trim_end() == b.trim_end(),
-        eof,
-    ) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Rstrip,
-            line_count: pattern.len(),
-        });
+    for (tier, compare) in [
+        (
+            MatchTier::Rstrip,
+            (|a: &str, b: &str| a.trim_end() == b.trim_end()) as fn(&str, &str) -> bool,
+        ),
+        (
+            MatchTier::Trim,
+            (|a: &str, b: &str| a.trim() == b.trim()) as fn(&str, &str) -> bool,
+        ),
+    ] {
+        let found = unique_match(
+            try_match(lines, pattern, start_index, compare, eof),
+            |next| try_match(lines, pattern, next, compare, eof),
+        )?;
+        if let Some(found) = found {
+            return Ok(matched(found, tier));
+        }
     }
-
-    if let Some(found) = try_match(
-        lines,
-        pattern,
-        start_index,
-        |a, b| a.trim() == b.trim(),
-        eof,
-    ) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Trim,
-            line_count: pattern.len(),
-        });
+    let indent = |a: &str, b: &str| a.trim() == b.trim();
+    let found = unique_match(
+        normalized_sequence_match(lines, pattern, start_index, eof, indent),
+        |next| normalized_sequence_match(lines, pattern, next, eof, indent),
+    )?;
+    if let Some(found) = found {
+        return Ok(matched(found, MatchTier::Indent));
     }
-
-    // Trim already subsumes indentation-only equality; retain the existing
-    // tier contract while comparing without allocating normalized lines.
-    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |a, b| {
-        a.trim() == b.trim()
-    }) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Indent,
-            line_count: pattern.len(),
-        });
+    let unicode = |a: &str, b: &str| unicode_characters(a.trim()).eq(unicode_characters(b.trim()));
+    let found = unique_match(
+        normalized_sequence_match(lines, pattern, start_index, eof, unicode),
+        |next| normalized_sequence_match(lines, pattern, next, eof, unicode),
+    )?;
+    if let Some(found) = found {
+        return Ok(matched(found, MatchTier::Unicode));
     }
-
-    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |a, b| {
-        unicode_characters(a.trim()).eq(unicode_characters(b.trim()))
-    }) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Unicode,
-            line_count: pattern.len(),
-        });
-    }
-
     if eof {
-        return None;
+        return Ok(None);
     }
-
-    find_reflow_match(lines, pattern, start_index).map(|(found, line_count)| SequenceMatch {
-        found,
-        tier: MatchTier::Reflow,
-        line_count,
-    })
+    Ok(
+        find_reflow_match(lines, pattern, start_index).map(|(found, line_count)| SequenceMatch {
+            found,
+            tier: MatchTier::Reflow,
+            line_count,
+        }),
+    )
 }
 
 fn add_sampled_candidates(
@@ -1084,5 +1093,48 @@ mod audit11_regressions {
         // Only the needle is normalized (once collapsed, once stripped) per
         // search; file lines and candidate windows are compared in place.
         assert_eq!(REFLOW_WINDOW_ALLOCATIONS.with(|count| count.get()), 4);
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn non_exact_matches_must_be_unique_in_the_eligible_range() {
+        for (lines, pattern) in [
+            (vec!["target ", "other", "target\t"], vec!["target"]),
+            (vec!["  target", "other", "\ttarget"], vec!["target"]),
+            (vec!["‘target’", "other", "’target’"], vec!["'target'"]),
+        ] {
+            assert!(
+                seek_sequence_tiered(&lines, &pattern, 0, false).is_none(),
+                "{lines:?}"
+            );
+            let selected = seek_sequence_tiered(&lines, &pattern, 2, false).unwrap();
+            assert_eq!(selected.found, 2);
+            assert_eq!(
+                seek_sequence_tiered(&lines, &pattern, 0, true)
+                    .unwrap()
+                    .found,
+                2
+            );
+        }
+        assert!(
+            seek_sequence_tiered(
+                &["say( ‘a’ )", "say( ’a’ )", "say(", " 'a' ", ")"],
+                &["say( 'a' )"],
+                0,
+                false
+            )
+            .is_none(),
+            "an ambiguous stronger fallback must not fall through to reflow"
+        );
+        assert_eq!(
+            seek_sequence_tiered(&["target", "target"], &["target"], 0, false)
+                .unwrap()
+                .found,
+            0
+        );
     }
 }
