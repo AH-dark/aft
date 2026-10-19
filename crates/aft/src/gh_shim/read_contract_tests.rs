@@ -451,6 +451,15 @@ fn audit_search_repo_org_user_qualifiers_have_one_shared_guard() {
 }
 
 #[test]
+fn audit_search_unclosed_quotes_and_dangling_escapes_are_rejected() {
+    for q in ["needle \"", "label:\"unfinished", "needle\\"] {
+        assert!(read_contract::validate_search(q).is_err(), "{q}");
+    }
+    assert!(read_contract::validate_search("label:\"two words\" needle").is_ok());
+    assert!(read_contract::validate_search(r#"label:"a\"b" needle"#).is_ok());
+}
+
+#[test]
 fn audit_identity_lookup_reports_missing_connection_bad_ticket_and_old_daemon() {
     use std::sync::Arc;
     let missing = RelayContext {
