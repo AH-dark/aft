@@ -1219,6 +1219,9 @@ impl FirstLoadDriver for CheckoutDriver {
         seed_derived: bool,
     ) -> Result<Arc<OpenGeneration>, PlaneError> {
         self.check_owner(access)?;
+        super::io::WORK
+            .own_generation_folds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let store = self
             .owner
             .view_store()

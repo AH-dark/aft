@@ -267,6 +267,9 @@ pub fn prepare_checkout_deferring(
     let defer_derived = defer_derived && request.callgraph;
     timing.phase("previous_manifest");
     let head_started = Instant::now();
+    super::io::WORK
+        .full_walks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let head = head_tree_entries(&request.project_root)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     profile.head_ms = head_started.elapsed().as_millis();

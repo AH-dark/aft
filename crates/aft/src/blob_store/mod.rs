@@ -203,7 +203,7 @@ impl SemanticKey {
         model_fingerprint: impl Into<String>,
     ) -> Self {
         Self {
-            source_digest: *blake3::hash(bytes).as_bytes(),
+            source_digest: *crate::views::io::source_hash(bytes).as_bytes(),
             rel_path: rel_path.to_vec(),
             chunker_version: chunker_version.into(),
             embed_template_version: embed_template_version.into(),
@@ -263,7 +263,11 @@ impl CallgraphKey {
         language: impl Into<String>,
         extractor_version: impl Into<String>,
     ) -> Self {
-        Self::from_source_digest(*blake3::hash(bytes).as_bytes(), language, extractor_version)
+        Self::from_source_digest(
+            *crate::views::io::source_hash(bytes).as_bytes(),
+            language,
+            extractor_version,
+        )
     }
 
     /// Reconstruct a key from a proven Git-object alias without rereading source.
@@ -541,6 +545,9 @@ impl BlobStore {
     /// admission uses this before an insert so a rejected payload never enters
     /// the immutable store.
     pub fn usage(&self) -> Result<BlobUsage, BlobStoreError> {
+        crate::views::io::WORK
+            .logical_aggregates
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (rows, payload_bytes): (u64, u64) = self.connection.query_row(
             "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
             [],

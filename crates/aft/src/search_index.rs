@@ -5929,6 +5929,9 @@ fn project_walk_builder_with_admission(
     search_root: &Path,
     excludes: fn(&Path, Option<&std::fs::FileType>) -> bool,
 ) -> WalkBuilder {
+    crate::views::io::WORK
+        .full_walks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.

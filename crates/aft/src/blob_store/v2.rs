@@ -122,7 +122,7 @@ pub struct ContentHash([u8; 32]);
 
 impl ContentHash {
     pub fn of(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
+        Self(*crate::views::io::source_hash(bytes).as_bytes())
     }
 
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -1084,6 +1084,9 @@ fn contains(inner: &StoreInner, key: &FamilyKey) -> StoreResult<bool> {
 
 fn usage(inner: &StoreInner) -> StoreResult<StoreUsage> {
     let connection = lock(&inner.connection);
+    crate::views::io::WORK
+        .logical_aggregates
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (rows, payload_bytes): (u64, u64) = connection.query_row(
         "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
         [],
