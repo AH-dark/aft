@@ -197,6 +197,24 @@ class MeasurementContractTests(unittest.TestCase):
             {"name": "probe_entry", "children": [{"name": "probe_beta", "resolved": True}], "complete": True}, "probe_beta"
         ))
 
+    def test_provisioning_failure_still_writes_a_failed_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            args = SimpleNamespace(
+                semantic=False, model="m", subjects=tmp / "subjects", source=tmp / "src",
+                corpus="corpus", state_timeout=1, ready_timeout=1, request_timeout=1,
+                graph_inspect=False, warmup_minutes=0, activity_minutes=0, quiet_minutes=0,
+            )
+            args.subjects.mkdir()
+            out = tmp / "out" / "arm"
+            with patch.object(gate, "provision", side_effect=gate.MeasurementError("clone failed")):
+                result = gate.run_arm(args, {"commit": "abc"}, 1, True, out)
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("clone failed", result["failure"])
+            written = json.loads((out / "result.json").read_text())
+            self.assertEqual(written["status"], "failed")
+            self.assertIsNone(written["inventory"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -585,14 +585,14 @@ def run_arm(args, corpus, count, views, out):
     config = configuration(views, args.semantic, args.model)
     subject = args.subjects / out.name
     subject.mkdir(parents=True, exist_ok=False)
-    roots, inventory = provision(args.source, corpus["commit"], subject, count, config)
-    dump(out / "inventory.json", inventory)
     broker = None
     acquisition = None
+    # Built before provisioning so a failed clone or checkout still leaves a
+    # result.json, and the caller's matrix keeps the arms that did finish.
     result = {"schema": 1, "corpus": args.corpus, "roots": count, "views": views,
               "profile": "witness-gated-structural-acquisition-v2", "config": config,
               "plane_clock": "public_response_completion",
-              "inventory": inventory, "status": "failed", "gates_certified": [],
+              "inventory": None, "status": "failed", "gates_certified": [],
               "semantic": {"enabled": args.semantic, "backend": "fastembed", "model": args.model,
                            "status": "unavailable" if not args.semantic else "not_yet_observed"},
               "deadlines_seconds": {"state": args.state_timeout, "ready": args.ready_timeout, "request": args.request_timeout},
@@ -609,6 +609,9 @@ def run_arm(args, corpus, count, views, out):
                   "No independent full cold graph oracle or ranked semantic quality replay in this acquisition.",
               ]}
     try:
+        roots, inventory = provision(args.source, corpus["commit"], subject, count, config)
+        dump(out / "inventory.json", inventory)
+        result["inventory"] = inventory
         broker = Broker(args.binary, args.broker, subject, roots[0], args.request_timeout)
         acquisition = Acquisition(broker, out, args.state_timeout, args.semantic, args.ready_timeout)
         result["identity"] = broker.identity
