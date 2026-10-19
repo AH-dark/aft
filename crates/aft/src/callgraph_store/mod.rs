@@ -2356,6 +2356,45 @@ pub(crate) fn callgraph_refresh_status(project_root: &Path) -> serde_json::Value
     }))
 }
 
+/// Files whose changes a refresh batch for `project_root` has accepted but not
+/// yet written to the store: batches queued behind other work, the batch the
+/// worker is applying now, and batches parked until the store is writable.
+/// Until a batch settles, a query answered from the store can still show the
+/// graph from before those edits.
+pub(crate) fn callgraph_refresh_unapplied_paths(project_root: &Path) -> BTreeSet<PathBuf> {
+    let isolated = ISOLATED_REFRESH_TEST_WORKERS.get().and_then(|workers| {
+        workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(project_root)
+            .cloned()
+    });
+    let worker = isolated.or_else(|| {
+        CALLGRAPH_REFRESH_WORKER.get().and_then(|worker| {
+            worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    });
+    let Some(worker) = worker else {
+        return BTreeSet::new();
+    };
+    let queue = worker
+        .shared
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queue
+        .queued
+        .values()
+        .chain(queue.active.iter())
+        .chain(queue.waiting.values().map(|waiting| &waiting.batch))
+        .filter(|batch| batch.root.project_root == project_root)
+        .flat_map(|batch| batch.paths.iter().cloned())
+        .collect()
+}
+
 pub(crate) fn retire_obsolete_callgraph_refresh_waiters() {
     let mut workers = ISOLATED_REFRESH_TEST_WORKERS
         .get()

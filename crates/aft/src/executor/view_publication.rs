@@ -190,6 +190,29 @@ pub(crate) fn running_for(ctx: &AppContext) -> bool {
     JOBS.lock().values().any(|job| job.context == address)
 }
 
+/// What the queued or running view publications for `ctx` have yet to
+/// install: `None` when none is running, otherwise the root-relative paths
+/// they carry. An empty set means a publication of the whole checkout (after
+/// lost watcher events or an ignore-rule change, for example), whose changed
+/// files are not known in advance.
+pub(crate) fn unpublished_paths_for(ctx: &AppContext) -> Option<BTreeSet<Vec<u8>>> {
+    let address = ctx as *const AppContext as usize;
+    let jobs = JOBS.lock();
+    let mut running = jobs
+        .values()
+        .filter(|job| job.context == address)
+        .peekable();
+    running.peek()?;
+    let mut paths = BTreeSet::new();
+    for job in running {
+        if job.paths.is_empty() {
+            return Some(BTreeSet::new());
+        }
+        paths.extend(job.paths.iter().cloned());
+    }
+    Some(paths)
+}
+
 /// True when [`schedule`] called on this thread for `ctx` hands the work to a
 /// detached worker instead of publishing inline on the calling thread.
 pub(crate) fn detaches_for(ctx: &AppContext) -> bool {

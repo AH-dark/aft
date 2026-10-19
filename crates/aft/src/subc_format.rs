@@ -338,6 +338,9 @@ pub(crate) fn format_response_unbounded(
         _ => unreachable!("core agent tools are exhaustive"),
     };
     crate::response_finalize::append_watcher_query_notice(&mut text, response);
+    if bare_name == "callgraph" {
+        crate::response_finalize::append_callgraph_pending_notice(&mut text, response);
+    }
     if let Some(reason) = data.get("backup_skipped_reason").and_then(Value::as_str) {
         let notice = format!(
             "Undo is unavailable for this change because the backup snapshot was skipped ({reason})."

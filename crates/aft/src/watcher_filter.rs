@@ -2513,7 +2513,13 @@ impl WatcherFilterThread {
             // /private/var aliasing and matches the callgraph/semantic/search
             // cache keys. Same-file repeats within the window still dedup here;
             // the high-churn flood is already dropped above, before this syscall.
-            self.raw_paths.insert(canonicalize_watcher_path(path));
+            let path = canonicalize_watcher_path(path);
+            // Published before the flush window ends so that call-graph
+            // answers in the meantime already know these files are changing.
+            self.config
+                .counters
+                .note_unflushed_paths(std::iter::once(&path));
+            self.raw_paths.insert(path);
         }
         if !self.raw_paths.is_empty() && self.flush_deadline.is_none() {
             self.flush_deadline = Some(Instant::now() + WATCHER_FLUSH_WINDOW);
@@ -2546,6 +2552,17 @@ impl WatcherFilterThread {
     }
 
     fn flush_pending_with_wait(&mut self, deadline: Instant, pause: impl FnMut()) -> bool {
+        let flushed = self.flush_raw_paths_with_wait(deadline, pause);
+        // Paths kept for another window (an ignore-rule change still being
+        // acknowledged) remain unflushed; everything else has been handed to
+        // the dispatch channel or dropped by the filter.
+        if self.raw_paths.is_empty() {
+            self.config.counters.clear_unflushed_paths();
+        }
+        flushed
+    }
+
+    fn flush_raw_paths_with_wait(&mut self, deadline: Instant, pause: impl FnMut()) -> bool {
         if self.raw_paths.is_empty() {
             self.flush_deadline = None;
             return true;
@@ -5297,6 +5314,46 @@ mod tests {
         let file = root.join("fixture.db");
         std::fs::write(&file, "not source").unwrap();
         assert!(watcher_path_is_infra_skip_under(&root, &file));
+    }
+
+    #[test]
+    fn atomic_save_paths_are_reported_unflushed_until_dispatched() {
+        let project = TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let source = root.join("probe.rs");
+        let temporary = root.join("probe.rs.save");
+        std::fs::write(&temporary, "pub fn probe() {}\n").unwrap();
+        std::fs::rename(&temporary, &source).unwrap();
+        let (tx, rx) = watcher_dispatch_channel();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        let counters = Arc::clone(&config.counters);
+        let mut filter = WatcherFilterThread::new(
+            config,
+            shared_matcher(&root),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // A rename-over names the vanished temporary file and the replaced
+        // original. Only the source file can change a call-graph answer.
+        assert!(filter.push_raw_paths(vec![temporary.clone(), source.clone()]));
+        assert_eq!(
+            counters.unflushed_paths(),
+            BTreeSet::from([source.clone()]),
+            "a held source file must be visible before the flush window ends"
+        );
+        assert!(rx.try_recv().is_err(), "nothing is dispatched yet");
+
+        assert!(filter.flush_pending());
+        match rx.try_recv().expect("the flush dispatches the save") {
+            WatcherDispatchEvent::Paths(paths) => assert!(paths.contains(&source), "{paths:?}"),
+            other => panic!("unexpected dispatch: {other:?}"),
+        }
+        assert!(
+            counters.unflushed_paths().is_empty(),
+            "dispatched paths are the drain's to report"
+        );
     }
 
     #[test]
