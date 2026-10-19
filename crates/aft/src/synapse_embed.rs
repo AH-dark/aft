@@ -106,6 +106,22 @@ pub enum SynapseEmbeddingError {
     NoProgress(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticBuildFailureClass {
+    ModelLoading,
+    Failure,
+}
+
+/// Classify the daemon's model-loading response after it crosses the existing
+/// string-based semantic-index build boundary.
+pub(crate) fn classify_semantic_build_failure(error: &str) -> SemanticBuildFailureClass {
+    if error.starts_with("synapse_daemon_unavailable: model_loading:") {
+        SemanticBuildFailureClass::ModelLoading
+    } else {
+        SemanticBuildFailureClass::Failure
+    }
+}
+
 impl fmt::Display for SynapseEmbeddingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1376,6 +1392,27 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_loading_synapse_failure_is_classified_as_waiting_only_for_its_cause() {
+        assert_eq!(
+            super::classify_semantic_build_failure(
+                "synapse_daemon_unavailable: model_loading: catalog lane 'qwen3-embedding-0.6b-ane' is loading"
+            ),
+            super::SemanticBuildFailureClass::ModelLoading
+        );
+        for error in [
+            "synapse_daemon_unavailable: connection refused",
+            "synapse_daemon_unavailable: module unavailable",
+            "synapse_missing_model: model unset",
+        ] {
+            assert_eq!(
+                super::classify_semantic_build_failure(error),
+                super::SemanticBuildFailureClass::Failure,
+                "{error} must remain a real failure"
+            );
+        }
+    }
+
     #[test]
     fn lane_paused_identity_and_retry_bounds_are_validated() {
         use super::pause_test_support::*;

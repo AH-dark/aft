@@ -16,6 +16,7 @@ use crate::executor::BindBlockerSnapshot;
 const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
     "executor scheduler state could not be snapshotted without contention";
 const UNANSWERED_TOOL_DEADLINE: Duration = Duration::from_secs(25);
+const BASH_WATCH_UNANSWERED_GRACE: Duration = Duration::from_secs(5);
 
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
@@ -627,6 +628,11 @@ impl DispatchPathMetrics {
         received_at: Instant,
         body: Option<&Value>,
     ) {
+        // bg_events is a held-open subscription, not a unary call awaiting a
+        // response. Its StreamEnd is sent when the subscription is drained.
+        if is_long_lived_subscription(body) {
+            return;
+        }
         let name = body
             .and_then(|body| {
                 body.get("name")
@@ -660,6 +666,10 @@ impl DispatchPathMetrics {
                     .min(u64::MAX as u128) as u64
             });
             (deadline, class_ms)
+        } else if name == "bash_watch" {
+            // The dispatch layer replaces this with the role-specific watch
+            // window once the route's worker limit and config are available.
+            (None, None)
         } else {
             (
                 received_at.checked_add(UNANSWERED_TOOL_DEADLINE),
@@ -706,6 +716,34 @@ impl DispatchPathMetrics {
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
         );
+    }
+
+    /// Replace the generic 25-second watchdog window with bash_watch's own
+    /// synchronous wait plus a short margin for polling and response delivery.
+    pub(super) fn set_bash_watch_unanswered_wait(
+        &self,
+        route: super::RouteChannel,
+        corr: u64,
+        wait_ms: u64,
+    ) {
+        let Ok(mut tools) = self.unanswered_tools.lock() else {
+            return;
+        };
+        let Some(tool) = tools.get_mut(&(route, corr)) else {
+            return;
+        };
+        if tool.name != "bash_watch" {
+            return;
+        }
+        let warning_window =
+            Duration::from_millis(wait_ms).saturating_add(BASH_WATCH_UNANSWERED_GRACE);
+        tool.deadline = tool.received_at.checked_add(warning_window);
+        tool.deadline_class_ms = tool.deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(tool.received_at)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        });
     }
 
     /// Called by the independent watchdog thread, not by an executor job or
@@ -1276,6 +1314,12 @@ struct UnansweredTool {
     deadline_class_ms: Option<u64>,
     client_deadline_supplied: bool,
     warned: bool,
+}
+
+fn is_long_lived_subscription(body: Option<&Value>) -> bool {
+    body.and_then(|body| body.get("op"))
+        .and_then(Value::as_str)
+        .is_some_and(|operation| operation == "bg_events")
 }
 
 fn client_deadline(body: &Value) -> Option<Instant> {
@@ -3501,6 +3545,119 @@ mod tests {
         assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1190"));
         metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(12), &sink);
         assert_eq!(lines.borrow().len(), 1, "each call warns only once");
+    }
+
+    #[test]
+    fn subscription_streams_do_not_get_unary_deadline_warnings() {
+        use std::cell::RefCell;
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = |corr, body: serde_json::Value| {
+            crate::subc::Frame::build_with_version(
+                crate::subc::PROTOCOL_VERSION,
+                crate::subc::FrameType::Request,
+                crate::subc::control_flags(),
+                24,
+                1,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        };
+        let subscription = request(1187, serde_json::json!({"op": "bg_events"}));
+        let unary = request(1188, serde_json::json!({"name": "configure"}));
+        metrics.tool_received(&subscription, now);
+        metrics.tool_received(&unary, now);
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(26), &sink);
+
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("corr=1188"));
+        assert!(!lines.borrow()[0].contains("corr=1187"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(52), &sink);
+        assert_eq!(lines.borrow().len(), 1, "unary calls warn only once");
+    }
+
+    #[test]
+    fn bash_watch_deadline_warning_uses_its_effective_wait_and_grace() {
+        use std::cell::RefCell;
+
+        let worker_limit_ms = 180_000;
+        let primary_cap_ms = 120_000;
+        let requested_ms = super::super::bash_watch_warning_wait_ms(
+            &serde_json::json!({"timeout_ms": 60_000}),
+            false,
+            worker_limit_ms,
+            primary_cap_ms,
+        )
+        .unwrap();
+        assert_eq!(requested_ms, 60_000);
+        assert_eq!(
+            super::super::bash_watch_warning_wait_ms(
+                &serde_json::json!({"timeoutMs": 60_000}),
+                false,
+                worker_limit_ms,
+                primary_cap_ms,
+            ),
+            Some(60_000)
+        );
+        assert_eq!(
+            super::super::bash_watch_warning_wait_ms(
+                &serde_json::json!({}),
+                true,
+                worker_limit_ms,
+                primary_cap_ms,
+            ),
+            Some(worker_limit_ms)
+        );
+        assert_eq!(
+            super::super::bash_watch_warning_wait_ms(
+                &serde_json::json!({}),
+                false,
+                worker_limit_ms,
+                primary_cap_ms,
+            ),
+            Some(crate::commands::bash_watch::DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
+        );
+        assert_eq!(
+            super::super::bash_watch_warning_wait_ms(
+                &serde_json::json!({"background": true, "timeout_ms": 60_000}),
+                true,
+                worker_limit_ms,
+                primary_cap_ms,
+            ),
+            Some(worker_limit_ms)
+        );
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1186,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "bash_watch",
+                "arguments": {"timeout_ms": requested_ms},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now);
+        metrics.set_bash_watch_unanswered_wait(super::super::route_key(24, 1), 1186, requested_ms);
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(25), &sink);
+        assert!(lines.borrow().is_empty());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_millis(65_000), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash_watch"));
     }
 
     #[test]

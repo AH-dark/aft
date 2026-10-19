@@ -56,6 +56,10 @@ pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
 /// `view_disk_limits_next_ms` while views are disabled: never due.
 const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
+/// Stable retry outcome used when semantic blobs cannot be published until the
+/// checkout's semantic index has finished loading.
+pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
+    "semantic view publication is waiting for the semantic index";
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -7870,9 +7874,7 @@ impl AppContext {
                     .read()
                     .unwrap_or_else(|error| error.into_inner())
                     .clone()
-                    .ok_or_else(|| {
-                        "semantic view publication is waiting for the semantic index".to_string()
-                    })?;
+                    .ok_or_else(|| VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX.to_owned())?;
                 let fingerprint = index
                     .fingerprint()
                     .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
