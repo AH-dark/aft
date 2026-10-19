@@ -2,6 +2,9 @@
   "id": "confine-vector",
   "success": true,
   "text": "symlink.rs  rust         1 syms       1 lines\n",
+  "content_files": [
+    "<fixture>/pin/nested/symlink.rs"
+  ],
   "files": [
     {
       "path": "symlink.rs",
