@@ -1,5 +1,10 @@
 //! Authenticated worker read planning and head-compatible upstream passthrough.
 
+use super::read_contract::Reply as ReadReply;
+use super::read_contract::{
+    self, Accept, GetArgs, GetReply, LogArgs, LogReply, Request as WireRequest, SearchArgs,
+    SearchReply,
+};
 use super::*;
 
 pub(super) const TUPLES: &[&str] = &[
@@ -40,8 +45,6 @@ enum ReadRequest {
         query: String,
         page: u64,
         per_page: u64,
-        sort: Option<String>,
-        order: Option<String>,
     },
 }
 
@@ -52,19 +55,9 @@ struct ByteRange {
 }
 
 #[derive(Debug)]
-struct ReadReply {
-    body: Vec<u8>,
-    total_bytes: Option<u64>,
-    next_path: Option<String>,
-}
-
-#[derive(Debug)]
 enum ReadError {
-    /// Only installation-scoped, not_sent budget refusals may construct this.
-    #[allow(dead_code)] // The pending executor adapter is the production producer.
-    Budget {
-        retry_after_ms: u64,
-    },
+    Budget { retry_after_ms: u64 },
+    Vendor { status: u16, message: String },
     Refused(String),
     Failed(String),
 }
@@ -72,7 +65,7 @@ enum ReadError {
 impl ReadError {
     fn status(&self) -> i32 {
         match self {
-            Self::Failed(_) => 1,
+            Self::Failed(_) | Self::Vendor { .. } => 1,
             _ => REFUSAL_EXIT_STATUS,
         }
     }
@@ -83,8 +76,10 @@ impl ReadError {
                 "read budget for {bot} used up; retry in {} min",
                 retry_after_ms.div_ceil(60_000).max(1)
             ),
+            Self::Vendor { status, message } => format!("HTTP {status}: {message}"),
             Self::Refused(text) | Self::Failed(text) => text.clone(),
         }
+        .replace(['\n', '\r'], " ")
     }
 }
 
@@ -94,20 +89,11 @@ struct ExecutionContext<'a> {
     relay: &'a RelayContext,
 }
 
-/// The sole executor boundary. Plans contain only repository-scoped GETs,
-/// named searches and bounded log ranges; no raw argv or credential crosses it.
-fn execute_read(
-    context: &ExecutionContext<'_>,
-    request: &ReadRequest,
-) -> Result<ReadReply, ReadError> {
-    // TODO(PLEX): translate these typed requests/replies at the existing
-    // gh_shim.bot_request daemon relay once Plexus publishes its read wire
-    // contract, including not_sent installation-budget refusals. The GET
-    // adapter must enforce the 1 MB cap and forbid off-API-host redirects.
-    // Never delegate to real gh or acquire a token here. The path stays closed until then.
-    let _ = (context.binding, context.manifest, context.relay, request);
-    Err(ReadError::Refused("the governed worker read executor is pending Plexus's read contract; the command was not sent".into()))
-}
+#[path = "read_executor.rs"]
+mod executor;
+use executor::execute_read;
+#[cfg(test)]
+use executor::execute_read_with;
 
 pub(super) fn validate_class(manifest: &Manifest) -> Result<(), String> {
     if !manifest.worker_reads.is_empty() && manifest.manifest_version < 20 {
@@ -533,6 +519,10 @@ mod render;
 #[path = "v20_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "read_contract_tests.rs"]
+mod wire_tests;
+
 fn flag_spec(tuple: &str, flag: &str) -> Option<(&'static str, bool)> {
     let common = match flag {
         "--repo" | "-R" => Some(("repo", true)),
@@ -665,6 +655,7 @@ fn api_plan(plan: &Plan) -> Result<ReadRequest, String> {
             }
             let value = value.trim();
             let format = match value {
+                "application/vnd.github.raw+json" => "raw",
                 "diff" | "application/vnd.github.diff" | "application/vnd.github.v3.diff" => "diff",
                 "patch" | "application/vnd.github.patch" | "application/vnd.github.v3.patch" => {
                     "patch"
@@ -678,7 +669,8 @@ fn api_plan(plan: &Plan) -> Result<ReadRequest, String> {
                 .map(|(_, suffix)| suffix.split('?').next().unwrap_or(suffix))
                 .unwrap_or("");
             let parts: Vec<_> = suffix.split('/').collect();
-            if !(parts.len() == 2 && parts[0] == "pulls" && positive_id(parts[1]).is_ok())
+            if format != "raw"
+                && !(parts.len() == 2 && parts[0] == "pulls" && positive_id(parts[1]).is_ok())
                 && !(parts.len() == 2 && parts[0] == "compare" && !parts[1].is_empty())
             {
                 return Err(
@@ -718,7 +710,7 @@ fn validate_api_path<'a>(raw: &'a str, repository: &str) -> Result<&'a str, Stri
     let path = raw.strip_prefix('/').unwrap_or(raw);
     let endpoint = path.split('?').next().unwrap_or(path);
     let prefix = format!("repos/{repository}/");
-    if !endpoint.starts_with(&prefix)
+    if !(endpoint == format!("repos/{repository}") || endpoint.starts_with(&prefix))
         || endpoint.len() == prefix.len()
         || raw.starts_with("//")
         || raw.contains('\\')
@@ -803,28 +795,10 @@ fn search_query(plan: &Plan) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("search requires a query (it need not include a repo qualifier)".into());
     }
-    if plan
-        .value("order")
-        .is_some_and(|order| !matches!(order, "asc" | "desc"))
-    {
-        return Err("search --order must be asc or desc".into());
+    if plan.flag("sort") || plan.flag("order") {
+        return Err("search --sort/--order are not available in the pinned github_read draft; its args are q, page and per_page".into());
     }
-    if let Some(sort) = plan.value("sort") {
-        let allowed = if plan.tuple == "search code" {
-            &["indexed"][..]
-        } else {
-            &[
-                "comments",
-                "created",
-                "interactions",
-                "reactions",
-                "updated",
-            ][..]
-        };
-        if !allowed.contains(&sort) {
-            return Err(format!("unsupported search sort {sort}"));
-        }
-    }
+    read_contract::validate_search(&query)?;
     if plan.limit() > 1000 {
         return Err("GitHub search supports at most 1000 results".into());
     }

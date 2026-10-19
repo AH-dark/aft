@@ -1056,7 +1056,7 @@ fn describe_session_agent_mismatch(
 
 #[cfg(test)]
 #[path = "gh_shim_relay_client_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 /// Resolve worker policy from the ticket's daemon-stamped route, never from a
 /// caller-supplied session id or an environment variable claiming to be a worker.
@@ -1094,5 +1094,50 @@ pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, Strin
             }
             envelope["data"]["worker"].as_bool().map(Some).ok_or_else(|| "the daemon returned no authenticated worker context".to_string())
         }).await.map_err(|_| "worker read session lookup timed out; the command was not run".to_string())?
+    })
+}
+
+/// Send one github_read request through AFT's ticket-authenticated management
+/// relay. Tool refusals remain Response bodies; Error frames are transport errors.
+pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Value, String> {
+    let ticket = relay
+        .ticket
+        .as_deref()
+        .filter(|ticket| !ticket.is_empty())
+        .ok_or("no live command ticket is attached")?;
+    let connection = relay
+        .connection_file
+        .as_ref()
+        .ok_or("no AFT daemon connection is configured")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(relay.relay_budget, async {
+            let setup = tokio::time::timeout(SETUP_TIMEOUT, async {
+                let consumer = SubcConsumer::connect(connection, ConsumerOptions {
+                    call_timeout: relay.relay_budget, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
+                }).await.map_err(|error| error.to_string())?;
+                let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+                let route = consumer.open_route(
+                    RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
+                    BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-request"),
+                    CallOptions::default(),
+                ).await.map_err(|error| error.to_string())?;
+                Ok::<_, String>((consumer, route))
+            }).await.map_err(|_| "read relay setup timed out".to_string())??;
+            let (consumer, route) = setup;
+            let body = json!({"op": crate::gh_shim_relay::READ_REQUEST_OPERATION, "params": {"ticket": ticket, "request": request}});
+            let reply = consumer.request(&route, serde_json::to_vec(&body).map_err(|error| error.to_string())?, CallOptions::default()).await;
+            let _ = consumer.close_handle(&route, CloseRouteOptions::default()).await;
+            let bytes = reply.map_err(|error| format!("read relay transport error: {error}"))?;
+            let envelope: Value = serde_json::from_slice(&bytes).map_err(|error| format!("malformed read relay response: {error}"))?;
+            match envelope["status"].as_str() {
+                Some("ok") => envelope.get("data").cloned().ok_or_else(|| "read relay response omitted data".to_string()),
+                Some("error") => Err(format!("{}: {}", envelope["data"]["refusal_code"].as_str().unwrap_or("relay_error"), envelope["data"]["message"].as_str().unwrap_or("read relay refused"))),
+                _ => Err("read relay response has no known status".into()),
+            }
+        }).await.map_err(|_| "read relay timed out; the read was not retried".to_string())?
     })
 }

@@ -32,6 +32,7 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+pub(crate) mod read_contract;
 mod rename_guard;
 mod worker_reads;
 

@@ -15,11 +15,19 @@ fn planned(raw: &[&str]) -> Plan {
     plan(&args(raw), "cortexkit/aft").unwrap()
 }
 fn reply(value: Value) -> ReadReply {
-    ReadReply {
-        body: serde_json::to_vec(&value).unwrap(),
-        total_bytes: None,
-        next_path: None,
-    }
+    ReadReply::Get(GetReply {
+        status: 200,
+        body: value,
+        next_page: None,
+    })
+}
+fn log_reply(body: &[u8], offset: u64, total_bytes: u64) -> ReadReply {
+    ReadReply::JobLog(LogReply {
+        body: String::from_utf8(body.to_vec()).unwrap(),
+        offset,
+        length: body.len() as u64,
+        total_bytes,
+    })
 }
 fn run_json(raw: &[&str], responses: Vec<Value>) -> (Value, Vec<ReadRequest>, i32) {
     let plan = planned(raw);
@@ -30,7 +38,13 @@ fn run_json(raw: &[&str], responses: Vec<Value>) -> (Value, Vec<ReadRequest>, i3
         &plan,
         &mut |request| {
             calls.push(request.clone());
-            Ok(reply(responses.next().expect("unexpected request")))
+            let value = responses.next().expect("unexpected request");
+            let result = match request {
+                ReadRequest::Search { .. } => json!({"total_count":value["items"].as_array().unwrap().len(),"incomplete_results":false,"items":value["items"],"next_page":null}),
+                _ => json!({"status":200,"body":value,"next_page":null}),
+            };
+            let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+            executor::decode_reply(&wire, &json!({"result":result,"isError":false}))
         },
         &mut output,
     )
@@ -217,7 +231,7 @@ fn v20_unqualified_search_uses_named_actions_without_adding_repo_in_the_shim() {
 fn v20_three_megabyte_job_log_pages_into_one_byte_exact_stream() {
     let mut log = Vec::with_capacity(3 * REPLY_BYTES);
     for index in 0..3 * REPLY_BYTES {
-        log.push((index % 251) as u8);
+        log.push(b'a' + (index % 26) as u8);
     }
     let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
     let mut ranges = Vec::new();
@@ -236,11 +250,11 @@ fn v20_three_megabyte_job_log_pages_into_one_byte_exact_stream() {
             assert_eq!(range.length, REPLY_BYTES as u64);
             ranges.push(range.clone());
             let offset = range.offset as usize;
-            Ok(ReadReply {
-                body: log[offset..offset + REPLY_BYTES].to_vec(),
-                total_bytes: Some(log.len() as u64),
-                next_path: None,
-            })
+            Ok(log_reply(
+                &log[offset..offset + REPLY_BYTES],
+                range.offset,
+                log.len() as u64,
+            ))
         },
         &mut output,
     )
@@ -267,7 +281,7 @@ fn v20_log_failed_selects_failed_jobs_and_steps_across_page_boundaries() {
                 assert_eq!(*job_id, 42);
                 let start = range.offset as usize;
                 let end = (start + 13).min(log.len());
-                Ok(ReadReply { body: log[start..end].to_vec(), total_bytes: Some(log.len() as u64), next_path: None })
+                Ok(log_reply(&log[start..end], range.offset, log.len() as u64))
             }
             _ => panic!("unexpected request"),
         }
@@ -282,26 +296,11 @@ fn v20_log_failed_selects_failed_jobs_and_steps_across_page_boundaries() {
 #[test]
 fn v20_log_protocol_rejects_missing_total_stalls_and_oversized_replies() {
     for response in [
-        ReadReply {
-            body: b"a".to_vec(),
-            total_bytes: None,
-            next_path: None,
-        },
-        ReadReply {
-            body: Vec::new(),
-            total_bytes: Some(3),
-            next_path: None,
-        },
-        ReadReply {
-            body: vec![0; REPLY_BYTES + 1],
-            total_bytes: Some(3_000_000),
-            next_path: None,
-        },
-        ReadReply {
-            body: b"too long".to_vec(),
-            total_bytes: Some(2),
-            next_path: None,
-        },
+        reply(json!("wrong reply type")),
+        log_reply(b"", 0, 3),
+        log_reply(&vec![b'a'; REPLY_BYTES + 1], 0, 3_000_000),
+        log_reply(b"too long", 0, 2),
+        log_reply(b"offset mismatch", 1, 100),
     ] {
         let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
         let mut response = Some(response);
@@ -550,11 +549,7 @@ fn v20_diff_files_comments_workflows_releases_and_repo_use_gets() {
                     accept: Some("patch".into())
                 }
             );
-            Ok(ReadReply {
-                body: b"From abc\npatch\n".to_vec(),
-                total_bytes: None,
-                next_path: None,
-            })
+            Ok(reply(json!("From abc\npatch\n")))
         },
         &mut output,
     )
@@ -657,44 +652,53 @@ fn v20_checks_render_and_preserve_failure_and_pending_exit_codes() {
 }
 
 #[test]
-fn v20_api_pagination_is_streamed_and_links_are_bound_again() {
-    let plan = planned(&["api", "repos/cortexkit/aft/issues", "--paginate", "--slurp"]);
-    let mut calls = 0;
+fn v20_api_pagination_follows_integer_pages_without_changing_repository() {
+    let plan = planned(&[
+        "api",
+        "repos/cortexkit/aft/issues?per_page=5",
+        "--paginate",
+        "--slurp",
+    ]);
+    let mut calls = Vec::new();
     let mut output = Vec::new();
     render::run(
         &plan,
-        &mut |_| {
-            calls += 1;
-            Ok(ReadReply {
-                body: format!("[{calls}]").into_bytes(),
-                total_bytes: None,
-                next_path: (calls == 1).then(|| "/repos/cortexkit/aft/issues?page=2".into()),
-            })
+        &mut |request| {
+            calls.push(request.clone());
+            Ok(ReadReply::Get(GetReply {
+                status: 200,
+                body: json!([calls.len()]),
+                next_page: (calls.len() == 1).then_some(2),
+            }))
         },
         &mut output,
     )
     .unwrap();
     assert_eq!(output, b"[[1],[2]]\n");
-    assert_eq!(calls, 2);
-    for next in ["https://evil.example/issues", "/repos/other/repo/issues"] {
-        let error = render::run(
-            &plan,
-            &mut |_| {
-                Ok(ReadReply {
-                    body: b"[]".to_vec(),
-                    total_bytes: None,
-                    next_path: Some(next.into()),
-                })
-            },
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
-    }
+    assert_eq!(
+        calls[1],
+        ReadRequest::Get {
+            path: "/repos/cortexkit/aft/issues?page=2&per_page=5".into(),
+            accept: None
+        }
+    );
+    let error = render::run(
+        &plan,
+        &mut |_| {
+            Ok(ReadReply::Get(GetReply {
+                status: 200,
+                body: json!([]),
+                next_page: Some(1),
+            }))
+        },
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
 }
 
 #[test]
-fn v20_pending_executor_refuses_without_delegation_or_credentials() {
+fn v20_missing_ticket_refuses_without_delegation_or_credentials() {
     let binding = AgentBinding {
         repo: "cortexkit/aft".into(),
         agent_id: "aft-bot".into(),
@@ -719,7 +723,7 @@ fn v20_pending_executor_refuses_without_delegation_or_credentials() {
         },
     )
     .unwrap_err();
-    assert!(error.message("aft-bot").contains("not sent"));
+    assert!(error.message("aft-bot").contains("no live command ticket"));
     assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
 }
 
@@ -927,4 +931,39 @@ fn v20_rest_backed_json_hydrates_repository_and_preserves_native_aliases() {
         ],
     );
     assert_eq!(value["files"][0]["path"], "src/lib.rs");
+}
+
+#[test]
+fn v20_executor_uses_pinned_plexus_repo_get_request_and_success() {
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "not-sent-as-identity".into(),
+    };
+    let manifest = manifest();
+    let relay = RelayContext {
+        connection_file: None,
+        ticket: Some("test-ticket".into()),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(1),
+    };
+    let context = ExecutionContext {
+        binding: &binding,
+        manifest: &manifest,
+        relay: &relay,
+    };
+    let request = ReadRequest::Get {
+        path: "/repos/cortexkit/aft/pulls/7/files?a=b&per_page=10".into(),
+        accept: None,
+    };
+    let mut calls = Vec::new();
+    let _result = execute_read_with(&context, &request, &mut |request| {
+        calls.push(request.clone());
+        Ok(json!({"result":{"status":200,"body":[{"filename":"src/lib.rs"}],"next_page":2},"content":[{"type":"text","text":"never parse this field"}],"isError":false,"structuredContent":{"status":200,"body":[{"filename":"src/lib.rs"}],"next_page":2}}))
+    }).expect("draft github_read success must be decoded");
+    assert_eq!(
+        calls,
+        vec![
+            json!({"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","query":{"a":"b","per_page":"10"},"accept":"application/vnd.github+json"}})
+        ]
+    );
 }

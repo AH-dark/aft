@@ -1495,3 +1495,153 @@ fn session_context_replayed_ticket_cannot_restore_worker_routing() {
     assert_eq!(replay.data["refusal_code"], "ticket_unknown");
     assert!(transport.calls().is_empty());
 }
+
+fn read_params(ticket: &str) -> Value {
+    json!({"ticket":ticket,"request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","accept":"application/vnd.github+json"}}})
+}
+
+#[test]
+fn read_relay_uses_github_read_and_the_ticket_scope_without_identity_fields() {
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read", "read-call", "/p");
+    for worker in [false, true] {
+        let transport = FakeTransport::scoped();
+        let vector: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/gh_shim/v20-read-vectors.json"
+        ))
+        .unwrap();
+        transport.push_plexus(Ok(vector["get_success"].clone()));
+        let mut scope = stamp(None, false, true);
+        if worker {
+            scope.kind = subc_protocol::scope::ScopeKind::Worker;
+        }
+        let mut params = read_params(ticket.value().unwrap());
+        params["agent_id"] = json!("forged-agent");
+        params["session_id"] = json!("forged-head");
+        let (reply, _) = run_with_scopes(
+            &transport,
+            READ_REQUEST_OPERATION,
+            params.clone(),
+            &scopes_for("ses-read", Some(scope.clone())),
+        );
+        assert!(reply.ok);
+        assert_eq!(reply.data, vector["get_success"]);
+        assert_eq!(transport.calls()[0].1, "ses-read");
+        assert_eq!(
+            transport.calls()[0].2,
+            json!({"name":"github_read","arguments":params["request"]})
+        );
+        assert_eq!(
+            transport.plexus_scopes(),
+            vec![Some(scope_selector(&scope))]
+        );
+    }
+}
+
+#[test]
+fn read_relay_refuses_unknown_actions_unsafe_paths_and_caller_identity() {
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-invalid", "read-call", "/p");
+    let transport = FakeTransport::scoped();
+    let scopes = scopes_for("ses-read-invalid", Some(delegating_stamp()));
+    let base = read_params(ticket.value().unwrap());
+    let mut cases = Vec::new();
+    for path in [
+        "/",
+        "https://evil.example",
+        "../issues",
+        "pulls//7",
+        "a%2fb",
+    ] {
+        let mut params = base.clone();
+        params["request"]["args"]["path"] = json!(path);
+        cases.push(params);
+    }
+    let mut params = base.clone();
+    params["request"]["action"] = json!("github.repo.delete");
+    cases.push(params);
+    let mut params = base.clone();
+    params["request"]["metadata"] = json!({"agent_id":"forged"});
+    cases.push(params);
+    let mut params = base.clone();
+    params["request"]["args"]["method"] = json!("POST");
+    cases.push(params);
+    let mut params = base;
+    params["request"] = json!({"action":"github.search.code","repository":"cortexkit/aft","args":{"q":"repo:other/repo","per_page":100}});
+    cases.push(params);
+    for params in cases {
+        let (reply, _) = run_with_scopes(&transport, READ_REQUEST_OPERATION, params, &scopes);
+        assert!(!reply.ok);
+        assert_eq!(reply.data["refusal_code"], "request_malformed");
+    }
+    assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn read_relay_requires_live_ticket_and_scoped_transport_without_fallback() {
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-scoped", "read-call", "/p");
+    let transport = FakeTransport::scoped();
+    let params = read_params(ticket.value().unwrap());
+    let (reply, _) = run(&transport, READ_REQUEST_OPERATION, params.clone());
+    assert_eq!(reply.data["refusal_code"], "agent_identity_required");
+    assert!(transport.calls().is_empty());
+    let unscoped = FakeTransport::default();
+    let (reply, _) = run_with_scopes(
+        &unscoped,
+        READ_REQUEST_OPERATION,
+        params,
+        &scopes_for("ses-read-scoped", Some(delegating_stamp())),
+    );
+    assert_eq!(reply.data["refusal_code"], "agent_identity_required");
+    assert!(unscoped.calls().is_empty());
+    let expired = ticket.value().unwrap().to_string();
+    drop(ticket);
+    for value in [expired, "0123456789abcdef0123456789abcdef".into()] {
+        let (reply, _) = run(&transport, READ_REQUEST_OPERATION, read_params(&value));
+        assert_eq!(reply.data["refusal_code"], "ticket_unknown");
+    }
+    assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn read_relay_preserves_tool_refusals_and_treats_error_frames_as_transport_errors() {
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-errors", "read-call", "/p");
+    let scopes = scopes_for("ses-read-errors", Some(delegating_stamp()));
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v20-read-vectors.json"
+    ))
+    .unwrap();
+    for code in [
+        "read_budget_exhausted",
+        "repository_not_visible",
+        "endpoint_not_allowed",
+        "response_too_large",
+        "agent_identity_required",
+        "vendor_error",
+    ] {
+        let transport = FakeTransport::scoped();
+        transport.push_plexus(Ok(vector[code].clone()));
+        let (reply, _) = run_with_scopes(
+            &transport,
+            READ_REQUEST_OPERATION,
+            read_params(ticket.value().unwrap()),
+            &scopes,
+        );
+        assert!(reply.ok, "a tool refusal is still a subc Response");
+        assert_eq!(reply.data, vector[code]);
+        assert_eq!(transport.calls().len(), 1);
+    }
+    let transport = FakeTransport::scoped();
+    transport.push_plexus(Err(TransportError::Refused {
+        code: "decode_error".into(),
+        message: "Error frame".into(),
+    }));
+    let (reply, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        read_params(ticket.value().unwrap()),
+        &scopes,
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "decode_error");
+    assert_eq!(reply.data["stage"], "plexus");
+    assert_eq!(transport.calls().len(), 1);
+}

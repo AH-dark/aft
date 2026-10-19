@@ -42,6 +42,8 @@ pub const BOT_REQUEST_OPERATION: &str = "gh_shim.bot_request";
 pub const BINDINGS_READ_OPERATION: &str = "gh_shim.bindings_read";
 /// Inspect the ticket's daemon-stamped session kind, without contacting Plexus.
 pub const SESSION_CONTEXT_OPERATION: &str = "gh_shim.session_context";
+/// Relay a credential-free github_read request under the ticket's scoped route.
+pub const READ_REQUEST_OPERATION: &str = "gh_shim.read_request";
 
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
 /// The handle connection named in `bindings.read`. Plexus uses the name only
@@ -55,7 +57,10 @@ const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 pub fn is_relay_operation(operation: &str) -> bool {
     matches!(
         operation,
-        BOT_REQUEST_OPERATION | BINDINGS_READ_OPERATION | SESSION_CONTEXT_OPERATION
+        BOT_REQUEST_OPERATION
+            | BINDINGS_READ_OPERATION
+            | SESSION_CONTEXT_OPERATION
+            | READ_REQUEST_OPERATION
     )
 }
 
@@ -308,6 +313,12 @@ pub async fn relay<T: RelayTransport>(
             redeemed.task_id.clone()
         };
         match call.operation {
+            READ_REQUEST_OPERATION => {
+                let stamp = call.route_scopes.for_session(&redeemed.session_id);
+                let (reply, taken) = read_request(transport, &redeemed, stamp, params).await;
+                path = taken;
+                reply
+            }
             SESSION_CONTEXT_OPERATION => {
                 match call.route_scopes.for_session(&redeemed.session_id) {
                     Some(stamp) => RelayReply::relayed(json!({"worker": worker_scope(stamp)})),
@@ -354,6 +365,63 @@ fn worker_scope(stamp: &ScopeStamp) -> bool {
         && matches!(&stamp.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
         && (stamp.kind == ScopeKind::Worker
             || (stamp.kind == ScopeKind::Ephemeral && stamp.parent.is_some()))
+}
+
+async fn read_request<T: RelayTransport>(
+    transport: &T,
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
+    params: &Value,
+) -> (RelayReply, &'static str) {
+    let request = params.get("request").cloned().unwrap_or(Value::Null);
+    let parsed = serde_json::from_value::<crate::gh_shim::read_contract::Request>(request.clone());
+    let validated = parsed
+        .map_err(|error| error.to_string())
+        .and_then(|request| request.validate());
+    if let Err(message) = validated {
+        return (
+            RelayReply::refused("request_malformed", "request", message),
+            "-",
+        );
+    }
+    let Some(stamp) = stamp.filter(|_| transport.opens_scoped_routes()) else {
+        return (
+            RelayReply::refused(
+                "agent_identity_required",
+                "scope",
+                "governed reads require the ticket's authenticated scoped route",
+            ),
+            "-",
+        );
+    };
+    // The selector reopens the redeemed session's scope at the same epoch.
+    // Plexus receives its own target-specific stamp, including worker delegation;
+    // AFT neither reads nor reconstructs the bot identity in that stamp.
+    let selector = scope_selector(stamp);
+    let body = serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
+        name: "github_read".into(),
+        arguments: request,
+        tool_call_id: None,
+        progress_token: None,
+        call_key: None,
+        schema_pin: None,
+        origin: None,
+        preset: None,
+    })
+    .expect("a read tool call serializes to JSON");
+    let reply = match transport
+        .plexus(
+            &redeemed.project_root,
+            &redeemed.session_id,
+            Some(&selector),
+            body,
+        )
+        .await
+    {
+        Ok(reply) => RelayReply::relayed(reply),
+        Err(error) => transport_refusal("plexus", error),
+    };
+    (reply, PATH_STAMP)
 }
 
 /// Read plexus's repository-to-agent bindings for the shim's version check.

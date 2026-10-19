@@ -11,7 +11,15 @@ fn refused(text: impl Into<String>) -> ReadError {
 }
 
 fn checked(reply: ReadReply) -> Result<ReadReply, ReadError> {
-    if reply.body.len() > REPLY_BYTES {
+    if reply.next_page() == Some(0) {
+        return Err(refused("governed read returned an invalid next_page"));
+    }
+    if reply
+        .bytes()
+        .map_err(|error| failed(error.to_string()))?
+        .len()
+        > REPLY_BYTES
+    {
         return Err(refused("governed read reply exceeds the 1 MB limit"));
     }
     Ok(reply)
@@ -29,8 +37,10 @@ fn get(
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
 ) -> Result<Value, ReadError> {
     let reply = fetch(&ReadRequest::Get { path, accept: None }, execute)?;
-    serde_json::from_slice(&reply.body)
-        .map_err(|error| failed(format!("invalid GitHub JSON: {error}")))
+    match reply {
+        ReadReply::Get(reply) => Ok(reply.body),
+        _ => Err(failed("GET returned the wrong read reply type")),
+    }
 }
 
 fn list(
@@ -48,29 +58,38 @@ fn list(
         if per_page == 0 {
             return Ok(rows);
         }
-        let response = get(
-            query(
-                &path,
-                &[
-                    ("per_page", &per_page.to_string()),
-                    ("page", &page.to_string()),
-                ],
-            ),
+        let reply = fetch(
+            &ReadRequest::Get {
+                path: query(
+                    &path,
+                    &[
+                        ("per_page", &per_page.to_string()),
+                        ("page", &page.to_string()),
+                    ],
+                ),
+                accept: None,
+            },
             execute,
         )?;
+        let ReadReply::Get(reply) = reply else {
+            return Err(failed("list returned the wrong read reply type"));
+        };
         let items = container
-            .map(|name| &response[name])
-            .unwrap_or(&response)
+            .map(|name| &reply.body[name])
+            .unwrap_or(&reply.body)
             .as_array()
             .ok_or_else(|| failed("GitHub list response is not an array"))?;
         if items.len() > per_page {
             return Err(failed("GitHub returned more rows than requested"));
         }
         rows.extend(items.iter().cloned());
-        if items.len() < per_page || limit == Some(rows.len()) {
+        if limit == Some(rows.len()) {
             return Ok(rows);
         }
-        page += 1;
+        let Some(next) = advance_page(page, reply.next_page)? else {
+            return Ok(rows);
+        };
+        page = next;
     }
 }
 
@@ -90,24 +109,26 @@ fn search(
                 query: query_text.clone(),
                 page,
                 per_page: per_page as u64,
-                sort: plan.value("sort").map(str::to_string),
-                order: plan.value("order").map(str::to_string),
             },
             execute,
         )?;
-        let value: Value =
-            serde_json::from_slice(&reply.body).map_err(|error| failed(error.to_string()))?;
-        let items = value["items"]
-            .as_array()
-            .ok_or_else(|| failed("search returned no items array"))?;
+        let ReadReply::Search(reply) = reply else {
+            return Err(failed("search returned the wrong reply type"));
+        };
+        if reply.incomplete_results {
+            return Err(refused(
+                "GitHub search returned incomplete results; narrow the query",
+            ));
+        }
+        let items = &reply.items;
         if items.len() > per_page {
             return Err(failed("search returned more rows than requested"));
         }
         rows.extend(items.iter().cloned());
-        if items.len() < per_page {
+        let Some(next) = advance_page(page, reply.next_page)? else {
             break;
-        }
-        page += 1;
+        };
+        page = next;
     }
     Ok(rows)
 }
@@ -360,7 +381,7 @@ pub(super) fn run(
             execute,
         )?;
         output
-            .write_all(&reply.body)
+            .write_all(&reply.bytes().map_err(|error| failed(error.to_string()))?)
             .map_err(|error| failed(error.to_string()))?;
         return Ok(0);
     }
@@ -1251,44 +1272,73 @@ fn api(
     }
     let mut request = request.clone();
     let mut pages = Vec::new();
-    let mut visited = BTreeSet::new();
+    let mut page = match &request {
+        ReadRequest::Get { path, .. } => path
+            .split_once('?')
+            .and_then(|(_, encoded)| {
+                url::form_urlencoded::parse(encoded.as_bytes()).find_map(|(key, value)| {
+                    (key == "page").then(|| value.parse::<u64>().ok()).flatten()
+                })
+            })
+            .unwrap_or(1),
+        _ => return Err(failed("invalid API request")),
+    };
     loop {
         let ReadRequest::Get { path, accept } = &request else {
             return Err(failed("invalid API request"));
         };
-        if !visited.insert(path.clone()) {
-            return Err(failed("GitHub pagination repeated a page"));
-        }
-        let reply = fetch(&request, execute)?;
+        let response = fetch(&request, execute)?;
+        let ReadReply::Get(reply) = response else {
+            return Err(failed("API GET returned the wrong reply type"));
+        };
         if plan.flag("slurp") {
-            pages.push(
-                serde_json::from_slice::<Value>(&reply.body)
-                    .map_err(|error| failed(error.to_string()))?,
-            );
+            pages.push(reply.body.clone());
         } else if !plan.flag("silent") {
             if let Some(jq) = plan.value("jq") {
-                let value: Value = serde_json::from_slice(&reply.body)
-                    .map_err(|error| failed(error.to_string()))?;
+                let value = if accept.is_some() {
+                    serde_json::from_str(
+                        reply
+                            .body
+                            .as_str()
+                            .ok_or_else(|| failed("raw reply was not a string"))?,
+                    )
+                    .map_err(|error| failed(error.to_string()))?
+                } else {
+                    reply.body.clone()
+                };
                 write_json(&value, Some(jq), output)?;
             } else {
+                let bytes = if accept.is_some() {
+                    reply
+                        .body
+                        .as_str()
+                        .ok_or_else(|| failed("raw reply was not a string"))?
+                        .as_bytes()
+                        .to_vec()
+                } else {
+                    serde_json::to_vec(&reply.body).map_err(|error| failed(error.to_string()))?
+                };
                 output
-                    .write_all(&reply.body)
+                    .write_all(&bytes)
                     .map_err(|error| failed(error.to_string()))?;
-                if !reply.body.ends_with(b"\n") {
+                if !bytes.ends_with(b"\n") {
                     output
                         .write_all(b"\n")
                         .map_err(|error| failed(error.to_string()))?;
                 }
             }
         }
-        let Some(next) = reply.next_path.filter(|_| plan.flag("paginate")) else {
+        if !plan.flag("paginate") {
+            break;
+        }
+        let Some(next) = advance_page(page, reply.next_page)? else {
             break;
         };
-        validate_api_path(&next, &plan.repository).map_err(refused)?;
         request = ReadRequest::Get {
-            path: next,
+            path: page_path(path, next),
             accept: accept.clone(),
         };
+        page = next;
     }
     if plan.flag("slurp") && !plan.flag("silent") {
         write_json(&Value::Array(pages), plan.value("jq"), output)?;
@@ -1296,9 +1346,29 @@ fn api(
     Ok(0)
 }
 
-/// Request the complete log in bounded byte windows, including the first window
-/// for short logs. The read contract defines no-range replies as tails, so the
-/// shim must always supply a range when the caller asks for the whole log.
+fn advance_page(current: u64, next: Option<u64>) -> Result<Option<u64>, ReadError> {
+    if next.is_some_and(|next| next <= current) {
+        return Err(refused("governed read pagination did not advance"));
+    }
+    Ok(next)
+}
+
+fn page_path(path: &str, page: u64) -> String {
+    let (endpoint, encoded) = path.split_once('?').unwrap_or((path, ""));
+    let mut pairs: BTreeMap<String, String> = url::form_urlencoded::parse(encoded.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    pairs.insert("page".into(), page.to_string());
+    query(
+        endpoint,
+        &pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Request every log window from offset zero; omitting a range means a tail.
 fn stream_log(
     job_id: u64,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
@@ -1307,7 +1377,7 @@ fn stream_log(
     let mut offset = 0_u64;
     let mut total = None;
     loop {
-        let reply = fetch(
+        let response = fetch(
             &ReadRequest::JobLog {
                 job_id,
                 range: Some(ByteRange {
@@ -1317,25 +1387,31 @@ fn stream_log(
             },
             execute,
         )?;
-        let size = reply
-            .total_bytes
-            .ok_or_else(|| failed("job_log reply omitted total_bytes"))?;
-        if total.is_some_and(|total| total != size) {
+        let ReadReply::JobLog(reply) = response else {
+            return Err(failed("job_log returned the wrong reply type"));
+        };
+        if reply.offset != offset
+            || reply.length != reply.body.len() as u64
+            || reply.length > REPLY_BYTES as u64
+        {
+            return Err(failed("job_log returned an invalid offset or length"));
+        }
+        if total.is_some_and(|total| total != reply.total_bytes) {
             return Err(failed(
                 "job log changed while paging; retry when it finishes",
             ));
         }
-        total = Some(size);
+        total = Some(reply.total_bytes);
         let end = offset
-            .checked_add(reply.body.len() as u64)
+            .checked_add(reply.length)
             .ok_or_else(|| failed("job log offset overflow"))?;
-        if end > size || (end < size && reply.body.is_empty()) {
+        if end > reply.total_bytes || (end < reply.total_bytes && reply.body.is_empty()) {
             return Err(failed("job_log returned an invalid byte range"));
         }
         output
-            .write_all(&reply.body)
+            .write_all(reply.body.as_bytes())
             .map_err(|error| failed(error.to_string()))?;
-        if end == size {
+        if end == reply.total_bytes {
             return Ok(());
         }
         offset = end;
