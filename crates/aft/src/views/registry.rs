@@ -235,6 +235,9 @@ struct RegistryInner {
     /// The disk limits this process applies to the family; see
     /// `views::eviction`. Shared by every handle on this registry file.
     budget: Mutex<super::eviction::DiskBudget>,
+    /// Sizes of immutable view files measured by `views::eviction::measure`.
+    /// Kept here so they live exactly as long as the registry.
+    size_caches: Mutex<super::eviction::ViewSizeCaches>,
     /// Sessions that ended while the connection was busy; see
     /// `ViewSession::drop`. Never held while waiting for `connection`.
     ended_sessions: Mutex<Vec<EndedSession>>,
@@ -314,6 +317,7 @@ impl FamilyRegistry {
             path: path.clone(),
             connection: Mutex::new(connection),
             budget: Mutex::new(super::eviction::DiskBudget::default()),
+            size_caches: Mutex::default(),
             ended_sessions: Mutex::new(Vec::new()),
         });
         {
@@ -470,6 +474,12 @@ impl FamilyRegistry {
     /// exercise eviction and admission with real files.
     pub fn set_disk_budget(&self, budget: super::eviction::DiskBudget) {
         *lock(&self.inner.budget) = budget;
+    }
+
+    /// The view size caches of this family, shared by every handle on this
+    /// registry in this process and dropped with the last one.
+    pub(super) fn view_size_caches(&self) -> &Mutex<super::eviction::ViewSizeCaches> {
+        &self.inner.size_caches
     }
 
     /// Every recorded view session, live or not.

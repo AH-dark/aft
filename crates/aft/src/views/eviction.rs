@@ -314,17 +314,42 @@ fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
 /// them in place. SQLite files, pins, markers and temporary files are never cached.
 const SIZE_RECONCILE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-#[derive(Default)]
-struct ViewSizeCache {
+pub(super) struct ViewSizeCache {
     directory: Option<Vec<u64>>,
     reconciled: Option<Instant>,
     files: BTreeMap<PathBuf, u64>,
 }
 
-fn size_caches() -> &'static Mutex<BTreeMap<PathBuf, BTreeMap<PathBuf, ViewSizeCache>>> {
-    static CACHES: OnceLock<Mutex<BTreeMap<PathBuf, BTreeMap<PathBuf, ViewSizeCache>>>> =
-        OnceLock::new();
-    CACHES.get_or_init(Mutex::default)
+/// The size caches of one family's views, keyed by view directory. The
+/// registry owns them (see `FamilyRegistry::view_size_caches`), so they are
+/// dropped with the last handle on the registry instead of outliving the
+/// family for the rest of the process.
+pub(super) type ViewSizeCaches = BTreeMap<PathBuf, ViewSizeCache>;
+
+#[cfg(test)]
+thread_local! {
+    /// View size caches alive on this thread, so a test can prove that a
+    /// family's caches go away with its registry.
+    static LIVE_SIZE_CACHES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+impl Default for ViewSizeCache {
+    fn default() -> Self {
+        #[cfg(test)]
+        LIVE_SIZE_CACHES.with(|live| live.set(live.get() + 1));
+        Self {
+            directory: None,
+            reconciled: None,
+            files: BTreeMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ViewSizeCache {
+    fn drop(&mut self) {
+        LIVE_SIZE_CACHES.with(|live| live.set(live.get() - 1));
+    }
 }
 
 fn immutable_generation(path: &Path) -> Option<&str> {
@@ -555,11 +580,14 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
         ..DiskUsage::default()
     };
     let members = registry.members()?;
-    let mut caches = size_caches()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(registry.path())
-        .unwrap_or_default();
+    // Taken out for the walk so the lock is not held across disk I/O; a
+    // concurrent measurement of the same family simply walks uncached.
+    let mut caches = std::mem::take(
+        &mut *registry
+            .view_size_caches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     caches.retain(|dir, _| members.iter().any(|member| &member.view_dir == dir));
     for member in members {
         let (bytes, complete) = match view_tree_bytes(
@@ -586,10 +614,10 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
             complete,
         });
     }
-    size_caches()
+    *registry
+        .view_size_caches()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(registry.path().to_path_buf(), caches);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = caches;
     usage.family_store = measure_family_store(registry, deadline)?;
     usage.complete &= usage.family_store.complete;
     // Best effort: a failed record only leaves admission an older one.
@@ -1540,6 +1568,36 @@ mod tests {
         assert!(!registered(&registry, "a"));
         assert!(registered(&registry, "b"));
         assert!(registered(&registry, "c"));
+    }
+
+    /// A family's view size caches belong to its registry: once the last
+    /// handle on a measured registry is dropped, none of its caches remain,
+    /// so a long-running process does not keep them for closed families.
+    #[test]
+    fn size_caches_drop_with_their_registry() {
+        let storage = tempfile::tempdir().unwrap();
+        let live_before = LIVE_SIZE_CACHES.with(|live| live.get());
+        {
+            let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+            for (seed, scope) in ["a", "b"].into_iter().enumerate() {
+                idle_view(&registry, scope, seed as u64, 4);
+            }
+            measure(&registry, None).unwrap();
+            assert_eq!(
+                LIVE_SIZE_CACHES.with(|live| live.get()) - live_before,
+                2,
+                "one size cache per measured view"
+            );
+            assert_eq!(registry.view_size_caches().lock().unwrap().len(), 2);
+            wait_for_background_enforcement(&registry);
+        }
+        assert_eq!(
+            LIVE_SIZE_CACHES.with(|live| live.get()),
+            live_before,
+            "a dropped registry's size caches must be dropped with it"
+        );
+        let reopened = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        assert!(reopened.view_size_caches().lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]

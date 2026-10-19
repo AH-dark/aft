@@ -6067,10 +6067,69 @@ mod membership_admission_tests {
         );
     }
 
+    /// The membership walker's stat budget, asserted exactly on a private tree
+    /// that nothing else touches between its walks.
     #[test]
-    fn membership_checkout_stat_counts() {
-        // Use the actual checkout, not a synthetic tree, to quantify the limited
-        // gain possible without dropping live SQLite hard-link identity checks.
+    fn membership_walker_stat_counts() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for dir in [".git", "src/nested", "target"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        for name in [
+            "lib.rs",
+            "ignored.rs",
+            "src/main.rs",
+            "src/nested/deep.rs",
+            "target/built.rs",
+        ] {
+            fs::write(root.join(name), "fn source() {}\n").unwrap();
+        }
+        symlink("lib.rs", root.join("lib-alias.rs")).unwrap();
+
+        let (old, old_stats) = inventory(&root, true);
+        let (new, new_stats) = inventory(&root, false);
+        assert_eq!(new, old, "admission must match the legacy walker");
+        assert!(
+            new_stats > 0 && new_stats <= old_stats,
+            "legacy={old_stats} optimized={new_stats}"
+        );
+        let expected = [".gitignore", "lib.rs", "src/main.rs", "src/nested/deep.rs"]
+            .map(|name| root.join(name))
+            .to_vec();
+        use crate::views::first_load::{
+            ConfiguredMembershipWalker, MembershipWalker, MEMBERSHIP_WALKS,
+        };
+        MEMBERSHIP_WALKS.with(|walks| walks.set(0));
+        let counts = crate::db::file_identity::stat_probe::count_candidates(|| {
+            for _ in 0..3 {
+                let mut files = ConfiguredMembershipWalker.files(&root).unwrap();
+                files.sort();
+                assert_eq!(files, expected);
+            }
+        });
+        let walks = MEMBERSHIP_WALKS.with(|walks| walks.get());
+        assert_eq!(walks, 3, "each membership request walks once");
+        let stats = counts
+            .iter()
+            .filter(|(path, _)| path.starts_with(&root))
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        assert_eq!(
+            stats,
+            new_stats * walks,
+            "each walk spends exactly the optimized admission's stat calls"
+        );
+    }
+
+    /// Measures the stat calls of the real working checkout. It asserts
+    /// nothing exact: an editor or another job may change files between its
+    /// walks. Run with `--ignored --nocapture` to read the counts.
+    #[test]
+    #[ignore = "benchmark of the live checkout; prints counts only"]
+    fn membership_checkout_stat_counts_benchmark() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -6078,32 +6137,27 @@ mod membership_admission_tests {
             .unwrap();
         let (old, old_stats) = inventory(root, true);
         let (new, new_stats) = inventory(root, false);
-        assert_eq!(new, old);
-        println!("checkout membership / {} admitted entries: legacy={old_stats} lstat, optimized={new_stats} lstat, saved={}; one walk per ConfiguredMembershipWalker::files call", new.len(), old_stats.saturating_sub(new_stats));
-        assert!(new_stats <= old_stats);
+        println!(
+            "checkout membership: legacy {} entries / {old_stats} lstat, optimized {} entries / {new_stats} lstat, saved={}",
+            old.len(),
+            new.len(),
+            old_stats.saturating_sub(new_stats)
+        );
         use crate::views::first_load::{
             ConfiguredMembershipWalker, MembershipWalker, MEMBERSHIP_WALKS,
         };
         MEMBERSHIP_WALKS.with(|walks| walks.set(0));
         let counts = crate::db::file_identity::stat_probe::count_candidates(|| {
-            let mut prior = None;
             for _ in 0..3 {
-                let mut files = ConfiguredMembershipWalker.files(root).unwrap();
-                files.sort();
-                if let Some(prior) = &prior {
-                    assert_eq!(&files, prior);
-                }
-                prior = Some(files);
+                let _ = ConfiguredMembershipWalker.files(root);
             }
         });
         let walks = MEMBERSHIP_WALKS.with(|walks| walks.get());
-        assert_eq!(walks, 3);
         let stats = counts
             .iter()
             .filter(|(path, _)| path.starts_with(root))
             .map(|(_, count)| count)
             .sum::<usize>();
-        assert_eq!(stats, new_stats * walks);
         println!("three checkout membership requests: {walks} full walks, {stats} candidate identity lstat calls");
     }
 }
