@@ -59,6 +59,8 @@ if a[:3] == ['pr', 'checks', '7']:
     persist()
     if s.get('failed_check'):
         answer([{'name': s['failed_check'], 'bucket': 'fail'}])
+    if 'check_results' in s:
+        answer(s['check_results'], s.get('checks_exit_code', 0))
     answer([{'name': 'Landing policy', 'bucket': 'pending' if s.get('checks_pending') else 'pass'}],
            8 if s.get('checks_pending') else 0)
 if a[:2] == ['pr', 'create']:
@@ -247,7 +249,12 @@ if endpoint == 'repos/example/repo/pulls/7':
     answer({'user': s.get('author', {'login': 'aft-alfonso[bot]', 'type': 'Bot', 'id': 318960130})})
 if endpoint == 'repos/example/repo':
     answer({'allow_auto_merge': s.get('auto_merge', False)})
-if '/protection/required_status_checks' in endpoint: answer({'contexts': ['Landing policy']})
+if '/protection/required_status_checks' in endpoint:
+    if s.get('protection_failure'): raise SystemExit('HTTP 403: protection unavailable')
+    answer(s.get('required_status_checks', {'contexts': s.get('required_contexts', ['Landing policy'])}))
+if endpoint.endswith('/rules/branches/main'):
+    if s.get('rules_failure'): raise SystemExit('HTTP 403: rules unavailable')
+    answer(s.get('branch_rules', []))
 if '/pulls?' in endpoint: answer([[pr()] if s.get('exists') else []] if slurp else [pr()])
 if endpoint.endswith('/comments'):
     if s.get('fail_comments'): raise SystemExit('HTTP 502')
@@ -409,6 +416,44 @@ class MergeAdmissionTests(PRFixture):
         self.assertIn("required checks still running", result.stderr)
         self.assertIn("auto-merge is off", result.stderr)
         self.assertEqual(json.loads(self.state_path.read_text())["check_polls"], 1)
+        self.assertEqual(self.merges(), [])
+
+    def test_partial_required_results_leave_missing_contexts_pending(self) -> None:
+        self.write_state(
+            required_status_checks={"checks": [{"context": "Landing policy"}, {"context": "Tests / Unit"}]},
+            branch_rules=[{"type": "required_status_checks", "parameters": {
+                "required_status_checks": [{"context": "Tests / Integration"}]}}],
+            check_results=[{"name": "Landing policy", "bucket": "skipping"}],
+        )
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("required checks still running", result.stderr)
+        self.assertIn("Tests / Unit", result.stderr)
+        self.assertIn("Tests / Integration", result.stderr)
+        self.assertEqual(self.merges(), [])
+
+    def test_no_reported_required_checks_are_pending_by_name(self) -> None:
+        self.write_state(
+            required_contexts=["Unit tests", "Integration tests"],
+            check_results=[],
+            auto_merge=True,
+            ghost_enqueue=True,
+        )
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("required checks still running for #7", result.stderr)
+        self.assertIn("confirmed #7 with GitHub", result.stderr)
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state["check_polls"], 2)
+        self.assertTrue(state["auto_merge_armed"])
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_required_check_protection_read_failure_refuses(self) -> None:
+        self.write_state(protection_failure=True, auto_merge=True)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not read branch-protection required checks", result.stderr)
+        self.assertIn("base branch 'main'", result.stderr)
         self.assertEqual(self.merges(), [])
 
     def test_red_required_check_refuses_by_name(self) -> None:

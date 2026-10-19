@@ -178,47 +178,98 @@ submit_merge() {
   fi
 }
 
-# Reads the PR's required checks. REQUIRED_PENDING gets the names of checks
-# still running; REQUIRED_PROBLEM says why the result cannot admit the PR (a red
-# or unknown check, or an unreadable or empty result) and is empty otherwise.
+# Reads every required status context configured for the PR's base branch,
+# then overlays the results GitHub has reported for this head. A configured
+# context without a result is still a pending check, not an absent requirement.
 read_required_checks() {
-  local output exit_code=0 name bucket
+  local protection_output rules_output output exit_code=0 name bucket context existing found i name_index
+  local required_count=0 reported_count=0
+  local -a required_contexts=() reported_names=()
   REQUIRED_PENDING=()
   REQUIRED_PROBLEM=""
-  if output=$("$OPERATOR_GH" pr checks "$PR" --required --json name,bucket \
-      --jq '.[] | [.name, .bucket] | @tsv'); then
+
+  if protection_output=$("$OPERATOR_GH" api "repos/$OWNER_REPO/branches/$BASE_BRANCH/protection/required_status_checks" \
+      --jq 'if type != "object" then error("expected required-status-checks object") elif .checks? != null and (.checks | type) != "array" then error("malformed required checks") elif .contexts? != null and (.contexts | type) != "array" then error("malformed required contexts") elif ((.checks // []) | length) > 0 then .checks[] | if (.context | type) == "string" and .context != "" then .context else error("malformed required-check context") end elif ((.contexts // []) | length) > 0 then .contexts[] | if type == "string" and . != "" then . else error("malformed required context") end else empty end'); then
     :
   else
-    exit_code=$?
+    REQUIRED_PROBLEM="could not read branch-protection required checks for base branch '$BASE_BRANCH' on PR #$PR"
+    return 0
   fi
+
+  # This endpoint returns the active rules that apply to the named branch,
+  # including repository rulesets and inherited rulesets.
+  if rules_output=$("$OPERATOR_GH" api "repos/$OWNER_REPO/rules/branches/$BASE_BRANCH" \
+      --jq 'if type != "array" then error("expected effective branch-rules list") else .[] | select(.type == "required_status_checks") | if (.parameters.required_status_checks | type) != "array" then error("malformed required-status-check rule") else .parameters.required_status_checks[] | if (.context | type) == "string" and .context != "" then .context else error("malformed ruleset context") end end end'); then
+    :
+  else
+    REQUIRED_PROBLEM="could not read effective ruleset checks for base branch '$BASE_BRANCH' on PR #$PR"
+    return 0
+  fi
+
+  while IFS= read -r context; do
+    [ -n "$context" ] || continue
+    found=false
+    for ((i = 0; i < required_count; i++)); do
+      existing=${required_contexts[i]}
+      if [[ "$existing" == "$context" ]]; then
+        found=true
+        break
+      fi
+    done
+    if [[ "$found" != true ]]; then
+      required_contexts+=("$context")
+      required_count=$((required_count + 1))
+    fi
+  done <<< "$(printf '%s\n%s\n' "$protection_output" "$rules_output")"
+
+  output=$("$OPERATOR_GH" pr checks "$PR" --required --json name,bucket \
+      --jq '.[] | [.name, .bucket] | @tsv') || exit_code=$?
   # gh exits 1 when a check failed and 8 when one is pending; anything else
   # means the checks could not be read at all.
   if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 1 ] && [ "$exit_code" -ne 8 ]; then
     REQUIRED_PROBLEM="could not read required checks for PR #$PR"
     return 0
   fi
-  if [ -z "$output" ]; then
+  if [ -n "$output" ]; then
+    while IFS=$'\t' read -r name bucket; do
+      if [ -z "$name" ] || [ -z "$bucket" ]; then
+        REQUIRED_PROBLEM="malformed required-check result for PR #$PR"
+        return 0
+      fi
+      reported_names+=("$name")
+      reported_count=$((reported_count + 1))
+      case "$bucket" in
+        pass|skipping) ;;
+        pending) REQUIRED_PENDING+=("$name") ;;
+        fail|cancel)
+          REQUIRED_PROBLEM="required check '$name' did not pass ($bucket)"
+          return 0
+          ;;
+        *)
+          REQUIRED_PROBLEM="required check '$name' has unknown status '$bucket'"
+          return 0
+          ;;
+      esac
+    done <<< "$output"
+  fi
+
+  for ((i = 0; i < required_count; i++)); do
+    context=${required_contexts[i]}
+    found=false
+    for ((name_index = 0; name_index < reported_count; name_index++)); do
+      name=${reported_names[name_index]}
+      if [[ "$name" == "$context" ]]; then
+        found=true
+        break
+      fi
+    done
+    [[ "$found" == true ]] || REQUIRED_PENDING+=("$context")
+  done
+
+  if [ "$required_count" -eq 0 ] && [ -z "$output" ]; then
     REQUIRED_PROBLEM="no required checks found for PR #$PR"
     return 0
   fi
-  while IFS=$'\t' read -r name bucket; do
-    if [ -z "$name" ] || [ -z "$bucket" ]; then
-      REQUIRED_PROBLEM="malformed required-check result for PR #$PR"
-      return 0
-    fi
-    case "$bucket" in
-      pass|skipping) ;;
-      pending) REQUIRED_PENDING+=("$name") ;;
-      fail|cancel)
-        REQUIRED_PROBLEM="required check '$name' did not pass ($bucket)"
-        return 0
-        ;;
-      *)
-        REQUIRED_PROBLEM="required check '$name' has unknown status '$bucket'"
-        return 0
-        ;;
-    esac
-  done <<< "$output"
   if [ "$exit_code" -eq 1 ]; then
     REQUIRED_PROBLEM="gh pr checks failed without a named required-check result for PR #$PR"
   elif [ "$exit_code" -eq 8 ] && [ "${#REQUIRED_PENDING[@]}" -eq 0 ]; then
