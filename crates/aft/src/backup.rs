@@ -3028,8 +3028,9 @@ impl BackupStore {
             Ok(entries) => entries,
             Err(error) => {
                 errors += 1;
-                crate::slog_info!(
-                    "backup session retention sweep removed={removed} kept={kept} errors={errors} elapsed_ms={} error={error}",
+                crate::slog_warn!(
+                    "backup session retention sweep failed path={} removed={removed} kept={kept} errors={errors} elapsed_ms={} error={error}",
+                    backups_dir.display(),
                     started.elapsed().as_millis()
                 );
                 return;
@@ -3107,10 +3108,18 @@ impl BackupStore {
             }
             drop(gate);
         }
-        crate::slog_info!(
-            "backup session retention sweep removed={removed} kept={kept} errors={errors} elapsed_ms={}",
-            started.elapsed().as_millis()
-        );
+        if errors == 0 {
+            crate::slog_info!(
+                "backup session retention sweep removed={removed} kept={kept} errors={errors} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        } else {
+            crate::slog_warn!(
+                "backup session retention sweep removed={removed} kept={kept} errors={errors} elapsed_ms={} path={}",
+                started.elapsed().as_millis(),
+                backups_dir.display()
+            );
+        }
     }
 
     /// One-time migration: move pre-session flat layout into the default
@@ -5730,6 +5739,49 @@ mod tests {
         }));
         assert!(!lines.iter().any(|line| {
             line.starts_with("WARN ") && line.contains("removed stale backup session")
+        }));
+
+        let failed_session = backups.join("failed-session");
+        std::fs::create_dir_all(&failed_session).unwrap();
+        std::fs::write(
+            failed_session.join("session.json"),
+            serde_json::to_vec(&serde_json::json!({"last_accessed": 1})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(failed_session.join(".locks"), b"not a directory").unwrap();
+        let (_, error_lines) = crate::logging::capture_log_lines(|| store.gc_stale_sessions(1));
+
+        assert!(failed_session.exists());
+        assert!(error_lines.iter().any(|line| {
+            line.starts_with("WARN ")
+                && line.contains("backup session retention sweep")
+                && line.contains("removed=0 kept=2 errors=1")
+                && line.contains("path=")
+        }));
+        assert!(!error_lines.iter().any(|line| {
+            line.starts_with("INFO ") && line.contains("backup session retention sweep")
+        }));
+    }
+
+    #[test]
+    fn stale_session_gc_read_dir_failure_warns_with_path_and_error() {
+        let storage = tempfile::tempdir().unwrap();
+        let backups = storage.path().join("backups");
+        std::fs::write(&backups, b"not a directory").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 1);
+
+        let (_, lines) = crate::logging::capture_log_lines(|| store.gc_stale_sessions(1));
+
+        assert!(lines.iter().any(|line| {
+            line.starts_with("WARN ")
+                && line.contains("backup session retention sweep failed")
+                && line.contains(&format!("path={}", backups.display()))
+                && line.contains("errors=1")
+                && line.contains("error=")
+        }));
+        assert!(!lines.iter().any(|line| {
+            line.starts_with("INFO ") && line.contains("backup session retention sweep")
         }));
     }
 
