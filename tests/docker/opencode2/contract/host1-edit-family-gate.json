@@ -1,24 +1,34 @@
 {
   "schema_version": 1,
-  "run_id": "oc1-1.18.30-20260921-edit-family-gate",
-  "observed_run_id": "oc1-1.18.30-20260921-edit-family-gate",
-  "host_version": "1.18.30",
+  "run_id": "oc1-1.19.3-20261019T153146048Z-t7-parity",
+  "observed_run_id": "oc1-1.19.3-20261019T153146048Z-t7-parity",
+  "host_version": "1.19.3",
   "host": "opencode1",
   "platform": "linux-x64",
-  "transcript": "probe/host1-edit-family-gate-1.18.30.txt",
-  "executable": "/opt/opencode1/node_modules/opencode-ai/bin/opencode.exe",
-  "executable_sha256": "87bd160e053af86b5b409daabf71f8dc05bbc3a2a3a5f563f36011cdf706a999",
+  "transcript": "probe/host1-edit-family-gate-1.19.3.txt",
+  "executable": "opencode-ai/bin/opencode.exe",
+  "executable_sha256": "179ca421d61eefeadfa0c50e084a6e79c1623734732f0f4593f81ccfd3ab7ee9",
   "registry_function": "s.fn(\"ToolRegistry.tools\")",
   "selector_source": "let F=D.modelID.includes(\"gpt-\")&&!D.modelID.includes(\"oss\")&&!D.modelID.includes(\"gpt-4\");if(A.id===xr.id)return F;if(A.id===Hr.id||A.id===vr.id)return!F;",
   "tool_selectors": [
-    { "tool": "apply_patch", "source": "xr=j(\"apply_patch\"" },
-    { "tool": "edit", "source": "Hr=j(\"edit\"" },
-    { "tool": "write", "source": "vr=j(\"write\"" }
+    {
+      "tool": "apply_patch",
+      "source": "xr=j(\"apply_patch\""
+    },
+    {
+      "tool": "edit",
+      "source": "Hr=j(\"edit\""
+    },
+    {
+      "tool": "write",
+      "source": "vr=j(\"write\""
+    }
   ],
   "harness_models": {
     "v1_leg": "mock/mock-model",
     "v2_leg": "openai/gpt-5-mock",
     "v2_default": "openai/mock-model"
   },
-  "reading": "F is true for a model id containing gpt- but neither oss nor gpt-4. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. V1 parity still uses the captured mock/mock-model, so its apply_patch leg remains excluded. V2 apply_patch scenarios now explicitly select openai/gpt-5-mock while other scenarios keep openai/mock-model by default. V2 disables the host patch plugin and AFT supplies the corresponding per-model gate; the V1 source fragments above remain unchanged."
+  "reading": "F is true for a model id containing gpt- but neither oss nor gpt-4. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. V1 parity still uses the captured mock/mock-model, so its apply_patch leg remains excluded. V2 apply_patch scenarios now explicitly select openai/gpt-5-mock while other scenarios keep openai/mock-model by default. V2 disables the host patch plugin and AFT supplies the corresponding per-model gate; the V1 source fragments above remain unchanged.",
+  "capture_source_sha": "13f6f70aecd4481550fd50f34ea479ab1ee03d51"
 }

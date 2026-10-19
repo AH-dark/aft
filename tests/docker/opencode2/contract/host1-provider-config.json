@@ -1,12 +1,11 @@
 {
   "schema_version": 1,
-  "run_id": "oc1-1.18.30-20260921-t7-parity",
-  "observed_run_id": "oc1-1.18.30-20260921-t7-parity",
-  "observed_image_sha": "ebbcd34839b2a14bf1e9e05e939d32e783ac7a37",
-  "host_version": "1.18.30",
+  "run_id": "oc1-1.19.3-20261019T153146048Z-t7-parity",
+  "observed_run_id": "oc1-1.19.3-20261019T153146048Z-t7-parity",
+  "host_version": "1.19.3",
   "host": "opencode1",
   "platform": "linux-x64",
-  "transcript": "probe/host1-provider-config-1.18.30.txt",
+  "transcript": "probe/host1-provider-config-1.19.3.txt",
   "provider_config": {
     "mock": {
       "name": "Deterministic aimock",
@@ -28,7 +27,7 @@
         "name": "Deterministic aimock",
         "npm": "@ai-sdk/openai-compatible",
         "options": {
-          "baseURL": "http://127.0.0.1:32945/v1",
+          "baseURL": "http://127.0.0.1:41249/v1",
           "apiKey": "{env:OPENAI_API_KEY}"
         },
         "models": {
@@ -53,7 +52,7 @@
     "OPENAI_API_KEY": "sk-opencode2-harness"
   },
   "observed_session": {
-    "session_id": "ses_f3d961c8effe5ZOBjhE5GX7jI7",
+    "session_id": "ses_eab3536fcfferraMK6XccPLbbC",
     "model": {
       "id": "mock-model",
       "providerID": "mock"
@@ -65,23 +64,29 @@
   "rejected_shapes": [
     {
       "config_key": "providers",
-      "shape": "V2 GA package/settings",
+      "shape": "V2 providers/package/settings shape",
       "model": "openai/mock-model",
       "host_diagnostic": "configuration compatibility diagnostic path=[\"providers\"] kind=unsupported action=\"Omitted native setting that cannot be represented in V1\"",
       "host_error": "ProviderModelNotFoundError: Model not found: openai/mock-model.",
       "exit_code": 1,
-      "mock_requests": 0
+      "mock_requests": 0,
+      "observed_wire_paths": [],
+      "rejected_because": "the OpenCode 1 host does not consume the V2 providers/package/settings key"
     },
     {
       "config_key": "provider",
-      "shape": "api alias on the openai provider id",
+      "shape": "V1 provider key with OpenAI API alias",
       "model": "openai/mock-model",
-      "observed_wire_path": "/v1/responses",
       "exit_code": 0,
       "mock_requests": 2,
-      "rejected_because": "the harness reads scripted turns and tool results out of chat messages; a Responses body carries neither"
+      "observed_wire_paths": [
+        "/v1/responses",
+        "/v1/responses"
+      ],
+      "rejected_because": "the Responses API does not carry the chat messages the parity harness reads"
     }
   ],
   "required_for": "the V1 leg of every T7 parity row",
-  "missing_contract_code": "contract_uncaptured:host1_provider_config"
+  "missing_contract_code": "contract_uncaptured:host1_provider_config",
+  "capture_source_sha": "13f6f70aecd4481550fd50f34ea479ab1ee03d51"
 }
