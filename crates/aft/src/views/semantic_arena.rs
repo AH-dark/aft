@@ -49,12 +49,23 @@ pub struct ArenaMemory {
     pub bytes: u64,
 }
 
+type Registry = HashMap<(PathBuf, String), Weak<SemanticArena>>;
+
+fn arenas() -> &'static Mutex<Registry> {
+    static ARENAS: OnceLock<Mutex<Registry>> = OnceLock::new();
+    ARENAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Every arena alive in this process, one per `(storage, family)`, so the
+/// memory census can count each family's runs exactly once.
+pub fn live_arenas() -> Vec<Arc<SemanticArena>> {
+    lock(arenas()).values().filter_map(Weak::upgrade).collect()
+}
+
 /// The process's arena for `family` in `storage`. Views of the same family
 /// get the same arena while any of them holds it.
 pub fn arena_for(storage: &Path, family: &str) -> Arc<SemanticArena> {
-    type Registry = HashMap<(PathBuf, String), Weak<SemanticArena>>;
-    static ARENAS: OnceLock<Mutex<Registry>> = OnceLock::new();
-    let mut arenas = lock(ARENAS.get_or_init(|| Mutex::new(HashMap::new())));
+    let mut arenas = lock(arenas());
     arenas.retain(|_, arena| arena.strong_count() > 0);
     let key = (storage.to_path_buf(), family.to_owned());
     if let Some(arena) = arenas.get(&key).and_then(Weak::upgrade) {

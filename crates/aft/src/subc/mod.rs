@@ -1778,6 +1778,7 @@ fn pressure_relief_label(relief: &crate::memory::AllocatorPressureRelief) -> Str
 fn idle_root_eviction_message(
     root_id: &ProjectRootId,
     memory: &crate::memory::RootMemorySnapshot,
+    semantic_family_arena: Option<u64>,
     pressure_relief: Option<&crate::memory::AllocatorPressureRelief>,
 ) -> String {
     // Bash, LSP, and parser state remain resident. The freed total is deliberately
@@ -1805,6 +1806,20 @@ fn idle_root_eviction_message(
         eviction_estimate_label(&memory.lsp),
         eviction_estimate_label(&memory.parser_pool),
     );
+    if let Some(arena_bytes) = semantic_family_arena {
+        // The semantic figure above already includes the view's overlay. The
+        // family arena is shared, so only the runs no other view of the
+        // family holds are freed when the released lane's view unbinds.
+        message.push_str(&format!(
+            "; semantic view released (overlay {} MB, family arena {:.1} MB before release, shared with the family's other views)",
+            memory
+                .semantic
+                .counts
+                .get("checkout_overlay_bytes")
+                .map_or_else(|| "?".to_owned(), |bytes| format!("{:.1}", *bytes as f64 / (1024.0 * 1024.0))),
+            arena_bytes as f64 / (1024.0 * 1024.0),
+        ));
+    }
     if let Some(pressure_relief) = pressure_relief {
         message.push_str(&pressure_relief_label(pressure_relief));
     }
@@ -2407,6 +2422,7 @@ fn reap_idle_roots_with_presence(
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
+        let semantic_arena_before = ctx.semantic_family_arena_bytes();
         if !ctx.try_evict_idle_artifacts() {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
@@ -2456,7 +2472,7 @@ fn reap_idle_roots_with_presence(
             }
             ctx.release_idle_reopenable_resources_in_background();
         }
-        reaped.push((root_id, memory_before));
+        reaped.push((root_id, memory_before, semantic_arena_before));
     }
 
     // Emit-on-change: the census is on the health surface every sweep; the log
@@ -2475,10 +2491,15 @@ fn reap_idle_roots_with_presence(
     let pressure_relief = (!reaped.is_empty())
         .then(|| allocator_pressure_relief_after_idle_sweep(now, live_roots, executor))
         .flatten();
-    for (root_id, memory_before) in &reaped {
+    for (root_id, memory_before, semantic_arena_before) in &reaped {
         log::info!(
             "{}",
-            idle_root_eviction_message(root_id, memory_before, pressure_relief.as_ref())
+            idle_root_eviction_message(
+                root_id,
+                memory_before,
+                *semantic_arena_before,
+                pressure_relief.as_ref()
+            )
         );
     }
     IdleReapOutcome {
@@ -13580,7 +13601,7 @@ mod tests {
         meta.unbound_quiesced = true;
         live_roots.insert(root.clone(), meta);
 
-        let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot(), None);
+        let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot(), None, None);
         assert!(message.contains("evicted idle root"));
         assert!(message.contains("freed ~"));
         assert!(message.contains("semantic"));

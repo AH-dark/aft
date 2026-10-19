@@ -6396,7 +6396,11 @@ impl BgTaskRegistry {
                 memo.session_read(&session_dir);
             }
         }
-        crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
+        // The collector runs every few seconds; a zero count is the normal
+        // case and logging it would flood the daemon log.
+        if retired > 0 {
+            crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
+        }
         memo.finish_pass(pass);
         gc_quarantine(storage_dir);
         Ok(deleted)

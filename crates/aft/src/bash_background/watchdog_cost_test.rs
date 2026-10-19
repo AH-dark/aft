@@ -543,6 +543,34 @@ fn watchdog_cost_abandonment_requires_both_paths_missing_and_seven_days() {
     );
 }
 
+/// The collector runs every few seconds, so a pass that retires nothing must
+/// stay out of the log; a pass that retires something still reports it.
+#[test]
+fn watchdog_cost_retirement_is_logged_only_when_nonzero() {
+    const LINE: &str = "undelivered completions of deleted worktrees";
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (_, idle_lines) = crate::logging::capture_log_lines(|| {
+        registry.maybe_gc_persisted(storage.path()).unwrap();
+    });
+    assert!(
+        !idle_lines.iter().any(|line| line.contains(LINE)),
+        "a pass that retired nothing was logged: {idle_lines:?}"
+    );
+
+    let (_, abandoned) = fixture(storage.path(), "session", false, 8);
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        registry.maybe_gc_persisted(storage.path()).unwrap();
+    });
+    assert!(!abandoned.json.exists());
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(&format!("retired 1 {LINE}"))),
+        "a pass that retired a completion was not logged: {lines:?}"
+    );
+}
+
 #[test]
 fn watchdog_cost_scheduler_does_not_own_idle_registries() {
     let registry = BgTaskRegistry::default();

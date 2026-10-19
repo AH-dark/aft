@@ -58,6 +58,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// [`lock`] without waiting: `None` only while another thread holds it.
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 fn plane_error(reason: impl Into<String>) -> PlaneError {
     PlaneError {
         plane: FamilyPlane::Semantic,
@@ -1469,6 +1478,23 @@ impl SemanticPlane {
         state.cache.as_ref().map_or(0, |(_, index)| {
             index.estimated_memory().estimated_bytes.unwrap_or(0)
         })
+    }
+
+    /// [`Self::private_memory`] without waiting: `None` while the view's
+    /// state is locked (an overlay build holds it), `Some(0)` for a view this
+    /// plane does not hold. The memory census uses this so it never blocks.
+    pub fn try_private_memory(&self, access: &ViewAccess) -> Option<u64> {
+        let view = {
+            let views = try_lock(&self.views)?;
+            match views.get(&(access.family().to_owned(), access.scope().to_owned())) {
+                Some(view) => Arc::clone(view),
+                None => return Some(0),
+            }
+        };
+        let state = try_lock(&view)?;
+        Some(state.cache.as_ref().map_or(0, |(_, index)| {
+            index.estimated_memory().estimated_bytes.unwrap_or(0)
+        }))
     }
 
     /// Outstanding semantic work for the checkout, as a fill would see it.
