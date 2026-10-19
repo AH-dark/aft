@@ -8153,10 +8153,15 @@ impl AppContext {
                 let _ = gate.installed.send(report.generation.clone().unwrap());
             }
         }
-        if report.published && self.config().indexes.callgraph {
-            // A scan can finish before its checkout's graph is published. Retain
-            // pull demand even if that scan is still in flight; the maintenance
-            // scheduler dispatches it once the scan and admission gates settle.
+        if report.published
+            && self.config().indexes.callgraph
+            && self
+                .inspect_manager
+                .note_view_publication(&self.canonical_cache_root())
+        {
+            // Only analysis that deferred for this view needs another pass.
+            // Retain its pull demand even while that scan is still in flight;
+            // ordinary publications must not start unsolicited analysis.
             let _ = self.request_tier2_refresh_pull();
         }
         Ok(report)
@@ -10475,6 +10480,15 @@ impl AppContext {
         changed_path_count: usize,
     ) -> Option<Tier2TriggerReason> {
         let manager = self.inspect_manager();
+        // A pending result can arrive after the publication callback already
+        // ran. Epoch comparison recovers only that owed refresh, without probing
+        // the filesystem or waking roots with no deferred analysis.
+        if self
+            .canonical_cache_root_opt()
+            .is_some_and(|root| manager.deferred_view_refresh_ready(&root))
+        {
+            let _ = self.request_tier2_refresh_pull();
+        }
         let can_write = self.inspect_writer()
             && self.heavy_root_work_allowed()
             && manager.automatic_tier2_refresh_allowed();
@@ -10557,9 +10571,18 @@ impl AppContext {
         else {
             return false;
         };
+        // A late pending result may owe a published view before the scheduler
+        // knows about it. Include it in the idle probe, or no watcher drain
+        // would be scheduled to run the recovery tick on a quiet checkout.
+        let view_refresh_ready = self.canonical_cache_root_opt().is_some_and(|root| {
+            self.inspect_manager.try_deferred_view_refresh_ready(&root) == Some(true)
+        });
         self.tier2_refresh_scheduler
             .try_lock()
             .is_none_or(|mut scheduler| {
+                if view_refresh_ready {
+                    scheduler.request_pull(true);
+                }
                 scheduler.set_resource_retry_at(retry_at);
                 scheduler.dispatch_due(Instant::now())
             })

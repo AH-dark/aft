@@ -372,6 +372,31 @@ fn commit(root: &Path) {
 }
 
 #[test]
+fn inspect_view_pending_publication_without_deferred_job_requests_no_refresh() {
+    let fixture = Fixture::new();
+    fixture.ctx.set_harness(crate::harness::Harness::Opencode);
+    fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+    fixture.change("no_inspection_requested");
+    let before = fixture
+        .ctx
+        .inspect_manager()
+        .automatic_tier2_schedule_count_for_test();
+    fixture.schedule();
+    fixture.wait_idle();
+    assert!(
+        !fixture.ctx.tier2_pull_demand_pending(),
+        "publication without deferred analysis must not request a Tier-2 pull"
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        before
+    );
+}
+
+#[test]
 fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspect() {
     use crate::inspect::{InspectCategory, InspectSnapshot, JobScope};
     let fixture = Fixture::new();
@@ -414,6 +439,24 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
         fixture.ctx.tier2_pull_demand_pending(),
         "view publication must wake deferred Tier-2 work"
     );
+    // A publication callback can run before the job records its pending result.
+    // Recreate that scheduler state and let only the idle probe discover demand.
+    fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+    assert!(!fixture.ctx.tier2_pull_demand_pending());
+    manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+    assert!(!fixture.ctx.tier2_refresh_dispatch_due());
+    assert_eq!(
+        fixture
+            .ctx
+            .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+        None
+    );
+    assert!(manager.deferred_view_refresh_ready(&fixture.ctx.canonical_cache_root()));
+    manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, false);
+    assert!(
+        fixture.ctx.tier2_refresh_dispatch_due(),
+        "a quiet checkout must discover its owed published view without a watcher edit"
+    );
     assert_eq!(
         fixture
             .ctx
@@ -440,6 +483,14 @@ fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspec
             .map(|payload| &payload["callgraph_available"]),
         Some(&serde_json::json!(true)),
         "{outcome:?}"
+    );
+    assert!(!manager.deferred_view_refresh_ready(&fixture.ctx.canonical_cache_root()));
+    fixture.change("no_more_deferred_analysis");
+    fixture.schedule();
+    fixture.wait_idle();
+    assert!(
+        !fixture.ctx.tier2_pull_demand_pending(),
+        "a later publication must not repeat the consumed refresh"
     );
 }
 

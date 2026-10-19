@@ -783,7 +783,16 @@ struct CheckoutViewVerification {
     files: BTreeMap<PathBuf, crate::views::read::VerifiedCallgraphFile>,
 }
 
+#[derive(Default)]
+struct DeferredViewRefresh {
+    publication_epoch: u64,
+    // The publication observed by the job that could not project its graph.
+    // A later publication makes the owed refresh eligible for dispatch.
+    pending_epoch: Option<u64>,
+}
+
 pub struct InspectManager {
+    deferred_view_refreshes: Mutex<HashMap<PathBuf, DeferredViewRefresh>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     request_tx: Sender<InspectJob>,
     result_rx: Receiver<InspectResult>,
@@ -963,6 +972,7 @@ impl InspectManager {
         });
         let handles = start_dispatch_loop(guarded_worker);
         Self {
+            deferred_view_refreshes: Mutex::new(HashMap::new()),
             root_work_cancellation,
             request_tx: handles.request_tx,
             result_rx: handles.result_rx,
@@ -1521,6 +1531,7 @@ impl InspectManager {
     pub(crate) fn current_checkout_view(
         &self,
         snapshot: &InspectSnapshot,
+        files: &[PathBuf],
         observed_stats: Option<&[(PathBuf, u64, SystemTime)]>,
     ) -> Option<Arc<ReadonlyCallGraphStore>> {
         #[cfg(test)]
@@ -1533,14 +1544,6 @@ impl InspectManager {
             );
             return None;
         }
-        let files = observed_stats
-            .map(|files| files.iter().map(|(path, _, _)| path.clone()).collect())
-            .unwrap_or_else(|| {
-                scope_files(
-                    &snapshot.project_root,
-                    &JobScope::for_project(snapshot.project_root.clone()),
-                )
-            });
         let (store, generation) = checkout_view_some!(
             current_view_projection_store(
                 &snapshot.project_root,
@@ -1659,21 +1662,85 @@ impl InspectManager {
     pub(crate) fn checkout_view_unavailability(
         &self,
         snapshot: &InspectSnapshot,
+        files: &[PathBuf],
     ) -> CheckoutViewUnavailable {
-        let files = scope_files(
-            &snapshot.project_root,
-            &JobScope::for_project(snapshot.project_root.clone()),
-        );
-        match current_view_projection_result(
+        let epoch = self.view_publication_epoch(&snapshot.project_root);
+        let reason = match current_view_projection_result(
             &snapshot.project_root,
             &snapshot.inspect_dir,
             &snapshot.config,
-            &files,
+            files,
         ) {
             Err(reason) => reason,
             // The reader opened, but the full coverage/freshness proof did not.
             // Absence of that proof does not establish a source or config change.
             Ok(_) => CheckoutViewUnavailable::Unverified,
+        };
+        if matches!(reason, CheckoutViewUnavailable::Pending) {
+            self.note_view_pending(&snapshot.project_root, epoch);
+        }
+        reason
+    }
+
+    fn view_publication_epoch(&self, root: &Path) -> u64 {
+        self.deferred_view_refreshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .map_or(0, |state| state.publication_epoch)
+    }
+
+    fn note_view_pending(&self, root: &Path, epoch: u64) {
+        self.deferred_view_refreshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .pending_epoch
+            .get_or_insert(epoch);
+    }
+
+    pub(crate) fn note_view_publication(&self, root: &Path) -> bool {
+        let mut states = self
+            .deferred_view_refreshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = states.entry(root.to_path_buf()).or_default();
+        state.publication_epoch = state.publication_epoch.wrapping_add(1);
+        state.pending_epoch.is_some()
+    }
+
+    pub(crate) fn deferred_view_refresh_ready(&self, root: &Path) -> bool {
+        self.deferred_view_refreshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .is_some_and(|state| {
+                state
+                    .pending_epoch
+                    .is_some_and(|epoch| epoch != state.publication_epoch)
+            })
+    }
+
+    pub(crate) fn try_deferred_view_refresh_ready(&self, root: &Path) -> Option<bool> {
+        let states = self.deferred_view_refreshes.try_lock().ok()?;
+        Some(states.get(root).is_some_and(|state| {
+            state
+                .pending_epoch
+                .is_some_and(|epoch| epoch != state.publication_epoch)
+        }))
+    }
+
+    fn view_refresh_dispatched(&self, root: &Path, category: InspectCategory) {
+        if category == InspectCategory::DeadCode {
+            if let Some(state) = self
+                .deferred_view_refreshes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(root)
+            {
+                state.pending_epoch = None;
+            }
         }
     }
 
@@ -1998,6 +2065,8 @@ impl InspectManager {
         drop(in_flight);
         self.record_flight_start(&key);
 
+        self.view_refresh_dispatched(&job.project_root, category);
+
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         let cancellation = self
@@ -2148,6 +2217,9 @@ impl InspectManager {
 
         let permit_slot = Arc::new(Mutex::new(Some(permit)));
         let categories_for_worker = submission.newly_queued_categories.clone();
+        for category in &categories_for_worker {
+            self.view_refresh_dispatched(&snapshot.project_root, *category);
+        }
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         let cancellation = self
@@ -3099,6 +3171,7 @@ impl InspectManager {
     }
 
     fn spawn_tier2_reuse_job(self: &Arc<Self>, job: InspectJob, options: Tier2ReuseOptions) {
+        self.view_refresh_dispatched(&job.project_root, job.category);
         // Rebinds retain the persisted contribution cache. Let quick reuse prove
         // that cache before joining the cold-build queue, so an unchanged root can
         // answer immediately even while unrelated background builds own the slots.
@@ -3642,6 +3715,7 @@ impl InspectManager {
         cache: &InspectCache,
         options: &Tier2ReuseOptions,
     ) -> Result<InspectScanSuccess, String> {
+        let view_epoch = self.view_publication_epoch(&job.project_root);
         let mut phases = Tier2PhaseTimings::default();
         self.record_build_progress(
             &job.key,
@@ -4047,6 +4121,15 @@ impl InspectManager {
                 )
                 .err()
                 .unwrap_or(CheckoutViewUnavailable::Unverified);
+                // Publication may finish between the projection attempt and
+                // recording its pending result. Preserve its epoch so the next
+                // maintenance tick can recover the missed publication wakeup.
+                if matches!(reason, CheckoutViewUnavailable::Pending)
+                    || (matches!(reason, CheckoutViewUnavailable::Unverified)
+                        && self.view_publication_epoch(&job.project_root) != view_epoch)
+                {
+                    self.note_view_pending(&job.project_root, view_epoch);
+                }
                 phases.projection_skip_reason = Some(reason.kind());
                 phases.log(job.category, &job.project_root);
                 // Preserve the last complete aggregate while publication is pending.
@@ -4700,7 +4783,14 @@ fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static SCOPE_FILE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
+    #[cfg(test)]
+    SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut files = crate::callgraph::walk_project_files(project_root)
         .filter(|path| scope.contains(path))
         .collect::<Vec<_>>();

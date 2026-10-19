@@ -64,6 +64,56 @@ fn view_projection_fixture() -> (
 }
 
 #[test]
+fn inspect_view_pending_publication_race_and_dispatch_are_root_local() {
+    let manager = InspectManager::new();
+    let root = PathBuf::from("pending-checkout");
+    let other = PathBuf::from("uninspected-checkout");
+    let observed_epoch = manager.view_publication_epoch(&root);
+    assert!(!manager.note_view_publication(&root));
+    manager.note_view_pending(&root, observed_epoch);
+    assert!(manager.deferred_view_refresh_ready(&root), "a pending result recorded after publication must not lose its wakeup");
+    assert!(!manager.note_view_publication(&other));
+    assert!(!manager.deferred_view_refresh_ready(&other));
+    manager.view_refresh_dispatched(&root, InspectCategory::Complexity);
+    assert!(manager.deferred_view_refresh_ready(&root));
+    manager.view_refresh_dispatched(&root, InspectCategory::DeadCode);
+    assert!(!manager.deferred_view_refresh_ready(&root));
+    assert!(!manager.note_view_publication(&root), "accepted refresh must consume the owed demand");
+}
+
+#[test]
+fn inspect_view_pending_unavailability_reuses_request_files() {
+    let (_project, _storage, mut job, _request) = view_projection_fixture();
+    for directory in 0..10 {
+        for file in 0..128 {
+            let path = job.project_root.join(format!("dir_{directory}/file_{file}.ts"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "export function pending() {}\n").unwrap();
+        }
+    }
+    eprintln!("IO_MEASURE_REQUEST_WALK_BEGIN");
+    job.scope_files = scope_files(&job.project_root, &JobScope::for_project(job.project_root.clone()));
+    let stats = job.scope_files.iter().map(|path| {
+        let metadata = std::fs::metadata(path).unwrap();
+        (path.clone(), metadata.len(), metadata.modified().unwrap())
+    }).collect::<Vec<_>>();
+    eprintln!("IO_MEASURE_REQUEST_WALK_END files={}", stats.len());
+    assert_eq!(stats.len(), 1282);
+    let snapshot = InspectSnapshot::new(
+        job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(),
+    );
+    let manager = InspectManager::new();
+    SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+    eprintln!("IO_MEASURE_REASON_BEGIN");
+    let unavailable = manager.checkout_view_unavailability(&snapshot, &job.scope_files);
+    eprintln!("IO_MEASURE_REASON_END");
+    assert_eq!(unavailable.kind(), "view_pending");
+    let walks = SCOPE_FILE_WALKS.with(std::cell::Cell::get);
+    eprintln!("inspect_view_pending_reason extra_project_walks={walks}");
+    assert_eq!(walks, 0, "reporting an unavailable view must reuse the request inventory");
+}
+
+#[test]
 fn views_tier2_published_plane_never_refreshes_legacy() {
     let (_project, _storage, job, request) = view_projection_fixture();
     crate::views::assembly::publish_checkout(&request).unwrap();
@@ -355,7 +405,7 @@ fn verify_checkout_view_corpus(phase: &PhaseReport) {
         .collect::<Vec<_>>();
     crate::views::read::take_verification_io();
     phase("cold checkout verification");
-    let cold_view = manager.current_checkout_view(&snapshot, Some(&stats));
+    let cold_view = manager.current_checkout_view(&snapshot, &job.scope_files, Some(&stats));
     assert!(
         cold_view.is_some(),
         "cold checkout view refused: {:?}; root={:?} desired_head={} observed_files={}",
@@ -368,7 +418,7 @@ fn verify_checkout_view_corpus(phase: &PhaseReport) {
     phase("warm checkout verification with known stats");
     assert!(
         manager
-            .current_checkout_view(&snapshot, Some(&stats))
+            .current_checkout_view(&snapshot, &job.scope_files, Some(&stats))
             .is_some(),
         "warm checkout view refused: {:?}",
         take_checkout_view_refusal()
@@ -397,7 +447,7 @@ fn verify_checkout_view_corpus(phase: &PhaseReport) {
     );
     phase("standalone checkout verification");
     assert!(
-        manager.current_checkout_view(&snapshot, None).is_some(),
+        manager.current_checkout_view(&snapshot, &job.scope_files, None).is_some(),
         "standalone checkout view refused: {:?}",
         take_checkout_view_refusal()
     );
@@ -422,7 +472,7 @@ fn verify_checkout_view_corpus(phase: &PhaseReport) {
     crate::cache_freshness::invalidate_verify_memo(&job.project_root);
     phase("checkout verification after invalidation");
     assert!(manager
-        .current_checkout_view(&snapshot, Some(&stats))
+        .current_checkout_view(&snapshot, &job.scope_files, Some(&stats))
         .is_none());
     assert!(crate::views::read::take_verification_io().files_read > 0);
     phase("dropping fixture and manager");
@@ -525,7 +575,7 @@ fn inspect_checkout_view_lookup_never_creates_a_view_folder() {
         false,
     );
     assert!(InspectManager::new()
-        .current_checkout_view(&snapshot, None)
+        .current_checkout_view(&snapshot, &job.scope_files, None)
         .is_none());
     // A folder made by a reader has no binding and no registry member; it
     // would be left behind as an orphan once the checkout is gone.
@@ -548,7 +598,8 @@ fn inspect_checkout_view_refusal_diagnostics_name_compared_values() {
     );
     let manager = InspectManager::new();
     let refusal = |snapshot: &InspectSnapshot, stats: Option<&[(PathBuf, u64, SystemTime)]>| {
-        assert!(manager.current_checkout_view(snapshot, stats).is_none());
+        let files = stats.map(|stats| stats.iter().map(|(path, _, _)| path.clone()).collect::<Vec<_>>()).unwrap_or_else(|| job.scope_files.clone());
+        assert!(manager.current_checkout_view(snapshot, &files, stats).is_none());
         take_checkout_view_refusal().expect("every checkout refusal must name its branch")
     };
     let unpublished = refusal(&snapshot, None);

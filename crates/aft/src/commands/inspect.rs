@@ -716,9 +716,29 @@ fn handle_inspect_payload(
     // A writer-backed unscoped request must retain contribution reuse. Only
     // requests the legacy scanner cannot serve need an ephemeral view scan.
     let needs_ephemeral_view = (scope_was_provided || !ctx.inspect_writer()) && tier2_enabled;
+    // Reuse the blocking request's inventory, or collect it once for a warm
+    // request. Explaining an unavailable view must not walk the project again.
+    let checkout_view_files =
+        (needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed).then(|| {
+            observed_stats
+                .map(|stats| {
+                    stats
+                        .0
+                        .iter()
+                        .map(|(path, _, _)| path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    crate::callgraph::walk_project_files(&snapshot.project_root).collect()
+                })
+        });
     let checkout_store =
         if needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed {
-            manager.current_checkout_view(&snapshot, observed_stats.map(|stats| stats.0.as_slice()))
+            manager.current_checkout_view(
+                &snapshot,
+                checkout_view_files.as_deref().unwrap_or_default(),
+                observed_stats.map(|stats| stats.0.as_slice()),
+            )
         } else {
             checkout_store
         };
@@ -738,7 +758,12 @@ fn handle_inspect_payload(
         && snapshot.config.views.enabled
         && !checkout_routed
         && checkout_store.is_none())
-    .then(|| manager.checkout_view_unavailability(&snapshot));
+    .then(|| {
+        manager.checkout_view_unavailability(
+            &snapshot,
+            checkout_view_files.as_deref().unwrap_or_default(),
+        )
+    });
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
