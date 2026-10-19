@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "dfd6fc108d653fb00c153cc50cd221df81b5ce6128d7e6b22e3fe453f6483798",
-      "catalog_digest": "dfd6fc108d653fb00c153cc50cd221df81b5ce6128d7e6b22e3fe453f6483798",
+      "generation": "45df5e1a39606b5a4f0fdd5c3432d8eb9ee2eb63bab49db6c0c3cf8d38f1aca8",
+      "catalog_digest": "45df5e1a39606b5a4f0fdd5c3432d8eb9ee2eb63bab49db6c0c3cf8d38f1aca8",
       "tools": [
         {
           "name": "status",
@@ -181,7 +181,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -471,7 +471,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -481,57 +481,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -980,7 +1009,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1188,8 +1217,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d520a6f473522b342d671c2f5741f4fca3830d7bcddeb5aedfcbe2f273a070c1",
-      "catalog_digest": "d520a6f473522b342d671c2f5741f4fca3830d7bcddeb5aedfcbe2f273a070c1",
+      "generation": "d7851a85920b34f663f05620d9e4cd5e3d714db335ba51ce83c551022396a6ef",
+      "catalog_digest": "d7851a85920b34f663f05620d9e4cd5e3d714db335ba51ce83c551022396a6ef",
       "tools": [
         {
           "name": "status",
@@ -1353,7 +1382,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1643,7 +1672,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -1653,57 +1682,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -2152,7 +2210,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2362,8 +2420,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9383e009382593b8b2044b8a3fdeb4cbfb08b52af051fc4d83da97d1c9020635",
-      "catalog_digest": "9383e009382593b8b2044b8a3fdeb4cbfb08b52af051fc4d83da97d1c9020635",
+      "generation": "9c602f3cd332880e5aac5d826a66d113b16e0f61032a854de7b33ac85a2234f5",
+      "catalog_digest": "9c602f3cd332880e5aac5d826a66d113b16e0f61032a854de7b33ac85a2234f5",
       "tools": [
         {
           "name": "status",
@@ -2447,7 +2505,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2737,7 +2795,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2747,57 +2805,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -3246,7 +3333,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3455,8 +3542,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "63f234ad5c407151745e7a84d3fa978fb21f04c4e1e8a76dfc5162836016e741",
-      "catalog_digest": "63f234ad5c407151745e7a84d3fa978fb21f04c4e1e8a76dfc5162836016e741",
+      "generation": "ad85f0250049b6f6dacbe58d78790ca4ecefc6d26724c5c83e54f4ba74213251",
+      "catalog_digest": "ad85f0250049b6f6dacbe58d78790ca4ecefc6d26724c5c83e54f4ba74213251",
       "tools": [
         {
           "name": "status",
@@ -3620,7 +3707,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3865,7 +3952,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -3875,57 +3962,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -4374,7 +4490,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4583,8 +4699,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ac1964122e47bfe42cf7e5f40c11a6d577a3b4912062a136c1ac000122eb016f",
-      "catalog_digest": "ac1964122e47bfe42cf7e5f40c11a6d577a3b4912062a136c1ac000122eb016f",
+      "generation": "7f0d55580f1b8770a53624c8411651ff60a777190ccbf41a76fa25cca4801ae7",
+      "catalog_digest": "7f0d55580f1b8770a53624c8411651ff60a777190ccbf41a76fa25cca4801ae7",
       "tools": [
         {
           "name": "status",
@@ -4748,7 +4864,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4990,7 +5106,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5000,57 +5116,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -5499,7 +5644,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5709,8 +5854,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6063574f6e37ecb572dadf76cc2a6d8d4958577ba97bed3a841faf0bc73d5c41",
-      "catalog_digest": "6063574f6e37ecb572dadf76cc2a6d8d4958577ba97bed3a841faf0bc73d5c41",
+      "generation": "6ceff7fa7e8b64c2ba3668cfae141baadb41db14bdc0f38041cf5d63c0ad8630",
+      "catalog_digest": "6ceff7fa7e8b64c2ba3668cfae141baadb41db14bdc0f38041cf5d63c0ad8630",
       "tools": [
         {
           "name": "status",
@@ -5874,7 +6019,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -6119,7 +6264,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -6129,57 +6274,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -6569,7 +6743,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -6778,8 +6952,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "cdf390c4d6c56eb7463125c5c2ee0f1e5e2173af02877fd0d791c2f17eb847e1",
-      "catalog_digest": "cdf390c4d6c56eb7463125c5c2ee0f1e5e2173af02877fd0d791c2f17eb847e1",
+      "generation": "95321f10641a4bd4928b962dee76fadc913ec0abee4aa35144d8136f1a6d962d",
+      "catalog_digest": "95321f10641a4bd4928b962dee76fadc913ec0abee4aa35144d8136f1a6d962d",
       "tools": [
         {
           "name": "status",
@@ -6943,7 +7117,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -7185,7 +7359,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -7195,57 +7369,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -7635,7 +7838,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -7844,8 +8047,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a667653576f643a7decb75c2ca4cac1b9c6430bf875027be82ba9599c1b8012b",
-      "catalog_digest": "a667653576f643a7decb75c2ca4cac1b9c6430bf875027be82ba9599c1b8012b",
+      "generation": "84afbeb52e76ed8bceb950f07e547f5a857fbd02d736dad6b8baf17b088f3a62",
+      "catalog_digest": "84afbeb52e76ed8bceb950f07e547f5a857fbd02d736dad6b8baf17b088f3a62",
       "tools": [
         {
           "name": "status",
@@ -8009,7 +8212,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -8698,7 +8901,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -8907,8 +9110,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e48fa405bc987949ac749b8ea59ffadaf5b389185031608c63fdd7bdbf5ce0e8",
-      "catalog_digest": "e48fa405bc987949ac749b8ea59ffadaf5b389185031608c63fdd7bdbf5ce0e8",
+      "generation": "8f744be2013fca67e91940c84137aeaf1fc251fa51ae81a5405fcabda9c6ad6d",
+      "catalog_digest": "8f744be2013fca67e91940c84137aeaf1fc251fa51ae81a5405fcabda9c6ad6d",
       "tools": [
         {
           "name": "status",
@@ -9072,7 +9275,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -9758,7 +9961,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -9964,8 +10167,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d14409c98ba9a81f8db0cd0f28dabe96a8e4d89266875bc5b93e851cb7b9fdfe",
-      "catalog_digest": "d14409c98ba9a81f8db0cd0f28dabe96a8e4d89266875bc5b93e851cb7b9fdfe",
+      "generation": "c2dda745cfd6afd78c926c06c40efde80dcc2c87941da66350b764c208488490",
+      "catalog_digest": "c2dda745cfd6afd78c926c06c40efde80dcc2c87941da66350b764c208488490",
       "tools": [
         {
           "name": "status",
@@ -10202,7 +10405,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -10492,7 +10695,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -10502,57 +10705,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -11001,7 +11233,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -11210,8 +11442,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7087dea25a2bf8b9e64473677b174c38f6dbab6dea37540d0d1f1e563d5dd436",
-      "catalog_digest": "7087dea25a2bf8b9e64473677b174c38f6dbab6dea37540d0d1f1e563d5dd436",
+      "generation": "582d58d0e500358db3335ee2d8ed163ec4a347ae9e2787b696d7b705f68ba1c7",
+      "catalog_digest": "582d58d0e500358db3335ee2d8ed163ec4a347ae9e2787b696d7b705f68ba1c7",
       "tools": [
         {
           "name": "status",
@@ -11448,7 +11680,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -11738,7 +11970,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -11748,57 +11980,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -12247,7 +12508,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -12458,8 +12719,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c1af78fd76b8015a4e3e4d15d99420a144fcefbef97160981184e16ec70ee32d",
-      "catalog_digest": "c1af78fd76b8015a4e3e4d15d99420a144fcefbef97160981184e16ec70ee32d",
+      "generation": "3528f63df2145ee089faa56c227624181e6a8dbfaf72b310a97070ca3c02c724",
+      "catalog_digest": "3528f63df2145ee089faa56c227624181e6a8dbfaf72b310a97070ca3c02c724",
       "tools": [
         {
           "name": "status",
@@ -12616,7 +12877,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -12906,7 +13167,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -12916,57 +13177,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -13415,7 +13705,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -13625,8 +13915,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "81336379ea82d827703b385e1c13361c6e7b3450e7d635598cac3693ea1e597e",
-      "catalog_digest": "81336379ea82d827703b385e1c13361c6e7b3450e7d635598cac3693ea1e597e",
+      "generation": "51cd197d46b90b8c1bde9108fe4c31d6d49e2a5e0bae5f27114e057d8a32e28a",
+      "catalog_digest": "51cd197d46b90b8c1bde9108fe4c31d6d49e2a5e0bae5f27114e057d8a32e28a",
       "tools": [
         {
           "name": "status",
@@ -13863,7 +14153,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -14108,7 +14398,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -14118,57 +14408,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -14617,7 +14936,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -14827,8 +15146,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "17e75ddacbc5006c8e060cbac18ac14d44de53453652ae61b3436f3cb8494b9d",
-      "catalog_digest": "17e75ddacbc5006c8e060cbac18ac14d44de53453652ae61b3436f3cb8494b9d",
+      "generation": "2c6df5cc900e7141ff88ec9b2a3ebd66f9d3454be1a8120422f1b92b59e9e21a",
+      "catalog_digest": "2c6df5cc900e7141ff88ec9b2a3ebd66f9d3454be1a8120422f1b92b59e9e21a",
       "tools": [
         {
           "name": "status",
@@ -15065,7 +15384,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -15307,7 +15626,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -15317,57 +15636,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -15816,7 +16164,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -16027,8 +16375,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "40994d26e51cf202c9abbadefd30027bb2028ad33ca5f988f0a08608a11e258f",
-      "catalog_digest": "40994d26e51cf202c9abbadefd30027bb2028ad33ca5f988f0a08608a11e258f",
+      "generation": "34b0f74b4c32e1b8cb97de0f1646405522bdf6bcb2f1f4e4c2a3fecd625df26f",
+      "catalog_digest": "34b0f74b4c32e1b8cb97de0f1646405522bdf6bcb2f1f4e4c2a3fecd625df26f",
       "tools": [
         {
           "name": "status",
@@ -16265,7 +16613,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -16510,7 +16858,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -16520,57 +16868,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -16960,7 +17337,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -17170,8 +17547,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "45f2a04e0b1edbce73120bee65aa83f057f9ad9938585f29ff884a800650c370",
-      "catalog_digest": "45f2a04e0b1edbce73120bee65aa83f057f9ad9938585f29ff884a800650c370",
+      "generation": "4ed04da1112a573d37ff8a2591737a79bd0427cd65bd9788db6b06b59c5d6d70",
+      "catalog_digest": "4ed04da1112a573d37ff8a2591737a79bd0427cd65bd9788db6b06b59c5d6d70",
       "tools": [
         {
           "name": "status",
@@ -17408,7 +17785,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -17650,7 +18027,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
           "modes": [
             "classic",
@@ -17660,57 +18037,86 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "batch": {
-                "description": "One or more lookups; entries may mix file paths and URLs",
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "target": {
-                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
                       "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
                     },
-                    "symbols": {
-                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                      "anyOf": [
-                        {
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
                           "type": "string"
                         },
-                        {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
                         }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
                       ]
                     }
-                  },
-                  "required": [
-                    "target",
-                    "symbols"
-                  ]
-                }
+                  }
+                ]
               },
               "contextLines": {
-                "description": "Lines of context before/after each symbol (default: 3)",
+                "description": "Lines of context before/after the symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations for every entry (default: false)",
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
                 "type": "boolean"
               }
-            },
-            "required": [
-              "batch"
-            ]
+            }
           }
         },
         {
@@ -18100,7 +18506,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -18310,8 +18716,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c5744a7da6224d5985968e72135bf1e25b09d4fcfd8e649f1e7986c4c69e4cf4",
-      "catalog_digest": "c5744a7da6224d5985968e72135bf1e25b09d4fcfd8e649f1e7986c4c69e4cf4",
+      "generation": "41c67820460df4040a72dad6cc9aeea697ddbdd6c8ba220da1b923bc97725555",
+      "catalog_digest": "41c67820460df4040a72dad6cc9aeea697ddbdd6c8ba220da1b923bc97725555",
       "tools": [
         {
           "name": "status",
@@ -18548,7 +18954,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -19237,7 +19643,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -19447,8 +19853,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "12903af2e5d2c57c60f8dacdc9599480fcbf2a9d47a0e35d290b7b5b548b3393",
-      "catalog_digest": "12903af2e5d2c57c60f8dacdc9599480fcbf2a9d47a0e35d290b7b5b548b3393",
+      "generation": "f8c0ff39e61f960af01bd2864dfe52a5792dac43956adf0cab7c3c391386904b",
+      "catalog_digest": "f8c0ff39e61f960af01bd2864dfe52a5792dac43956adf0cab7c3c391386904b",
       "tools": [
         {
           "name": "status",
@@ -19685,7 +20091,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -20371,7 +20777,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
