@@ -15,6 +15,7 @@ use crate::language::{HeadingAnchor, LanguageProvider};
 use crate::lsp_hints;
 use crate::parser::{detect_language, json_document_value, node_text, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
+use crate::revision_read::RevisionSession;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 use crate::url_fetch::is_http_url;
 
@@ -120,9 +121,11 @@ thread_local! {
 /// `file` string, plus the per-file call enrichment. Several targets in one
 /// file then share one read and one enrichment instead of each repeating it.
 #[derive(Default)]
-struct ZoomTargetMemo {
+struct ZoomTargetMemo<'a> {
     files: HashMap<String, (PathBuf, String)>,
     enrichments: HashMap<PathBuf, ZoomEnrichment>,
+    /// The git revision every target is read at, when the call passed `ref`.
+    revision: Option<&'a RevisionSession>,
 }
 
 struct ZoomEnrichment {
@@ -242,8 +245,22 @@ fn resolve_zoom_file(
     req: &RawRequest,
     ctx: &AppContext,
     file: &str,
+    revision: Option<&RevisionSession>,
 ) -> Result<(PathBuf, String), Response> {
-    let path = resolve_file_or_url(req, ctx, file)?;
+    let path = match revision {
+        Some(revision) => {
+            if is_http_url(file) {
+                return Err(Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "zoom: 'ref' reads repository files; a URL has no git revision",
+                ));
+            }
+            ctx.validate_read_path(&req.id, req.session(), Path::new(file))?;
+            revision.materialize(req, ctx, Path::new(file), file)?
+        }
+        None => resolve_file_or_url(req, ctx, file)?,
+    };
     if !path.exists() {
         return Err(Response::error(
             &req.id,
@@ -280,10 +297,13 @@ fn zoom_one_target_response(
     memo: &mut ZoomTargetMemo,
 ) -> Response {
     if is_github_read_target(file) {
+        if memo.revision.is_some() {
+            return github_revision_refusal(req);
+        }
         return handle_github_zoom(req, ctx, file, symbol);
     }
     if !memo.files.contains_key(file) {
-        match resolve_zoom_file(req, ctx, file) {
+        match resolve_zoom_file(req, ctx, file, memo.revision) {
             Ok(resolved) => {
                 memo.files.insert(file.to_string(), resolved);
             }
@@ -421,6 +441,7 @@ fn handle_zoom_targets(
     targets: &[serde_json::Value],
     context_lines: usize,
     include_callgraph: bool,
+    revision: Option<&RevisionSession>,
 ) -> Response {
     if targets.is_empty() {
         return Response::error(
@@ -439,7 +460,10 @@ fn handle_zoom_targets(
     let mut entries = Vec::with_capacity(targets.len());
     let mut first_refusal: Option<String> = None;
     let mut any_usable = false;
-    let mut memo = ZoomTargetMemo::default();
+    let mut memo = ZoomTargetMemo {
+        revision,
+        ..ZoomTargetMemo::default()
+    };
     for (index, target) in targets.iter().enumerate() {
         match zoom_target_fields(target, index) {
             Ok((file, symbols, target_label)) => {
@@ -526,6 +550,47 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
+    let Some(reference) = crate::revision_read::requested_ref(req) else {
+        return zoom_at(req, ctx, None);
+    };
+    // The revision is resolved once and every file of the call is read at it.
+    let anchor = req
+        .params
+        .get("file")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            req.params
+                .get("targets")
+                .and_then(|targets| targets.as_array())
+                .and_then(|targets| {
+                    targets
+                        .iter()
+                        .find_map(|target| target.get("file").and_then(|v| v.as_str()))
+                })
+        })
+        .filter(|file| !file.trim().is_empty())
+        .map(Path::new);
+    let session = match RevisionSession::open(req, ctx, reference, anchor) {
+        Ok(session) => session,
+        Err(refusal) => return refusal,
+    };
+    let mut response = zoom_at(req, ctx, Some(&session));
+    session.annotate(&mut response);
+    response
+}
+
+/// A GitHub discussion is not a repository file and has no git revision.
+fn github_revision_refusal(req: &RawRequest) -> Response {
+    Response::error(
+        &req.id,
+        "invalid_request",
+        "zoom: 'ref' reads repository files; a GitHub issue or pull request has no git revision",
+    )
+}
+
+/// Zoom with every file read at `revision` when one is given, otherwise from
+/// the working tree (or the URL).
+fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession>) -> Response {
     let context_lines = req
         .params
         .get("context_lines")
@@ -559,7 +624,14 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             merged.extend(same_file_zoom_targets(req, file));
         }
         merged.extend(targets.iter().cloned());
-        return handle_zoom_targets(req, ctx, &merged, context_lines, include_callgraph);
+        return handle_zoom_targets(
+            req,
+            ctx,
+            &merged,
+            context_lines,
+            include_callgraph,
+            revision,
+        );
     }
 
     let file = match req
@@ -582,6 +654,9 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     if is_github_read_target(file) {
+        if revision.is_some() {
+            return github_revision_refusal(req);
+        }
         let selector = match github_zoom_selector(req) {
             Ok(selector) => selector,
             Err(response) => return response,
@@ -601,7 +676,7 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .map(|v| v as usize);
 
     // Read source file early because both symbol mode and line-range mode need it.
-    let (path, source) = match resolve_zoom_file(req, ctx, file) {
+    let (path, source) = match resolve_zoom_file(req, ctx, file, revision) {
         Ok(file) => file,
         Err(resp) => return resp,
     };

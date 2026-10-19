@@ -1,0 +1,1 @@
+`read`, `aft_outline` and `aft_zoom` can read a file as it is at a git revision (branch, tag, SHA or `HEAD~2`) with a new `ref` argument, taken from git's object store without touching the working tree. Turn it on with `"revision_reads": true`; it is off by default and not offered until enabled.

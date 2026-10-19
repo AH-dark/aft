@@ -88,8 +88,11 @@ export type SubcBareToolName = (typeof BARE_TOOL_ORDER)[number];
  * bash path reads a passed `sandbox` argument regardless of this manifest.
  * Remote execution is different: the default artifacts omit it, and a
  * separately generated bash override is selected only for an enabled session.
+ * Revision reads (`ref` on read/outline/zoom) work the same way: the default
+ * artifacts omit `ref`, and `subc_tool_revision_schemas.json` holds the three
+ * schemas a session with `revision_reads` on is served instead.
  */
-export function makeSubcSchemaStubCtx(): PluginContext {
+export function makeSubcSchemaStubCtx(revisionReads = false): PluginContext {
   return {
     pool: {
       getBridge: () =>
@@ -101,6 +104,7 @@ export function makeSubcSchemaStubCtx(): PluginContext {
     config: {
       disabled_tools: [],
       sandbox: { profile: { head: "strict" } },
+      ...(revisionReads ? { revision_reads: true } : {}),
     } as PluginContext["config"],
     storageDir: "/tmp/aft-subc-schema",
   };
@@ -139,8 +143,9 @@ function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
  */
 export function buildSubcToolSchemas(
   remoteRuns = false,
+  revisionReads = false,
 ): Record<SubcBareToolName, Record<string, unknown>> {
-  const ctx = makeSubcSchemaStubCtx();
+  const ctx = makeSubcSchemaStubCtx(revisionReads);
   const bash = createBashTool(ctx);
   const read = createReadTool(ctx);
   const hoisted = hoistedTools(ctx);
@@ -389,4 +394,19 @@ export function buildSubcRemoteToolSchemasJson(): string {
     null,
     2,
   )}\n`;
+}
+
+/** The tools that take `ref` while `revision_reads` is on. */
+export const SUBC_REVISION_TOOL_NAMES = ["read", "outline", "zoom"] as const;
+
+/**
+ * Enabled-only overrides for revision reads: the read, outline and zoom
+ * schemas with `ref`. No preset rewords these tools, so one map serves every
+ * preset; default schemas never advertise the argument.
+ */
+export function buildSubcRevisionToolSchemasJson(): string {
+  const schemas = buildSubcToolSchemas(false, true);
+  const overrides: Record<string, Record<string, unknown>> = {};
+  for (const name of SUBC_REVISION_TOOL_NAMES) overrides[name] = schemas[name];
+  return `${JSON.stringify(overrides, null, 2)}\n`;
 }

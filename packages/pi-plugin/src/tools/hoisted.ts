@@ -25,7 +25,11 @@ import {
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
   isFindReplaceOnlyEdit,
+  REVISION_REF_DESCRIPTION,
+  REVISION_REF_TOOL_NOTE,
   relativePathEscapesRoot,
+  revisionReadsOffered,
+  revisionRefArg,
   shortenHomePath as shortenPath,
   toolErrorFromResponse,
 } from "@cortexkit/aft-bridge";
@@ -37,7 +41,7 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
-import { type Static, Type } from "typebox";
+import { type Static, type TObject, Type } from "typebox";
 import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
 import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
 import type { PluginContext } from "../types.js";
@@ -309,6 +313,34 @@ export async function assertExternalReadPermission(
 // keep these schemas flat and validate mode-specific required fields at runtime.
 // Compatibility normalization runs before host validation, allowing legacy aliases
 // to be converted while explicitly provided canonical fields remain authoritative.
+/** The optional `ref` property offered while `revision_reads` is on. */
+const RevisionRefParam = {
+  ref: Type.Optional(Type.String({ description: REVISION_REF_DESCRIPTION })),
+};
+
+/**
+ * `params` with the `ref` (git revision) property added when this config
+ * offers it. Read live each time the host asks, so a reload is reflected.
+ */
+export function withRevisionRefParam<T extends TObject>(
+  params: T,
+  config: PluginContext["config"],
+): T {
+  if (!revisionReadsOffered(config)) return params;
+  return Type.Object({ ...params.properties, ...RevisionRefParam }) as unknown as T;
+}
+
+/** A tool description with the `ref` sentence added when this config offers it. */
+export function withRevisionRefNote(
+  description: string,
+  config: PluginContext["config"],
+  extra = "",
+): string {
+  if (!revisionReadsOffered(config)) return description;
+  const note = `${REVISION_REF_TOOL_NOTE}${extra ? ` ${extra}` : ""}`;
+  return `${description}\n\n${note}`;
+}
+
 const ReadParams = Type.Object({
   path: Type.String({
     description: "Path to the file or directory to read (absolute or relative to project root)",
@@ -612,10 +644,17 @@ export function registerHoistedTools(
       withPathAliasPreparation({
         name: readName,
         label: readName,
-        description: readDescription(resolveGithubConfig(ctx.config).read),
+        get description() {
+          return withRevisionRefNote(
+            readDescription(resolveGithubConfig(ctx.config).read),
+            ctx.config,
+          );
+        },
         promptSnippet: "Read files or directories (supports offset/limit for either)",
         promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
-        parameters: ReadParams,
+        get parameters() {
+          return withRevisionRefParam(ReadParams, ctx.config);
+        },
         async execute(
           _toolCallId: string,
           params: Static<typeof ReadParams>,
@@ -647,6 +686,10 @@ export function registerHoistedTools(
           if (endLine !== undefined) rawArgs.endLine = endLine;
           if (offset !== undefined) rawArgs.offset = offset;
           if (limit !== undefined) rawArgs.limit = limit;
+          // Forwarded even when this config does not offer it, so the engine
+          // refuses a stale `ref` by name instead of reading the working tree.
+          const ref = revisionRefArg((params as Record<string, unknown>).ref);
+          if (ref !== undefined) rawArgs.ref = ref;
           const visionCapability = visionCapabilityForPiModel(extCtx);
           if (visionCapability !== undefined) rawArgs.vision_capability = visionCapability;
           const response = await callToolCall(bridge, "read", rawArgs, extCtx);

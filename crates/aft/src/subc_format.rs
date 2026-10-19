@@ -343,6 +343,15 @@ pub(crate) fn format_response_unbounded(
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
     };
+    if matches!(bare_name, "read" | "outline" | "zoom") {
+        if let Some(header) = revision_header(data) {
+            text = if text.is_empty() {
+                header
+            } else {
+                format!("{header}\n{text}")
+            };
+        }
+    }
     crate::response_finalize::append_watcher_query_notice(&mut text, response);
     if bare_name == "callgraph" {
         crate::response_finalize::append_callgraph_pending_notice(&mut text, response);
@@ -369,6 +378,18 @@ pub(crate) fn format_response_unbounded(
         }
     }
     text
+}
+
+/// The first reply line of a `read`, `outline` or `zoom` that read a file at
+/// a git revision: the revision as written and the commit it resolved to, so
+/// the reader can never mistake the content for the working tree's.
+fn revision_header(data: &Value) -> Option<String> {
+    let revision = data.get("revision")?;
+    let reference = revision.get("ref").and_then(Value::as_str)?;
+    let commit = revision.get("commit").and_then(Value::as_str)?;
+    Some(format!(
+        "Revision `{reference}` = commit {commit} (read from git's object store, not the working tree)"
+    ))
 }
 
 /// The final reply line for an `edit`/`write` call that created a file which

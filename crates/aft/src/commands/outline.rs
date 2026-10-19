@@ -68,6 +68,9 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     const MAX_OUTPUT_BYTES: usize = 30 * 1024;
+    if let Some(reference) = crate::revision_read::requested_ref(req) {
+        return handle_revision_outline(req, ctx, reference);
+    }
     let excluded = excluded_read_paths(req);
 
     if req
@@ -257,6 +260,12 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    outline_single_file(req, ctx, path, file)
+}
+
+/// Outline one file already resolved to a readable local `path`; `file` is
+/// the caller's spelling (a URL for a downloaded document).
+fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: &str) -> Response {
     let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path) {
         Ok(s) => s,
         Err(e) => {
@@ -337,6 +346,70 @@ fn format_url_outline_with_header(url: &str, text: &str, notice: Option<&str>) -
         None => body.to_string(),
     };
     format_url_outline(url, &contents)
+}
+
+/// Outline one file as it is at the git revision `reference`. Only a single
+/// local file can be outlined at a revision: directories, `files` mode and
+/// URLs read the working tree or the network, never the object store.
+fn handle_revision_outline(req: &RawRequest, ctx: &AppContext, reference: &str) -> Response {
+    if let Err(refusal) = crate::revision_read::check_enabled(req, ctx) {
+        return refusal;
+    }
+    let unsupported = |what: &str| {
+        Response::error(
+            &req.id,
+            "invalid_request",
+            format!("outline: 'ref' outlines a single repository file; {what} cannot be outlined at a revision"),
+        )
+    };
+    if req.params.get("files").is_some() {
+        return unsupported("files mode or several targets");
+    }
+    if req.params.get("directory").is_some() {
+        return unsupported("a directory");
+    }
+    let Some(file) = req
+        .params
+        .get("file")
+        .or_else(|| req.params.get("target"))
+        .and_then(|v| v.as_str())
+    else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "outline: missing required param 'file'",
+        );
+    };
+    if is_http_url(file) || is_github_read_target(file) {
+        return unsupported("a URL or GitHub address");
+    }
+    let requested = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+        Ok(path) => path,
+        Err(refusal) => return refusal,
+    };
+    let session = match crate::revision_read::RevisionSession::open(
+        req,
+        ctx,
+        reference,
+        Some(Path::new(file)),
+    ) {
+        Ok(session) => session,
+        Err(refusal) => return refusal,
+    };
+    let staged = match session.materialize(req, ctx, Path::new(file), file) {
+        Ok(staged) => staged,
+        Err(refusal) => return refusal,
+    };
+    let mut response = outline_single_file(req, ctx, staged, file);
+    // Host adapters authorize the files an outline drew from; name the
+    // requested path, not the private staged copy.
+    if let Some(data) = response.data.as_object_mut() {
+        if data.contains_key("content_files") {
+            data.insert("content_files".into(), serde_json::json!([requested]));
+        }
+    }
+    session.annotate(&mut response);
+    response
 }
 
 /// Host adapters can re-render a held outline after applying their own read policy.

@@ -214,6 +214,13 @@ const CASES: ParityCase[] = [
     user: { search_index: false },
     project: { search_index: true, format_on_edit: false },
   },
+  { name: "revision_reads_user_enabled", user: { revision_reads: true } },
+  {
+    name: "revision_reads_project_override",
+    user: { revision_reads: true },
+    project: { revision_reads: false },
+  },
+  { name: "pi_revision_reads_project_enabled", project: { revision_reads: true }, harness: "pi" },
   {
     name: "views_enabled_project_override",
     user: { views: { enabled: false } },

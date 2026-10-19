@@ -114,6 +114,13 @@ function buildSchema(): Record<string, unknown> {
           "Auto-format files after edits with the language's configured formatter. Default false: formatting can reflow the file under the agent and stale the next edit's context.",
       },
 
+      revision_reads: {
+        type: "boolean",
+        default: false,
+        description:
+          "Let read, aft_outline and aft_zoom take a `ref` argument that reads a file as it is at a git revision (branch, tag, SHA, or forms like HEAD~2) from the repository's object store, without touching the working tree. Default false: the argument is not offered and a call that passes it is refused.",
+      },
+
       formatter_timeout_secs: {
         type: "integer",
         minimum: 1,

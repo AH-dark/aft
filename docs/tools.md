@@ -120,6 +120,38 @@ return metadata suitable for UI preview. Output is capped at 50KB.
 
 For symbol inspection with call-graph annotations, use `aft_zoom`.
 
+#### Reading at a git revision (`ref`)
+
+With [`revision_reads`](config.md#reading-at-a-git-revision) enabled, `read`, `aft_outline` and
+`aft_zoom` take an optional `ref`: any revision git resolves to a commit, such as a branch, a
+tag (annotated tags resolve to their commit), a full or short SHA, or forms like `HEAD~2`. The
+file comes from git's object store as it is in that commit; the working tree, the index and
+HEAD are never read or changed, so uncommitted work is safe.
+
+```json
+// The file as it is on another branch
+{ "path": "src/app.ts", "ref": "main" }
+
+// Lines 40-80 of the file two commits ago
+{ "path": "src/app.ts", "ref": "HEAD~2", "startLine": 40, "endLine": 80 }
+```
+
+- The revision is resolved once per call, and the reply's first line names the commit:
+  ``Revision `main` = commit <sha> (read from git's object store, not the working tree)``.
+- `read` keeps its line numbers, ranges, binary detection and size limits. `aft_outline` and
+  `aft_zoom` parse the file with the same parsers, choosing the language from the path. Every
+  file of an `aft_zoom` call, including each `targets` entry, is read at the same revision.
+- The path is checked exactly like a working-tree read: the project-root restriction, read
+  permission rules and outside-path prompts all apply to the path you pass.
+- Only files of the session's own repository can be read, including from a linked worktree of
+  it. `aft_outline` at a revision takes a single file, not a directory, an array or a URL.
+  There is no search at a revision.
+- Errors are typed: `revision_path_not_found` (the path does not exist at that revision; the
+  message names the revision and commit), `revision_not_found` (the revision names no commit),
+  `revision_path_is_directory`, `revision_blob_too_large` (above 256 MiB) and, while
+  `revision_reads` is off, `revision_reads_disabled`. While it is off, `ref` is not part of any
+  tool schema or description.
+
 ---
 
 ### write
@@ -668,6 +700,9 @@ In multi-file and directory modes, files that fail to parse or whose language is
 are listed under `skipped_files` with a per-file `reason` (e.g. `parse_error`,
 `unsupported_language`) instead of being silently dropped from the result.
 
+With `revision_reads` enabled, `ref` outlines a single file as it is at a git revision; see
+[Reading at a git revision](#reading-at-a-git-revision-ref).
+
 ---
 
 ### aft_zoom
@@ -692,6 +727,9 @@ For Markdown and HTML, use the heading text as the symbol name.
 `callgraph` defaults to `false`. Enabling it adds `calls_out` and `called_by` annotations.
 Each failed lookup reports its own error line while other entries still return results.
 Use `read` rather than zoom to read an entire local file.
+
+With `revision_reads` enabled, `ref` reads every file of the call at one git revision; see
+[Reading at a git revision](#reading-at-a-git-revision-ref).
 
 ---
 

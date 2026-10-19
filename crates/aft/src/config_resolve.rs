@@ -111,6 +111,7 @@ pub struct RawAftConfig {
     pub schema: Option<String>,
     pub edit_mode: Option<RawEditMode>,
     pub format_on_edit: Option<bool>,
+    pub revision_reads: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
     pub formatter_timeout_secs: Option<u32>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
@@ -1166,6 +1167,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.format_on_edit.is_some() {
         base.format_on_edit = override_config.format_on_edit;
     }
+    if override_config.revision_reads.is_some() {
+        base.revision_reads = override_config.revision_reads;
+    }
     if override_config.formatter_timeout_secs.is_some() {
         base.formatter_timeout_secs = override_config.formatter_timeout_secs;
     }
@@ -1288,6 +1292,11 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     if project.format_on_edit.is_some() {
         base.format_on_edit = project.format_on_edit;
+    }
+    // Reading git objects of the session's own repository grants nothing the
+    // read permission rules do not already allow, so a project may opt in.
+    if project.revision_reads.is_some() {
+        base.revision_reads = project.revision_reads;
     }
     if project.validate_on_edit.is_some() {
         base.validate_on_edit = project.validate_on_edit;
@@ -2054,6 +2063,9 @@ fn apply_resolved_config(
     };
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;
+    }
+    if let Some(value) = raw.revision_reads {
+        config.revision_reads = value;
     }
     if let Some(value) = raw.formatter_timeout_secs {
         config.formatter_timeout_secs = value;

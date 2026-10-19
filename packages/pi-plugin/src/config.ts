@@ -436,6 +436,7 @@ export interface AftConfig {
   /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
   edit_mode?: "default" | "hashline";
   format_on_edit?: boolean;
+  revision_reads?: boolean;
   /** Maximum formatter subprocess wallclock seconds. Bounded 1..=600. Default 10. */
   formatter_timeout_secs?: number;
   validate_on_edit?: "syntax" | "full";
@@ -1098,6 +1099,12 @@ const AftConfigFieldsSchema = z.object({
    * with `true` if you want AFT to format after edits.
    */
   format_on_edit: z.boolean().optional(),
+  /**
+   * Let `read`, `aft_outline` and `aft_zoom` take a `ref` argument that reads a
+   * file as it is at a git revision, from the repository's object store.
+   * Default: false — the argument is not offered and a call passing it is refused.
+   */
+  revision_reads: z.boolean().optional(),
   formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
   validate_on_edit: z.enum(["syntax", "full"]).optional(),
   formatter: z.record(z.string(), FormatterEnum).optional(),
@@ -1254,6 +1261,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 
   if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
   if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
+  if (config.revision_reads !== undefined) overrides.revision_reads = config.revision_reads;
   if (config.formatter_timeout_secs !== undefined)
     overrides.formatter_timeout_secs = config.formatter_timeout_secs;
   if (config.validate_on_edit !== undefined) overrides.validate_on_edit = config.validate_on_edit;
@@ -1837,6 +1845,8 @@ function getProjectLspStrippedKeys(lsp?: LspConfig): string[] {
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "edit_mode",
   "format_on_edit",
+  // Reads git objects of the session's own repository under the same read rules.
+  "revision_reads",
   "validate_on_edit",
   "configure_warnings_delivery",
   // "indexes" handled separately — a project can only switch an index off.

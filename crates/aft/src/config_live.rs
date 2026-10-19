@@ -842,6 +842,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
 
     // Edit pipeline.
     live!("format_on_edit", format_on_edit);
+    live!("revision_reads", revision_reads);
     live!("formatter_timeout_secs", formatter_timeout_secs);
     live!("type_checker_timeout_secs", type_checker_timeout_secs);
     live!("validate_on_edit", validate_on_edit);
@@ -973,6 +974,7 @@ fn classification_is_exhaustive(config: &Config) {
         formatter_timeout_secs: _,
         type_checker_timeout_secs: _,
         format_on_edit: _,
+        revision_reads: _,
         hashline_enabled: _,
         validate_on_edit: _,
         formatter: _,

@@ -812,6 +812,10 @@ pub struct Config {
     pub type_checker_timeout_secs: u32,
     /// Whether to auto-format files after edits (default: false).
     pub format_on_edit: bool,
+    /// Whether `read`, `outline` and `zoom` accept a `ref` argument that reads
+    /// a file as it is at a git revision (default: false). While it is off,
+    /// the argument is neither advertised nor accepted.
+    pub revision_reads: bool,
     /// Whether the hashline edit/read surface is enabled for eligible sessions.
     /// Resolved from the public `edit_mode` enum in aft.jsonc.
     pub hashline_enabled: bool,
@@ -955,6 +959,7 @@ impl Default for Config {
             // context for the next edit/patch. Agents that want formatting opt in
             // via `format_on_edit: true`.
             format_on_edit: false,
+            revision_reads: false,
             hashline_enabled: false,
             validate_on_edit: None,
             formatter: HashMap::new(),

@@ -120,6 +120,10 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // queued and runs after ~90s without further edits to the file.
   "format_on_edit": false,
 
+  // Let read, aft_outline and aft_zoom take a `ref` argument that reads a file
+  // as it is at a git revision. Default: false. User and project tiers.
+  "revision_reads": false,
+
   // Auto-validate after edits: "syntax" (tree-sitter, fast) or "full" (runs type checker)
   "validate_on_edit": "syntax",
 
@@ -521,6 +525,21 @@ Backends:
 - **`remote`** calls a Cohere-style `POST <endpoint>/rerank` (`model`, `query`, `documents`, `top_n` in; `results[{index, relevance_score}]` out, scores in [0, 1]). This works with OpenRouter, Voyage, Cohere and other compatible services, and with a Hugging Face TEI server when the endpoint carries the `tei+` prefix (`tei+http://host:8080`). At most 20 candidates are sent per search. Redirects are refused, and errors never include the key or response bodies.
 
 See [Synapse search backends](synapse-search-backends.md) for the wire details of `remote` and `synapse`.
+
+## Reading at a git revision
+
+`revision_reads: true` adds an optional `ref` argument to `read`, `aft_outline` and `aft_zoom`
+that reads a file as it is at a git revision (a branch, tag, SHA, or a form like `HEAD~2`)
+straight from the repository's object store. It defaults to `false`. While it is off the
+argument appears in no tool schema or description, and a call that passes it anyway is refused
+with `revision_reads_disabled`. User and project configs both accept the key, with the usual
+project-over-user precedence: the feature grants nothing beyond what the read permission rules
+already allow, because the path is checked exactly like a working-tree read.
+
+The content never comes from the working tree, and AFT runs no git command that writes the
+working tree, the index or HEAD. Each call resolves the revision once and names the commit in
+its reply. See [Reading at a git revision](tools.md#reading-at-a-git-revision-ref) for the
+argument's behavior.
 
 ## GitHub integration
 

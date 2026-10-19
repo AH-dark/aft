@@ -203,6 +203,7 @@ pub(super) fn catalog(
         &identity.disabled_tools,
         powershell,
         offered,
+        ctx.config().revision_reads,
         worker_wait_max_ms,
     )
 }
