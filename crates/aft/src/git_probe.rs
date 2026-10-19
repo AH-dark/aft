@@ -528,6 +528,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn unlimited() -> DiscoveryLimits {
         DiscoveryLimits {
             ceilings: Vec::new(),
