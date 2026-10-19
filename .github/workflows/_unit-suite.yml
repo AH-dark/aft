@@ -893,11 +893,10 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Rust libtest shard (nextest archive)
-        run: |
-          set -o pipefail
-          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/macos-libtest-shard-${{ matrix.shard }}.log"
+        run: ./scripts/rust-test-gate.sh
         shell: bash
         env:
+          AFT_GATE_LOG: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
@@ -972,11 +971,10 @@ jobs:
       - name: Rust watcher gate (macOS)
         # Keep FSEvents tests serial because they share fixtures and exercise
         # the platform watcher backend that the other shards exclude.
-        run: |
-          set -o pipefail
-          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/macos-watcher.log"
+        run: ./scripts/rust-test-gate.sh
         shell: bash
         env:
+          AFT_GATE_LOG: ${{ runner.temp }}/macos-watcher.log
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: watcher
           AFT_GATE_SKIP_RELEASE_STORM: "1"
@@ -1240,11 +1238,15 @@ jobs:
         # Run `platform_verifier_tls_client_subprocess` once in shard one before
         # hash partitioning. Its spawned system-trust check can hang when other
         # tests contend with machine trust evaluation.
-        run: |
-          set -o pipefail
-          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/windows-libtest-shard-${{ matrix.shard }}.log"
+        #
+        # The gate writes AFT_GATE_LOG itself; do not pipe it through `tee`.
+        # On Windows a process a test leaks inherits the write end of every
+        # pipe above it, so `tee` never saw end-of-file and the step hung past
+        # a fully passing nextest summary until the job timeout.
+        run: ./scripts/rust-test-gate.sh
         shell: bash
         env:
+          AFT_GATE_LOG: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
@@ -1292,11 +1294,10 @@ jobs:
         # Keep watcher tests serial because they share fixtures. The conformance
         # phase checks the provider contract and four bash-promotion/elicitation
         # cases compiled only with test-timing-hooks.
-        run: |
-          set -o pipefail
-          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/windows-watcher-conformance.log"
+        run: ./scripts/rust-test-gate.sh
         shell: bash
         env:
+          AFT_GATE_LOG: ${{ runner.temp }}/windows-watcher-conformance.log
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: watcher,conformance
           AFT_GATE_SKIP_RELEASE_STORM: "1"

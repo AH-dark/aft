@@ -18228,6 +18228,18 @@ mod tests {
         (registry, shared, frames)
     }
 
+    /// Kills every task the registry still holds when the test ends, whether
+    /// it passed or panicked. Background children are detached so they can
+    /// outlive a bridge; one a test leaves running outlives the test process
+    /// too and, on Windows, keeps the test runner's output handles open.
+    struct KillTasksOnDrop(BgTaskRegistry);
+
+    impl Drop for KillTasksOnDrop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     fn spawn_long_running_task(
         registry: &BgTaskRegistry,
@@ -19496,6 +19508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
         let task_id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,
@@ -19532,6 +19545,7 @@ mod tests {
         frames.lock().unwrap().clear();
 
         let (replayed, _db2, replay_frames) = registry_with_db_and_frames(storage);
+        let _reap_replayed = KillTasksOnDrop(replayed.clone());
         // Keep the original process's task row out of the way; replay loads from DB/disk.
         registry
             .inner
@@ -19642,6 +19656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
         registry.inner.shutdown.store(true, Ordering::SeqCst);
         let spawn = || {
             registry
@@ -19712,6 +19727,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, db, _) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
         let task_id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,

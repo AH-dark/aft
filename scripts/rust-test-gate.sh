@@ -235,29 +235,70 @@ report_gate_failure() {
   tail -n 60 "$gate_log" >&2 || true
 }
 
+# Copy everything appended to the gate log after byte OFFSET to stdout, once a
+# second, until STOP_FILE exists (then one final copy) or the gate shell that
+# started it is gone. Runs in the background beside a phase command.
+stream_gate_log() {
+  local offset="$1"
+  local stop_file="$2"
+  local gate_pid="$3"
+  local size stop
+  while :; do
+    stop=0
+    if [[ -e "$stop_file" ]] || ! kill -0 "$gate_pid" 2>/dev/null; then
+      stop=1
+    fi
+    size=$(($(wc -c < "$gate_log")))
+    if (( size > offset )); then
+      tail -c "+$((offset + 1))" "$gate_log" | head -c "$((size - offset))"
+      offset=$size
+    fi
+    (( stop )) && return 0
+    sleep 1
+  done
+}
+
 run_phase() {
   local label="$1"
   shift
   local started=$SECONDS
-  local -a pipeline_status
   local rc
-  local tee_rc
+  local offset stop_dir streamer_pid
 
+  # Also proves the log is writable: under `set -e` a log that cannot be
+  # written ends the gate here, before any phase command runs.
   announce_gate_line "==> $label"
+  # The phase command writes straight into the gate log file and a background
+  # loop copies the new bytes to the console. It is deliberately not piped
+  # through `tee`: on Windows every process a test leaks inherits the write
+  # end of any pipe above it, so a leaked grandchild kept `tee` from seeing
+  # end-of-file and held a CI step open long after nextest had printed its
+  # summary and exited. A file has no reader waiting for end-of-file, so a
+  # leaked process holding it delays nothing.
+  offset=$(($(wc -c < "$gate_log")))
+  stop_dir="$(mktemp -d "${TMPDIR:-/tmp}/aft-gate-phase.XXXXXX")"
+  # errexit is off before the streamer forks: its `tail | head` pipeline ends
+  # with SIGPIPE by design and must not stop the copy loop.
   set +e
-  "$@" 2>&1 | tee -a "$gate_log"
-  pipeline_status=("${PIPESTATUS[@]}")
+  stream_gate_log "$offset" "$stop_dir/done" "$$" &
+  streamer_pid=$!
+  # `exec` replaces the inherited console descriptors instead of saving
+  # copies of them, so the command and its children never hold the console
+  # pipe.
+  (
+    exec >>"$gate_log" 2>&1
+    "$@"
+  )
+  rc=$?
+  : > "$stop_dir/done"
+  wait "$streamer_pid"
+  rm -rf "$stop_dir"
   set -e
-  rc="${pipeline_status[0]:-1}"
-  tee_rc="${pipeline_status[1]:-1}"
-  if [[ "$rc" -ne 0 || "$tee_rc" -ne 0 ]]; then
-    if [[ "$rc" -eq 0 ]]; then
-      rc="$tee_rc"
-    fi
+  if [[ "$rc" -ne 0 ]]; then
     report_gate_failure "$label" "$rc"
     # Only independent test commands may continue after a red phase. Failed
-    # archive extraction, signing, lint or log writes are fatal prerequisites.
-    if [[ -n "${CI:-}" && "$tee_rc" -eq 0 && "${1:-}" == "gate_cargo" \
+    # archive extraction, signing or lint are fatal prerequisites.
+    if [[ -n "${CI:-}" && "${1:-}" == "gate_cargo" \
       && ( "${2:-}" == "test" || ( "${2:-}" == "nextest" && "${3:-}" == "run" ) ) ]]; then
       failed_test_phases=$((failed_test_phases + 1))
       if [[ "$first_test_failure" -eq 0 ]]; then
