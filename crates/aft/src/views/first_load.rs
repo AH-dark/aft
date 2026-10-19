@@ -1898,8 +1898,15 @@ mod callgraph_bridge_tests {
 /// Configured walker membership with traversal errors retained. Source content
 /// reads belong exclusively to CheckoutDriver's strict same-buffer reconciliation.
 pub struct ConfiguredMembershipWalker;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MEMBERSHIP_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl MembershipWalker for ConfiguredMembershipWalker {
     fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
+        #[cfg(test)]
+        MEMBERSHIP_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut files = Vec::new();
         for result in crate::search_index::project_walk_builder(root).build() {
             let item = result

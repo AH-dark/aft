@@ -108,7 +108,7 @@ impl LiveFileIdentity {
         #[cfg(unix)]
         {
             #[cfg(test)]
-            stat_probe::record(path);
+            stat_probe::record_followed(path);
             Self::from_metadata(&std::fs::metadata(path).ok()?)
         }
         #[cfg(not(unix))]
@@ -725,6 +725,27 @@ pub(crate) mod stat_probe {
 
     thread_local! {
         static COUNTS: RefCell<Option<BTreeMap<PathBuf, usize>>> = const { RefCell::new(None) };
+        static CANDIDATES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(crate) fn record_followed(path: &Path) {
+        if !CANDIDATES_ONLY.with(|only| only.get()) {
+            record(path);
+        }
+    }
+
+    /// Count lstat candidates without counting stat calls that refresh SQLite
+    /// sidecar identities. Their warm-up state must not look like a walker gain.
+    pub(crate) fn count_candidates(f: impl FnOnce()) -> BTreeMap<PathBuf, usize> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CANDIDATES_ONLY.with(|only| only.set(false));
+            }
+        }
+        let _reset = Reset;
+        CANDIDATES_ONLY.with(|only| only.set(true));
+        count(f)
     }
 
     pub(crate) fn record(path: &Path) {
