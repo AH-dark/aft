@@ -371,6 +371,7 @@ impl AccessPolicy {
                 read_allow,
                 write_allow: roots.clone(),
                 read_metadata_allow: Vec::new(),
+                session_task_read_dir: None,
             },
             roots,
             outside: if config.restrict_to_project_root && config.project_root.is_some() {

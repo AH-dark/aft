@@ -1581,3 +1581,90 @@ fn linux_jailed_launch_reports_sccache_gap_without_blocking_tcp() {
         "{output:?}"
     );
 }
+
+#[path = "helpers/session_output.rs"]
+mod session_output;
+
+fn session_output_probe() -> (ProbeFixture, session_output::SessionOutput) {
+    let mut fixture = ProbeFixture::new();
+    let storage = fixture.outside_home.join("storage.with[regex]+chars");
+    let outputs = session_output::SessionOutput::new(&storage, "probe-session");
+    let mut profile: SandboxProfile =
+        serde_json::from_reader(fs::File::open(fixture.profile.path()).unwrap()).unwrap();
+    profile.data_policy.deny.push(storage);
+    profile.data_policy.session_task_read_dir = Some(outputs.own.session_dir.clone());
+    fixture.profile = InheritedProfile::new(&profile);
+    (fixture, outputs)
+}
+
+#[test]
+fn shell_reads_own_saved_task_output() {
+    skip_if_landlock_absent!();
+    let (mut fixture, outputs) = session_output_probe();
+    let copied = fixture.project.join("gate.log");
+    let output = fixture.launch_bash(&format!(
+        "cat {} && cp {} {}",
+        shell_path(&outputs.own.stdout),
+        shell_path(&outputs.own.stdout),
+        shell_path(&copied),
+    ));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"saved-output\n");
+    assert_eq!(fs::read(&copied).unwrap(), b"saved-output\n");
+    #[cfg(target_os = "macos")]
+    if let Ok(alias) = outputs.own.stdout.strip_prefix("/private") {
+        let output =
+            fixture.launch_bash(&format!("cat {}", shell_path(&Path::new("/").join(alias))));
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"saved-output\n");
+    }
+}
+
+#[test]
+fn shell_denies_other_session_saved_output() {
+    skip_if_landlock_absent!();
+    let (mut fixture, outputs) = session_output_probe();
+    for path in [&outputs.other.stdout, &outputs.other_harness.stdout] {
+        let output = fixture.launch_bash(&format!("cat {}", shell_path(path)));
+        assert_denied(&output, "other session task output");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+}
+
+#[test]
+fn shell_denies_saved_task_environment() {
+    skip_if_landlock_absent!();
+    let (mut fixture, outputs) = session_output_probe();
+    let output = fixture.launch_bash(&format!("cat {}", shell_path(&outputs.own.environment)));
+    assert_denied(&output, "same-session task environment");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_denies_private_storage_and_output_symlinks() {
+    skip_if_landlock_absent!();
+    let (mut fixture, outputs) = session_output_probe();
+    for path in outputs.private.iter().chain([&outputs.other.stdout]) {
+        let output = fixture.launch_bash(&format!("cat {}", shell_path(path)));
+        assert_denied(&output, "private storage");
+    }
+    fs::remove_file(&outputs.own.stdout).unwrap();
+    for target in outputs.private.iter().chain([&outputs.other.stdout]) {
+        std::os::unix::fs::symlink(target, &outputs.own.stdout).unwrap();
+        let output = fixture.launch_bash(&format!("cat {}", shell_path(&outputs.own.stdout)));
+        assert_denied(&output, "symlink outside task read grant");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        fs::remove_file(&outputs.own.stdout).unwrap();
+    }
+}
+
+#[test]
+fn shell_cannot_write_saved_task_output() {
+    skip_if_landlock_absent!();
+    let (mut fixture, outputs) = session_output_probe();
+    for path in [&outputs.own.stdout, &outputs.own.io_dir.join("new-file")] {
+        let output = fixture.launch_bash(&format!("printf tampered > {}", shell_path(path)));
+        assert_denied(&output, "saved output write");
+    }
+    assert_eq!(fs::read(&outputs.own.stdout).unwrap(), b"saved-output\n");
+}

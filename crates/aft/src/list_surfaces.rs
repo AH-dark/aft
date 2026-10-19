@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "cli/sandbox_launch/landlock_backend.rs",
+        enclosing_item: "session_task_read_paths",
+        location_or_primitive: "tasks.truncate(MAX_SESSION_READ_TASKS)",
+        reason: "internal Landlock read-grant snapshot; tasks beyond the 500-entry budget stay unreadable without a broader grant, not an agent-visible list",
+    },
+    ExclusionEntry {
         file: "lsp/manager.rs",
         enclosing_item: "walk_applicable_area_uncached",
         location_or_primitive: "visited >= entry_limit",

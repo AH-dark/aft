@@ -88,6 +88,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.data_policy.read_allow,
         &profile.writable_files,
     )?;
+    render_session_task_reads(&mut source, profile)?;
     // Git resolves the cwd by statting each ancestor. Permit metadata on the
     // exact exception's ancestor chain, not directory contents or sibling data.
     for allow in profile
@@ -204,6 +205,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.writable_files,
         &[],
     )?;
+    render_session_task_reads(&mut source, profile)?;
     for allow in profile
         .data_policy
         .read_allow
@@ -293,6 +295,54 @@ fn relaxed_filter(path: &Path, prefix: bool) -> Result<String, String> {
     // SBPL #"..." retains regex backslashes. Ordinary string escaping would
     // turn \. into \\. and match a backslash instead of a literal dot.
     Ok(format!("(regex #\"{pattern}\")"))
+}
+
+fn session_task_pattern(root: &Path) -> Result<String, String> {
+    use aft::bash_background::persistence::{readable_task_file_names, TaskLayout};
+    let text = root.to_str().ok_or("Seatbelt session path is not UTF-8")?;
+    if text.chars().any(char::is_control) {
+        return Err("Seatbelt session path contains a control character".into());
+    }
+    let names = |layout| {
+        readable_task_file_names(layout)
+            .iter()
+            .map(|name| regex::escape(name))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let task = format!("bash-{}", "[0-9a-f]".repeat(16));
+    Ok(format!(
+        "^{}/({task}/({})|{task}\\.({}))$",
+        regex::escape(text),
+        names(TaskLayout::Directory),
+        names(TaskLayout::Flat)
+    ))
+}
+
+fn render_session_task_reads(source: &mut String, profile: &SandboxProfile) -> Result<(), String> {
+    let Some(root) = &profile.data_policy.session_task_read_dir else {
+        return Ok(());
+    };
+    // This allow must follow the storage denies. Only registered readable names
+    // match; resolved symlink targets outside the session do not match the regex.
+    let pattern = session_task_pattern(root)?.replace('"', "\\\"");
+    source.push_str(&format!(
+        "(allow file-read* (require-all (regex #\"{pattern}\")"
+    ));
+    for path in &profile.read_deny {
+        source.push_str(&format!(" (require-not {})", relaxed_filter(path, false)?));
+    }
+    for path in &profile.deny_prefixes {
+        source.push_str(&format!(" (require-not {})", relaxed_filter(path, true)?));
+    }
+    source.push_str("))\n");
+    for ancestor in root.ancestors() {
+        source.push_str(&format!(
+            "(allow file-read-metadata (literal \"{}\"))\n",
+            escape_path(ancestor)?
+        ));
+    }
+    Ok(())
 }
 
 fn render_data_denies(
@@ -700,5 +750,76 @@ mod tests {
         assert!(source.contains("file-write-unlink"));
         assert!(!source.contains("network-outbound"));
         assert!(!source.contains("no-sandbox"));
+    }
+}
+
+#[cfg(test)]
+mod session_read_tests {
+    use super::*;
+    use aft::bash_background::persistence::{
+        create_task_layout, readable_task_file_names, TaskLayout,
+    };
+
+    #[test]
+    fn session_read_regex_matches_only_file_tool_names_after_storage_deny() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage.with[regex]+chars");
+        let task = create_task_layout(&storage, "session", "bash-1111111111111111").unwrap();
+        let session = task.paths.session_dir.canonicalize().unwrap();
+        let pattern = session_task_pattern(&session).unwrap();
+        let matcher = regex::Regex::new(&pattern).unwrap();
+        for layout in [TaskLayout::Directory, TaskLayout::Flat] {
+            for name in readable_task_file_names(layout) {
+                let path = match layout {
+                    TaskLayout::Directory => session.join(&task.paths.task_id).join(name),
+                    TaskLayout::Flat => session.join(format!("{}.{name}", task.paths.task_id)),
+                };
+                assert!(
+                    matcher.is_match(path.to_str().unwrap()),
+                    "{}",
+                    path.display()
+                );
+                assert!(!matcher.is_match(&format!("{}/child", path.display())));
+            }
+        }
+        for path in [
+            &task.paths.environment,
+            &storage.join("aft.db"),
+            &task.paths.io_dir.join("unexpected.sqlite"),
+        ] {
+            assert!(!matcher.is_match(path.to_str().unwrap()));
+        }
+        let mut profile = SandboxProfile::build(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        profile
+            .data_policy
+            .deny
+            .push(storage.canonicalize().unwrap());
+        profile.data_policy.session_task_read_dir = Some(session);
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            let deny = source.find("(deny file-read*").unwrap();
+            let allow = source
+                .find("(allow file-read* (require-all (regex")
+                .unwrap();
+            assert!(allow > deny, "{source}");
+            assert!(
+                source.contains(&format!("(regex #\"{pattern}\")")),
+                "{source}"
+            );
+        }
     }
 }

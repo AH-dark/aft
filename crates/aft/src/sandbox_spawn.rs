@@ -1638,6 +1638,7 @@ fn build_native_profile(
         policy.private_stores.read_allow.dedup();
         policy.private_stores.write_allow = project_roots.clone();
         policy.private_stores.deny.push(session_store.clone());
+        policy.private_stores.session_task_read_dir = Some(session_store.clone());
         let mut write_deny_nested = Vec::new();
         let mut shell_write_deny = Vec::new();
         let mut shell_read_deny = Vec::new();
@@ -1888,6 +1889,7 @@ fn build_relaxed_profile(
     );
     let mut stores = policy.private_stores.clone();
     stores.deny.push(session_store.to_path_buf());
+    stores.session_task_read_dir = Some(session_store.to_path_buf());
     stores.deny.push(home.join(".config/cortexkit"));
     stores.deny.extend([
         home.join(".local/share/cortexkit"),
@@ -9191,6 +9193,7 @@ mod read_allow_tests {
                 ],
                 write_allow: vec![project.clone().into(), temp.clone().into()],
                 read_metadata_allow: Vec::new(),
+                session_task_read_dir: None,
             },
             writable_roots: vec![project.into()],
             writable_files: Vec::new(),
