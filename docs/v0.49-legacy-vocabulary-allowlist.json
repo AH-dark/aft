@@ -557,6 +557,17 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 3584,
+      "column": 21,
+      "token": "filePath",
+      "text": "json!({\"filePath\": roots[0].join(\"scratch.rs\"), \"content\": \"overwrite\"}),",
+      "location": "line 3584, column 21",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The scratch-write consent regression uses the served write schema's legacy filePath spelling; the canonical path spelling is not accepted by that schema."
+    },
+    {
       "path": "crates/aft/src/subc/manifest.rs",
       "line": 654,
       "column": 53,

@@ -153,8 +153,11 @@ async function executeProjected(
   return await Effect.runPromise(tool.execute(input, context));
 }
 
-function artifactReadTool(owned: boolean, name = "read") {
-  const artifact = "/aft-v2-artifact-fixture/opencode/bash-tasks/bgb-0123abcd/stdout";
+function artifactReadTool(
+  owned: boolean,
+  name = "read",
+  artifact = "/aft-v2-artifact-fixture/opencode/bash-tasks/bgb-0123abcd/stdout",
+) {
   const ownershipQueries: Record<string, unknown>[] = [];
   const plugin = pluginContext(
     () => ({ success: true, text: "task output" }),
@@ -501,6 +504,24 @@ describe("OpenCode 2 in-process permission assertion", () => {
         Object.fromEntries(readers.map((reader) => [reader.name, scenario === "own" ? 0 : 1])),
       );
     });
+  }
+
+  for (const owned of [true, false]) {
+    for (const target of [
+      "/aft-v2-scratch-fixture/.sandbox-tmp-task/scratch.rs",
+      "/aft-v2-scratch-fixture/.sandbox-tmp-task",
+    ]) {
+      test(`scratch read capability ${owned ? "owned" : "foreign"} ${target}`, async () => {
+        for (const reader of [{ name: "read", args: (p: string) => ({ path: p }) }, ...readers]) {
+          const { read, calls, ownershipQueries } = artifactReadTool(owned, reader.name, target);
+          await executeProjected(read, reader.args(target));
+          expect(ownershipQueries).toEqual([{ path: target, session_id: "ses_test" }]);
+          expect(
+            calls.filter((call) => (call as { action: string }).action === "external_directory"),
+          ).toHaveLength(owned ? 0 : 1);
+        }
+      });
+    }
   }
 
   test("write to own artifact still asserts external_directory", async () => {

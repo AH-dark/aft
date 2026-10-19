@@ -1670,6 +1670,35 @@ describe("session-owned bash artifact reads", () => {
     });
   }
 
+  for (const owned of [true, false]) {
+    for (const directory of [true, false]) {
+      test(`scratch capability ${owned ? "owned" : "foreign"} ${directory ? "directory" : "file"} skips only owned external asks`, async () => {
+        const { project, artifact } = await artifactFixture();
+        const target = directory
+          ? path.dirname(artifact)
+          : path.join(path.dirname(artifact), "scratch.rs");
+        for (const reader of [
+          { name: "read", args: (p: string) => ({ filePath: p }) },
+          ...readers,
+        ]) {
+          const asks: AskCall[] = [];
+          const { tools, calls } = ownershipHarness(new Set(owned ? [target] : []));
+          await tools[reader.name].execute(
+            reader.args(target),
+            createSdkContext(project, recordingAsk(asks)),
+          );
+          expect(asks.filter((ask) => ask.permission === "external_directory")).toHaveLength(
+            owned ? 0 : 1,
+          );
+          expect(calls.find((call) => call.command === "bash_artifact_owned")?.params).toEqual({
+            path: target,
+            session_id: "permission-audit-test",
+          });
+        }
+      });
+    }
+  }
+
   test("glob exact absolute artifact pattern stays file-scoped", async () => {
     const { project, artifact } = await artifactFixture();
     const asks: AskCall[] = [];

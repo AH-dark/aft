@@ -257,7 +257,7 @@ fn resolve_zoom_file(
 
     #[cfg(test)]
     ZOOM_FILE_READS.with(|count| count.set(count.get() + 1));
-    let source = std::fs::read_to_string(&path).map_err(|error| {
+    let source = crate::bounded_io::read_to_string(&path).map_err(|error| {
         Response::error(
             &req.id,
             "file_not_found",

@@ -266,21 +266,15 @@ function isSystemTempPath(target: string): boolean {
 }
 
 /**
- * Whether `target` is one of this session's own background-bash output files
- * (stdout, stderr, exit or pty), as decided by the Rust task registry.
+ * Whether the Rust task registry recognizes a read-only capability for this
+ * session's exact bash output file or recorded sandbox scratch file/directory.
+ * Fresh task paths cannot be covered by a host's earlier external-directory
+ * approval, so eligible reads skip that host prompt.
  *
- * Truncated bash output points agents at these files. They live under the AFT
- * storage root, outside every project, and every task gets a freshly named
- * directory, so an "always allow" answer to an external-directory prompt never
- * matches the next task and unattended sessions stall on the prompt.
- *
- * The plugin cannot decide ownership itself: a `bash-tasks` path shape would
- * also match another session's output or any file dropped beside an artifact,
- * and with `restrict_to_project_root` off Rust would then read it with no
- * check at all. So the answer comes from `bash_artifact_owned`, which applies
- * `BgTaskRegistry::is_session_owned_artifact_path` (canonical path, exact
- * artifact name, requesting session). Any failure — an older binary, a closed
- * bridge, a malformed reply — counts as "not owned" so the prompt still runs.
+ * The plugin must not infer ownership from a path's shape. `bash_artifact_owned`
+ * checks the session's task records and canonical containment; Rust readers
+ * still enforce policy floors and opened-handle safety. An older binary, closed
+ * bridge, or malformed reply counts as not owned, preserving the prompt.
  */
 async function isSessionOwnedBashArtifact(
   ctx: PluginContext,

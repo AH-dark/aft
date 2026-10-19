@@ -55,10 +55,10 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 /// - `bash_regex_match`: pure regex compilation and matching for the plugins'
 ///   `bash_watch` validation and output scan; its parameters are only a regex
 ///   pattern and text, with no session or configuration privileges.
-/// - `bash_artifact_owned`: read-only yes/no answer to "is this path one of
-///   the requesting session's own background-bash output files?", which the
-///   plugins ask before raising an external-directory prompt for a read. It
-///   reads no file and grants nothing; the answer is scoped to the session.
+/// - `bash_artifact_owned`: read-only yes/no answer for the requesting
+///   session's registered bash outputs and sandbox scratch files/directories.
+///   Plugins ask before raising an external-directory prompt for a read. It
+///   reads no content and grants nothing; the answer is scoped to the session.
 /// - `bash_owned_tasks`: read-only active task ids from the bound session's
 ///   persisted owner records, used to clean up deliberately stopped workers.
 /// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for

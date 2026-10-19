@@ -958,7 +958,9 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
     }
+    let scratch_check = crate::task_temp_reads::check_path(path)?;
     let mut file = options.open(path)?;
+    crate::task_temp_reads::check_opened(path, scratch_check.as_ref(), &file)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(

@@ -288,13 +288,13 @@ describe("session-owned bash artifact reads", () => {
     },
   ];
 
-  function harness() {
+  function harness(ownedTarget = artifact) {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((command, params) =>
       command === "bash_artifact_owned"
         ? {
             success: true,
-            owned: params.path === artifact && params.session_id === "artifact-owner",
+            owned: params.path === ownedTarget && params.session_id === "artifact-owner",
           }
         : { success: true, text: "task output" },
     );
@@ -354,6 +354,34 @@ describe("session-owned bash artifact reads", () => {
         ),
       );
     });
+  }
+
+  for (const session of ["artifact-owner", "other-session"]) {
+    for (const target of [
+      "/aft-pi-scratch-fixture/.sandbox-tmp-task/scratch.rs",
+      "/aft-pi-scratch-fixture/.sandbox-tmp-task",
+    ]) {
+      test(`scratch read capability ${session} ${target}`, async () => {
+        for (const reader of readers) {
+          const { tools, calls } = harness(target);
+          const execute = executeTool(
+            tools.get(reader.name)!,
+            reader.args(target),
+            makeExtContext(projectRoot, session),
+          );
+          if (session === "artifact-owner") {
+            await execute;
+            expect(calls.some((call) => call.command === "tool_call")).toBe(true);
+          } else {
+            await expect(execute).rejects.toThrow(BLOCK_MESSAGE);
+            expect(calls.some((call) => call.command === "tool_call")).toBe(false);
+          }
+          expect(
+            calls.find((call) => call.command === "bash_artifact_owned")?.params,
+          ).toMatchObject({ path: target, session_id: session });
+        }
+      });
+    }
   }
 
   test("write to own artifact remains blocked", async () => {

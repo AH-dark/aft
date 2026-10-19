@@ -181,6 +181,7 @@ pub mod symbol_cache_disk;
 pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
+pub(crate) mod task_temp_reads;
 #[cfg(test)]
 pub(crate) mod test_storage;
 pub mod tool_gate;

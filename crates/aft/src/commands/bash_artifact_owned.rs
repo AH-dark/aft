@@ -1,20 +1,13 @@
-//! `bash_artifact_owned`: ask whether a path is one of the requesting
-//! session's own background-bash output files.
+//! `bash_artifact_owned`: query the session's read-only task-content capability.
 //!
-//! Plugins call this before raising an external-directory permission prompt
-//! for a read. Background task output (stdout, stderr, exit and pty files)
-//! lives under the AFT storage root, outside every project, and each task gets
-//! a freshly named directory, so a host "always allow" rule can never cover
-//! the next task. Truncated output points the agent at these files, which made
-//! every follow-up read stall an unattended session on a prompt.
+//! Plugins use this answer before raising an external-directory permission
+//! prompt. Eligible paths are exact registered bash output files, or files and
+//! directories inside scratch roots recorded on the session's existing tasks.
+//! Scratch ownership comes from the registry's spawn metadata, never a path's
+//! shape. Canonical targets outside the recorded root are not owned.
 //!
-//! The answer comes from
-//! [`crate::bash_background::BgTaskRegistry::is_session_owned_artifact_path`]:
-//! the canonical path must equal a registered artifact of a task owned by the
-//! requesting session. Anything else — another session's artifact, an
-//! unregistered file beside an artifact, a symlink or `..` path resolving
-//! elsewhere — answers `owned: false`, and the plugin prompts as usual. The
-//! command only answers a question; it grants nothing and reads no file.
+//! This command grants no access. The read tools still enforce policy floors,
+//! reject live SQLite content, and check opened scratch handles for escapes.
 
 use std::path::Path;
 
@@ -61,6 +54,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let owned = ctx
         .bash_background()
-        .is_session_owned_artifact_path(req.session(), &path);
+        .is_session_owned_artifact_path(req.session(), &path)
+        || ctx
+            .bash_background()
+            .is_session_owned_scratch_path(req.session(), &path);
     Response::success(&req.id, json!({ "owned": owned }))
 }

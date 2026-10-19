@@ -12652,9 +12652,10 @@ impl AppContext {
         Ok(resolved)
     }
 
-    /// Validate a read path. A file produced by a background bash task may live
-    /// outside the project root, so the session that owns the registered output
-    /// may read that specific file. Mutating tools deliberately use
+    /// Validate a read path. Registered bash output and a task's recorded
+    /// scratch directory may live outside the project root; their owning
+    /// session may read them without an additional permission request. Mutating
+    /// tools deliberately use
     /// [`AppContext::validate_path`] or [`AppContext::validate_write_location`]
     /// and never receive this exception.
     pub fn validate_read_path(
@@ -12687,8 +12688,21 @@ impl AppContext {
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
-            // Root restriction is disabled, so return the caller's input spelling
-            // unchanged. Canonical identities are used only for the policy check.
+            // Scratch readers use the canonical spelling checked by policy so
+            // aliases such as /tmp on macOS cannot evade the opened-handle fence.
+            if let Some(session) = artifact_session_id {
+                if self
+                    .bash_background
+                    .is_session_owned_scratch_path(session, path)
+                {
+                    let resolved = crate::bounded_io::canonicalize(path).map_err(|error| {
+                        crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+                    })?;
+                    self.check_path_access(req_id, path, &resolved, artifact_session_id, false)?;
+                    return Ok(resolved);
+                }
+            }
+            // Root restriction is disabled, so retain ordinary callers' spelling.
             self.check_path_access(req_id, path, path, artifact_session_id, false)?;
             return Ok(path.to_path_buf());
         };
@@ -12922,6 +12936,9 @@ impl AppContext {
         let owned_artifact = artifact_session.is_some_and(|session| {
             self.bash_background
                 .is_session_owned_artifact_path(session, &identity)
+                || self
+                    .bash_background
+                    .is_session_owned_scratch_path(session, &identity)
                 || self
                     .bash_background
                     .is_readable_task_path(session, &identity)

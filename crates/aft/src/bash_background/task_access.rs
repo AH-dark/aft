@@ -329,6 +329,39 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Scratch ownership comes only from a task still held by this registry.
+    /// The persisted sandbox path is recorded from the spawn plan, not inferred
+    /// from the scratch directory's name or its caller-writable contents.
+    pub(crate) fn is_session_owned_scratch_path(&self, session: &str, path: &Path) -> bool {
+        let Ok(requested) = fs::canonicalize(path) else {
+            return false;
+        };
+        if !crate::task_temp_reads::is_scratch(&requested) {
+            return false;
+        }
+        self.task_arcs().iter().any(|task| {
+            if task.session_id != session {
+                return false;
+            }
+            let root = task
+                .lock_state()
+                .ok()
+                .and_then(|state| state.metadata.sandbox_temp_dir.clone());
+            let Some(root) = root else {
+                return false;
+            };
+            // Do not canonicalize the recorded root into a replacement symlink.
+            // The allocator records an absolute, canonical directory at spawn.
+            crate::sandbox_spawn::is_managed_task_temp_dir(&root)
+                && requested.starts_with(&root)
+                && fs::canonicalize(&root).is_ok_and(|current| current == root)
+                && !crate::project_content::is_sqlite_or_metadata(&requested)
+                && fs::symlink_metadata(&requested).is_ok_and(|metadata| {
+                    metadata.is_dir() || metadata.is_file() && !has_multiple_hard_links(&metadata)
+                })
+        })
+    }
+
     fn head_reads_record(&self, record: &TaskReadRecord) -> bool {
         let Some(caller) = crate::access_policy::current_scope() else {
             return false;
