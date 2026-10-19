@@ -1,4 +1,4 @@
-//! A call-scoped module route delegates only exact reads, never general tools.
+//! Call-scoped Basal routes delegate read-only operations, never general tools.
 use super::*;
 use crate::commands::file_read_exact::{self, ReadExactRefusal as Refusal};
 use subc_protocol::{
@@ -153,6 +153,8 @@ pub(super) fn intercept(identity: &RouteIdentity, envelope: &Value) -> bool {
         .is_some_and(|s| s.scope_ref.starts_with("flow-read/"))
         || envelope.get("op").and_then(Value::as_str) == Some(file_read_exact::OPERATION)
         || envelope.get("name").and_then(Value::as_str) == Some(file_read_exact::OPERATION)
+        || envelope.get("op").and_then(Value::as_str) == Some(super::perf_sweep::OPERATION)
+        || envelope.get("name").and_then(Value::as_str) == Some(super::perf_sweep::OPERATION)
 }
 
 pub(super) fn admit_management(scope: Option<&ScopeStamp>) -> Result<(), ErrorBody> {
@@ -173,6 +175,11 @@ pub(super) async fn dispatch(
     active: &ActiveToolCalls,
     control: Option<&Arc<readiness::DaemonControl>>,
 ) -> Result<(), SubcError> {
+    let wait = if envelope.get("op").and_then(Value::as_str) == Some(super::perf_sweep::OPERATION) {
+        super::perf_sweep::DISPATCH_BUDGET
+    } else {
+        persistence::WAIT_BUDGET
+    };
     dispatch_with_wait(
         tx,
         metrics,
@@ -183,7 +190,7 @@ pub(super) async fn dispatch(
         executor,
         active,
         control,
-        persistence::WAIT_BUDGET,
+        wait,
         #[cfg(test)]
         DispatchHooks::default(),
     )
@@ -214,8 +221,12 @@ async fn dispatch_with_wait(
     #[cfg(test)] hooks: DispatchHooks,
 ) -> Result<(), SubcError> {
     let limit = Instant::now() + parent_wait;
+    let operation = match envelope.get("op").and_then(Value::as_str) {
+        Some(super::perf_sweep::OPERATION) => super::perf_sweep::OPERATION,
+        _ => file_read_exact::OPERATION,
+    };
     let admit = || {
-        if envelope.get("op").and_then(Value::as_str) != Some(file_read_exact::OPERATION) {
+        if envelope.get("op").and_then(Value::as_str) != Some(operation) {
             return Err(Refusal::RouteNotAdmitted("operation"));
         }
         let stamp = route_checks(&identity)?;
@@ -232,6 +243,14 @@ async fn dispatch_with_wait(
         Ok(admitted) => admitted,
         Err(error) => return send_provider_error(tx, metrics, frame, error.error()).await,
     };
+    let sweep = if operation == super::perf_sweep::OPERATION {
+        match super::perf_sweep::admit(&envelope) {
+            Ok(guard) => Some(guard),
+            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        }
+    } else {
+        None
+    };
     let route = route_key(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
     let request = RequestFrameMeta {
@@ -247,7 +266,7 @@ async fn dispatch_with_wait(
                 root_id: parent.root.clone(),
                 cancellation: JobCancellation::new(),
                 detach_policy: RouteDetachPolicy::CancelOnDetach,
-                tool: file_read_exact::OPERATION.into(),
+                tool: operation.into(),
                 started_at: Instant::now(),
                 request,
                 answering: false,
@@ -295,19 +314,25 @@ async fn dispatch_with_wait(
                         parent.root.clone(),
                         Lane::PureRead,
                         request_id.clone(),
-                        file_read_exact::OPERATION,
+                        operation,
                         Box::new(move |ctx| {
                             #[cfg(test)]
                             if let Some(before_read) = hooks.before_read {
                                 before_read();
                             }
-                            let result =
-                                read_as_parent(&identity, &parent, &envelope, ctx, deadline);
+                            let result = if let Some(_sweep) = sweep {
+                                unexpired(identity.scope.as_ref().expect("child route was checked"))
+                                    .map_err(Refusal::error)
+                                    .and_then(|_| super::perf_sweep::run(&envelope, deadline))
+                            } else {
+                                read_as_parent(&identity, &parent, &envelope, ctx, deadline)
+                                    .map_err(Refusal::error)
+                            };
                             Response::success(
                                 job_id,
                                 match result {
                                     Ok(value) => json!({"answer": value}),
-                                    Err(error) => json!({"error": error.error()}),
+                                    Err(error) => json!({"error": error}),
                                 },
                             )
                         }),
@@ -367,7 +392,7 @@ async fn dispatch_with_wait(
             corr,
             serde_json::to_vec(&body).unwrap(),
         ) {
-            let _ = send_reliable_writer_frame(&tx, &metrics, frame, "exact read reply").await;
+            let _ = send_reliable_writer_frame(&tx, &metrics, frame, "flow operation reply").await;
         }
         finish_active_tool_call(&active, route, corr);
     });

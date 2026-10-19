@@ -842,6 +842,18 @@ fn install_panic_hook(initial_path: PathBuf) {
     }));
 }
 
+/// The process log follows storage-root reconfiguration, not a caller's project.
+pub(crate) fn daemon_log_path() -> PathBuf {
+    let root = FILE_CONTROL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .storage_root
+        .clone()
+        .unwrap_or_else(|| crate::bash_background::storage_dir(None));
+    root.join("logs")
+        .join(format!("aft-{}.log", std::process::id()))
+}
+
 fn bounded_panic_text(args: std::fmt::Arguments<'_>, max_bytes: usize) -> String {
     use std::fmt::Write;
 

@@ -1353,3 +1353,43 @@ async fn flow_read_policy_lock_held_past_limit_replies_once_with_timeout() {
         );
     }
 }
+
+#[tokio::test]
+async fn perf_sweep_admission_only_the_basal_flow_route() {
+    let dir = tempfile::tempdir().unwrap();
+    for scope_ref in ["head/call", "codemode/call"] {
+        let mut scope = stamp();
+        scope["ref"] = json!(scope_ref);
+        let error = wire(
+            identity(dir.path(), scope, "reserved:basal"),
+            json!({"op":"perf.sweep"}),
+        )
+        .await;
+        assert_eq!(error["code"], "file_read_exact_route_not_admitted");
+        assert_eq!(error["message"], "Route not admitted: scope_ref.");
+    }
+    let error = wire(
+        identity(dir.path(), stamp(), "reserved:other"),
+        json!({"op":"perf.sweep"}),
+    )
+    .await;
+    assert_eq!(error["message"], "Route not admitted: principal.");
+    let error = wire(
+        identity(dir.path(), stamp(), "reserved:basal"),
+        json!({"op":"tool.call", "name":"perf.sweep", "arguments":{}}),
+    )
+    .await;
+    assert_eq!(error["message"], "Route not admitted: operation.");
+    let error = wire(
+        identity(dir.path(), stamp(), "reserved:basal"),
+        json!({"op":"perf.sweep"}),
+    )
+    .await;
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("no open AFT route for the parent head scope"),
+        "{error}"
+    );
+}
