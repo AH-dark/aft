@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -140,14 +140,15 @@ fn collect(
             (Vec::new(), 0)
         }
     };
-    let metrics =
-        match File::open(log).and_then(|file| parse_log(file, args.since_ms, byte_cap, line_cap)) {
-            Ok(value) => value,
-            Err(error) => {
-                gap("log", error.to_string());
-                Value::Null
-            }
-        };
+    let metrics = match File::open(log)
+        .and_then(|file| parse_log_tail(file, args.since_ms, byte_cap, line_cap))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            gap("log", error.to_string());
+            Value::Null
+        }
+    };
     json!({"pid": std::process::id(), "card_sha256": card,
         "uptime": os["uptime"], "cpu_percent": os["cpu_percent"], "rss_bytes": os["rss_bytes"],
         "load_average": load_average(), "since_ms": args.since_ms, "until_ms": until_ms,
@@ -225,6 +226,47 @@ struct ToolSamples {
     exec: Samples,
 }
 
+fn parse_log_tail(
+    mut file: File,
+    since_ms: u64,
+    byte_cap: u64,
+    line_cap: usize,
+) -> io::Result<Value> {
+    let len = file.metadata()?.len();
+    let offset = len.saturating_sub(byte_cap);
+    file.seek(SeekFrom::Start(offset))?;
+    let starts_at_line_boundary = if offset == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::Start(offset - 1))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)?;
+        previous[0] == b'\n'
+    };
+    file.seek(SeekFrom::Start(offset))?;
+    let mut input = BufReader::new(file.take(byte_cap));
+    if offset > 0 && !starts_at_line_boundary {
+        let mut partial = Vec::new();
+        input.read_until(b'\n', &mut partial)?;
+    }
+    parse_log(input, since_ms, byte_cap, line_cap)
+}
+
+fn log_timestamp(line: &str) -> Option<&str> {
+    let timestamp = line.split_whitespace().next()?;
+    let bytes = timestamp.as_bytes();
+    if bytes.len() < 19
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    Some(timestamp)
+}
+
 fn parse_log(input: impl Read, since_ms: u64, byte_cap: u64, line_cap: usize) -> io::Result<Value> {
     // Take bounds even a single unterminated line before read_until can allocate it.
     // The extra byte distinguishes an exact fit from a truncated prefix.
@@ -259,6 +301,7 @@ fn parse_log(input: impl Read, since_ms: u64, byte_cap: u64, line_cap: usize) ->
     let (mut bytes, mut scanned_lines, mut lines, mut refusals, mut warn, mut error, mut panic) =
         (0u64, 0, 0, 0, 0, 0, 0);
     let mut truncated = false;
+    let mut window_start = None::<String>;
     let mut buffer = Vec::new();
     while scanned_lines < line_cap {
         buffer.clear();
@@ -273,6 +316,14 @@ fn parse_log(input: impl Read, since_ms: u64, byte_cap: u64, line_cap: usize) ->
         }
         scanned_lines += 1;
         let line = String::from_utf8_lossy(&buffer);
+        if window_start.is_none() {
+            if let Some(timestamp) = log_timestamp(&line) {
+                window_start = Some(timestamp.to_owned());
+                if timestamp.get(..19).unwrap_or(timestamp) > since.as_str() {
+                    truncated = true;
+                }
+            }
+        }
         if line.chars().take(19).collect::<String>() < since {
             continue;
         }
@@ -368,6 +419,7 @@ fn parse_log(input: impl Read, since_ms: u64, byte_cap: u64, line_cap: usize) ->
     let tools_total = tools.len();
     Ok(
         json!({"lines_in_window": lines, "scanned_lines": scanned_lines, "scanned_bytes": bytes.min(byte_cap), "truncated": truncated,
+        "window_start": window_start,
         "stats": stats.iter_mut().map(|(key, samples)| (*key, samples.value())).collect::<BTreeMap<_, _>>(),
         "slow_by_tool": tools.into_iter().take(8).map(|(name, mut samples)| json!({"name": name, "count": samples.count,
             "total": samples.total.value(), "queue": samples.queue.value(), "exec": samples.exec.value()})).collect::<Vec<_>>(),

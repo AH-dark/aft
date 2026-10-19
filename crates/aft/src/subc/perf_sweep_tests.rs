@@ -163,10 +163,56 @@ fn perf_sweep_log_caps_stop_the_iterator_and_report_truncation() {
     );
     let exact = "2025-01-01T00:00:01 WARN one\n";
     assert_eq!(
-        parse_log(exact.as_bytes(), 0, exact.len() as u64, 1).unwrap()["truncated"],
+        parse_log(exact.as_bytes(), SINCE + 1_000, exact.len() as u64, 1).unwrap()["truncated"],
         false
     );
 }
+#[test]
+fn perf_sweep_reads_recent_entries_from_bounded_log_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("daemon.log");
+    let old_line = format!(
+        "2024-12-31T23:59:59.000Z [aft] WARN slow tool_call name=old total=999ms queue=1ms exec=998ms {}\n",
+        "x".repeat(LOG_BYTES as usize)
+    );
+    let recent = concat!(
+        "2025-01-01T00:00:01.000Z [aft] WARN slow tool_call name=recent total=11ms queue=2ms exec=9ms\n",
+        "2025-01-01T00:00:02.000Z [aft] WARN slow tool_call name=recent total=13ms queue=3ms exec=10ms\n",
+    );
+    std::fs::write(&log, format!("{old_line}{recent}")).unwrap();
+    assert!(std::fs::metadata(&log).unwrap().len() > LOG_BYTES);
+
+    let report = collect(
+        &Args {
+            since_ms: SINCE + 1_000,
+            profile_seconds: 15,
+        },
+        &log,
+        LOG_BYTES,
+        LOG_LINES,
+        || Ok(profile_fixture()),
+    );
+    assert_eq!(report["log"]["lines_in_window"], 2);
+    assert_eq!(report["log"]["stats"]["slow_total"]["n"], 2);
+    assert_eq!(report["log"]["slow_by_tool"][0]["name"], "recent");
+    assert_eq!(report["log"]["slow_by_tool"][0]["count"], 2);
+    assert_eq!(report["log"]["window_start"], "2025-01-01T00:00:01.000Z");
+    assert_eq!(report["log"]["truncated"], false);
+
+    let older = collect(
+        &Args {
+            since_ms: SINCE,
+            profile_seconds: 15,
+        },
+        &log,
+        LOG_BYTES,
+        LOG_LINES,
+        || Ok(profile_fixture()),
+    );
+    assert_eq!(older["log"]["truncated"], true);
+    assert_eq!(older["log"]["window_start"], "2025-01-01T00:00:01.000Z");
+}
+
 #[test]
 fn perf_sweep_parser_matches_script_python_on_shared_fixture() {
     let output = std::process::Command::new("python3")
@@ -188,7 +234,12 @@ fn perf_sweep_parser_matches_script_python_on_shared_fixture() {
     );
     let expected: Value = serde_json::from_slice(&output.stdout).unwrap();
     let mut actual = parse_log(FIXTURE.as_bytes(), SINCE, LOG_BYTES, LOG_LINES).unwrap();
-    for key in ["scanned_lines", "scanned_bytes", "truncated"] {
+    for key in [
+        "scanned_lines",
+        "scanned_bytes",
+        "truncated",
+        "window_start",
+    ] {
         actual.as_object_mut().unwrap().remove(key);
     }
     assert_eq!(actual, expected);
