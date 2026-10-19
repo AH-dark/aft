@@ -328,8 +328,9 @@ pub fn git_availability() -> &'static GitAvailability {
     })
 }
 
-/// Whether engine code may spawn `git`. Callers that get `false` take the
-/// same fallback they use for a directory that is not a git repository.
+/// Whether engine code may spawn `git`. A disabled tool cannot determine whether
+/// a directory is a repository or which index data belongs to it. Preserve that
+/// uncertainty rather than using it to choose another identity or delete data.
 pub fn git_usable() -> bool {
     matches!(git_availability(), GitAvailability::Usable)
 }

@@ -123,6 +123,14 @@ impl<'a> Probe<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        // Unavailable Git cannot attest repository absence. Do not launch the
+        // developer-tools installer while trying to determine an identity.
+        if !crate::developer_tools::git_usable() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON,
+            ));
+        }
         let output = self.command().args(args).output()?;
         self.spawned += 1;
         Ok(output)

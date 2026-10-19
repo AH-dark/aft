@@ -571,9 +571,6 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 }
 
 fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
-    if !crate::developer_tools::git_usable() {
-        return Err("not_a_git_root".to_string());
-    }
     let stdout = match crate::git_probe::toplevel_in_directory(base_dir) {
         Ok(stdout) => stdout,
         Err(crate::git_probe::ProbeError::Spawn(error))
@@ -604,6 +601,72 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_git_is_uncertainty_without_launching_the_installer() {
+        const CHILD_DIR: &str = "AFT_STORAGE_GIT_UNAVAILABLE_ROOT";
+        if let Some(base) = std::env::var_os(CHILD_DIR) {
+            let base = PathBuf::from(base);
+            assert!(!crate::developer_tools::git_usable());
+            let result = resolve_git_root_from_user_path(
+                &base.join("configured"),
+                &base.join("requested").display().to_string(),
+            );
+            let probe = crate::git_probe::toplevel(&base.join("requested"));
+            let standing = crate::scoped_key::resolve_standing_root(
+                &base.join("requested").display().to_string(),
+            );
+            let cache = crate::search_index::artifact_cache_key_with_memo(
+                &base.join("requested"),
+                &base.join("requested"),
+                &base.join("storage"),
+                None,
+            );
+            let outcomes = [
+                matches!(result, Err(GitRootResolutionError::Other(_))),
+                matches!(probe, Err(crate::git_probe::ProbeError::Spawn(_))),
+                matches!(
+                    standing,
+                    Err(crate::scoped_key::ScopedKeyError::GitProbe { .. })
+                ),
+                cache.is_err(),
+                !base.join("launched").exists(),
+            ];
+            assert_eq!(outcomes, [true; 5], "unavailable Git must preserve readonly/probe/standing/cache uncertainty and never launch the installer");
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let launcher = base.path().join("launcher");
+        std::fs::create_dir_all(&launcher).unwrap();
+        for name in ["configured", "requested"] {
+            std::fs::create_dir(base.path().join(name)).unwrap();
+        }
+        std::fs::create_dir(base.path().join("requested/.git")).unwrap();
+        let script = launcher.join("git");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 1\n",
+                base.path().join("launched").display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "readonly_artifacts::tests::unavailable_git_is_uncertainty_without_launching_the_installer"])
+            .env(CHILD_DIR, base.path()).env("PATH", &launcher).env("AFT_TEST_RAW_PATH", "1")
+            .env("AFT_TEST_DEVELOPER_TOOLS", "absent").env("AFT_TEST_XCODE_LAUNCHER_DIRS", &launcher)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "unavailable-Git child: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!base.path().join("launched").exists());
+    }
+
     use super::*;
 
     use std::collections::BTreeMap;

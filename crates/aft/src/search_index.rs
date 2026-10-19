@@ -8145,11 +8145,12 @@ fn git_root_commit_once_real(
     project_root: &Path,
     timings: &mut ArtifactCacheKeyTimings,
 ) -> RootCommitProbe {
-    // Without runnable git, answer the way a non-git directory does: a
-    // deterministic NotARepo, so the caller takes the path-identity fallback
-    // and never retries.
+    // Keep the availability timing, but preserve uncertainty: a disabled Git
+    // cannot justify switching a repository's stored data to path identity.
     if !time_cache_key_work(&mut timings.git_usable, crate::developer_tools::git_usable) {
-        return RootCommitProbe::NotARepo;
+        return RootCommitProbe::Transient(
+            crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string(),
+        );
     }
     #[cfg(test)]
     ROOT_COMMIT_GIT_RUNS.with(|runs| {

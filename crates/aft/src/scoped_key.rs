@@ -308,9 +308,6 @@ fn unicode_path(path: &Path) -> Result<String, ScopedKeyError> {
 }
 
 fn find_git_toplevel(path: &Path) -> Result<Option<PathBuf>, ScopedKeyError> {
-    if !crate::developer_tools::git_usable() {
-        return Ok(None);
-    }
     let stdout = match crate::git_probe::toplevel(path) {
         Ok(stdout) => stdout,
         Err(crate::git_probe::ProbeError::Spawn(error)) => {
