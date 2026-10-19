@@ -728,6 +728,7 @@ pub(crate) mod stat_probe {
         static CANDIDATES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    #[cfg(unix)]
     pub(crate) fn record_followed(path: &Path) {
         if !CANDIDATES_ONLY.with(|only| only.get()) {
             record(path);
@@ -736,6 +737,7 @@ pub(crate) mod stat_probe {
 
     /// Count lstat candidates without counting stat calls that refresh SQLite
     /// sidecar identities. Their warm-up state must not look like a walker gain.
+    #[cfg(unix)]
     pub(crate) fn count_candidates(f: impl FnOnce()) -> BTreeMap<PathBuf, usize> {
         struct Reset;
         impl Drop for Reset {

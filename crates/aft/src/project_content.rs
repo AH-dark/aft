@@ -205,8 +205,9 @@ fn excluded_error() -> std::io::Error {
     )
 }
 
-/// Independent pre-optimization oracle for walker admission parity tests.
-#[cfg(test)]
+/// Independent pre-optimization oracle for walker admission parity tests,
+/// which run on Unix only.
+#[cfg(all(test, unix))]
 pub(crate) fn legacy_walker_excludes(path: &Path, file_type: Option<&std::fs::FileType>) -> bool {
     let known_directory = file_type.is_some_and(std::fs::FileType::is_dir);
     let metadata = (!known_directory)
