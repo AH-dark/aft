@@ -972,8 +972,66 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
             }
             lines.join("\n")
         }
+        Some("purge") => format_safety_purge(response),
         _ => "No safety result.".to_string(),
     }
+}
+
+/// Reply text for `aft_safety` op `purge`: what was removed, what could not
+/// be, and that none of it can be recovered.
+fn format_safety_purge(response: &serde_json::Map<String, Value>) -> String {
+    let path = import_string_field(response, "path").unwrap_or_else(|| "(path)".to_string());
+    let stacks = number_field(response, "undo_stacks_removed").unwrap_or(0);
+    let entries = number_field(response, "undo_entries_removed").unwrap_or(0);
+    let complete = response.get("complete").and_then(Value::as_bool) != Some(false);
+    let mut lines = vec![if complete {
+        format!("purged {}", shorten_path(&path))
+    } else {
+        format!("purged {} (incomplete)", shorten_path(&path))
+    }];
+    lines.push(if stacks == 0 {
+        "undo: no backups of this session held this path".to_string()
+    } else {
+        format!("undo: removed {entries} backup(s) of {stacks} file(s)")
+    });
+    let pruned = records_field(response, "checkpoints_pruned")
+        .iter()
+        .filter_map(|record| {
+            let name = record.get("name").and_then(Value::as_str)?;
+            let files = record
+                .get("files_removed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(format!("{name} ({files} file(s) removed)"))
+        })
+        .collect::<Vec<_>>();
+    let dropped = string_array(response.get("checkpoints_dropped"));
+    if pruned.is_empty() && dropped.is_empty() {
+        lines.push("checkpoints: none of this session's checkpoints held this path".to_string());
+    } else {
+        if !pruned.is_empty() {
+            lines.push(format!("checkpoints pruned: {}", pruned.join(", ")));
+        }
+        if !dropped.is_empty() {
+            lines.push(format!("checkpoints dropped: {}", dropped.join(", ")));
+        }
+    }
+    for failure in records_field(response, "failures") {
+        let target = failure
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)");
+        let error = failure
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        lines.push(format!("not removed: {target}: {error}"));
+    }
+    lines.push(
+        "This cannot be undone: the removed copies are gone and aft_safety undo or restore cannot bring them back."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 /// Most paths a checkpoint or restore result lists before summarising the rest.

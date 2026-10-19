@@ -40,13 +40,13 @@ function responsePaths(response: Record<string, unknown>): string[] {
 }
 
 const SafetyParams = Type.Object({
-  op: StringEnum(["undo", "history", "checkpoint", "restore", "list"] as const, {
+  op: StringEnum(["undo", "history", "checkpoint", "restore", "list", "purge"] as const, {
     description: "Safety operation",
   }),
   path: Type.Optional(
     Type.String({
       description:
-        "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root.",
+        "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file, required for purge — a file or directory). Absolute or relative to project root.",
     }),
   ),
   name: Type.Optional(
@@ -148,6 +148,26 @@ export function buildSafetySections(args: unknown, payload: unknown, theme: Them
     return sections;
   }
 
+  if (op === "purge") {
+    const pruned = asRecords(response.checkpoints_pruned)
+      .map((entry) => asString(entry.name))
+      .filter((name): name is string => Boolean(name));
+    const dropped = Array.isArray(response.checkpoints_dropped)
+      ? response.checkpoints_dropped.filter((name): name is string => typeof name === "string")
+      : [];
+    const failures = asRecords(response.failures);
+    return [
+      `${theme.fg("success", "purged")} ${theme.fg("accent", shortenPath(asString(response.path) ?? path ?? "(path)"))}`,
+      `${theme.fg("muted", "undo backups removed")} ${asNumber(response.undo_entries_removed) ?? 0}`,
+      pruned.length > 0 ? `${theme.fg("muted", "checkpoints pruned")} ${pruned.join(", ")}` : "",
+      dropped.length > 0 ? `${theme.fg("muted", "checkpoints dropped")} ${dropped.join(", ")}` : "",
+      failures.length > 0
+        ? `${theme.fg("warning", "not removed")}\n${failures.map((entry) => `  ↳ ${asString(entry.target) ?? "(unknown)"}: ${asString(entry.error) ?? "unknown error"}`).join("\n")}`
+        : "",
+      theme.fg("warning", "This cannot be undone."),
+    ].filter((section) => section.length > 0);
+  }
+
   const knownDetails = [path, name].filter((value): value is string => Boolean(value));
   return [theme.fg("muted", "Safety result available."), ...knownDetails];
 }
@@ -191,7 +211,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       name: "aft_safety",
       label: "safety",
       description:
-        "`undo` reverts a tool call (omit path) or latest file snapshot (irreversible); `history` lists snapshots; `checkpoint` saves named snapshots on disk across restarts, expiring after 14 days (contents may include secrets); `restore` restores a checkpoint, optionally scoped by path/files; `list` lists checkpoints. Undo keeps 20 snapshots/file (oldest evicted).",
+        "`undo` reverts a tool call (omit path) or latest file snapshot (irreversible); `history` lists snapshots; `checkpoint` saves named snapshots on disk across restarts, expiring after 14 days (contents may include secrets); `restore` restores a checkpoint, optionally scoped by path/files; `list` lists checkpoints; `purge` permanently deletes this session's undo backups and checkpoint copies of a file or directory `path` (cannot be undone). Undo keeps 20 snapshots/file (oldest evicted).",
       parameters: SafetyParams,
       async execute(
         _toolCallId: string,
@@ -200,7 +220,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         _onUpdate,
         extCtx,
       ) {
-        if (params.op === "history" && !params.path) {
+        if ((params.op === "history" || params.op === "purge") && !params.path) {
           throw new Error(`op='${params.op}' requires 'path'`);
         }
         if ((params.op === "checkpoint" || params.op === "restore") && !params.name) {
@@ -253,6 +273,16 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
               restrictToProjectRoot,
             });
           }
+        }
+
+        if (params.op === "purge" && params.path) {
+          // Pi has no edit prompt; the purge path gets the same project-root
+          // check every other write in this plugin gets.
+          await assertExternalDirectoryPermission(
+            extCtx,
+            await resolvePathArg(extCtx.cwd, params.path),
+            { restrictToProjectRoot },
+          );
         }
 
         const rawArgs: Record<string, unknown> = { op: params.op };

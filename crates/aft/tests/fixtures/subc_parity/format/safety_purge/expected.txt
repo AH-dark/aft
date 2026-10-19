@@ -1,0 +1,5 @@
+purged <PROJECT_ROOT>/secret.env
+undo: removed 3 backup(s) of 1 file(s)
+checkpoints pruned: pre-edit (1 file(s) removed)
+checkpoints dropped: only-secret
+This cannot be undone: the removed copies are gone and aft_safety undo or restore cannot bring them back.

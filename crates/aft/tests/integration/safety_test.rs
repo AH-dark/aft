@@ -2744,3 +2744,232 @@ fn undo_miss_message_echoes_resolved_absolute_path() {
     assert!(status.success());
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Send `command` with `fields` on behalf of `session`.
+fn session_send(
+    aft: &mut AftProcess,
+    session: &str,
+    id: &str,
+    command: &str,
+    fields: serde_json::Value,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({ "id": id, "command": command, "session_id": session });
+    for (key, value) in fields.as_object().expect("fields object") {
+        request[key] = value.clone();
+    }
+    aft.send(&request.to_string())
+}
+
+/// Record one undo backup of `file` for `session`, then change the file so the
+/// next backup captures different content.
+fn session_snapshot(aft: &mut AftProcess, session: &str, file: &std::path::Path, next: &str) {
+    let response = session_send(
+        aft,
+        session,
+        &format!("snap-{session}-{}", file.display()),
+        "snapshot",
+        serde_json::json!({ "file": file }),
+    );
+    assert_eq!(response["success"], true, "snapshot: {response:?}");
+    fs::write(file, next).unwrap();
+}
+
+fn session_purge(aft: &mut AftProcess, session: &str, path: &str) -> serde_json::Value {
+    let response = session_send(
+        aft,
+        session,
+        &format!("purge-{session}-{path}"),
+        "tool_call",
+        serde_json::json!({
+            "name": "safety",
+            "arguments": { "op": "purge", "path": path },
+        }),
+    );
+    assert_eq!(response["success"], true, "purge {path}: {response:?}");
+    assert!(
+        response["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("This cannot be undone")),
+        "purge reply must say it is irreversible: {response:?}"
+    );
+    response
+}
+
+fn session_undo_code(aft: &mut AftProcess, session: &str, file: &std::path::Path) -> String {
+    let response = session_send(
+        aft,
+        session,
+        &format!("undo-{session}-{}", file.display()),
+        "undo",
+        serde_json::json!({ "file": file }),
+    );
+    if response["success"] == true {
+        "ok".to_string()
+    } else {
+        response["code"].as_str().unwrap_or_default().to_string()
+    }
+}
+
+fn checkpoint_names(aft: &mut AftProcess, session: &str) -> Vec<String> {
+    let response = session_send(
+        aft,
+        session,
+        &format!("list-{session}"),
+        "list_checkpoints",
+        serde_json::json!({}),
+    );
+    assert_eq!(response["success"], true, "list: {response:?}");
+    let mut names = response["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|checkpoint| checkpoint["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn purged_file_cannot_be_undone_or_restored_and_other_sessions_keep_theirs() {
+    let dir = temp_dir("purge_file");
+    let secret = dir.join("secret.env");
+    let keep = dir.join("keep.txt");
+    fs::write(&secret, "token=0").unwrap();
+    fs::write(&keep, "keep-0").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-purge-file");
+    session_snapshot(&mut aft, "s1", &secret, "token=1");
+    session_snapshot(&mut aft, "s1", &secret, "token=2");
+    session_snapshot(&mut aft, "s1", &keep, "keep-1");
+    session_snapshot(&mut aft, "s2", &secret, "token=3");
+    for (session, name, files) in [
+        ("s1", "both", vec![&secret, &keep]),
+        ("s1", "solo", vec![&secret]),
+        ("s2", "theirs", vec![&secret]),
+    ] {
+        let response = session_send(
+            &mut aft,
+            session,
+            &format!("cp-{name}"),
+            "checkpoint",
+            serde_json::json!({ "name": name, "files": files }),
+        );
+        assert_eq!(response["success"], true, "checkpoint {name}: {response:?}");
+    }
+
+    let purge = session_purge(&mut aft, "s1", "secret.env");
+    assert_eq!(purge["undo_stacks_removed"], 1, "{purge:?}");
+    assert_eq!(purge["undo_entries_removed"], 2, "{purge:?}");
+    assert_eq!(
+        purge["checkpoints_pruned"],
+        serde_json::json!([{ "name": "both", "files_removed": 1 }])
+    );
+    assert_eq!(purge["checkpoints_dropped"], serde_json::json!(["solo"]));
+    assert_eq!(purge["complete"], true);
+    let text = purge["text"].as_str().unwrap();
+    assert!(text.contains("both"), "{text}");
+    assert!(text.contains("solo"), "{text}");
+
+    assert_eq!(
+        session_undo_code(&mut aft, "s1", &secret),
+        "no_undo_history"
+    );
+    let restore = session_send(
+        &mut aft,
+        "s1",
+        "restore-solo",
+        "restore_checkpoint",
+        serde_json::json!({ "name": "solo" }),
+    );
+    assert_eq!(restore["code"], "checkpoint_not_found", "{restore:?}");
+    let restore = session_send(
+        &mut aft,
+        "s1",
+        "restore-both-secret",
+        "restore_checkpoint",
+        serde_json::json!({ "name": "both", "file": secret }),
+    );
+    assert_eq!(restore["success"], false, "{restore:?}");
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "token=3");
+    assert_eq!(checkpoint_names(&mut aft, "s1"), vec!["both".to_string()]);
+
+    // The caller's other file and the other session's copies are untouched.
+    assert_eq!(session_undo_code(&mut aft, "s1", &keep), "ok");
+    assert_eq!(fs::read_to_string(&keep).unwrap(), "keep-0");
+    assert_eq!(checkpoint_names(&mut aft, "s2"), vec!["theirs".to_string()]);
+    assert_eq!(session_undo_code(&mut aft, "s2", &secret), "ok");
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "token=2");
+
+    assert!(aft.shutdown().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn purge_of_a_directory_then_of_the_project_root() {
+    let dir = temp_dir("purge_directory");
+    let inside = dir.join("sub/a.txt");
+    let nested = dir.join("sub/deep/b.txt");
+    // Shares the string prefix `sub` without being inside it.
+    let sibling = dir.join("subling/c.txt");
+    let top = dir.join("top.txt");
+    let files = [&inside, &nested, &sibling, &top];
+    for file in files {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "v0").unwrap();
+    }
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-purge-directory");
+    for file in files {
+        session_snapshot(&mut aft, "s1", file, "v1");
+    }
+    session_snapshot(&mut aft, "s2", &inside, "v2");
+    let response = session_send(
+        &mut aft,
+        "s1",
+        "cp-all",
+        "checkpoint",
+        serde_json::json!({ "name": "all", "files": files }),
+    );
+    assert_eq!(response["success"], true, "checkpoint: {response:?}");
+
+    let purge = session_purge(&mut aft, "s1", "sub");
+    assert_eq!(purge["undo_stacks_removed"], 2, "{purge:?}");
+    assert_eq!(
+        purge["checkpoints_pruned"],
+        serde_json::json!([{ "name": "all", "files_removed": 2 }])
+    );
+    assert_eq!(purge["checkpoints_dropped"], serde_json::json!([]));
+    assert_eq!(
+        session_undo_code(&mut aft, "s1", &inside),
+        "no_undo_history"
+    );
+    assert_eq!(
+        session_undo_code(&mut aft, "s1", &nested),
+        "no_undo_history"
+    );
+    let paths = session_send(
+        &mut aft,
+        "s1",
+        "cp-all-paths",
+        "checkpoint_paths",
+        serde_json::json!({ "name": "all" }),
+    );
+    assert_eq!(paths["file_count"], 2, "{paths:?}");
+
+    let purge = session_purge(&mut aft, "s1", &dir.display().to_string());
+    assert_eq!(purge["undo_stacks_removed"], 2, "{purge:?}");
+    assert_eq!(purge["checkpoints_dropped"], serde_json::json!(["all"]));
+    for file in files {
+        assert_eq!(session_undo_code(&mut aft, "s1", file), "no_undo_history");
+    }
+    assert!(checkpoint_names(&mut aft, "s1").is_empty());
+
+    // Neither purge reached the other session.
+    assert_eq!(session_undo_code(&mut aft, "s2", &inside), "ok");
+    assert_eq!(fs::read_to_string(&inside).unwrap(), "v1");
+
+    assert!(aft.shutdown().success());
+    let _ = fs::remove_dir_all(&dir);
+}

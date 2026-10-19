@@ -75,7 +75,7 @@ Registered unless listed in `disabled_tools`.
 | `aft_conflicts` | Show all git merge conflicts with line-numbered regions | `path` (optional) |
 | `aft_search` | Hybrid semantic + lexical code search by meaning | `query`, `topK`, `path` |
 | `aft_inspect` | Codebase-health snapshot (TODOs, metrics, dead code, unused exports, duplicates) | `sections`, `scope`, `topK` |
-| `aft_safety` | Undo, history, checkpoints, restore | `op`, `path`, `name` |
+| `aft_safety` | Undo, history, checkpoints, restore, purge | `op`, `path`, `name` |
 
 Default-off tools (in the default `disabled_tools`; set an explicit list such as `[]` to
 enable them) plus the call graph:
@@ -1299,6 +1299,7 @@ Backup and recovery for risky edits.
 | `checkpoint` | Save a named snapshot; explicit files may be untracked or gitignored |
 | `restore` | Restore files to a named checkpoint |
 | `list` | List all available checkpoints |
+| `purge` | Permanently delete this session's undo backups and checkpoint copies of `path` (a file, or everything under a directory, up to the project root); asks edit permission for the path and cannot be undone |
 
 ```json
 // Checkpoint before a multi-file refactor

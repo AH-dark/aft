@@ -441,6 +441,76 @@ pub fn purge_as_owner(
     Ok(purge_backups(&request, db, live_stores))
 }
 
+/// Remove one session's undo stacks at or under `path`, for the agent-facing
+/// `aft_safety` purge op.
+///
+/// Only `session` is matched, in every harness namespace of the store's
+/// storage, so another session's stacks are never touched. The database
+/// handle is the store's own (the connection that owns `aft.db` in this
+/// process); `resident_db` is consulted only when the store has none attached
+/// and must likewise return an already-open handle, never open a new one. The
+/// caller must not hold `store`'s mutex: the purge takes it itself.
+pub fn purge_session_path(
+    store: &parking_lot::Mutex<BackupStore>,
+    session: &str,
+    path: &Path,
+    resident_db: impl FnOnce(&Path) -> Option<Arc<Mutex<TrackedConnection>>>,
+) -> Result<PurgeReport, String> {
+    let (storage_dir, own_db) = {
+        let guard = store.lock();
+        (
+            guard.storage_dir.clone(),
+            guard.db_pool.read().ok().and_then(|slot| slot.clone()),
+        )
+    };
+    let Some(storage_dir) = storage_dir else {
+        return Ok(purge_session_path_in_memory(store, session, path));
+    };
+    let request = PurgeRequest {
+        path: Some(path.to_path_buf()),
+        session: Some(session.to_string()),
+        harness: None,
+        dry_run: false,
+        storage_dir,
+    };
+    request.validate()?;
+    let db = own_db.or_else(|| resident_db(&request.storage_dir.join("aft.db")));
+    Ok(purge_backups(&request, db, &[store]))
+}
+
+/// A store with no storage directory keeps its stacks only in memory, so
+/// forgetting them there removes them completely.
+fn purge_session_path_in_memory(
+    store: &parking_lot::Mutex<BackupStore>,
+    session: &str,
+    path: &Path,
+) -> PurgeReport {
+    let filter = canonicalize_key(path);
+    let mut guard = store.lock();
+    let keys = guard
+        .in_memory_stack_keys()
+        .into_iter()
+        .filter(|(owner, key)| owner == session && key_matches(key, Some(&filter)))
+        .collect::<Vec<_>>();
+    let mut removed = TotalsBuilder::default();
+    for (owner, key) in keys {
+        let measure = StackMeasure {
+            entries: guard.in_memory_entry_count(&owner, &key),
+            ..StackMeasure::default()
+        };
+        guard.evict_purged_stack(&owner, &key);
+        removed.add(&owner, &measure);
+    }
+    let removed = removed.finish();
+    PurgeReport {
+        dry_run: false,
+        matched: removed.clone(),
+        removed,
+        live_stores: 1,
+        ..PurgeReport::default()
+    }
+}
+
 fn open_purge_db(
     storage_dir: &Path,
     dry_run: bool,

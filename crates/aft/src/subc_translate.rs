@@ -2219,15 +2219,16 @@ fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, Tran
         "checkpoint" => "checkpoint",
         "restore" => "restore_checkpoint",
         "list" => "list_checkpoints",
+        "purge" => "safety_purge",
         other => {
             return Err(invalid_request(format!(
-                "aft_safety: invalid op {other:?}; expected 'undo', 'history', 'checkpoint', 'restore', or 'list'"
+                "aft_safety: invalid op {other:?}; expected 'undo', 'history', 'checkpoint', 'restore', 'list', or 'purge'"
             )));
         }
     };
 
-    if op == "history" && map_in.get("path").and_then(Value::as_str).is_none() {
-        return Err(invalid_request("'path' is required for 'history' op"));
+    if matches!(op, "history" | "purge") && map_in.get("path").and_then(Value::as_str).is_none() {
+        return Err(invalid_request(format!("'path' is required for '{op}' op")));
     }
     if matches!(op, "checkpoint" | "restore")
         && map_in.get("name").and_then(Value::as_str).is_none()

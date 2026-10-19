@@ -62,6 +62,7 @@ pub mod read;
 pub mod remove_import;
 pub mod restore_checkpoint;
 mod rollback_outcome;
+pub mod safety_purge;
 pub mod semantic_search;
 pub mod state;
 pub mod status;

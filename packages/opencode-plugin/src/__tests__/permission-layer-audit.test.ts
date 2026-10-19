@@ -1404,6 +1404,72 @@ describe("permission audit regressions", () => {
     expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "safety"]);
   });
 
+  test("aft_safety purge of a file asks edit for that file, then calls the bridge", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true }));
+
+    const raw = (await tools.aft_safety.execute(
+      { op: "purge", filePath: "secret.env" },
+      sdkCtx,
+    )) as string;
+
+    expect(raw).toBe("ok");
+    expect(askCalls.map((call) => [call.permission, call.patterns])).toEqual([
+      ["edit", ["secret.env"]],
+    ]);
+    expect(calls.map((call) => call.command)).toEqual(["safety"]);
+    expect(calls[0]?.params).toMatchObject({ op: "purge", filePath: "secret.env" });
+  });
+
+  test("aft_safety purge of a directory asks edit for it and everything under it", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    await mkdir(path.join(project, "secrets"), { recursive: true });
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { tools } = createHarness(safetyTools, () => ({ success: true }));
+
+    await tools.aft_safety.execute({ op: "purge", filePath: "secrets" }, sdkCtx);
+    await tools.aft_safety.execute({ op: "purge", filePath: project }, sdkCtx);
+
+    expect(askCalls.map((call) => call.patterns)).toEqual([
+      ["secrets", path.join("secrets", "*")],
+      [".", "*"],
+    ]);
+  });
+
+  test("aft_safety purge stops before the bridge when edit permission is denied", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(
+      project,
+      recordingAsk(askCalls, { permission: "edit", message: "edit denied by policy" }),
+    );
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true }));
+
+    const raw = (await tools.aft_safety.execute(
+      { op: "purge", filePath: "secret.env" },
+      sdkCtx,
+    )) as string;
+
+    expect(parsePermissionDenied(raw).message).toBe("edit denied by policy");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("aft_safety purge without a path is refused before any ask", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true }));
+
+    await expect(tools.aft_safety.execute({ op: "purge" }, sdkCtx)).rejects.toThrow(
+      "'path' is required for 'purge' op",
+    );
+    expect(askCalls).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
   test("aft_safety checkpoint checks a single external filePath", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];

@@ -1,0 +1,6 @@
+{
+  "args": {
+    "file": "<PROJECT_ROOT>/src"
+  },
+  "command": "safety_purge"
+}

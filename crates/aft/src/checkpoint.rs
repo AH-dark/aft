@@ -66,6 +66,20 @@ pub struct CheckpointInfo {
     pub unchanged: Vec<PathBuf>,
 }
 
+/// What [`CheckpointStore::purge_paths`] changed in one session.
+#[derive(Debug, Default)]
+pub struct CheckpointPurge {
+    /// Checkpoints rewritten without the purged files, with how many files
+    /// each lost.
+    pub pruned: Vec<(String, usize)>,
+    /// Checkpoints removed whole, because every file in them was purged or
+    /// because rewriting them without those files failed.
+    pub dropped: Vec<String>,
+    /// Checkpoints that may still hold purged content because removing them
+    /// failed, with the error.
+    pub failures: Vec<(String, String)>,
+}
+
 /// A stored checkpoint: a snapshot of multiple file contents and metadata.
 #[derive(Debug, Clone)]
 struct Checkpoint {
@@ -791,6 +805,91 @@ impl CheckpointStore {
             self.checkpoints.remove(session);
         }
         removed
+    }
+
+    /// Permanently remove every file `matches` selects from this session's
+    /// checkpoints, on disk and in memory. `matches` receives each stored path
+    /// made absolute and normalized.
+    ///
+    /// A checkpoint that keeps other files is rewritten without the selected
+    /// ones, and their blobs are deleted. A checkpoint left with no files is
+    /// dropped, and so is one whose rewrite fails: keeping the old copy would
+    /// keep the content the caller asked to remove. Other sessions'
+    /// checkpoints are never read.
+    pub fn purge_paths(
+        &mut self,
+        session: &str,
+        matches: &dyn Fn(&Path) -> bool,
+    ) -> Result<CheckpointPurge, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
+        let mut names = self
+            .checkpoints
+            .get(session)
+            .map(|checkpoints| checkpoints.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        names.sort();
+
+        let mut report = CheckpointPurge::default();
+        for name in names {
+            let Some(mut checkpoint) = self
+                .checkpoints
+                .get_mut(session)
+                .and_then(|checkpoints| checkpoints.remove(&name))
+            else {
+                continue;
+            };
+            let before = checkpoint.file_contents.len();
+            checkpoint
+                .file_contents
+                .retain(|path, _| !matches(&absolute_checkpoint_path(path.clone())));
+            let removed = before - checkpoint.file_contents.len();
+            if removed == 0 {
+                self.checkpoints
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(name, checkpoint);
+                continue;
+            }
+
+            let rewrite_error = if checkpoint.file_contents.is_empty() {
+                None
+            } else {
+                if let Some(dir) = self.durable_checkpoint_dir(session, &name) {
+                    self.hydrated_checkpoints
+                        .get_mut()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&dir);
+                }
+                match self.persist_checkpoint_locked(session, &checkpoint) {
+                    Ok(()) => {
+                        self.checkpoints
+                            .entry(session.to_string())
+                            .or_default()
+                            .insert(name.clone(), checkpoint);
+                        report.pruned.push((name, removed));
+                        continue;
+                    }
+                    Err(error) => Some(error),
+                }
+            };
+            if let Some(error) = &rewrite_error {
+                crate::slog_warn!(
+                    "checkpoint {} could not be rewritten during purge; dropping it: {}",
+                    name,
+                    error
+                );
+            }
+            match self.remove_checkpoint_from_disk_locked(session, &name) {
+                Ok(()) => report.dropped.push(name),
+                Err(error) => report.failures.push((name, error.to_string())),
+            }
+        }
+        if self.checkpoints.get(session).is_some_and(HashMap::is_empty) {
+            self.checkpoints.remove(session);
+        }
+        Ok(report)
     }
 
     /// List all checkpoints for this session with metadata, hydrating from the
@@ -3551,5 +3650,98 @@ mod tests {
         store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
         assert_eq!(fs::read_to_string(&source).unwrap(), "secret-token");
         assert_eq!(mode_of(&source), 0o644);
+    }
+
+    /// Every `file_*.blob` under a checkpoint directory, read back.
+    fn blob_contents(checkpoint_dir: &Path) -> Vec<String> {
+        let mut contents = fs::read_dir(checkpoint_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("file_") && name.ends_with(".blob")
+                            })
+                    })
+                    .map(|path| fs::read_to_string(path).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        contents.sort();
+        contents
+    }
+
+    #[test]
+    fn purge_paths_prunes_shared_checkpoints_and_drops_emptied_ones() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        let keep = project.path().join("keep.txt");
+        fs::write(&secret, "token=1").unwrap();
+        fs::write(&keep, "keep-1").unwrap();
+
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "both", vec![secret.clone(), keep.clone()])
+            .unwrap();
+        store
+            .create_for_files("s1", "only-secret", vec![secret.clone()])
+            .unwrap();
+        store
+            .create_for_files("s1", "only-keep", vec![keep.clone()])
+            .unwrap();
+        store
+            .create_for_files("s2", "theirs", vec![secret.clone()])
+            .unwrap();
+
+        let report = store
+            .purge_paths("s1", &|path: &Path| path == secret.as_path())
+            .unwrap();
+
+        assert_eq!(report.pruned, vec![("both".to_string(), 1)]);
+        assert_eq!(report.dropped, vec!["only-secret".to_string()]);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+        // A restarted store sees exactly what the purge left on disk.
+        let mut reloaded = fresh_checkpoint_store(storage.path());
+        let names = reloaded
+            .list("s1")
+            .unwrap()
+            .into_iter()
+            .map(|info| info.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["both".to_string(), "only-keep".to_string()]);
+        assert_eq!(
+            reloaded.file_paths("s1", "both").unwrap(),
+            vec![keep.clone()]
+        );
+        let both_dir = reloaded.durable_checkpoint_dir("s1", "both").unwrap();
+        assert_eq!(blob_contents(&both_dir), vec!["keep-1".to_string()]);
+        assert!(!reloaded
+            .durable_checkpoint_dir("s1", "only-secret")
+            .unwrap()
+            .exists());
+
+        // The purged file can no longer be restored; the rest still can.
+        fs::write(&secret, "token=2").unwrap();
+        fs::write(&keep, "keep-2").unwrap();
+        reloaded.restore("s1", "both").unwrap();
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "keep-1");
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "token=2");
+        assert!(matches!(
+            reloaded.restore("s1", "only-secret"),
+            Err(AftError::CheckpointNotFound { .. })
+        ));
+
+        // Another session's checkpoint of the same file is untouched.
+        assert_eq!(
+            reloaded.file_paths("s2", "theirs").unwrap(),
+            vec![secret.clone()]
+        );
+        let theirs_dir = reloaded.durable_checkpoint_dir("s2", "theirs").unwrap();
+        assert_eq!(blob_contents(&theirs_dir), vec!["token=1".to_string()]);
     }
 }

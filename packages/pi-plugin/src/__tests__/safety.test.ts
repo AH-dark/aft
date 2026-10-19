@@ -168,4 +168,53 @@ describe("aft_safety adapter", () => {
     );
     expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "tool_call"]);
   });
+
+  test("purge requires path before bridge dispatch", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge();
+    registerSafetyTool(api, makePluginContext(bridge));
+
+    await expect(executeTool(tools.get("aft_safety")!, { op: "purge" })).rejects.toThrow(
+      "requires 'path'",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test("purge forwards the path through tool_call", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "purged" }));
+    registerSafetyTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_safety")!, { op: "purge", filePath: "secrets" });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      command: "tool_call",
+      params: { name: "safety", arguments: { op: "purge", filePath: "secrets" } },
+    });
+  });
+
+  for (const restrictToProjectRoot of [true, false]) {
+    test(`purge outside the project root with restriction ${restrictToProjectRoot}`, async () => {
+      const { api, tools } = makeMockApi();
+      const externalDir = resolve(process.cwd(), "../outside/secrets");
+      const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "purged" }));
+      registerSafetyTool(
+        api,
+        makePluginContext(bridge, { config: { restrict_to_project_root: restrictToProjectRoot } }),
+      );
+      const purge = executeTool(
+        tools.get("aft_safety")!,
+        { op: "purge", filePath: externalDir },
+        makeExtContext(),
+      );
+      if (restrictToProjectRoot) {
+        await expect(purge).rejects.toThrow(`'${externalDir}' is outside the project root`);
+        expect(calls).toHaveLength(0);
+      } else {
+        await purge;
+        expect(calls.map((call) => call.command)).toEqual(["tool_call"]);
+      }
+    });
+  }
 });

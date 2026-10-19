@@ -1,0 +1,22 @@
+{
+  "tool_name": "safety",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "path": "<PROJECT_ROOT>/secret.env",
+    "undo_stacks_removed": 1,
+    "undo_entries_removed": 3,
+    "checkpoints_pruned": [{ "name": "pre-edit", "files_removed": 1 }],
+    "checkpoints_dropped": ["only-secret"],
+    "complete": true,
+    "failures": [],
+    "irreversible": true
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "purge",
+      "filePath": "secret.env"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

@@ -170,6 +170,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "undo"
         | "checkpoint"
         | "restore_checkpoint"
+        | "safety_purge"
         | "write"
         | "apply_patch"
         | "delete_file"

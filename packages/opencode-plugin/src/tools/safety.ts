@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { coerceStringArray } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
@@ -50,7 +51,7 @@ function relativePatternsFromPaths(context: ToolContext, paths: string[]): strin
 
 /**
  * Tool definitions for safety & recovery commands: undo, edit_history,
- * checkpoint, restore_checkpoint, list_checkpoints.
+ * checkpoint, restore_checkpoint, list_checkpoints, purge.
  */
 export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> {
   return prepareToolMap({
@@ -63,20 +64,21 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "- 'history': List all edit snapshots for a file. Requires 'path'.\n" +
         "- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n" +
         "- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n" +
-        "- 'list': List all available named checkpoints. No extra params needed.\n\n" +
+        "- 'list': List all available named checkpoints. No extra params needed.\n" +
+        "- 'purge': Permanently delete this session's undo backups and checkpoint copies of 'path' (a file, or everything under a directory); cannot be undone.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
         "Use checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {
         op: z
-          .enum(["undo", "history", "checkpoint", "restore", "list"])
+          .enum(["undo", "history", "checkpoint", "restore", "list", "purge"])
           .describe("Safety operation"),
         path: z
           .string()
           .optional()
           .describe(
-            "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+            "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file, required for purge — a file or directory). Absolute or relative to project root",
           ),
         name: z.string().optional().describe("Checkpoint name (required for checkpoint, restore)"),
         files: z
@@ -89,7 +91,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
 
-        if (op === "history" && typeof args.path !== "string") {
+        if ((op === "history" || op === "purge") && typeof args.path !== "string") {
           throw new Error(`'path' is required for '${op}' op`);
         }
         if ((op === "checkpoint" || op === "restore") && typeof args.name !== "string") {
@@ -176,6 +178,31 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             relativePatternsFromPaths(context, Array.from(new Set(responsePaths(preview)))),
             { checkpoint: args.name },
           );
+          if (permissionError) return permissionDeniedResponse(permissionError);
+        }
+
+        if (op === "purge") {
+          // Purging destroys copies of the path's content, so it asks the same
+          // edit permission a write to the path would. A directory is asked
+          // for as itself and as everything under it, so a rule like
+          // `secrets/*` also governs purging `secrets`.
+          const absolutePath = resolveAbsolutePath(context, args.path as string);
+          let isDirectory = false;
+          try {
+            isDirectory = fs.statSync(absolutePath).isDirectory();
+          } catch {
+            // A deleted file still has backups worth purging; treat it as a file.
+          }
+          const denial = await assertExternalDirectoryPermission(ctx, context, absolutePath, {
+            kind: isDirectory ? "directory" : "file",
+          });
+          if (denial) return permissionDeniedResponse(denial);
+          const pattern = resolveRelativePatternFromAbsolute(context, absolutePath);
+          const patterns = isDirectory ? [pattern, path.join(pattern, "*")] : [pattern];
+          const permissionError = await askEditPermission(context, patterns, {
+            filepath: absolutePath,
+            operation: "purge",
+          });
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
 
