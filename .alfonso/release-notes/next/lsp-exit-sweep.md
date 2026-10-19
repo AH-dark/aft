@@ -1,0 +1,1 @@
+- When the daemon exits, it now stops every running language server within its shared shutdown budget and reports the true count, instead of leaving some to per-project background threads.
