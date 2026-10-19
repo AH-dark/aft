@@ -43,6 +43,8 @@
       {
         "kind": "field",
         "field": "read_policy",
+        "min_lines": 1,
+        "max_lines": 10000,
         "pattern": "^(?![\\s\\S]*SECRET_CONTENT_MUST_NOT_ESCAPE)(?=[\\s\\S]*visibleSymbol)(?=[\\s\\S]*(?<value>permission_denied: read))[\\s\\S]+$"
       }
     ],

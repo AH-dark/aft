@@ -1,9 +1,12 @@
 import { expect, test } from "bun:test";
 import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
+import { projectText } from "../../../../tests/docker/opencode2/harness/projection.js";
+import type { ProjectionRule } from "../../../../tests/docker/opencode2/harness/types.js";
+import readRules from "../../../../tests/docker/opencode2/scenarios/aft_zoom/read-rules.scenario.json";
 import { requestPermission } from "../permissions/v2.js";
 import { projectV2Tool } from "../tools/definitions/v2.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
@@ -241,6 +244,110 @@ test("directory outline with every content file denied refuses like read", async
     expect(dispatched).toHaveLength(1);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("directory outline checks only rendered files and rechecks newly visible files", async () => {
+  const root = await mkdtemp(resolve(process.cwd(), ".aft-visible-read-"));
+  const allowed = resolve(root, "allowed.ts");
+  const secret = resolve(root, "secret.ts");
+  const newlyVisible = resolve(root, "newly-visible.ts");
+  try {
+    for (const files of [false, true]) {
+      const { execute, calls, dispatched } = readers(
+        (input, effect) =>
+          input.action === "read" && input.resources.some((file) => file.endsWith("/secret.ts"))
+            ? "deny"
+            : effect,
+        (args) =>
+          args._exclude_read_paths
+            ? {
+                success: true,
+                text: "allowed() newlyVisible()",
+                content_files: [allowed, newlyVisible],
+              }
+            : { success: true, text: "allowed() SECRET", content_files: [allowed, secret] },
+      );
+      const result = await execute("aft_outline", { target: root, files });
+      expect(result.content).toBe("allowed() newlyVisible()\n1 files left out by read rules.");
+      expect(dispatched).toHaveLength(2);
+      expect(calls.filter((call) => call.action === "read").map((call) => call.resources)).toEqual([
+        [relative(process.cwd(), allowed)],
+        [relative(process.cwd(), secret)],
+        [relative(process.cwd(), newlyVisible)],
+      ]);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("directory outline stops after eight renders without returning held content", async () => {
+  const root = await mkdtemp(resolve(process.cwd(), ".aft-round-limit-"));
+  const allowed = resolve(root, "allowed.ts");
+  try {
+    for (const files of [false, true]) {
+      let renders = 0;
+      const { execute, calls, dispatched } = readers(
+        (input, effect) =>
+          input.action === "read" && input.resources.some((file) => /\/denied-\d+\.ts$/.test(file))
+            ? "deny"
+            : effect,
+        () => {
+          renders++;
+          if (renders > 8) throw new Error("unexpected ninth render");
+          return {
+            success: true,
+            text: "allowed() SECRET_CONTENT_MUST_NOT_ESCAPE",
+            content_files: [allowed, resolve(root, `denied-${renders}.ts`)],
+          };
+        },
+      );
+      await expect(execute("aft_outline", { target: root, files })).rejects.toThrow(
+        "Outline read authorization limit reached after 8 renders; narrow the target to a subdirectory.",
+      );
+      expect(dispatched).toHaveLength(8);
+      expect(calls.filter((call) => call.action === "read")).toHaveLength(9);
+      expect(dispatched[7]?._exclude_read_paths).toEqual(
+        Array.from({ length: 7 }, (_, index) => resolve(root, `denied-${index + 1}.ts`)),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const zoomReadReply = `public.ts:1-3 [function visibleSymbol]
+
+ 1: export function visibleSymbol() {
+ 2:   return "PUBLIC_CONTENT";
+ 3: }
+
+secret.ts: permission_denied: read is denied by this session's permission rules (not a user choice)`;
+const zoomReadScenario = readRules.scenarios[0]!;
+const zoomReadProjection = zoomReadScenario.comparison.rules as ProjectionRule[];
+
+test("zoom read-rule scenario projects multiline allowed output and denial", () => {
+  expect(projectText(zoomReadReply, zoomReadProjection)).toEqual(
+    zoomReadScenario.comparison.expected,
+  );
+});
+
+test("zoom read-rule scenario rejects leaked secret content", () => {
+  for (const reply of [
+    `SECRET_CONTENT_MUST_NOT_ESCAPE\n${zoomReadReply}`,
+    `${zoomReadReply}\nSECRET_CONTENT_MUST_NOT_ESCAPE`,
+  ]) {
+    expect(() => projectText(reply, zoomReadProjection)).toThrow("projection_unparsed");
+  }
+});
+
+test("zoom read-rule scenario requires both allowed output and denial", () => {
+  for (const reply of [
+    zoomReadReply.replaceAll("visibleSymbol", "unrelatedSymbol"),
+    zoomReadReply.replace("permission_denied: read", "unrelated error"),
+  ]) {
+    expect(() => projectText(reply, zoomReadProjection)).toThrow("projection_unparsed");
   }
 });
 

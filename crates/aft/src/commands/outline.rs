@@ -146,7 +146,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "collection_truncated": discovery.collection_truncated,
             "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
             "skipped_files": skipped_files,
-            "content_files": file_outlines.iter().map(|file| &file.absolute_path).collect::<Vec<_>>(),
+            "content_files": rendered.content_files,
         });
         crate::context::confinement::disclose_denied(&mut body);
         return Response::success(&req.id, body);
@@ -189,7 +189,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 "files_shown": rendered.shown,
                 "structure_footer": rendered.footer,
                 "skipped_files": skipped_files,
-                "content_files": file_outlines.iter().map(|file| &file.absolute_path).collect::<Vec<_>>(),
+                "content_files": rendered.content_files,
             }),
         );
     }
@@ -1473,10 +1473,17 @@ fn handle_outline_files_mode(
         ));
     }
 
+    let content_files = rows
+        .iter()
+        .filter_map(|row| match row {
+            OutlineTableRow::File(file_id) => Some(file_entries[*file_id].absolute_path.clone()),
+            OutlineTableRow::Rollup(_) => None,
+        })
+        .collect::<Vec<_>>();
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut response_data = serde_json::json!({
         "text": text,
-        "content_files": file_entries.iter().map(|file| &file.absolute_path).collect::<Vec<_>>(),
+        "content_files": content_files,
         "files": file_entries,
         "complete": !walk_truncated
             && !collection_truncated
@@ -3050,6 +3057,7 @@ struct RenderedOutline {
     truncated: bool,
     shown: usize,
     footer: String,
+    content_files: Vec<PathBuf>,
 }
 
 fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool) -> String {
@@ -3090,6 +3098,7 @@ fn format_multi_file_tree(
     let mut output = String::new();
     let mut truncated = false;
     let mut files_shown = 0;
+    let mut content_files = Vec::new();
     // Reserve the real list trailer, not a guessed number of bytes. Rendering
     // files atomically keeps every shown type's preview and exact remainder.
     let trailer_reserve =
@@ -3145,6 +3154,7 @@ fn format_multi_file_tree(
             break;
         }
         output.push_str(&file_output);
+        content_files.push(fo.absolute_path.clone());
 
         files_shown += 1;
         prev_parts = parts.iter().map(|s| *s).collect();
@@ -3161,6 +3171,7 @@ fn format_multi_file_tree(
         truncated,
         shown: files_shown,
         footer,
+        content_files,
     }
 }
 
@@ -3247,6 +3258,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn outline_content_files_only_lists_rendered_structure_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let shown = root.join("a.ts");
+        let hidden = root.join("z.ts");
+        let source = (0..700)
+            .map(|index| format!("export function symbol_{index:04}() {{}}\n"))
+            .collect::<String>();
+        std::fs::write(&shown, &source).unwrap();
+        std::fs::write(&hidden, &source).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for params in [
+            serde_json::json!({"directory": root}),
+            serde_json::json!({"files": [hidden, shown]}),
+        ] {
+            let mut args = params;
+            args["id"] = serde_json::json!("bounded-content");
+            args["command"] = serde_json::json!("outline");
+            let request = serde_json::from_value(args).unwrap();
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success);
+            let text = response.data["text"].as_str().unwrap();
+            assert!(response.data["output_truncated"].as_bool().unwrap());
+            assert_eq!(response.data["files_shown"], 1);
+            assert!(text.contains("a.ts"));
+            assert!(!text.contains("z.ts"));
+            assert_eq!(response.data["content_files"], serde_json::json!([shown]));
+        }
+    }
+
+    #[test]
+    fn outline_content_files_only_lists_rendered_table_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let shown = root.join("a.ts");
+        std::fs::write(&shown, "export function visible() {}\n").unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        for index in 0..12 {
+            std::fs::write(
+                root.join(format!("nested/hidden_{index:02}.ts")),
+                "export function hidden() {}\n",
+            )
+            .unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "bounded-table-content", "command": "outline", "directory": root, "files": true,
+        }))
+        .unwrap();
+        let response = handle_outline_files_mode(&request, &ctx, 250);
+        assert!(response.success);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("a.ts"));
+        assert!(text.contains("nested/"));
+        assert!(!text.contains("hidden_"));
+        assert_eq!(response.data["files_list_envelope"]["shown"], 1);
+        assert_eq!(response.data["content_files"], serde_json::json!([shown]));
     }
 
     fn navigation_counts(

@@ -31,6 +31,7 @@ import {
 
 const z = tool.schema;
 const READ_PERMISSION_CONCURRENCY = 8;
+const MAX_OUTLINE_READ_ROUNDS = 8;
 
 /** GitHub discussion targets are fetched by the server, not read from disk. */
 function isGithubPathArg(value: unknown): boolean {
@@ -205,7 +206,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         }
 
         const excluded = new Set<string>();
-        for (;;) {
+        for (let round = 0; round < MAX_OUTLINE_READ_ROUNDS; round++) {
           const response = await callToolCall(ctx, context, "outline", {
             ...rawArgs,
             ...(excluded.size ? { _exclude_read_paths: [...excluded] } : {}),
@@ -248,6 +249,11 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             (excluded.size ? `\n${excluded.size} files left out by read rules.` : "")
           );
         }
+        // A denied row can reveal another file on every render. At the limit,
+        // discard the held output rather than return content that is not authorized.
+        throw new Error(
+          `Outline read authorization limit reached after ${MAX_OUTLINE_READ_ROUNDS} renders; narrow the target to a subdirectory.`,
+        );
       },
     },
 
