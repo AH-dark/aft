@@ -64,7 +64,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
 struct Jail {
     _dir: tempfile::TempDir,
     base: PathBuf,
-    #[cfg(target_os = "macos")]
     home: PathBuf,
     main: PathBuf,
     worktree: PathBuf,
@@ -420,7 +419,6 @@ impl Jail {
         let mut jail = Self {
             _dir: dir,
             base,
-            #[cfg(target_os = "macos")]
             home,
             main,
             worktree,
@@ -475,7 +473,6 @@ impl Jail {
         self.bind(bind).await;
     }
 
-    #[cfg(target_os = "macos")]
     async fn bind_grant_head(&mut self) {
         let root = self.base.clone();
         self.bind(ModuleControlRequest::RouteBind {
@@ -536,7 +533,6 @@ impl Jail {
         assert_eq!(response, ModuleControlResponse::RouteBindAck {});
     }
 
-    #[cfg(target_os = "macos")]
     async fn allow_paths(&mut self, paths: Value) {
         for channel in [2, 1] {
             let corr = self.next_corr;
@@ -684,6 +680,146 @@ async fn worker_allow_paths_bash_writes_work_grant_but_not_siblings() {
             !jail.main.join("ungranted-result").exists(),
             "{profile}: {output}"
         );
+    }
+}
+
+async fn granted_checkout_fixture(profile: &str) -> (Jail, Vec<(PathBuf, PathBuf)>) {
+    let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
+    jail.bind_grant_head().await;
+    let ready = jail.bash("printf READY").await;
+    assert!(ready.contains("READY"), "{ready}");
+    let normal = jail.home.join("Work/granted-normal");
+    let common = jail.home.join("Work/granted-common");
+    let linked = jail.home.join("Work/granted-linked");
+    for root in [&normal, &common] {
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-q", "-m", "initial"]);
+    }
+    git(
+        &common,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert!(linked.join(".git").is_file());
+    for root in [&normal, &common, &linked] {
+        std::fs::create_dir_all(root.join(".cortexkit/aft/filters")).unwrap();
+        std::fs::write(root.join(".cortexkit/aft.jsonc"), "{}\n").unwrap();
+    }
+    // Grant the common checkout too, so its config/hooks are not protected
+    // merely by the unrelated sibling-checkout deny.
+    jail.allow_paths(json!([
+        {"path":normal,"mode":"write"}, {"path":common,"mode":"write"},
+        {"path":linked,"mode":"write"},
+    ]))
+    .await;
+    let checkouts = vec![
+        (normal.clone(), normal.join(".git")),
+        (linked, common.join(".git")),
+    ];
+    (jail, checkouts)
+}
+
+#[cfg(target_os = "macos")]
+async fn assert_granted_checkout_control_denied(relative: &str, git_control: bool) {
+    for profile in ["relaxed", "strict"] {
+        let (mut jail, checkouts) = granted_checkout_fixture(profile).await;
+        for (root, git_dir) in checkouts {
+            let working = root.join("working-file");
+            let control = if git_control {
+                git_dir.join(relative)
+            } else {
+                root.join(relative)
+            };
+            let before = std::fs::read(&control).ok();
+            let output = jail.bash(&format!(
+                "printf working > {} && echo WORKING_WRITABLE; printf altered > {} && echo CONTROL_WRITABLE",
+                quote(&working), quote(&control),
+            )).await;
+            assert!(output.contains("WORKING_WRITABLE"), "{profile}: {output}");
+            assert_eq!(std::fs::read_to_string(working).unwrap(), "working");
+            assert!(
+                !output.contains("CONTROL_WRITABLE"),
+                "{profile} {}: {output}",
+                control.display()
+            );
+            assert!(
+                output.contains("Operation not permitted"),
+                "{profile}: {output}"
+            );
+            assert_eq!(
+                std::fs::read(&control).ok(),
+                before,
+                "{}",
+                control.display()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_granted_checkout_hooks_are_immutable() {
+    assert_granted_checkout_control_denied("hooks/grant-probe", true).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_granted_checkout_git_config_is_immutable() {
+    assert_granted_checkout_control_denied("config", true).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_granted_checkout_aft_config_is_immutable() {
+    assert_granted_checkout_control_denied(".cortexkit/aft.jsonc", false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_granted_checkout_filters_are_immutable() {
+    assert_granted_checkout_control_denied(".cortexkit/aft/filters/grant-probe", false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn worker_granted_checkout_linux_reports_unenforced_controls() {
+    if !native_available() {
+        return;
+    }
+    for profile in ["relaxed", "strict"] {
+        let (mut jail, checkouts) = granted_checkout_fixture(profile).await;
+        let output = jail.bash("printf LINUX_GRANT_REPORT").await;
+        assert!(output.contains("LINUX_GRANT_REPORT"), "{profile}: {output}");
+        for (root, git_dir) in checkouts {
+            for path in [
+                git_dir.join("hooks"),
+                git_dir.join("config"),
+                root.join(".cortexkit/aft.jsonc"),
+                root.join(".cortexkit/aft/filters"),
+            ] {
+                assert!(
+                    output.contains(&format!("write:{}", path.display())),
+                    "{profile} {}: {output}",
+                    path.display()
+                );
+            }
+        }
+        if profile == "strict" {
+            assert!(output.contains("nested_write_deny"), "{output}");
+            assert!(
+                output.contains("worktree_git_config_mutable_on_landlock"),
+                "{output}"
+            );
+        }
     }
 }
 

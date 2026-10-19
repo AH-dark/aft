@@ -3,6 +3,103 @@ use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
 use crate::db::access_grants::{self as grants, ScopeKey};
 
 #[test]
+fn granted_checkout_controls_join_relaxed_denies() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let root = base.join("own");
+    let granted = base.join("granted");
+    let home = base.join("home");
+    let store = base.join("store");
+    let task_io = base.join("tasks/session/task/io");
+    let temp = base.join("temp");
+    for path in [&root, &granted, &home, &store, &task_io, &temp] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&granted)
+        .status()
+        .unwrap()
+        .success());
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(store.clone()),
+            ..Default::default()
+        },
+    );
+    let scope = ScopeKey {
+        owner: "reserved:prefrontal-core".into(),
+        scope_ref: "checkout-controls".into(),
+        epoch: 1,
+    };
+    let conn = crate::db::open(&store.join("aft.db")).unwrap();
+    grants::register_scope(&conn, &scope, None, &ctx.config()).unwrap();
+    grants::register_worker(&conn, &scope).unwrap();
+    grants::insert(
+        &conn,
+        &scope,
+        &AccessGrant {
+            path: granted.clone(),
+            operation: AccessOperation::Write,
+            kind: GrantKind::Subtree,
+        },
+    )
+    .unwrap();
+    ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
+    crate::access_policy::with_scope(Some(scope), || {
+        let profile = build_relaxed_profile(
+            &ctx,
+            &home,
+            &[root.clone()],
+            &[resolve_git_policy(&root).unwrap()],
+            &store,
+            &task_io,
+            &temp,
+        )
+        .unwrap();
+        for path in [
+            ".git/hooks",
+            ".git/config",
+            ".cortexkit/aft.jsonc",
+            ".cortexkit/aft/filters",
+        ] {
+            assert!(
+                profile.write_deny.contains(&granted.join(path)),
+                "missing deny: {path}"
+            );
+        }
+    });
+}
+
+#[test]
+fn checkout_control_denies_preserve_nested_and_non_repository_root_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    let nested = root.join("src");
+    std::fs::create_dir(&nested).unwrap();
+    let nonrepo = tempfile::tempdir().unwrap();
+    let nonrepo = nonrepo.path().canonicalize().unwrap();
+    for path in [&nested, &nonrepo] {
+        // Project roots without a local .git do not discover an ancestor
+        // repository. Grants keep that behavior and add no ancestor paths.
+        let git = resolve_git_policy(path).unwrap();
+        assert!(git.read_roots.is_empty());
+        let denies = checkout_control_denies(path, &git).unwrap();
+        assert!(denies.iter().all(|deny| deny.starts_with(path)));
+        assert!(denies.contains(&path.join(".cortexkit/aft.jsonc")));
+        assert!(denies.contains(&path.join(".git/config")));
+    }
+}
+
+#[test]
 fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
