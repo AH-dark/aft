@@ -9783,6 +9783,281 @@ mod tests {
         );
     }
 
+    // Frozen from c71c33a96, including its SHA-256 and path/session key formulas.
+    // Git probing and memo codecs are shared, but no record-aware resolver or
+    // current top-level/path key hasher may supply the compatibility expectation.
+    fn base_c71_cache_key(
+        probe_root: &Path,
+        memo_root: &Path,
+        storage_root: &Path,
+        git_common_dir: Option<&Path>,
+        timings: &mut ArtifactCacheKeyTimings,
+    ) -> Result<String, ArtifactCacheKeyProbeError> {
+        fn base_hash16(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())[..16].to_string()
+        }
+        fn artifact_path_identity_key(root: &Path) -> String {
+            base_hash16(canonicalize_or_normalize(root).to_string_lossy().as_bytes())
+        }
+        fn session_artifact_key_from_git_identity(root: &Path, root_commit: &str) -> String {
+            match checkout_position(root) {
+                CheckoutPosition::TopLevel => base_hash16(root_commit.as_bytes()),
+                CheckoutPosition::Subdirectory(relative) => {
+                    match crate::scoped_key::scoped_v1_key(root_commit, relative.as_bytes()) {
+                        Ok(scoped) => scoped[..16].to_string(),
+                        Err(_) => artifact_path_identity_key(root),
+                    }
+                }
+                CheckoutPosition::Unrepresentable => artifact_path_identity_key(root),
+            }
+        }
+        let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
+        let git_marker_state = root_git_marker_state(probe_root, git_common_dir);
+        if git_marker_state == GitMarkerState::Absent {
+            return Ok(artifact_path_identity_key(probe_root));
+        }
+
+        match repo_root_commit_with_retry_profiled(probe_root, timings) {
+            RootCommitResolution::Commit(root_commit) => {
+                let key = session_artifact_key_from_git_identity(probe_root, &root_commit);
+                record_derived_cache_key(memo_root, &key);
+                if let Err(error) = record_artifact_cache_key_memo_profiled(
+                    storage_root,
+                    &memo_root_key,
+                    &key,
+                    &root_commit,
+                    timings,
+                ) {
+                    crate::slog_warn!(
+                        "artifact cache key: failed to persist memo for {} in {}: {}",
+                        memo_root.display(),
+                        storage_root.display(),
+                        error
+                    );
+                }
+                Ok(key)
+            }
+            RootCommitResolution::NotARepo => Ok(artifact_path_identity_key(probe_root)),
+            RootCommitResolution::Failed(detail) => {
+                if let Some(entry) =
+                    lookup_artifact_cache_key_memo_profiled(storage_root, &memo_root_key, timings)
+                {
+                    // Re-derive from the memoized repository identity rather than
+                    // trusting the memoized key: memos written by older versions
+                    // hold the whole-repository key even for subfolder roots, and
+                    // reusing it would let a subfolder session overwrite the
+                    // repository's shared artifact again.
+                    let key =
+                        session_artifact_key_from_git_identity(probe_root, &entry.git_root_commit);
+                    crate::slog_warn!(
+                        "artifact cache key: probe failed, using memoized identity (key {}) for {}",
+                        key,
+                        memo_root.display()
+                    );
+                    return Ok(key);
+                }
+
+                match git_marker_state {
+                    GitMarkerState::Absent => Ok(artifact_path_identity_key(probe_root)),
+                    GitMarkerState::Present => Err(ArtifactCacheKeyProbeError {
+                        root: memo_root.to_path_buf(),
+                        detail,
+                    }),
+                    GitMarkerState::Unknown(marker_detail) => Err(ArtifactCacheKeyProbeError {
+                        root: memo_root.to_path_buf(),
+                        detail: format!("{detail}; {marker_detail}"),
+                    }),
+                }
+            }
+            RootCommitResolution::Cancelled => Err(ArtifactCacheKeyProbeError {
+                root: memo_root.to_path_buf(),
+                detail: "artifact cache key probe cancelled".to_string(),
+            }),
+        }
+    }
+
+    fn upgrade_fixture_git(
+        root: &Path,
+        args: &[&str],
+        author: &serde_json::Value,
+    ) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(root));
+        let output = command
+            .args(args)
+            .env("GIT_AUTHOR_NAME", author["name"].as_str().unwrap())
+            .env("GIT_COMMITTER_NAME", author["name"].as_str().unwrap())
+            .env("GIT_AUTHOR_EMAIL", author["email"].as_str().unwrap())
+            .env("GIT_COMMITTER_EMAIL", author["email"].as_str().unwrap())
+            .env("GIT_AUTHOR_DATE", author["date"].as_str().unwrap())
+            .env("GIT_COMMITTER_DATE", author["date"].as_str().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn assert_upgrade_identity_fixture(name: &str, repeat_bind: bool) {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        assert!(
+            crate::developer_tools::git_usable(),
+            "upgrade fixtures require usable Git"
+        );
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/root_identity_upgrade/cases.json"
+        ))
+        .unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"].as_str() == Some(name))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        for (relative, content) in fixture["files"].as_object().unwrap() {
+            let path = repository.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content.as_str().unwrap()).unwrap();
+        }
+        let plain = case["layout"] == "plain";
+        let author = &fixture["commit"];
+        if !plain {
+            upgrade_fixture_git(&repository, &["init", "-q"], author);
+            upgrade_fixture_git(&repository, &["add", "."], author);
+            upgrade_fixture_git(
+                &repository,
+                &["commit", "-q", "-m", author["message"].as_str().unwrap()],
+                author,
+            );
+        }
+        let root = if case["layout"] == "linked_worktree" {
+            let linked = directory.path().join("linked");
+            upgrade_fixture_git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+                author,
+            );
+            assert!(linked.join(".git").is_file());
+            linked
+        } else {
+            repository.clone()
+        };
+        let root = fs::canonicalize(root).unwrap();
+        if plain {
+            assert!(
+                root.ancestors().all(|parent| !parent.join(".git").exists()),
+                "plain fixture must be outside any repository"
+            );
+        } else if case["layout"] == "repository" {
+            assert!(root.join(".git").is_dir());
+        }
+        let common = (!plain).then(|| fs::canonicalize(repository.join(".git")).unwrap());
+        let base_storage = directory.path().join("base-storage");
+        let upgraded_storage = directory.path().join("upgraded-storage");
+        if case["legacy_memo"] == true {
+            let seed = base_c71_cache_key(
+                &root,
+                &root,
+                &directory.path().join("seed-storage"),
+                common.as_deref(),
+                &mut ArtifactCacheKeyTimings::default(),
+            )
+            .unwrap();
+            let output =
+                upgrade_fixture_git(&root, &["rev-list", "--max-parents=0", "HEAD"], author);
+            let entry = ArtifactCacheKeyMemoEntry {
+                key: seed,
+                git_root_commit: String::from_utf8(output.stdout).unwrap().trim().to_string(),
+                recorded_at_ms: current_time_millis(),
+            };
+            for storage in [&base_storage, &upgraded_storage] {
+                write_cache_key_memo(
+                    storage,
+                    &BTreeMap::from([(artifact_cache_key_memo_root_key(&root), entry.clone())]),
+                );
+            }
+            assert_eq!(
+                fs::read(base_storage.join(ARTIFACT_CACHE_KEY_MEMO_FILE)).unwrap(),
+                fs::read(upgraded_storage.join(ARTIFACT_CACHE_KEY_MEMO_FILE)).unwrap()
+            );
+        }
+        // Separate stores keep the old oracle's memo writes out of the upgrade input.
+        let expected = base_c71_cache_key(
+            &root,
+            &root,
+            &base_storage,
+            common.as_deref(),
+            &mut ArtifactCacheKeyTimings::default(),
+        )
+        .unwrap();
+        assert!(!base_storage.join("root-identities").exists());
+        assert!(crate::root_identity::read(&root, &upgraded_storage)
+            .unwrap()
+            .is_none());
+        let actual =
+            artifact_cache_key_with_memo(&root, &root, &upgraded_storage, common.as_deref())
+                .unwrap();
+        assert_eq!(
+            actual, expected,
+            "first upgrade bind changed the base key for {name}"
+        );
+        assert!(crate::root_identity::read(&root, &upgraded_storage)
+            .unwrap()
+            .is_some());
+        if repeat_bind {
+            assert!(matches!(
+                crate::root_identity::read(&root, &upgraded_storage).unwrap(),
+                Some(crate::root_identity::Identity::Git { .. })
+            ));
+            let next =
+                artifact_cache_key_with_memo(&root, &root, &upgraded_storage, common.as_deref())
+                    .unwrap();
+            assert_eq!(
+                next, expected,
+                "record-derived key changed on the next bind"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_identity_repository_top_level_matches_base() {
+        assert_upgrade_identity_fixture("repository_top_level", false);
+    }
+
+    #[test]
+    fn upgrade_identity_linked_worktree_matches_base() {
+        assert_upgrade_identity_fixture("linked_worktree", false);
+    }
+
+    #[test]
+    fn upgrade_identity_plain_folder_matches_base() {
+        assert_upgrade_identity_fixture("plain_folder", false);
+    }
+
+    #[test]
+    fn upgrade_identity_legacy_git_memo_matches_base() {
+        assert_upgrade_identity_fixture("legacy_git_memo", false);
+    }
+
+    #[test]
+    fn upgrade_identity_written_repository_record_keeps_base_key() {
+        assert_upgrade_identity_fixture("repository_top_level", true);
+    }
+
     #[test]
     fn semantic_namespaces_share_type_identity() {
         use std::any::TypeId;
