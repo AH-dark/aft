@@ -2255,7 +2255,14 @@ describe("packed module shapes", () => {
   });
 
   test("modern V1 version is sourced only from the repository pin", async () => {
-    expect(modernV1).toMatch(/^1\.18\./);
+    const pinnedVersion = (
+      await readFile(join(repoRoot, ".github/opencode-version.txt"), "utf8")
+    ).trim();
+    expect(pinnedVersion).toMatch(
+      /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+    );
+    expect(modernV1).toBe(pinnedVersion);
+
     const files = await fixtureFiles(join(pluginRoot, "test"));
     const literals: string[] = [];
     for (const path of files) {
@@ -2266,7 +2273,9 @@ describe("packed module shapes", () => {
       // finding rather than protect it.
       if (path.endsWith(".md")) continue;
       const text = await readFile(path, "utf8");
-      if (/\b1\.18\.\d+\b/.test(text)) literals.push(path);
+      if (text.split(/[^0-9A-Za-z.+-]+/).includes(pinnedVersion)) {
+        literals.push(path);
+      }
     }
     expect(literals).toEqual([]);
   });
