@@ -1033,6 +1033,7 @@ mod tests {
                     usize::MAX,
                     None,
                     &path,
+                    QuiescedLsp::ReapInBackground,
                     None,
                     Some(hooks),
                 ))

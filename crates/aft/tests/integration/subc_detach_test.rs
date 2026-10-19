@@ -758,6 +758,13 @@ fn drain_with_live_lsp_servers_and_writer(
             shutdowns[0].contains(" budget_ms=1500 "),
             "all servers must be admitted under one 1500 ms shutdown budget: {log}"
         );
+        // Connection teardown leaves every running server to the exit phase,
+        // so the phase takes all of them however late the runner schedules it.
+        assert!(
+            shutdowns[0].contains(&format!(" servers={server_count} ")),
+            "the exit phase must take every root's running server: {}",
+            shutdowns[0]
+        );
         let durable_path = data_home.path().join("aft").join("logs").join(format!("aft-{}.log", module.child.id()));
         let durable = std::fs::read_to_string(&durable_path)
             .unwrap_or_else(|error| panic!("{}: {error}", durable_path.display()));
@@ -769,9 +776,8 @@ fn drain_with_live_lsp_servers_and_writer(
         if active_ort {
             assert!(durable.contains("phase=ort_quiesce active=1 budget_ms=0"), "{}", log_tail(&durable));
         }
-        // Draining roots may already have stopped some servers before the final
-        // sweep, so the summary's split depends on timing. What must hold is one
-        // summary, a bounded exit and no orphans.
+        // One summary, covering every server: the exit phase owns them all, so
+        // its count does not depend on timing. The graceful/killed split does.
         let summaries: Vec<&str> = log
             .lines()
             .filter(|line| line.contains("lsp shutdown_all: servers="))
@@ -791,7 +797,11 @@ fn drain_with_live_lsp_servers_and_writer(
                 .unwrap_or_else(|| panic!("missing {field} in shutdown summary: {}", summaries[0]))
         };
         let servers = summary_field("servers=");
-        assert!(servers >= 3, "shared-deadline proof needs at least three shutdowns: {}", summaries[0]);
+        assert_eq!(
+            servers, server_count as u128,
+            "shared-deadline proof needs every server stopped by the exit phase: {}",
+            summaries[0]
+        );
         let lsp_elapsed_ms = summary_field("elapsed_ms=");
         let lsp_ceiling_ms = 2 * aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis();
         // Measure AFT's phase, not the parent thread's wakeup or process exit.

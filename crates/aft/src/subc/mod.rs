@@ -1865,10 +1865,32 @@ fn allocator_pressure_relief_after_idle_sweep(
     }
 }
 
+/// Who stops a root's running language servers once the root is quiesced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuiescedLsp {
+    /// Detach the clients and shut them down on a background thread. Right for
+    /// a route that closes while the module keeps running: nothing else would
+    /// stop those servers.
+    ReapInBackground,
+    /// Refuse new starts but leave the clients in the manager, because the
+    /// caller's exit phase shuts down every manager's servers together under
+    /// one shared budget right after the module loop returns.
+    LeaveForExitSweep,
+}
+
 fn quiesce_unbound_root(
     root_id: &ProjectRootId,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
+) {
+    quiesce_unbound_root_with(root_id, live_roots, executor, QuiescedLsp::ReapInBackground);
+}
+
+fn quiesce_unbound_root_with(
+    root_id: &ProjectRootId,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    lsp: QuiescedLsp,
 ) {
     let Some(meta) = live_roots.get_mut(root_id) else {
         return;
@@ -1887,10 +1909,16 @@ fn quiesce_unbound_root(
             ctx.stop_watcher_runtime();
             ctx.invalidate_artifacts_after_watcher_gap();
         }
-        // Detach under the root's manager lock before allowing a rebind. The
-        // reaper owns only the old clients, never servers a new route starts.
-        let clients = ctx.lsp().quiesce();
-        crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
+        match lsp {
+            QuiescedLsp::ReapInBackground => {
+                // Detach under the root's manager lock before allowing a
+                // rebind. The reaper owns only the old clients, never servers
+                // a new route starts.
+                let clients = ctx.lsp().quiesce();
+                crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
+            }
+            QuiescedLsp::LeaveForExitSweep => ctx.lsp().close_start_admission(),
+        }
         ctx.bash_background()
             .replace_live_delivery_sessions(HashSet::new());
     }
@@ -1931,6 +1959,7 @@ fn quiesce_connection_roots(
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
     executor: &Arc<Executor>,
+    lsp: QuiescedLsp,
 ) {
     cancel_all_active_tool_calls(active_tool_calls, executor, "connection teardown");
     for cancel in route_bash_cancels.values() {
@@ -1950,7 +1979,7 @@ fn quiesce_connection_roots(
     // root activity after the loop-owned route tables disappear.
     for root_id in roots {
         if live_roots.contains_key(&root_id) {
-            quiesce_unbound_root(&root_id, live_roots, executor);
+            quiesce_unbound_root_with(&root_id, live_roots, executor, lsp);
         } else if let Some(ctx) = executor.actor_context(&root_id) {
             ctx.mark_subc_unbound();
             executor.cancel_queued_maintenance(&root_id);
@@ -3949,6 +3978,8 @@ fn run_subc_mode_inner(
             tool_response_body_limit,
             lifecycle_probe,
             &storage_dir,
+            // The exit phase below takes and shuts down every root's servers.
+            QuiescedLsp::LeaveForExitSweep,
             #[cfg(test)]
             None,
             #[cfg(test)]
@@ -3980,6 +4011,9 @@ fn run_subc_mode_inner(
     });
     let mut clients = Vec::new();
     for actor_ctx in &actor_contexts {
+        // Connection teardown left every root's running servers in its
+        // manager (`QuiescedLsp::LeaveForExitSweep`), so they are all stopped
+        // here under the one shared budget below.
         clients.extend(actor_ctx.lsp().take_all_clients());
         actor_ctx.bash_background().detach();
     }
@@ -4638,6 +4672,7 @@ async fn run_module_loop<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
+    connection_end_lsp: QuiescedLsp,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
@@ -6074,6 +6109,7 @@ where
         &mut route_bash_cancels,
         &active_tool_calls,
         &executor,
+        connection_end_lsp,
     );
 
     fleet_status_client.set_route_live(false);
@@ -12418,6 +12454,7 @@ mod tests {
                 usize::MAX,
                 None,
                 &fixture_path.join("storage"),
+                QuiescedLsp::ReapInBackground,
                 Some(actor),
                 None,
             ))
@@ -12581,6 +12618,7 @@ mod tests {
                 usize::MAX,
                 None,
                 &fixture_path.join("storage"),
+                QuiescedLsp::ReapInBackground,
                 Some(actor),
                 None,
             ))
@@ -15014,6 +15052,7 @@ mod tests {
             &mut route_bash_cancels,
             &active_tool_calls,
             &executor,
+            QuiescedLsp::ReapInBackground,
         );
         assert!(live_roots[&root].unbound_quiesced);
         assert!(!live_roots[&root].maintenance_pending);
@@ -15164,6 +15203,142 @@ mod tests {
         assert_eq!(ctx.lsp().active_client_count(), 1);
         assert_eq!(ctx.lsp_child_registry().health_snapshot().children_total, 1);
         ctx.lsp().shutdown_all();
+    }
+
+    /// A root with one running fake rust-analyzer that ignores Shutdown, bound
+    /// through `live_roots` as the module loop would hold it.
+    fn root_with_running_fake_server(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        ProjectRootId,
+        Arc<AppContext>,
+        Arc<Executor>,
+        HashMap<ProjectRootId, RootMeta>,
+        u32,
+    ) {
+        use crate::lsp::registry::ServerKind;
+
+        let (root_dir, root) = test_root(name);
+        std::fs::write(
+            root.as_path().join("Cargo.toml"),
+            "[package]\nname='quiesce'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let file = root.as_path().join("lib.rs");
+        std::fs::write(&file, "pub fn f() {}\n").unwrap();
+        let ctx = test_ctx();
+        ctx.mark_subc_bound();
+        ctx.update_config(|config| config.project_root = Some(root.as_path().to_path_buf()));
+        let config = ctx.config().as_ref().clone();
+        ctx.lsp().override_binary(
+            ServerKind::Rust,
+            crate::fake_lsp_test_helper::fake_server_binary(),
+        );
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
+        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(ctx.lsp().active_client_count(), 1);
+        let pids = ctx.lsp_child_registry().pids();
+        assert_eq!(pids.len(), 1, "one tracked server child: {pids:?}");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        (root_dir, root, ctx, executor, live_roots, pids[0])
+    }
+
+    fn quiesce_whole_connection(
+        live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+        executor: &Arc<Executor>,
+        lsp: QuiescedLsp,
+    ) {
+        quiesce_connection_roots(
+            live_roots,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &Arc::new(StdMutex::new(HashMap::new())),
+            executor,
+            lsp,
+        );
+    }
+
+    /// When the module's connection ends, the exit phase that follows must be
+    /// the one owner of every running server, so it can stop them all under
+    /// its single shared budget and report each one. Connection teardown used
+    /// to detach them to per-root background reap threads, which could stop
+    /// every server first and leave the exit phase reporting `servers=0`.
+    #[test]
+    fn connection_end_quiesce_leaves_running_servers_for_the_exit_sweep() {
+        use crate::lsp::manager::ServerAttemptResult;
+
+        let (_root_dir, root, ctx, executor, mut live_roots, pid) =
+            root_with_running_fake_server("connection-end-exit-sweep");
+        quiesce_whole_connection(&mut live_roots, &executor, QuiescedLsp::LeaveForExitSweep);
+        assert!(live_roots[&root].unbound_quiesced);
+        assert_eq!(
+            ctx.lsp().active_client_count(),
+            1,
+            "the exit sweep, not a background reap, must own the running server"
+        );
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        // The exit phase of `run_subc_mode_inner`: take every client and stop
+        // them under one budget, killing the server that ignores Shutdown.
+        let clients = ctx.lsp().take_all_clients();
+        assert_eq!(clients.len(), 1);
+        let outcome = crate::lsp::manager::LspManager::shutdown_at_process_exit(
+            clients,
+            ctx.lsp_child_registry(),
+        );
+        assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
+        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
+        // The forced kill does not wait; its worker thread reaps the child
+        // right after. Hang guard only.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::bash_background::process::is_process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "exit sweep left server {pid} running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Admission stays closed: a late request (an inspect job that outlived
+        // its route) cannot start a replacement server after the sweep.
+        let config = ctx.config().as_ref().clone();
+        let refused = ctx
+            .lsp()
+            .ensure_server_for_file_detailed(&root.as_path().join("lib.rs"), &config);
+        assert!(refused
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::ProjectClosed)));
+        assert_eq!(ctx.lsp().active_client_count(), 0);
+        assert!(ctx.lsp_child_registry().pids().is_empty());
+    }
+
+    /// A teardown that the process outlives has no exit sweep behind it, so
+    /// its servers must still be stopped by the background reap.
+    #[test]
+    fn connection_end_quiesce_without_exit_sweep_reaps_servers_in_background() {
+        let (_root_dir, _root, ctx, executor, mut live_roots, pid) =
+            root_with_running_fake_server("connection-end-background-reap");
+        quiesce_whole_connection(&mut live_roots, &executor, QuiescedLsp::ReapInBackground);
+        assert_eq!(ctx.lsp().active_client_count(), 0);
+        // Hang guard only: the reap waits 25 ms for Shutdown, then terminates.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "background reap left server {pid} running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
