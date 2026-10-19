@@ -236,7 +236,6 @@ impl BgTaskRegistry {
                 .readable_files()
                 .filter(|file| file.starts_with(path))
                 .filter(|file| self.is_readable_task_path(session, file))
-                .map(Path::to_path_buf)
                 .collect(),
         )
     }

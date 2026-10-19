@@ -37,6 +37,30 @@ pub const ENVIRONMENT_FILE: &str = "environment.bin";
 pub const MANIFEST_FILE: &str = "manifest.blake3";
 pub const SANDBOX_PROFILE_FILE: &str = "sandbox-profile.json";
 
+// Directory-layout and legacy flat-layout names share one visibility list.
+// The launch environment is deliberately absent: it can contain call secrets.
+const READABLE_CONTROL_FILES: [(&str, &str); 5] = [
+    (METADATA_FILE, "json"),
+    (COMMAND_FILE, "sh"),
+    (WRAPPER_FILE, "wrapper.sh"),
+    (MANIFEST_FILE, "manifest"),
+    (SANDBOX_PROFILE_FILE, "sandbox-profile.json"),
+];
+
+pub fn readable_task_file_names(layout: TaskLayout) -> Vec<String> {
+    READABLE_CONTROL_FILES
+        .iter()
+        .map(|(directory, flat)| match layout {
+            TaskLayout::Directory => format!("{CONTROL_DIR}/{directory}"),
+            TaskLayout::Flat => flat.to_string(),
+        })
+        .chain(TaskArtifact::ALL.into_iter().map(|artifact| match layout {
+            TaskLayout::Directory => format!("{IO_DIR}/{}", artifact.file_name()),
+            TaskLayout::Flat => artifact.flat_extension().to_string(),
+        }))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskLayout {
     Flat,
@@ -131,21 +155,13 @@ impl TaskPaths {
 
     /// Exact bundle files visible to authorized readers. The launch environment
     /// is intentionally absent even when the caller may inspect task records.
-    pub(crate) fn readable_files(&self) -> impl Iterator<Item = &Path> {
-        [
-            &self.json,
-            &self.command,
-            &self.wrapper,
-            &self.manifest,
-            &self.sandbox_profile,
-        ]
-        .into_iter()
-        .map(PathBuf::as_path)
-        .chain(
-            TaskArtifact::ALL
-                .into_iter()
-                .map(|artifact| self.artifact_path(artifact)),
-        )
+    pub(crate) fn readable_files(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        readable_task_file_names(self.layout)
+            .into_iter()
+            .map(|name| match self.layout {
+                TaskLayout::Directory => self.dir.join(name),
+                TaskLayout::Flat => self.session_dir.join(format!("{}.{name}", self.task_id)),
+            })
     }
 
     fn artifact_name(&self, artifact: TaskArtifact) -> OsString {
@@ -4131,5 +4147,39 @@ mod tests {
         let path = CString::new(task.paths.stdout.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(open_task_artifact(&task.paths, TaskArtifact::Stdout).is_err());
+    }
+}
+
+#[cfg(test)]
+mod readable_name_tests {
+    use super::*;
+
+    #[test]
+    fn shell_read_names_match_file_tool_readable_files() {
+        for paths in [
+            TaskPaths::directory(PathBuf::from("/session"), "bash-1111111111111111"),
+            TaskPaths::flat(PathBuf::from("/session"), "bash-1111111111111111"),
+        ] {
+            let actual = paths
+                .readable_files()
+                .collect::<std::collections::BTreeSet<_>>();
+            let expected = [
+                &paths.json,
+                &paths.command,
+                &paths.wrapper,
+                &paths.manifest,
+                &paths.sandbox_profile,
+            ]
+            .into_iter()
+            .cloned()
+            .chain(
+                TaskArtifact::ALL
+                    .into_iter()
+                    .map(|artifact| paths.artifact_path(artifact).to_path_buf()),
+            )
+            .collect();
+            assert_eq!(actual, expected);
+            assert!(!actual.contains(&paths.environment));
+        }
     }
 }

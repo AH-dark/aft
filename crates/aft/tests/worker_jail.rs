@@ -1964,3 +1964,129 @@ else:
     assert!(reply.contains("SHARED_TMP_DENIED"), "{reply}");
     assert!(!outside.exists());
 }
+
+#[path = "helpers/session_output.rs"]
+mod session_output;
+
+async fn session_output_jail() -> (Jail, session_output::SessionOutput) {
+    let mut jail = Jail::start().await;
+    let ready = jail.tool_reply("bash", json!({"command": "true"})).await;
+    let capture = PathBuf::from(
+        ready["structuredContent"]["output_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing task capture: {ready}")),
+    );
+    let storage = capture
+        .ancestors()
+        .nth(6)
+        .expect("namespaced task capture root");
+    let outputs = session_output::SessionOutput::new(storage, "worker-session");
+    (jail, outputs)
+}
+
+#[tokio::test]
+async fn worker_jail_reads_own_saved_task_output() {
+    if !native_available() {
+        return;
+    }
+    let (mut jail, outputs) = session_output_jail().await;
+    let copied = jail.worktree.join("saved-gate.log");
+    let reply = jail
+        .bash(&format!(
+            "cat {} && cp {} {} && echo OWN_OUTPUT_READ",
+            quote(&outputs.own.stdout),
+            quote(&outputs.own.stdout),
+            quote(&copied),
+        ))
+        .await;
+    assert!(reply.contains("saved-output\n"), "{reply}");
+    assert_eq!(std::fs::read_to_string(copied).unwrap(), "saved-output\n");
+}
+
+#[tokio::test]
+async fn worker_jail_denies_other_session_saved_output() {
+    if !native_available() {
+        return;
+    }
+    let (mut jail, outputs) = session_output_jail().await;
+    for path in [&outputs.other.stdout, &outputs.other_harness.stdout] {
+        let reply = jail
+            .bash(&format!(
+                "if cat {}; then echo UNEXPECTED_READ; else echo OTHER_SESSION_DENIED; fi",
+                quote(path)
+            ))
+            .await;
+        assert!(reply.contains("OTHER_SESSION_DENIED"), "{reply}");
+        assert!(!reply.contains("saved-output"), "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn worker_jail_denies_saved_task_environment() {
+    if !native_available() {
+        return;
+    }
+    let (mut jail, outputs) = session_output_jail().await;
+    let reply = jail
+        .bash(&format!(
+            "if cat {}; then echo UNEXPECTED_READ; else echo ENVIRONMENT_DENIED; fi",
+            quote(&outputs.own.environment)
+        ))
+        .await;
+    assert!(reply.contains("ENVIRONMENT_DENIED"), "{reply}");
+    assert!(!reply.contains("secret-environment"), "{reply}");
+}
+
+#[tokio::test]
+async fn worker_jail_denies_private_storage_and_output_symlinks() {
+    if !native_available() {
+        return;
+    }
+    let (mut jail, outputs) = session_output_jail().await;
+    for (index, path) in outputs
+        .private
+        .iter()
+        .chain([&outputs.other.stdout])
+        .enumerate()
+    {
+        let link = outputs.own.io_dir.join("stdout-link");
+        std::os::unix::fs::symlink(path, &link).unwrap();
+        let reply = jail
+            .bash(&format!(
+                "if cat {} || cat {}; then echo UNEXPECTED_READ; else echo PRIVATE_DENIED; fi",
+                quote(path),
+                quote(&link)
+            ))
+            .await;
+        assert!(reply.contains("PRIVATE_DENIED"), "case {index}: {reply}");
+        std::fs::remove_file(link).unwrap();
+    }
+    // A readable artifact name must not turn a symlink into a storage escape.
+    std::fs::remove_file(&outputs.own.stdout).unwrap();
+    std::os::unix::fs::symlink(&outputs.private[0], &outputs.own.stdout).unwrap();
+    let reply = jail
+        .bash(&format!(
+            "if cat {}; then echo UNEXPECTED_READ; else echo SYMLINK_DENIED; fi",
+            quote(&outputs.own.stdout)
+        ))
+        .await;
+    assert!(reply.contains("SYMLINK_DENIED"), "{reply}");
+}
+
+#[tokio::test]
+async fn worker_jail_cannot_write_saved_task_output() {
+    if !native_available() {
+        return;
+    }
+    let (mut jail, outputs) = session_output_jail().await;
+    for path in [&outputs.own.stdout, &outputs.own.io_dir.join("new-file")] {
+        let reply = jail.bash(&format!(
+            "if printf tampered > {}; then echo UNEXPECTED_WRITE; else echo SAVED_WRITE_DENIED; fi", quote(path)
+        )).await;
+        assert!(reply.contains("SAVED_WRITE_DENIED"), "{reply}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&outputs.own.stdout).unwrap(),
+        "saved-output\n"
+    );
+}

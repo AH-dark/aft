@@ -69,11 +69,15 @@ fn configure_native(aft: &mut AftProcess, project: &Path, storage: &Path, enable
 }
 
 fn foreground(aft: &mut AftProcess, id: &str, command: &str) -> Value {
+    foreground_in_session(aft, id, "native-sandbox-session", command)
+}
+
+fn foreground_in_session(aft: &mut AftProcess, id: &str, session: &str, command: &str) -> Value {
     aft.send(
         &json!({
             "id": id,
             "method": "bash",
-            "session_id": "native-sandbox-session",
+            "session_id": session,
             "params": {
                 "command": command,
                 "foreground_orchestrate": true,
@@ -237,12 +241,40 @@ fn cortexkit_floor_state_is_denied() {
 }
 
 #[test]
-fn cortexkit_floor_other_task_io_is_denied() {
+fn cortexkit_floor_other_session_task_io_is_denied() {
     skip_if_landlock_absent!();
     let mut f = CortexkitFloorFixture::new();
-    let other = foreground(&mut f.aft, "other-task", "printf other-task");
+    // A shell may read its own session's saved output, never another session's.
+    let other = foreground_in_session(
+        &mut f.aft,
+        "other-task",
+        "other-native-sandbox-session",
+        "printf other-task",
+    );
     assert_eq!(other["status"], "completed", "{other:?}");
     f.denied_read(PathBuf::from(other["output_path"].as_str().unwrap()));
+}
+
+#[test]
+fn cortexkit_floor_own_session_task_output_is_readable() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    let earlier = foreground(&mut f.aft, "earlier-task", "printf earlier-output");
+    assert_eq!(earlier["status"], "completed", "{earlier:?}");
+    let output_path = PathBuf::from(earlier["output_path"].as_str().unwrap());
+    let response = foreground(
+        &mut f.aft,
+        "read-own-output",
+        &format!("cat {}", quote(&output_path)),
+    );
+    assert_eq!(response["status"], "completed", "{response:?}");
+    assert!(
+        response["output"]
+            .as_str()
+            .unwrap()
+            .contains("earlier-output"),
+        "own session output was not readable: {response:?}"
+    );
 }
 
 #[test]

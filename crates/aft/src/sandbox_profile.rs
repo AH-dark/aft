@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-pub const SANDBOX_PROFILE_VERSION: u32 = 6;
+pub const SANDBOX_PROFILE_VERSION: u32 = 7;
 
 /// Private stores with narrowly scoped exceptions. These exceptions apply only
 /// to these trees, never to the credential floor or user-supplied read denies.
@@ -18,6 +18,10 @@ pub struct SandboxDataPolicy {
     /// through the resolved `read_allow` targets, and writes stay denied.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_metadata_allow: Vec<PathBuf>,
+    /// Readable task-file names beneath the calling session, never its environment.
+    /// Seatbelt matches names; Landlock snapshots existing files at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_task_read_dir: Option<PathBuf>,
 }
 
 impl SandboxDataPolicy {
@@ -48,6 +52,19 @@ impl SandboxDataPolicy {
                 "data_policy.write_allow",
             )?,
             read_metadata_allow: self.read_metadata_allow,
+            session_task_read_dir: self
+                .session_task_read_dir
+                .map(|path| {
+                    let canonical =
+                        canonicalize_required_dir(path.clone(), "session_task_read_dir")?;
+                    if canonical != path {
+                        return Err(SandboxProfileError::new(
+                            "session task read directory changed canonical identity",
+                        ));
+                    }
+                    Ok(canonical)
+                })
+                .transpose()?,
         })
     }
 
@@ -696,6 +713,7 @@ mod tests {
             read_allow: files.to_vec(),
             write_allow: files.to_vec(),
             read_metadata_allow: Vec::new(),
+            session_task_read_dir: None,
         };
         // None of Git's optional files needs to exist at initial profile build.
         let mut profile = profile.canonicalize_for_launch().unwrap();
@@ -795,6 +813,7 @@ mod tests {
             read_allow: vec![lock.clone()],
             write_allow: vec![lock.clone()],
             read_metadata_allow: Vec::new(),
+            session_task_read_dir: None,
         }
         .canonicalize(&[], false)
         .unwrap();
@@ -824,6 +843,7 @@ mod tests {
             read_allow: vec![own.clone(), io.clone(), hooks.clone()],
             write_allow: vec![own.clone(), io.clone()],
             read_metadata_allow: Vec::new(),
+            session_task_read_dir: None,
         };
         for allowed in [&own, &io, &own.join("new-file"), &io.join("temp")] {
             policy
@@ -1288,7 +1308,7 @@ mod tests {
             .expect_err("new launcher must reject a v1 profile");
         assert!(error
             .to_string()
-            .contains("unsupported sandbox profile version 1; expected 6"));
+            .contains("unsupported sandbox profile version 1; expected 7"));
 
         let current = SandboxProfile::build(
             vec![root.clone()],
@@ -1307,7 +1327,7 @@ mod tests {
             .canonicalize_for_launch()
             .unwrap_err()
             .to_string()
-            .contains("unsupported sandbox profile version 4; expected 6"));
+            .contains("unsupported sandbox profile version 4; expected 7"));
         let error = serde_json::from_value::<LegacyProfile>(
             serde_json::to_value(current).expect("serialize current profile"),
         )
