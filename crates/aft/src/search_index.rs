@@ -7085,7 +7085,9 @@ pub(crate) fn resolve_root_identity(
         let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
         let canonical_key =
             artifact_cache_key_memo_root_key(&crate::root_identity::canonical_root(probe_root));
-        let cached = crate::developer_tools::git_usable()
+        // Cached lookups refresh old entries on disk. Health uses the direct,
+        // non-refreshing reader instead of this mutating cache lookup.
+        let cached = (persist && crate::developer_tools::git_usable())
             .then(|| {
                 lookup_artifact_cache_key_memo_profiled(storage_root, &canonical_key, timings)
                     .or_else(|| {
@@ -7144,28 +7146,31 @@ pub(crate) fn resolve_root_identity(
         match repo_root_commit_with_retry_profiled(probe_root, timings) {
             RootCommitResolution::Commit(root_commit) => {
                 let key = session_artifact_key_from_git_identity(probe_root, &root_commit);
-                if let Err(error) = record_artifact_cache_key_memo_profiled(
-                    storage_root,
-                    &memo_root_key,
-                    &key,
-                    &root_commit,
-                    timings,
-                ) {
-                    crate::slog_warn!(
-                        "artifact cache key: could not update legacy Git memo: {error}"
-                    );
+                if persist {
+                    if let Err(error) = record_artifact_cache_key_memo_profiled(
+                        storage_root,
+                        &memo_root_key,
+                        &key,
+                        &root_commit,
+                        timings,
+                    ) {
+                        crate::slog_warn!(
+                            "artifact cache key: could not update legacy Git memo: {error}"
+                        );
+                    }
                 }
                 Identity::git(probe_root, root_commit)
             }
-            RootCommitResolution::NotARepo if memo.is_none() => Ok(Identity::Path),
-            RootCommitResolution::NotARepo | RootCommitResolution::Failed(_) if memo.is_some() => {
+            // A verified non-repository or unborn replacement must not inherit
+            // the committed repository identity retained in an older memo.
+            RootCommitResolution::NotARepo => Ok(Identity::Path),
+            RootCommitResolution::Failed(_) if memo.is_some() => {
                 Identity::git(probe_root, memo.unwrap().git_root_commit)
             }
             RootCommitResolution::Failed(detail) => Err(std::io::Error::other(detail)),
             RootCommitResolution::Cancelled => {
                 Err(std::io::Error::other("artifact cache key probe cancelled"))
             }
-            RootCommitResolution::NotARepo => unreachable!("memo cases covered"),
         }
     };
     let result = if persist {
@@ -13191,6 +13196,80 @@ mod tests {
             assert_eq!(standing.artifact_key, expected);
             assert_eq!(standing.resolved_git_toplevel, None);
         });
+    }
+
+    #[test]
+    fn usable_git_rebind_replaces_an_unrelated_repository_identity() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        assert!(crate::developer_tools::git_usable());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("checkout");
+        let replacement = directory.path().join("replacement");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/root_identity_upgrade/cases.json"
+        ))
+        .unwrap();
+        for (path, content) in [
+            (&root, "first repository"),
+            (&replacement, "unrelated repository"),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("lib.rs"), content).unwrap();
+            upgrade_fixture_git(path, &["init", "-q"], &fixture["commit"]);
+            upgrade_fixture_git(path, &["add", "."], &fixture["commit"]);
+            upgrade_fixture_git(path, &["commit", "-q", "-m", content], &fixture["commit"]);
+        }
+        let storage = directory.path().join("storage");
+        let first = artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap();
+        let expected = base_c71_cache_key(
+            &replacement,
+            &replacement,
+            &directory.path().join("base"),
+            None,
+            &mut ArtifactCacheKeyTimings::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            first, expected,
+            "the fixtures must be unrelated repositories"
+        );
+        fs::rename(&root, directory.path().join("archived-checkout")).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+                first
+            );
+        });
+        assert_eq!(
+            artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+            expected,
+            "usable Git must not reuse the replaced repository's key"
+        );
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            assert_eq!(
+                artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+                expected,
+                "the replacement identity must be durably recorded"
+            );
+        });
+        fs::rename(&root, directory.path().join("second-archived-checkout")).unwrap();
+        fs::create_dir(&root).unwrap();
+        upgrade_fixture_git(&root, &["init", "-q"], &fixture["commit"]);
+        let unborn = base_c71_cache_key(
+            &root,
+            &root,
+            &directory.path().join("unborn-base"),
+            None,
+            &mut ArtifactCacheKeyTimings::default(),
+        )
+        .unwrap();
+        assert_ne!(unborn, expected);
+        assert_eq!(
+            artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+            unborn,
+            "a verified unborn replacement must not reuse the legacy repository key"
+        );
     }
 
     #[test]

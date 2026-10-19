@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Identity {
     Path,
@@ -60,7 +60,9 @@ pub(crate) fn bind(
 ) -> io::Result<Identity> {
     let root = canonical_root(root);
     if let Some(identity) = read(&root, storage)? {
-        return Ok(identity);
+        if matches!(&identity, Identity::Path) || !crate::developer_tools::git_usable() {
+            return Ok(identity);
+        }
     }
     let path = record_path(&root, storage);
     let directory = path.parent().unwrap();
@@ -76,11 +78,19 @@ pub(crate) fn bind(
     }
     let lock = options.open(lock_path)?;
     lock.lock()?;
-    if let Some(identity) = read(&root, storage)? {
-        return Ok(identity);
+    let previous = read(&root, storage)?;
+    if let Some(identity) = &previous {
+        if matches!(identity, Identity::Path) || !crate::developer_tools::git_usable() {
+            return Ok(identity.clone());
+        }
     }
+    // With Git available, resolve again under the record lock: a different
+    // repository can replace a checkout without changing its canonical path.
     let identity = select(&root, storage, choose)?;
     identity.validate(&root)?;
+    if previous.as_ref() == Some(&identity) {
+        return Ok(identity);
+    }
     let bytes = serde_json::to_vec(&Record {
         version: 1,
         root,
@@ -288,9 +298,12 @@ mod tests {
                 let (root, storage) = (root.path(), storage.path());
                 scope.spawn(move || {
                     start.wait();
-                    bind(root, storage, |_| {
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(choice)
+                    // Without Git, both contenders must reuse the first choice.
+                    crate::developer_tools::with_git_usable_for_test(false, || {
+                        bind(root, storage, |_| {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(choice)
+                        })
                     })
                     .unwrap()
                     .key(root, false)

@@ -7248,6 +7248,102 @@ mod tests {
         assert!(executor.register_actor(root_id, ctx));
     }
 
+    fn assert_standing_health_preserves_legacy_memo(old_entry: bool) {
+        assert!(crate::developer_tools::git_usable());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repository");
+        let storage = directory.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn health_fixture() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            crate::test_env::apply_hermetic_git_env(command.current_dir(&root));
+            let output = command.args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "health fixture git: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Health fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "health fixture",
+        ]);
+        let root = std::fs::canonicalize(&root).unwrap();
+        let commit = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let memo_root = if old_entry {
+            root.clone()
+        } else {
+            directory.path().join("another-root")
+        };
+        std::fs::create_dir_all(&memo_root).unwrap();
+        let memo = storage.join("cache-keys.json");
+        std::fs::write(
+            &memo,
+            serde_json::to_vec(&json!({ (memo_root.to_string_lossy().to_string()): {
+                "key": crate::search_index::artifact_key_from_git_identity(&commit),
+                "git_root_commit": commit, "recorded_at_ms": 0
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&memo, filetime::FileTime::from_unix_time(60, 0)).unwrap();
+        let before = (
+            std::fs::read(&memo).unwrap(),
+            std::fs::metadata(&memo).unwrap().modified().unwrap(),
+        );
+        let app = App::default_shared();
+        let executor = Executor::new();
+        register_standing_health_actor(&executor, &app, &root, standing_config(&root, &storage));
+        let metrics = DispatchPathMetrics::new();
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let report = report.metrics.unwrap();
+        let row = report["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["standing_entry"] == root.display().to_string())
+            .unwrap();
+        assert!(
+            row.get("standing_refusal").is_none(),
+            "the fixture must complete identity observation"
+        );
+        let after = (
+            std::fs::read(&memo).unwrap(),
+            std::fs::metadata(&memo).unwrap().modified().unwrap(),
+        );
+        assert_eq!(
+            after, before,
+            "health changed legacy memo bytes or mtime (old entry: {old_entry})"
+        );
+        assert!(crate::root_identity::read(&root, &storage)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn standing_health_probe_does_not_write_legacy_memo() {
+        assert_standing_health_preserves_legacy_memo(false);
+    }
+
+    #[test]
+    fn standing_health_lookup_does_not_refresh_legacy_memo() {
+        assert_standing_health_preserves_legacy_memo(true);
+    }
+
     #[test]
     fn standing_health_and_memory_reuse_existing_per_root_tables() {
         let storage = tempfile::tempdir().expect("storage directory");

@@ -3701,7 +3701,7 @@ impl BackupStore {
             message: error.to_string(),
         })?;
         let _namespace =
-            backup_namespace_gate(namespace_root, true).map_err(|error| AftError::IoError {
+            backup_namespace_admission(namespace_root).map_err(|error| AftError::IoError {
                 path: namespace_root.display().to_string(),
                 message: error.to_string(),
             })?;
@@ -5743,7 +5743,7 @@ thread_local! {
     static AFTER_BACKUP_NAMESPACE_ADMISSION: std::cell::RefCell<Option<NamespaceAdmissionHook>> = const { std::cell::RefCell::new(None) };
 }
 
-fn backup_namespace_gate(storage: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+fn backup_namespace_file(storage: &Path) -> std::io::Result<std::fs::File> {
     let path = storage.join(".backup-repair.lock");
     crate::production_storage::refuse_write(&path)?;
     let mut options = crate::private_storage::options();
@@ -5753,7 +5753,19 @@ fn backup_namespace_gate(storage: &Path, wait: bool) -> std::io::Result<Option<s
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(path)?;
+    options.open(path)
+}
+
+// Admissions share the stable gate even while a file lock is busy. Repair
+// alone needs exclusivity, so unrelated sessions can keep admitting backups.
+fn backup_namespace_admission(storage: &Path) -> std::io::Result<std::fs::File> {
+    let file = backup_namespace_file(storage)?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+fn backup_namespace_gate(storage: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+    let file = backup_namespace_file(storage)?;
     if wait {
         file.lock()?;
     } else {
@@ -5895,6 +5907,68 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn waiting_for_one_backup_file_does_not_block_another_session() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut owner = BackupStore::new();
+        owner.set_storage_dir(storage.path().to_path_buf(), 72);
+        let key = storage.path().join("busy.txt");
+        let held = owner.acquire_stack_disk_lock("busy-session", &key).unwrap();
+        assert!(held.is_some());
+        assert_ne!(
+            session_gc_lock_path(&owner.session_dir("busy-session").unwrap()),
+            session_gc_lock_path(&owner.session_dir("independent-session").unwrap()),
+            "the fixture must use different session-gate stripes"
+        );
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::channel();
+        let waiter_storage = storage.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let mut store = BackupStore::new();
+            store.set_storage_dir(waiter_storage, 72);
+            AFTER_BACKUP_NAMESPACE_ADMISSION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_| {
+                    admitted_tx.send(()).unwrap();
+                }))
+            });
+            let result = store.acquire_stack_disk_lock("busy-session", &key);
+            waiter_tx.send(result.is_ok()).unwrap();
+        });
+        admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (independent_tx, independent_rx) = std::sync::mpsc::channel();
+        let independent_storage = storage.path().to_path_buf();
+        let independent = std::thread::spawn(move || {
+            let mut store = BackupStore::new();
+            store.set_storage_dir(independent_storage.clone(), 72);
+            let result = store.acquire_stack_disk_lock(
+                "independent-session",
+                &independent_storage.join("other.txt"),
+            );
+            independent_tx
+                .send(
+                    result
+                        .map(|guard| guard.is_some())
+                        .map_err(|error| error.to_string()),
+                )
+                .unwrap();
+        });
+        let admitted_while_busy = independent_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let busy_still_waiting = waiter_rx.try_recv().is_err();
+        drop(held);
+        waiter.join().unwrap();
+        independent.join().unwrap();
+        assert!(
+            busy_still_waiting,
+            "the held per-file lock must actually block its waiter"
+        );
+        assert!(
+            matches!(admitted_while_busy, Ok(Ok(true))),
+            "an unrelated backup session waited behind the busy file: {admitted_while_busy:?}"
+        );
+    }
+
     #[test]
     fn legacy_backup_repair_reports_unwritable_namespace_without_losing_source() {
         let storage = tempfile::tempdir().unwrap();
