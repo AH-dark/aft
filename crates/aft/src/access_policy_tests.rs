@@ -1079,6 +1079,125 @@ fn scratch_read_respects_absolute_floor_and_live_sqlite() {
 
 #[cfg(unix)]
 #[test]
+fn scratch_read_inner_scratch_name_cannot_become_trusted_root() {
+    let (directory, ctx, scratch, _scope) = scratch_read_context();
+    let inner = scratch.join(".sandbox-tmp-inner");
+    std::fs::create_dir(&inner).unwrap();
+    let file = inner.join("file.txt");
+    std::fs::write(&file, "own scratch\n").unwrap();
+    let validated = ctx
+        .validate_read_path("policy-test", "policy-session", &file)
+        .unwrap();
+    assert_eq!(validated, file);
+    assert_eq!(
+        crate::bounded_io::read(&validated, None).unwrap(),
+        b"own scratch\n"
+    );
+    assert_eq!(
+        crate::project_content::read(&validated).unwrap(),
+        b"own scratch\n"
+    );
+
+    let outside = directory.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("file.txt"), "outside secret\n").unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir(&inner).unwrap();
+    std::os::unix::fs::symlink(&outside, &inner).unwrap();
+
+    let read = crate::bounded_io::read(&validated, None);
+    assert!(read.is_err(), "inner scratch symlink leaked: {read:?}");
+    assert_eq!(
+        read.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        crate::project_content::read(&validated).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        crate::task_temp_reads::open(&validated).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_parent_of_inner_scratch_name_cannot_escape() {
+    let (directory, ctx, scratch, _scope) = scratch_read_context();
+    let parent = scratch.join("nested");
+    let inner = parent.join(".sandbox-tmp-inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let file = inner.join("file.txt");
+    std::fs::write(&file, "own scratch\n").unwrap();
+    let validated = ctx
+        .validate_read_path("policy-test", "policy-session", &file)
+        .unwrap();
+    assert_eq!(validated, file);
+
+    let outside = directory.path().join("outside");
+    std::fs::create_dir_all(outside.join(".sandbox-tmp-inner")).unwrap();
+    std::fs::write(
+        outside.join(".sandbox-tmp-inner/file.txt"),
+        "outside secret\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&parent).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+
+    let read = crate::bounded_io::read(&validated, None);
+    assert!(
+        read.is_err(),
+        "inner scratch parent symlink leaked: {read:?}"
+    );
+    assert_eq!(
+        read.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        crate::project_content::read(&validated).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        crate::task_temp_reads::open(&validated).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_replaced_root_symlink_is_refused() {
+    let (directory, ctx, scratch, _scope) = scratch_read_context();
+    let file = scratch.join("scratch.rs");
+    let validated = ctx
+        .validate_read_path("policy-test", "policy-session", &file)
+        .unwrap();
+    assert_eq!(validated, file);
+    let outside = directory.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("scratch.rs"), "outside secret\n").unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir(&scratch).unwrap();
+    std::os::unix::fs::symlink(&outside, &scratch).unwrap();
+
+    let read = crate::bounded_io::read(&validated, None);
+    assert!(read.is_err(), "scratch root symlink leaked: {read:?}");
+    assert_eq!(
+        read.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        crate::project_content::read(&validated).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        crate::task_temp_reads::open(&validated).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn scratch_read_opened_handle_cannot_escape_after_authorization() {
     let (directory, ctx, scratch, _scope) = scratch_read_context();
     let nested = scratch.join("nested");

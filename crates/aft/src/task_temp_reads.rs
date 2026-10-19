@@ -15,27 +15,41 @@ pub(crate) fn is_scratch(path: &Path) -> bool {
 }
 
 pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
-    let Some(root) = path
+    // Both open callers resolve relative paths against the process cwd. Make
+    // that base explicit without following links, so the root search below
+    // also sees task-temp directories that sit above the cwd.
+    let absolute_path = std::path::absolute(path)?;
+    // The trusted root must be the task-temp directory the task registry
+    // records, never a directory the task itself created. Registry roots are
+    // either /private/tmp/aft-w/<12 hex> (/tmp/aft-w/<12 hex> on Linux), which
+    // only matches when its parent is exactly that fixed daemon-owned folder,
+    // or a legacy .sandbox-tmp-* folder the daemon made inside the task's IO
+    // bundle. A sandboxed task can only write inside its root, so any other
+    // matching name it creates sits BELOW the registry root, while nothing
+    // above the root is task-created. Taking the outermost match therefore
+    // always lands on the registry root for registry-authorized paths.
+    let Some(absolute_root) = absolute_path
         .ancestors()
-        .find(|path| crate::sandbox_spawn::is_managed_task_temp_dir(path))
+        .filter(|path| crate::sandbox_spawn::is_managed_task_temp_dir(path))
+        .last()
     else {
         return Ok(None);
     };
     if crate::project_content::is_sqlite_or_metadata(path) {
         return Err(refused());
     }
-    // Both open callers resolve relative paths against the process cwd. Make
-    // that base explicit without following links below the task-temp root.
-    let absolute_path = std::path::absolute(path)?;
-    let absolute_root = std::path::absolute(root)?;
     let remainder = absolute_path
-        .strip_prefix(&absolute_root)
+        .strip_prefix(absolute_root)
         .map_err(|_| refused())?;
-    // The root is the directory named by authorization, so resolving its
-    // prefix accepts aliases such as /var on macOS. Snapshot it before open;
-    // resolving descendants would accept a parent replaced by a symlink after
-    // authorization instead of detecting the changed location of the handle.
-    let root = crate::inspect::job::normalize_path(&std::fs::canonicalize(absolute_root)?);
+    // Resolve aliases such as /var on macOS only ABOVE the root: canonicalize
+    // the root's parent and append the root's own name unresolved. Following
+    // the root or anything below it would trust a replacement symlink's
+    // outside target; left unresolved, such a swap changes the opened
+    // descriptor's location and the check after open refuses it.
+    let (Some(parent), Some(name)) = (absolute_root.parent(), absolute_root.file_name()) else {
+        return Err(refused());
+    };
+    let root = crate::inspect::job::normalize_path(&std::fs::canonicalize(parent)?.join(name));
     let expected = crate::inspect::job::normalize_path(&root.join(remainder));
     Ok(Some(OpenCheck { root, expected }))
 }
