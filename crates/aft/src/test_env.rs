@@ -12,30 +12,13 @@ use std::ffi::{OsStr, OsString};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Names used by completion redaction to identify environment credentials.
-pub(crate) fn is_secret_named_environment_variable(key: &OsStr) -> bool {
-    let Some(key) = key.to_str() else {
-        return false;
-    };
-    let key = key.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "SECRET",
-        "KEY",
-        "PASSWORD",
-        "PASSWD",
-        "CREDENTIAL",
-        "AUTH",
-    ]
-    .iter()
-    .any(|marker| key.contains(marker))
-}
-
 /// Return inherited credential-shaped names so test child processes can omit them.
-pub(crate) fn secret_named_environment_keys() -> Vec<OsString> {
+pub(crate) fn secret_named_environment_keys(
+    is_secret_environment_key: fn(&str) -> bool,
+) -> Vec<OsString> {
     std::env::vars_os()
         .map(|(key, _)| key)
-        .filter(|key| is_secret_named_environment_variable(key))
+        .filter(|key| key.to_str().is_some_and(is_secret_environment_key))
         .collect()
 }
 

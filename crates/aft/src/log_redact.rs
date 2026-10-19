@@ -194,6 +194,21 @@ fn redact_with_range<'a>(
 #[derive(Default)]
 pub(crate) struct SecretValues(Vec<String>);
 
+/// Whether an environment variable name marks its value as a completion secret.
+pub fn is_secret_environment_key(key: &str) -> bool {
+    [
+        "TOKEN",
+        "SECRET",
+        "KEY",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|part| contains_ignore_ascii_case(key, part))
+}
+
 impl SecretValues {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -207,19 +222,7 @@ impl SecretValues {
             let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
                 continue;
             };
-            if value.chars().count() >= 8
-                && [
-                    "TOKEN",
-                    "SECRET",
-                    "KEY",
-                    "PASSWORD",
-                    "PASSWD",
-                    "CREDENTIAL",
-                    "AUTH",
-                ]
-                .iter()
-                .any(|part| contains_ignore_ascii_case(key, part))
-            {
+            if value.chars().count() >= 8 && is_secret_environment_key(key) {
                 values.push(value.to_owned());
             }
         }

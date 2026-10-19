@@ -4947,7 +4947,9 @@ pub(crate) fn completion_secret_values(
         isolated_environment_for_plan(plan, request_environment).unwrap_or_else(|| {
             let mut environment: ChildEnvironment = std::env::vars_os().collect();
             #[cfg(test)]
-            for key in crate::test_env::secret_named_environment_keys() {
+            for key in crate::test_env::secret_named_environment_keys(
+                crate::log_redact::is_secret_environment_key,
+            ) {
                 environment.remove(&key);
             }
             environment.extend(

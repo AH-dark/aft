@@ -734,7 +734,9 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
     }
     #[cfg(test)]
-    for key in crate::test_env::secret_named_environment_keys() {
+    for key in
+        crate::test_env::secret_named_environment_keys(crate::log_redact::is_secret_environment_key)
+    {
         command.env_remove(key);
     }
     command.envs(environment);
