@@ -1053,7 +1053,7 @@ fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
     );
     assert_eq!(std::fs::read_to_string(written).unwrap(), "allowed");
 
-    let etc = foreground(&mut aft, "system-read", "cat /etc/hostname");
+    let etc = foreground(&mut aft, "system-read", "cat /etc/passwd");
     assert_eq!(etc["status"], "completed", "system read failed: {etc:?}");
     assert!(aft.shutdown().success());
 }
