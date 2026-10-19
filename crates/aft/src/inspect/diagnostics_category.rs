@@ -513,12 +513,7 @@ fn collect_warm_working_set(
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     // External workspace servers can publish unrelated files too. Retain only
     // the requested files outside the project; unscoped collection stays local.
-    let scoped_files = scoped_files.map(|files| {
-        files
-            .iter()
-            .map(|file| crate::inspect::job::canonicalize_normalized(file))
-            .collect::<HashSet<_>>()
-    });
+    let scoped_files = scoped_files.map(|files| files.iter().cloned().collect::<HashSet<_>>());
     let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
     let accepts_file = |file: &Path| {
         let file = crate::inspect::job::canonicalize_normalized(file);
@@ -725,7 +720,10 @@ pub(crate) fn scoped_coverage_candidates(
         vec![snapshot.project_root.clone()]
     } else {
         scope.roots().to_vec()
-    };
+    }
+    .into_iter()
+    .map(|root| crate::inspect::job::canonicalize_normalized(&root))
+    .collect::<Vec<_>>();
 
     let mut candidates = BTreeSet::new();
     // A directory's raw entries, not just its recognized source files, must
@@ -741,14 +739,13 @@ pub(crate) fn scoped_coverage_candidates(
             {
                 continue;
             }
-            candidates.insert(crate::inspect::job::canonicalize_normalized(&root));
+            candidates.insert(root);
             continue;
         }
         if Instant::now() >= deadline {
             continue;
         }
 
-        let root = crate::inspect::job::canonicalize_normalized(&root);
         let walk_visited = std::sync::Arc::clone(&visited);
         let walker = crate::callgraph::walk_project_paths_while(&root, move || {
             Instant::now() < deadline
@@ -763,7 +760,7 @@ pub(crate) fn scoped_coverage_candidates(
             if tsconfig_membership.should_skip_diagnostics(&path) || !has_producer {
                 continue;
             }
-            candidates.insert(crate::inspect::job::canonicalize_normalized(&path));
+            candidates.insert(path);
         }
     }
 

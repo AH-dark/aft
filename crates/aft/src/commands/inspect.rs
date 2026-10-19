@@ -674,40 +674,24 @@ fn handle_inspect_payload(
     // File accounting describes the selected corpus, not a scanner's progress.
     // Blocking requests already captured this inventory for stat verification.
     let scoped_inventory = scope_roots.map(|roots| {
-        let mut files = observed_stats.map_or_else(
-            || {
-                let deadline =
-                    scope_walk_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
-                crate::callgraph::walk_project_files_in_scope_while(
-                    &snapshot.project_root,
-                    roots,
-                    inspect_scope_walk_budget(deadline),
-                )
-                .map(|file| crate::inspect::job::canonicalize_normalized(&file))
-                .collect::<BTreeSet<_>>()
-            },
-            |stats| {
-                stats
-                    .0
-                    .iter()
-                    .filter(|(file, _, _)| scope.contains(file))
-                    .map(|(file, _, _)| crate::inspect::job::canonicalize_normalized(file))
-                    .collect::<BTreeSet<_>>()
-            },
+        let in_root_count = scoped_in_root_file_count(
+            &snapshot.project_root,
+            roots,
+            &scope,
+            scope_walk_deadline,
+            observed_stats,
         );
         let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
         // External directory roots contribute only files with a registered
         // diagnostics producer; explicit file roots remain counted even when
         // no producer can analyze that file.
-        files.extend(
-            scope_candidates
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .filter(|file| !file.starts_with(&project_root))
-                .cloned(),
-        );
-        (roots, files.len() as u64)
+        let external_count = scope_candidates
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|file| !file.starts_with(&project_root))
+            .count();
+        (roots, (in_root_count + external_count) as u64)
     });
     let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 
@@ -1097,6 +1081,33 @@ fn handle_inspect_payload(
     };
     append_inspect_runtime_notes(&mut payload, &runtime_notes);
     Response::success(&req.id, payload)
+}
+
+fn scoped_in_root_file_count(
+    project_root: &Path,
+    scope_roots: &[PathBuf],
+    scope: &JobScope,
+    deadline: Option<Instant>,
+    observed_stats: Option<&InspectRootStatSnapshot>,
+) -> usize {
+    observed_stats.map_or_else(
+        || {
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
+            crate::callgraph::walk_project_files_in_scope_while(
+                project_root,
+                scope_roots,
+                inspect_scope_walk_budget(deadline),
+            )
+            .count()
+        },
+        |stats| {
+            stats
+                .0
+                .iter()
+                .filter(|(file, _, _)| scope.contains(file))
+                .count()
+        },
+    )
 }
 
 /// A linked worktree builds its call graph when a query first needs it, and
@@ -7517,6 +7528,47 @@ mod deferred_terminal_tests {
             started.elapsed() < Duration::from_millis(900),
             "inspect missed caller reply deadline: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn scoped_in_root_inventory_does_not_realpath_each_file() {
+        const FILE_COUNT: usize = 32;
+
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let scope_root = root.join("src");
+        std::fs::create_dir_all(&scope_root).expect("create source directory");
+        let files = (0..FILE_COUNT)
+            .map(|index| {
+                let file = scope_root.join(format!("file-{index}.ts"));
+                std::fs::write(&file, "export const value = 1;\n").expect("write source file");
+                file
+            })
+            .collect::<Vec<_>>();
+        let scope_roots = vec![scope_root];
+        let scope = JobScope::from_roots(root.clone(), scope_roots.clone());
+
+        crate::inspect::job::CANONICALIZE_CALLS.with(|calls| {
+            *calls.borrow_mut() = Some(Vec::new());
+        });
+        let count = scoped_in_root_file_count(&root, &scope_roots, &scope, None, None);
+        let canonicalized = crate::inspect::job::CANONICALIZE_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .take()
+                .expect("canonicalization capture was armed")
+        });
+
+        assert_eq!(count, FILE_COUNT);
+        assert!(
+            canonicalized.len() < FILE_COUNT,
+            "canonicalized {} paths for {FILE_COUNT} in-root files: {canonicalized:?}",
+            canonicalized.len()
+        );
+        assert!(
+            canonicalized.iter().all(|path| !files.contains(path)),
+            "an in-root source file was realpathed: {canonicalized:?}"
         );
     }
 
