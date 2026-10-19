@@ -133,7 +133,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .files
         .par_iter()
         .map(|file_path| {
-            let source = match std::fs::read_to_string(file_path) {
+            let source = match crate::bounded_io::read_to_string(file_path) {
                 Ok(s) => s,
                 Err(err) => {
                     return (

@@ -138,7 +138,10 @@ pub(crate) fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     admit(path, None)?;
     #[cfg(test)]
     record_open(path);
-    std::fs::read(path)
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    crate::task_temp_reads::open(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 pub(crate) fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> {
@@ -151,7 +154,7 @@ pub(crate) fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     admit(path, None)?;
     #[cfg(test)]
     record_open(path);
-    std::fs::File::open(path)
+    crate::task_temp_reads::open(path)
 }
 
 fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<()> {

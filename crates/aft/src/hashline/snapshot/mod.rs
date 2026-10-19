@@ -1159,7 +1159,7 @@ pub(crate) fn read_source(path: &Path) -> io::Result<ReadSource> {
 }
 
 fn read_source_unbounded(path: &Path) -> io::Result<ReadSource> {
-    let mut file = match fs::File::open(path) {
+    let mut file = match crate::task_temp_reads::open(path) {
         Ok(file) => file,
         Err(error) => {
             // Windows cannot open a directory as a regular File. Preserve the

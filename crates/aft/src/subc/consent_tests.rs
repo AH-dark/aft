@@ -417,6 +417,7 @@ fn scope_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     match request.command.as_str() {
         "read" => read_dispatch(request, ctx),
         "grep" => crate::commands::grep::handle_grep(&request, ctx),
+        "glob" => crate::commands::glob::handle_glob(&request, ctx),
         "write" => crate::commands::write::handle_write(&request, ctx),
         other => panic!("unexpected scope test command: {other}"),
     }
@@ -3495,4 +3496,98 @@ async fn consent_answered_call_returns_while_another_scope_open_is_held() {
     assert_eq!(daemon.counts.0.lock().unwrap().closes, 2);
     assert!(transport.routes.lock().unwrap().is_empty());
     daemon.finish();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
+    use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use crate::bash_background::BgTaskStatus;
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(50)));
+    let storage = f.ctx.config().storage_dir.clone().unwrap();
+    let mut roots = Vec::new();
+    for (session, id) in [
+        ("worker", "bash-0123456789abcdef"),
+        ("other-session", "bash-fedcba9876543210"),
+    ] {
+        let paths = task_paths(&storage, session, id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            id.into(),
+            session.into(),
+            "echo scratch".into(),
+            f.worker.project_root.clone(),
+            Some(f.worker.project_root.clone()),
+            None,
+            false,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task(&paths.json, &metadata).unwrap();
+        std::fs::write(&paths.stdout, "task output\n").unwrap();
+        std::fs::write(&paths.stderr, "").unwrap();
+        std::fs::write(&paths.exit, "0\n").unwrap();
+        f.ctx
+            .bash_background()
+            .replay_session(&storage, session)
+            .unwrap();
+        let scratch = f
+            .dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(format!(".sandbox-tmp-{session}"));
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("scratch.rs"), "fn scratch_marker() {}\n").unwrap();
+        f.ctx
+            .bash_background()
+            .task_for_test(id)
+            .unwrap()
+            .lock_state()
+            .unwrap()
+            .metadata
+            .sandbox_temp_dir = Some(scratch.clone());
+        roots.push(scratch);
+    }
+    let own = f.read(&f.worker, &roots[0].join("scratch.rs"), 701).await;
+    assert!(text(&own).contains("scratch_marker"), "{own}");
+    for (name, args) in [
+        (
+            "grep",
+            json!({"path": roots[0], "pattern": "scratch_marker"}),
+        ),
+        ("glob", json!({"path": roots[0], "pattern": "*.rs"})),
+    ] {
+        let own = f.tool(name, args, 702).await;
+        assert!(text(&own).contains("scratch.rs"), "{name}: {own}");
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.asks().is_empty());
+    let foreign = f.read(&f.worker, &roots[1].join("scratch.rs"), 703).await;
+    assert_eq!(code(&foreign), "access_pending", "{foreign}");
+    for (name, args) in [
+        (
+            "grep",
+            json!({"path": roots[1], "pattern": "scratch_marker"}),
+        ),
+        ("glob", json!({"path": roots[1], "pattern": "*.rs"})),
+    ] {
+        let foreign = f.tool(name, args, 704).await;
+        assert_eq!(code(&foreign), "access_pending", "{name}: {foreign}");
+    }
+    assert_eq!(f.fake.calls("consent.request").len(), 3);
+    let write = f
+        .tool(
+            "write",
+            json!({"filePath": roots[0].join("scratch.rs"), "content": "overwrite"}),
+            705,
+        )
+        .await;
+    assert_eq!(code(&write), "access_pending", "{write}");
+    assert_eq!(
+        std::fs::read_to_string(roots[0].join("scratch.rs")).unwrap(),
+        "fn scratch_marker() {}\n"
+    );
 }

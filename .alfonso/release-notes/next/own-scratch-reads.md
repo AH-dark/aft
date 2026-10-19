@@ -1,0 +1,1 @@
+- Sessions can read their own sandbox scratch files and folders without permission prompts; other sessions' scratch files and writes still follow the existing access policy.

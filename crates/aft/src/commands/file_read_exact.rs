@@ -289,14 +289,14 @@ fn open_contents(_root: &Path, target: &Path) -> Result<File, ReadExactRefusal> 
 
 /// Where an open file really is, asked of the kernel through its handle.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn opened_location(file: &File) -> io::Result<PathBuf> {
+pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 /// Where an open file really is, asked of the kernel through its handle.
 #[cfg(target_os = "macos")]
-fn opened_location(file: &File) -> io::Result<PathBuf> {
+pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = vec![0u8; libc::PATH_MAX as usize];
@@ -318,13 +318,13 @@ fn opened_location(file: &File) -> io::Result<PathBuf> {
     unix,
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
-fn opened_location(_file: &File) -> io::Result<PathBuf> {
+pub(crate) fn opened_location(_file: &File) -> io::Result<PathBuf> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
 /// Where an open file really is, with every junction and symlink resolved.
 #[cfg(windows)]
-fn opened_location(file: &File) -> io::Result<PathBuf> {
+pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{

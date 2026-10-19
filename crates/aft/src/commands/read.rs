@@ -103,7 +103,7 @@ fn is_binary(content: &[u8]) -> bool {
 }
 
 fn read_magic(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::task_temp_reads::open(path)?;
     let mut magic = [0u8; MEDIA_MAGIC_BYTES];
     let len = file.read(&mut magic)?;
     Ok(magic[..len].to_vec())
@@ -223,7 +223,7 @@ fn prepare_media_read(
         .flatten();
     let bytes = match source.as_ref().filter(|source| source.has_complete_bytes()) {
         Some(source) => Ok(source.bytes().to_vec()),
-        None => fs::read(path),
+        None => crate::bounded_io::read(path, None),
     };
     let raw_bytes = match bytes {
         Ok(bytes) => bytes,
@@ -1620,7 +1620,7 @@ fn handle_text_or_binary_read(
     let raw_bytes = if let Some(source) = &read_source {
         source.bytes()
     } else {
-        fallback_bytes = match fs::read(path) {
+        fallback_bytes = match crate::bounded_io::read(path, None) {
             Ok(b) => b,
             Err(e) => {
                 return Response::error(
@@ -1838,7 +1838,7 @@ fn handle_streaming_range_read(
     explicit_end_line: Option<u64>,
     limit: u32,
 ) -> Response {
-    let mut file = match fs::File::open(path) {
+    let mut file = match crate::task_temp_reads::open(path) {
         Ok(file) => file,
         Err(e) => {
             return Response::error(

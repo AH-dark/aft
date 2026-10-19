@@ -783,3 +783,372 @@ fn artifact_read_search_does_not_authorize_containing_git_store() {
         )
     );
 }
+
+fn scratch_read_context() -> (
+    tempfile::TempDir,
+    AppContext,
+    PathBuf,
+    (
+        crate::access_policy::ScopeGuard,
+        crate::access_policy::AskRouteGuard,
+    ),
+) {
+    let (directory, ctx, _) = artifact_read_context();
+    let scratch = directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".sandbox-tmp-scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::write(scratch.join("scratch.rs"), "fn scratch_marker() {}\n").unwrap();
+    let task = ctx
+        .bash_background()
+        .task_for_test("bash-0123456789abcdef")
+        .unwrap();
+    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
+    let db = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::db::open(&directory.path().join("grants.db")).unwrap(),
+    ));
+    let stamp = serde_json::from_value(json!({
+        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "ref": "scratch-worker", "kind": "worker", "scope_epoch": 1,
+        "owner_authorized": true
+    }))
+    .unwrap();
+    let scope = crate::db::access_grants::ScopeKey::from_stamp(&stamp);
+    crate::db::access_grants::register_scope(&db.lock().unwrap(), &scope, None, &ctx.config())
+        .unwrap();
+    crate::db::access_grants::register_worker(&db.lock().unwrap(), &scope).unwrap();
+    ctx.set_db(db);
+    let guard = crate::access_policy::scope_guard(Some(scope));
+    let ask =
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
+            once: Vec::new(),
+        }));
+    (directory, ctx, scratch, (guard, ask))
+}
+
+#[test]
+fn scratch_read_own_file_and_directory_skip_permission_ask() {
+    let (_directory, ctx, scratch, _scope) = scratch_read_context();
+    for (command, params, handler) in [
+        (
+            "read",
+            json!({"file": scratch.join("scratch.rs")}),
+            crate::commands::read::handle_read
+                as fn(&RawRequest, &AppContext) -> crate::protocol::Response,
+        ),
+        (
+            "read",
+            json!({"file": scratch}),
+            crate::commands::read::handle_read,
+        ),
+        (
+            "grep",
+            json!({"path": scratch, "pattern": "scratch_marker"}),
+            crate::commands::grep::handle_grep,
+        ),
+        (
+            "glob",
+            json!({"path": scratch, "pattern": "*.rs"}),
+            crate::commands::glob::handle_glob,
+        ),
+    ] {
+        let response = handler(&request(command, params), &ctx);
+        assert!(response.success, "{command}: {:?}", response.data);
+        assert!(
+            response.data.to_string().contains("scratch"),
+            "{command}: {:?}",
+            response.data
+        );
+    }
+}
+
+#[test]
+fn scratch_read_foreign_and_unregistered_paths_still_ask() {
+    let (directory, ctx, scratch, _scope) = scratch_read_context();
+    let unregistered = directory.path().join("unregistered");
+    std::fs::create_dir(&unregistered).unwrap();
+    std::fs::write(unregistered.join("scratch.rs"), "foreign scratch\n").unwrap();
+    for path in [&scratch, &unregistered] {
+        for command in ["read", "grep", "glob"] {
+            let params = match command {
+                "read" => json!({"file": path.join("scratch.rs")}),
+                "grep" => json!({"path": path, "pattern": "scratch"}),
+                _ => json!({"path": path, "pattern": "*"}),
+            };
+            let mut req = request(command, params);
+            req.session_id = Some(
+                if path == &scratch {
+                    "foreign-session"
+                } else {
+                    "policy-session"
+                }
+                .into(),
+            );
+            let response = match command {
+                "read" => crate::commands::read::handle_read(&req, &ctx),
+                "grep" => crate::commands::grep::handle_grep(&req, &ctx),
+                _ => crate::commands::glob::handle_glob(&req, &ctx),
+            };
+            assert!(!response.success, "{command} leaked: {:?}", response.data);
+            assert_eq!(
+                response.data["code"], "access_ask_required",
+                "{command}: {:?}",
+                response.data
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_symlink_escape_still_asks() {
+    let (directory, ctx, scratch, _scope) = scratch_read_context();
+    let outside = directory.path().join("secret.rs");
+    std::fs::write(&outside, "fn outside_secret() {}\n").unwrap();
+    let link = scratch.join("escape.rs");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let response =
+        crate::commands::read::handle_read(&request("read", json!({"file": link})), &ctx);
+    assert!(!response.success, "symlink leaked: {:?}", response.data);
+    assert_eq!(
+        response.data["code"], "access_ask_required",
+        "{:?}",
+        response.data
+    );
+    let grep = crate::commands::grep::handle_grep(
+        &request(
+            "grep",
+            json!({"path": scratch, "pattern": "outside_secret"}),
+        ),
+        &ctx,
+    );
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["total_matches"], 0, "{:?}", grep.data);
+}
+
+#[test]
+fn scratch_read_does_not_authorize_writes() {
+    let (_directory, ctx, scratch, _scope) = scratch_read_context();
+    let file = scratch.join("scratch.rs");
+    let response = crate::commands::ast_replace::handle_ast_replace(
+        &request(
+            "ast_replace",
+            json!({"paths": [file], "lang": "rust", "pattern": "fn $NAME() { $$$ }", "rewrite": "fn changed() {}"}),
+        ),
+        &ctx,
+    );
+    assert!(!response.success, "{:?}", response.data);
+    assert_eq!(
+        response.data["code"], "access_ask_required",
+        "{:?}",
+        response.data
+    );
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        "fn scratch_marker() {}\n"
+    );
+}
+
+#[test]
+fn scratch_read_all_source_tools_reach_the_reader() {
+    let (_directory, ctx, scratch, _scope) = scratch_read_context();
+    let file = scratch.join("scratch.rs");
+    let tools: &[(
+        &str,
+        serde_json::Value,
+        fn(&RawRequest, &AppContext) -> crate::protocol::Response,
+    )] = &[
+        (
+            "outline",
+            json!({"file": file}),
+            crate::commands::outline::handle_outline,
+        ),
+        (
+            "zoom",
+            json!({"file": file, "symbol": "scratch_marker"}),
+            crate::commands::zoom::handle_zoom,
+        ),
+        (
+            "callers",
+            json!({"file": file, "symbol": "scratch_marker"}),
+            crate::commands::callers::handle_callers,
+        ),
+        (
+            "call_tree",
+            json!({"file": file, "symbol": "scratch_marker"}),
+            crate::commands::call_tree::handle_call_tree,
+        ),
+        (
+            "ast_search",
+            json!({"paths": [file], "lang": "rust", "pattern": "fn $NAME() { $$$ }"}),
+            crate::commands::ast_search::handle_ast_search,
+        ),
+        (
+            "inspect",
+            json!({"scope": file, "sections": ["todos"]}),
+            crate::commands::inspect::handle_inspect,
+        ),
+    ];
+    for (command, params, handler) in tools {
+        let own = handler(&request(command, params.clone()), &ctx);
+        if matches!(*command, "callers" | "call_tree") {
+            // Callgraph queries remain project-indexed; an external scratch
+            // target passes authorization before the existing index refusal.
+            assert_eq!(
+                own.data["code"], "path_outside_project_root",
+                "{command}: {:?}",
+                own.data
+            );
+        } else if *command == "inspect" && own.data["code"] == "inspect_not_fresh" {
+            // Authorization precedes scanning; a busy scanner's independent
+            // freshness deadline does not turn an authorized read into an ask.
+            assert!(
+                own.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("todos did not complete"),
+                "{:?}",
+                own.data
+            );
+        } else {
+            assert!(own.success, "{command}: {:?}", own.data);
+        }
+        let mut foreign = request(command, params.clone());
+        foreign.session_id = Some("foreign-session".into());
+        let denied = handler(&foreign, &ctx);
+        assert_eq!(
+            denied.data["code"], "access_ask_required",
+            "{command}: {:?}",
+            denied.data
+        );
+    }
+}
+
+#[test]
+fn scratch_read_bridge_capability_is_session_scoped() {
+    let (_directory, ctx, scratch, _scope) = scratch_read_context();
+    for path in [&scratch, &scratch.join("scratch.rs")] {
+        for (session, expected) in [("policy-session", true), ("foreign-session", false)] {
+            let mut req = request("bash_artifact_owned", json!({"path": path}));
+            req.session_id = Some(session.into());
+            let response = crate::commands::bash_artifact_owned::handle(&req, &ctx);
+            assert_eq!(response.data["owned"], expected, "{:?}", response.data);
+        }
+    }
+    assert!(!crate::bash_background::BgTaskRegistry::default()
+        .is_session_owned_scratch_path("policy-session", &scratch));
+    let task = ctx
+        .bash_background()
+        .task_for_test("bash-0123456789abcdef")
+        .unwrap();
+    task.lock_state().unwrap().metadata.sandbox_temp_dir = None;
+    assert!(!ctx
+        .bash_background()
+        .is_session_owned_scratch_path("policy-session", &scratch));
+    let response = crate::commands::read::handle_read(
+        &request("read", json!({"file": scratch.join("scratch.rs")})),
+        &ctx,
+    );
+    assert_eq!(
+        response.data["code"], "access_ask_required",
+        "{:?}",
+        response.data
+    );
+}
+
+#[test]
+fn scratch_read_respects_absolute_floor_and_live_sqlite() {
+    let (_directory, ctx, scratch, _scope) = scratch_read_context();
+    let file = scratch.join("scratch.rs");
+    ctx.update_config(|config| config.sandbox.read_deny.push(file.clone()));
+    let response =
+        crate::commands::read::handle_read(&request("read", json!({"file": file})), &ctx);
+    assert_eq!(response.data["code"], "denied_floor", "{:?}", response.data);
+    let database = scratch.join("live.db");
+    let _connection = crate::db::file_identity::IdentityConnection::new(
+        rusqlite::Connection::open(&database).unwrap(),
+        "scratch read live sqlite test",
+    );
+    assert!(!ctx
+        .bash_background()
+        .is_session_owned_scratch_path("policy-session", &database));
+    assert!(crate::task_temp_reads::open(&database).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_opened_handle_cannot_escape_after_authorization() {
+    let (directory, ctx, scratch, _scope) = scratch_read_context();
+    let nested = scratch.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let file = nested.join("secret.rs");
+    std::fs::write(&file, "own scratch\n").unwrap();
+    assert!(ctx
+        .validate_read_path("policy-test", "policy-session", &file)
+        .is_ok());
+    let outside = directory.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.rs"), "outside secret\n").unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir(&nested).unwrap();
+    std::os::unix::fs::symlink(&outside, &nested).unwrap();
+    let read = crate::bounded_io::read(&file, None);
+    assert!(read.is_err(), "opened handle escaped: {read:?}");
+    assert!(crate::project_content::read(&file).is_err());
+    assert!(crate::task_temp_reads::open(&file).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_canonicalizes_alias_before_opening() {
+    let (_directory, ctx, scratch, _scope) = scratch_read_context();
+    let alias = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap()
+        .join("scratch-alias");
+    std::os::unix::fs::symlink(&scratch, &alias).unwrap();
+    let resolved = ctx
+        .validate_read_path("policy-test", "policy-session", &alias.join("scratch.rs"))
+        .unwrap();
+    assert_eq!(resolved, scratch.join("scratch.rs"));
+    let response = crate::commands::read::handle_read(
+        &request("read", json!({"file": alias.join("scratch.rs")})),
+        &ctx,
+    );
+    assert!(response.success, "{:?}", response.data);
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_allocator_path_uses_the_task_record() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = crate::sandbox_spawn::cleanup_task_temp_dir(&self.0);
+        }
+    }
+    let (_directory, ctx, _scratch, _scope) = scratch_read_context();
+    let task = ctx
+        .bash_background()
+        .task_for_test("bash-0123456789abcdef")
+        .unwrap();
+    let allocated =
+        Cleanup(crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap());
+    let file = allocated.0.join("worker.diff");
+    std::fs::write(&file, "own scratch diff\n").unwrap();
+    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(allocated.0.clone());
+    let response =
+        crate::commands::read::handle_read(&request("read", json!({"file": file})), &ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert!(response.data["content"]
+        .as_str()
+        .unwrap()
+        .contains("own scratch diff"));
+    assert!(!ctx
+        .bash_background()
+        .is_session_owned_scratch_path("foreign-session", &file));
+}
