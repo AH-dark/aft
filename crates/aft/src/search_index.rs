@@ -6107,8 +6107,22 @@ pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
 /// that reload's results: a corpus commonly has many files per directory, while
 /// retaining results across loads would need filesystem-change invalidation.
 #[derive(Default)]
-struct ParentCanonicalizationMemo {
+pub(crate) struct ParentCanonicalizationMemo {
     canonical_parents: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CachedPathCanonicalizationWork {
+    canonicalize_calls: usize,
+    parent_lookups: usize,
+    distinct_parents: HashSet<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    // Reload decoders are serial; isolate their counters from concurrent tests.
+    static CACHED_PATH_CANONICALIZATION_WORK: std::cell::RefCell<Option<CachedPathCanonicalizationWork>> = const { std::cell::RefCell::new(None) };
 }
 
 impl ParentCanonicalizationMemo {
@@ -6120,6 +6134,13 @@ impl ParentCanonicalizationMemo {
     where
         F: FnMut(&Path) -> std::io::Result<PathBuf>,
     {
+        #[cfg(test)]
+        CACHED_PATH_CANONICALIZATION_WORK.with(|slot| {
+            if let Some(work) = slot.borrow_mut().as_mut() {
+                work.parent_lookups += 1;
+                work.distinct_parents.insert(parent.to_path_buf());
+            }
+        });
         self.canonical_parents
             .entry(parent.to_path_buf())
             .or_insert_with(|| canonicalize(parent).ok())
@@ -6127,17 +6148,26 @@ impl ParentCanonicalizationMemo {
     }
 }
 
-pub(crate) fn cached_path_under_root(root: &Path, relative_path: &Path) -> Option<PathBuf> {
+#[cfg(test)]
+fn cached_path_under_root(root: &Path, relative_path: &Path) -> Option<PathBuf> {
     let mut canonical_parents = ParentCanonicalizationMemo::default();
     cached_path_under_root_with_memo(root, relative_path, &mut canonical_parents)
 }
 
-fn cached_path_under_root_with_memo(
+pub(crate) fn cached_path_under_root_with_memo(
     root: &Path,
     relative_path: &Path,
     canonical_parents: &mut ParentCanonicalizationMemo,
 ) -> Option<PathBuf> {
-    let mut canonicalize = |path: &Path| fs::canonicalize(path);
+    let mut canonicalize = |path: &Path| {
+        #[cfg(test)]
+        CACHED_PATH_CANONICALIZATION_WORK.with(|slot| {
+            if let Some(work) = slot.borrow_mut().as_mut() {
+                work.canonicalize_calls += 1;
+            }
+        });
+        fs::canonicalize(path)
+    };
     cached_path_under_root_with_memo_and_canonicalizer(
         root,
         relative_path,
@@ -9578,6 +9608,241 @@ mod tests {
             .expect("missing child should fall back to lexical validation");
 
         assert_eq!(path, root.join("future/file.rs"));
+    }
+
+    fn count_cached_path_canonicalizations<T>(
+        reload: impl FnOnce() -> T,
+    ) -> (T, CachedPathCanonicalizationWork) {
+        CACHED_PATH_CANONICALIZATION_WORK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(CachedPathCanonicalizationWork::default());
+        });
+        let result = reload();
+        let work = CACHED_PATH_CANONICALIZATION_WORK
+            .with(|slot| slot.borrow_mut().take().expect("reload counters"));
+        (result, work)
+    }
+
+    fn measure_warm_reload_canonicalizations(root: &Path) {
+        use crate::parser::{FileParser, SymbolCache};
+        use crate::semantic_index::SemanticIndex;
+
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let storage = tempfile::tempdir().expect("cache storage");
+        let search_dir = storage.path().join("search");
+        fs::create_dir_all(&search_dir).unwrap();
+        let mut search = SearchIndex::build_with_limit(&root, DEFAULT_MAX_FILE_SIZE);
+        let paths: Vec<_> = search.files.iter().map(|file| file.path.clone()).collect();
+        assert!(!paths.is_empty());
+        assert!(search.write_to_disk(&search_dir, None));
+
+        let mut parser = FileParser::new();
+        for path in &paths {
+            if crate::parser::detect_language(path).is_some() {
+                // Unsupported or malformed source need not produce a symbol cache entry.
+                let _ = parser.extract_symbols(path);
+            }
+        }
+        let shared = parser.symbol_cache();
+        let mut symbols = shared.write().unwrap();
+        symbols.set_project_root(root.clone());
+        let symbol_count = symbols.len();
+        assert!(symbol_count > 0);
+        crate::symbol_cache_disk::write_to_disk(&symbols, storage.path(), "reload").unwrap();
+        drop(symbols);
+
+        // Use real source chunks but deterministic vectors: no embedding service is needed.
+        let semantic = SemanticIndex::build(
+            &root,
+            &paths,
+            &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            128,
+        )
+        .expect("build semantic fixture");
+        assert!(semantic.entry_count() > 0);
+        assert!(semantic.write_to_disk(storage.path(), "reload"));
+
+        let (restored_search, search_work) = count_cached_path_canonicalizations(|| {
+            SearchIndex::read_from_disk(&search_dir, &root).expect("reload search")
+        });
+        assert_eq!(restored_search.file_count(), paths.len());
+        let (restored_symbols, symbol_work) = count_cached_path_canonicalizations(|| {
+            let mut restored = SymbolCache::new();
+            restored.load_from_disk(storage.path(), "reload", &root)
+        });
+        assert_eq!(restored_symbols, symbol_count);
+        let (restored_semantic, semantic_work) = count_cached_path_canonicalizations(|| {
+            SemanticIndex::read_from_disk(storage.path(), "reload", &root, false, None)
+                .expect("reload semantic")
+        });
+        assert_eq!(restored_semantic.entry_count(), semantic.entry_count());
+
+        // Re-publish the same files as a delta to cover tombstones and embedded snapshots.
+        semantic.extend_dirty_paths_for_test([paths[0].clone()]);
+        assert!(semantic.write_to_disk(storage.path(), "reload"));
+        let (segmented, segment_work) = count_cached_path_canonicalizations(|| {
+            SemanticIndex::read_from_disk(storage.path(), "reload", &root, false, None)
+                .expect("reload semantic segments")
+        });
+        assert_eq!(segmented.entry_count(), semantic.entry_count());
+        let bytes = fs::read(storage.path().join("semantic/reload/semantic.bin")).unwrap();
+        let (from_bytes, bytes_work) = count_cached_path_canonicalizations(|| {
+            SemanticIndex::from_bytes(&bytes, &root).expect("decode semantic bytes")
+        });
+        assert_eq!(from_bytes.entry_count(), semantic.entry_count());
+
+        let measurements = [
+            ("search", search_work),
+            ("symbols", symbol_work),
+            ("semantic", semantic_work),
+            ("semantic_segments", segment_work),
+            ("semantic_bytes", bytes_work),
+        ];
+        for (loader, work) in &measurements {
+            eprintln!(
+                "warm reload {loader}: files={}, canonicalize_calls={}, parent_lookups={}, distinct_parents={}",
+                paths.len(), work.canonicalize_calls, work.parent_lookups, work.distinct_parents.len()
+            );
+        }
+        for (loader, work) in measurements {
+            assert!(work.parent_lookups > work.distinct_parents.len());
+            assert_eq!(
+                work.canonicalize_calls,
+                work.distinct_parents.len(),
+                "{loader} must share one parent memo across the whole reload"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_reload_canonicalizes_each_parent_once() {
+        let project = tempfile::tempdir().unwrap();
+        for directory in ["src", "src/nested", "tests"] {
+            fs::create_dir_all(project.path().join(directory)).unwrap();
+            for file in 0..4 {
+                fs::write(
+                    project
+                        .path()
+                        .join(directory)
+                        .join(format!("file{file}.rs")),
+                    "pub fn first() {}\npub fn second() {}\n",
+                )
+                .unwrap();
+            }
+        }
+        measure_warm_reload_canonicalizations(project.path());
+    }
+
+    #[test]
+    #[ignore = "profiles real repository sources and persists temporary caches"]
+    fn warm_reload_repository_canonicalization_counts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        measure_warm_reload_canonicalizations(&root);
+    }
+
+    #[cfg(unix)]
+    fn cached_path_before_reload_memo(root: &Path, relative_path: &Path) -> Option<PathBuf> {
+        // Resolve each parent afresh, as before reload-wide memo sharing, so this
+        // reference checks returned spellings without using the optimized helper.
+        let relative = validate_cached_relative_path(relative_path)?;
+        let root = normalize_path(root);
+        let full = normalize_path(&root.join(relative));
+        let canonical = match fs::symlink_metadata(&full) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => fs::canonicalize(full.parent()?)
+                .ok()?
+                .join(full.file_name()?),
+            Ok(_) => fs::canonicalize(&full).ok()?,
+            Err(_) => return is_within_search_root(&root, &full).then_some(full),
+        };
+        if is_within_search_root(&root, &canonical) {
+            Some(full)
+        } else {
+            let canonical_root = fs::canonicalize(&root).ok()?;
+            is_within_search_root(&canonical_root, &canonical).then_some(full)
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_reload_path_identity(project: &Path) {
+        let root = fs::canonicalize(project).unwrap();
+        let source = root.join("MixedCase");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("File.rs"), "pub fn identity() {}\n").unwrap();
+        fs::write(outside.path().join("secret.rs"), "secret").unwrap();
+        std::os::unix::fs::symlink(&source, root.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(source.join("File.rs"), root.join("file-link.rs")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            root.join("secret-link.rs"),
+        )
+        .unwrap();
+        let alias_directory = tempfile::tempdir().unwrap();
+        let alias = alias_directory.path().join("root-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let mut roots = vec![root.clone(), alias];
+        #[cfg(target_os = "macos")]
+        {
+            let var_alias = Path::new("/").join(root.strip_prefix("/private").unwrap());
+            assert!(var_alias.starts_with("/var/"));
+            roots.push(var_alias);
+        }
+        let case_insensitive = source.join("file.rs").exists();
+        if case_insensitive {
+            roots.push(
+                root.parent()
+                    .unwrap()
+                    .join(root.file_name().unwrap().to_str().unwrap().to_uppercase()),
+            );
+        }
+        let relatives = [
+            "MixedCase/File.rs",
+            "mixedcase/file.rs",
+            "MixedCase/./File.rs",
+            "linked/File.rs",
+            "linked/missing.rs",
+            "escape/secret.rs",
+            "escape/missing.rs",
+            "file-link.rs",
+            "secret-link.rs",
+            "missing/child.rs",
+            "../outside.rs",
+            "/absolute.rs",
+        ];
+        let mut comparisons = 0;
+        for spelling in &roots {
+            let mut memo = ParentCanonicalizationMemo::default();
+            // Repeat with the same memo to exercise hits as well as misses.
+            for _ in 0..2 {
+                for relative in relatives {
+                    let old = cached_path_before_reload_memo(spelling, Path::new(relative));
+                    let new =
+                        cached_path_under_root_with_memo(spelling, Path::new(relative), &mut memo);
+                    assert_eq!(
+                        new.as_deref().map(Path::as_os_str),
+                        old.as_deref().map(Path::as_os_str),
+                        "returned bytes differ for root={spelling:?}, relative={relative:?}"
+                    );
+                    comparisons += 1;
+                }
+            }
+        }
+        assert!(cached_path_before_reload_memo(&root, Path::new("escape/secret.rs")).is_none());
+        eprintln!("reload identity: {comparisons} byte-identical results, case_insensitive={case_insensitive}, roots={}", roots.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_reload_path_identity_matches_old_resolver() {
+        #[cfg(target_os = "macos")]
+        let project = tempfile::Builder::new()
+            .prefix("aft-identity-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let project = tempfile::tempdir().unwrap();
+        assert_reload_path_identity(project.path());
     }
 
     #[test]

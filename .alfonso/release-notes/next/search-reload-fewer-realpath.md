@@ -1,0 +1,1 @@
+- Reloading a project's search data after a restart now does far fewer filesystem lookups, reducing startup work, especially on macOS.

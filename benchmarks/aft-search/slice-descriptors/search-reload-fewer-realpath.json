@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "warm-reload-parent-canonicalization"
+  ],
+  "note": "The ranking fence hits search_index.rs and semantic_index.rs. This change shares parent canonicalization memos across symbol and semantic artifact decoding, including delta segments; containment and returned path spellings are unchanged. No ranking or scoring mechanism changes. Canonical-checkout ranked rows must remain byte-identical to the committed reference."
+}

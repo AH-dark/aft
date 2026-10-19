@@ -1258,6 +1258,7 @@ impl DecodedSymbolCache {
         let cache = symbol_cache_disk::read_from_disk(storage_dir, project_key)?;
         let mut entries = HashMap::new();
         let mut outcome = SymbolCacheLoadOutcome::default();
+        let mut canonical_parents = crate::search_index::ParentCanonicalizationMemo::default();
 
         for entry in cache.entries {
             #[cfg(test)]
@@ -1267,9 +1268,11 @@ impl DecodedSymbolCache {
                     released.wait();
                 }
             });
-            let Some(path) =
-                crate::search_index::cached_path_under_root(current_root, &entry.relative_path)
-            else {
+            let Some(path) = crate::search_index::cached_path_under_root_with_memo(
+                current_root,
+                &entry.relative_path,
+                &mut canonical_parents,
+            ) else {
                 outcome.needs_persistence = true;
                 continue;
             };
