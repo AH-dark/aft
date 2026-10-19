@@ -7,6 +7,11 @@ pub(super) struct BashWaitCancel {
     pub(super) run_scope: Option<Arc<super::run_scope::RunScope>>,
     pub(super) scope: Option<subc_protocol::scope::ScopeStamp>,
     pub(super) late_results: bool,
+    /// The call-ledger carrier to record this call under when it is not the
+    /// spawn principal's own id: a codemode program's call runs with its head
+    /// agent's principal, but its ledger rows belong to the run route that sent
+    /// it, so `late_results` and `tool.withdraw` on that route find them.
+    pub(super) ledger_carrier: Option<String>,
     pub(super) connection: PersistentCancelSignal,
     pub(super) route: PersistentCancelSignal,
     /// Open while the daemon drains this module; a foreground wait that sees it
@@ -1177,19 +1182,20 @@ pub(super) fn submit_deferred_bash(
     // call the module loop answers instead (drain or cancel) carries no result
     // and is not observed.
     let mut repeat_for_spawn = repeat.clone();
+    let ledger_carrier = cancel
+        .ledger_carrier
+        .clone()
+        .unwrap_or_else(|| super::tool_provider::ledger_carrier(&spawn_principal));
     let ledger_key =
         call_key
             .as_ref()
             .filter(|_| server_completion)
             .map(|key| crate::db::call_ledger::Key {
-                carrier: match &spawn_principal {
-                    AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
-                        principal_id.clone().unwrap_or_else(|| "absent".into())
-                    }
-                    _ => "first-party".into(),
-                },
+                carrier: ledger_carrier.clone(),
                 call_key: key.clone(),
             });
+    // A task records the same requester as its call's ledger row.
+    let task_requester = cancel.ledger_carrier.clone();
     let submit_executor = executor.clone();
     let unanswered_metrics = Arc::clone(metrics);
     let spawn_cancel = JobCancellation::new();
@@ -1340,7 +1346,9 @@ pub(super) fn submit_deferred_bash(
                                                          || {
                                                               crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || {
                                                                   let run_dispatch = || {
-                                                                      crate::bash_rewrite::with_rewrites_off(run_scoped, || dispatch(raw_req, ctx))
+                                                                      crate::bash_rewrite::with_rewrites_off(run_scoped, || {
+                                                                          crate::bash_background::with_call_requester(task_requester, || dispatch(raw_req, ctx))
+                                                                      })
                                                                   };
                                                                   #[cfg(not(test))]
                                                                   let response = run_dispatch();
@@ -3480,6 +3488,89 @@ mod grant_path_tests {
         )
     }
 
+    fn observe_ledger_identity(req: RawRequest, _ctx: &AppContext) -> Response {
+        Response::error_with_data(
+            &req.id,
+            "ledger_identity_observation",
+            "test dispatch observes the ledger identity a task would record",
+            json!({
+                "task_requester": crate::bash_background::call_key_for_new_task("task").requester,
+                "ledger_carrier": crate::bash_background::registry::ledger_spawn_for_test()
+                    .map(|key| key.carrier),
+            }),
+        )
+    }
+
+    /// A codemode program's shell call spawns with its head agent's
+    /// principal, but its task and its call-ledger row both name the run
+    /// route's carrier, so the run route's late_results finds the result.
+    #[tokio::test]
+    async fn run_shell_task_and_ledger_row_name_the_run_route_carrier() {
+        let (_dir, root) = super::super::test_support::test_root("run-shell-carrier");
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (touch, _touch_rx) = mpsc::channel(8);
+        submit_deferred_bash(
+            &executor,
+            &tx,
+            &touch,
+            &metrics,
+            observe_ledger_identity,
+            root.clone(),
+            root.as_path().into(),
+            "head-session".into(),
+            "run-shell-carrier".into(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            Flags::new(false, Priority::Interactive, false),
+            PROTOCOL_VERSION,
+            json!({"command":"echo test","timeout":5000}),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: true,
+                ledger_carrier: Some("reserved:basal".into()),
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 7,
+                route_epoch: 1,
+                project_root: root.as_path().into(),
+                harness: "opencode".into(),
+                session_id: "head-session".into(),
+                principal_id: Some("direct".into()),
+            },
+            None,
+            Some("program-shell".into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            super::remote_policy::RemoteSource::None,
+            Instant::now(),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert_eq!(response.data["code"], "ledger_identity_observation");
+        assert_eq!(response.data["task_requester"], "reserved:basal");
+        assert_eq!(response.data["ledger_carrier"], "reserved:basal");
+    }
+
     #[tokio::test]
     async fn consent_routing_does_not_choose_worker_shell_confinement() {
         for worker_jail in [false, true] {
@@ -3516,6 +3607,7 @@ mod grant_path_tests {
                         run_scope: None,
                         scope: None,
                         late_results: false,
+                        ledger_carrier: None,
                         connection: PersistentCancelSignal::new(),
                         route: PersistentCancelSignal::new(),
                         drain: drain::ModuleDrainWindow::default(),
@@ -3592,6 +3684,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: Some(scope),
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -3680,6 +3773,7 @@ mod grant_path_tests {
                     run_scope: None,
                     scope: None,
                     late_results: false,
+                    ledger_carrier: None,
                     connection: PersistentCancelSignal::new(),
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
@@ -3837,6 +3931,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -4508,6 +4603,7 @@ mod grant_path_tests {
             run_scope: None,
             scope: None,
             late_results: false,
+            ledger_carrier: None,
             connection: PersistentCancelSignal::new(),
             route: PersistentCancelSignal::new(),
             drain: drain::ModuleDrainWindow::default(),
@@ -4602,6 +4698,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -4735,6 +4832,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -4812,6 +4910,7 @@ mod grant_path_tests {
                     run_scope: None,
                     scope: None,
                     late_results: false,
+                    ledger_carrier: None,
                     connection: PersistentCancelSignal::new(),
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
@@ -5199,6 +5298,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -5264,6 +5364,7 @@ mod grant_path_tests {
                     run_scope: None,
                     scope: None,
                     late_results: false,
+                    ledger_carrier: None,
                     connection: PersistentCancelSignal::new(),
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
@@ -5330,6 +5431,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -6827,6 +6929,7 @@ mod grant_path_tests {
                     run_scope: None,
                     scope: None,
                     late_results: false,
+                    ledger_carrier: None,
                     connection,
                     route,
                     drain: drain::ModuleDrainWindow::default(),
@@ -7000,6 +7103,7 @@ mod grant_path_tests {
                 run_scope: None,
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -7138,6 +7242,7 @@ mod run_tests {
                 run_scope: Some(super::super::run_scope::RunScope::for_test(deadline)),
                 scope: None,
                 late_results: false,
+                ledger_carrier: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),

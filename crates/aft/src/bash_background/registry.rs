@@ -111,6 +111,12 @@ pub(crate) fn with_ledger_spawn<T>(
     let _restore = Restore(LEDGER_SPAWN.with(|slot| slot.replace(key)));
     run()
 }
+
+/// The call-ledger key a task created on this thread now would be linked to.
+#[cfg(test)]
+pub(crate) fn ledger_spawn_for_test() -> Option<crate::db::call_ledger::Key> {
+    LEDGER_SPAWN.with(|slot| slot.borrow().clone())
+}
 /// How far past the last written hard-kill limit a renewal must reach before
 /// it is written to the task's record (see `BgTaskRegistry::renew_hard_kill`).
 pub(crate) const RENEWAL_PERSIST_STEP_MS: u64 = 60_000;

@@ -60,6 +60,16 @@ pub(super) fn recognized_operation(op: &str) -> bool {
     )
 }
 
+/// The call-ledger carrier a route principal records its calls under.
+pub(super) fn ledger_carrier(principal: &crate::sandbox_spawn::AuthenticatedPrincipal) -> String {
+    match principal {
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+            principal_id.clone().unwrap_or_else(|| "absent".into())
+        }
+        crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => "first-party".into(),
+    }
+}
+
 pub(super) fn describe() -> Value {
     serde_json::to_value(RoleDescribe {
         majors: vec![Major {
@@ -1204,14 +1214,14 @@ impl LedgerEdge {
         identity: &super::RouteIdentity,
         call_key: &str,
     ) -> crate::db::call_ledger::Key {
-        let carrier = match &identity.spawn_principal {
-            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
-                principal_id.clone().unwrap_or_else(|| "absent".into())
-            }
-            _ => "first-party".into(),
-        };
+        // A codemode call runs with its head agent's principal, but its
+        // ledger rows belong to the run route that sent it.
+        let principal = identity
+            .run_owner
+            .as_ref()
+            .map_or(&identity.spawn_principal, |owner| &owner.run_principal);
         crate::db::call_ledger::Key {
-            carrier,
+            carrier: ledger_carrier(principal),
             call_key: call_key.into(),
         }
     }

@@ -338,6 +338,10 @@ thread_local! {
     /// only sees the tool's own arguments, which the agent controls.
     static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// The call-ledger carrier to record as a new task's requester when it is
+    /// not the authenticated principal's id (see [`with_call_requester`]).
+    static CURRENT_CALL_REQUESTER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
     /// True only while dispatching a bash call admitted under the catalog's
     /// worker preset. Plugin worker-session flags do not set this marker.
@@ -492,15 +496,36 @@ pub(crate) fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T
     run()
 }
 
+/// Run `run` with `requester` recorded as the requester of any task it
+/// creates, instead of the authenticated principal's id. A codemode
+/// program's shell call runs with its head agent's principal while its
+/// call-ledger row belongs to the run route that sent it; the task must name
+/// that same requester so the ledger can find it. `None` keeps the
+/// principal's id.
+pub(crate) fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_CALL_REQUESTER.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_CALL_REQUESTER.with(|slot| slot.replace(requester));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
 /// The requester and key to record on a task being created now: the
 /// consumer's key when the call carried one, otherwise the task id.
 pub(crate) fn call_key_for_new_task(task_id: &str) -> TaskCallKey {
-    let requester = match current_authenticated_principal() {
+    let requester = CURRENT_CALL_REQUESTER.with(|slot| slot.borrow().clone());
+    let requester = requester.unwrap_or_else(|| match current_authenticated_principal() {
         crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => "first-party".to_string(),
         crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
             principal_id.unwrap_or_else(|| "absent".to_string())
         }
-    };
+    });
     match CURRENT_CALL_KEY.with(|slot| slot.borrow().clone()) {
         Some(key) => TaskCallKey {
             requester,

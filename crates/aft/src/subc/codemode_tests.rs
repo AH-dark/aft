@@ -242,3 +242,150 @@ fn classic_route_calls_are_unchanged() {
         Admission::Unchanged
     ));
 }
+
+/// Give `route`'s spawn principal the id `principal_id`.
+fn with_principal_id(
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    route: RouteChannel,
+    id: &str,
+) {
+    let identity = routes.get_mut(&route).unwrap();
+    let data = Arc::get_mut(&mut identity.0).unwrap();
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some(id.to_owned());
+    }
+}
+
+#[test]
+fn codemode_call_uses_head_principal_and_records_ledger_under_run_route() {
+    let mut f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
+    // The run route's principal id would force the strict sandbox if it were
+    // used for the call; the head's does not.
+    with_principal_id(&mut f.routes, channel(9), "unverified");
+    let head = f.routes[&channel(1)].clone();
+    let run = f.routes[&channel(9)].clone();
+    let body = call("read", json!({"path": "notes.txt"}));
+    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+    // Sandbox and permission decisions read the head's principal, id included.
+    assert_eq!(effective.spawn_principal, head.spawn_principal);
+    assert!(!crate::sandbox_spawn::principal_requires_strict(
+        &effective.spawn_principal
+    ));
+    // The call's ledger rows are keyed the way the run route's late_results
+    // and tool.withdraw look them up.
+    let call_key = "program-call";
+    assert_eq!(
+        tool_provider::LedgerEdge::key(&effective, call_key),
+        tool_provider::LedgerEdge::key(&run, call_key)
+    );
+    assert_eq!(
+        tool_provider::LedgerEdge::key(&effective, call_key).carrier,
+        "unverified"
+    );
+    assert_eq!(
+        effective.run_owner.as_ref().unwrap().ledger_carrier(),
+        "unverified"
+    );
+}
+
+fn audit_read(req: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::read::handle_read(&req, ctx)
+}
+
+#[test]
+fn codemode_audit_line_is_written_once_per_admitted_call() {
+    let f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
+    let file = f.head_root.as_path().join("audited.txt");
+    std::fs::write(&file, "audited contents\n").unwrap();
+    let ctx = crate::subc::test_support::test_ctx();
+    ctx.update_config(|config| config.project_root = Some(f.head_root.as_path().to_path_buf()));
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(f.head_root.clone(), ctx));
+    let body = call("read", json!({"path": &file}));
+    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+    let routes = overlay(&f.routes, channel(9), effective);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (reply, lines) = crate::logging::capture_log_lines(|| {
+        runtime.block_on(async {
+            let frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                9,
+                1,
+                77,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let (writer, mut replies) = mpsc::channel(8);
+            let (bash_tx, _bash_rx) = mpsc::channel(8);
+            let (touch_tx, _touch_rx) = mpsc::channel(8);
+            let (entries, _deferred_rx) = mpsc::unbounded_channel();
+            let deferred_tx = DeferredResponseSender {
+                entries,
+                wake: crate::response_finalize::DeferredResponseWake::default(),
+            };
+            handle_tool_call(
+                &writer,
+                &frame,
+                None,
+                None,
+                PhaseTrace::new(Instant::now()),
+                &routes,
+                &HashMap::new(),
+                &ReclaimedRoutes::default(),
+                &mut HashMap::new(),
+                &executor,
+                &ActiveToolCalls::default(),
+                &Arc::new(PendingDeferredSetups::default()),
+                &Arc::new(Notify::new()),
+                &PersistentCancelSignal::new(),
+                &bash_tx,
+                &touch_tx,
+                &Arc::new(DispatchPathMetrics::new()),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut 1,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                audit_read,
+                &deferred_tx,
+                false,
+                1024 * 1024,
+                &drain::ModuleDrainWindow::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await
+                .expect("the audited call terminates")
+                .expect("writer stays open")
+        })
+    });
+    assert!(
+        String::from_utf8_lossy(&reply.body).contains("audited contents"),
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let audit: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("codemode call: tool=read"))
+        .collect();
+    assert_eq!(audit.len(), 1, "{lines:#?}");
+    for field in [
+        "agent_id=agent-a",
+        "run_id=run-1",
+        "head_session=head-a-session",
+    ] {
+        assert!(
+            audit[0].contains(field),
+            "{field} missing from {}",
+            audit[0]
+        );
+    }
+}

@@ -9240,6 +9240,10 @@ async fn handle_tool_call(
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
                     && identity.scope.is_some()
                     && call_key.is_some(),
+                ledger_carrier: identity
+                    .run_owner
+                    .as_ref()
+                    .map(|owner| owner.ledger_carrier()),
                 connection: connection_cancel.clone(),
                 route: route_cancel.token.clone(),
                 drain: module_drain.clone(),
@@ -9297,6 +9301,10 @@ async fn handle_tool_call(
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
                 && identity.scope.is_some()
                 && call_key.is_some(),
+            ledger_carrier: identity
+                .run_owner
+                .as_ref()
+                .map(|owner| owner.ledger_carrier()),
             connection: connection_cancel.clone(),
             route: route_cancel.token.clone(),
             drain: module_drain.clone(),
@@ -14435,6 +14443,7 @@ mod tests {
                         run_scope: None,
                         scope: None,
                         late_results: false,
+                        ledger_carrier: None,
                         connection: PersistentCancelSignal::new(),
                         route: PersistentCancelSignal::new(),
                         drain: drain::ModuleDrainWindow::default(),

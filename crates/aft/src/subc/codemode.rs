@@ -29,6 +29,19 @@ pub(super) struct RunOwner {
     pub(super) head: RouteIdentity,
     /// The run route the call arrived on, for audit lines.
     pub(super) run_route: RouteChannel,
+    /// The run route's own principal. It grants nothing: the call runs with
+    /// the head route's principal. It only names the call-ledger carrier, so
+    /// the call's ledger rows are found again by `late_results` and
+    /// `tool.withdraw` on the run route, which answer for that principal.
+    pub(super) run_principal: AuthenticatedPrincipal,
+}
+
+impl RunOwner {
+    /// The carrier this call's call-ledger rows and shell tasks are recorded
+    /// under: the run route's, never the head's.
+    pub(super) fn ledger_carrier(&self) -> String {
+        tool_provider::ledger_carrier(&self.run_principal)
+    }
 }
 
 /// How a request on a route is admitted with respect to codemode runs.
@@ -94,7 +107,7 @@ pub(super) fn admit(
     match resolve_owner(routes, route, run) {
         Ok(effective) => Admission::Owner(effective),
         Err(error) => {
-            log::warn!(
+            crate::slog_warn!(
                 "codemode call refused: tool={name} route={}/{} code={} detail={}",
                 route.channel,
                 route.epoch,
@@ -245,9 +258,11 @@ fn resolve_owner(
 }
 
 /// The identity a codemode call runs under. Root, session, harness, trust,
-/// disabled tools and sandbox principal are the head route's. The scope stays
-/// the run's, so the run's lifetime controls (deadline, scope-end kill, call
-/// ledger settlement) keep applying to the work the program starts.
+/// disabled tools and sandbox principal (its id included) are the head
+/// route's. The scope stays the run's, so the run's lifetime controls
+/// (deadline, scope-end kill, call ledger settlement) keep applying to the
+/// work the program starts; only the call-ledger carrier is the run route's
+/// (see [`RunOwner::ledger_carrier`]).
 fn effective_identity(
     run: &RouteIdentity,
     head: &RouteIdentity,
@@ -267,7 +282,7 @@ fn effective_identity(
         // The reply is framed for the route the call arrived on.
         role: run.role,
         trust: head.trust,
-        spawn_principal: spawn_principal(run, head),
+        spawn_principal: head.spawn_principal.clone(),
         // Kept so an untrusted head's shell call reaches the same approval
         // step as the head's direct call, which then refuses it because a run
         // route has nobody to answer.
@@ -283,34 +298,15 @@ fn effective_identity(
             run_id: run_id.to_owned(),
             head: head.clone(),
             run_route: route,
+            run_principal: run.spawn_principal.clone(),
         })),
     }))
-}
-
-/// The head route's sandbox principal. Its principal id becomes the run
-/// route's, so call-ledger rows written for this call are found again by
-/// `late_results` on the run route, unless the head's id is the one that
-/// forces the strict sandbox profile; that one is kept so a program never
-/// runs under a looser profile than its head.
-fn spawn_principal(run: &RouteIdentity, head: &RouteIdentity) -> AuthenticatedPrincipal {
-    let mut principal = head.spawn_principal.clone();
-    let run_id = match &run.spawn_principal {
-        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.clone(),
-        AuthenticatedPrincipal::FirstParty => None,
-    };
-    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut principal {
-        let head_strict = principal_id.as_deref().is_none_or(|id| id == "unverified");
-        if !head_strict && run_id.is_some() {
-            *principal_id = run_id;
-        }
-    }
-    principal
 }
 
 /// Record who a codemode call ran for. Every admitted call writes one line.
 pub(super) fn audit_call(identity: &RouteIdentity, tool: &str, corr: u64) {
     if let Some(owner) = identity.run_owner.as_ref() {
-        log::info!(
+        crate::slog_info!(
             "codemode call: tool={tool} agent_id={} run_id={} head_session={} head_root={} run_route={}/{} corr={corr}",
             owner.agent_id,
             owner.run_id,

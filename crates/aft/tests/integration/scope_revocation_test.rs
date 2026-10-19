@@ -160,6 +160,31 @@ async fn bind_mode_as(
     scope: Option<subc_protocol::scope::ScopeStamp>,
     session: &str,
 ) {
+    bind_route_as(
+        stream,
+        root,
+        channel,
+        mode,
+        scope,
+        session,
+        Principal::Direct,
+        false,
+    )
+    .await;
+}
+
+/// Bind a route as `principal`, on tool-provider v1 when `v1` is set.
+#[allow(clippy::too_many_arguments)]
+async fn bind_route_as(
+    stream: &mut tokio::net::TcpStream,
+    root: &Path,
+    channel: u16,
+    mode: Option<subc_protocol::call_mode::CallMode>,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    session: &str,
+    principal: Principal,
+    v1: bool,
+) {
     let config_path = root.join(".cortexkit/aft.jsonc");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     if !config_path.exists() {
@@ -179,11 +204,12 @@ async fn bind_mode_as(
             module_id: "aft".into(),
         },
         identity: BindIdentity::new(root, "opencode", session),
-        principal: Some(Principal::Direct),
+        principal: Some(principal),
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope,
-        role_versions: None,
+        role_versions: v1
+            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
         call_mode: mode,
     };
     send_frame(
@@ -373,6 +399,9 @@ fn codemode_bash_clamps_requested_timeout_to_bind_deadline() {
         Duration::from_secs(30),
         |input| async move {
             let mut daemon = open_scope_daemon_session(input).await;
+            // Bind the head first so its bind time is not taken out of the
+            // run's five-second budget.
+            bind_head(&mut daemon.stream, &daemon.root1, 101, "run-session").await;
             let mut scope = stamp();
             scope.expires_at_ms = Some(
                 std::time::SystemTime::now()
@@ -381,7 +410,6 @@ fn codemode_bash_clamps_requested_timeout_to_bind_deadline() {
                     .as_millis() as u64
                     + 5000,
             );
-            bind_head(&mut daemon.stream, &daemon.root1, 101, "run-session").await;
             bind_mode(
                 &mut daemon.stream,
                 &daemon.root1,
@@ -412,7 +440,8 @@ fn codemode_bash_clamps_requested_timeout_to_bind_deadline() {
             let timeout = OBSERVED_TIMEOUT.load(std::sync::atomic::Ordering::Acquire);
             assert!(
                 (1..=5000).contains(&timeout),
-                "timeout was {timeout}, must be clamped to bind deadline"
+                "timeout was {timeout}, must be clamped to bind deadline: {}",
+                String::from_utf8_lossy(&reply.body)
             );
             send_connection_goodbye(&mut daemon.stream).await;
         },
@@ -1238,6 +1267,23 @@ async fn expect_refusal(stream: &mut tokio::net::TcpStream, label: &str) -> Erro
     serde_json::from_slice(&reply.body).unwrap()
 }
 
+/// Send a provider operation (`late_results`, `tool.withdraw`) on `channel`.
+async fn provider_op(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64, body: Value) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+}
+
 /// Bind a run route on `channel` with `scope`, in its own session and root.
 async fn bind_run(
     stream: &mut tokio::net::TcpStream,
@@ -1728,6 +1774,178 @@ fn codemode_bash_runs_in_a_real_shell_without_rewrites() {
                     Some(aft::bash_rewrite::dispatch::DispatchRoute::Rewritten { .. })
                 ),
                 "a program's cat must run in a real shell"
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        configured_dispatch,
+    );
+}
+
+#[test]
+fn codemode_call_runs_with_head_principal_and_run_route_finds_its_ledger_row() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-ledger-carrier",
+        Duration::from_secs(30),
+        |input| async move {
+            let mut daemon = open_scope_daemon_session(input).await;
+            write_project_config(&daemon.root1, json!({}));
+            write_project_config(&daemon.root2, json!({}));
+            std::fs::write(daemon.root1.join("ledger.txt"), "ledger-read").unwrap();
+            // Ledger keys outlive one module run, so each run uses fresh ones.
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let read_key = format!("program-read-{unique}");
+            let shell_key = format!("program-shell-{unique}");
+            bind_route_as(
+                &mut daemon.stream,
+                &daemon.root1,
+                1,
+                Some(subc_protocol::call_mode::CallMode::Classic),
+                Some(head_stamp("agent-a")),
+                "head-session",
+                Principal::Direct,
+                true,
+            )
+            .await;
+            // The program's carrier binds the run route under its own principal.
+            bind_route_as(
+                &mut daemon.stream,
+                &daemon.root2,
+                2,
+                Some(subc_protocol::call_mode::CallMode::Codemode),
+                Some(stamp()),
+                "program-session",
+                Principal::Reserved {
+                    module_id: "basal".into(),
+                },
+                true,
+            )
+            .await;
+            // Bind acknowledgement precedes the asynchronous aft.db open.
+            let until = Instant::now() + Duration::from_secs(15);
+            let mut corr = 300;
+            loop {
+                corr += 1;
+                provider_op(
+                    &mut daemon.stream,
+                    2,
+                    corr,
+                    json!({"name": "late_results", "arguments": {}}),
+                )
+                .await;
+                let ready = read_frame_timeout(&mut daemon.stream, "ledger readiness").await;
+                if ready.header.ty == FrameType::Response {
+                    break;
+                }
+                assert_eq!(
+                    reply_json(&ready)["code"],
+                    "database_initializing",
+                    "{}",
+                    String::from_utf8_lossy(&ready.body)
+                );
+                assert!(Instant::now() < until, "aft.db never opened");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let keyed = json!({
+                "name": "glob",
+                "preset": "head",
+                "call_key": &read_key,
+                "arguments": {"pattern": "ledger*.txt", "path": &daemon.root1},
+            });
+            send_frame(
+                &mut daemon.stream,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    2,
+                    1,
+                    400,
+                    serde_json::to_vec(&keyed).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let reply = read_frame_timeout(&mut daemon.stream, "keyed program read").await;
+            assert!(
+                reply_text(&reply).contains("ledger.txt"),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            // The run route answers for the call it sent: its withdraw lookup,
+            // keyed by the same carrier late_results uses, finds the call's
+            // retained result.
+            provider_op(
+                &mut daemon.stream,
+                2,
+                401,
+                json!({"name": "tool.withdraw", "arguments": {"call_key": &read_key}}),
+            )
+            .await;
+            let withdrawn = read_frame_timeout(&mut daemon.stream, "withdraw lookup").await;
+            assert_eq!(
+                withdrawn.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&withdrawn.body)
+            );
+            let withdrawn = reply_json(&withdrawn);
+            assert_eq!(withdrawn["answer"], "completed", "{withdrawn}");
+            assert!(
+                withdrawn["result"].to_string().contains("ledger.txt"),
+                "{withdrawn}"
+            );
+            // A keyed shell call records its ledger row and its task under the
+            // run route's carrier too.
+            let keyed_shell = json!({
+                "name": "bash",
+                "preset": "head",
+                "call_key": &shell_key,
+                "arguments": {"command": "echo ledger-shell", "timeout": 5000},
+            });
+            send_frame(
+                &mut daemon.stream,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    2,
+                    1,
+                    402,
+                    serde_json::to_vec(&keyed_shell).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                subc_protocol::scope::ScopeStatus::Live,
+                true,
+                Some(1),
+            )
+            .await;
+            let shell = read_frame_timeout(&mut daemon.stream, "keyed program shell").await;
+            assert!(
+                reply_text(&shell).contains("ledger-shell"),
+                "{}",
+                String::from_utf8_lossy(&shell.body)
+            );
+            provider_op(
+                &mut daemon.stream,
+                2,
+                403,
+                json!({"name": "tool.withdraw", "arguments": {"call_key": &shell_key}}),
+            )
+            .await;
+            let withdrawn =
+                reply_json(&read_frame_timeout(&mut daemon.stream, "shell withdraw lookup").await);
+            assert_eq!(withdrawn["answer"], "completed", "{withdrawn}");
+            assert!(
+                withdrawn["result"].to_string().contains("ledger-shell"),
+                "{withdrawn}"
             );
             send_connection_goodbye(&mut daemon.stream).await;
         },
