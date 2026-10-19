@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INSPECT_SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 const INSPECT_WRITER_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const WRITER_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 // Field data (2026-08-06): ~/.local/share/cortexkit/aft/inspect held 1,945
 // scope-key directories for about 30 repositories; 1,849 directories (21.5 GB)
 // had no file newer than seven days. Scope keys hash canonical checkout paths,
@@ -495,6 +496,7 @@ pub struct InspectCache {
     read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<TrackedConnection>,
     memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
+    writer_retry_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -574,13 +576,26 @@ impl InspectCache {
         let writer_deadline = crate::fs_lock::acquisition_now() + INSPECT_WRITER_LEASE_TIMEOUT;
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let project_inspect_dir = project_inspect_dir(inspect_dir.clone(), &project_key);
-        let Some(writer_lease) = acquire_writer_lease(
+        let writer_lease = match acquire_writer_lease(
             &project_inspect_dir,
             &project_key,
             &project_root,
             writer_deadline,
-        )?
-        else {
+        ) {
+            Ok(lease) => lease,
+            Err(InspectCacheError::WriterLeaseTimeout) => {
+                // A live writer owns publication, but its committed snapshot is
+                // still readable. Keep write attempts classified as resource waits.
+                let Some(cache) = Self::open_readonly(inspect_dir, project_root)? else {
+                    return Err(InspectCacheError::WriterLeaseTimeout);
+                };
+                let mut cache = cache.into_inner();
+                cache.writer_retry_at = Some(Instant::now() + WRITER_RETRY_BACKOFF);
+                return Ok(cache);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(writer_lease) = writer_lease else {
             return match Self::open_readonly(inspect_dir, project_root.clone())? {
                 Some(cache) => Ok(cache.into_inner()),
                 None => Self::borrow_only_empty(project_inspect_dir, project_root, project_key),
@@ -692,6 +707,7 @@ impl InspectCache {
             read_marker,
             conn: Mutex::new(conn),
             memory: RwLock::new(HashMap::new()),
+            writer_retry_at: None,
         }
     }
 
@@ -722,6 +738,9 @@ impl InspectCache {
 
     fn verify_writer_lease(&self) -> Result<(), InspectCacheError> {
         let Some(lease) = self.writer_lease.as_ref() else {
+            if self.writer_retry_at.is_some() {
+                return Err(InspectCacheError::WriterLeaseTimeout);
+            }
             return Err(InspectCacheError::Io(std::io::Error::other(
                 "inspect cache opened read-only; write API is unavailable",
             )));
@@ -735,6 +754,11 @@ impl InspectCache {
                 lease.epoch()
             ))))
         }
+    }
+
+    pub(super) fn writer_retry_due(&self) -> bool {
+        self.writer_retry_at
+            .is_some_and(|retry_at| Instant::now() >= retry_at)
     }
 
     fn refresh_read_marker(&self) -> Result<(), InspectCacheError> {
@@ -2597,8 +2621,145 @@ fn now_nanos() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) struct ForeignWriter {
+        child: std::process::Child,
+        _stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl Drop for ForeignWriter {
+        fn drop(&mut self) {
+            drop(self.child.stdin.take());
+            let status = self.child.wait().expect("join foreign inspect writer");
+            if !std::thread::panicking() {
+                assert!(status.success(), "foreign writer failed: {status}");
+            }
+        }
+    }
+
+    pub(crate) fn foreign_writer(root: &Path, inspect_dir: &Path, snapshot: bool) -> ForeignWriter {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "inspect::cache::tests::foreign_writer_process",
+                "--nocapture",
+            ])
+            .env("AFT_INSPECT_TEST_WRITER_ROOT", root)
+            .env("AFT_INSPECT_TEST_WRITER_DIR", inspect_dir)
+            .env(
+                "AFT_INSPECT_TEST_WRITER_SNAPSHOT",
+                if snapshot { "1" } else { "0" },
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn foreign writer");
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "writer exited before ready"
+            );
+            if line.trim() == "inspect-writer-ready" {
+                break;
+            }
+        }
+        ForeignWriter {
+            child,
+            _stdout: output,
+        }
+    }
+
+    #[test]
+    fn foreign_writer_process() {
+        use std::io::{Read, Write};
+        let Some(root) = std::env::var_os("AFT_INSPECT_TEST_WRITER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let inspect_dir = PathBuf::from(std::env::var_os("AFT_INSPECT_TEST_WRITER_DIR").unwrap());
+        crate::root_cache::configure_artifact_access(&root, "shared", false);
+        let key = crate::path_identity::project_scope_key(&root);
+        let dir = project_inspect_dir(inspect_dir.clone(), &key);
+        fs::create_dir_all(&dir).unwrap();
+        let (cache, lease) = if std::env::var("AFT_INSPECT_TEST_WRITER_SNAPSHOT").unwrap() == "1" {
+            let cache = InspectCache::open(inspect_dir, root).unwrap();
+            cache
+                .store_tier2_result(
+                    JobKey::for_project_category(InspectCategory::Duplicates),
+                    &[],
+                    &[],
+                    serde_json::json!({"count": 17}),
+                )
+                .unwrap();
+            (Some(cache), None)
+        } else {
+            let lease = crate::root_cache::WriterLease::acquire_shared_until(
+                crate::root_cache::RootCacheDomain::Inspect,
+                &dir,
+                &key,
+                &root,
+                crate::fs_lock::acquisition_now() + Duration::from_secs(2),
+            )
+            .unwrap()
+            .expect("writer admitted");
+            (None, Some(lease))
+        };
+        println!("inspect-writer-ready");
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0]);
+        let lease = cache
+            .as_ref()
+            .and_then(|cache| cache.writer_lease.as_ref())
+            .or(lease.as_ref())
+            .unwrap();
+        assert!(
+            lease.verify().unwrap(),
+            "the foreign writer must keep its lease"
+        );
+    }
+
+    #[test]
+    fn foreign_writer_open_serves_readonly_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let inspect_dir = temp.path().join("inspect");
+        let _writer = foreign_writer(&root, &inspect_dir, true);
+        let cache =
+            InspectCache::open(inspect_dir, root).expect("borrow foreign writer's snapshot");
+        assert!(cache.writer_epoch_for_test().is_none());
+        assert_eq!(
+            cache
+                .latest_aggregate_any_hash(InspectCategory::Duplicates)
+                .unwrap(),
+            Some(serde_json::json!({"count": 17}))
+        );
+        assert!(
+            matches!(
+                cache.store_tier2_result(
+                    JobKey::for_project_category(InspectCategory::Duplicates),
+                    &[],
+                    &[],
+                    serde_json::json!({"count": 99}),
+                ),
+                Err(InspectCacheError::WriterLeaseTimeout)
+            ),
+            "borrower must not write, and must retain the resource-wait reason"
+        );
+        assert_eq!(
+            cache
+                .latest_aggregate_any_hash(InspectCategory::Duplicates)
+                .unwrap(),
+            Some(serde_json::json!({"count": 17}))
+        );
+    }
     #[test]
     fn durability_inspect_pointer_count() {
         let dir = tempfile::tempdir().unwrap();
