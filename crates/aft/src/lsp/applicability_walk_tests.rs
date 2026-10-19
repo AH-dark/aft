@@ -265,6 +265,297 @@ fn applicability_walk_manifest_change_invalidates_from_watcher() {
 }
 
 #[test]
+fn applicability_walk_fifty_content_batches_do_zero_full_walks() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("main.py");
+    std::fs::write(&source, "print(0)").unwrap();
+    let config = config(&root);
+    let cache = ApplicabilityCache::default();
+    let walk = || {
+        cache
+            .walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(10),
+                || Ok(scan(&root, &config)),
+            )
+            .unwrap()
+    };
+    let before = signature(&walk());
+    let baseline = cache.metrics(&root).full_walks;
+    for n in 1..=50 {
+        std::fs::write(&source, format!("print({n})")).unwrap();
+        cache.invalidate_batch(
+            &root,
+            std::slice::from_ref(&source),
+            crate::watcher_filter::watcher_event_is_content_only(&notify::EventKind::Modify(
+                notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+            )),
+        );
+        assert_eq!(signature(&walk()), before);
+    }
+    let metrics = cache.metrics(&root);
+    assert_eq!(
+        metrics.full_walks - baseline,
+        0,
+        "content edits must not walk"
+    );
+    assert_eq!(metrics.hits, 50);
+    assert_eq!(metrics.retained_content_batches, 50);
+    assert_eq!(metrics.warm_validations, 50);
+    assert!(metrics.invalidations.is_empty());
+}
+
+struct WatcherWalkFixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    config: Config,
+    cache: ApplicabilityCache,
+}
+
+impl WatcherWalkFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("main.py"), "print(0)").unwrap();
+        std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::write(root.join(".gitignore"), "# initial rules\n").unwrap();
+        let mut config = config(&root);
+        // Biome may probe ancestor directories outside this checkout. Other
+        // parallel tempfile fixtures change those directories' metadata; this
+        // fixture tests watcher invalidation, not ancestor revalidation.
+        config.disabled_lsp.insert("biome".into());
+        Self {
+            _temp: temp,
+            root,
+            config,
+            cache: ApplicabilityCache::default(),
+        }
+    }
+
+    fn walk(&self) -> ApplicabilityWalk {
+        self.cache
+            .walk(
+                &self.root,
+                &self.config,
+                Instant::now() + Duration::from_secs(10),
+                || Ok(scan(&self.root, &self.config)),
+            )
+            .unwrap()
+    }
+
+    fn batch(&self, paths: &[PathBuf], kind: notify::EventKind) {
+        self.cache.invalidate_batch(
+            &self.root,
+            paths,
+            crate::watcher_filter::watcher_event_is_content_only(&kind),
+        );
+    }
+
+    fn assert_one_new_walk(&self) -> ApplicabilityWalk {
+        let result = self.walk();
+        assert_eq!(self.cache.metrics(&self.root).full_walks, 2);
+        result
+    }
+}
+
+fn data_modify() -> notify::EventKind {
+    notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    ))
+}
+
+#[test]
+fn applicability_walk_new_source_in_fresh_directory_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    assert!(!fixture
+        .walk()
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
+    let source = fixture.root.join("fresh/deep/main.go");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, "package main").unwrap();
+    fixture.batch(
+        &[source],
+        notify::EventKind::Create(notify::event::CreateKind::File),
+    );
+    assert!(fixture
+        .assert_one_new_walk()
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).invalidations["create_remove_rename_or_directory"],
+        1
+    );
+}
+
+#[test]
+fn applicability_walk_deleted_source_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    assert!(!fixture.walk().candidates.is_empty());
+    let source = fixture.root.join("main.py");
+    std::fs::remove_file(&source).unwrap();
+    fixture.batch(
+        &[source],
+        notify::EventKind::Remove(notify::event::RemoveKind::File),
+    );
+    assert!(!fixture
+        .assert_one_new_walk()
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Python));
+}
+
+#[test]
+fn applicability_walk_new_tsconfig_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    std::fs::write(fixture.root.join("main.ts"), "export const a = 1;").unwrap();
+    fixture.walk();
+    let config = fixture.root.join("tsconfig.json");
+    std::fs::write(&config, "{}").unwrap();
+    fixture.batch(
+        &[config],
+        notify::EventKind::Create(notify::event::CreateKind::File),
+    );
+    fixture.assert_one_new_walk();
+}
+
+#[test]
+fn applicability_walk_package_json_content_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    let manifest = fixture.root.join("package.json");
+    std::fs::write(&manifest, r#"{"type":"module"}"#).unwrap();
+    fixture.batch(&[manifest], data_modify());
+    fixture.assert_one_new_walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).invalidations["marker_ignore_config_or_ts_install"],
+        1
+    );
+}
+
+#[test]
+fn applicability_walk_gitignore_content_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    let ignore = fixture.root.join(".gitignore");
+    std::fs::write(&ignore, "main.py\n").unwrap();
+    fixture.batch(&[ignore], data_modify());
+    let result = fixture.assert_one_new_walk();
+    assert!(!result
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Python));
+}
+
+#[test]
+fn applicability_walk_overflow_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    fixture
+        .cache
+        .invalidate(&fixture.root, InvalidationCause::OverflowLostEvents);
+    fixture.assert_one_new_walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).invalidations["overflow_or_lost_events"],
+        1
+    );
+}
+
+#[test]
+fn applicability_walk_rename_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    let before = fixture.root.join("main.py");
+    let after = fixture.root.join("renamed.py");
+    std::fs::rename(&before, &after).unwrap();
+    fixture.batch(
+        &[before, after.clone()],
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )),
+    );
+    let result = fixture.assert_one_new_walk();
+    assert!(result.candidates.iter().any(|c| c.source_file == after));
+}
+
+#[test]
+fn applicability_walk_custom_marker_and_captured_ignore_content_invalidate() {
+    let mut fixture = WatcherWalkFixture::new();
+    fixture
+        .config
+        .lsp_servers
+        .push(crate::config::UserServerDef {
+            id: "custom".into(),
+            root_markers: vec!["project.anchor".into()],
+            ..Default::default()
+        });
+    let marker = fixture.root.join("project.anchor");
+    let ignore = fixture.root.join(".ignore");
+    std::fs::write(&marker, "before").unwrap();
+    std::fs::write(&ignore, "# before").unwrap();
+    fixture.walk();
+    std::fs::write(&marker, "after").unwrap();
+    fixture.batch(&[marker], data_modify());
+    fixture.assert_one_new_walk();
+    std::fs::write(&ignore, "# after").unwrap();
+    fixture.batch(&[ignore], data_modify());
+    fixture.walk();
+    let metrics = fixture.cache.metrics(&fixture.root);
+    assert_eq!(metrics.full_walks, 3);
+    assert_eq!(
+        metrics.invalidations["marker_ignore_config_or_ts_install"],
+        2
+    );
+    assert!(metrics.dependency_count > 0);
+}
+
+#[test]
+fn applicability_walk_directory_and_ambiguous_modify_invalidate() {
+    for (name, kind) in [
+        ("folder", data_modify()),
+        (
+            "main.py",
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+        ),
+    ] {
+        let fixture = WatcherWalkFixture::new();
+        fixture.walk();
+        let path = fixture.root.join(name);
+        if name == "folder" {
+            std::fs::create_dir(&path).unwrap();
+        }
+        fixture.batch(&[path], kind);
+        fixture.assert_one_new_walk();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn applicability_walk_symlinked_selection_input_content_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    let target = fixture.root.join("workspace.settings");
+    std::fs::write(&target, "[workspace]\nmembers = []\n").unwrap();
+    std::os::unix::fs::symlink(&target, fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::write(fixture.root.join("lib.rs"), "pub fn example() {}\n").unwrap();
+    fixture.walk();
+    std::fs::write(&target, "[workspace]\nmembers = []\nresolver = '2'\n").unwrap();
+    // The watcher resolves the symlink, so its event names the target rather
+    // than Cargo.toml. The captured input's identity must still invalidate it.
+    fixture.batch(&[target], data_modify());
+    fixture.assert_one_new_walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).invalidations["marker_ignore_config_or_ts_install"],
+        1
+    );
+}
+
+#[test]
 fn applicability_walk_invalidation_returns_uncached_result_to_parked_callers() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -309,7 +600,7 @@ fn applicability_walk_invalidation_returns_uncached_result_to_parked_callers() {
         });
         assert!(cache.wait_for_waiter_for_test(Instant::now() + Duration::from_secs(5)));
         std::fs::write(root.join("new.py"), "").unwrap();
-        cache.invalidate(&root);
+        cache.invalidate(&root, InvalidationCause::CreateRemoveRename);
         release_tx.send(()).unwrap();
         (
             caller.join().unwrap().unwrap(),

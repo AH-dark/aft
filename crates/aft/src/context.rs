@@ -11450,7 +11450,10 @@ impl AppContext {
     ) {
         let root = self.watcher_root_path();
         // Changes made while no watcher was installed were not observable.
-        crate::lsp::manager::invalidate_applicability_walk(&root);
+        crate::lsp::manager::invalidate_applicability_walk(
+            &root,
+            crate::lsp::manager::InvalidationCause::WatcherInstalled,
+        );
         let gitignore_generation = self.gitignore_generation.load(Ordering::SeqCst);
         let _runtime_guard = self.watcher_runtime_lock.lock();
         let replaced = self.watcher_thread.lock().replace(runtime);
@@ -11534,7 +11537,10 @@ impl AppContext {
         *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
         if let Some(identity) = self.watcher_runtime_identity.lock().take() {
-            crate::lsp::manager::invalidate_applicability_walk(&identity.root);
+            crate::lsp::manager::invalidate_applicability_walk(
+                &identity.root,
+                crate::lsp::manager::InvalidationCause::WatcherRemoved,
+            );
         }
         runtime
     }
@@ -11573,7 +11579,10 @@ impl AppContext {
             *self.watcher_drain_slice.lock() = None;
             *self.watcher.lock() = None;
             if let Some(identity) = self.watcher_runtime_identity.lock().take() {
-                crate::lsp::manager::invalidate_applicability_walk(&identity.root);
+                crate::lsp::manager::invalidate_applicability_walk(
+                    &identity.root,
+                    crate::lsp::manager::InvalidationCause::WatcherRemoved,
+                );
             }
             runtime
         };
@@ -12090,8 +12099,36 @@ impl AppContext {
         if paths.is_empty() {
             return;
         }
-        self.invalidate_project_applicability();
+        self.lsp_note_watcher_batch(paths, false);
         self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    /// Check the applicability cache when a watcher batch enters the drain,
+    /// before its paths are forwarded to language servers in later drain slices.
+    /// `content_only` is true only if every event for every path was a data
+    /// modification; callers with paths alone must pass false to allow creation.
+    pub(crate) fn lsp_note_watcher_batch(&self, paths: &[PathBuf], content_only: bool) {
+        let config = self.config();
+        if let Some(root) = &config.project_root {
+            if crate::lsp::manager::invalidate_applicability_batch(
+                root,
+                paths,
+                content_only,
+                &config,
+            ) {
+                self.refresh_project_applicability(config, false);
+            }
+        }
+    }
+
+    pub(crate) fn lsp_forward_classified_watcher_file_events(&self, paths: &[PathBuf]) {
+        self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    pub(crate) fn lsp_note_watcher_ignore_change(&self) {
+        self.invalidate_project_applicability(
+            crate::lsp::manager::InvalidationCause::SelectionInput,
+        );
     }
 
     /// After the file watcher lost events (an overflow that needs a rescan),
@@ -12101,14 +12138,16 @@ impl AppContext {
     /// them more than a missed notification for files AFT resyncs when it
     /// next opens or edits them.
     pub fn lsp_reload_rust_workspaces_after_lost_watcher_events(&self) {
-        self.invalidate_project_applicability();
+        self.invalidate_project_applicability(
+            crate::lsp::manager::InvalidationCause::OverflowLostEvents,
+        );
         self.lsp_forward_or_queue_watcher_changes(&[], true);
     }
 
-    fn invalidate_project_applicability(&self) {
+    fn invalidate_project_applicability(&self, cause: crate::lsp::manager::InvalidationCause) {
         let config = self.config();
         if let Some(root) = &config.project_root {
-            crate::lsp::manager::invalidate_applicability_walk(root);
+            crate::lsp::manager::invalidate_applicability_walk(root, cause);
             self.refresh_project_applicability(config, false);
         }
     }
@@ -17555,6 +17594,49 @@ mod health_warming_honesty_tests {
 #[cfg(test)]
 mod configure_applicability_tests {
     use super::*;
+
+    #[test]
+    fn configure_applicability_content_batches_keep_cache_and_health_counters() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("main.py");
+        std::fs::write(&source, "print(0)").unwrap();
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        ));
+        ctx.refresh_project_applicability(Arc::new(config.clone()), false);
+        assert!(ctx.wait_for_project_applicability(Duration::from_secs(10)));
+        let spawns = ctx
+            .project_applicability_progress
+            .refresh_spawns
+            .load(Ordering::SeqCst);
+        let before = crate::lsp::manager::applicability_metrics(&root).full_walks;
+        for n in 1..=50 {
+            std::fs::write(&source, format!("print({n})")).unwrap();
+            ctx.lsp_note_watcher_batch(std::slice::from_ref(&source), true);
+            crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        }
+        assert_eq!(
+            ctx.project_applicability_progress
+                .refresh_spawns
+                .load(Ordering::SeqCst),
+            spawns
+        );
+        let census = crate::lifecycle_census::collect(&App::default(), &[ctx]);
+        let health = serde_json::to_value(census).unwrap();
+        let metrics = &health["lsp"]["applicability_by_root"][root.display().to_string()];
+        assert_eq!(metrics["full_walks"].as_u64().unwrap() - before, 0);
+        assert_eq!(metrics["retained_content_batches"], 50);
+        assert_eq!(metrics["hits"], 50);
+        assert!(metrics["dependency_count"].as_u64().unwrap() > 0);
+        assert!(metrics["warm_validation_micros"].is_u64());
+        assert!(metrics["full_walk_micros"].is_u64());
+    }
 
     #[test]
     fn configure_applicability_coalesces_watcher_batches_during_scan() {

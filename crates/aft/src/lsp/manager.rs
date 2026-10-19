@@ -7300,15 +7300,49 @@ pub fn walk_applicable_area(
     }
 }
 
-/// Watcher batches also include source creation/removal, ignored-file changes
-/// and renames. Conservatively invalidate on every batch: a source extension or
-/// a custom marker can affect applicability just as a built-in manifest can.
-pub(crate) fn invalidate_applicability_walk(root: &Path) {
+pub(crate) use super::applicability_cache::{ApplicabilityMetrics, InvalidationCause};
+
+pub(crate) fn applicability_metrics(root: &Path) -> ApplicabilityMetrics {
+    super::applicability_cache::shared()
+        .metrics(&crate::inspect::job::canonicalize_normalized(root))
+}
+
+pub(crate) fn invalidate_applicability_walk(root: &Path, cause: InvalidationCause) {
     let root = crate::inspect::job::canonicalize_normalized(root);
     // Invalidate selectors before waking a new scan, even when forwarding the
     // watcher events to a busy language-server manager has to be queued.
     super::typescript_project::clear_typescript_selection();
-    super::applicability_cache::shared().invalidate(&root);
+    super::applicability_cache::shared().invalidate(&root, cause);
+}
+
+pub(crate) fn invalidate_applicability_batch(
+    root: &Path,
+    paths: &[PathBuf],
+    content_only: bool,
+    config: &Config,
+) -> bool {
+    // Source edits do not change TypeScript selection. Keep the selector's own
+    // input predicate as the authority, rather than duplicating its install rules.
+    let custom_ts_marker = config.lsp_servers.iter().any(|server| {
+        server.id == ServerKind::TypeScript.id_str()
+            && server
+                .root_markers
+                .iter()
+                .any(|marker| paths.iter().any(|path| path.ends_with(marker)))
+    });
+    // A directory move can relocate an entire TypeScript installation. Missing
+    // paths have lost their file type, so topology changes there are ambiguous.
+    if custom_ts_marker || paths.iter().any(|path| !path.is_file()) {
+        super::typescript_project::clear_typescript_selection();
+    } else {
+        super::typescript_project::invalidate_typescript_selection(
+            paths.iter().map(PathBuf::as_path),
+        );
+    }
+    let root = crate::inspect::job::canonicalize_normalized(root);
+    super::applicability_cache::shared()
+        .invalidate_batch(&root, paths, content_only)
+        .is_some()
 }
 
 fn walk_applicable_area_uncached(
@@ -7378,6 +7412,12 @@ fn walk_applicable_area_uncached(
             root: project_root.to_path_buf(),
             reason: error.to_string(),
         })?;
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            super::applicability_cache::observe_directory_ignores(entry.path());
+        }
         if !entry
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
