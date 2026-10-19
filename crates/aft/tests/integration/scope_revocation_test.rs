@@ -46,6 +46,15 @@ fn assert_run_not_killing() {
 }
 
 async fn assert_scope_kill_settled() {
+    assert_scope_kill_settled_as("run-session", "scope_revoked", "killed (scope revoked)").await;
+}
+
+/// A codemode program's task killed at its run's end says so.
+async fn assert_run_kill_settled(session: &str) {
+    assert_scope_kill_settled_as(session, "run_ended", "killed (run ended)").await;
+}
+
+async fn assert_scope_kill_settled_as(session: &str, reason: &str, rendered: &str) {
     let (registry, task) = OBSERVED_TASK
         .get()
         .unwrap()
@@ -55,18 +64,13 @@ async fn assert_scope_kill_settled() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let snapshot = registry
-            .status(&task, "run-session", None, None, 0)
-            .unwrap();
+        let snapshot = registry.status(&task, session, None, None, 0).unwrap();
         if snapshot.info.status.is_terminal() {
             assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
-            assert_eq!(
-                snapshot.info.status_reason.as_deref(),
-                Some("scope_revoked")
-            );
+            assert_eq!(snapshot.info.status_reason.as_deref(), Some(reason));
             assert!(
                 aft::commands::bash_orchestrate::format_foreground_result(&snapshot)
-                    .contains("killed (scope revoked)")
+                    .contains(rendered)
             );
             return;
         }
@@ -944,7 +948,11 @@ fn close_case(name: &'static str, case: CloseCase) {
                         ));
                 if should_kill {
                     wait_dead(pid).await;
-                    assert_scope_kill_settled().await;
+                    if run {
+                        assert_run_kill_settled("run-session").await;
+                    } else {
+                        assert_scope_kill_settled().await;
+                    }
                 }
                 if matches!(case, CloseCase::Duplicate) {
                     no_extra_frames_until_pong(
@@ -1014,26 +1022,23 @@ fn scope_revocation_classic_route_ended_kills_group() {
 }
 
 #[test]
-fn scope_revocation_run_background_refused_before_spawn() {
+fn scope_revocation_run_pty_refused_before_spawn() {
     run_subc_bridge_test_with_dispatch(
-        "run-background-refused",
+        "run-pty-refused",
         Duration::from_secs(15),
         |input| async move {
             let mut daemon = open_scope_daemon_session(input).await;
             bind(&mut daemon.stream, &daemon.root1, 1, true).await;
             let marker = daemon.root1.join("must-not-exist");
-            for (corr, option) in [(100, "background"), (101, "pty")] {
-                let mut args = json!({"command":format!("touch '{}'", marker.display())});
-                args[option] = json!(true);
-                call(&mut daemon.stream, 1, corr, args).await;
-                let response =
-                    read_frame_timeout(&mut daemon.stream, "named background refusal").await;
-                assert_eq!(response.header.ty, FrameType::Error);
-                let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
-                assert_eq!(error.code, "run_background_refused");
-                assert!(error.message.contains("codemode runs can't background"));
-                assert!(!marker.exists());
-            }
+            let mut args = json!({"command":format!("touch '{}'", marker.display())});
+            args["pty"] = json!(true);
+            call(&mut daemon.stream, 1, 100, args).await;
+            let response = read_frame_timeout(&mut daemon.stream, "named PTY refusal").await;
+            assert_eq!(response.header.ty, FrameType::Error);
+            let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(error.code, "run_pty_refused");
+            assert!(error.message.contains("codemode runs can't open a PTY"));
+            assert!(!marker.exists());
             send_connection_goodbye(&mut daemon.stream).await;
         },
         |_, _, _| {},
@@ -1468,6 +1473,261 @@ fn codemode_call_needing_an_ask_is_refused_permission_ask_unavailable() {
             assert!(
                 data["resource"].as_str().unwrap().ends_with("outside.txt"),
                 "{data}"
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        configured_dispatch,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codemode_background_task_killed_when_run_scope_ends_and_only_then() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-background-run-end",
+        Duration::from_secs(30),
+        |input| async move {
+            use subc_protocol::scope::ScopeStatus;
+            *OBSERVED_TASK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap() = None;
+            let mut daemon = open_scope_daemon_session(input).await;
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            // Two routes of one run: closing one is a transient close.
+            bind_run(&mut daemon.stream, &daemon.root2, 2, stamp()).await;
+            bind_run(&mut daemon.stream, &daemon.root2, 3, stamp()).await;
+            let pid_path = daemon.root1.join("background.pid");
+            let command = format!(
+                "(trap '' TERM; sleep 30) & echo $! > '{}'; wait",
+                pid_path.display()
+            );
+            call(
+                &mut daemon.stream,
+                2,
+                100,
+                json!({"command":command, "background":true}),
+            )
+            .await;
+            let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                ScopeStatus::Live,
+                true,
+                Some(1),
+            )
+            .await;
+            let launch = read_frame_timeout(&mut daemon.stream, "background launch").await;
+            assert_eq!(
+                launch.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&launch.body)
+            );
+            let pid = child_pid(&pid_path).await;
+            let _cleanup = ChildCleanup(pid);
+            let (registry, task) = OBSERVED_TASK
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            // The task belongs to the head's session, so the agent reads it.
+            assert!(registry
+                .status(&task, "head-session", None, None, 0)
+                .is_some());
+            assert!(registry
+                .status(&task, "program-session", None, None, 0)
+                .is_none());
+            named_call(
+                &mut daemon.stream,
+                1,
+                101,
+                "bash_status",
+                json!({"taskId": &task}),
+            )
+            .await;
+            let status = read_frame_timeout(&mut daemon.stream, "head bash_status").await;
+            assert!(
+                reply_text(&status).contains(&task),
+                "{}",
+                reply_text(&status)
+            );
+            assert!(
+                !reply_text(&status).contains("not found"),
+                "{}",
+                reply_text(&status)
+            );
+            // A transient close without a definitive describe keeps it running.
+            send_route_goodbye(&mut daemon.stream, 2, 200).await;
+            let request = describe_phase(&mut daemon.stream, "transient close describe").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                ScopeStatus::Live,
+                true,
+                Some(1),
+            )
+            .await;
+            no_extra_frames_until_pong(&mut daemon.stream, 9100, "live run keeps its task").await;
+            assert!(
+                alive(pid),
+                "a transient close must not kill the program's task"
+            );
+            let snapshot = registry
+                .status(&task, "head-session", None, None, 0)
+                .unwrap();
+            assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+            // The run's end, confirmed by describe, kills it.
+            send_route_goodbye(&mut daemon.stream, 3, 201).await;
+            let request = describe_phase(&mut daemon.stream, "run end describe").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                ScopeStatus::Ended,
+                true,
+                Some(1),
+            )
+            .await;
+            wait_dead(pid).await;
+            assert_run_kill_settled("head-session").await;
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        observing_dispatch,
+    );
+}
+
+#[test]
+fn codemode_edit_lands_in_head_undo_history_and_undoes() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-edit-undo",
+        Duration::from_secs(30),
+        |input| async move {
+            // Fixture roots live under the system temp directory, where undo
+            // snapshots are otherwise skipped.
+            let _backups = set_test_env("AFT_TEST_ALLOW_TEMP_BACKUPS", "1");
+            let mut daemon = open_scope_daemon_session(input).await;
+            let file = daemon.root1.join("edited.txt");
+            std::fs::write(&file, "before\n").unwrap();
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            bind_run(&mut daemon.stream, &daemon.root2, 2, stamp()).await;
+            named_call(
+                &mut daemon.stream,
+                2,
+                100,
+                "write",
+                json!({"path": &file, "content": "after\n"}),
+            )
+            .await;
+            let reply = read_frame_timeout(&mut daemon.stream, "program write").await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "after\n",
+                "{}",
+                reply_text(&reply)
+            );
+            // The head agent sees the program's edit in its own history.
+            named_call(
+                &mut daemon.stream,
+                1,
+                101,
+                "safety",
+                json!({"op":"history", "path": &file}),
+            )
+            .await;
+            let history = read_frame_timeout(&mut daemon.stream, "head history").await;
+            assert!(
+                reply_text(&history).contains("[codemode run run-a]"),
+                "{}",
+                String::from_utf8_lossy(&history.body)
+            );
+            named_call(
+                &mut daemon.stream,
+                1,
+                102,
+                "safety",
+                json!({"op":"undo", "path": &file}),
+            )
+            .await;
+            let undo = read_frame_timeout(&mut daemon.stream, "head undo").await;
+            assert_eq!(undo.header.ty, FrameType::Response);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "before\n",
+                "{}",
+                reply_text(&undo)
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        bridge_dispatch,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codemode_bash_runs_in_a_real_shell_without_rewrites() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-no-rewrite",
+        Duration::from_secs(30),
+        |input| async move {
+            use subc_protocol::scope::ScopeStatus;
+            let mut daemon = open_scope_daemon_session(input).await;
+            std::fs::write(daemon.root1.join("cat.txt"), "alpha\nbeta\n").unwrap();
+            write_project_config(&daemon.root1, json!({"bash": {"rewrite": true}}));
+            write_project_config(&daemon.root2, json!({}));
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            bind_run(&mut daemon.stream, &daemon.root2, 2, stamp()).await;
+            // Control: the head's direct call is answered by the read rewrite.
+            call(
+                &mut daemon.stream,
+                1,
+                100,
+                json!({"command":"cat cat.txt","timeout":5000}),
+            )
+            .await;
+            let head = read_frame_timeout(&mut daemon.stream, "head cat").await;
+            assert!(reply_text(&head).contains("alpha"), "{}", reply_text(&head));
+            let head_route =
+                aft::bash_rewrite::dispatch::route_record("subc-1-100").map(|record| record.route);
+            assert!(
+                matches!(
+                    head_route,
+                    Some(aft::bash_rewrite::dispatch::DispatchRoute::Rewritten { .. })
+                ),
+                "the head's cat was not rewritten: {head_route:?}"
+            );
+            call(
+                &mut daemon.stream,
+                2,
+                101,
+                json!({"command":"cat cat.txt","timeout":5000}),
+            )
+            .await;
+            let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                ScopeStatus::Live,
+                true,
+                Some(1),
+            )
+            .await;
+            let program = read_frame_timeout(&mut daemon.stream, "program cat").await;
+            let program_text = reply_text(&program);
+            assert!(program_text.contains("alpha\nbeta"), "{program_text}");
+            assert!(
+                !matches!(
+                    aft::bash_rewrite::dispatch::route_record("subc-2-101")
+                        .map(|record| record.route),
+                    Some(aft::bash_rewrite::dispatch::DispatchRoute::Rewritten { .. })
+                ),
+                "a program's cat must run in a real shell"
             );
             send_connection_goodbye(&mut daemon.stream).await;
         },

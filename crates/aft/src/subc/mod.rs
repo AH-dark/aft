@@ -8418,16 +8418,23 @@ impl PlainToolRun {
                 // Undo history and named checkpoints belong to the issuing route,
                 // not to whichever harness configured this shared root last.
                 let harness = identity_for_run.harness.clone();
+                // A codemode program's edits are tagged with its run.
+                let run_id = identity_for_run
+                    .run_owner
+                    .as_ref()
+                    .map(|owner| owner.run_id.clone());
                 let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                 crate::access_policy::with_scope(
                     Some(access_grants::policy_scope_key(&identity_for_run)),
                     || {
                         crate::backup::with_request_harness(&harness, || {
-                            if matches!(bind_trust, BindTrust::Untrusted) {
-                                ctx.with_force_restrict(&request_id_for_force, run)
-                            } else {
-                                run()
-                            }
+                            crate::backup::with_request_run(run_id.as_deref(), || {
+                                if matches!(bind_trust, BindTrust::Untrusted) {
+                                    ctx.with_force_restrict(&request_id_for_force, run)
+                                } else {
+                                    run()
+                                }
+                            })
                         })
                     },
                 )
@@ -9541,11 +9548,17 @@ async fn handle_tool_call(
                 crate::sandbox_spawn::with_authenticated_principal(
                     identity_for_run.spawn_principal.clone(),
                     || {
-                        if matches!(bind_trust, BindTrust::Untrusted) {
-                            ctx.with_force_restrict(&request_id_for_force, run)
-                        } else {
-                            run()
-                        }
+                        let run_id = identity_for_run
+                            .run_owner
+                            .as_ref()
+                            .map(|owner| owner.run_id.clone());
+                        crate::backup::with_request_run(run_id.as_deref(), || {
+                            if matches!(bind_trust, BindTrust::Untrusted) {
+                                ctx.with_force_restrict(&request_id_for_force, run)
+                            } else {
+                                run()
+                            }
+                        })
                     },
                 )
             });

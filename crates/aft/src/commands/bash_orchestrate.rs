@@ -42,10 +42,10 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
     let terminal_status = match snapshot.info.status {
         BgTaskStatus::Failed if snapshot.exit_code.is_none_or(|code| code == 0) => Some("failed"),
         BgTaskStatus::Killed
-            if !matches!(
+            if crate::bash_background::registry::scope_end_label(
                 snapshot.info.status_reason.as_deref(),
-                Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
-            ) =>
+            )
+            .is_none() =>
         {
             Some("killed")
         }
@@ -86,13 +86,12 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
             ));
         }
     }
-    if snapshot.info.status == BgTaskStatus::Killed
-        && matches!(
+    if snapshot.info.status == BgTaskStatus::Killed {
+        if let Some(label) = crate::bash_background::registry::scope_end_label(
             snapshot.info.status_reason.as_deref(),
-            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
-        )
-    {
-        rendered.push_str("\n[killed (scope revoked)]");
+        ) {
+            rendered.push_str(&format!("\n[killed ({label})]"));
+        }
     }
     if snapshot.info.status == BgTaskStatus::TimedOut {
         rendered.push_str("\n[command timed out]");

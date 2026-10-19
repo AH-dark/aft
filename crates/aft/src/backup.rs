@@ -104,6 +104,37 @@ pub(crate) fn request_harness_segment() -> Option<String> {
     REQUEST_HARNESS_SEGMENT.with(|slot| slot.borrow().clone())
 }
 
+thread_local! {
+    /// The codemode run whose program issued the request on this thread.
+    /// The program's edits land in its head agent's own undo history, and
+    /// each snapshot names the run so the agent can tell them apart.
+    static REQUEST_RUN_ID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct RequestRunScope(Option<String>);
+
+impl Drop for RequestRunScope {
+    fn drop(&mut self) {
+        REQUEST_RUN_ID.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+/// Run `run` with every new undo snapshot tagged with `run_id`, the codemode
+/// run that made the edit. `None` leaves snapshots untagged.
+pub(crate) fn with_request_run<R>(run_id: Option<&str>, run: impl FnOnce() -> R) -> R {
+    let previous = REQUEST_RUN_ID.with(|slot| slot.replace(run_id.map(str::to_owned)));
+    let _scope = RequestRunScope(previous);
+    run()
+}
+
+/// The text a codemode run's snapshot descriptions end with.
+pub(crate) fn run_tag(run_id: &str) -> String {
+    format!(" [codemode run {run_id}]")
+}
+
 #[cfg(test)]
 fn set_restore_before_lock_hook_for_tests(
     session: &str,
@@ -2290,6 +2321,11 @@ impl BackupStore {
         key: &Path,
         mut entry: BackupEntry,
     ) -> Result<(), AftError> {
+        // The description is persisted with the entry everywhere it is stored,
+        // so the run tag survives restarts without a schema change.
+        if let Some(run_id) = REQUEST_RUN_ID.with(|slot| slot.borrow().clone()) {
+            entry.description.push_str(&run_tag(&run_id));
+        }
         let max_depth = self.policy.max_depth;
         // Detach the stack so persistence can borrow it while updating the rest of
         // the store. Keep evicted entries by ownership until the disk commit, which

@@ -124,6 +124,20 @@ pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 /// Status reason of a task killed because its caller withdrew the call.
 pub const WITHDRAWN_REASON: &str = "withdrawn";
 pub const SCOPE_REVOKED_REASON: &str = "scope_revoked";
+/// Status reason of a task a codemode program started, killed because the
+/// daemon confirmed the program's run scope ended.
+pub const RUN_ENDED_REASON: &str = "run_ended";
+
+/// How a task killed at the end of its daemon scope is labelled to the agent:
+/// `run ended` for a codemode program's task, `scope revoked` otherwise.
+/// `None` for any other status reason.
+pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
+        Some(RUN_ENDED_REASON) => Some("run ended"),
+        _ => None,
+    }
+}
 #[path = "remote.rs"]
 pub(crate) mod remote;
 #[cfg(target_os = "linux")]
@@ -6596,6 +6610,20 @@ impl BgTaskRegistry {
         )
     }
 
+    /// Kill a codemode program's task once its run scope is confirmed ended.
+    pub(crate) fn kill_for_run_end(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some(RUN_ENDED_REASON.into()),
+        )
+    }
+
     /// Kill a running call's task because its caller withdrew the call
     /// (`tool.withdraw`). The task is named by the call ledger row, so it is
     /// found by id alone; its status reason is [`WITHDRAWN_REASON`].
@@ -7983,18 +8011,23 @@ impl BgTaskRegistry {
                 scope.scope_epoch,
             ));
         for task in self.running_tasks() {
-            let matches = task
+            let stamp = task
                 .lock_state()
                 .ok()
                 .and_then(|state| state.metadata.scope.clone())
-                .is_some_and(|stamp| {
+                .filter(|stamp| {
                     stamp.owner == scope.owner
                         && stamp.scope_ref == scope.scope_ref
                         && stamp.scope_epoch == scope.scope_epoch
                 });
-            if matches {
-                if let Err(error) = self.kill_for_scope_revocation(&task.task_id, &task.session_id)
-                {
+            if let Some(stamp) = stamp {
+                // A run scope's tasks were started by a codemode program.
+                let killed = if stamp.attributes.run_id.is_some() {
+                    self.kill_for_run_end(&task.task_id, &task.session_id)
+                } else {
+                    self.kill_for_scope_revocation(&task.task_id, &task.session_id)
+                };
+                if let Err(error) = killed {
                     log::warn!(
                         "scope revocation kill failed task={}: {error}",
                         task.task_id
@@ -8425,10 +8458,7 @@ impl BgTaskRegistry {
         reason: Option<String>,
     ) -> Result<BgTaskSnapshot, String> {
         #[cfg(feature = "test-timing-hooks")]
-        let scope_diagnostic = matches!(
-            reason.as_deref(),
-            Some(SCOPE_REVOKED_REASON | "scope revoked")
-        );
+        let scope_diagnostic = scope_end_label(reason.as_deref()).is_some();
         #[cfg(feature = "test-timing-hooks")]
         let diagnostic_start = Instant::now();
         #[cfg(feature = "test-timing-hooks")]
@@ -8442,10 +8472,7 @@ impl BgTaskRegistry {
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
-            if matches!(
-                reason.as_deref(),
-                Some(SCOPE_REVOKED_REASON | "scope revoked")
-            ) {
+            if scope_end_label(reason.as_deref()).is_some() {
                 let mut db = DeferredDbWrites::new(self, &task);
                 let mut state = task
                     .lock_state()

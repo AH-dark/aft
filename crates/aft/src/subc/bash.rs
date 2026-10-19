@@ -1339,7 +1339,9 @@ pub(super) fn submit_deferred_bash(
                                                             ),
                                                          || {
                                                               crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || {
-                                                                  let run_dispatch = || dispatch(raw_req, ctx);
+                                                                  let run_dispatch = || {
+                                                                      crate::bash_rewrite::with_rewrites_off(run_scoped, || dispatch(raw_req, ctx))
+                                                                  };
                                                                   #[cfg(not(test))]
                                                                   let response = run_dispatch();
                                                                   #[cfg(test)]
@@ -1422,7 +1424,11 @@ pub(super) fn submit_deferred_bash(
                         .and_then(Value::as_str)
                         .unwrap_or("pipes");
                     let is_pty = mode == "pty" || settings.pty;
-                    if !server_completion && (is_pty || settings.background) {
+                    // A codemode program's background launch answers at once like
+                    // a classic one; its task stays under the run's lifetime.
+                    let launch_answers_now =
+                        !server_completion || (run_scoped && settings.background);
+                    if launch_answers_now && (is_pty || settings.background) {
                         let unanswered_deadline = unanswered_bash_reply_deadline(
                             received_at,
                             0,
@@ -3397,7 +3403,7 @@ mod grant_path_tests {
         );
         let dispatch = submit.find("dispatch(raw_req, ctx)").unwrap();
         let mode_branch = submit
-            .find("if !server_completion && (is_pty || settings.background)")
+            .find("if launch_answers_now && (is_pty || settings.background)")
             .expect("background/PTY branch");
         let foreground_wait = submit
             .find("select_foreground_wait_window_ms")

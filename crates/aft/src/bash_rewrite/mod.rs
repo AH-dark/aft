@@ -62,6 +62,28 @@ pub trait RewriteRule: Send + Sync {
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response;
 }
 
+thread_local! {
+    /// Set while a codemode program's shell call runs. The program parses
+    /// what a real shell prints, so its commands are never answered by AFT's
+    /// own tools (line-numbered reads, grep formatting, edit reports).
+    static REWRITES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct RewritesOffScope(bool);
+
+impl Drop for RewritesOffScope {
+    fn drop(&mut self) {
+        REWRITES_OFF.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Run `run` with command rewriting turned off when `off` is true.
+pub(crate) fn with_rewrites_off<R>(off: bool, run: impl FnOnce() -> R) -> R {
+    let previous = REWRITES_OFF.with(|slot| slot.replace(off || slot.get()));
+    let _scope = RewritesOffScope(previous);
+    run()
+}
+
 /// Try to rewrite a synthetic request. Production bash calls
 /// [`try_rewrite_for_request`] with the caller's request ID; this compatibility
 /// wrapper is retained for direct library users and existing unit tests.
@@ -93,6 +115,11 @@ pub fn try_rewrite_for_request(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
+    // A codemode program's shell call always runs in a real shell. This is a
+    // caller decision, not a rewrite branch, so it records no branch.
+    if REWRITES_OFF.with(std::cell::Cell::get) {
+        return None;
+    }
     // Windows relaxed shells must reach task capture to report that their
     // filesystem denies are unenforced, even when a rewrite would otherwise fit.
     let unenforced_relaxed = cfg!(windows)
