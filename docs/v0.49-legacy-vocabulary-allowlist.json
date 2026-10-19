@@ -4464,6 +4464,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/__tests__/v2-read-permissions.test.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture asserts the Rust zoom payload's internal filePath field; model input uses path."
+    },
+    {
       "path": "packages/opencode-plugin/src/__tests__/v2-tool-hooks.test.ts",
       "token": "filePath",
       "location": "file-level",
