@@ -191,7 +191,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       name: "aft_safety",
       label: "safety",
       description:
-        "File safety and recovery operations. Ops: `undo` (omit path to undo the entire last tool call; pass path to pop latest snapshot for one file — irreversible), `history` (list snapshots for a file), `checkpoint` (save named snapshot), `restore` (restore named checkpoint; optional path/files scopes it), `list` (list checkpoints). Per-file undo stack is capped at 20.",
+        "`undo` reverts a tool call (omit path) or latest file snapshot (irreversible); `history` lists snapshots; `checkpoint` saves named snapshots on disk across restarts, expiring after 14 days (contents may include secrets); `restore` restores a checkpoint, optionally scoped by path/files; `list` lists checkpoints. Undo keeps 20 snapshots/file (oldest evicted).",
       parameters: SafetyParams,
       async execute(
         _toolCallId: string,

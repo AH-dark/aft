@@ -1309,9 +1309,8 @@ Backup and recovery for risky edits.
 ```
 
 > **Note:** Backups are persisted to disk (SQLite-backed) and survive bridge and host restarts.
-> Named checkpoints are memory-only and session-scoped: they are lost when the bridge or daemon
-> restarts. A checkpoint response reports this durability limit; use persisted undo history when
-> recovery must survive a restart.
+> Named checkpoints are stored on disk across bridge and daemon restarts, expire after 14 days, and
+> may contain secrets.
 > Undo is operation-scoped: a single multi-file delete, directory delete, file move, symbol move,
 > or AST replace is reverted atomically by one `undo` with no `path`. Per-file undo stack is
 > capped at 20 entries — oldest snapshots are evicted when exceeded. History, undo, and
