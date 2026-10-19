@@ -33,6 +33,9 @@ fn classify_publication_failure(error: &str) -> PublicationFailureKind {
 pub(crate) struct PublicationRetry {
     error: Option<String>,
     failures: usize,
+    /// Real failures in the current streak, counted apart from semantic-index
+    /// waits so a warm-up wait never uses up the warnings a real fault gets.
+    real_failures: usize,
     delay: Duration,
     due: Option<Instant>,
     initial: Duration,
@@ -44,6 +47,7 @@ impl Default for PublicationRetry {
         Self {
             error: None,
             failures: 0,
+            real_failures: 0,
             delay: Duration::ZERO,
             due: None,
             initial: Duration::from_secs(1),
@@ -68,6 +72,7 @@ impl PublicationRetry {
         }
         self.error = None;
         self.failures = 0;
+        self.real_failures = 0;
         self.delay = Duration::ZERO;
         self.due = None;
     }
@@ -87,9 +92,12 @@ impl PublicationRetry {
         self.due = Some(Instant::now() + self.delay);
         let waiting =
             classify_publication_failure(error) == PublicationFailureKind::SemanticIndexWaiting;
+        if !waiting {
+            self.real_failures = self.real_failures.saturating_add(1);
+        }
         // Report real failures early, then summarize them on recovery or an
         // edit. Waiting for the semantic index is expected during warm-up.
-        let warn = self.failures <= 2 && !waiting;
+        let warn = !waiting && self.real_failures <= 2;
         if waiting {
             log::debug!(
                 "content-addressed view publication waiting root={} repeat_count={} retry_ms={} error={}",

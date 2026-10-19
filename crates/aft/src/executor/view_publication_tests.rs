@@ -33,6 +33,31 @@ fn semantic_index_wait_is_classified_without_changing_retry_backoff() {
     assert!(retry.due().is_some());
 }
 
+#[test]
+fn semantic_index_waits_do_not_silence_the_first_real_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let failures = Failures::new(root.path().to_path_buf());
+    let waiting = crate::context::VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX;
+    let real = "view I/O failed writing semantic blobs: permission denied";
+    let mut retry = PublicationRetry::default();
+    retry.failed(root.path(), waiting);
+    retry.failed(root.path(), waiting);
+    assert!(!failures.next().3, "a semantic-index wait must not warn");
+    assert!(!failures.next().3, "a semantic-index wait must not warn");
+    retry.failed(root.path(), real);
+    let (_, delay, count, warned) = failures.next();
+    assert!(warned, "the first real failure after waits must warn");
+    assert_eq!(count, 3, "waits still count toward the shared retry streak");
+    assert_eq!(delay, Duration::from_secs(4), "retry backoff is unchanged");
+    retry.failed(root.path(), real);
+    assert!(failures.next().3, "the second real failure warns too");
+    retry.failed(root.path(), real);
+    assert!(
+        !failures.next().3,
+        "later repeats are summarized on recovery"
+    );
+}
+
 static CAS_TIMINGS: LazyLock<Mutex<HashMap<PathBuf, Vec<Duration>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub(super) fn record_cas(root: PathBuf, elapsed: Duration) {
