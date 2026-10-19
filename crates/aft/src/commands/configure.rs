@@ -16101,8 +16101,33 @@ mod tests {
         }
         crate::runtime_drain::drain_build_completions(&ctx);
         assert!(ctx.search_index().read().unwrap().is_none());
+        let receiver = ctx
+            .search_index_rx()
+            .read()
+            .unwrap()
+            .clone()
+            .expect("search index completion receiver");
         drop(held);
-        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        // Observe the build's publication directly; the timeout guards against a
+        // hung worker rather than imposing a limit on index-build duration.
+        let index = receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("cold search build did not publish after permit release");
+        assert!(index.ready, "cold search build published an unready index");
+
+        // The cloned receiver consumes the event, so put it back for the normal
+        // runtime drain to install and retire the current build receiver.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(index).expect("restore search index completion");
+        *ctx.search_index_rx().write().unwrap() = Some(rx);
+        crate::runtime_drain::drain_build_completions(&ctx);
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready));
     }
 
     #[test]
