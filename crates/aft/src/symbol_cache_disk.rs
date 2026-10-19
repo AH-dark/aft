@@ -26,6 +26,9 @@ pub const SCHEMA_VERSION: u32 = 4;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
+// Cache writes serialize every entry while holding this cross-process lock.
+// Leave enough time for another AFT process to persist a large cache on a slow disk.
+const SYMBOL_CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SYMBOL_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 #[cfg(test)]
@@ -51,7 +54,7 @@ impl SymbolCacheLock {
         let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
-        fs_lock::try_acquire(&path, Duration::from_secs(2))
+        fs_lock::try_acquire(&path, SYMBOL_CACHE_LOCK_TIMEOUT)
             .map(|guard| Self {
                 _guard: Some(guard),
             })
@@ -578,17 +581,59 @@ mod tests {
 
         let cache_a = test_cache(&project, "a");
         let cache_b = test_cache(&project, "b");
+        let held_lock = SymbolCacheLock::acquire(&storage, "unit-project", &project)
+            .expect("hold symbol cache lock while writers start");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
         let storage_a = storage.clone();
+        let start_a = std::sync::Arc::clone(&start);
+        let ready_a = ready_tx.clone();
+        let done_a = done_tx.clone();
         let writer_a = std::thread::spawn(move || {
-            write_to_disk(&cache_a, &storage_a, "unit-project").expect("write a");
-        });
-        let storage_b = storage.clone();
-        let writer_b = std::thread::spawn(move || {
-            write_to_disk(&cache_b, &storage_b, "unit-project").expect("write b");
+            start_a.wait();
+            ready_a.send(()).expect("report writer a ready");
+            let result = write_to_disk(&cache_a, &storage_a, "unit-project");
+            done_a.send(("a", result)).expect("report writer a result");
         });
 
-        writer_a.join().expect("writer a");
-        writer_b.join().expect("writer b");
+        let storage_b = storage.clone();
+        let start_b = std::sync::Arc::clone(&start);
+        let ready_b = ready_tx.clone();
+        let done_b = done_tx.clone();
+        let writer_b = std::thread::spawn(move || {
+            start_b.wait();
+            ready_b.send(()).expect("report writer b ready");
+            let result = write_to_disk(&cache_b, &storage_b, "unit-project");
+            done_b.send(("b", result)).expect("report writer b result");
+        });
+
+        start.wait();
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both symbol cache writers should start");
+        }
+        // Keep both writers contending longer than the former two-second wait.
+        std::thread::sleep(Duration::from_millis(2_500));
+        drop(held_lock);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let mut results = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            results.push(
+                done_rx
+                    .recv_timeout(remaining)
+                    .expect("symbol cache writers exceeded the 45-second test deadline"),
+            );
+        }
+        writer_a.join().expect("writer a thread");
+        writer_b.join().expect("writer b thread");
+        for (writer, result) in results {
+            result.unwrap_or_else(|error| panic!("write {writer}: {error}"));
+        }
 
         let loaded = read_from_disk(&storage, "unit-project").expect("load symbol cache");
         assert_eq!(loaded.len(), 1);

@@ -11,6 +11,8 @@ use serde_json::{json, Map, Value};
 use super::helpers::AftProcess;
 
 const SESSION_ID: &str = "tool-call-parity-session";
+// Wait out delayed watcher notifications so they cannot skew only one parity call.
+const WATCHER_QUIET_WINDOW: Duration = Duration::from_millis(250);
 
 struct ParityCase {
     label: &'static str,
@@ -193,6 +195,7 @@ fn wait_until_watcher_queries_are_current(
     let deadline = Instant::now() + Duration::from_secs(10);
     let readiness_arguments = json!({"pattern": "needle", "path": "src/search.txt"});
     let mut attempt = 0;
+    let mut quiet_since = None;
 
     loop {
         attempt += 1;
@@ -225,7 +228,11 @@ fn wait_until_watcher_queries_are_current(
 
         let direct_pending = has_pending_watcher_changes(&direct_response);
         let tool_call_pending = has_pending_watcher_changes(&tool_call_response);
-        if !direct_pending && !tool_call_pending {
+        if watcher_quiet_window_elapsed(
+            &mut quiet_since,
+            direct_pending || tool_call_pending,
+            Instant::now(),
+        ) {
             return;
         }
         assert!(
@@ -236,11 +243,65 @@ fn wait_until_watcher_queries_are_current(
     }
 }
 
+fn watcher_quiet_window_elapsed(
+    quiet_since: &mut Option<Instant>,
+    pending: bool,
+    now: Instant,
+) -> bool {
+    if pending {
+        *quiet_since = None;
+        return false;
+    }
+
+    let Some(quiet_since) = quiet_since else {
+        *quiet_since = Some(now);
+        return false;
+    };
+    now.duration_since(*quiet_since) >= WATCHER_QUIET_WINDOW
+}
+
 fn has_pending_watcher_changes(response: &Value) -> bool {
     response
         .get("gaps")
         .and_then(Value::as_array)
         .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"))
+}
+
+#[test]
+fn watcher_quiet_window_requires_an_uninterrupted_clear_interval() {
+    let start = Instant::now();
+    let mut quiet_since = None;
+
+    assert!(!watcher_quiet_window_elapsed(
+        &mut quiet_since,
+        false,
+        start,
+    ));
+    assert!(!watcher_quiet_window_elapsed(
+        &mut quiet_since,
+        false,
+        start + Duration::from_millis(125),
+    ));
+    assert!(!watcher_quiet_window_elapsed(
+        &mut quiet_since,
+        true,
+        start + Duration::from_millis(200),
+    ));
+    assert!(!watcher_quiet_window_elapsed(
+        &mut quiet_since,
+        false,
+        start + Duration::from_millis(201),
+    ));
+    assert!(!watcher_quiet_window_elapsed(
+        &mut quiet_since,
+        false,
+        start + Duration::from_millis(450),
+    ));
+    assert!(watcher_quiet_window_elapsed(
+        &mut quiet_since,
+        false,
+        start + Duration::from_millis(451),
+    ));
 }
 
 #[test]
