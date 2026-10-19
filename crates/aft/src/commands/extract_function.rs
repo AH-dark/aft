@@ -103,7 +103,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
             "invalid_request",
             format!(
                 "extract_function: start_line ({}) must be less than end_line ({})",
-                start_line, end_line
+                start_line_1based, end_line_1based
             ),
         );
     }
@@ -189,7 +189,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
             "invalid_request",
             format!(
                 "extract_function: start_line {} is beyond end of file",
-                start_line
+                start_line_1based
             ),
         );
     }
@@ -402,6 +402,44 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);
     Response::success(&req.id, result)
+}
+
+#[cfg(test)]
+mod approved_contract_tests {
+    use super::*;
+
+    #[test]
+    fn extraction_errors_report_submitted_one_based_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.ts");
+        std::fs::write(&file, "function outer() { return 1; }\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for (start, end, message) in [
+            (
+                6,
+                4,
+                "extract_function: start_line (6) must be less than end_line (4)",
+            ),
+            (
+                3,
+                3,
+                "extract_function: start_line (3) must be less than end_line (3)",
+            ),
+            (6, 7, "extract_function: start_line 6 is beyond end of file"),
+        ] {
+            let req = serde_json::from_value(serde_json::json!({"id": "bounds", "command": "extract_function", "file": file, "name": "extracted", "start_line": start, "end_line": end})).unwrap();
+            let response = handle_extract_function(&req, &ctx);
+            assert_eq!(response.data["code"], "invalid_request");
+            assert_eq!(response.data["message"], message);
+        }
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "function outer() { return 1; }\n"
+        );
+    }
 }
 
 /// Find the enclosing function node for a byte position.

@@ -426,6 +426,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         for (change, validated_path, backup_id) in changes_to_apply {
             match std::fs::write(validated_path.as_path(), &change.new_content) {
                 Ok(()) => {
+                    ctx.lsp_notify_file_changed(validated_path.as_path(), &change.new_content);
                     written_changes.push((validated_path.clone(), change.original.clone()));
                     let mut entry = serde_json::json!({
                         "file": change.file_path.display().to_string(),
@@ -450,6 +451,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                     let rollback_error = rollback_written_changes(
                         &written_changes,
                         Some((validated_path.as_path(), change.original.as_str())),
+                        ctx,
                     );
                     let rollback_ok = rollback_error.is_none();
                     if rollback_ok {
@@ -517,26 +519,147 @@ mod audit_regressions {
             (restored.clone(), "before".to_string()),
             (failed.clone(), "before".to_string()),
         ];
-        let error = rollback_written_changes(&changes, Some((&attempted, "before"))).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let error = rollback_written_changes(&changes, Some((&attempted, "before")), &ctx).unwrap();
         assert_eq!(std::fs::read_to_string(restored).unwrap(), "before");
         assert!(error.contains(failed.to_str().unwrap()));
         assert!(error.contains(attempted.to_str().unwrap()));
     }
 }
 
+#[cfg(test)]
+#[path = "../../tests/helpers/fake_lsp.rs"]
+mod approved_fake_lsp;
+
+#[cfg(test)]
+mod approved_lsp_tests {
+    use super::*;
+    use crate::lsp::client::LspEvent;
+    use crate::lsp::position::uri_for_path;
+    use crate::lsp::registry::ServerKind;
+
+    fn changed_contents(ctx: &AppContext, stage: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            for event in ctx.lsp().drain_events() {
+                if let LspEvent::Notification {
+                    method,
+                    params: Some(params),
+                    ..
+                } = event
+                {
+                    if method == "custom/documentChangedContents" {
+                        return params;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing documentChangedContents notification at {stage}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn open_document() -> (tempfile::TempDir, PathBuf, AppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"notifications\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let file = dir.path().join("src/main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let file = std::fs::canonicalize(file).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: true,
+                ..Default::default()
+            },
+        );
+        {
+            let mut manager = ctx.lsp();
+            manager.override_binary(ServerKind::Rust, approved_fake_lsp::fake_server_binary());
+            manager.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+            manager.set_extra_env("AFT_FAKE_LSP_ECHO_CHANGES", "1");
+            assert_eq!(
+                manager
+                    .ensure_file_open(&file, &ctx.config())
+                    .unwrap()
+                    .server_keys
+                    .len(),
+                1
+            );
+        }
+        (dir, file, ctx)
+    }
+
+    #[test]
+    fn ast_replace_notifies_final_unformatted_contents() {
+        let (_dir, file, ctx) = open_document();
+        let expected = "fn main(){let changed=1;}\n";
+        let req = serde_json::from_value(serde_json::json!({"id": "ast-notify", "command": "ast_replace", "pattern": "fn main() {}", "rewrite": "fn main(){let changed=1;}", "lang": "rust", "paths": [file], "dry_run": false})).unwrap();
+        let response = handle_ast_replace(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        let changed = changed_contents(&ctx, "post-write");
+        assert_eq!(
+            changed["textDocument"]["uri"],
+            uri_for_path(&file).unwrap().to_string()
+        );
+        assert_eq!(changed["textDocument"]["version"], 1);
+        assert_eq!(changed["contentChanges"][0]["text"], expected);
+    }
+
+    #[test]
+    fn ast_rollback_notifies_restored_contents() {
+        let (_dir, file, ctx) = open_document();
+        let after = "fn main(){let changed=1;}\n";
+        std::fs::write(&file, after).unwrap();
+        ctx.lsp_notify_file_changed(&file, after);
+        assert_eq!(
+            changed_contents(&ctx, "arrange")["contentChanges"][0]["text"],
+            after
+        );
+        assert!(
+            rollback_written_changes(&[(file.clone(), "fn main() {}\n".into())], None, &ctx)
+                .is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {}\n");
+        let restored = changed_contents(&ctx, "post-restore");
+        assert_eq!(
+            restored["textDocument"]["uri"],
+            uri_for_path(&file).unwrap().to_string()
+        );
+        assert_eq!(restored["textDocument"]["version"], 2);
+        assert_eq!(restored["contentChanges"][0]["text"], "fn main() {}\n");
+    }
+}
+
 fn rollback_written_changes(
     written_changes: &[(PathBuf, String)],
     attempted: Option<(&Path, &str)>,
+    ctx: &AppContext,
 ) -> Option<String> {
     let mut failures = Vec::new();
     if let Some((path, original)) = attempted {
         if let Err(e) = std::fs::write(path, original) {
             failures.push(format!("{}: {}", path.display(), e));
+        } else {
+            ctx.lsp_notify_file_changed(path, original);
         }
     }
     for (path, original) in written_changes.iter().rev() {
         if let Err(e) = std::fs::write(path, original) {
             failures.push(format!("{}: {}", path.display(), e));
+        } else {
+            ctx.lsp_notify_file_changed(path, original);
         }
     }
     (!failures.is_empty()).then(|| failures.join("; "))

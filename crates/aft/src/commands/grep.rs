@@ -28,6 +28,32 @@ pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
     "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
+#[cfg(test)]
+mod approved_contract_tests {
+    use super::*;
+
+    #[test]
+    fn grep_rejects_excessive_offset_before_pattern_compile() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for offset in [100001, u64::MAX] {
+            let req = serde_json::from_value(serde_json::json!({"id": "offset", "command": "grep", "pattern": "[", "offset": offset})).unwrap();
+            let response = handle_grep(&req, &ctx);
+            assert_eq!(
+                response.data["code"], "invalid_request",
+                "{:?}",
+                response.data
+            );
+        }
+        for offset in [0, 100000] {
+            let req = serde_json::from_value(serde_json::json!({"id": "offset", "command": "grep", "pattern": "[", "offset": offset})).unwrap();
+            assert_eq!(handle_grep(&req, &ctx).data["code"], "invalid_pattern");
+        }
+    }
+}
+
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     crate::bounded_io::command(req, ctx, handle_grep_inner)
 }
@@ -66,8 +92,15 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .params
         .get("offset")
         .and_then(|value| value.as_u64())
-        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
         .unwrap_or(0);
+    if offset > 100000 {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "grep: 'offset' must be at most 100000",
+        );
+    }
+    let offset = offset as usize;
     let max_results = offset.saturating_add(page_size);
 
     let compiled = match pattern_compile::compile(

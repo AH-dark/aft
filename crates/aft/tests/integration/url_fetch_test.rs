@@ -77,6 +77,8 @@ fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body
 
 fn configure_with_storage(project: &Path, storage: &Path) -> AftProcess {
     let mut aft = AftProcess::spawn();
+    // Loopback mock servers require trusted configuration permission;
+    // individual requests can still disable it.
     let resp = aft.send(
         &json!({
             "id": "cfg",
@@ -84,6 +86,7 @@ fn configure_with_storage(project: &Path, storage: &Path) -> AftProcess {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
+            "config": [super::helpers::user_config_tier(json!({"url_fetch_allow_private": true}))],
         })
         .to_string(),
     );
@@ -140,6 +143,7 @@ fn private_ip_blocked_at_fetch_time() {
             "id": "private",
             "command": "outline",
             "file": "http://127.0.0.1/foo",
+            "allow_private": false,
         })
         .to_string(),
     );
@@ -181,6 +185,7 @@ fn cache_hit_revalidates_ssrf() {
             "id": "revalidate",
             "command": "outline",
             "file": url,
+            "allow_private": false,
         })
         .to_string(),
     );
@@ -1101,6 +1106,7 @@ fn ipv4_mapped_ipv6_ssrf_blocked() {
                 "id": format!("block-{host}"),
                 "command": "outline",
                 "file": format!("http://{host}/doc.md"),
+                "allow_private": false,
             })
             .to_string(),
         );

@@ -224,14 +224,31 @@ fn apply_workspace_edit(
             Ok(changes)
         }
         Err(err) => {
-            rollback_rename(ctx, session, &rollback);
-            Err(Response::error(
+            let outcome = rollback_rename(ctx, session, &rollback);
+            Err(rename_failure_response(
                 req_id,
-                "lsp_error",
-                format!("rename failed: {err}"),
+                &err,
+                &rollback.checkpoint_name,
+                &outcome,
             ))
         }
     }
+}
+
+fn rename_failure_response(
+    req_id: &str,
+    error: &LspError,
+    checkpoint: &str,
+    outcome: &super::rollback_outcome::RollbackOutcome,
+) -> Response {
+    let mut data = serde_json::json!({});
+    outcome.append_to(&mut data, checkpoint);
+    Response::error_with_data(
+        req_id,
+        "lsp_error",
+        outcome.failure_message(&format!("rename failed: {error}"), checkpoint),
+        data,
+    )
 }
 
 fn collect_workspace_edit_changes(
@@ -380,15 +397,21 @@ fn snapshot_affected_files(
     })
 }
 
-fn rollback_rename(ctx: &AppContext, session: &str, rollback: &RenameRollback) {
+fn rollback_rename(
+    ctx: &AppContext,
+    session: &str,
+    rollback: &RenameRollback,
+) -> super::rollback_outcome::RollbackOutcome {
     let _view_intent =
         crate::views::intent::record_paths(rollback.files.iter().map(|path| path.as_path()));
-    let restored = ctx
+    let result = ctx
         .checkpoint()
         .lock()
         .restore(session, &rollback.checkpoint_name)
-        .is_ok();
-    if restored {
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    let outcome = super::rollback_outcome::RollbackOutcome::from_restore(result);
+    if outcome.complete() {
         ctx.backup()
             .lock()
             .discard_operation_entries(session, &rollback.op_id);
@@ -399,6 +422,7 @@ fn rollback_rename(ctx: &AppContext, session: &str, rollback: &RenameRollback) {
         }
         delete_rename_checkpoint(ctx, session, &rollback.checkpoint_name);
     }
+    outcome
 }
 
 fn delete_rename_checkpoint(ctx: &AppContext, session: &str, checkpoint_name: &str) {
@@ -696,4 +720,84 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
     }
 
     line.len()
+}
+
+#[cfg(test)]
+mod approved_rollback_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, AppContext, RenameRollback) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.ts");
+        std::fs::write(&file, "before").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let changes = BTreeMap::from([(file.clone(), Vec::new())]);
+        let rollback =
+            snapshot_affected_files(&changes, "rename-recovery", &ctx, "rename-operation").unwrap();
+        (dir, file, ctx, rollback)
+    }
+
+    #[test]
+    fn rename_restore_failure_is_reported_and_recovery_is_retained() {
+        let (_dir, file, ctx, rollback) = fixture();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let outcome = rollback_rename(&ctx, "rename-recovery", &rollback);
+        let response = rename_failure_response(
+            "rename",
+            &LspError::NotFound("apply failed".into()),
+            &rollback.checkpoint_name,
+            &outcome,
+        );
+        assert_eq!(response.data["rollback_complete"], false);
+        assert!(response.data["rollback_error"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()));
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("rollback incomplete"));
+        assert_eq!(
+            response.data["recovery_checkpoint"],
+            rollback.checkpoint_name
+        );
+        let retained = ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths("rename-recovery")
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&retained[0]).unwrap(),
+            std::fs::canonicalize(&file).unwrap()
+        );
+        std::fs::remove_dir(&file).unwrap();
+        ctx.checkpoint()
+            .lock()
+            .restore("rename-recovery", &rollback.checkpoint_name)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+    }
+
+    #[test]
+    fn complete_rename_rollback_preserves_error_text_and_discards_backups() {
+        let (_dir, file, ctx, rollback) = fixture();
+        std::fs::write(&file, "after").unwrap();
+        let outcome = rollback_rename(&ctx, "rename-recovery", &rollback);
+        let error = LspError::NotFound("apply failed".into());
+        let response =
+            rename_failure_response("rename", &error, &rollback.checkpoint_name, &outcome);
+        assert_eq!(response.data["rollback_complete"], true);
+        assert!(response.data.get("rollback_error").is_none());
+        assert_eq!(response.data["message"], format!("rename failed: {error}"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+        assert!(ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths("rename-recovery")
+            .is_err());
+    }
 }
