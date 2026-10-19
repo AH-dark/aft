@@ -157,8 +157,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const filesMode = coerceBoolean(args.files);
         const hasIncludeTests = !isEmptyParam(args.includeTests);
         const includeTests = coerceBoolean(args.includeTests);
-        // Forwarded even when this config does not offer it, so the engine
-        // refuses a stale `ref` by name instead of reading the working tree.
+        // Forward a caller's `ref` even while `revision_reads` is off and the
+        // schema does not offer it: the engine then refuses it by name instead
+        // of silently reading the working tree.
         const ref = revisionRefArg(args.ref);
         const rawArgs: Record<string, unknown> = {
           target,
@@ -277,6 +278,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       execute: async (args, context): Promise<ToolResult> => {
         if (!Array.isArray(args.batch) || args.batch.length === 0)
           throw new Error("'batch' must be a non-empty array of {target, symbols}");
+        // Forward unadvertised refs too, so the engine refuses stale calls
+        // instead of silently reading the working tree when revision_reads is off.
         const ref = revisionRefArg(args.ref);
         if (ref !== undefined && args.batch.some((entry) => isUrl(entry.target)))
           throw new Error("'ref' cannot be used with a URL target: a URL has no revision");

@@ -931,6 +931,28 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
+      "path": "crates/aft/src/subc_tool_revision_schemas.json",
+      "line": 6,
+      "column": 8,
+      "token": "filePath",
+      "text": "\"filePath\": {",
+      "location": "line 6, column 8",
+      "ordinal": 1,
+      "class": "compatibility-boundary",
+      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_revision_schemas.json",
+      "line": 40,
+      "column": 8,
+      "token": "filePath",
+      "text": "\"filePath\"",
+      "location": "line 40, column 8",
+      "ordinal": 1,
+      "class": "compatibility-boundary",
+      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
+    },
+    {
       "path": "crates/aft/src/subc_tool_schemas.json",
       "line": 170,
       "column": 8,

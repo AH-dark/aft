@@ -320,7 +320,9 @@ const RevisionRefParam = {
 
 /**
  * `params` with the `ref` (git revision) property added when this config
- * offers it. Read live each time the host asks, so a reload is reflected.
+ * offers it. Path-alias tools copy their definition when registered, so for
+ * them the offer is decided once, at registration; the engine still refuses a
+ * `ref` call by name if `revision_reads` is later turned off.
  */
 export function withRevisionRefParam<T extends TObject>(
   params: T,
@@ -686,8 +688,9 @@ export function registerHoistedTools(
           if (endLine !== undefined) rawArgs.endLine = endLine;
           if (offset !== undefined) rawArgs.offset = offset;
           if (limit !== undefined) rawArgs.limit = limit;
-          // Forwarded even when this config does not offer it, so the engine
-          // refuses a stale `ref` by name instead of reading the working tree.
+          // Forward a caller's `ref` even while `revision_reads` is off and the
+          // schema does not offer it: the engine then refuses it by name instead
+          // of silently reading the working tree.
           const ref = revisionRefArg((params as Record<string, unknown>).ref);
           if (ref !== undefined) rawArgs.ref = ref;
           const visionCapability = visionCapabilityForPiModel(extCtx);

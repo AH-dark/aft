@@ -2951,7 +2951,18 @@ mod tests {
                 }
             }
         }
-        let request = call("read", json!({"path": "src/a.rs", "ref": "main"}));
+        // Fill the read schema's required path argument under whatever name
+        // the catalog uses for it, then add `ref`.
+        let read = tools_for_session(CatalogPreset::Head, &[], true, false, true)
+            .into_iter()
+            .find(|tool| tool.name == "read")
+            .unwrap();
+        let mut arguments = serde_json::Map::new();
+        for name in read.input_schema["required"].as_array().unwrap() {
+            arguments.insert(name.as_str().unwrap().into(), json!("src/a.rs"));
+        }
+        arguments.insert("ref".into(), json!("main"));
+        let request = call("read", Value::Object(arguments));
         assert!(admit(&request, false, &[], true, "session", true).is_ok());
     }
 

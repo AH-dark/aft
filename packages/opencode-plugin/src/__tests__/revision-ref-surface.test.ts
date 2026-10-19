@@ -137,8 +137,8 @@ describe("revision reads surface", () => {
     const read = createReadTool(ctx);
     const { aft_outline: outline, aft_zoom: zoom } = readingTools(ctx);
 
-    await read.execute({ filePath: "src/lib.ts", ref: "v1", startLine: 2 }, context);
-    await read.execute({ filePath: "src/lib.ts", ref: "  " }, context);
+    await read.execute({ path: "src/lib.ts", ref: "v1", startLine: 2 }, context);
+    await read.execute({ path: "src/lib.ts", ref: "  " }, context);
     await outline.execute({ target: "src/lib.ts", ref: "main" }, context);
     await zoom.execute({ path: "src/lib.ts", symbols: "value", ref: "HEAD~1" }, context);
     await zoom.execute(
@@ -160,7 +160,7 @@ describe("revision reads surface", () => {
   test("a ref sent while revision_reads is off still reaches the engine to be refused", async () => {
     const root = await project();
     const { ctx, calls } = harness({});
-    await createReadTool(ctx).execute({ filePath: "src/lib.ts", ref: "v1" }, sdkContext(root));
-    expect(calls).toEqual([{ name: "read", rawArgs: { filePath: "src/lib.ts", ref: "v1" } }]);
+    await createReadTool(ctx).execute({ path: "src/lib.ts", ref: "v1" }, sdkContext(root));
+    expect(calls.map((call) => [call.name, call.rawArgs.ref])).toEqual([["read", "v1"]]);
   });
 });

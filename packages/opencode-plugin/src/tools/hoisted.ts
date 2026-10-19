@@ -498,8 +498,9 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         if (endLine !== undefined) rawArgs.endLine = endLine;
         if (offset !== undefined) rawArgs.offset = offset;
         if (limit !== undefined) rawArgs.limit = limit;
-        // Forwarded even when this config does not offer it, so the engine
-        // refuses a stale `ref` by name instead of reading the working tree.
+        // Forward a caller's `ref` even while `revision_reads` is off and the
+        // schema does not offer it: the engine then refuses it by name instead
+        // of silently reading the working tree.
         const ref = revisionRefArg(args.ref);
         if (ref !== undefined) rawArgs.ref = ref;
 

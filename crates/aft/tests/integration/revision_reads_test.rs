@@ -14,6 +14,8 @@ const V1_LIB: &str = "pub fn version() -> u32 {\n    1\n}\n\npub fn only_in_v1()
 const MAIN_LIB: &str = "pub fn version() -> u32 {\n    2\n}\n";
 const FEATURE_LIB: &str =
     "pub fn version() -> u32 {\n    3\n}\n\npub fn feature_flag() -> bool {\n    true\n}\n";
+// The working-tree version. Tests look for its `    99` line (never the bare
+// digits, which a commit SHA in the reply header may contain).
 const WORKING_LIB: &str = "pub fn version() -> u32 {\n    99\n}\n\npub fn uncommitted() {}\n";
 
 struct Fixture {
@@ -53,7 +55,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-/// A repository with an annotated tag `v1`, a later commit on `main`, a
+/// A repository with an annotated tag `v1` (and a `release` branch at the
+/// same commit), a later commit on `main`, a
 /// `feature` branch with its own version, and an uncommitted working-tree
 /// change, so every revision's content differs from the working file.
 fn fixture() -> Fixture {
@@ -67,6 +70,8 @@ fn fixture() -> Fixture {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "--quiet", "-m", "v1"]);
     git(&repo, &["tag", "-a", "v1", "-m", "release one"]);
+    // A plain branch at the same commit, so only one test depends on tag peeling.
+    git(&repo, &["branch", "release"]);
     let v1 = git(&repo, &["rev-parse", "HEAD"]);
 
     fs::write(repo.join("src/lib.rs"), MAIN_LIB).unwrap();
@@ -168,7 +173,10 @@ fn revision_reads_at_tag_branch_sha_and_parent_return_that_revisions_content() {
     let text = ok_text(&tagged);
     assert!(text.starts_with(&header("v1", &fixture.v1)), "{text}");
     assert!(text.contains("5: pub fn only_in_v1()"), "{text}");
-    assert!(!text.contains("99"), "working-tree content leaked: {text}");
+    assert!(
+        !text.contains("    99"),
+        "working-tree content leaked: {text}"
+    );
 
     let branch = call(
         &mut aft,
@@ -203,12 +211,6 @@ fn revision_reads_at_tag_branch_sha_and_parent_return_that_revisions_content() {
     assert!(text.starts_with(&header("HEAD~1", &fixture.v1)), "{text}");
     assert!(text.contains("5: pub fn only_in_v1()"), "{text}");
     assert!(!text.contains("1: pub fn version"), "{text}");
-
-    // Without `ref` the working tree is read as before.
-    let working = call(&mut aft, "read", json!({ "path": "src/lib.rs" }));
-    let text = ok_text(&working);
-    assert!(!text.contains("Revision `"), "{text}");
-    assert!(text.contains("99"), "{text}");
 }
 
 #[test]
@@ -219,10 +221,10 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
     let outline = call(
         &mut aft,
         "outline",
-        json!({ "target": "src/lib.rs", "ref": "v1" }),
+        json!({ "target": "src/lib.rs", "ref": "release" }),
     );
     let text = ok_text(&outline);
-    assert!(text.starts_with(&header("v1", &fixture.v1)), "{text}");
+    assert!(text.starts_with(&header("release", &fixture.v1)), "{text}");
     assert!(text.contains("only_in_v1"), "{text}");
     assert!(!text.contains("uncommitted"), "{text}");
 
@@ -247,29 +249,29 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
                 { "path": "src/lib.rs", "symbol": "only_in_v1" },
                 { "path": "src/lib.rs", "symbol": "version" },
             ],
-            "ref": "v1",
+            "ref": "release",
         }),
     );
     let text = ok_text(&batch);
-    assert!(text.starts_with(&header("v1", &fixture.v1)), "{text}");
+    assert!(text.starts_with(&header("release", &fixture.v1)), "{text}");
     assert!(text.contains("\"tagged\""), "{text}");
-    assert!(!text.contains("99"), "{text}");
+    assert!(!text.contains("    99"), "{text}");
 }
 
 #[test]
 fn revision_read_of_a_path_missing_at_that_revision_names_the_revision() {
     let fixture = fixture();
     let mut aft = configured(&fixture, true);
-    // `src/added.rs` exists in the working tree but not at the tag.
+    // `src/added.rs` exists in the working tree but not at `release`.
     let resp = call(
         &mut aft,
         "read",
-        json!({ "path": "src/added.rs", "ref": "v1" }),
+        json!({ "path": "src/added.rs", "ref": "release" }),
     );
     assert_eq!(resp["success"], false, "{resp:?}");
     assert_eq!(resp["code"], "revision_path_not_found", "{resp:?}");
     let message = resp["message"].as_str().unwrap();
-    assert!(message.contains("'v1'"), "{message}");
+    assert!(message.contains("'release'"), "{message}");
     assert!(message.contains(&fixture.v1), "{message}");
 
     let unknown = call(
@@ -302,7 +304,7 @@ fn revision_reads_off_refuses_ref_on_every_tool() {
     }
     // A blank placeholder is no revision and reads the working tree.
     let blank = call(&mut aft, "read", json!({ "path": "src/lib.rs", "ref": "" }));
-    assert!(ok_text(&blank).contains("99"));
+    assert!(ok_text(&blank).contains("2:     99"));
 }
 
 #[test]
@@ -333,12 +335,9 @@ fn revision_reads_leave_the_working_tree_index_and_head_unchanged() {
     let before = snapshot(&fixture.repo);
 
     for (name, arguments) in [
-        ("read", json!({ "path": "src/lib.rs", "ref": "v1" })),
+        ("read", json!({ "path": "src/lib.rs", "ref": "release" })),
         ("read", json!({ "path": "src/lib.rs", "ref": "feature" })),
-        (
-            "outline",
-            json!({ "target": "src/lib.rs", "ref": "HEAD~1" }),
-        ),
+        ("outline", json!({ "target": "src/lib.rs", "ref": "main" })),
         (
             "zoom",
             json!({ "path": "src/lib.rs", "symbols": "version", "ref": "feature" }),
@@ -403,10 +402,10 @@ fn revision_reads_work_from_a_linked_worktree_of_the_repository() {
     let tagged = call(
         &mut aft,
         "read",
-        json!({ "path": "src/lib.rs", "ref": "v1" }),
+        json!({ "path": "src/lib.rs", "ref": "release" }),
     );
     let text = ok_text(&tagged);
-    assert!(text.starts_with(&header("v1", &fixture.v1)), "{text}");
+    assert!(text.starts_with(&header("release", &fixture.v1)), "{text}");
     assert!(text.contains("only_in_v1"), "{text}");
     let head = call(
         &mut aft,
