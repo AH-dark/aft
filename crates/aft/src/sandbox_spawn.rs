@@ -1642,7 +1642,14 @@ fn build_native_profile(
         let mut write_deny_nested = Vec::new();
         let mut shell_write_deny = Vec::new();
         let mut shell_read_deny = Vec::new();
-        let mut control_roots = project_roots.clone();
+        let jailed = worker_jail_active();
+        // Ordinary sessions retain writable project Git configuration; jailed
+        // workers and delegated write roots must not change execution controls.
+        let mut control_roots = if jailed {
+            project_roots.clone()
+        } else {
+            Vec::new()
+        };
         control_roots.extend(policy.shell_grants(crate::access_policy::AccessOperation::Write));
         control_roots.sort_unstable();
         control_roots.dedup();
@@ -1650,7 +1657,6 @@ fn build_native_profile(
             let git = resolve_git_policy(root)?;
             write_deny_nested.extend(checkout_control_denies(root, &git)?);
         }
-        let jailed = worker_jail_active();
         #[cfg(target_os = "macos")]
         if jailed {
             install_worker_mktemp(&temp_dir)?;

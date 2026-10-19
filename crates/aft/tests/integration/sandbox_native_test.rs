@@ -944,6 +944,22 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_sandbox_non_worker_strict_project_git_config_remains_writable() {
+    let mut fixture = CortexkitFloorFixture::new();
+    let response = foreground(
+        &mut fixture.aft,
+        "ordinary-project-git-config",
+        "git init -q --template= && printf '\n# ordinary-project-metadata\n' >> .git/config",
+    );
+    assert_eq!(response["status"], "completed", "{response:?}");
+    assert!(std::fs::read_to_string(fixture.project.join(".git/config"))
+        .unwrap()
+        .contains("# ordinary-project-metadata"));
+    assert!(fixture.aft.shutdown().success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_macos() {
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
