@@ -1535,6 +1535,15 @@ console.log("[load-matrix-host:v2] resolvedEntry=" + entrypoints.server + " sele
 async function writeV2LifecycleProbe(hostRoot: string): Promise<string> {
   const probe = join(hostRoot, "core-loader-lifecycle.mjs");
   const bridgeModule = pathToFileURL(join(repoRoot, "packages/aft-bridge/dist/index.js")).href;
+  // Resolve the fixture's runtime imports from the pinned host install, just
+  // like the probe, rather than mixing its Effect runtime with the checkout's.
+  await writeFile(
+    join(hostRoot, "permission-host.mjs"),
+    ts.transpileModule(
+      await readFile(join(pluginRoot, "src/__tests__/v2-permission-host.ts"), "utf8"),
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ESNext } },
+    ).outputText,
+  );
   await writeFile(
     probe,
     `
@@ -1552,6 +1561,7 @@ import {
   getBridgeLifecycleTopology,
   sampleBridgeLifecycleCensus,
 } from ${JSON.stringify(bridgeModule)};
+import { permissionHost } from "./permission-host.mjs";
 
 const packageRoot = process.argv[2];
 const directory = process.argv[3];
@@ -1589,11 +1599,8 @@ if (loaded.pending) throw new Error("host loader returned pending");
 const entrypoints = Host.resolve(installed);
 
 function permissionRules() {
-  // Mirrors OpenCode's own starting ruleset plus three explicit rows, so the
-  // probe can exercise an allowed tool, a denied one, and one the rules leave
-  // to the host's assertion. The denied rows start with "*" because
-  // "edit" states the project-relative path while "aft_delete" states an
-  // absolute one, and one rule has to cover both spellings.
+  // The fixture host handles allow, deny, and ask; explicit rules override
+  // the leading allow-everything rule just as they do in OpenCode.
   return [
     { action: "*", resource: "*", effect: "allow" },
     { action: "read", resource: "*.env", effect: "ask" },
@@ -1611,7 +1618,8 @@ function locationContext(id) {
   let rpcDisposals = 0;
   const agentReads = [];
   const sessionReads = [];
-  const permissionAsserts = [];
+  const permissions = permissionHost({ agentRules: permissionRules() });
+  const permissionAsserts = permissions.calls;
   return {
     tools,
     rpcRegistrations,
@@ -1647,7 +1655,7 @@ function locationContext(id) {
         get: () => Effect.succeed(undefined),
         reply: () => Effect.void,
         rules: () => Effect.void,
-        assert: (input) => Effect.sync(() => permissionAsserts.push(input)),
+        assert: permissions.host.permission.assert,
       },
       tool: {
         transform: (register) => Effect.sync(() => register({
@@ -1695,6 +1703,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       {
         sessionID: "lifecycle-" + index,
         messageID: "message-" + index,
+        id: "outline-" + index,
         agent: "load-matrix",
         progress: () => Effect.succeed(undefined),
       },
@@ -1748,7 +1757,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     progress: () => Effect.succeed(undefined),
   });
 
-  // A rule that allows the action must let the tool run, with no prompt.
+  // The host must authorize even allowed calls before they reach the filesystem.
   yield* edit.execute(
     { path: editPath, edits: [{ oldString: "old", newString: "new" }] },
     permissionContext("edit-allowed"),
@@ -1762,12 +1771,19 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   }
   appendFileSync(marker, "permission-gated:allowed:edit,read\\n");
 
-  if (first.permissionAsserts.length !== 0) {
-    throw new Error("an allowed tool call unexpectedly reached permission.assert");
-  }
+  const expectAssertion = (id, action, path) => {
+    const calls = first.permissionAsserts.filter((input) => input.source?.id === id);
+    if (calls.length !== 1 || calls[0].action !== action || !calls[0].resources.includes(path.replaceAll("\\\\", "/"))) {
+      throw new Error("tool call did not reach permission.assert exactly once with its resource: " +
+        JSON.stringify({ id, action, path, calls }));
+    }
+    appendFileSync(marker, "permission-assert:" + id + ":once\\n");
+  };
+  expectAssertion("edit-allowed", "edit", relative(directory, editPath));
+  expectAssertion("read-allowed", "read", relative(directory, readPath));
 
-  // Every denial has to reach the caller as a failed call whose text is the
-  // rendered sentence, not a successful JSON envelope.
+  // Every host denial must reach the caller as a failed call, not a successful
+  // JSON envelope.
   const settle = (label, effect) =>
     Effect.match(effect, {
       onSuccess: (value) => {
@@ -1787,6 +1803,8 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       permissionContext("delete-denied"),
     )),
   };
+  expectAssertion("edit-denied", "edit", relative(directory, deniedEditPath));
+  expectAssertion("delete-denied", "edit", relative(directory, deniedDeletePath));
   for (const [label, failure] of Object.entries(refusals)) {
     const text = String(failure?.message ?? failure);
     if (text.includes('"success"') || text.trimStart().startsWith("{")) {
@@ -1804,29 +1822,19 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   if (!String(askedRead.content).includes("TOKEN=1")) {
     throw new Error("GA permission.assert allow did not serve the asked read");
   }
-  if (
-    first.permissionAsserts.length !== 1 ||
-    first.permissionAsserts[0]?.action !== "read" ||
-    !first.permissionAsserts[0]?.resources.some((resource) => resource.endsWith("permission-read.env"))
-  ) {
-    throw new Error(
-      "the ask did not reach permission.assert exactly once with its resource: " +
-        JSON.stringify(first.permissionAsserts),
-    );
-  }
-  appendFileSync(marker, "permission-assert:read-ask:once\\n");
+  expectAssertion("read-ask", "read", relative(directory, secretPath));
   if (
     readFileSync(deniedEditPath, "utf8") !== "keep me\\n" ||
     readFileSync(deniedDeletePath, "utf8") !== "keep me\\n"
   ) {
     throw new Error("GA permission refusal allowed a filesystem mutation");
   }
-  if (first.agentReads.length === 0 || first.sessionReads.length === 0) {
-    throw new Error("GA permission evaluation did not read the host's configured rules");
+  if (first.agentReads.length !== 0) {
+    throw new Error("AFT read agent rules instead of delegating permission decisions to the host");
   }
   appendFileSync(
     marker,
-    "permission-api:evaluated:domain=agent.get,session.get;assert=read-ask\\n",
+    "permission-api:delegated:domain=permission.assert;assert=allow,deny,ask\\n",
   );
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
@@ -1866,6 +1874,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     {
       sessionID: "lifecycle-reload",
       messageID: "message-reload",
+      id: "outline-reload",
       agent: "load-matrix",
       progress: () => Effect.succeed(undefined),
     },
@@ -2526,12 +2535,14 @@ export default { id: original.id, effect };
     console.log(`[v2-tool-evidence]\n${toolEvidence.join("\n")}`);
     expect(abortEvidence).toEqual(["abort-path:rule_denied:refused_before_process"]);
     expect(wakeEvidence).toEqual(["idle-wake:rule_denied:refused_before_background_start"]);
-    // A gated tool the rules allow must complete, and every refusal must arrive
-    // as rendered text naming its real cause.
+    // Allowed and denied calls both consult the host; only allowed calls may
+    // reach the filesystem, and host refusals remain failed calls.
     expect(permissionEvidence).toContain("permission-gated:allowed:edit,read");
-    expect(permissionEvidence).toContain("permission-assert:read-ask:once");
+    for (const id of ["edit-allowed", "read-allowed", "edit-denied", "delete-denied", "read-ask"]) {
+      expect(permissionEvidence).toContain(`permission-assert:${id}:once`);
+    }
     expect(permissionEvidence).toContain(
-      "permission-api:evaluated:domain=agent.get,session.get;assert=read-ask",
+      "permission-api:delegated:domain=permission.assert;assert=allow,deny,ask",
     );
     const refusals = permissionEvidence.filter((line) => line.startsWith("permission-refusal:"));
     expect(refusals.map((line) => line.split(":")[1]).sort()).toEqual([
