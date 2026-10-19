@@ -199,6 +199,9 @@ type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod access_grants;
 mod bash;
+// The grant tests run real shell commands, which need a POSIX shell.
+#[cfg(all(test, unix))]
+mod bash_grant_tests;
 #[cfg(test)]
 mod bash_selector_tests;
 mod consent;
