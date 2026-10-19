@@ -493,7 +493,8 @@ fn codemode_same_agent_on_a_head_under_another_scope_is_not_the_runs_head() {
     assert_eq!(refusal_reason(&f), "head_route_not_bound");
 }
 
-/// A second agent-a head route on channel 3, otherwise like channel 1.
+/// A second agent-a head route on channel 3, otherwise like channel 1. Its
+/// principal carries its own channel and epoch, as every production bind does.
 fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: BindTrust) {
     let mut identity = crate::subc::test_support::route_identity_with_trust(root, session, trust);
     {
@@ -502,6 +503,15 @@ fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: Bind
         data.project_root = primary.project_root.clone();
         data.harness = primary.harness.clone();
         data.spawn_principal = primary.spawn_principal.clone();
+        if let AuthenticatedPrincipal::RouteBind {
+            route_channel,
+            route_epoch,
+            ..
+        } = &mut data.spawn_principal
+        {
+            *route_channel = 3;
+            *route_epoch += 1;
+        }
         data.consumer_elicitation_capable = primary.consumer_elicitation_capable;
         data.disabled_tools = Arc::clone(&primary.disabled_tools);
         data.scope = Some(head_stamp("head-a", "agent-a"));

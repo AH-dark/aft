@@ -250,7 +250,7 @@ fn resolve_owner(
             || other.harness != head.harness
             || other.session != head.session
             || other.trust != head.trust
-            || other.spawn_principal != head.spawn_principal
+            || !same_principal_access(&other.spawn_principal, &head.spawn_principal)
             || other.consumer_elicitation_capable != head.consumer_elicitation_capable
             || other.disabled_tools != head.disabled_tools
     }) {
@@ -262,6 +262,41 @@ fn resolve_owner(
         ));
     }
     Ok(effective_identity(run, head, agent_id, run_id, route))
+}
+
+/// Whether two head routes' sandbox principals grant the same access. Each route
+/// bind stamps its own channel and epoch into the principal, so those two fields
+/// differ between any two routes of one head and are not access settings.
+fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal) -> bool {
+    match (a, b) {
+        (
+            AuthenticatedPrincipal::RouteBind {
+                trust: a_trust,
+                project_root: a_root,
+                harness: a_harness,
+                session_id: a_session,
+                principal_id: a_principal,
+                route_channel: _,
+                route_epoch: _,
+            },
+            AuthenticatedPrincipal::RouteBind {
+                trust: b_trust,
+                project_root: b_root,
+                harness: b_harness,
+                session_id: b_session,
+                principal_id: b_principal,
+                route_channel: _,
+                route_epoch: _,
+            },
+        ) => {
+            a_trust == b_trust
+                && a_root == b_root
+                && a_harness == b_harness
+                && a_session == b_session
+                && a_principal == b_principal
+        }
+        _ => a == b,
+    }
 }
 
 /// The identity a codemode call runs under. Root, session, harness, trust,

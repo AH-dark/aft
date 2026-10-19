@@ -5982,6 +5982,7 @@ mod grant_path_tests {
                     run_scope: None,
                     scope: None,
                     late_results: false,
+                    ledger_carrier: None,
                     connection: PersistentCancelSignal::new(),
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
