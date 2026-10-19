@@ -6383,6 +6383,25 @@ pub(crate) fn open_database_runtime(
         ));
 
     let db_path = storage_root.join("aft.db");
+    // Hold deferred migration in conformance tests until the caller releases it.
+    // The marker proves the bind replied while persistence was still opening.
+    #[cfg(debug_assertions)]
+    if mode == crate::db::OpenMode::Deferred {
+        if let Some(gate) = std::env::var_os("AFT_TEST_DATABASE_OPEN_GATE").map(PathBuf::from) {
+            if gate.exists() {
+                std::fs::write(gate.with_extension("entered"), b"opening").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while gate.exists() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "database open test gate was not released: {}",
+                        gate.display()
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
     // In debug builds, optionally delay opening the database to exercise readiness handling.
     #[cfg(debug_assertions)]
     if let Some(delay_ms) = std::env::var("AFT_TEST_DATABASE_OPEN_DELAY_MS")
