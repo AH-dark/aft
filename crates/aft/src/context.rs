@@ -13092,8 +13092,27 @@ impl AppContext {
         #[cfg(test)]
         confinement::note_ask();
         use crate::access_policy::{AskRoute, GrantKind};
-        let AskRoute::Consent { once } = crate::access_policy::current_ask_route() else {
-            return Ok(());
+        let once = match crate::access_policy::current_ask_route() {
+            AskRoute::Lowered => return Ok(()),
+            AskRoute::Unavailable => {
+                return Err(crate::protocol::Response::error_with_data(
+                    req_id,
+                    crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
+                    format!(
+                        "{} access to '{}' needs permission, and a codemode program can't ask for it",
+                        match operation {
+                            crate::access_policy::AccessOperation::Read => "read",
+                            crate::access_policy::AccessOperation::Write => "write",
+                        },
+                        original.display()
+                    ),
+                    serde_json::json!({
+                        "permission": operation,
+                        "resource": identity,
+                    }),
+                ));
+            }
+            AskRoute::Consent { once } => once,
         };
         if once.iter().any(|grant| grant.covers(operation, identity)) {
             return Ok(());

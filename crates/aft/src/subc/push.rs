@@ -1161,6 +1161,7 @@ mod tests {
                 call_mode: subc_protocol::call_mode::CallMode::Classic,
                 scope: None,
                 made_tool_call: AtomicBool::new(false),
+                run_owner: None,
             })),
         );
         let mut root_channels = HashMap::new();

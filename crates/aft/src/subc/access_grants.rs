@@ -37,6 +37,11 @@ pub(super) fn scope_key(identity: &RouteIdentity) -> ScopeKey {
 /// grant checks on the attested parent identity instead of copying grants into
 /// the run, so revocation remains effective and ending a run retains agent grants.
 pub(super) fn policy_scope_key(identity: &RouteIdentity) -> ScopeKey {
+    // A codemode call runs on its head agent's policy, read from the head
+    // agent's own route exactly as the head's direct calls read it.
+    if let Some(owner) = identity.run_owner.as_ref() {
+        return scope_key(&owner.head);
+    }
     if let Some(stamp) = identity
         .scope
         .as_ref()
@@ -266,6 +271,10 @@ pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
 /// runs carry no parent, so a parented run is a worker's run and is judged as
 /// that worker.
 pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
+    // A codemode call acts for a head agent, never as a worker.
+    if identity.run_owner.is_some() {
+        return false;
+    }
     identity.scope.as_ref().is_some_and(|stamp| {
         alfonso(stamp)
             && match stamp.kind {
@@ -280,6 +289,11 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 /// to Cingulate, the consent service, never to a plugin prompt. Other routes
 /// retain compatibility behavior: an outside-root ask is treated as allow.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
+    // No path yet carries a codemode call's question to the head agent's
+    // user, so such a call is refused rather than asked or allowed.
+    if identity.run_owner.is_some() {
+        return crate::access_policy::AskRoute::Unavailable;
+    }
     if identity.scope.as_ref().is_some_and(alfonso) {
         crate::access_policy::AskRoute::Consent { once: Vec::new() }
     } else {

@@ -947,6 +947,60 @@ mod unanswered_deadline_tests {
     }
 }
 
+/// A codemode program's shell call that would need the user's approval
+/// (a scanned permission or a host escalation) is refused by name: nobody can
+/// be asked on the head agent's behalf from a run route yet.
+fn refuse_run_permission_ask(response: Response, run_scoped: bool) -> Response {
+    if !run_scoped
+        || response.success
+        || response.data.get("code").and_then(Value::as_str)
+            != Some(crate::protocol::ERROR_PERMISSION_REQUIRED)
+    {
+        return response;
+    }
+    Response::error_with_data(
+        &response.id,
+        crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
+        "this shell command needs permission, and a codemode program can't ask for it",
+        json!({
+            "permission": "bash",
+            "resource": response.data.get("asks").cloned().unwrap_or(Value::Null),
+        }),
+    )
+}
+
+#[cfg(test)]
+mod run_permission_tests {
+    use super::*;
+
+    fn permission_required() -> Response {
+        Response::error_with_data(
+            "run-shell",
+            crate::protocol::ERROR_PERMISSION_REQUIRED,
+            "bash command requires permission",
+            json!({"asks": [{"kind": "escalation", "command": "make"}]}),
+        )
+    }
+
+    #[test]
+    fn run_shell_permission_ask_is_refused_permission_ask_unavailable() {
+        let refused = refuse_run_permission_ask(permission_required(), true);
+        assert!(!refused.success);
+        assert_eq!(refused.data["code"], "permission_ask_unavailable");
+        assert_eq!(refused.data["permission"], "bash");
+        assert_eq!(
+            refused.data["resource"],
+            json!([{"kind": "escalation", "command": "make"}])
+        );
+        // The head's direct call keeps its ordinary approval request.
+        let direct = refuse_run_permission_ask(permission_required(), false);
+        assert_eq!(
+            direct.data["code"],
+            crate::protocol::ERROR_PERMISSION_REQUIRED
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_deferred_bash(
     executor: &Arc<Executor>,
@@ -1290,6 +1344,7 @@ pub(super) fn submit_deferred_bash(
                                                                   let response = run_dispatch();
                                                                   #[cfg(test)]
                                                                   let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), run_dispatch);
+                                                                  let response = refuse_run_permission_ask(response, run_scoped);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
                                                                   if let Some(scope) = &scope_stamp {

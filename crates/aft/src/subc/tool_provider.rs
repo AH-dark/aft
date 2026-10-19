@@ -3871,6 +3871,7 @@ mod route_tests {
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         exchange_with_actor(body, identity, ctx, metrics, |request, _| {
             ACTIONS.fetch_add(1, Ordering::SeqCst);
@@ -4328,6 +4329,7 @@ mod route_tests {
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         // Wait on filesystem evidence, not on the command's completion. The
         // old AFT process has exited while the detached shell keeps writing.
@@ -4812,6 +4814,7 @@ mod route_tests {
             run_scope: OnceLock::new(),
             call_mode,
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         (project, storage, ctx, identity)
     }

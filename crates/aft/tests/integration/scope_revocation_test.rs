@@ -75,21 +75,54 @@ async fn assert_scope_kill_settled() {
     }
 }
 
+const PREFRONTAL: &str = "prefrontal-core";
+
+/// The head scope a run is opened under: core opens runs only for heads, and
+/// a head's scope carries its agent's id.
+fn head_stamp(agent: &str) -> subc_protocol::scope::ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind":"reserved", "module_id":PREFRONTAL},
+        "ref":"head-scope", "scope_epoch":1, "kind":"head",
+        "attributes":{"agent_id":agent},
+        "owner_authorized":true
+    }))
+    .unwrap()
+}
+
 fn stamp() -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+        "owner": {"kind":"reserved", "module_id":PREFRONTAL},
         "ref":"run-scope", "scope_epoch":1, "kind":"ephemeral",
         "attributes":{"agent_id":"agent-a", "run_id":"run-a"},
+        "parent": {"owner": {"kind":"reserved", "module_id":PREFRONTAL}, "ref":"head-scope", "scope_epoch":1},
+        "parent_state":"linked",
         "owner_authorized":true,
         "expires_at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 30000
     }))
     .unwrap()
 }
 
+/// Bind the head route a codemode run acts for, on its own channel.
+async fn bind_head(stream: &mut tokio::net::TcpStream, root: &Path, channel: u16, session: &str) {
+    bind_mode_as(
+        stream,
+        root,
+        channel,
+        Some(subc_protocol::call_mode::CallMode::Classic),
+        Some(head_stamp("agent-a")),
+        session,
+    )
+    .await;
+}
+
 async fn bind(stream: &mut tokio::net::TcpStream, root: &Path, channel: u16, run: bool) {
     let mut scope = stamp();
     if !run {
         scope.attributes.run_id = None;
+    } else {
+        // A run's calls act for its head; the head shares the session so
+        // the tasks these tests observe stay where they look for them.
+        bind_head(stream, root, channel + 100, "run-session").await;
     }
     bind_mode(
         stream,
@@ -112,23 +145,36 @@ async fn bind_mode(
     mode: Option<subc_protocol::call_mode::CallMode>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
 ) {
+    bind_mode_as(stream, root, channel, mode, scope, "run-session").await;
+}
+
+async fn bind_mode_as(
+    stream: &mut tokio::net::TcpStream,
+    root: &Path,
+    channel: u16,
+    mode: Option<subc_protocol::call_mode::CallMode>,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    session: &str,
+) {
     let config_path = root.join(".cortexkit/aft.jsonc");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        config_path,
-        serde_json::to_vec(&json!({
-            "bash":{"foreground_wait_window_ms":10}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    if !config_path.exists() {
+        std::fs::write(
+            config_path,
+            serde_json::to_vec(&json!({
+                "bash":{"foreground_wait_window_ms":10}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
     let body = ModuleControlRequest::RouteBind {
         route_channel: channel,
         epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".into(),
         },
-        identity: BindIdentity::new(root, "opencode", "run-session"),
+        identity: BindIdentity::new(root, "opencode", session),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
@@ -278,6 +324,7 @@ fn codemode_bash_refuses_missing_bind_deadline() {
         |input| async move {
             let mut daemon = open_scope_daemon_session(input).await;
             let scope = stamp().with_expires_at_ms(None);
+            bind_head(&mut daemon.stream, &daemon.root1, 101, "run-session").await;
             bind_mode(
                 &mut daemon.stream,
                 &daemon.root1,
@@ -330,6 +377,7 @@ fn codemode_bash_clamps_requested_timeout_to_bind_deadline() {
                     .as_millis() as u64
                     + 5000,
             );
+            bind_head(&mut daemon.stream, &daemon.root1, 101, "run-session").await;
             bind_mode(
                 &mut daemon.stream,
                 &daemon.root1,
@@ -1147,4 +1195,283 @@ fn scope_revocation_record_timeout_refuses_without_blocking_frames() {
 #[test]
 fn scope_revocation_three_inconclusive_then_ended_kills_group() {
     close_case("scope-slow-owner-resync", CloseCase::SlowResync);
+}
+
+fn reply_json(frame: &Frame) -> Value {
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+fn reply_text(frame: &Frame) -> String {
+    reply_json(frame)["content"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// A tool response's native error code, from `structuredContent`.
+fn reply_code(frame: &Frame) -> String {
+    reply_json(frame)["structuredContent"]["code"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned()
+}
+
+async fn expect_refusal(stream: &mut tokio::net::TcpStream, label: &str) -> ErrorBody {
+    let reply = read_frame_timeout(stream, label).await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Error,
+        "{label}: {}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+/// Bind a run route on `channel` with `scope`, in its own session and root.
+async fn bind_run(
+    stream: &mut tokio::net::TcpStream,
+    root: &Path,
+    channel: u16,
+    scope: subc_protocol::scope::ScopeStamp,
+) {
+    bind_mode_as(
+        stream,
+        root,
+        channel,
+        Some(subc_protocol::call_mode::CallMode::Codemode),
+        Some(scope),
+        "program-session",
+    )
+    .await;
+}
+
+#[test]
+fn codemode_run_owner_not_bound_without_matching_live_head_route() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-owner-not-bound",
+        Duration::from_secs(30),
+        |input| async move {
+            let mut daemon = open_scope_daemon_session(input).await;
+            std::fs::write(daemon.root1.join("owned.txt"), "head-owned").unwrap();
+            let read = json!({"path": daemon.root1.join("owned.txt")});
+            bind_run(&mut daemon.stream, &daemon.root2, 1, stamp()).await;
+            // No head route is bound at all.
+            named_call(&mut daemon.stream, 1, 100, "read", read.clone()).await;
+            let error = expect_refusal(&mut daemon.stream, "no head route").await;
+            assert_eq!(error.code, "run_owner_not_bound");
+            assert_eq!(
+                error.detail.as_ref().unwrap()["reason"],
+                "head_route_not_bound"
+            );
+            // A run on another agent is not served by this head's route.
+            bind_head(&mut daemon.stream, &daemon.root1, 3, "head-session").await;
+            let mut other_agent = stamp();
+            other_agent.scope_ref = "run-scope-z".into();
+            other_agent.attributes.agent_id = Some("agent-z".into());
+            other_agent.attributes.run_id = Some("run-z".into());
+            bind_run(&mut daemon.stream, &daemon.root2, 2, other_agent).await;
+            named_call(&mut daemon.stream, 2, 101, "read", read.clone()).await;
+            let error = expect_refusal(&mut daemon.stream, "mismatched agent").await;
+            assert_eq!(error.code, "run_owner_not_bound");
+            assert_eq!(error.detail.as_ref().unwrap()["reason"], "agent_mismatch");
+            // A run whose parent link has ended serves no new call even
+            // though a matching head route is live.
+            let mut ended = stamp();
+            ended.scope_ref = "run-scope-ended".into();
+            ended.parent_state = Some(subc_protocol::scope::ParentState::Ended);
+            bind_run(&mut daemon.stream, &daemon.root2, 4, ended).await;
+            named_call(&mut daemon.stream, 4, 102, "read", read.clone()).await;
+            let error = expect_refusal(&mut daemon.stream, "ended parent").await;
+            assert_eq!(error.code, "run_owner_not_bound");
+            assert_eq!(error.detail.as_ref().unwrap()["reason"], "parent_ended");
+            // Control: the linked run with its agent's head route is served.
+            named_call(&mut daemon.stream, 1, 103, "read", read).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "owned read").await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            assert!(reply_text(&reply).contains("head-owned"));
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        bridge_dispatch,
+    );
+}
+
+/// Runs the real `configure`, so the project and user config files decide the
+/// head's policy; every other command goes to the shared bridge stand-in.
+fn configured_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.command == "configure" {
+        return aft::commands::configure::handle_configure(&req, ctx);
+    }
+    bridge_dispatch(req, ctx)
+}
+
+/// Project config with the index builders off, merged with `extra`.
+fn write_project_config(root: &Path, extra: Value) {
+    let mut doc = json!({
+        "bash": {"foreground_wait_window_ms": 10},
+        "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        match (doc.get_mut(key), value) {
+            (Some(Value::Object(existing)), Value::Object(add)) => {
+                existing.extend(add.clone());
+            }
+            _ => {
+                doc[key] = value.clone();
+            }
+        }
+    }
+    std::fs::create_dir_all(root.join(".cortexkit")).unwrap();
+    std::fs::write(
+        root.join(".cortexkit/aft.jsonc"),
+        serde_json::to_vec(&doc).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn codemode_path_outside_head_root_or_denied_by_head_policy_is_refused() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-head-policy",
+        Duration::from_secs(30),
+        |input| async move {
+            // The head restricts itself to its root and denies one path in it.
+            std::fs::write(
+                &input.user_config_path,
+                serde_json::to_vec(&json!({"restrict_to_project_root": true})).unwrap(),
+            )
+            .unwrap();
+            let mut daemon = open_scope_daemon_session(input).await;
+            let secret = daemon.root1.join("secret.txt");
+            write_project_config(&daemon.root1, json!({"sandbox": {"read_deny": [&secret]}}));
+            write_project_config(&daemon.root2, json!({}));
+            std::fs::write(daemon.root1.join("inside.txt"), "inside-head-root").unwrap();
+            std::fs::write(&secret, "denied-by-head-policy").unwrap();
+            std::fs::write(daemon.root2.join("program.txt"), "program-root-file").unwrap();
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            // The run's own bind names root2; that is configuration, not authority.
+            bind_run(&mut daemon.stream, &daemon.root2, 2, stamp()).await;
+            named_call(
+                &mut daemon.stream,
+                2,
+                100,
+                "read",
+                json!({"path": daemon.root1.join("inside.txt")}),
+            )
+            .await;
+            let reply = read_frame_timeout(&mut daemon.stream, "inside read").await;
+            assert!(
+                reply_text(&reply).contains("inside-head-root"),
+                "{}",
+                reply_text(&reply)
+            );
+            named_call(
+                &mut daemon.stream,
+                2,
+                101,
+                "read",
+                json!({"path": daemon.root2.join("program.txt")}),
+            )
+            .await;
+            let reply = read_frame_timeout(&mut daemon.stream, "outside head root").await;
+            assert!(
+                !reply_text(&reply).contains("program-root-file"),
+                "{}",
+                reply_text(&reply)
+            );
+            assert_eq!(
+                reply_code(&reply),
+                "path_outside_root",
+                "{}",
+                reply_text(&reply)
+            );
+            named_call(&mut daemon.stream, 2, 102, "read", json!({"path": &secret})).await;
+            let reply = read_frame_timeout(&mut daemon.stream, "denied path").await;
+            assert!(
+                !reply_text(&reply).contains("denied-by-head-policy"),
+                "{}",
+                reply_text(&reply)
+            );
+            assert_eq!(reply_code(&reply), "denied_floor", "{}", reply_text(&reply));
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        configured_dispatch,
+    );
+}
+
+#[test]
+fn codemode_call_needing_an_ask_is_refused_permission_ask_unavailable() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-ask-refused",
+        Duration::from_secs(30),
+        |input| async move {
+            let mut daemon = open_scope_daemon_session(input).await;
+            write_project_config(&daemon.root1, json!({}));
+            write_project_config(&daemon.root2, json!({}));
+            std::fs::write(daemon.root2.join("outside.txt"), "needs-an-ask").unwrap();
+            bind_head(&mut daemon.stream, &daemon.root1, 1, "head-session").await;
+            // The head chose ask mode, so a path outside its root asks.
+            send_frame(
+                &mut daemon.stream,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    1,
+                    1,
+                    99,
+                    serde_json::to_vec(
+                        &json!({"op":"tool.catalog", "preset":"head", "params":{"mode":"ask"}}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let catalog = read_frame_timeout(&mut daemon.stream, "head catalog").await;
+            assert_eq!(
+                catalog.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&catalog.body)
+            );
+            bind_run(&mut daemon.stream, &daemon.root2, 2, stamp()).await;
+            let outside = daemon.root2.join("outside.txt");
+            named_call(
+                &mut daemon.stream,
+                2,
+                100,
+                "read",
+                json!({"path": &outside}),
+            )
+            .await;
+            let reply = read_frame_timeout(&mut daemon.stream, "ask refusal").await;
+            assert!(
+                !reply_text(&reply).contains("needs-an-ask"),
+                "{}",
+                reply_text(&reply)
+            );
+            assert_eq!(
+                reply_code(&reply),
+                "permission_ask_unavailable",
+                "{}",
+                reply_text(&reply)
+            );
+            let data = &reply_json(&reply)["structuredContent"];
+            assert_eq!(data["permission"], "read", "{data}");
+            assert!(
+                data["resource"].as_str().unwrap().ends_with("outside.txt"),
+                "{data}"
+            );
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        configured_dispatch,
+    );
 }

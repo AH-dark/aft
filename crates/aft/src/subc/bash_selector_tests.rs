@@ -30,6 +30,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }));
     let routes = HashMap::from([(route_key(41, 1), identity)]);
     // The bash tool runs PowerShell on Windows, where `printf` does not exist.
@@ -153,6 +154,7 @@ async fn route_bash(
         call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }));
     let routes = HashMap::from([(route_key(41, 1), identity)]);
     let frame = Frame::build(
@@ -395,6 +397,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }));
     let mut call = json!({"name":"bash","arguments":{
         "command":"sleep 30; printf completed", "wait":true, "timeout":120_000
