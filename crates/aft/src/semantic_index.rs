@@ -6,7 +6,9 @@ use crate::config::{
 use crate::context::SemanticIndexStatus;
 use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, parse_source_with_cached_parser};
-use crate::search_index::{cache_relative_path, cached_path_under_root};
+use crate::search_index::{
+    cache_relative_path, cached_path_under_root_with_memo, ParentCanonicalizationMemo,
+};
 use crate::symbols::{Symbol, SymbolKind};
 use crate::synapse_embed::SynapseEmbeddingClient;
 use crate::{slog_info, slog_warn};
@@ -8412,6 +8414,7 @@ impl SemanticIndex {
         current_canonical_root: &Path,
         base_fingerprint: Option<&SemanticIndexFingerprint>,
         base_dimension: usize,
+        canonical_parents: &mut ParentCanonicalizationMemo,
     ) -> Result<(BTreeSet<PathBuf>, Self), String> {
         let mut reader = CountingReader::with_bytes_read(Cursor::new(payload), 0);
         let segment_version = read_u8_stream(&mut reader, "semantic segment is empty")?;
@@ -8463,8 +8466,12 @@ impl SemanticIndex {
         let mut tombstones = BTreeSet::new();
         for _ in 0..tombstone_count {
             let relative = PathBuf::from(read_string_stream(&mut reader, Some(payload.len()))?);
-            let path = cached_path_under_root(current_canonical_root, &relative)
-                .ok_or_else(|| "semantic segment tombstone escapes project root".to_string())?;
+            let path = cached_path_under_root_with_memo(
+                current_canonical_root,
+                &relative,
+                canonical_parents,
+            )
+            .ok_or_else(|| "semantic segment tombstone escapes project root".to_string())?;
             if !tombstones.insert(path) {
                 return Err("semantic segment contains a duplicate tombstone".to_string());
             }
@@ -8481,7 +8488,8 @@ impl SemanticIndex {
             &mut delta_bytes,
             "unexpected end of semantic segment delta",
         )?;
-        let delta = Self::from_bytes(&delta_bytes, current_canonical_root)?;
+        let delta =
+            Self::from_bytes_with_memo(&delta_bytes, current_canonical_root, canonical_parents)?;
         if delta.dimension != base_dimension
             || delta
                 .fingerprint
@@ -8513,6 +8521,7 @@ impl SemanticIndex {
         mut index: Self,
         total_len: usize,
         base_bytes: usize,
+        canonical_parents: &mut ParentCanonicalizationMemo,
     ) -> Result<LoadedSemanticArtifact, String> {
         let mut valid_bytes = base_bytes;
         let mut segment_count = 0usize;
@@ -8564,6 +8573,7 @@ impl SemanticIndex {
                 &index.project_root,
                 index.fingerprint.as_ref(),
                 index.dimension,
+                canonical_parents,
             )?;
             let tombstones = tombstones.into_iter().collect::<Vec<_>>();
             index.remove_indexed_files(&tombstones);
@@ -8610,14 +8620,23 @@ impl SemanticIndex {
         if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
             return Err(format!("unsupported on-disk semantic version: {version}"));
         }
+        // Base rows, tombstones, and delta rows all resolve within this one load.
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
         let (index, base_bytes) = Self::from_reader_after_version(
             &mut reader,
             version,
             current_canonical_root,
             Some(file_len),
             1,
+            &mut canonical_parents,
         )?;
-        let loaded = Self::apply_segment_log(&mut reader, index, file_len, base_bytes)?;
+        let loaded = Self::apply_segment_log(
+            &mut reader,
+            index,
+            file_len,
+            base_bytes,
+            &mut canonical_parents,
+        )?;
         loaded.index.set_dirty_paths(Some(BTreeSet::new()));
         loaded
             .index
@@ -9107,6 +9126,18 @@ impl SemanticIndex {
 
     /// Deserialize a base snapshot and any committed delta segments.
     pub fn from_bytes(data: &[u8], current_canonical_root: &Path) -> Result<Self, String> {
+        Self::from_bytes_with_memo(
+            data,
+            current_canonical_root,
+            &mut ParentCanonicalizationMemo::default(),
+        )
+    }
+
+    fn from_bytes_with_memo(
+        data: &[u8],
+        current_canonical_root: &Path,
+        canonical_parents: &mut ParentCanonicalizationMemo,
+    ) -> Result<Self, String> {
         debug_assert!(current_canonical_root.is_absolute());
         if data.len() < HEADER_BYTES_V1 {
             return Err("data too short".to_string());
@@ -9119,9 +9150,16 @@ impl SemanticIndex {
             current_canonical_root,
             Some(data.len()),
             1,
+            canonical_parents,
         )?;
-        Self::apply_segment_log(&mut reader, index, data.len(), base_bytes)
-            .map(|loaded| loaded.index)
+        Self::apply_segment_log(
+            &mut reader,
+            index,
+            data.len(),
+            base_bytes,
+            canonical_parents,
+        )
+        .map(|loaded| loaded.index)
     }
 
     fn from_reader_after_version<R: Read>(
@@ -9130,6 +9168,7 @@ impl SemanticIndex {
         current_canonical_root: &Path,
         total_len: Option<usize>,
         bytes_read: usize,
+        canonical_parents: &mut ParentCanonicalizationMemo,
     ) -> Result<(Self, usize), String> {
         debug_assert!(current_canonical_root.is_absolute());
         let mut reader = CountingReader::with_bytes_read(reader, bytes_read);
@@ -9278,14 +9317,17 @@ impl SemanticIndex {
                         secs, nanos
                     )
                 })?;
-            let path = if version == SEMANTIC_INDEX_VERSION_V6
-                || version == SEMANTIC_INDEX_VERSION_V7
-            {
-                cached_path_under_root(current_canonical_root, &PathBuf::from(path))
+            let path =
+                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
+                    cached_path_under_root_with_memo(
+                        current_canonical_root,
+                        &PathBuf::from(path),
+                        canonical_parents,
+                    )
                     .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
-            } else {
-                PathBuf::from(path)
-            };
+                } else {
+                    PathBuf::from(path)
+                };
             file_mtimes.insert(path.clone(), mtime);
             file_sizes.insert(path.clone(), size);
             file_hashes.insert(path, content_hash);
@@ -9301,14 +9343,17 @@ impl SemanticIndex {
         let mut vector_bytes = vec![0u8; vec_bytes];
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
-            let file = if version == SEMANTIC_INDEX_VERSION_V6
-                || version == SEMANTIC_INDEX_VERSION_V7
-            {
-                cached_path_under_root(current_canonical_root, &raw_file)
+            let file =
+                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
+                    cached_path_under_root_with_memo(
+                        current_canonical_root,
+                        &raw_file,
+                        canonical_parents,
+                    )
                     .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
-            } else {
-                raw_file
-            };
+                } else {
+                    raw_file
+                };
             let name = read_string_stream(&mut reader, total_len)?;
             let qualified_name = if version == SEMANTIC_INDEX_VERSION_V7 {
                 let qualified_name = read_string_stream(&mut reader, total_len)?;
@@ -14446,9 +14491,15 @@ Connection: close
             calls: calls.clone(),
             vector_reads: vector_reads.clone(),
         };
-        let (loaded, bytes_read) =
-            SemanticIndex::from_reader_after_version(reader, bytes[0], &root, Some(bytes.len()), 1)
-                .unwrap();
+        let (loaded, bytes_read) = SemanticIndex::from_reader_after_version(
+            reader,
+            bytes[0],
+            &root,
+            Some(bytes.len()),
+            1,
+            &mut ParentCanonicalizationMemo::default(),
+        )
+        .unwrap();
         assert_eq!(bytes_read, bytes.len());
         assert_eq!(loaded.to_bytes(), bytes);
         for (before, after) in index.entries.iter().zip(&loaded.entries) {
@@ -14496,6 +14547,7 @@ Connection: close
             &root,
             None,
             1,
+            &mut ParentCanonicalizationMemo::default(),
         )
         .unwrap();
         assert_eq!(loaded.to_bytes(), bytes);
@@ -14507,6 +14559,7 @@ Connection: close
                 &root,
                 total_len,
                 1,
+                &mut ParentCanonicalizationMemo::default(),
             )
             .unwrap_err();
             assert_eq!(error, "unexpected end of data reading vector");
