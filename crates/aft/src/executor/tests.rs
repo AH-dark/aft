@@ -3778,6 +3778,14 @@ fn bind_herd_is_answered_beside_a_same_root_tail_stuck_in_one_long_step() {
 /// actor hands its worker back and is queued again as a writer. The polling
 /// tail sees that writer and steps aside, and the bind runs again, this time
 /// exclusively, from the start.
+///
+/// The tail starts polling only after the bind's shared attempt has begun.
+/// A freshly submitted bind already counts as a waiting writer while it sits
+/// in the queue, so a tail that polls in the moment between the submit and
+/// the scheduler admitting the bind steps aside for it; the bind then finds
+/// the actor free and correctly runs exclusively on its first attempt, and
+/// there is no shared attempt to observe. Waiting for the shared attempt
+/// means the only writer the tail can see is the bind queued again.
 #[test]
 fn bind_needing_exclusive_use_is_rerun_after_a_polling_tail_steps_aside() {
     let executor = test_executor(4, 2, 2, 2);
@@ -3785,12 +3793,17 @@ fn bind_needing_exclusive_use_is_rerun_after_a_polling_tail_steps_aside() {
     assert!(executor.register_actor(root.clone(), test_ctx()));
 
     let (tail_started_tx, tail_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (shared_attempt_tx, shared_attempt_rx) = crossbeam_channel::bounded::<()>(1);
     let tail = executor.submit_maintenance_async(
         root.clone(),
         Lane::MaintenanceCommit,
         "subc-maintenance-drain-configure-tail-rerun".to_string(),
         Box::new(move |_| {
             tail_started_tx.send(()).expect("signal tail start");
+            // If the bind is never admitted beside the tail, give up waiting
+            // and poll anyway: the bind then runs only exclusively and the
+            // assertions below report it instead of the test hanging.
+            let _ = shared_attempt_rx.recv_timeout(Duration::from_secs(5));
             for step in 0..500 {
                 if current_actor_writer_waiting() {
                     return ok(format!("stepped-aside-after-{step}"));
@@ -3810,6 +3823,9 @@ fn bind_needing_exclusive_use_is_rerun_after_a_polling_tail_steps_aside() {
     let (bind, _token) = submit_repeatable_bind(&executor, &root, "subc-bind-rerun", move |_| {
         let shared = current_bind_gate_is_shared();
         recorded.lock().push(shared);
+        if shared {
+            let _ = shared_attempt_tx.try_send(());
+        }
         if request_exclusive_rerun() {
             return Response::error("subc-bind-rerun", "configure_needs_exclusive", "rerun");
         }
