@@ -9,7 +9,10 @@ use crossbeam_channel::{after, bounded, select_biased, Receiver, Sender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::cache::{InspectCache, InspectCacheRead, InspectDbTimings, Tier2ContributionUpdates};
+use super::cache::{
+    InspectCache, InspectCacheError, InspectCacheRead, InspectDbTimings, Tier2ContributionUpdates,
+    WRITER_RETRY_BACKOFF,
+};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
@@ -115,6 +118,8 @@ struct InspectCacheIdentity {
     sqlite_path: PathBuf,
     project_root: PathBuf,
 }
+
+type CacheOpenGates = Mutex<HashMap<InspectCacheIdentity, Weak<Mutex<()>>>>;
 
 /// A published generation names an immutable cold build; the durable revision
 /// distinguishes the cheap in-place refreshes of that generation.
@@ -783,7 +788,9 @@ pub struct InspectManager {
     pool: Arc<rayon::ThreadPool>,
     in_flight: Mutex<HashMap<JobKey, InFlightRegistration>>,
     in_flight_changed: Condvar,
-    caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+    caches: Arc<Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>>,
+    cache_writer_waits: Arc<Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>>,
+    cache_open_gates: Arc<CacheOpenGates>,
     /// One root-scoped dead-code graph projection. It is cleared with the
     /// manager's other idle artifacts rather than on a separate timer.
     callgraph_projection: Arc<ProjectionSlot>,
@@ -909,6 +916,12 @@ impl InspectManager {
         let metrics_wait_for_test = Arc::new(Mutex::new(None::<Arc<MetricsWaitControlForTest>>));
         #[cfg(test)]
         let metrics_worker_control = metrics_wait_for_test.clone();
+        let caches = Arc::new(Mutex::new(HashMap::new()));
+        let cache_writer_waits = Arc::new(Mutex::new(HashMap::new()));
+        let cache_open_gates = Arc::new(Mutex::new(HashMap::new()));
+        let worker_caches = Arc::clone(&caches);
+        let worker_writer_waits = Arc::clone(&cache_writer_waits);
+        let worker_open_gates = Arc::clone(&cache_open_gates);
         let guarded_worker: InspectWorker = Arc::new(move |job| {
             #[cfg(test)]
             if job.category == InspectCategory::Metrics {
@@ -932,7 +945,18 @@ impl InspectManager {
                     Duration::ZERO,
                 );
             }
-            worker(job)
+            let mut result = worker(job);
+            // Publication may need a writer lease. Finish it on the inspect
+            // worker before notifying the request/reply loop of completion.
+            if let Err(message) = Self::store_completion(
+                &worker_caches,
+                &worker_writer_waits,
+                &worker_open_gates,
+                &result,
+            ) {
+                result.outcome = Err(message);
+            }
+            result
         });
         let handles = start_dispatch_loop(guarded_worker);
         Self {
@@ -942,7 +966,9 @@ impl InspectManager {
             pool: handles.pool,
             in_flight: Mutex::new(HashMap::new()),
             in_flight_changed: Condvar::new(),
-            caches: Mutex::new(HashMap::new()),
+            caches,
+            cache_writer_waits,
+            cache_open_gates,
             callgraph_projection: Arc::new(Mutex::new(None)),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
@@ -2200,6 +2226,12 @@ impl InspectManager {
         if let Ok(mut caches) = self.caches.lock() {
             caches.clear();
         }
+        if let Ok(mut waits) = self.cache_writer_waits.lock() {
+            waits.clear();
+        }
+        if let Ok(mut gates) = self.cache_open_gates.lock() {
+            gates.clear();
+        }
         self.clear_callgraph_projection();
         if let Ok(mut verified) = self.checkout_view_verification.lock() {
             *verified = None;
@@ -2496,14 +2528,15 @@ impl InspectManager {
     /// agent status bar can refresh after a background scan completes without a
     /// freshness round-trip. A category with no readable aggregate reports
     /// `None` (never a fabricated `0`), so the status bar can preserve any
-    /// last-known value and stay suppressed until every category is real (#1).
+    /// last-known value and stay suppressed until every category is real. Status
+    /// observation only uses resident caches; it never acquires a writer lease.
     pub fn latest_tier2_counts(
         &self,
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> (Option<usize>, Option<usize>, Option<usize>) {
         let dead_code_unavailable = self.dead_code_borrow_only_unavailable(&project_root);
-        let Ok(cache) = self.cache_for_paths(inspect_dir, project_root) else {
+        let Some(cache) = self.resident_cache_for_paths(inspect_dir, project_root) else {
             return (None, None, None);
         };
         let count_of = |category: InspectCategory| -> Option<usize> {
@@ -2571,7 +2604,7 @@ impl InspectManager {
             InspectCategory::Todos,
             &JobScope::for_project(project_root.clone()),
         );
-        let cache = self.cache_for_paths(inspect_dir, project_root).ok()?;
+        let cache = self.resident_cache_for_paths(inspect_dir, project_root)?;
         cache
             .get_aggregated(&key)
             .ok()
@@ -2592,7 +2625,7 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> bool {
-        let Ok(cache) = self.cache_for_paths(inspect_dir, project_root) else {
+        let Some(cache) = self.resident_cache_for_paths(inspect_dir, project_root) else {
             return false;
         };
         cache
@@ -2607,11 +2640,10 @@ impl InspectManager {
             == Some(false)
     }
 
-    pub fn cache_for_paths(
-        &self,
+    fn cache_identity(
         inspect_dir: PathBuf,
         project_root: PathBuf,
-    ) -> Result<Arc<InspectCache>, String> {
+    ) -> (PathBuf, InspectCacheIdentity) {
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let inspect_dir = if inspect_dir
             .file_name()
@@ -2626,17 +2658,105 @@ impl InspectManager {
             sqlite_path: inspect_dir.join(format!("{project_key}.current")),
             project_root: project_root.clone(),
         };
-        let mut caches = self
-            .caches
+        (inspect_dir, identity)
+    }
+
+    fn resident_cache_for_paths(
+        &self,
+        inspect_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Option<Arc<InspectCache>> {
+        let (_, identity) = Self::cache_identity(inspect_dir, project_root);
+        // Status is an observation, not cache initialization. A cold or busy
+        // manager leaves the counts unknown until a scan supplies an aggregate.
+        self.caches.try_lock().ok()?.get(&identity).cloned()
+    }
+
+    pub fn cache_for_paths(
+        &self,
+        inspect_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Arc<InspectCache>, String> {
+        Self::open_cache_for_paths(
+            &self.caches,
+            &self.cache_writer_waits,
+            &self.cache_open_gates,
+            inspect_dir,
+            project_root,
+        )
+    }
+
+    fn open_cache_for_paths(
+        cache_map: &Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+        writer_waits: &Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>,
+        open_gates: &CacheOpenGates,
+        inspect_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Arc<InspectCache>, String> {
+        let (inspect_dir, identity) = Self::cache_identity(inspect_dir, project_root.clone());
+        let gate = {
+            let mut gates = open_gates
+                .lock()
+                .map_err(|_| "inspect manager open gate map lock poisoned".to_string())?;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(&identity).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(identity.clone(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        // Serialize initialization of one scope's SQLite generation, not other
+        // scopes or status readers of the resident map.
+        let _opening = gate
+            .lock()
+            .map_err(|_| "inspect cache open gate poisoned".to_string())?;
+        if let Some(cache) = cache_map
+            .lock()
+            .map_err(|_| "inspect manager cache map lock poisoned".to_string())?
+            .get(&identity)
+            .filter(|cache| !cache.writer_retry_due())
+            .cloned()
+        {
+            return Ok(cache);
+        }
+        {
+            let mut waits = writer_waits
+                .lock()
+                .map_err(|_| "inspect manager writer wait map lock poisoned".to_string())?;
+            waits.retain(|_, (retry_at, _)| Instant::now() < *retry_at);
+            if let Some((_, message)) = waits.get(&identity) {
+                return Err(message.clone());
+            }
+        }
+        // Opening can wait on another process. Never keep the resident map
+        // locked while doing filesystem or SQLite work for a cold scope.
+        let cache = match InspectCache::open(inspect_dir, project_root) {
+            Ok(cache) => Arc::new(cache),
+            Err(error) => {
+                let message = format!("failed to open inspect cache: {error}");
+                if matches!(error, InspectCacheError::WriterLeaseTimeout) {
+                    writer_waits
+                        .lock()
+                        .map_err(|_| "inspect manager writer wait map lock poisoned".to_string())?
+                        .insert(
+                            identity,
+                            (Instant::now() + WRITER_RETRY_BACKOFF, message.clone()),
+                        );
+                }
+                return Err(message);
+            }
+        };
+        let mut caches = cache_map
             .lock()
             .map_err(|_| "inspect manager cache map lock poisoned".to_string())?;
-        if let Some(cache) = caches.get(&identity) {
-            return Ok(Arc::clone(cache));
+        if let Some(existing) = caches
+            .get(&identity)
+            .filter(|cache| !cache.writer_retry_due())
+        {
+            return Ok(Arc::clone(existing));
         }
-        let cache = Arc::new(
-            InspectCache::open(inspect_dir, project_root)
-                .map_err(|error| format!("failed to open inspect cache: {error}"))?,
-        );
         caches.insert(identity, Arc::clone(&cache));
         Ok(cache)
     }
@@ -4319,37 +4439,42 @@ impl InspectManager {
     }
 
     fn completion_outcome(&self, result: InspectResult) -> JobOutcome {
-        let cache =
-            match self.cache_for_paths(result.inspect_dir.clone(), result.project_root.clone()) {
-                Ok(cache) => cache,
-                Err(message) => return JobOutcome::Failed { message },
-            };
-
         match result.outcome {
-            Ok(success) => {
-                let store_result = if result.category.is_tier2() {
-                    cache.store_tier2_result_for_config(
-                        result.key.clone(),
-                        &success.scanned_files,
-                        &success.contributions,
-                        success.aggregate.clone(),
-                        result.config.as_ref(),
-                    )
-                } else {
-                    cache.store_aggregated(result.key, success.aggregate.clone())
-                };
-
-                match store_result {
-                    Ok(()) => JobOutcome::Fresh {
-                        payload: success.aggregate,
-                    },
-                    Err(error) => JobOutcome::Failed {
-                        message: error.to_string(),
-                    },
-                }
-            }
+            Ok(success) => JobOutcome::Fresh {
+                payload: success.aggregate,
+            },
             Err(message) => JobOutcome::Failed { message },
         }
+    }
+
+    fn store_completion(
+        caches: &Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+        writer_waits: &Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>,
+        open_gates: &CacheOpenGates,
+        result: &InspectResult,
+    ) -> Result<(), String> {
+        let Ok(success) = &result.outcome else {
+            return Ok(());
+        };
+        let cache = Self::open_cache_for_paths(
+            caches,
+            writer_waits,
+            open_gates,
+            result.inspect_dir.clone(),
+            result.project_root.clone(),
+        )?;
+        if result.category.is_tier2() {
+            cache.store_tier2_result_for_config(
+                result.key.clone(),
+                &success.scanned_files,
+                &success.contributions,
+                success.aggregate.clone(),
+                result.config.as_ref(),
+            )
+        } else {
+            cache.store_aggregated(result.key.clone(), success.aggregate.clone())
+        }
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -7587,6 +7712,108 @@ mod guard_tests {
             None,
             "callgraph_unavailable dead_code must stay suppressed"
         );
+    }
+
+    #[test]
+    fn foreign_writer_failure_backoff_is_scope_local_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let inspect_dir = root.join("inspect");
+        let _writer = super::super::cache::tests::foreign_writer(&root, &inspect_dir, false);
+        let manager = InspectManager::new();
+        for (pass, expected_attempts) in [(0, 20), (1, 0), (2, 20)] {
+            if pass == 2 {
+                let mut waits = manager.cache_writer_waits.lock().unwrap();
+                for (retry_at, _) in waits.values_mut() {
+                    *retry_at = Instant::now() - Duration::from_secs(1);
+                }
+            }
+            let clock = crate::fs_lock::retry_clock::Guard::install(Duration::ZERO);
+            let error = manager
+                .cache_for_paths(inspect_dir.clone(), root.clone())
+                .unwrap_err();
+            assert!(error.contains("writer_lease_timeout:"), "{error}");
+            assert_eq!(
+                clock.observations().2,
+                expected_attempts,
+                "backoff pass {pass}"
+            );
+        }
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(
+            manager.cache_for_paths(inspect_dir, other).is_ok(),
+            "one scope cannot back off another"
+        );
+    }
+
+    #[test]
+    fn foreign_writer_open_does_not_lock_resident_map() {
+        use std::sync::atomic::AtomicUsize;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let inspect_dir = root.join("inspect");
+        let _writer = super::super::cache::tests::foreign_writer(&root, &inspect_dir, false);
+        let manager = InspectManager::new();
+        let sleeps = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            let opening = scope.spawn(|| {
+                let _observer = crate::fs_lock::observe_retry_sleeps_for_test(sleeps.clone());
+                manager.cache_for_paths(inspect_dir.clone(), root.clone())
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while sleeps.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                sleeps.load(Ordering::SeqCst) > 0,
+                "open reached the contended lease"
+            );
+            assert!(
+                manager.caches.try_lock().is_ok(),
+                "cache open held the resident map mutex"
+            );
+            let start = Instant::now();
+            assert_eq!(
+                manager.latest_tier2_counts(inspect_dir.clone(), root.clone()),
+                (None, None, None)
+            );
+            assert!(start.elapsed() < Duration::from_millis(500));
+            assert!(opening
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .contains("writer_lease_timeout:"));
+        });
+    }
+
+    #[test]
+    fn foreign_writer_regular_completion_is_resident_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let inspect_dir = root.join("inspect");
+        let _writer = super::super::cache::tests::foreign_writer(&root, &inspect_dir, false);
+        let manager = InspectManager::new();
+        let job = snapshot_job(&root, &inspect_dir, false);
+        let start = Instant::now();
+        let failed =
+            manager.completion_outcome(InspectResult::failed(&job, "scan failed", Duration::ZERO));
+        assert!(matches!(failed, JobOutcome::Failed { message } if message == "scan failed"));
+        let succeeded = manager.completion_outcome(InspectResult::success(
+            &job,
+            InspectScanSuccess {
+                aggregate: json!({"count": 7}),
+                scanned_files: vec![],
+                contributions: vec![],
+            },
+            Duration::ZERO,
+        ));
+        assert!(matches!(succeeded, JobOutcome::Fresh { .. }));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "routing completed work waited for a writer lease"
+        );
+        assert!(manager.caches.lock().unwrap().is_empty());
     }
 
     /// The status bar's TODO count comes from a background todos scan. Its
@@ -11729,8 +11956,11 @@ mod tier2_unreadable_source_tests {
         );
 
         drop(held);
-        // Advance the resource deadline, not the input epoch. A lease release
-        // needs no watcher edit to make the next automatic admission succeed.
+        // Advance both the resource deadline and the cache-open backoff, not the
+        // input epoch. A lease release needs no watcher edit to permit a retry.
+        for (retry_at, _) in manager.cache_writer_waits.lock().unwrap().values_mut() {
+            *retry_at = Instant::now();
+        }
         manager
             .builder_states
             .lock()

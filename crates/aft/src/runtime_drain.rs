@@ -633,6 +633,9 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
     // an explicit aft_inspect call.
     if drained > 0 || reuse_completed {
         if let Some(project_root) = ctx.config().project_root.clone() {
+            // Failed reuse attempts also advance `reuse_completions`. Read only
+            // caches already held by InspectManager: opening one here could
+            // wait on a foreign writer and stall standalone request/reply service.
             let inspect_dir = ctx.inspect_dir();
             let (dead_code, unused_exports, duplicates) = ctx
                 .inspect_manager()
@@ -4105,6 +4108,52 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
+
+    #[test]
+    fn inspect_failure_drain_does_not_delay_unrelated_read() {
+        use crate::inspect::job::{InspectCategory, JobOutcome};
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join("hello.txt"), "hello from read\n").unwrap();
+        let (ctx, _) = watcher_context(&root);
+        let _writer =
+            crate::inspect::cache::tests::foreign_writer(&root, &ctx.inspect_dir(), false);
+        let request = crate::protocol::RawRequest {
+            id: "unrelated-read".into(),
+            command: "read".into(),
+            params: serde_json::json!({"file": root.join("hello.txt")}),
+            session_id: None,
+            lsp_hints: None,
+        };
+        assert!(crate::commands::read::handle_read(&request, &ctx).success);
+        for _ in 0..3 {
+            ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+                InspectCategory::Duplicates,
+                JobOutcome::Failed {
+                    message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
+                },
+            );
+            let start = Instant::now();
+            drain_inspect_events(&ctx);
+            let response = crate::commands::read::handle_read(&request, &ctx);
+            assert!(response.success, "{response:?}");
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "inspect status blocked an unrelated read for {:?}",
+                start.elapsed()
+            );
+            assert_eq!(
+                ctx.inspect_manager()
+                    .latest_tier2_counts(ctx.inspect_dir(), root.clone()),
+                (None, None, None),
+                "missing snapshot is unknown, not zero"
+            );
+            assert!(ctx
+                .inspect_manager()
+                .tier2_resource_wait(InspectCategory::Duplicates)
+                .is_some());
+        }
+    }
 
     #[test]
     fn lsp_secret_is_masked_before_truncation() {
