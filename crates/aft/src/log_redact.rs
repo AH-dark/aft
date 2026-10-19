@@ -196,6 +196,16 @@ pub(crate) struct SecretValues(Vec<String>);
 
 /// Whether an environment variable name marks its value as a completion secret.
 pub fn is_secret_environment_key(key: &str) -> bool {
+    // Git's numbered config variables carry a setting NAME in GIT_CONFIG_KEY_<n>
+    // (AFT itself injects core.hooksPath this way). The name is not a secret,
+    // and dropping it alone while GIT_CONFIG_COUNT and GIT_CONFIG_VALUE_<n>
+    // stay makes every git child exit with "missing config key".
+    if key
+        .get(.."GIT_CONFIG_KEY_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_KEY_"))
+    {
+        return false;
+    }
     [
         "TOKEN",
         "SECRET",
@@ -695,5 +705,44 @@ mod tests {
     fn non_utf8_bytes_are_safely_decoded() {
         let bytes = [0xff, 0xfe, b'g', b'h'];
         assert_eq!(aft_redact_bytes(&bytes).as_ref(), "��gh".as_bytes());
+    }
+
+    #[test]
+    fn git_numbered_config_names_are_not_secret_names() {
+        // Scrubbing GIT_CONFIG_KEY_0 alone leaves GIT_CONFIG_COUNT pointing at a
+        // missing key, and git refuses to run.
+        for key in ["GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_12", "git_config_key_1"] {
+            assert!(!is_secret_environment_key(key), "{key}");
+        }
+        for key in [
+            "GITHUB_TOKEN",
+            "NPM_AUTH",
+            "AWS_SECRET_ACCESS_KEY",
+            "API_KEY",
+        ] {
+            assert!(is_secret_environment_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn git_runs_after_the_secret_name_scrub() {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["config", "--get", "core.hooksPath"])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", "/dev/null");
+        for key in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
+            if is_secret_environment_key(key) {
+                command.env_remove(key);
+            }
+        }
+        let output = command.output().expect("git runs");
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "/dev/null");
     }
 }
