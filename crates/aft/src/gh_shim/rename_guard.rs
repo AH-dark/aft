@@ -303,6 +303,19 @@ fn read_preflight_gh(
 
 fn read_gh(real_gh: &Path, args: &[String], deadline: Instant, cap: u64) -> Result<String, String> {
     ensure_time(deadline)?;
+    read_gh_after_spawn(real_gh, args, cap, || Ok(()), || deadline)
+}
+
+// The Windows process-tree test waits for PowerShell to publish the
+// grandchild PID before starting its timeout budget. Production callers keep
+// passing their existing absolute deadline through the closure.
+fn read_gh_after_spawn(
+    real_gh: &Path,
+    args: &[String],
+    cap: u64,
+    after_spawn: impl FnOnce() -> Result<(), String>,
+    deadline: impl FnOnce() -> Instant,
+) -> Result<String, String> {
     let mut command = Command::new(real_gh);
     command
         .args(args)
@@ -313,28 +326,31 @@ fn read_gh(real_gh: &Path, args: &[String], deadline: Instant, cap: u64) -> Resu
     let mut child = command
         .spawn()
         .map_err(|e| format!("could not run real gh: {e}"))?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    for (is_stdout, pipe, cap) in [
-        (true, Box::new(stdout) as Box<dyn Read + Send>, cap),
-        (false, Box::new(stderr) as Box<dyn Read + Send>, 8192),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let read = pipe.take(cap + 1).read_to_end(&mut bytes);
-            let result = read.map_err(|e| e.to_string()).and_then(|_| {
-                if bytes.len() as u64 > cap {
-                    Err("gh response exceeded capture limit".into())
-                } else {
-                    String::from_utf8(bytes).map_err(|e| e.to_string())
-                }
-            });
-            let _ = tx.send((is_stdout, result));
-        });
-    }
     let result = (|| {
+        after_spawn()?;
+        let deadline = deadline();
+        ensure_time(deadline)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        for (is_stdout, pipe, cap) in [
+            (true, Box::new(stdout) as Box<dyn Read + Send>, cap),
+            (false, Box::new(stderr) as Box<dyn Read + Send>, 8192),
+        ] {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let read = pipe.take(cap + 1).read_to_end(&mut bytes);
+                let result = read.map_err(|e| e.to_string()).and_then(|_| {
+                    if bytes.len() as u64 > cap {
+                        Err("gh response exceeded capture limit".into())
+                    } else {
+                        String::from_utf8(bytes).map_err(|e| e.to_string())
+                    }
+                });
+                let _ = tx.send((is_stdout, result));
+            });
+        }
         let mut stdout = String::new();
         let mut stderr = String::new();
         for _ in 0..2 {
@@ -577,31 +593,60 @@ mod tests {
             quote(&powershell),
             quote(&pid_file),
         );
-        // Two nested PowerShell starts can take many seconds on a loaded Windows
-        // runner, so the deadline must leave room for the grandchild to exist and
-        // record its pid before the timeout kills the tree.
-        let start = Instant::now();
-        let result = read_gh(
-            &powershell,
-            &[
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                script,
-            ],
-            start + Duration::from_secs(20),
-            1024,
+        let mut grandchild_pid = None;
+        let mut timeout_started = None;
+        let result =
+            read_gh_after_spawn(
+                &powershell,
+                &[
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    script,
+                ],
+                1024,
+                || {
+                    let setup_deadline = Instant::now() + Duration::from_secs(120);
+                    loop {
+                        match std::fs::read_to_string(&pid_file) {
+                            Ok(contents) => {
+                                grandchild_pid =
+                                    Some(contents.trim().parse::<u32>().map_err(|error| {
+                                        format!("invalid grandchild pid: {error}")
+                                    })?);
+                                return Ok(());
+                            }
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::NotFound
+                                    || error.raw_os_error() == Some(32) =>
+                            {
+                                // PowerShell can briefly keep the pid file locked after writing it.
+                            }
+                            Err(error) => {
+                                return Err(format!("could not read grandchild pid: {error}"));
+                            }
+                        }
+                        if Instant::now() >= setup_deadline {
+                            return Err("grandchild pid setup guard exceeded 120 seconds".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                },
+                || {
+                    let start = Instant::now();
+                    timeout_started = Some(start);
+                    start + Duration::from_secs(20)
+                },
+            );
+        assert!(
+            grandchild_pid.is_some(),
+            "the grandchild never recorded its pid before the setup guard: {result:?}"
         );
+        let start = timeout_started.expect("timeout starts after the grandchild pid is recorded");
         assert!(result.unwrap_err().contains("deadline"));
         assert!(start.elapsed() < Duration::from_secs(35));
 
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap_or_else(|error| {
-                panic!("the grandchild never recorded its pid before the deadline: {error}")
-            })
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = grandchild_pid.unwrap();
         let query = format!(
             "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
         );
