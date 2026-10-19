@@ -10984,6 +10984,152 @@ mod tests {
         );
     }
 
+    /// Idle eviction of a views-on root lets go of its semantic lane: the
+    /// view unbinds and the family arena drops the runs it held. The next
+    /// semantic query reports the lane as reloading (never an empty or wrong
+    /// answer) and starts it again; once it is back, search answers as before
+    /// from the stored vectors, without embedding anything again.
+    #[test]
+    fn idle_eviction_releases_semantic_view_and_a_query_restarts_it() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let root = project.path().canonicalize().unwrap();
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("module_{index}.rs")),
+                format!("pub fn evicted_function_{index}(value: u32) -> u32 {{\n    value + {index}\n}}\n"),
+            )
+            .unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let fills = crate::views::semantic_runtime::FillObserver::new(root.clone());
+        let request = configure_semantic_views(&root, storage.path(), &server.base_url);
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let settled = |fills: &crate::views::semantic_runtime::FillObserver| loop {
+            match fills.next() {
+                "settled" => break,
+                "wake" => continue,
+                other => panic!("semantic fill did not settle: {other}"),
+            }
+        };
+        settled(&fills);
+        let names = |ctx: &AppContext| {
+            ctx.checkout_semantic_runtime()
+                .expect("semantic view loaded")
+                .search(&[1.0, 0.0, 0.0], 1_000, &|_| true)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|result| result.name)
+                .collect::<BTreeSet<_>>()
+        };
+        let served = names(&ctx);
+        assert!(served.contains("evicted_function_0"), "{served:?}");
+        let embedded = server.non_probe_input_count();
+
+        let runtime = ctx.checkout_semantic_runtime().unwrap();
+        let arena = runtime.plane().arena(runtime.access().family());
+        assert!(arena.memory().runs > 0, "the view held no arena runs");
+        let census = crate::memory::SemanticArenaCensus::measure();
+        assert!(
+            census
+                .families
+                .iter()
+                .any(|row| row.family == arena.family() && row.bytes == arena.memory().bytes),
+            "the census did not report the view's family arena: {census:?}"
+        );
+        let released = Arc::downgrade(&runtime);
+        drop(runtime);
+
+        // Evict as the idle reaper does once the root's TTL has passed.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ctx.try_evict_idle_artifacts() {
+            assert!(Instant::now() < deadline, "idle eviction stayed blocked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ctx.invalidate_artifacts_after_watcher_gap();
+        assert!(
+            !ctx.checkout_semantic().active(),
+            "idle eviction kept the semantic lane loaded"
+        );
+        while released.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the released semantic view was never dropped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The view unbinds inside the runtime's drop, just after its last
+        // strong reference is gone, so wait for the trim.
+        while arena.memory() != crate::views::semantic_arena::ArenaMemory::default() {
+            assert!(
+                Instant::now() < deadline,
+                "the arena kept runs only the released view held: {:?}",
+                arena.memory()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A query finds no lane. It starts the lane again and reports the
+        // semantic lane as building, with no results, rather than an empty
+        // or partial answer. Trigram is off in this fixture, so no lane is
+        // ready and the query refuses.
+        let loading = |response: &Response| {
+            assert!(!response.success, "{:?}", response.data);
+            assert_eq!(response.data["code"], json!("search_lanes_unavailable"));
+            assert_eq!(
+                response.data["lanes"]["semantic"]["status"],
+                json!("building"),
+                "a query during the reload did not report it: {:?}",
+                response.data
+            );
+            assert_eq!(response.data["results"], json!([]));
+        };
+        let first = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("evicted function value"),
+            &ctx,
+        );
+        loading(&first);
+        assert!(
+            ctx.checkout_semantic().active(),
+            "the query did not restart the semantic lane"
+        );
+        // A query while the lane is still loading reports the same state.
+        let second = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("evicted function value"),
+            &ctx,
+        );
+        if ctx.checkout_semantic_runtime().is_none() {
+            loading(&second);
+        }
+
+        settled(&fills);
+        assert_eq!(
+            names(&ctx),
+            served,
+            "the restarted lane answers differently"
+        );
+        assert_eq!(
+            server.non_probe_input_count(),
+            embedded,
+            "the restarted lane embedded stored content again"
+        );
+    }
+
     /// Callgraph view publication never waits on semantic embedding. With
     /// views enabled, semantic vectors belong to the root's per-checkout
     /// semantic view, so the older view publishes callgraph data with no
@@ -14410,6 +14556,10 @@ mod tests {
             SemanticIndex::build(&root, std::slice::from_ref(&source), &mut local_embed, 64)
                 .expect("build baseline semantic index");
         let config = semantic_refresh_test_config(&server.base_url);
+        // Answer embeddings immediately: a refresh that wrongly embeds the
+        // file then completes and fails the input-count assertion below,
+        // instead of hanging on a held response.
+        server.release_responses();
         let ctx = test_context();
         let generation = ctx.configure_generation();
         let (request_tx, request_rx) = crossbeam_channel::unbounded();
@@ -14421,7 +14571,10 @@ mod tests {
                 .expect("construct semantic refresh model"),
             config.max_batch_size,
             config.max_files,
-            Duration::from_millis(300),
+            // Far longer than any scheduler stall, so the restore below always
+            // lands inside the window. The test closes the window itself by
+            // disconnecting the request channel, which ends the wait at once.
+            Duration::from_secs(600),
             true,
             None,
             request_rx,
@@ -14442,28 +14595,46 @@ mod tests {
                 paths: vec![source.clone()],
             })
             .expect("queue file refresh");
+        // Correctness does not depend on this pause. It gives a worker that
+        // skipped the quiet window time to read the transient content, so
+        // that regression fails here rather than racing the restore.
         std::thread::sleep(Duration::from_millis(100));
         std::fs::write(&source, original).expect("restore original source");
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "the worker must not start a file refresh before its quiet window closes"
+        );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        drop(request_tx);
+        // Hang guard only: the window is already closed, so the refresh runs
+        // now and normally completes in milliseconds.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut completed = false;
-        while Instant::now() < deadline {
-            match event_rx.recv_timeout(Duration::from_millis(100)) {
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match event_rx.recv_timeout(remaining) {
                 Ok(SemanticRefreshEvent::Completed { .. }) => {
                     completed = true;
                     break;
                 }
-                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Ok(SemanticRefreshEvent::Failed { error, .. }) => {
+                    panic!("quiet-window file refresh failed: {error}")
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
-        assert!(completed, "quiet-window file refresh did not complete");
+        assert!(
+            completed,
+            "quiet-window file refresh did not complete within the 60 s hang guard"
+        );
         assert_eq!(
             server.non_probe_input_count(),
             0,
             "content restored before the quiet window closed must reuse cached vectors"
         );
-        drop(request_tx);
         worker.join().expect("semantic refresh worker joins");
     }
 

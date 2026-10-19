@@ -1647,7 +1647,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     for (seq, b) in [(0, b'A'), (1, b'B')] {
         // Checkpoint B explicitly; A's first-output running transition is
         // durable, while ordinary output now checkpoints at most once a second.
-        sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+        sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
         consumer
             .consume(
                 StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(vec![b]))),
@@ -2117,7 +2117,7 @@ fn exec_remote_bash_progress_checkpoints_are_coalesced() {
         read_task(&paths.json).unwrap().remote.unwrap().last_seq,
         Some(0)
     );
-    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
     work_counts::reset();
     sink.output(2, OutputStream::Stderr, b"B").unwrap();
     let remote = read_task(&paths.json).unwrap().remote.unwrap();
@@ -2125,7 +2125,9 @@ fn exec_remote_bash_progress_checkpoints_are_coalesced() {
         (remote.last_seq, remote.stdout_len, remote.stderr_len),
         (Some(2), 1, 1)
     );
-    assert_eq!(work_counts::get().syncs, 4);
+    // Two dirty output files and the new metadata file; a progress-only
+    // checkpoint leaves the directory unsynced.
+    assert_eq!(work_counts::get().syncs, 3);
     assert_eq!(work_counts::get().renames, 1);
     work_counts::reset();
     sink.output(3, OutputStream::Stdout, b"C").unwrap();
@@ -2135,6 +2137,144 @@ fn exec_remote_bash_progress_checkpoints_are_coalesced() {
         read_task(&paths.json).unwrap().remote.unwrap().last_seq,
         Some(2)
     );
+}
+
+#[test]
+fn exec_remote_bash_progress_checkpoints_over_a_20s_fake_run() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task).unwrap();
+    let start = Instant::now();
+    let elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock_ticks = Arc::clone(&elapsed_ms);
+    sink.set_progress_clock_for_test(Arc::new(move || {
+        start + Duration::from_millis(clock_ticks.load(std::sync::atomic::Ordering::Relaxed))
+    }));
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    work_counts::reset();
+    // A fake runner streams 100 records a second, alternating stdout and
+    // stderr, for 20 simulated seconds. The injected clock advances without
+    // sleeping or depending on how long checkpoint writes take.
+    const TICK: Duration = Duration::from_millis(10);
+    for seq in 1..=2000_u64 {
+        elapsed_ms.fetch_add(
+            TICK.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let stream = if seq % 2 == 0 {
+            OutputStream::Stdout
+        } else {
+            OutputStream::Stderr
+        };
+        sink.output(seq, stream, b"line\n").unwrap();
+    }
+    let counts = work_counts::get();
+    eprintln!(
+        "20s fake run: {} checkpoints, {} fsyncs; per minute: {} checkpoints, {} fsyncs",
+        counts.renames,
+        counts.syncs,
+        counts.renames * 3,
+        counts.syncs * 3
+    );
+    assert_eq!(counts.renames, 4, "one checkpoint per five seconds");
+    // Each checkpoint syncs the two dirty output files and the new metadata
+    // file; a progress-only checkpoint does not sync the directory.
+    assert_eq!(counts.syncs, 12);
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    let saved = remote.last_seq.unwrap();
+    assert!(saved >= 1500, "the last checkpoint is recent: {saved}");
+    assert_eq!(
+        (remote.stdout_len, remote.stderr_len),
+        (saved / 2 * 5, saved.div_ceil(2) * 5),
+        "the saved lengths match the saved sequence number"
+    );
+}
+
+#[test]
+fn exec_remote_bash_stale_checkpoint_snapshot_loses_to_newer_locked_write() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.output(1, OutputStream::Stdout, b"A").unwrap();
+    // A cancel lands after the checkpoint took its snapshot (without the
+    // cancel) and before the snapshot reaches the file.
+    let (cancel_registry, cancel_task) = (registry.clone(), task.clone());
+    sink.before_checkpoint_write = Some(Box::new(move || {
+        assert!(cancel_registry.record_remote_cancel(&cancel_task).unwrap());
+    }));
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
+    work_counts::reset();
+    sink.output(2, OutputStream::Stderr, b"B").unwrap();
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    assert!(
+        remote.cancel_requested,
+        "the older checkpoint snapshot must not replace the cancel record"
+    );
+    assert_eq!(
+        (remote.last_seq, remote.stdout_len, remote.stderr_len),
+        (Some(2), 1, 1),
+        "the cancel record already carries the checkpointed cursor"
+    );
+    assert_eq!(work_counts::get().renames, 1, "only the cancel was written");
+}
+
+#[test]
+fn exec_remote_bash_restart_after_progress_checkpoint_replays_from_saved_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.output(1, OutputStream::Stdout, b"A").unwrap();
+    sink.output(2, OutputStream::Stderr, b"a").unwrap();
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
+    // A progress-only checkpoint saves the cursor after this record.
+    sink.output(3, OutputStream::Stdout, b"B").unwrap();
+    // Received after the checkpoint and never saved in metadata.
+    sink.output(4, OutputStream::Stdout, b"C").unwrap();
+    sink.output(5, OutputStream::Stderr, b"b").unwrap();
+    let disk = read_task(&paths.json).unwrap();
+    let point = disk.remote.as_ref().unwrap().point().unwrap();
+    drop(sink);
+    drop(registry);
+
+    let restarted = self::registry();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&restarted, task).unwrap();
+    let mut consumer = exec::StreamConsumer::resume(point);
+    let from_seq = consumer
+        .resume_point()
+        .unwrap()
+        .attach_request()
+        .unwrap()
+        .from_seq;
+    // The runner replays every record after the saved sequence number.
+    for (seq, stream, bytes) in [
+        (4, OutputStream::Stdout, b"C"),
+        (5, OutputStream::Stderr, b"b"),
+        (6, OutputStream::Stdout, b"D"),
+    ] {
+        consumer
+            .consume(
+                StreamRecord::Output(Output::new(seq, stream, BytePayload(bytes.to_vec()))),
+                &mut sink,
+            )
+            .unwrap();
+    }
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"ABCD");
+    assert_eq!(fs::read(&paths.stderr).unwrap(), b"ab");
+    assert_eq!(from_seq, 4, "attach resumes after the progress checkpoint");
 }
 
 #[test]
@@ -2196,13 +2336,13 @@ fn exec_remote_bash_checkpoint_syncs_dirty_output_before_metadata() {
         sink.output(seq + 10, OutputStream::Stderr, b"B").unwrap();
         sink.unknown_output(seq + 20, b"C").unwrap();
     }
-    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
     work_counts::reset();
     sink.unknown_output(31, b"").unwrap();
     assert_eq!(
         work_counts::get().syncs,
-        5,
-        "three dirty files plus metadata"
+        4,
+        "three dirty files plus the metadata file"
     );
     assert_eq!(work_counts::get().renames, 1);
     let remote = read_task(&paths.json).unwrap().remote.unwrap();
@@ -2212,17 +2352,17 @@ fn exec_remote_bash_checkpoint_syncs_dirty_output_before_metadata() {
     );
     assert_eq!(remote.last_seq, Some(31));
 
-    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
     work_counts::reset();
     sink.unknown_output(32, b"").unwrap();
     assert_eq!(
         work_counts::get().syncs,
-        2,
+        1,
         "clean files must not sync again"
     );
 
     sink.output(33, OutputStream::Stdout, b"tail").unwrap();
-    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
     work_counts::reset();
     let result = with_task_io_fault(TaskIoFault::RunningEnospc, || sink.unknown_output(34, b""));
     assert!(result.is_err());
@@ -2239,7 +2379,7 @@ fn exec_remote_bash_checkpoint_syncs_dirty_output_before_metadata() {
     sink.unknown_output(34, b"").unwrap();
     assert_eq!(
         work_counts::get().syncs,
-        2,
+        1,
         "a metadata retry must not resync clean output"
     );
 }
@@ -2387,7 +2527,7 @@ fn exec_remote_bash_restart_short_checkpoint_never_zero_fills() {
             )
             .unwrap();
         } else {
-            sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+            sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
             sink.unknown_output(4, b"").unwrap();
         }
         drop(sink);
@@ -2516,7 +2656,7 @@ fn recover_short_checkpoint(
     if terminal_proof {
         sink.terminal(&record, &exec::grade(&record)).unwrap();
     } else {
-        sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+        sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
         sink.unknown_output(4, b"").unwrap();
     }
     drop(sink);
@@ -3141,7 +3281,7 @@ fn exec_remote_bash_unknown_output_bytes_are_durable_without_misattribution() {
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
     let task = registry.task(&task_id).unwrap();
     let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
-    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    sink.last_progress_persist = Instant::now() - PROGRESS_CHECKPOINT_INTERVAL;
     sink.unknown_output(0, b"future").unwrap();
     drop(sink);
     let mut sink = TaskSink::new(&registry, task).unwrap();

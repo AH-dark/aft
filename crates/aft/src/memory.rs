@@ -372,6 +372,12 @@ pub struct ProcessMemorySnapshot {
     /// a request-path read is null until the first process-wide observation exists.
     pub allocator_observation_age_ms: Option<u64>,
     pub total_attributed_bytes: u64,
+    /// Resident views-on semantic arena bytes, every family counted once
+    /// (see [`SemanticArenaCensus`]). Included in `total_attributed_bytes`.
+    pub semantic_arena_bytes: u64,
+    /// Embedded chunks resident in those arenas. Each holds one embedding
+    /// vector, so it can be checked against an allocator's block counts.
+    pub semantic_resident_chunks: u64,
     pub unattributed_bytes: Option<i64>,
     pub root_count: usize,
     pub busy_subsystems: usize,
@@ -495,6 +501,63 @@ impl AllocatorPressureRelief {
     }
 }
 
+/// One family's resident views-on semantic arena.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SemanticArenaRow {
+    pub storage: String,
+    pub family: String,
+    pub runs: usize,
+    pub chunks: usize,
+    pub bytes: u64,
+}
+
+/// The views-on semantic arenas alive in this process. A family's arena is
+/// shared by every view of that family and appears once in the process
+/// registry, so its runs are counted here exactly once and never on a root
+/// row. A root row counts only its own overlay (see `CheckoutSemantic`).
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SemanticArenaCensus {
+    pub bytes: u64,
+    pub resident_chunks: u64,
+    /// Largest family first.
+    pub families: Vec<SemanticArenaRow>,
+}
+
+impl SemanticArenaCensus {
+    pub fn measure() -> Self {
+        let mut families: Vec<SemanticArenaRow> = crate::views::semantic_arena::live_arenas()
+            .iter()
+            .map(|arena| {
+                let memory = arena.memory();
+                SemanticArenaRow {
+                    storage: arena.storage().display().to_string(),
+                    family: arena.family().to_owned(),
+                    runs: memory.runs,
+                    chunks: memory.chunks,
+                    bytes: memory.bytes,
+                }
+            })
+            .collect();
+        families.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| a.family.cmp(&b.family))
+                .then_with(|| a.storage.cmp(&b.storage))
+        });
+        Self {
+            bytes: families
+                .iter()
+                .map(|row| row.bytes)
+                .fold(0u64, u64::saturating_add),
+            resident_chunks: families
+                .iter()
+                .map(|row| usize_to_u64(row.chunks))
+                .fold(0u64, u64::saturating_add),
+            families,
+        }
+    }
+}
+
 impl ProcessMemorySnapshot {
     pub fn from_roots(
         roots: &BTreeMap<String, RootMemorySnapshot>,
@@ -505,6 +568,7 @@ impl ProcessMemorySnapshot {
             rollups.iter(),
             roots.len(),
             shared_semantic_bases,
+            &SemanticArenaCensus::measure(),
             AllocatorObservation::measure(),
         )
     }
@@ -513,6 +577,7 @@ impl ProcessMemorySnapshot {
         roots: impl Iterator<Item = &'a RootMemoryRollup>,
         root_count: usize,
         shared_semantic_bases: &MemoryEstimate,
+        semantic_arenas: &SemanticArenaCensus,
         allocator_observation: AllocatorObservation,
     ) -> Self {
         let mut root_attributed_bytes = 0u64;
@@ -531,6 +596,7 @@ impl ProcessMemorySnapshot {
         } = allocator_observation;
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
+            .saturating_add(semantic_arenas.bytes)
             .saturating_add(sqlite.memory_used_bytes);
         let rss_bytes = process_rss_bytes();
         let phys_footprint_bytes = process_phys_footprint_bytes();
@@ -556,6 +622,8 @@ impl ProcessMemorySnapshot {
             allocator,
             allocator_observation_age_ms,
             total_attributed_bytes,
+            semantic_arena_bytes: semantic_arenas.bytes,
+            semantic_resident_chunks: semantic_arenas.resident_chunks,
             unattributed_bytes,
             root_count,
             busy_subsystems,
@@ -590,6 +658,9 @@ pub struct MemorySnapshot {
     /// snapshots borrowed loads share and the indexes owner roots froze when
     /// they installed them. Root rows count zero for a view of such a base.
     pub shared_semantic_bases: MemoryEstimate,
+    /// Views-on semantic arenas, one row per family, attributed once
+    /// process-wide (`process.semantic_arena_bytes`).
+    pub semantic_arenas: SemanticArenaCensus,
     pub process: ProcessMemorySnapshot,
 }
 
@@ -614,6 +685,7 @@ impl MemoryRollupSnapshot {
             roots.values(),
             roots.len(),
             &shared_semantic_bases,
+            &SemanticArenaCensus::measure(),
             allocator,
         );
         let roots_total = roots.len();
@@ -663,12 +735,14 @@ impl MemorySnapshot {
         allocator: AllocatorObservation,
     ) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
+        let semantic_arenas = SemanticArenaCensus::measure();
         // Totals cover EVERY root before the detail map is capped.
         let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
         let process = ProcessMemorySnapshot::from_root_rollups(
             rollups.iter(),
             roots.len(),
             &shared_semantic_bases,
+            &semantic_arenas,
             allocator,
         );
         let roots_total = roots.len();
@@ -684,6 +758,7 @@ impl MemorySnapshot {
             roots_omitted,
             roots_omitted_bytes,
             shared_semantic_bases,
+            semantic_arenas,
             process,
         }
     }

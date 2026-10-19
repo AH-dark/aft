@@ -45,6 +45,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// [`lock`] without waiting: `None` only while another thread holds it.
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// The process's semantic plane for `storage` and `producer`.
 ///
 /// Every checkout of this process that uses the same storage root and
@@ -376,6 +385,19 @@ impl CheckoutSemantic {
             private: self.plane.private_memory(&self.access),
         }
     }
+
+    /// This checkout's own overlay bytes (the `private` part of
+    /// [`Self::memory`]) without waiting; `None` while an overlay build holds
+    /// the view. The family arena is counted process-wide, not here.
+    pub fn try_private_memory(&self) -> Option<u64> {
+        self.plane.try_private_memory(&self.access)
+    }
+
+    /// The resident bytes of this checkout's family arena, shared with every
+    /// other view of the family.
+    pub fn family_arena_bytes(&self) -> u64 {
+        self.plane.arena(self.owner.family()).memory().bytes
+    }
 }
 
 impl Drop for CheckoutSemantic {
@@ -635,6 +657,40 @@ impl CheckoutSemanticSlot {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Forgets a loaded lane of an idle root without waiting, so its
+    /// checkout runtime can drop, the view unbinds and the family arena drops
+    /// the runs no other view holds. The worker sees its channel close and
+    /// exits. The slot then reads as never started, so the next semantic
+    /// query's reload check starts a new lane, which loads the view again
+    /// from the family store.
+    ///
+    /// `None` when the lane's locks are held (the caller retries later);
+    /// `Some(None)` when no runtime is loaded, in which case the lane is left
+    /// as it is: a loading lane is still working and a failed one keeps its
+    /// named cause; `Some(Some(runtime))` with the runtime the slot let go.
+    pub(crate) fn try_release_idle(&self) -> Option<Option<Arc<CheckoutSemantic>>> {
+        let _publishing = try_lock(&self.publish)?;
+        let mut state = match self.state.try_write() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if !matches!(&*state, Some(CheckoutSemanticState::Ready(_))) {
+            return Some(None);
+        }
+        // Under the publish lock, like every other epoch change, so no
+        // publication of the released lane can still be in flight.
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        let released = match state.take() {
+            Some(CheckoutSemanticState::Ready(runtime)) => runtime,
+            _ => unreachable!("the lane was checked to be ready under its write lock"),
+        };
+        drop(state);
+        *lock(&self.wake) = None;
+        *lock(&self.retry) = None;
+        Some(Some(released))
     }
 
     /// Whether a views-on semantic lane was started for the root, in any

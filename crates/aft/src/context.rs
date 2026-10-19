@@ -79,6 +79,16 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static SEMANTIC_FAMILY_ARENA_MEASUREMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn semantic_family_arena_measurements_for_test() -> u64 {
+    SEMANTIC_FAMILY_ARENA_MEASUREMENTS.with(std::cell::Cell::get)
+}
+
 thread_local! {
     /// Set while this thread runs a closure under the configuration write
     /// lock (`update_config`). Reading the configuration there would wait on
@@ -11571,6 +11581,8 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.borrowed_index_cache.lock().clear();
+        // A contended lane is left loaded: this eviction does not wait for it.
+        let _ = self.try_release_idle_semantic_lane();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
@@ -11725,6 +11737,10 @@ impl AppContext {
         let Some(mut borrowed_index_cache) = self.borrowed_index_cache.try_lock() else {
             return false;
         };
+        // Last, so a contended lane leaves every other handle in place too.
+        if !self.try_release_idle_semantic_lane() {
+            return false;
+        }
         callgraph_store.take();
         search_index.take();
         semantic_index.take();
@@ -11741,6 +11757,61 @@ impl AppContext {
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
+        true
+    }
+
+    /// Count requests for a family-arena measurement on this thread. The idle
+    /// reaper test uses this hook to guard against adding an arena walk back to
+    /// the frame loop, even when its fixture has no semantic lane loaded.
+    #[cfg(test)]
+    pub(crate) fn semantic_family_arena_bytes_for_test(&self) -> Option<u64> {
+        SEMANTIC_FAMILY_ARENA_MEASUREMENTS.with(|count| count.set(count.get() + 1));
+        self.checkout_semantic
+            .runtime()
+            .map(|runtime| runtime.family_arena_bytes())
+    }
+
+    /// Let go of this root's loaded views-on semantic lane when its artifacts
+    /// are evicted for idleness. Without this an idle root keeps its overlay
+    /// and pins every arena run its view names until the daemon exits.
+    ///
+    /// The checkout runtime drops once its worker notices the closed lane and
+    /// exits; the view then unbinds and the family arena drops every run no
+    /// other view still holds. Runs shared with a live view stay. The next
+    /// semantic query on this root finds no lane, reports that semantic
+    /// search is reloading, and starts a new lane through the same reload
+    /// path that reopens an evicted legacy index.
+    ///
+    /// Returns false, releasing nothing, when the lane's locks are contended.
+    fn try_release_idle_semantic_lane(&self) -> bool {
+        let Some(released) = self.checkout_semantic.try_release_idle() else {
+            return false;
+        };
+        let Some(runtime) = released else {
+            return true;
+        };
+        // The watcher drain routes changes to the installed driver; a dropped
+        // lane's driver must not keep receiving them (or stay resident). The
+        // driver lock and the runtime's drop (its view unbind and arena trim)
+        // can wait, so neither runs on the caller's thread, which may be the
+        // subc frame loop.
+        let driver = Arc::downgrade(runtime.driver());
+        let drivers = self.checkout_driver.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aft-semantic-release".to_owned())
+            .spawn({
+                let drivers = drivers.clone();
+                move || {
+                    drivers.clear_if(runtime.driver());
+                    drop(runtime);
+                }
+            });
+        if spawned.is_err() {
+            // The runtime was dropped with the closure; only the driver is left.
+            if let Some(driver) = driver.upgrade() {
+                drivers.clear_if(&driver);
+            }
+        }
         true
     }
 
@@ -13121,6 +13192,28 @@ impl AppContext {
         semantic
             .counts
             .insert("worker_index_bytes".into(), worker_bytes);
+        // A views-on root serves semantic search from its checkout view. Its
+        // overlay (replacement entries not yet folded into a generation) is
+        // this root's own memory; the base runs it reads live in the family
+        // arena and are counted once process-wide, never here.
+        let overlay_bytes = match self.checkout_semantic.runtime() {
+            Some(runtime) => runtime.try_private_memory(),
+            None => Some(0),
+        };
+        match overlay_bytes {
+            Some(overlay_bytes) => {
+                semantic.estimated_bytes = semantic
+                    .estimated_bytes
+                    .map(|bytes| bytes.saturating_add(overlay_bytes));
+                semantic
+                    .counts
+                    .insert("checkout_overlay_bytes".into(), overlay_bytes);
+            }
+            None => {
+                semantic.bytes_status = "partial";
+                semantic.not_estimated.push("checkout_overlay_busy".into());
+            }
+        }
         let callgraph = match self.callgraph_store.try_read() {
             Ok(store) => store
                 .as_ref()

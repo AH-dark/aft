@@ -1,0 +1,1 @@
+- Semantic search with per-checkout views uses less memory: a checkout's edited files no longer keep a private copy of their vectors, and re-indexing an edited file shares the vectors of its unchanged symbols instead of copying them.

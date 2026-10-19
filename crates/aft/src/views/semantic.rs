@@ -58,6 +58,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// [`lock`] without waiting: `None` only while another thread holds it.
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 fn plane_error(reason: impl Into<String>) -> PlaneError {
     PlaneError {
         plane: FamilyPlane::Semantic,
@@ -1460,15 +1469,32 @@ impl SemanticPlane {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// This checkout's own resident semantic bytes: the replacement entries
-    /// and tombstones of its last overlay. Base runs live in the family arena
-    /// and are counted there once.
+    /// This checkout's own resident semantic bytes: the tombstones of its last
+    /// overlay and its handles to the replacement runs. Base and replacement
+    /// runs live in the family arena and are counted there once.
     pub fn private_memory(&self, access: &ViewAccess) -> u64 {
         let view = self.view(access);
         let state = lock(&view);
         state.cache.as_ref().map_or(0, |(_, index)| {
             index.estimated_memory().estimated_bytes.unwrap_or(0)
         })
+    }
+
+    /// [`Self::private_memory`] without waiting: `None` while the view's
+    /// state is locked (an overlay build holds it), `Some(0)` for a view this
+    /// plane does not hold. The memory census uses this so it never blocks.
+    pub fn try_private_memory(&self, access: &ViewAccess) -> Option<u64> {
+        let view = {
+            let views = try_lock(&self.views)?;
+            match views.get(&(access.family().to_owned(), access.scope().to_owned())) {
+                Some(view) => Arc::clone(view),
+                None => return Some(0),
+            }
+        };
+        let state = try_lock(&view)?;
+        Some(state.cache.as_ref().map_or(0, |(_, index)| {
+            index.estimated_memory().estimated_bytes.unwrap_or(0)
+        }))
     }
 
     /// Outstanding semantic work for the checkout, as a fill would see it.
@@ -2117,6 +2143,227 @@ mod tests {
         assert_canonical_blob(&worker, &edited);
     }
 
+    fn large_rel_path() -> RelPath {
+        RelPath::new(b"src/large.rs".to_vec()).unwrap()
+    }
+
+    /// A ready checkout of `large_source()` whose `src/large.rs` was then
+    /// edited in one definition and re-filled. Returns the checkout, the
+    /// edited snapshot, and the file's run before and after the edit.
+    fn refilled_large_checkout(
+        storage: &Path,
+        root: &Path,
+        plane: &Arc<SemanticPlane>,
+    ) -> (
+        Checkout,
+        Snapshot,
+        Arc<crate::semantic_index::SemanticVectors>,
+        Arc<crate::semantic_index::SemanticVectors>,
+    ) {
+        let source = large_source();
+        write_tree(root, &[("src/large.rs", &source)]);
+        let checkout = ready_checkout(storage, root, plane);
+        let producer = plane.semantic_producer();
+        let arena = plane.arena("family");
+        let old = arena
+            .get(&producer.key(source.as_bytes(), &large_rel_path()))
+            .expect("the unedited run is resident");
+        let edited = source.replace("input + 149\n", "input * 149\n");
+        let snapshot = edit_snapshot(&checkout, &edited);
+        let report = checkout.fill(&snapshot, &Model::default(), "model-a");
+        assert_eq!(
+            (report.chunk_reused, report.embedded_texts, report.installed),
+            (299, 1, 1),
+            "{report:?}"
+        );
+        let new = arena
+            .get(&producer.key(edited.as_bytes(), &large_rel_path()))
+            .expect("the re-filled run is resident");
+        (checkout, snapshot, old, new)
+    }
+
+    /// A re-fill reuses each unchanged chunk's stored vector. The new run must
+    /// point at the allocation the old run already holds rather than at a
+    /// fresh copy of the same floats.
+    #[test]
+    fn refill_of_an_edited_file_shares_reused_chunk_vectors() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let (_checkout, _snapshot, old, new) =
+            refilled_large_checkout(storage.path(), root.path(), &plane);
+        let shared = new
+            .vectors()
+            .filter(|vector| old.vectors().any(|old| Arc::ptr_eq(old, vector)))
+            .count();
+        assert_eq!(
+            shared, 299,
+            "reused chunks hold copies instead of the old run's vectors"
+        );
+        let memory = plane.arena("family").memory();
+        assert_eq!(
+            (memory.runs, memory.chunks, memory.vectors),
+            (2, 600, 301),
+            "{memory:?}"
+        );
+    }
+
+    /// The overlay a query scores holds the arena's replacement run itself:
+    /// no entry, string or vector of the edited file is copied for the view.
+    #[test]
+    fn overlay_holds_replacement_runs_without_copying_them() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let (checkout, snapshot, old, new) =
+            refilled_large_checkout(storage.path(), root.path(), &plane);
+        let index = plane
+            .overlay(&checkout.access, root.path(), &snapshot)
+            .unwrap()
+            .index;
+        assert!(
+            index
+                .view_runs_for_test()
+                .iter()
+                .any(|run| Arc::ptr_eq(run, &new)),
+            "the overlay does not reference the arena's replacement run"
+        );
+        let live = index.live_vectors_for_test();
+        assert_eq!(live.len(), 300);
+        assert!(
+            live.iter().all(|vector| old
+                .vectors()
+                .chain(new.vectors())
+                .any(|resident| Arc::ptr_eq(resident, vector))),
+            "the overlay scores a vector the arena does not hold"
+        );
+        let memory = index.estimated_memory();
+        assert_eq!(
+            (
+                memory.counts.get("vector_bytes").copied(),
+                memory.counts.get("text_bytes").copied()
+            ),
+            (Some(0), Some(0)),
+            "the overlay owns copied entries: {memory:?}"
+        );
+    }
+
+    /// Sharing changes where entries live, never what a query returns: the
+    /// overlay ranks exactly like a cold build, and a clone (which owns its
+    /// entries) ranks exactly like the overlay it was cloned from.
+    #[test]
+    fn overlay_results_after_refill_match_a_cold_build_and_a_private_copy() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let (checkout, snapshot, _old, _new) =
+            refilled_large_checkout(storage.path(), root.path(), &plane);
+        for text in ["definition 149", "input total", "definition_7"] {
+            let query = checkout.query(&snapshot, "model-a", text);
+            assert!(query.complete(), "{text}");
+            assert_eq!(query.results.len(), 100, "{text}");
+            assert_eq!(
+                rows(root.path(), &query.results),
+                cold(root.path(), "model-a", text),
+                "{text}"
+            );
+            let index = plane
+                .overlay(&checkout.access, root.path(), &snapshot)
+                .unwrap()
+                .index;
+            let private = (*index).clone();
+            assert!(private.view_runs_for_test().is_empty());
+            let query_vector = vector("model-a", text);
+            assert_eq!(
+                rows(root.path(), &private.search(&query_vector, 100)),
+                rows(root.path(), &index.search(&query_vector, 100)),
+                "{text}"
+            );
+        }
+    }
+
+    /// Resident vector bytes for one checkout with an overlay over a re-filled
+    /// large file, at the production vector width (1024 floats, 4 KiB). Every
+    /// distinct allocation reachable from the arena's runs or the overlay is
+    /// counted once.
+    #[test]
+    fn measurement_resident_vector_bytes_for_overlay_over_refilled_large_file() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = large_source();
+        write_tree(root.path(), &[("src/large.rs", &source)]);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
+        let mut wide = |texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let mut bytes = [0u8; 1024];
+                    blake3::Hasher::new()
+                        .update(text.as_bytes())
+                        .finalize_xof()
+                        .fill(&mut bytes);
+                    bytes
+                        .iter()
+                        .map(|byte| (f32::from(*byte) - 127.5) / 127.5)
+                        .collect()
+                })
+                .collect())
+        };
+        let snapshot = checkout.load();
+        plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut wide,
+                &|| snapshot.clone(),
+            )
+            .unwrap();
+        checkout.load();
+        let edited = source.replace("input + 149\n", "input * 149\n");
+        let snapshot = edit_snapshot(&checkout, &edited);
+        plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut wide,
+                &|| snapshot.clone(),
+            )
+            .unwrap();
+        let producer = plane.semantic_producer();
+        let arena = plane.arena("family");
+        let old = arena
+            .get(&producer.key(source.as_bytes(), &large_rel_path()))
+            .unwrap();
+        let new = arena
+            .get(&producer.key(edited.as_bytes(), &large_rel_path()))
+            .unwrap();
+        let index = plane
+            .overlay(&checkout.access, root.path(), &snapshot)
+            .unwrap()
+            .index;
+        let mut seen = HashSet::new();
+        let mut bytes = 0u64;
+        for vector in old
+            .vectors()
+            .chain(new.vectors())
+            .cloned()
+            .chain(index.live_vectors_for_test())
+        {
+            if seen.insert(Arc::as_ptr(&vector).cast::<f32>() as usize) {
+                bytes += crate::semantic_index::vector_bytes(&vector);
+            }
+        }
+        println!(
+            "measurement resident vectors: chunks_per_run=300 distinct_vectors={} vector_bytes={bytes} arena={:?}",
+            seen.len(),
+            arena.memory()
+        );
+        assert_eq!((seen.len(), bytes), (301, 301 * 4096));
+    }
+
     #[test]
     fn chunk_vector_stored_payload_is_compact_and_preserves_bits() {
         let storage = tempfile::tempdir().unwrap();
@@ -2673,7 +2920,8 @@ mod tests {
         );
         assert_eq!(plane.private_memory(&checkout.access), 0);
 
-        // Private memory is the edited files' replacements only.
+        // Private memory grows with the edited files (their tombstones and run
+        // handles) but holds none of their vectors.
         let edit = |files: &[(&str, &str)]| {
             write_tree(root.path(), files);
             let mut delta = LiveDelta::new(Arc::clone(generation.generation()));

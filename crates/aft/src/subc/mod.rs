@@ -13627,17 +13627,28 @@ mod tests {
         assert!(message.contains("retained: bash"));
         assert!(message.contains("parser_pool"));
 
+        let count_before_probe = crate::context::semantic_family_arena_measurements_for_test();
+        let _ = ctx.semantic_family_arena_bytes_for_test();
         assert_eq!(
-            reap_idle_roots(
-                Instant::now(),
-                &mut live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-                &DispatchPathMetrics::new(),
-            )
-            .evicted,
-            1
+            crate::context::semantic_family_arena_measurements_for_test(),
+            count_before_probe + 1,
+            "the test hook must count family-arena measurement requests"
+        );
+        let arena_measurements_before =
+            crate::context::semantic_family_arena_measurements_for_test();
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &DispatchPathMetrics::new(),
+        );
+        assert_eq!(outcome.evicted, 1);
+        assert_eq!(
+            crate::context::semantic_family_arena_measurements_for_test(),
+            arena_measurements_before,
+            "the frame-loop reaper must not measure the shared semantic family arena"
         );
         assert!(ctx.search_index().read().unwrap().is_none());
         wait_for_watcher_count(&ctx, 0);

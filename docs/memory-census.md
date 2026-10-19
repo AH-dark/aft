@@ -45,6 +45,7 @@ The `data` payload is:
       "evictable_in_ms": 1800000,
       "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "inspect": 0},
       "semantic_worker_bytes": 0,
+      "semantic_overlay_bytes": 0,
       "attributed_bytes": 0,
       "evictable_bytes": 0,
       "lsp_children": {"count": 0, "rss_bytes": 0}
@@ -56,6 +57,12 @@ The `data` payload is:
     "allocator_slack_bytes": 0,
     "allocator_slack_label": "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory",
     "sqlite_bytes": 0,
+    "shared_semantic_base_bytes": 0,
+    "semantic_arena_bytes": 0,
+    "semantic_resident_chunks": 0,
+    "semantic_arenas": [
+      {"storage": "/storage", "family": "<family>", "runs": 0, "chunks": 0, "bytes": 0}
+    ],
     "total_attributed_bytes": 0,
     "unattributed_bytes": 0,
     "last_relief_at_ms": null,
@@ -85,6 +92,19 @@ after each refresh (including failed refreshes); transient in-flight buffers,
 allocator capacity/size-class overhead and embedding models are not included.
 The richer status semantic estimate separates `serving_index_bytes` and
 `worker_index_bytes`.
+
+With views enabled, a root serves semantic search from its checkout view.
+`semantic_overlay_bytes` is that view's own overlay (replacement entries not
+yet folded into a generation) and is **already included** in
+`planes.semantic`. The vectors the view reads live in its family's arena,
+which every view of the family shares. Each family's arena is reported once in
+`process.semantic_arenas` (`runs`, `chunks`, `bytes`, largest first); their sum
+is `semantic_arena_bytes`, counted once in `total_attributed_bytes`.
+`semantic_resident_chunks` is the number of resident chunks, one embedding
+vector each, for comparison with allocator block counts. When the idle reaper
+evicts a root, it also releases the root's semantic view: the arena drops the
+runs no other view of the family still reads, and the root's next semantic
+query reports that semantic search is reloading until the view is loaded again.
 
 `evictable_in_ms` is null while a root has a bound
 route, and otherwise is the configured root idle TTL minus its request age

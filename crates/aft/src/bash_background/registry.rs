@@ -1011,6 +1011,12 @@ pub(crate) struct DbWriteOrder {
     /// Sequence number of the last row written. Held for the whole write, so
     /// it also serializes the task's own aft.db writes and fences.
     written: Mutex<u64>,
+    /// Counts this task's JSON metadata writes, and is held for each whole
+    /// write. Writers that hold `state` take it after `state`. The remote
+    /// output-progress checkpoint writes without holding `state`: it notes
+    /// the count while it holds `state`, then writes only if the count has
+    /// not moved since (see [`BgTaskRegistry::persist_task_checkpoint`]).
+    json_writes: Mutex<u64>,
 }
 
 /// A task's aft.db row captured under its state lock, written after it.
@@ -1055,6 +1061,13 @@ impl DbWriteOrder {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(session_id.to_string(), task_id.to_string()))
             .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Takes the JSON write lock; the guard holds the count of writes so far.
+    fn lock_json_writes(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.json_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Takes the flush lock and writes the pending row if it is newer than
@@ -1127,8 +1140,10 @@ impl<'a> DeferredDbWrites<'a> {
         }
     }
 
-    /// Must be called with the task's state lock held, right after the JSON
-    /// write it mirrors, so the sequence number follows the JSON write order.
+    /// Must be called right after the JSON write it mirrors, with that
+    /// task's JSON write lock still held (and, for writers holding the task's
+    /// state lock, that lock too), so the sequence number follows the JSON
+    /// write order.
     fn capture(&mut self, metadata: &PersistedTask) {
         let order = &self.task.db_write_order;
         let seq = order.captured.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2227,7 +2242,9 @@ impl BgTaskRegistry {
         db: &mut DeferredDbWrites<'_>,
     ) -> std::io::Result<()> {
         let layout = resolve_task_layout(&task.paths.session_dir, &task.paths.task_id)?;
+        let mut json_writes = task.db_write_order.lock_json_writes();
         write_task_at(&layout, metadata)?;
+        *json_writes += 1;
         db.capture(metadata);
         Ok(())
     }
@@ -2245,9 +2262,48 @@ impl BgTaskRegistry {
         F: FnOnce(&mut PersistedTask),
     {
         let layout = resolve_task_layout(&task.paths.session_dir, &task.paths.task_id)?;
+        let mut json_writes = task.db_write_order.lock_json_writes();
         let metadata = update_task_at(&layout, update)?;
+        *json_writes += 1;
         db.capture(&metadata);
         Ok(metadata)
+    }
+
+    /// Writes a remote task's output-progress checkpoint without holding its
+    /// state lock, so status readers are not blocked behind the file syncs.
+    ///
+    /// `metadata` was cloned under the state lock after the new cursor was
+    /// stored in the shared metadata, and `json_writes_seen` is the JSON write
+    /// count read at that moment. If another write has happened since, it
+    /// serialized the shared metadata, which already holds this cursor, and
+    /// this older snapshot must not replace it: the checkpoint is skipped.
+    /// Returns whether it was written.
+    #[cfg(unix)]
+    fn persist_task_checkpoint(
+        &self,
+        task: &BgTask,
+        metadata: &PersistedTask,
+        json_writes_seen: u64,
+    ) -> std::io::Result<bool> {
+        let layout = resolve_task_layout(&task.paths.session_dir, &task.paths.task_id)?;
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut json_writes = task.db_write_order.lock_json_writes();
+        if *json_writes != json_writes_seen {
+            return Ok(false);
+        }
+        super::persistence::write_task_checkpoint_at(&layout, metadata)?;
+        *json_writes += 1;
+        // Captured under the JSON write lock, so the aft.db rows keep the
+        // order of the JSON writes they mirror.
+        db.capture(metadata);
+        drop(json_writes);
+        Ok(true)
+    }
+
+    /// The task's JSON write count, read with its state lock held.
+    #[cfg(unix)]
+    fn json_writes_seen(task: &BgTask) -> u64 {
+        *task.db_write_order.lock_json_writes()
     }
 
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
@@ -6340,7 +6396,11 @@ impl BgTaskRegistry {
                 memo.session_read(&session_dir);
             }
         }
-        crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
+        // The collector runs every few seconds; a zero count is the normal
+        // case and logging it would flood the daemon log.
+        if retired > 0 {
+            crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
+        }
         memo.finish_pass(pass);
         gc_quarantine(storage_dir);
         Ok(deleted)

@@ -450,6 +450,163 @@ fn released_lane_frees_only_its_own_epoch() {
     );
 }
 
+/// Waits up to ten seconds for `done`, failing with `what`.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Idle eviction of a root lets go of its loaded semantic lane. The view
+/// unbinds and the family arena drops the run only that view held, while the
+/// runs another live view of the family still reads stay resident.
+#[test]
+fn idle_eviction_releases_the_lane_and_trims_only_its_own_runs() {
+    let storage = tempfile::tempdir().unwrap();
+    let evicted_root = tempfile::tempdir().unwrap();
+    let live_root = tempfile::tempdir().unwrap();
+    write_tree(evicted_root.path(), FILES);
+    write_tree(
+        evicted_root.path(),
+        &[(
+            "src/delta.rs",
+            "pub fn delta_only_here() -> u8 {\n    4\n}\n",
+        )],
+    );
+    write_tree(live_root.path(), FILES);
+    let model = Model::default();
+    let live = open(storage.path(), "idle-live", live_root.path());
+    refresh(&live, &model);
+
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config::default(),
+    );
+    let slot = ctx.checkout_semantic();
+    let (epoch, wake) = slot.begin();
+    let runtime = Arc::new(
+        CheckoutSemantic::new(
+            storage.path(),
+            "family",
+            "idle-evicted",
+            evicted_root.path(),
+            producer(),
+            Arc::downgrade(slot),
+        )
+        .unwrap(),
+    );
+    ctx.installed_checkout_driver()
+        .install(Arc::clone(runtime.driver()));
+    runtime.load().unwrap();
+    refresh(&runtime, &model);
+    assert!(slot.install(epoch, Arc::clone(&runtime)));
+    assert!(Arc::ptr_eq(runtime.plane(), live.plane()));
+
+    // The root's census row counts the view's own overlay, not the arena.
+    let semantic = ctx.memory_root_snapshot().semantic;
+    let overlay = runtime.memory().private;
+    assert_eq!(
+        semantic.counts.get("checkout_overlay_bytes"),
+        Some(&overlay)
+    );
+    assert_eq!(semantic.estimated_bytes, Some(overlay));
+
+    let arena = runtime.plane().arena("family");
+    let before = arena.memory();
+    assert_eq!(
+        before.runs, 4,
+        "three shared runs and one of the evicted view's own"
+    );
+    let released = Arc::downgrade(&runtime);
+    drop(runtime);
+
+    assert!(ctx.try_evict_idle_artifacts());
+    assert!(
+        !slot.active(),
+        "idle eviction kept the semantic lane loaded"
+    );
+    assert!(
+        wake.recv().is_err(),
+        "the released lane's worker channel stayed open"
+    );
+    wait_until("the released semantic view was never dropped", || {
+        released.upgrade().is_none()
+    });
+    wait_until("the released view's driver stayed installed", || {
+        ctx.installed_checkout_driver().get().is_none()
+    });
+    // The view unbinds inside the runtime's drop, after its last strong
+    // reference is gone, so wait for the trim rather than read it at once.
+    wait_until("the arena never trimmed the released view's run", || {
+        arena.memory().runs < before.runs
+    });
+    let after = arena.memory();
+    assert_eq!(after.runs, 3, "only the evicted view's own run is dropped");
+    assert!(after.bytes < before.bytes);
+    assert!(
+        query(&live, "alpha_total").complete(),
+        "the live view lost a shared run"
+    );
+}
+
+/// The memory census counts a family's arena runs once, however many views
+/// of the family are loaded, and adds them once to the process total.
+#[test]
+fn census_counts_a_family_arena_once_across_its_views() {
+    let storage = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_tree(first.path(), FILES);
+    write_tree(second.path(), FILES);
+    let model = Model::default();
+    let a = open(storage.path(), "census-a", first.path());
+    let b = open(storage.path(), "census-b", second.path());
+    refresh(&a, &model);
+    refresh(&b, &model);
+    let arena = a.plane().arena("family");
+    let memory = arena.memory();
+    assert_eq!(memory.runs, 3, "the two views share every run");
+    assert!(memory.bytes > 0);
+
+    let snapshot = crate::memory::MemorySnapshot::new("ready", Default::default());
+    let storage_label = arena.storage().display().to_string();
+    let rows: Vec<_> = snapshot
+        .semantic_arenas
+        .families
+        .iter()
+        .filter(|row| row.storage == storage_label)
+        .collect();
+    assert_eq!(rows.len(), 1, "the family was counted per view: {rows:?}");
+    assert_eq!(
+        (
+            rows[0].family.as_str(),
+            rows[0].runs,
+            rows[0].chunks,
+            rows[0].bytes
+        ),
+        ("family", memory.runs, memory.chunks, memory.bytes)
+    );
+    let families = &snapshot.semantic_arenas.families;
+    let process = &snapshot.process;
+    assert_eq!(
+        process.semantic_arena_bytes,
+        families.iter().map(|row| row.bytes).sum::<u64>()
+    );
+    assert_eq!(
+        process.semantic_resident_chunks,
+        families.iter().map(|row| row.chunks as u64).sum::<u64>()
+    );
+    assert_eq!(
+        process.total_attributed_bytes,
+        snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0)
+            + process.semantic_arena_bytes
+            + process.sqlite.memory_used_bytes,
+        "the arena is not in the process total exactly once"
+    );
+}
+
 const FILES: &[(&str, &str)] = &[
     (
         "src/alpha.rs",

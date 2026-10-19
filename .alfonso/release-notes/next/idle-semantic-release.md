@@ -1,0 +1,1 @@
+- Idle projects now release their semantic search vectors, which the daemon memory census now reports, and semantic search reports that it is reloading until the project's index is back.
