@@ -73,7 +73,9 @@
           {
             "kind": "field",
             "field": "inline_result",
-            "pattern": "^(?![\\s\\S]*Detached)(?=[\\s\\S]*(?<value>finished-inline))[\\s\\S]+$"
+            "pattern": "^(?![\\s\\S]*Detached)(?=[\\s\\S]*(?<value>finished-inline))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
           }
         ],
         "expected": {
