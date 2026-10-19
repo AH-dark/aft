@@ -307,6 +307,70 @@ fn applicability_walk_fifty_content_batches_do_zero_full_walks() {
     assert!(metrics.invalidations.is_empty());
 }
 
+#[test]
+fn applicability_walk_config_change_keeps_active_content_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("main.py");
+    std::fs::write(&source, "print(0)").unwrap();
+    let base_config = config(&root);
+    let mut unused_config = base_config.clone();
+    unused_config
+        .disabled_lsp
+        .insert("unused-server".to_owned());
+    let mut active_config = base_config;
+    active_config
+        .disabled_lsp
+        .insert("active-server".to_owned());
+    let cache = ApplicabilityCache::default();
+    let walk = |config: &Config| {
+        cache
+            .walk(
+                &root,
+                config,
+                Instant::now() + Duration::from_secs(10),
+                || Ok(scan(&root, config)),
+            )
+            .unwrap()
+    };
+
+    walk(&unused_config);
+    walk(&active_config);
+    let before_config_invalidation = cache.metrics(&root).full_walks;
+    cache.invalidate(
+        &root,
+        crate::lsp::applicability_cache::InvalidationCause::SelectionInput,
+    );
+    walk(&active_config);
+    let baseline = cache.metrics(&root).full_walks;
+    assert_eq!(
+        baseline,
+        before_config_invalidation + 1,
+        "the active config must rebuild"
+    );
+
+    for n in 1..=20 {
+        std::fs::write(&source, format!("print({n})")).unwrap();
+        cache.invalidate_batch(
+            &root,
+            std::slice::from_ref(&source),
+            crate::watcher_filter::watcher_event_is_content_only(&notify::EventKind::Modify(
+                notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+            )),
+        );
+        walk(&active_config);
+    }
+
+    let metrics = cache.metrics(&root);
+    assert_eq!(
+        metrics.full_walks - baseline,
+        0,
+        "content edits must not walk"
+    );
+    assert_eq!(metrics.retained_content_batches, 20);
+    assert_eq!(metrics.warm_validations, 20);
+}
+
 struct WatcherWalkFixture {
     _temp: tempfile::TempDir,
     root: PathBuf,

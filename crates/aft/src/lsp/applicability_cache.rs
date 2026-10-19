@@ -359,6 +359,7 @@ impl ApplicabilityCache {
             .iter()
             .any(|path| super::typescript_project::path_affects_typescript_selection(path));
         let mut ready = true;
+        let mut active_configurations = 0;
         let mut roots = HashSet::from([root.to_path_buf()]);
         let file_states: Vec<_> = if content_only {
             paths.iter().map(|path| PathState::read(path)).collect()
@@ -366,13 +367,30 @@ impl ApplicabilityCache {
             Vec::new()
         };
         {
-            let entries = self.entries.lock();
+            let mut entries = self.entries.lock();
+            // Invalidated snapshots from configurations nobody is using must
+            // not keep an otherwise warm configuration from retaining edits.
+            entries.retain(|(cached_root, _), flight| {
+                if !(cached_root.starts_with(root) || root.starts_with(cached_root))
+                    || Arc::strong_count(flight) > 1
+                {
+                    return true;
+                }
+                let state = flight.state.lock();
+                state.result.is_some() || state.running.is_some()
+            });
             for ((cached_root, _), flight) in entries.iter() {
                 if cached_root.starts_with(root) || root.starts_with(cached_root) {
                     known = true;
                     roots.insert(cached_root.clone());
                     let state = flight.state.lock();
-                    ready &= state.result.is_some() && state.running.is_none();
+                    if state.result.is_some()
+                        || state.running.is_some()
+                        || Arc::strong_count(flight) > 1
+                    {
+                        active_configurations += 1;
+                        ready &= state.result.is_some() && state.running.is_none();
+                    }
                     input_changed |= paths.iter().any(|path| {
                         state.inputs.contains(path)
                             || state
@@ -400,7 +418,7 @@ impl ApplicabilityCache {
                     }
                 )
             });
-        if content_only && known && ready && !input_changed {
+        if content_only && known && active_configurations > 0 && ready && !input_changed {
             for root in roots {
                 self.metrics
                     .lock()

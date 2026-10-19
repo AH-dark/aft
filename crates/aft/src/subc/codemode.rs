@@ -227,8 +227,8 @@ fn resolve_owner(
             .and_then(|head| head.attributes.agent_id.as_deref())
             == Some(agent_id)
     });
-    // Several channels of one head bind the same root and session; any
-    // disagreement means AFT can't tell whose access to use, so refuse.
+    // Channel order cannot choose between different access settings for one
+    // head, so refuse when routes disagree on any setting the call inherits.
     heads.sort_by_key(|(channel, identity)| {
         (
             identity.role != tool_provider::RouteRole::ToolProviderV1,
@@ -245,11 +245,18 @@ fn resolve_owner(
         ));
     };
     if heads.iter().any(|(_, other)| {
-        other.root != head.root || other.session != head.session || other.trust != head.trust
+        other.root != head.root
+            || other.project_root != head.project_root
+            || other.harness != head.harness
+            || other.session != head.session
+            || other.trust != head.trust
+            || other.spawn_principal != head.spawn_principal
+            || other.consumer_elicitation_capable != head.consumer_elicitation_capable
+            || other.disabled_tools != head.disabled_tools
     }) {
         return Err(not_bound(
             "head_route_ambiguous",
-            "the head scope's routes disagree on root, session or trust",
+            "the head scope's routes disagree on access settings",
             Some(agent_id),
             Some(run_id),
         ));

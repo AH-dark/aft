@@ -498,6 +498,12 @@ fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: Bind
     let mut identity = crate::subc::test_support::route_identity_with_trust(root, session, trust);
     {
         let data = Arc::get_mut(&mut identity.0).unwrap();
+        let primary = &f.routes[&channel(1)];
+        data.project_root = primary.project_root.clone();
+        data.harness = primary.harness.clone();
+        data.spawn_principal = primary.spawn_principal.clone();
+        data.consumer_elicitation_capable = primary.consumer_elicitation_capable;
+        data.disabled_tools = Arc::clone(&primary.disabled_tools);
         data.scope = Some(head_stamp("head-a", "agent-a"));
         data.call_mode = CallMode::Classic;
     }
@@ -525,6 +531,62 @@ fn codemode_head_routes_that_disagree_on_trust_are_ambiguous() {
     let mut f = linked_fixture();
     let root = f.head_root.clone();
     second_head(&mut f, &root, "head-a-session", BindTrust::Untrusted);
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_project_root_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    let second = f.routes.get_mut(&channel(3)).unwrap();
+    Arc::get_mut(&mut second.0)
+        .unwrap()
+        .project_root
+        .push("different-project-root");
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_harness_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    let second = f.routes.get_mut(&channel(3)).unwrap();
+    Arc::get_mut(&mut second.0).unwrap().harness = "another-harness".into();
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_spawn_principal_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    let second = f.routes.get_mut(&channel(3)).unwrap();
+    Arc::get_mut(&mut second.0).unwrap().spawn_principal =
+        crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty;
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_consumer_elicitation_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    let second = f.routes.get_mut(&channel(3)).unwrap();
+    Arc::get_mut(&mut second.0)
+        .unwrap()
+        .consumer_elicitation_capable = true;
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_disabled_tools_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    let second = f.routes.get_mut(&channel(3)).unwrap();
+    Arc::get_mut(&mut second.0).unwrap().disabled_tools = Arc::new(vec!["read".into()]);
     assert_eq!(refusal_reason(&f), "head_route_ambiguous");
 }
 
