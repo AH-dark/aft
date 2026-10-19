@@ -1637,7 +1637,7 @@ fn build_native_profile(
         policy.private_stores.read_allow.sort_unstable();
         policy.private_stores.read_allow.dedup();
         policy.private_stores.write_allow = project_roots.clone();
-        policy.private_stores.deny.push(session_store.clone());
+        policy.add_session_store_floor(session_store.clone());
         policy.private_stores.session_task_read_dir = Some(session_store.clone());
         let mut write_deny_nested = Vec::new();
         let mut shell_write_deny = Vec::new();
@@ -1851,7 +1851,7 @@ fn build_relaxed_profile(
     task_io: &Path,
     temp: &Path,
 ) -> Result<SandboxProfile, String> {
-    let policy = ctx
+    let mut policy = ctx
         .access_policy("")
         .map_err(|error| error.data.to_string())?;
     let mut read_deny = policy.absolute_floor.clone();
@@ -2016,6 +2016,16 @@ fn build_relaxed_profile(
         write_deny.push(binary);
     }
     stores.read_allow.retain(|path| path.exists());
+    // Relaxed mode has additional credential and store floors. Select grants
+    // against those same floors before making exceptions to checkout denies.
+    policy.absolute_floor = read_deny.clone();
+    policy.private_stores = stores.clone();
+    let write_grants = policy.shell_grants(crate::access_policy::AccessOperation::Write);
+    writable.extend(write_grants.iter().cloned());
+    stores.write_allow.extend(write_grants);
+    stores
+        .read_allow
+        .extend(policy.shell_grants(crate::access_policy::AccessOperation::Read));
     let mut profile = SandboxProfile {
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
@@ -7588,6 +7598,10 @@ mod git_policy_cache_tests {
         std::hint::black_box(heap);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "sandbox_scope_grants_tests.rs"]
+mod scope_grant_tests;
 
 #[cfg(test)]
 mod policy_tests {

@@ -472,6 +472,42 @@ impl Jail {
             )])),
             call_mode: None,
         };
+        self.bind(bind).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn bind_grant_head(&mut self) {
+        let root = self.base.clone();
+        self.bind(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new(&root, "runner", "head-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(
+                serde_json::from_value(json!({
+                    "owner": {"kind":"reserved","module_id":"prefrontal-core"},
+                    "ref":"head-scope", "scope_epoch":7, "kind":"head",
+                    "owner_authorized":true, "attributes":{"agent_id":"head"},
+                }))
+                .unwrap(),
+            ),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .await;
+    }
+
+    async fn bind(&mut self, bind: ModuleControlRequest) {
         let corr = self.next_corr;
         self.next_corr += 1;
         write_frame(
@@ -498,6 +534,44 @@ impl Jail {
                 )
             });
         assert_eq!(response, ModuleControlResponse::RouteBindAck {});
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn allow_paths(&mut self, paths: Value) {
+        for channel in [2, 1] {
+            let corr = self.next_corr;
+            self.next_corr += 1;
+            write_frame(
+                &mut self.stream,
+                &Frame::build(
+                    FrameType::Request,
+                    flags(),
+                    channel,
+                    1,
+                    corr,
+                    serde_json::to_vec(&json!({
+                        "name":"tool.catalog",
+                        "arguments":{"preset":"worker","params":{"allow_paths":paths}},
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let frame = loop {
+                let frame = next_frame(&mut self.stream).await;
+                if frame.header.channel == channel && frame.header.corr == corr {
+                    break frame;
+                }
+            };
+            assert_eq!(
+                frame.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&frame.body)
+            );
+        }
     }
 
     async fn submit_tool(&mut self, name: &str, arguments: Value) -> u64 {
@@ -565,6 +639,51 @@ impl Jail {
     async fn bash(&mut self, command: &str) -> String {
         self.tool("bash", json!({"command": command, "timeout": 300_000}))
             .await
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_allow_paths_bash_writes_work_grant_but_not_siblings() {
+    for profile in ["relaxed", "strict"] {
+        let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
+        jail.bind_grant_head().await;
+        // Wait for persistence before catalog materializes the worker's grants.
+        let ready = jail.bash("printf READY").await;
+        assert!(ready.contains("READY"), "{ready}");
+        let granted = jail.home.join("Work/granted");
+        let sibling = jail.home.join("Work/ungranted");
+        let nested = jail.main.join("granted");
+        for path in [&granted, &sibling, &nested] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        jail.allow_paths(json!([
+            {"path":granted,"mode":"write"}, {"path":nested,"mode":"write"},
+        ]))
+        .await;
+        let output = jail.bash(&format!(
+            "printf granted > {}/result && echo GRANT_WRITABLE; printf nested > {}/result && echo NESTED_WRITABLE; printf sibling > {}/result; printf checkout > {}/ungranted-result",
+            quote(&granted), quote(&nested), quote(&sibling), quote(&jail.main),
+        )).await;
+        assert!(output.contains("GRANT_WRITABLE"), "{profile}: {output}");
+        assert!(output.contains("NESTED_WRITABLE"), "{profile}: {output}");
+        assert!(
+            output.contains("Operation not permitted"),
+            "{profile}: {output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(granted.join("result")).unwrap(),
+            "granted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(nested.join("result")).unwrap(),
+            "nested"
+        );
+        assert!(!sibling.join("result").exists(), "{profile}: {output}");
+        assert!(
+            !jail.main.join("ungranted-result").exists(),
+            "{profile}: {output}"
+        );
     }
 }
 

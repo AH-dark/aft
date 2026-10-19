@@ -1,8 +1,7 @@
 //! Grant operations and launch validation use daemon-attested route ancestry.
 use super::*;
 use crate::access_policy::{
-    policy_path, AccessDecision, AccessDenial, AccessGrant, AccessOperation, AccessPolicy,
-    GrantKind, HeadPolicy,
+    policy_path, AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,
 };
 use crate::db::access_grants::{self as store, ScopeKey};
 
@@ -571,10 +570,18 @@ pub(super) fn validate(
         let Some(head) = head else {
             return Err(param_refused(index, path_value, "head_not_held"));
         };
-        if head.decide_capability(mode, GrantKind::Subtree, &grant.path)
-            == AccessDecision::Deny(AccessDenial::Floor)
-        {
-            return Err(param_refused(index, path_value, "denied_floor"));
+        if let Some(floor) = head.capability_floor(mode, GrantKind::Subtree, &grant.path) {
+            let mut error = param_refused(index, path_value, "denied_floor");
+            error.message.push_str(&format!(
+                " ({}: {})",
+                floor.rule.description(),
+                floor.path.display()
+            ));
+            if let Some(detail) = error.detail.as_mut() {
+                detail["floor_rule"] = json!(floor.rule.label());
+                detail["floor_path"] = json!(floor.path);
+            }
+            return Err(error);
         }
         if head.head_policy(&grant) != HeadPolicy::Allow {
             return Err(param_refused(index, path_value, "head_not_held"));
