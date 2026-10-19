@@ -3461,6 +3461,49 @@ fn redaction_replay_withholds_new_secret_output() {
 }
 
 #[test]
+fn redaction_replay_withholds_output_from_inherited_secret_environment() {
+    const SECRET: &str = "planted inherited OpenAI API key";
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-inherited-secret");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let mut owner = AftProcess::spawn_with_env(&[("OPENAI_API_KEY", std::ffi::OsStr::new(SECRET))]);
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' \"$OPENAI_API_KEY\"",
+        shell_quote_path(&release),
+    );
+    let id = spawn_redaction_task(&mut owner, &command, json!({}));
+    wait_for_status(&mut owner, SESSION, &id, "running");
+    let persisted = read_json(storage.path(), SESSION, &id);
+    assert_eq!(
+        persisted["completion_has_env_secrets"], true,
+        "the inherited secret is part of the child's environment"
+    );
+    sigkill_aft(owner);
+
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    drop(release_guard);
+    wait_for_status(&mut restored, SESSION, &id, "completed");
+    let drained = drain(&mut restored, SESSION);
+    let completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == id)
+        .unwrap();
+    let preview = completion["output_preview"].as_str().unwrap();
+    assert!(
+        preview.contains("secret values aren't available after the daemon restarted"),
+        "{completion}"
+    );
+    assert!(preview.contains("bash_status"), "{completion}");
+    assert!(!preview.contains(SECRET));
+    assert!(restored.shutdown().success());
+}
+
+#[test]
 fn redaction_replay_shows_new_output_without_env_secrets() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
@@ -3474,6 +3517,11 @@ fn redaction_replay_shows_new_output_without_env_secrets() {
     );
     let id = spawn_redaction_task(&mut owner, &command, json!({}));
     wait_for_status(&mut owner, SESSION, &id, "running");
+    let persisted = read_json(storage.path(), SESSION, &id);
+    assert_eq!(
+        persisted["completion_has_env_secrets"], false,
+        "the task has no secret-named values in its daemon or request environment"
+    );
     sigkill_aft(owner);
     let mut restored = AftProcess::spawn();
     configure_background(&mut restored, project.path(), storage.path(), SESSION);
