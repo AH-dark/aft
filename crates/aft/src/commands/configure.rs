@@ -2513,39 +2513,62 @@ fn prewarm_symbol_cache_from_search_files(
     let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
     if !is_worktree_bridge {
         if let Some(storage_dir) = symbol_storage.as_deref() {
-            if let Ok(cache) = symbol_cache.read() {
+            let needs_persistence = {
+                let Ok(cache) = symbol_cache.read() else {
+                    return;
+                };
                 if cache.generation() != symbol_cache_generation {
                     slog_info!("skipping stale symbol cache persistence after reconfigure");
                     return;
                 }
-                // Disk-load repairs and actual entry changes advance the cache revision;
-                // a fully unchanged warm load leaves it equal to the persisted revision.
-                if !cache.needs_persistence() {
-                    slog_debug!("symbol cache unchanged, skipping persistence");
-                } else {
-                    let persistence_revision = cache.persistence_revision();
-                    let persisted_files = cache.len();
-                    let write_result = crate::symbol_cache_disk::write_to_disk(
-                        &cache,
-                        storage_dir,
-                        &symbol_project_key,
-                    );
-                    drop(cache);
-                    match write_result {
-                        Ok(()) => {
-                            if let Ok(mut cache) = symbol_cache.write() {
-                                cache.mark_persisted_for_generation(
-                                    symbol_cache_generation,
-                                    persistence_revision,
-                                );
+                cache.needs_persistence()
+            };
+            if needs_persistence {
+                // Wait for other processes without a cache guard: the watcher needs
+                // the write guard to invalidate edits even while the disk is busy.
+                let disk_lock = match crate::symbol_cache_disk::SymbolCacheLock::acquire(
+                    storage_dir,
+                    &symbol_project_key,
+                    &root,
+                ) {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        slog_warn!("failed to acquire symbol cache disk lock: {}", error);
+                        return;
+                    }
+                };
+                if let Ok(cache) = symbol_cache.read() {
+                    if cache.generation() != symbol_cache_generation {
+                        slog_info!("skipping stale symbol cache persistence after reconfigure");
+                        return;
+                    }
+                    // Disk-load repairs and actual entry changes advance the cache revision;
+                    // a fully unchanged warm load leaves it equal to the persisted revision.
+                    if !cache.needs_persistence() {
+                        slog_debug!("symbol cache unchanged, skipping persistence");
+                    } else {
+                        let persistence_revision = cache.persistence_revision();
+                        let persisted_files = cache.len();
+                        let write_result = disk_lock.write_to_disk(&cache);
+                        drop(cache);
+                        match write_result {
+                            Ok(()) => {
+                                if let Ok(mut cache) = symbol_cache.write() {
+                                    cache.mark_persisted_for_generation(
+                                        symbol_cache_generation,
+                                        persistence_revision,
+                                    );
+                                }
+                                slog_info!("persisted symbol cache: {} files", persisted_files);
                             }
-                            slog_info!("persisted symbol cache: {} files", persisted_files);
-                        }
-                        Err(error) => {
-                            slog_warn!("failed to persist symbol cache: {}", error);
+                            Err(error) => {
+                                slog_warn!("failed to persist symbol cache: {}", error);
+                            }
                         }
                     }
                 }
+            } else {
+                slog_debug!("symbol cache unchanged, skipping persistence");
             }
         }
     }
@@ -8505,6 +8528,109 @@ mod tests {
         let cache = shared.read().expect("read final symbol cache");
         assert_eq!(cache.len(), sources.len());
         assert!(sources.iter().all(|path| cache.contains_key(path)));
+    }
+
+    fn symbol_cache_disk_lock_wait_allows_mutation(reset: bool) {
+        let _guard = symbol_cache_prewarm_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let project_key = "contended-prewarm";
+        let source =
+            write_symbol_cache_source(project.path(), "src/lib.rs", "pub fn edited() {}\n");
+        crate::root_cache::configure_artifact_access(project.path(), project_key, false);
+        let held_lock = crate::symbol_cache_disk::SymbolCacheLock::acquire(
+            storage.path(),
+            project_key,
+            project.path(),
+        )
+        .expect("hold disk lock while prewarm persists");
+        let shared = Arc::new(RwLock::new(SymbolCache::new()));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let root = project.path().to_path_buf();
+        let storage_dir = storage.path().to_path_buf();
+        let files = vec![symbol_file(&source)];
+        let writer_cache = shared.clone();
+        let writer = std::thread::spawn(move || {
+            crate::symbol_cache_disk::observe_next_lock_acquisition(waiting_tx);
+            super::prewarm_symbol_cache_from_search_files(
+                root,
+                writer_cache,
+                Some(storage_dir),
+                project_key.to_string(),
+                0,
+                files,
+                false,
+            );
+            done_tx.send(()).expect("report prewarm completion");
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("prewarm should reach the contended disk lock");
+
+        let (invalidated_tx, invalidated_rx) = std::sync::mpsc::channel();
+        let watcher_cache = shared.clone();
+        let watcher = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut cache = watcher_cache
+                .write()
+                .expect("watcher acquires cache write guard");
+            if reset {
+                cache.reset();
+            } else {
+                cache.invalidate(&source);
+            }
+            invalidated_tx
+                .send(started.elapsed())
+                .expect("report watcher invalidation");
+        });
+        let invalidation = invalidated_rx.recv_timeout(Duration::from_millis(500));
+        let writer_still_waiting = matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        // Release the disk lock before asserting so a regression cannot strand either thread.
+        drop(held_lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("prewarm should finish after releasing the disk lock");
+        writer.join().expect("prewarm thread");
+        watcher.join().expect("watcher thread");
+
+        assert!(
+            writer_still_waiting,
+            "disk writes must remain excluded by the held lock"
+        );
+        let elapsed = invalidation.expect("watcher invalidation blocked by disk lock wait");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "watcher took {elapsed:?}"
+        );
+        assert_eq!(shared.read().expect("read invalidated cache").len(), 0);
+        let disk = crate::symbol_cache_disk::read_from_disk(storage.path(), project_key);
+        if reset {
+            assert!(
+                disk.is_none(),
+                "stale prewarm must not persist after a reset"
+            );
+        } else {
+            assert!(
+                disk.expect("read persisted invalidation").is_empty(),
+                "persistence must read the cache after the lock wait"
+            );
+        }
+    }
+
+    #[test]
+    fn configure_symbol_cache_disk_lock_wait_does_not_block_watcher_invalidation() {
+        symbol_cache_disk_lock_wait_allows_mutation(false);
+    }
+
+    #[test]
+    fn configure_symbol_cache_reset_during_disk_lock_wait_skips_persistence() {
+        symbol_cache_disk_lock_wait_allows_mutation(true);
     }
 
     #[test]
