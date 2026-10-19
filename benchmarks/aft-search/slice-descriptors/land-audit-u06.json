@@ -1,0 +1,13 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Audit slice u06: git-less root identity records, standing backoff, backup and volume safety; search_index.rs identity derivation only, ranking unchanged. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
