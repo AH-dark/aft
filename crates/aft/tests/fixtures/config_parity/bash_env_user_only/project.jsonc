@@ -1,0 +1,8 @@
+{
+  "bash": {
+    "env": {
+      "TZ": "Mars",
+      "AFT_PARITY_PROJECT_ENV": "project-value"
+    }
+  }
+}

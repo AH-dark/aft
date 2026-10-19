@@ -33,9 +33,28 @@ fn wait_until_process_exits(pid: i32) -> bool {
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    // Keep background task storage per test. AftProcess::spawn() uses one
-    // AFT_CACHE_DIR per test binary process, so parallel integration tests
-    // would otherwise replay and mutate each other's live background tasks.
+    configure_background_at_root(
+        aft,
+        &dir,
+        user_config(serde_json::json!({
+            "experimental": { "bash": { "background": true } }
+        })),
+    );
+    dir
+}
+
+#[cfg(unix)]
+fn configure_background_with_env(aft: &mut AftProcess, env: Value) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    configure_background_at_root(
+        aft,
+        &dir,
+        user_config(serde_json::json!({ "bash": { "background": true, "env": env } })),
+    );
+    dir
+}
+
+fn configure_background_at_root(aft: &mut AftProcess, dir: &tempfile::TempDir, config: Value) {
     let storage_dir = dir.path().join("aft-storage");
     std::fs::create_dir_all(&storage_dir).unwrap();
     let response = aft.send(
@@ -45,14 +64,11 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": storage_dir,
-            "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
-            })),
+            "config": config,
         })
         .to_string(),
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
-    dir
 }
 
 fn configure_restricted_background(aft: &mut AftProcess) -> (tempfile::TempDir, tempfile::TempDir) {
@@ -81,7 +97,7 @@ fn spawn_bg(aft: &mut AftProcess, id: &str, command: &str) -> String {
         &json!({
             "id": id,
             "command": "bash",
-            "params": { "command": command, "background": true }
+            "params": { "command": command, "background": true, "foreground_orchestrate": true }
         })
         .to_string(),
     );
@@ -903,6 +919,198 @@ fn pty_spawn_honors_requested_terminal_dimensions() {
     windows,
     ignore = "POSIX-only harness (`sh` loop); Unix + Windows native E2E cover this"
 )]
+#[cfg(unix)]
+#[test]
+fn duplicate_running_bash_warns_only_for_same_project_root_and_workdir() {
+    let mut aft = AftProcess::spawn();
+    let project = configure_background(&mut aft);
+    let command = "  sleep 30  ";
+    let first = aft.send(
+        &json!({
+            "id": "duplicate-first",
+            "command": "bash",
+            "params": { "command": command, "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    assert_eq!(first["success"], true, "first spawn failed: {first:?}");
+    let first_id = first["task_id"].as_str().unwrap();
+
+    let same_session = aft.send(
+        &json!({
+            "id": "duplicate-same-session",
+            "command": "bash",
+            "params": { "command": "sleep 30", "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    let same_session_output = same_session["output"].as_str().unwrap();
+    assert!(
+        same_session_output.contains(first_id),
+        "{same_session_output}"
+    );
+    assert!(
+        same_session_output.contains("same session"),
+        "{same_session_output}"
+    );
+    let same_session_id = same_session["task_id"].as_str().unwrap();
+
+    let from_subagent = aft.send(
+        &json!({
+            "id": "duplicate-subagent",
+            "command": "bash",
+            "session_id": "subagent-session",
+            "params": { "command": "sleep 30", "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        from_subagent["success"], true,
+        "duplicate spawn failed: {from_subagent:?}"
+    );
+    let subagent_output = from_subagent["output"].as_str().unwrap();
+    assert!(
+        subagent_output.contains(same_session_id),
+        "{subagent_output}"
+    );
+    assert!(
+        subagent_output.contains("another session"),
+        "{subagent_output}"
+    );
+    assert!(subagent_output.contains("ago"), "{subagent_output}");
+
+    let nested = project.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let different_workdir = aft.send(
+        &json!({
+            "id": "duplicate-different-workdir",
+            "command": "bash",
+            "params": { "command": "sleep 30", "background": true, "workdir": nested, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    let different_workdir_output = different_workdir["output"].as_str().unwrap();
+    assert!(!different_workdir_output.contains("matching command is already running"));
+
+    let mut other_root_aft = AftProcess::spawn();
+    let other_root = configure_background(&mut other_root_aft);
+    assert_ne!(project.path(), other_root.path());
+    let other_root_response = other_root_aft.send(
+        &json!({
+            "id": "duplicate-other-root",
+            "command": "bash",
+            "params": {
+                "command": "sleep 30",
+                "background": true,
+                "foreground_orchestrate": true,
+                "workdir": project.path()
+            }
+        })
+        .to_string(),
+    );
+    let other_root_output = other_root_response["output"].as_str().unwrap();
+    assert!(!other_root_output.contains("matching command is already running"));
+
+    assert!(aft.shutdown().success());
+    assert!(other_root_aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn finished_duplicate_bash_task_does_not_warn() {
+    let mut aft = AftProcess::spawn();
+    let _project = configure_background(&mut aft);
+    let task_id = spawn_bg(&mut aft, "duplicate-finished-first", "printf done");
+    let finished = wait_for_status(&mut aft, &task_id, "completed");
+    assert_eq!(finished["exit_code"], 0);
+
+    let next = aft.send(
+        &json!({
+            "id": "duplicate-finished-next",
+            "command": "bash",
+            "params": { "command": "printf done", "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    let output = next["output"].as_str().unwrap();
+    assert!(!output.contains("matching command is already running"));
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn user_bash_env_is_applied_and_disclosed_once_without_values() {
+    let mut aft = AftProcess::spawn();
+    let _project = configure_background_with_env(
+        &mut aft,
+        json!({
+            "AFT_CONFIG_ENV_TEST": "config-secret-value",
+            "AFT_SECOND_CONFIG_ENV_TEST": "second-secret-value"
+        }),
+    );
+    let command = "printf '%s' \"$AFT_CONFIG_ENV_TEST\"";
+    let from_config = aft.send(
+        &json!({
+            "id": "config-env-first",
+            "command": "bash",
+            "params": { "command": command, "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        from_config["success"], true,
+        "spawn failed: {from_config:?}"
+    );
+    let first_reply = from_config["output"].as_str().unwrap();
+    assert!(first_reply.contains("AFT_CONFIG_ENV_TEST"), "{first_reply}");
+    assert!(
+        first_reply.contains("AFT_SECOND_CONFIG_ENV_TEST"),
+        "{first_reply}"
+    );
+    assert!(
+        !first_reply.contains("config-secret-value"),
+        "{first_reply}"
+    );
+    assert!(
+        !first_reply.contains("second-secret-value"),
+        "{first_reply}"
+    );
+    let first_id = from_config["task_id"].as_str().unwrap();
+    let first_result = wait_for_status(&mut aft, first_id, "completed");
+    assert_eq!(first_result["output_preview"], "config-secret-value");
+
+    let from_call = aft.send(
+        &json!({
+            "id": "config-env-override",
+            "command": "bash",
+            "params": {
+                "command": command,
+                "background": true,
+                "foreground_orchestrate": true,
+                "env": { "AFT_CONFIG_ENV_TEST": "call-secret-value" }
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(from_call["success"], true, "spawn failed: {from_call:?}");
+    let second_reply = from_call["output"].as_str().unwrap();
+    assert!(
+        !second_reply.contains("AFT_CONFIG_ENV_TEST"),
+        "{second_reply}"
+    );
+    assert!(
+        !second_reply.contains("call-secret-value"),
+        "{second_reply}"
+    );
+    let second_result = wait_for_status(
+        &mut aft,
+        from_call["task_id"].as_str().unwrap(),
+        "completed",
+    );
+    assert_eq!(second_result["output_preview"], "call-secret-value");
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn background_spawn_status_running_and_completion() {
     let mut aft = AftProcess::spawn();

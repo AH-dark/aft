@@ -479,12 +479,18 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
               },
+              env: {
+                type: "object",
+                additionalProperties: { type: "string" },
+                description:
+                  "Fixed shell environment variables from user config only. Project config cannot set this map; per-call env values override it. Loader, shell/interpreter startup hooks, PATH, and other protected keys are rejected.",
+              },
             },
             additionalProperties: false,
           },
         ],
         description:
-          "Bash runtime configuration (runtime gate + rewrite + compress + background execution). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*` (still accepted for backward compat).",
+          "Bash runtime configuration (runtime gate + rewrite + compress + background execution and user-only environment defaults). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*` (still accepted for backward compat).",
       },
 
       experimental: {

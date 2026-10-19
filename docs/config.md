@@ -16,6 +16,8 @@ OMP uses this same CortexKit user file; register its Pi-compatible plugin with `
 
 `bash.worker_wait_max_ms` bounds blocking `bash` calls in every session, including heads (`wait: true`, or foreground calls forced to block, such as when `bash.subagent_background` is false). It also bounds delegated (subagent) `bash_watch` calls, including an explicit timeout. Head watches still use `bash.watch_sync_max_ms`. At the limit the command is not killed: it keeps running in the background, and the caller gets its task id, elapsed time and latest output, so it can inspect it, wait again where `bash_watch` is available, or `bash_kill` it. Blocking calls and worker watches push the command's default 30-minute hard kill to at least this long after the wait; an explicit command `timeout` is never extended. The default is `1800000` (30 minutes); a value below `60000` is a config error that drops the `bash` block, not a silent clamp. User and project config may both set it, and harness blocks override it like the other `bash` keys. The key was originally worker-only; its name is retained so existing user and project configurations keep working when blocking head calls use it too.
 
+`bash.env` adds fixed variables to every shell command from user config only (for example, `"env": { "TZ": "UTC" }`). Project config cannot set environment values. Per-call `env` entries override these defaults, and user-config changes apply to future commands without a restart. Loader, shell/interpreter startup, `PATH`, and other protected variables are rejected while loading config. The first bash reply in each session lists the configured keys only, never their values. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
+
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
 
 On macOS, `bash.disclaim_privacy: true` makes agent shells (including background, PTY, and governed `gh` commands) responsible for their own privacy permissions instead of inheriting the supervisor's grants. It defaults to `false`; user config controls it and project config may only turn it on. It is live-reloadable for future commands, not already-running children, and accepted but inert on other platforms. Disclaimed shells cannot rely on inherited access to protected folders such as `~/Downloads`; agents should use AFT's in-process `read` tool for those files (`grep` and `glob` are also unaffected). If macOS cannot apply the responsibility attribute, AFT refuses the command with `privacy disclaim unavailable` rather than running it with inherited grants. Effective per-root settings appear in health, and the first disclaimed command logs an informational message per session.
@@ -301,6 +303,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   "bash": {
     // Runtime gate. Default true.
     "enabled": true,
+
+    // Fixed extra variables for every shell command. User-tier only; project
+    // config cannot set environment values. Per-call env overrides these.
+    // Protected loader, shell/interpreter startup and PATH variables are refused.
+    "env": { "TZ": "UTC" },
 
     // Rewrite common shell commands (cat / grep / find / sed / ls / rg / cat >>)
     // to AFT tools. Adds a footer hint nudging the agent to call the AFT tool

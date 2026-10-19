@@ -892,6 +892,15 @@ const CASES: ParityCase[] = [
   },
   { name: "bash_db_schema_hints_user_off", user: { bash: { db_schema_hints: false } } },
   {
+    name: "bash_env_user_only",
+    user: { bash: { env: { TZ: "UTC", AFT_PARITY_USER_ENV: "user-value" } } },
+    project: { bash: { env: { TZ: "Mars", AFT_PARITY_PROJECT_ENV: "project-value" } } },
+  },
+  {
+    name: "bash_env_project_only_dropped",
+    project: { bash: { env: { AFT_PARITY_PROJECT_ENV: "project-value" } } },
+  },
+  {
     name: "idle_user_tier",
     user: { idle: { root_ttl_minutes: 20, lsp_ttl_minutes: 5 } },
   },

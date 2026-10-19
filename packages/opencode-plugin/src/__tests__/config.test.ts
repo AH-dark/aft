@@ -760,6 +760,46 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
   });
 
+  test("bash.env is retained from user config and ignored from project config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ bash: { env: { TZ: "UTC", AFT_USER_ENV_TEST: "user-value" } } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ bash: { env: { TZ: "Mars", AFT_PROJECT_ENV_TEST: "project-value" } } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout).bash.env).toEqual({
+      TZ: "UTC",
+      AFT_USER_ENV_TEST: "user-value",
+    });
+    expect(result.stderr).toContain("bash.env");
+    expect(result.stderr).toContain("user-level config");
+  });
+
+  test("blocked bash.env keys are refused while loading user config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ bash: { env: { NODE_OPTIONS: "--require secret-module" } } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout).bash).toBeUndefined();
+    expect(result.stderr).toContain("bash.env key NODE_OPTIONS is blocked");
+  });
+
   test("deep merges project config on top of user config", () => {
     const fixture = createConfigFixture();
     writeFileSync(

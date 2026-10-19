@@ -43,6 +43,7 @@ export interface ResolvedBashForLiveReload {
   subagent_background: boolean;
   watch_sync_max_ms: number;
   worker_wait_max_ms: number;
+  env: Record<string, string>;
 }
 
 type AnyConfig = Record<string, unknown>;
@@ -131,6 +132,7 @@ export function aftLiveConfigKeys<C>(
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),
+    bashKey<C>("env", resolveBash),
   ];
 }
 

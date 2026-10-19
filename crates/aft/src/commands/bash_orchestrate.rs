@@ -451,11 +451,31 @@ fn observe_raw_bash_response(
 pub fn build_bash_outcome(
     req: &RawRequest,
     ctx: &AppContext,
-    spawn_response: Response,
+    mut spawn_response: Response,
 ) -> DispatchOutcome {
     if !spawn_response.success {
         return DispatchOutcome::Immediate(spawn_response);
     }
+
+    let (duplicate_warning, env_keys) = spawn_response
+        .data
+        .as_object_mut()
+        .map(|data| {
+            let warning = data
+                .remove("_bash_duplicate_warning")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            let keys = data.remove("_bash_env_keys").and_then(|value| {
+                value.as_array().map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+            });
+            (warning, keys)
+        })
+        .unwrap_or_default();
 
     let params = parse_params(req).unwrap_or_default();
     let worker_session = req.worker_session();
@@ -494,6 +514,11 @@ pub fn build_bash_outcome(
             ),
         );
         response.data["status"] = spawn_response.data["status"].clone();
+        append_bash_reply_notices(
+            &mut response,
+            duplicate_warning.as_deref(),
+            env_keys.as_deref(),
+        );
         return DispatchOutcome::Immediate(response);
     }
 
@@ -624,6 +649,14 @@ pub fn build_bash_outcome(
                 &task_id_for_poll,
             ))
         };
+        let response = response.map(|mut response| {
+            append_bash_reply_notices(
+                &mut response,
+                duplicate_warning.as_deref(),
+                env_keys.as_deref(),
+            );
+            response
+        });
 
         if response.is_some() {
             wait_registration.take();
@@ -1160,6 +1193,46 @@ fn push_line(output: &mut String, line: &str) {
         output.push('\n');
     }
     output.push_str(line);
+}
+
+fn append_bash_reply_notices(
+    response: &mut Response,
+    duplicate_warning: Option<&str>,
+    env_keys: Option<&[String]>,
+) {
+    if !response.success {
+        return;
+    }
+    let Some(output) = response
+        .data
+        .get_mut("output")
+        .and_then(|value| value.as_str().map(str::to_owned))
+    else {
+        return;
+    };
+    let mut notices = Vec::new();
+    if let Some(warning) = duplicate_warning {
+        notices.push(warning.to_string());
+    }
+    if let Some(keys) = env_keys.filter(|keys| !keys.is_empty()) {
+        notices.push(format!(
+            "Configured bash.env keys applied (values not shown): {}.",
+            keys.join(", ")
+        ));
+    }
+    if notices.is_empty() {
+        return;
+    }
+    let mut combined = output;
+    for notice in notices {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&notice);
+    }
+    if let Some(data) = response.data.as_object_mut() {
+        data.insert("output".to_string(), Value::String(combined));
+    }
 }
 
 fn background_launch_response(

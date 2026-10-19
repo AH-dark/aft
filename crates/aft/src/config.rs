@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -769,6 +769,10 @@ pub struct BashConfig {
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
+    /// Fixed environment entries merged into each bash request. Only trusted
+    /// user configuration supplies them; replies disclose names, never values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for BashConfig {
@@ -784,6 +788,7 @@ impl Default for BashConfig {
             linux_scope: false,
             disclaim_privacy: false,
             powershell_tool: false,
+            env: BTreeMap::new(),
         }
     }
 }

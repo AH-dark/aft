@@ -897,6 +897,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
     live!("bash.db_schema_hints", bash.db_schema_hints);
+    live!("bash.env", bash.env);
     later!("bash.powershell_tool", bash.powershell_tool);
     live!(
         "bash.long_running_reminder_enabled",
@@ -1023,6 +1024,7 @@ fn classification_is_exhaustive(config: &Config) {
         linux_scope: _,
         disclaim_privacy: _,
         powershell_tool: _,
+        env: _,
     } = bash;
     let crate::config::SandboxConfig {
         profile: _,

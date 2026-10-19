@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -18,19 +19,6 @@ const DEFAULT_PTY_ROWS: u16 = 24;
 const DEFAULT_PTY_COLS: u16 = 80;
 const MAX_PTY_ROWS: u16 = 60;
 const MAX_PTY_COLS: u16 = 140;
-
-const BLOCKED_ENV_VARS: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "BASH_ENV",
-    "ENV",
-    "IFS",
-    "PATH",
-];
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -101,6 +89,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    let configured_env = ctx.config().bash.env.clone();
+    let configured_env_keys = configured_env.keys().cloned().collect::<Vec<_>>();
+    // The request map is the process-creation channel, with call-specific values
+    // taking precedence over the user's stable defaults.
+    for (key, value) in &configured_env {
+        params
+            .env
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
     // The dedicated external route is defensive as well as convenient: callers
     // cannot accidentally execute Bash merely by omitting the selector.
     if req.command == "powershell" {
@@ -217,6 +215,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    let duplicate_workdir = workdir.clone();
+    let duplicate_project_root = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| default_workdir(ctx));
     let principal = crate::sandbox_spawn::current_authenticated_principal();
     let host_requested = matches!(params.sandbox, Some(BashSandbox::Host));
     if host_requested && !crate::sandbox_spawn::principal_is_first_party(&principal) {
@@ -375,6 +379,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     if !params.shell.is_powershell()
         && host_escalation.is_none()
         && remote.is_none()
+        && params.env.is_empty()
         && workdir_matches_project_root(&workdir, ctx)
     {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
@@ -397,15 +402,20 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             "runon sends the whole line to the remote runner"
         } else if host_escalation.is_some() {
             "host escalation owns process execution"
+        } else if !params.env.is_empty() {
+            "environment overrides require shell process execution"
         } else {
             "bash workdir differs from the project root"
         };
-        let branch =
-            if params.shell.is_powershell() || host_escalation.is_some() || remote.is_some() {
-                "dispatch.native.no_rule"
-            } else {
-                "dispatch.native.non_root_workdir"
-            };
+        let branch = if params.shell.is_powershell()
+            || host_escalation.is_some()
+            || remote.is_some()
+            || !params.env.is_empty()
+        {
+            "dispatch.native.no_rule"
+        } else {
+            "dispatch.native.non_root_workdir"
+        };
         crate::bash_rewrite::dispatch::record_native(
             &req.id,
             crate::bash_rewrite::catalog::ControlRole::Native,
@@ -432,7 +442,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let scanner_report = defer_permission_asks
         .then_some(permission_asks)
         .unwrap_or_default();
-    crate::bash_background::spawn(
+    let duplicate = ctx.bash_background().find_running_duplicate(
+        req.session(),
+        &execution_command,
+        &duplicate_project_root,
+        &duplicate_workdir,
+    );
+    let mut response = crate::bash_background::spawn(
         &req.id,
         req.session(),
         &execution_command,
@@ -452,7 +468,51 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         scanner_requires_approval,
         host_escalation,
         remote,
+    );
+    if response.success {
+        let object = response
+            .data
+            .as_object_mut()
+            .expect("successful bash spawn response is an object");
+        if let Some(duplicate) = duplicate {
+            object.insert(
+                "_bash_duplicate_warning".to_string(),
+                json!(format_duplicate_warning(&duplicate)),
+            );
+        }
+        if !configured_env_keys.is_empty()
+            && ctx
+                .bash_background()
+                .claim_bash_env_disclosure(req.session())
+        {
+            object.insert("_bash_env_keys".to_string(), json!(configured_env_keys));
+        }
+    }
+    response
+}
+
+fn format_duplicate_warning(
+    task: &crate::bash_background::registry::DuplicateRunningTask,
+) -> String {
+    let age = format_duplicate_task_age(task.age);
+    let session = if task.same_session {
+        "same session"
+    } else {
+        "another session"
+    };
+    format!(
+        "Warning: identical command already running as task {} (age {age}; {session}).",
+        task.task_id
     )
+}
+
+fn format_duplicate_task_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s ago"),
+        60..=3599 => format!("{}m{:02}s ago", seconds / 60, seconds % 60),
+        _ => format!("{}h{:02}m ago", seconds / 3600, (seconds % 3600) / 60),
+    }
 }
 
 fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &'static str> {
@@ -468,20 +528,7 @@ fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &
 }
 
 fn blocked_env_var(env: &HashMap<String, String>) -> Option<&str> {
-    env.keys()
-        .find(|key| {
-            BLOCKED_ENV_VARS.iter().any(|blocked| {
-                #[cfg(windows)]
-                {
-                    key.eq_ignore_ascii_case(blocked)
-                }
-                #[cfg(not(windows))]
-                {
-                    key.as_str() == *blocked
-                }
-            })
-        })
-        .map(String::as_str)
+    crate::bash_env::first_blocked_env_key(env)
 }
 
 fn permissions_granted_cover(
@@ -677,6 +724,30 @@ mod tests {
         let asks = conservative_powershell_permission_asks("cat $env:USERPROFILE\\secret.txt");
         assert_eq!(asks.len(), 1);
         assert_eq!(asks[0].patterns, ["cat $env:USERPROFILE\\secret.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_running_bash_from_other_root_is_not_warned_about() {
+        let root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(root.path(), storage.path());
+        let first_request = spawn_test_request("duplicate-root-first", "sleep 30", true);
+        let first = handle(&first_request, &ctx);
+        assert!(first.success, "{:?}", first.data);
+
+        // Keep the registry and its active task, but move this request to a
+        // different project root while deliberately retaining the same cwd.
+        ctx.update_config(|config| config.project_root = Some(other_root.path().to_path_buf()));
+        let mut other_root_request = spawn_test_request("duplicate-other-root", "sleep 30", true);
+        other_root_request.params["params"]["workdir"] = serde_json::json!(root.path());
+        let response = handle(&other_root_request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert!(response.data.get("_bash_duplicate_warning").is_none());
+
+        stop_spawned_test_task(&ctx, &first);
+        stop_spawned_test_task(&ctx, &response);
     }
 
     // Command rewriting resolves relative paths against the project root, so it
