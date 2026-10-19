@@ -1761,6 +1761,7 @@ async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
         1024 * 1024,
         None,
         dir.path(),
+        QuiescedLsp::ReapInBackground,
         None,
         None,
     );

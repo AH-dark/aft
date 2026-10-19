@@ -4333,6 +4333,17 @@ impl LspManager {
         self.take_all_clients()
     }
 
+    /// Refuse new server starts like [`Self::quiesce`], but keep the running
+    /// clients in this manager. Used when the module's connection has ended
+    /// and the exit phase that follows takes every manager's clients and shuts
+    /// them down together under one shared budget. Detaching them here would
+    /// hand each root's servers to its own background reap thread, which can
+    /// stop them before the exit phase sees them.
+    pub(crate) fn close_start_admission(&self) {
+        self.quiesced
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub(crate) fn resume(&self) {
         self.quiesced
             .store(false, std::sync::atomic::Ordering::Release);
