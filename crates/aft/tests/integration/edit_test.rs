@@ -998,7 +998,7 @@ fn edit_match_no_match() {
         "command": "edit_match",
         "file": file.display().to_string(),
         "match": "this_string_does_not_exist_anywhere",
-        "replacement": "nope"
+        "replacement": "export const add"
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
@@ -1008,6 +1008,10 @@ fn edit_match_no_match() {
         resp
     );
     assert_eq!(resp["code"], "match_not_found");
+    assert!(resp["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("newString is already present at line 7; the edit may already be applied."));
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -1538,7 +1542,7 @@ fn batch_near_miss_reports_candidate_and_divergence() {
         "file": target.display().to_string(),
         "edits": [{
             "match": "const first = 1;\nconst expected = 2;\nconst last = 3;",
-            "replacement": "const first = 1;\nconst changed = 2;\nconst last = 3;"
+            "replacement": "const first = 1;\nconst actual = 2;\nconst last = 3;"
         }]
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
@@ -1553,6 +1557,8 @@ fn batch_near_miss_reports_candidate_and_divergence() {
     assert!(message.contains("Nearest candidate at lines 1-3"));
     assert!(message.contains("- expected: const expected = 2;"));
     assert!(message.contains("+ actual: const actual = 2;"));
+    assert!(message
+        .contains("newString is already present at line 1; the edit may already be applied."));
     assert_eq!(fs::read_to_string(&target).unwrap(), original);
 
     let status = aft.shutdown();

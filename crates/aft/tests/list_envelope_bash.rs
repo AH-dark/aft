@@ -486,13 +486,14 @@ fn gate_script_trailer_counts_kept_lines_but_not_the_marker() {
     let result =
         compress_with_registry_exit_code("scripts/rust-test-gate.sh", &input, Some(0), &registry);
 
-    // The cargo sniffer keeps its five summary lines; the gate's last five lines
-    // follow after a marker for the 29 nextest lines between them.
+    // The cargo sniffer keeps its five summary lines and aggregate total; the gate's
+    // last five lines follow after a marker for the 29 nextest lines between them.
     let expected = "    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.2s\n\
          running 100 tests\n\
          test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
          running 100 tests\n\
          test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+         cargo test total: 200 passed, 0 failed, 0 ignored across 2 binaries\n\
          ... 29 lines omitted ...\n\
          \x20       PASS [   0.08s] crate::case_28\n\
          \x20       PASS [   0.09s] crate::case_29\n\
@@ -505,12 +506,12 @@ fn gate_script_trailer_counts_kept_lines_but_not_the_marker() {
     let envelope =
         append_envelope_trailer(&mut rendered, result.input_line_count).expect("lines dropped");
     assert_eq!(
-        envelope.shown, 10,
-        "5 summary lines + 5 final lines, marker excluded"
+        envelope.shown, 11,
+        "5 cargo summary lines + aggregate total + 5 final lines, marker excluded"
     );
     assert_eq!(envelope.total, Total::Exact(283));
     assert!(
-        rendered.ends_with("GATE PASSED: all phases green\nshown 10 of 283 lines (cap)"),
+        rendered.ends_with("GATE PASSED: all phases green\nshown 11 of 283 lines (cap)"),
         "{rendered}"
     );
 }
@@ -970,11 +971,10 @@ fn real_gate_script_output_ends_with_verdict_then_trailer() {
     assert_eq!(reply["success"], true, "gate script failed: {reply:?}");
     assert_real_bash_envelope(&reply, "output", 283);
     let output = reply["output"].as_str().expect("gate output");
-    // The verdict is the last output line; only the line naming the task
-    // sits between it and the trailer.
+    // The verdict remains the last output line before the task and trailer.
     assert!(
         output.ends_with(&format!(
-            "GATE PASSED: all phases green\n[task {}]\nshown 10 of 283 lines (cap)",
+            "GATE PASSED: all phases green\n[task {}]\nshown 11 of 283 lines (cap)",
             reply["task_id"].as_str().unwrap()
         )),
         "{output}"

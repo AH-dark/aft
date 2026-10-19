@@ -187,6 +187,38 @@ pub(crate) fn render_nearest_miss_detail(source: &str, needle: &str) -> String {
     detail
 }
 
+pub(crate) fn render_edit_not_found_detail(
+    source: &str,
+    old_string: &str,
+    new_string: &str,
+) -> String {
+    let mut detail = render_nearest_miss_detail(source, old_string);
+    if new_string.is_empty() || new_string.trim().is_empty() || old_string.contains(new_string) {
+        return detail;
+    }
+
+    let mut matches = source.match_indices(new_string);
+    let Some((first_match, _)) = matches.next() else {
+        return detail;
+    };
+    if matches.next().is_some() {
+        let count = 2 + matches.count();
+        detail.push_str(&format!(
+            "\nnewString occurs {count} times; the edit may already be applied."
+        ));
+    } else {
+        let line = source.as_bytes()[..first_match]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        detail.push_str(&format!(
+            "\nnewString is already present at line {line}; the edit may already be applied."
+        ));
+    }
+    detail
+}
+
 fn append_diagnostic_line(
     detail: &mut String,
     start: usize,
@@ -752,6 +784,43 @@ mod audit_regressions {
                     .get(m.byte_start..m.byte_start + m.byte_len)
                     .is_some());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod edit_not_found_detail_tests {
+    use super::render_edit_not_found_detail;
+
+    #[test]
+    fn already_applied_hint_reports_one_line_or_repeated_occurrences() {
+        let once =
+            render_edit_not_found_detail("first\nreplacement\nlast\n", "missing", "replacement");
+        assert!(once
+            .contains("newString is already present at line 2; the edit may already be applied."));
+
+        let repeated = render_edit_not_found_detail(
+            "replacement\nother replacement\n",
+            "missing",
+            "replacement",
+        );
+        assert!(repeated.contains("newString occurs 2 times; the edit may already be applied."));
+        assert!(!repeated.contains("newString is already present at line"));
+    }
+
+    #[test]
+    fn already_applied_hint_skips_empty_whitespace_and_old_string_substrings() {
+        for (old_string, new_string) in [
+            ("missing", ""),
+            ("missing", " \t\n "),
+            ("missing replacement", "replacement"),
+            ("missing", "not present"),
+        ] {
+            let detail = render_edit_not_found_detail("replacement\n", old_string, new_string);
+            assert!(
+                !detail.contains("newString"),
+                "unexpected hint for newString {new_string:?}: {detail}"
+            );
         }
     }
 }

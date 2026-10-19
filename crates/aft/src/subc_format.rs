@@ -2575,6 +2575,8 @@ fn format_zoom_batch_result(target_label: &str, symbols: &[String], responses: &
     sections.join("\n\n")
 }
 
+const ZOOM_CALL_ANNOTATION_LIMIT: usize = 15;
+
 fn format_zoom_text(target_label: &str, response: &Value) -> String {
     let range = response.get("range");
     let start_line = range
@@ -2637,10 +2639,11 @@ fn format_zoom_text(target_label: &str, response: &Value) -> String {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if calls_out.is_some_and(|calls| !calls.is_empty()) || other_calls > 0 {
-        out.push(String::new());
-        out.push("──── calls_out".to_string());
-        for call in calls_out.into_iter().flatten() {
-            out.push(format_zoom_call_ref(call));
+        if let Some(calls_out) = calls_out.filter(|calls| !calls.is_empty()) {
+            append_zoom_annotation_calls(&mut out, "calls_out", calls_out);
+        } else {
+            out.push(String::new());
+            out.push("──── calls_out".to_string());
         }
         if other_calls > 0 {
             out.push(format!("  +{other_calls} other calls"));
@@ -2651,14 +2654,24 @@ fn format_zoom_text(target_label: &str, response: &Value) -> String {
         .and_then(|annotations| annotations.get("called_by"))
         .and_then(Value::as_array);
     if let Some(called_by) = called_by.filter(|calls| !calls.is_empty()) {
-        out.push(String::new());
-        out.push("──── called_by".to_string());
-        for call in called_by {
-            out.push(format_zoom_call_ref(call));
-        }
+        append_zoom_annotation_calls(&mut out, "called_by (this file)", called_by);
     }
 
     out.join("\n")
+}
+
+fn append_zoom_annotation_calls(out: &mut Vec<String>, section: &str, calls: &[Value]) {
+    out.push(String::new());
+    out.push(format!("──── {section}"));
+    for call in calls.iter().take(ZOOM_CALL_ANNOTATION_LIMIT) {
+        out.push(format_zoom_call_ref(call));
+    }
+    if calls.len() > ZOOM_CALL_ANNOTATION_LIMIT {
+        out.push(format!(
+            "  +{} more",
+            calls.len() - ZOOM_CALL_ANNOTATION_LIMIT
+        ));
+    }
 }
 
 fn format_zoom_line(line_no: i64, gutter_width: usize, text: &str) -> String {
@@ -4594,6 +4607,46 @@ mod callgraph_format_tests {
         assert_eq!(
             format_callgraph("callers", &borrowed, false),
             "callgraph: borrowed from /owner\ncallgraph: the borrowed graph does not reflect 2 files here\n0 callers · 0 file groups"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zoom_call_annotation_cap_tests {
+    use super::format_zoom_text;
+    use serde_json::json;
+
+    #[test]
+    fn zoom_call_annotation_lists_keep_fifteen_entries_and_count_the_rest() {
+        let calls = |prefix: &str, count: usize| {
+            (1..=count)
+                .map(|line| json!({ "name": format!("{prefix}{line:02}"), "line": line }))
+                .collect::<Vec<_>>()
+        };
+        let response = json!({
+            "kind": "function",
+            "name": "target",
+            "range": { "start_line": 1, "end_line": 1 },
+            "content": "fn target() {}",
+            "annotations": {
+                "calls_out": calls("callee", 17),
+                "called_by": calls("caller", 18),
+            },
+        });
+
+        let rendered = format_zoom_text("src/lib.rs", &response);
+
+        assert!(rendered.contains("callee01 (line 1)"));
+        assert!(rendered.contains("callee15 (line 15)"));
+        assert!(!rendered.contains("callee16"));
+        assert!(rendered.contains("  +2 more"));
+        assert!(rendered.contains("caller01 (line 1)"));
+        assert!(rendered.contains("caller15 (line 15)"));
+        assert!(!rendered.contains("caller16"));
+        assert!(rendered.contains("  +3 more"));
+        assert!(rendered.contains("──── called_by (this file)"));
+        assert!(
+            rendered.find("──── calls_out").unwrap() < rendered.find("──── called_by").unwrap()
         );
     }
 }

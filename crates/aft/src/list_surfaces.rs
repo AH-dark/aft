@@ -370,6 +370,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "long or multiline AST capture values are referenced by their line range in the matched excerpt with an ellipsized first-line character preview; no match or capture entries are omitted, and the complete values remain in the structured response",
     },
     ExclusionEntry {
+        file: "subc_format.rs",
+        enclosing_item: "append_zoom_annotation_calls",
+        location_or_primitive: "ZOOM_CALL_ANNOTATION_LIMIT .take()",
+        reason: "aft_zoom displays at most 15 file-local call references per annotation section and counts omitted references with +N more; all annotation entries remain in the structured response",
+    },
+    ExclusionEntry {
         file: "bash_background/registry.rs",
         enclosing_item: "format_background_slot_refusal",
         location_or_primitive: "SLOT_REFUSAL_MAX_ROWS / SLOT_REFUSAL_COMMAND_CHARS .take()",
