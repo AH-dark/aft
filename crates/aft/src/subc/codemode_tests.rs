@@ -389,3 +389,161 @@ fn codemode_audit_line_is_written_once_per_admitted_call() {
         );
     }
 }
+
+/// Change the agent-a head route (channel 1) in place.
+fn edit_head(f: &mut Fixture, change: impl FnOnce(&mut RouteIdentityData)) {
+    let identity = f.routes.get_mut(&channel(1)).unwrap();
+    change(Arc::get_mut(&mut identity.0).unwrap());
+}
+
+/// Change the agent-a head route's scope stamp in place.
+fn edit_head_stamp(f: &mut Fixture, change: impl FnOnce(&mut ScopeStamp)) {
+    edit_head(f, |data| change(data.scope.as_mut().unwrap()));
+}
+
+/// The refusal reason for a read on the run route.
+fn refusal_reason(f: &Fixture) -> String {
+    let body = call("read", json!({"path": "notes.txt"}));
+    let error = refusal(admit(&f.routes, channel(9), Some(&body)));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    error.detail.as_ref().unwrap()["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn linked_fixture() -> Fixture {
+    fixture(run_stamp("agent-a", "head-a", Some("linked")))
+}
+
+#[test]
+fn codemode_head_with_another_scope_owner_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    edit_head_stamp(&mut f, |stamp| {
+        stamp.owner = subc_protocol::Principal::Reserved {
+            module_id: "another-core".into(),
+        };
+    });
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_head_with_another_scope_ref_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    edit_head_stamp(&mut f, |stamp| stamp.scope_ref = "head-a-other".into());
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_head_at_another_scope_epoch_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    edit_head_stamp(&mut f, |stamp| stamp.scope_epoch = 4);
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_parent_scope_that_is_not_a_head_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    edit_head_stamp(&mut f, |stamp| {
+        stamp.kind = subc_protocol::scope::ScopeKind::Worker;
+    });
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_head_with_unauthorized_owner_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    edit_head_stamp(&mut f, |stamp| stamp.owner_authorized = false);
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_route_bound_in_codemode_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    edit_head(&mut f, |data| data.call_mode = CallMode::Codemode);
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    let other = f.routes[&channel(2)].clone();
+    let other_principal = other.spawn_principal.clone();
+    edit_head(&mut f, |data| {
+        data.run_owner = Some(Arc::new(RunOwner {
+            agent_id: "agent-a".into(),
+            run_id: "earlier-run".into(),
+            head: other,
+            run_route: channel(5),
+            run_principal: other_principal,
+        }));
+    });
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+#[test]
+fn codemode_same_agent_on_a_head_under_another_scope_is_not_the_runs_head() {
+    let mut f = linked_fixture();
+    // The run's own agent has a live head route, but under another scope
+    // (other ref and epoch): the parent link, not the agent, finds the head.
+    edit_head_stamp(&mut f, |stamp| {
+        stamp.scope_ref = "head-c".into();
+        stamp.scope_epoch = 9;
+    });
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
+}
+
+/// A second agent-a head route on channel 3, otherwise like channel 1.
+fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: BindTrust) {
+    let mut identity = crate::subc::test_support::route_identity_with_trust(root, session, trust);
+    {
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.scope = Some(head_stamp("head-a", "agent-a"));
+        data.call_mode = CallMode::Classic;
+    }
+    f.routes.insert(channel(3), identity);
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_root_are_ambiguous() {
+    let mut f = linked_fixture();
+    let (_other_dir, other_root) = test_root("codemode-second-head");
+    second_head(&mut f, &other_root, "head-a-session", BindTrust::FirstParty);
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_session_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "another-head-session", BindTrust::FirstParty);
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_disagree_on_trust_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::Untrusted);
+    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+}
+
+#[test]
+fn codemode_head_routes_that_agree_are_served() {
+    // Control for the ambiguity tests: a second channel of the same head is
+    // not a disagreement.
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    let body = call("read", json!({"path": "notes.txt"}));
+    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+    assert_eq!(effective.session, "head-a-session");
+}
+
+#[test]
+fn codemode_run_with_unauthorized_owner_is_refused() {
+    let mut run = run_stamp("agent-a", "head-a", Some("linked"));
+    run.owner_authorized = false;
+    let f = fixture(run);
+    assert_eq!(refusal_reason(&f), "run_owner_unauthorized");
+}
