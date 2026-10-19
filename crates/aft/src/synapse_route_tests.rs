@@ -20,6 +20,7 @@ pub(crate) struct Daemon {
     server: std::thread::JoinHandle<()>,
     release: tokio::sync::watch::Sender<bool>,
     release_open: tokio::sync::watch::Sender<bool>,
+    disconnect: tokio::sync::watch::Sender<bool>,
 }
 
 impl Daemon {
@@ -63,6 +64,7 @@ impl Daemon {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::watch::channel(false);
         let (release_open, open_released) = tokio::sync::watch::channel(false);
+        let (disconnect, disconnected) = tokio::sync::watch::channel(false);
         let server = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -77,10 +79,15 @@ impl Daemon {
                             let counts = recorded.clone();
                             let mut released = released.clone();
                             let mut open_released = open_released.clone();
+                            let mut disconnected = disconnected.clone();
                             let held_open_scope = held_open_scope.clone();
                             tasks.spawn(async move {
                                 subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "route-test", Duration::from_secs(2)).await.unwrap();
-                                counts.0.lock().unwrap().connections += 1;
+                                let connection = {
+                                    let mut count = counts.0.lock().unwrap();
+                                    count.connections += 1;
+                                    count.connections
+                                };
                                 let mut active = 0;
                                 let mut pending = Vec::new();
                                 let mut held = Vec::new();
@@ -88,6 +95,7 @@ impl Daemon {
                                 let mut generation = 0;
                                 loop {
                                     let request = tokio::select! {
+                                        Ok(()) = disconnected.changed(), if connection == 1 => break,
                                         request = subc_transport::read_frame(&mut stream) => match request {
                                             Ok(Some(request)) => request,
                                             _ => break,
@@ -166,8 +174,8 @@ impl Daemon {
                                             // The real consumer enforces its 1024-request route window.
                                             // Holding these replies proves requests overlap on the wire.
                                             if disconnect_first_group && generation == 1 {
-                                                // Drop the socket with all callers pending, without a terminal reply.
-                                                break;
+                                                // Keep every caller pending until the test drops the socket.
+                                                continue;
                                             }
                                             for (request, value) in pending.drain(..) {
                                                 respond(&mut stream, &request, query_reply(&value), false).await;
@@ -213,6 +221,7 @@ impl Daemon {
             server,
             release,
             release_open,
+            disconnect,
         }
     }
 
@@ -222,6 +231,10 @@ impl Daemon {
 
     pub fn release_replies(&self) {
         self.release.send(true).unwrap();
+    }
+
+    fn disconnect_first_connection(&self) {
+        self.disconnect.send(true).unwrap();
     }
 
     pub fn config(&self, root: usize) -> SemanticBackendConfig {
@@ -347,13 +360,23 @@ fn synapse_shared_reset_reconnects_once_without_serializing_callers() {
     const CALLERS: usize = 8;
     let daemon = Daemon::start(CALLERS, true);
     let clients = (0..CALLERS)
-        .map(|n| SynapseEmbeddingClient::from_config(&daemon.config(n)).unwrap())
+        .map(|n| {
+            let mut config = daemon.config(n);
+            config.timeout_ms = 2_000;
+            SynapseEmbeddingClient::from_config(&config).unwrap()
+        })
         .collect::<Vec<_>>();
     let shared = Arc::clone(&clients[0].state.connection);
     let old = shared
         .runtime
         .block_on(clients[0].state.ensure_route())
         .unwrap();
+    let (dropped, observed_drop) = std::sync::mpsc::channel();
+    old.consumer.on_connection_state(move |state| {
+        if matches!(state, subc_client_rs::ConnectionState::Dropped) {
+            let _ = dropped.send(());
+        }
+    });
     let barrier = Arc::new(std::sync::Barrier::new(CALLERS));
     std::thread::scope(|scope| {
         let threads = clients
@@ -372,6 +395,19 @@ fn synapse_shared_reset_reconnects_once_without_serializing_callers() {
                 })
             })
             .collect::<Vec<_>>();
+        daemon.wait_queries(CALLERS);
+        // Hold AFT's reset behind the slot lock while the SDK observes the loss.
+        // A control call drives the old consumer's reconnect path to completion:
+        // it must fail, not authenticate a spare socket before AFT replaces it.
+        let resetting = shared.runtime.block_on(shared.active.lock());
+        daemon.disconnect_first_connection();
+        observed_drop.recv_timeout(Duration::from_secs(5)).unwrap();
+        let retired_catalog = shared.runtime.block_on(old.consumer.catalog_list());
+        drop(resetting);
+        assert!(
+            retired_catalog.is_err(),
+            "the retired SDK consumer reconnected independently of AFT"
+        );
         let clients = threads
             .into_iter()
             .map(|thread| thread.join().unwrap())
@@ -401,6 +437,49 @@ fn synapse_shared_reset_reconnects_once_without_serializing_callers() {
         }
     });
     drop(old);
+    drop(shared);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_idle_disconnect_reconnects_once_on_the_next_query() {
+    let daemon = Daemon::start(1, false);
+    let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let shared = Arc::clone(&client.state.connection);
+    let old = shared
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    let (dropped, observed_drop) = std::sync::mpsc::channel();
+    old.consumer.on_connection_state(move |state| {
+        if matches!(state, subc_client_rs::ConnectionState::Dropped) {
+            let _ = dropped.send(());
+        }
+    });
+    daemon.disconnect_first_connection();
+    observed_drop.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(daemon.counts.0.lock().unwrap().queries, 0);
+    assert_eq!(
+        client
+            .embed_query("after-idle-disconnect", Duration::from_secs(5))
+            .unwrap(),
+        vec![1.0, 0.0]
+    );
+    let replacement = shared
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old, &replacement));
+    {
+        let counts = daemon.counts.0.lock().unwrap();
+        assert_eq!(counts.opens, 2);
+        assert_eq!(counts.connections, 2);
+        assert_eq!(counts.queries, 1);
+    }
+    drop(replacement);
+    drop(old);
+    drop(client);
     drop(shared);
     daemon.wait_closed();
     daemon.finish();
