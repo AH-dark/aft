@@ -296,16 +296,15 @@ impl BgBuffer {
 
     /// Notice redaction needs contiguous input: a head/tail join could cut an
     /// opaque credential into fragments that no format matcher can recognize.
-    pub(crate) fn read_complete_for_notice(&self) -> Option<String> {
+    /// Returns stdout and stderr separately so a caller can find each stream's
+    /// final lines; join them with [`combine_streams`] for the display body.
+    pub(crate) fn read_complete_for_notice(&self) -> Option<(String, String)> {
         let read = |stream| {
             let source = self.source(stream)?;
             let read = read_source_bounded(source, DISK_LIMIT_BYTES as usize).ok()?;
             (!read.truncated).then_some(read.text)
         };
-        Some(combine_streams(
-            &read(StreamKind::Stdout)?,
-            &read(StreamKind::Stderr)?,
-        ))
+        Some((read(StreamKind::Stdout)?, read(StreamKind::Stderr)?))
     }
 
     pub fn stream_len(&self, stream: StreamKind) -> u64 {

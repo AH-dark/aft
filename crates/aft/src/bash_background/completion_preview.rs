@@ -122,9 +122,10 @@ impl BgTaskRegistry {
             return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
         };
         let buffer = BgBuffer::registered(paths, BgMode::Pipes);
-        let Some(mut raw) = buffer.read_complete_for_notice() else {
+        let Some((stdout, stderr)) = buffer.read_complete_for_notice() else {
             return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
         };
+        let mut raw = combine_streams(&stdout, &stderr);
         normalize_piped_display_output(&mut raw);
         let masked = secrets.redact(&raw);
         let mut safe_cache = cache.clone();
@@ -137,8 +138,23 @@ impl BgTaskRegistry {
             // Re-render only credential-bearing output. Ordinary completions
             // reuse the terminal cache and never invoke the compressor twice.
             let body = if cache.kind == TerminalOutputKind::Compressed {
-                self.compress_output(&metadata.command, masked, metadata.exit_code)
-                    .text
+                // Repeat the terminal render's per-stream ending repair, or a
+                // compressor that keeps stderr's last line can drop stdout's
+                // verdict. Each stream is masked the same way as the body, so
+                // a restored line carries placeholders, never the credential.
+                let [stdout, stderr] = [stdout, stderr].map(|mut stream| {
+                    normalize_piped_display_output(&mut stream);
+                    secrets.redact(&stream).into_owned()
+                });
+                let endings = stream_endings([&stdout, &stderr]);
+                let mut text = self
+                    .compress_output(&metadata.command, masked, metadata.exit_code)
+                    .text;
+                let final_lines = restore_stream_endings(&mut text, &endings);
+                if let Some(recovery) = &mut safe_cache.recovery {
+                    recovery.final_lines = final_lines;
+                }
+                text
             } else {
                 masked
             };

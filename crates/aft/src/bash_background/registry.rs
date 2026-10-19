@@ -1963,28 +1963,11 @@ impl BgTaskRegistry {
             if let Some(job) = self.db_hint_job(&metadata.task_id) {
                 job.finish(&raw.text, metadata.exit_code);
             }
-            let endings: Vec<String> = [&raw.text[..stdout_end], &raw.text[stdout_end..]]
-                .into_iter()
-                .map(crate::compress::generic::strip_ansi)
-                .map(|text| crate::compress::line_cut::ensure_final_lines(&text, ""))
-                .filter(|text| !text.is_empty())
-                .collect();
+            let endings = stream_endings([&raw.text[..stdout_end], &raw.text[stdout_end..]]);
             let mut compressed =
                 self.compress_output(&metadata.command, raw.text, metadata.exit_code);
-            // Summary extractors may see stderr's final "Finished" line and
-            // conclude the tail is intact even though stdout's verdict vanished.
             // Repair all compressor tiers here, before either byte cap runs.
-            for ending in &endings {
-                let last = ending.lines().last().unwrap();
-                if !compressed.text.lines().any(|line| line.trim_end() == last) {
-                    compressed.text =
-                        crate::compress::line_cut::ensure_final_lines(ending, &compressed.text);
-                }
-            }
-            let final_lines = endings
-                .iter()
-                .map(|ending| ending.lines().last().unwrap().to_string())
-                .collect();
+            let final_lines = restore_stream_endings(&mut compressed.text, &endings);
             render_compressed_with_recovery(
                 buffer,
                 compressed,
@@ -10099,6 +10082,35 @@ fn normalize_piped_display_output(text: &mut String) {
     *text = rendered;
 }
 
+/// Each non-empty stream's final lines, with ANSI escapes stripped, for
+/// [`restore_stream_endings`]. Stdout and stderr are kept apart because the
+/// compressor only ever sees them joined.
+fn stream_endings(streams: [&str; 2]) -> Vec<String> {
+    streams
+        .into_iter()
+        .map(crate::compress::generic::strip_ansi)
+        .map(|text| crate::compress::line_cut::ensure_final_lines(&text, ""))
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+/// Put back any stream's final line that compression dropped, and return those
+/// final lines so the later byte caps keep them. Summary extractors may see
+/// stderr's final "Finished" line and conclude the tail is intact even though
+/// stdout's verdict vanished.
+fn restore_stream_endings(compressed: &mut String, endings: &[String]) -> Vec<String> {
+    for ending in endings {
+        let last = ending.lines().last().unwrap();
+        if !compressed.lines().any(|line| line.trim_end() == last) {
+            *compressed = crate::compress::line_cut::ensure_final_lines(ending, compressed);
+        }
+    }
+    endings
+        .iter()
+        .map(|ending| ending.lines().last().unwrap().to_string())
+        .collect()
+}
+
 fn render_compressed_with_recovery(
     buffer: &BgBuffer,
     mut compressed: CompressionResult,
@@ -14556,6 +14568,17 @@ mod tests {
     }
 
     fn gate_tail_agent_text(command: &str, stdout: &str, stderr: &str) -> (String, String) {
+        gate_tail_agent_text_with_secrets(command, stdout, stderr, Default::default())
+    }
+
+    /// Returns the bash_status preview and the pushed completion preview for a
+    /// terminal task whose live child environment carried `secrets`.
+    fn gate_tail_agent_text_with_secrets(
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        secrets: crate::log_redact::SecretValues,
+    ) -> (String, String) {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
         let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
@@ -14574,6 +14597,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (task_id, task) =
             insert_terminal_piped_task(&registry, &dir, command, stdout, stderr, true);
+        *task.completion_secrets.lock().unwrap() = Some(secrets);
         let snapshot = registry
             .status(
                 &task_id,
@@ -14595,10 +14619,9 @@ mod tests {
         (snapshot.output_preview, completion)
     }
 
-    #[test]
-    fn gate_tail_fixture_keeps_verdict_through_extractors_and_caps() {
-        // Model command.sh in-process: this tests captured-output compression,
-        // not shell launching, and Windows need not have a working POSIX bash.
+    /// Models command.sh in-process: a Cargo-shaped gate whose stdout ends
+    /// with its verdict while stderr ends with Cargo's "Finished" line.
+    fn gate_tail_fixture_streams() -> (String, String) {
         let mut stdout = String::new();
         let mut stderr = String::new();
         for phase in 1..=2 {
@@ -14623,6 +14646,22 @@ mod tests {
             stdout.push_str(&format!("        PASS [   0.001s] gate::case_{index}\n"));
         }
         stdout.push_str("     Summary [   0.080s] 80 tests run: 80 passed, 0 skipped\n    ok (1s)\n==> generated files untouched by the build\n    ok (0s)\nGATE PASSED: all phases green\n");
+        (stdout, stderr)
+    }
+
+    // Commands covering each compressor tier the gate fixture can reach.
+    const GATE_TAIL_COMMANDS: [&str; 4] = [
+        "scripts/rust-test-gate.sh",
+        "cargo test --workspace",
+        "cargo nextest run --workspace",
+        "cargo test && printf done",
+    ];
+
+    #[test]
+    fn gate_tail_fixture_keeps_verdict_through_extractors_and_caps() {
+        // This tests captured-output compression, not shell launching, and
+        // Windows need not have a working POSIX bash.
+        let (stdout, stderr) = gate_tail_fixture_streams();
         assert_eq!(stdout.lines().count() + stderr.lines().count(), 327);
         assert_eq!(stdout.lines().last(), Some("GATE PASSED: all phases green"));
         assert!(stderr.lines().last().unwrap().contains("Finished"));
@@ -14631,12 +14670,7 @@ mod tests {
         // explicit cargo command takes the command tier; nextest and the shell
         // list take generic compression. Padding forces the 16 KiB reply cap
         // on those generic paths in addition to the 600-byte completion cap.
-        for command in [
-            "scripts/rust-test-gate.sh",
-            "cargo test --workspace",
-            "cargo nextest run --workspace",
-            "cargo test && printf done",
-        ] {
+        for command in GATE_TAIL_COMMANDS {
             for padding in [String::new(), cargo_verdict_noise("build context", 2000)] {
                 let (foreground, completion) =
                     gate_tail_agent_text(command, &(padding + &stdout), &stderr);
@@ -14647,6 +14681,39 @@ mod tests {
                     );
                     assert!(text.contains("Finished `test` profile"), "{text}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gate_tail_masked_completion_keeps_verdict() {
+        // A credential in the output sends the completion through the masked
+        // re-render, which must repair stdout's verdict like bash_status does.
+        let secret = "opaque-gate-deploy-credential";
+        let (stdout, stderr) = gate_tail_fixture_streams();
+        let stdout = format!("deploying with {secret}\n{stdout}");
+        let stderr = format!("   Uploading {secret}\n{stderr}");
+        for command in GATE_TAIL_COMMANDS {
+            for padding in [String::new(), cargo_verdict_noise("build context", 2000)] {
+                let secrets = crate::log_redact::SecretValues::from_environment([(
+                    std::ffi::OsStr::new("DEPLOY_TOKEN"),
+                    std::ffi::OsStr::new(secret),
+                )]);
+                let (_, completion) = gate_tail_agent_text_with_secrets(
+                    command,
+                    &(padding + &stdout),
+                    &stderr,
+                    secrets,
+                );
+                assert!(
+                    completion.contains("GATE PASSED: all phases green"),
+                    "masked completion lost the verdict for {command}: {completion}"
+                );
+                assert!(
+                    completion.contains("Finished `test` profile"),
+                    "{completion}"
+                );
+                assert!(!completion.contains(secret), "{completion}");
             }
         }
     }
