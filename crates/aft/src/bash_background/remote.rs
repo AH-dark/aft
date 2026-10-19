@@ -629,6 +629,8 @@ struct TaskSink {
     // metadata until the files are synced. Cancellation also saves that metadata.
     output_progress: OutputProgress,
     last_progress_persist: Instant,
+    #[cfg(test)]
+    progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
     /// Runs between the checkpoint snapshot and its file write, so a test can
     /// land another metadata write in that window.
     #[cfg(test)]
@@ -710,6 +712,8 @@ impl TaskSink {
             },
             last_progress_persist: Instant::now(),
             #[cfg(test)]
+            progress_clock: None,
+            #[cfg(test)]
             before_checkpoint_write: None,
         };
         let losses: Vec<_> = [
@@ -768,6 +772,28 @@ impl TaskSink {
         Ok(sink)
     }
 
+    #[cfg(test)]
+    fn set_progress_clock_for_test(&mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) {
+        self.last_progress_persist = clock();
+        self.progress_clock = Some(clock);
+    }
+
+    fn progress_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.progress_clock {
+            return clock();
+        }
+        Instant::now()
+    }
+
+    fn progress_elapsed(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(clock) = &self.progress_clock {
+            return clock().saturating_duration_since(self.last_progress_persist);
+        }
+        self.last_progress_persist.elapsed()
+    }
+
     fn commit(&mut self, update: impl FnOnce(&mut RemoteTask)) -> io::Result<()> {
         // Acceptance, start, and terminal records save output progress too, so
         // their metadata must not become durable before the output files.
@@ -794,7 +820,7 @@ impl TaskSink {
             state.metadata.remote = previous;
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
-            self.last_progress_persist = Instant::now();
+            self.last_progress_persist = self.progress_now();
         }
         result
     }
@@ -825,7 +851,7 @@ impl TaskSink {
             // Older runners omit Started. Their first output is still a
             // running transition, saved durably at once like Started is.
             self.commit(|remote| remote.output_received = true)
-        } else if self.last_progress_persist.elapsed() < PROGRESS_CHECKPOINT_INTERVAL {
+        } else if self.progress_elapsed() < PROGRESS_CHECKPOINT_INTERVAL {
             return Ok(());
         } else {
             self.checkpoint_progress()
@@ -876,7 +902,7 @@ impl TaskSink {
             .persist_task_checkpoint(&self.task, &snapshot, json_writes_seen);
         match result {
             Ok(_) => {
-                self.last_progress_persist = Instant::now();
+                self.last_progress_persist = self.progress_now();
                 Ok(())
             }
             Err(error) => {
@@ -1178,7 +1204,7 @@ impl TaskSink {
             state.metadata = previous;
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
-            self.last_progress_persist = Instant::now();
+            self.last_progress_persist = self.progress_now();
         }
         result
     }

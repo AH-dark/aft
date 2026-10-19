@@ -2147,14 +2147,23 @@ fn exec_remote_bash_progress_checkpoints_over_a_20s_fake_run() {
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
     let task = registry.task(&task_id).unwrap();
     let mut sink = TaskSink::new(&registry, task).unwrap();
+    let start = Instant::now();
+    let elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock_ticks = Arc::clone(&elapsed_ms);
+    sink.set_progress_clock_for_test(Arc::new(move || {
+        start + Duration::from_millis(clock_ticks.load(std::sync::atomic::Ordering::Relaxed))
+    }));
     sink.started(&Started::new(0, 123, 1)).unwrap();
     work_counts::reset();
     // A fake runner streams 100 records a second, alternating stdout and
-    // stderr, for 20 simulated seconds. Moving the last checkpoint time back
-    // one tick before each record advances the sink's clock without sleeping.
+    // stderr, for 20 simulated seconds. The injected clock advances without
+    // sleeping or depending on how long checkpoint writes take.
     const TICK: Duration = Duration::from_millis(10);
     for seq in 1..=2000_u64 {
-        sink.last_progress_persist -= TICK;
+        elapsed_ms.fetch_add(
+            TICK.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let stream = if seq % 2 == 0 {
             OutputStream::Stdout
         } else {

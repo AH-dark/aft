@@ -79,6 +79,16 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static SEMANTIC_FAMILY_ARENA_MEASUREMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn semantic_family_arena_measurements_for_test() -> u64 {
+    SEMANTIC_FAMILY_ARENA_MEASUREMENTS.with(std::cell::Cell::get)
+}
+
 thread_local! {
     /// Set while this thread runs a closure under the configuration write
     /// lock (`update_config`). Reading the configuration there would wait on
@@ -11750,10 +11760,12 @@ impl AppContext {
         true
     }
 
-    /// Resident bytes of the family arena this root's loaded semantic view
-    /// reads, shared with the family's other views; `None` without a loaded
-    /// lane. Walks the arena, so only the idle reaper's log line asks.
-    pub(crate) fn semantic_family_arena_bytes(&self) -> Option<u64> {
+    /// Count requests for a family-arena measurement on this thread. The idle
+    /// reaper test uses this hook to guard against adding an arena walk back to
+    /// the frame loop, even when its fixture has no semantic lane loaded.
+    #[cfg(test)]
+    pub(crate) fn semantic_family_arena_bytes_for_test(&self) -> Option<u64> {
+        SEMANTIC_FAMILY_ARENA_MEASUREMENTS.with(|count| count.set(count.get() + 1));
         self.checkout_semantic
             .runtime()
             .map(|runtime| runtime.family_arena_bytes())
