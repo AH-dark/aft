@@ -668,7 +668,15 @@ fn handle_inspect_payload(
                     .count()
             },
         );
-        (roots, count as u64)
+        // The project census cannot include explicit files in another
+        // workspace. Count those independently, including unsupported files
+        // whose diagnostics will be a named gap rather than a clean result.
+        let outside_files = roots
+            .iter()
+            .filter(|root| !root.starts_with(&snapshot.project_root) && root.is_file())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        (roots, (count + outside_files) as u64)
     });
     let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 

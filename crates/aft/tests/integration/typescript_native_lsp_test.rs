@@ -163,6 +163,53 @@ fn runtime_notes(aft: &mut AftProcess, file: &Path) -> Vec<String> {
 }
 
 #[test]
+fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
+    let Some(ts5) = installed(
+        TS5_ENV,
+        "typescript_5_inspect_outside_project_root_uses_external_workspace",
+    ) else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().canonicalize().unwrap();
+    let root = parent.join("configured");
+    fs::create_dir_all(&root).unwrap();
+    let external = parent.join("external");
+    typescript_package(&external, &ts5);
+    let broken = external.join("src/broken.ts");
+    write(&broken, "export const broken: number = \"not a number\";\n");
+    let mut aft = spawn_configured(&root, &[ts5.join(".bin")]);
+    let response = aft.send(
+        &json!({
+            "id": "inspect-external", "command": "inspect", "scope": broken,
+            "sections": ["diagnostics"],
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["scope_files"], 1, "{response}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"], 1,
+        "{response}"
+    );
+    assert!(
+        response["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == broken.to_str().unwrap()
+                && row["message"].as_str().is_some_and(
+                    |message| message.contains("2322") || message.contains("not assignable")
+                )),
+        "{response}"
+    );
+}
+
+#[test]
 fn typescript_7_project_is_served_by_the_native_language_server() {
     let Some(ts7) = installed(
         TS7_ENV,

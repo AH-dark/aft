@@ -304,6 +304,7 @@ pub(crate) fn run_diagnostics_category(
             snapshot,
             expected_producers,
             scoped.as_ref().map(|(_, producer_keys)| producer_keys),
+            scoped.as_ref().map(|(files, _)| files.as_slice()),
         )
     };
     collection.indexing_gaps = indexing_gaps
@@ -503,9 +504,16 @@ fn collect_warm_working_set(
     snapshot: &InspectSnapshot,
     expected_producers: &[ServerKey],
     scope_producers: Option<&HashSet<ServerKey>>,
+    scoped_files: Option<&[PathBuf]>,
 ) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
+    // External workspace servers can publish unrelated files too. Retain only
+    // the requested files outside the project; unscoped collection stays local.
+    let accepts_file = |file: &Path| {
+        file.starts_with(&snapshot.project_root)
+            || scoped_files.is_some_and(|files| files.iter().any(|candidate| candidate == file))
+    };
     {
         let mut lsp = ctx.lsp();
         // Live language-server diagnostics come from queued events and the
@@ -516,8 +524,7 @@ fn collect_warm_working_set(
         collection.producer_reports = lsp
             .authoritative_diagnostic_reports()
             .filter(|(_, file, _)| {
-                file.starts_with(&snapshot.project_root)
-                    && !tsconfig_membership.should_skip_diagnostics(file)
+                accepts_file(file) && !tsconfig_membership.should_skip_diagnostics(file)
             })
             .map(|(server, file, diagnostics)| {
                 (
@@ -623,10 +630,7 @@ fn collect_warm_working_set(
     }
 
     collection.diagnostics.retain(|diagnostic| {
-        diagnostic
-            .diagnostic
-            .file
-            .starts_with(&snapshot.project_root)
+        accepts_file(&diagnostic.diagnostic.file)
             && !tsconfig_membership.should_skip_diagnostics(&diagnostic.diagnostic.file)
     });
     collection.sort_and_dedup();
@@ -646,6 +650,8 @@ enum ScopedFileCoverage {
     /// Only warming (provisional) reports exist: the reporting server has not
     /// reached quiescence yet.
     Warming,
+    /// An explicitly scoped external file is excluded from its TypeScript project.
+    ExcludedByTsconfig,
 }
 
 /// Test hook: force every scoped file to read as authoritatively covered.
@@ -693,7 +699,8 @@ fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> Scope
 /// roots are walked with the same filters applicability resolution uses;
 /// only files with a registered producer are candidates there, because
 /// directories inevitably contain non-code files nobody expects diagnostics
-/// for. Files a tsconfig excludes from diagnostics are skipped in both cases.
+/// for. In-root files a tsconfig excludes are skipped. Explicit external files
+/// remain candidates so an excluded file is named as unchecked rather than clean.
 fn scoped_coverage_candidates(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
@@ -709,7 +716,9 @@ fn scoped_coverage_candidates(
     let mut candidates = BTreeSet::new();
     for root in roots {
         if root.is_file() {
-            if tsconfig_membership.should_skip_diagnostics(&root) {
+            if root.starts_with(&snapshot.project_root)
+                && tsconfig_membership.should_skip_diagnostics(&root)
+            {
                 continue;
             }
             candidates.insert(crate::inspect::job::canonicalize_normalized(&root));
@@ -850,11 +859,18 @@ impl DiagnosticsCollection {
             return;
         }
         let active: HashSet<ServerKey> = ctx.lsp().active_server_keys().into_iter().collect();
+        let mut tsconfig_membership = TsconfigMembershipCache::new();
         for file in candidates {
             if self.saved_files.contains(file) {
                 continue;
             }
-            let coverage = scoped_file_coverage(ctx, &snapshot.config, file);
+            let coverage = if !file.starts_with(&snapshot.project_root)
+                && tsconfig_membership.should_skip_diagnostics(file)
+            {
+                ScopedFileCoverage::ExcludedByTsconfig
+            } else {
+                scoped_file_coverage(ctx, &snapshot.config, file)
+            };
             // A report published while `cargo check` was still running lacks
             // the compiler's errors, so it cannot certify the file.
             let checking = sweep.and_then(|sweep| {
@@ -910,8 +926,14 @@ impl DiagnosticsCollection {
                 ScopedFileCoverage::Warming => {
                     "the reporting LSP server has not reached quiescence yet"
                 }
+                ScopedFileCoverage::ExcludedByTsconfig => {
+                    "the file is excluded from diagnostics by its tsconfig"
+                }
             };
-            let cause = if coverage == ScopedFileCoverage::NoProducer {
+            let cause = if matches!(
+                coverage,
+                ScopedFileCoverage::NoProducer | ScopedFileCoverage::ExcludedByTsconfig
+            ) {
                 CoverageCause::unattributed(reason)
             } else {
                 sweep
@@ -1129,7 +1151,11 @@ impl DiagnosticsCollection {
             serde_json::json!({
                 "kind": "uncovered_file",
                 "file": display_path(snapshot, &gap.file),
-                "reason": gap.reason,
+                "reason": if gap.file.starts_with(&snapshot.project_root) {
+                    gap.reason.to_string()
+                } else {
+                    format!("outside_project_root_unverified: {}", gap.reason)
+                },
                 "cause": {
                     "producer": gap.cause.producer,
                     "root": gap.cause.root.as_deref().map(|root| display_root(snapshot, root)),
@@ -1478,7 +1504,7 @@ mod payload_count_tests {
             kind,
             root: PathBuf::from("/repo"),
         });
-        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None);
+        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None, None);
         assert!(!collection.is_complete());
         let payload = collection.into_payload(&snapshot());
         assert!(payload["errors"].is_null(), "{payload:#}");
@@ -1494,6 +1520,33 @@ mod payload_count_tests {
                 .contains_key(producer));
             assert!(payload["by_producer"][producer]["errors"].is_null());
         }
+    }
+
+    #[test]
+    fn external_reports_are_collected_only_for_the_requested_files() {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let outside = PathBuf::from("/external/selected.rs");
+        let unrelated = PathBuf::from("/external/unrelated.rs");
+        for file in [&outside, &unrelated] {
+            let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
+            diagnostic.file = file.clone();
+            ctx.lsp()
+                .diagnostics_store_mut_for_test()
+                .publish_with_kind(ServerKind::Rust, file.clone(), vec![diagnostic]);
+        }
+        let files = [outside.clone()];
+        let scoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files));
+        assert_eq!(scoped.diagnostics.len(), 1);
+        assert_eq!(scoped.diagnostics[0].diagnostic.file, outside);
+        assert_eq!(scoped.producer_reports.len(), 1);
+        assert_eq!(scoped.producer_reports[0].1, outside);
+
+        let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None);
+        assert!(unscoped.diagnostics.is_empty());
+        assert!(unscoped.producer_reports.is_empty());
     }
 
     #[test]

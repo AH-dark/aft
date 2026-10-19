@@ -1,0 +1,1 @@
+- Scoped inspect now reports errors in external files or names them as unchecked, instead of claiming a clean result (#559, thanks @iceteaSA).
