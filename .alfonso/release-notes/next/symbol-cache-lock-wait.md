@@ -1,0 +1,1 @@
+- /tmp/symcache-note.md
