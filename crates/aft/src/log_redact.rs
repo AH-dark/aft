@@ -195,6 +195,10 @@ fn redact_with_range<'a>(
 pub(crate) struct SecretValues(Vec<String>);
 
 impl SecretValues {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub(crate) fn from_environment<'a>(
         env: impl IntoIterator<Item = (&'a std::ffi::OsStr, &'a std::ffi::OsStr)>,
     ) -> Self {

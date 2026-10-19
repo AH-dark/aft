@@ -504,6 +504,8 @@ fn fake_task(
     } else {
         metadata.status = status;
     }
+    // This synthetic task has no child environment credentials.
+    metadata.completion_has_env_secrets = Some(false);
     metadata.completion_delivered = completion_delivered;
     write_task(&paths.json, &metadata).unwrap();
     fs::write(&paths.stdout, "stdout").unwrap();
@@ -3312,4 +3314,181 @@ fn terminal_status_preserves_completion_until_explicit_acknowledges() {
         "completed"
     );
     assert!(collected.shutdown().success());
+}
+
+fn spawn_redaction_task(aft: &mut AftProcess, command: &str, env: Value) -> String {
+    let response = aft.send(
+        &json!({
+            "id": "spawn-redaction",
+            "session_id": SESSION,
+            "command": "bash",
+            "params": {
+                "command": command,
+                "background": true,
+                "compressed": false,
+                "env": env,
+                "timeout": 120_000,
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "spawn failed: {response:?}");
+    response["task_id"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
+    const SECRET: &str = "opaque deployment credential";
+    const MASKED: &str = "<REDACTED_SECRET>";
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-watch");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let env = json!({"DEPLOY_tOkEn": SECRET});
+    let completion_id = spawn_redaction_task(
+        &mut owner,
+        "printf 'finished %s\\n' \"$DEPLOY_tOkEn\"",
+        env.clone(),
+    );
+    let live_completion = wait_for_completion_frame(&mut owner, &completion_id);
+    assert_eq!(
+        live_completion["output_preview"],
+        format!("finished {MASKED}\n")
+    );
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY %s\\n' \"$DEPLOY_tOkEn\"",
+        shell_quote_path(&release),
+    );
+    let watch_id = spawn_redaction_task(&mut owner, &command, env);
+    let registered = owner.send(
+        &json!({
+            "id": "watch-redaction", "session_id": SESSION, "command": "bash_notify",
+            "params": {"task_id": watch_id, "regex": "READY .+", "once": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(registered["success"], true, "{registered:?}");
+    drop(release_guard);
+    let live_pattern = wait_for_pattern_frame(&mut owner, &watch_id);
+    assert_eq!(live_pattern["match_text"], format!("READY {MASKED}"));
+    assert!(live_pattern["context"].as_str().unwrap().contains(MASKED));
+    assert!(!live_pattern.to_string().contains(SECRET));
+    let persisted = persisted_watch_rows(storage.path(), SESSION, &watch_id);
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(
+        persisted[0].match_text.as_deref(),
+        live_pattern["match_text"].as_str()
+    );
+    assert!(!format!("{:?}", persisted[0]).contains(SECRET));
+    sigkill_aft(owner);
+
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    let replayed_pattern = wait_for_pattern_frame(&mut restored, &watch_id);
+    for field in ["match_text", "match_offset", "context"] {
+        assert_eq!(replayed_pattern[field], live_pattern[field], "{field}");
+    }
+    let drained = drain(&mut restored, SESSION);
+    let replayed_completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == completion_id)
+        .unwrap();
+    assert_eq!(
+        replayed_completion["output_preview"],
+        live_completion["output_preview"]
+    );
+    assert!(!drained.to_string().contains(SECRET));
+    assert!(!replayed_pattern.to_string().contains(SECRET));
+    assert!(restored.shutdown().success());
+}
+
+#[test]
+fn redaction_replay_withholds_new_secret_output() {
+    const SECRET: &str = "opaque post-restart credential";
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-secret");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' \"$DEPLOY_tOkEn\"",
+        shell_quote_path(&release),
+    );
+    let id = spawn_redaction_task(&mut owner, &command, json!({"DEPLOY_tOkEn": SECRET}));
+    let watched = spawn_redaction_task(&mut owner, &command, json!({"DEPLOY_tOkEn": SECRET}));
+    let registered = owner.send(
+        &json!({
+            "id": "watch-after-restart", "session_id": SESSION, "command": "bash_notify",
+            "params": {"task_id": watched, "regex": ".+", "once": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(registered["success"], true, "{registered:?}");
+    sigkill_aft(owner);
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    drop(release_guard);
+    let pattern = wait_for_pattern_frame(&mut restored, &watched);
+    assert_eq!(pattern["match_text"], "<REDACTED_SECRET>");
+    assert!(pattern["context"].as_str().unwrap().contains("bash_status"));
+    assert!(!pattern.to_string().contains(SECRET));
+    wait_for_status(&mut restored, SESSION, &id, "completed");
+    let drained = drain(&mut restored, SESSION);
+    let completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == id)
+        .unwrap();
+    let preview = completion["output_preview"].as_str().unwrap();
+    assert!(
+        preview.contains("secret values aren't available after the daemon restarted"),
+        "{completion}"
+    );
+    assert!(preview.contains("bash_status"), "{completion}");
+    assert!(preview.contains("Output file:"), "{completion}");
+    assert!(!preview.contains(SECRET));
+    assert_eq!(
+        status(&mut restored, SESSION, &id)["output_preview"],
+        format!("{SECRET}\n")
+    );
+    assert!(restored.shutdown().success());
+}
+
+#[test]
+fn redaction_replay_shows_new_output_without_env_secrets() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-ordinary");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf 'ordinary post-restart output\\n'",
+        shell_quote_path(&release),
+    );
+    let id = spawn_redaction_task(&mut owner, &command, json!({}));
+    wait_for_status(&mut owner, SESSION, &id, "running");
+    sigkill_aft(owner);
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    drop(release_guard);
+    wait_for_status(&mut restored, SESSION, &id, "completed");
+    let drained = drain(&mut restored, SESSION);
+    let completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == id)
+        .unwrap();
+    assert_eq!(
+        completion["output_preview"],
+        "ordinary post-restart output\n"
+    );
+    assert!(restored.shutdown().success());
 }

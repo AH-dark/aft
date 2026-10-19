@@ -5,32 +5,47 @@ use std::borrow::Cow;
 // Every host displays this Rust-owned text verbatim instead of reconstructing
 // an unsafe preview from bash_status or the capture files after a restart.
 pub(super) const RESTART_PREVIEW_WITHHELD: &str =
-    "Output preview withheld after a restart; read the output with bash_status.";
+    "Output preview withheld: this task's secret values aren't available after the daemon restarted; read the output with bash_status.";
 pub(super) const TRUNCATED_PREVIEW_WITHHELD: &str =
     "Output preview withheld because intact output is unavailable for credential masking; use bash_status.";
 
 impl BgTaskRegistry {
-    pub(super) fn mask_watch_text(
+    pub(super) fn saved_completion_preview(
+        &self,
+        metadata: &PersistedTask,
+    ) -> Option<crate::bash_background::persistence::PersistedCompletionPreview> {
+        self.task(&metadata.task_id)
+            .and_then(|task| task.lock_state().ok()?.metadata.completion_preview.clone())
+            .or_else(|| metadata.completion_preview.clone())
+    }
+
+    pub(super) fn save_completion_preview(
         &self,
         task_id: &str,
-        match_text: &mut String,
-        context: &mut String,
-    ) {
-        let task = self.task(task_id);
-        let guard = task.as_ref().map(|task| {
-            task.completion_secrets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-        if let Some(secrets) = guard.as_deref().and_then(Option::as_ref) {
-            *match_text = secrets.redact(match_text).into_owned();
-            *context = secrets.redact(context).into_owned();
-        } else {
-            if match_text != WATCH_TASK_EXIT_TEXT && match_text != WATCH_TARGET_ERASED_TEXT {
-                *match_text = crate::log_redact::SECRET_PLACEHOLDER.to_string();
-            }
-            *context = RESTART_PREVIEW_WITHHELD.to_string();
+        output_preview: &str,
+        output_truncated: bool,
+        bash_output_list_envelope: &Option<crate::list_envelope::ListEnvelope>,
+    ) -> crate::bash_background::persistence::PersistedCompletionPreview {
+        let preview = crate::bash_background::persistence::PersistedCompletionPreview {
+            output_preview: output_preview.to_string(),
+            output_truncated,
+            bash_output_list_envelope: bash_output_list_envelope.clone(),
+        };
+        let Some(task) = self.task(task_id) else {
+            return preview;
+        };
+        let mut db = DeferredDbWrites::new(self, &task);
+        let Ok(mut state) = task.lock_state() else {
+            return preview;
+        };
+        if let Some(saved) = &state.metadata.completion_preview {
+            return saved.clone();
         }
+        state.metadata.completion_preview = Some(preview.clone());
+        if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
+            crate::slog_warn!("failed to persist masked completion preview for {task_id}: {error}");
+        }
+        preview
     }
 
     pub(super) fn render_watch_preview(
@@ -78,6 +93,7 @@ impl BgTaskRegistry {
         &self,
         metadata: &PersistedTask,
         cache: &TerminalOutputCache,
+        paths: Option<&TaskPaths>,
     ) -> (String, bool) {
         let task = self.task(&metadata.task_id);
         let guard = task.as_ref().map(|task| {
@@ -85,7 +101,11 @@ impl BgTaskRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        let Some(secrets) = guard.as_deref().and_then(Option::as_ref) else {
+        let empty_secrets = crate::log_redact::SecretValues::default();
+        let secrets = guard.as_deref().and_then(Option::as_ref).or_else(|| {
+            (metadata.completion_has_env_secrets == Some(false)).then_some(&empty_secrets)
+        });
+        let Some(secrets) = secrets else {
             return withheld_preview(RESTART_PREVIEW_WITHHELD, cache);
         };
         if cache.output_preview.is_empty() {
@@ -98,7 +118,10 @@ impl BgTaskRegistry {
         {
             return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
         }
-        let buffer = BgBuffer::registered(&task.as_ref().unwrap().paths, BgMode::Pipes);
+        let Some(paths) = task.as_ref().map(|task| &task.paths).or(paths) else {
+            return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
+        };
+        let buffer = BgBuffer::registered(paths, BgMode::Pipes);
         let Some(mut raw) = buffer.read_complete_for_notice() else {
             return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
         };

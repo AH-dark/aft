@@ -204,8 +204,16 @@ fn bash_background_completion_replay_withholds_output_and_keeps_pointers() {
         "",
         false,
     );
-    *task.completion_secrets.lock().unwrap() = None;
-    let completion = registry.completion_snapshot_for_task(&task).unwrap();
+    let metadata: PersistedTask =
+        serde_json::from_str(&std::fs::read_to_string(&task.paths.json).unwrap()).unwrap();
+    assert_eq!(metadata.completion_has_env_secrets, None);
+    assert!(metadata.completion_preview.is_none());
+    let replayed = BgTaskRegistry::default();
+    replayed
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let recovered = replayed.task(&task.task_id).unwrap();
+    let completion = replayed.completion_snapshot_for_task(&recovered).unwrap();
     assert!(completion
         .output_preview
         .starts_with(completion_preview::RESTART_PREVIEW_WITHHELD));
@@ -387,7 +395,8 @@ fn bash_background_completion_redaction_preserves_short_recovery_trailers() {
         cache.output_truncated = true;
         cache.recovery = Some(recovery);
         let metadata = task.state.lock().unwrap().metadata.clone();
-        let (preview, truncated) = registry.completion_preview_for_notice(&metadata, &cache);
+        let (preview, truncated) =
+            registry.completion_preview_for_notice(&metadata, &cache, Some(&task.paths));
         assert!(truncated);
         assert!(!preview.contains(&token));
         assert!(preview.contains(SECRET_PLACEHOLDER));
