@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "34b6699589803c798ab71d0eae04c10107a8dee2364c2d071db3d492166d15f8",
-      "catalog_digest": "34b6699589803c798ab71d0eae04c10107a8dee2364c2d071db3d492166d15f8",
+      "generation": "e921e8ebb77a40efd52a5ff6b090e12486962f22d229dc8f284e118c3fbc0713",
+      "catalog_digest": "e921e8ebb77a40efd52a5ff6b090e12486962f22d229dc8f284e118c3fbc0713",
       "tools": [
         {
           "name": "status",
@@ -52,7 +52,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1217,8 +1217,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5cecd0fbebf3085d2c7b29f3dbbc867b11136ce182a998181350c291a2390d29",
-      "catalog_digest": "5cecd0fbebf3085d2c7b29f3dbbc867b11136ce182a998181350c291a2390d29",
+      "generation": "629bddbe4358113fbb99ee880aaf4e6a770b5fd4b59bfb5c08991bf2125f2b93",
+      "catalog_digest": "629bddbe4358113fbb99ee880aaf4e6a770b5fd4b59bfb5c08991bf2125f2b93",
       "tools": [
         {
           "name": "status",
@@ -1253,7 +1253,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3542,8 +3542,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "cff2f34fe2d80e0725ebd60e1c0bfb4ad26c394e19f40cd9f8b204f19fa4e4e2",
-      "catalog_digest": "cff2f34fe2d80e0725ebd60e1c0bfb4ad26c394e19f40cd9f8b204f19fa4e4e2",
+      "generation": "51163f1be2c24371444620c30a359762b5c9ecef2c18146a8b559f9872dfc4c7",
+      "catalog_digest": "51163f1be2c24371444620c30a359762b5c9ecef2c18146a8b559f9872dfc4c7",
       "tools": [
         {
           "name": "status",
@@ -3578,7 +3578,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4699,8 +4699,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "86710c08ed1d20db77bf829087344c3db78f112b2dda019a5fcc384a965e8169",
-      "catalog_digest": "86710c08ed1d20db77bf829087344c3db78f112b2dda019a5fcc384a965e8169",
+      "generation": "1c81c6d7aeb13d7538e819f7aa013f06356588f90c0d8fb2f9a12c5016cce50a",
+      "catalog_digest": "1c81c6d7aeb13d7538e819f7aa013f06356588f90c0d8fb2f9a12c5016cce50a",
       "tools": [
         {
           "name": "status",
@@ -4735,7 +4735,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5854,8 +5854,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5c1e6373005edb9b33c84d99031a86e3e0bb63b9354bf483c7255b95bb3506b4",
-      "catalog_digest": "5c1e6373005edb9b33c84d99031a86e3e0bb63b9354bf483c7255b95bb3506b4",
+      "generation": "dd6f8ba841e5fe74bcda36162725d687d31def2f95e81f2498d57eafd22a0c2f",
+      "catalog_digest": "dd6f8ba841e5fe74bcda36162725d687d31def2f95e81f2498d57eafd22a0c2f",
       "tools": [
         {
           "name": "status",
@@ -5890,7 +5890,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6952,8 +6952,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e4296c95cab19611a0207cdb7988f0da5f6964a09693c1735ffe11173484bbbd",
-      "catalog_digest": "e4296c95cab19611a0207cdb7988f0da5f6964a09693c1735ffe11173484bbbd",
+      "generation": "61dbb4ca1de10c96686502e2f518fecd664888892ea592cce0378b0b7376a54e",
+      "catalog_digest": "61dbb4ca1de10c96686502e2f518fecd664888892ea592cce0378b0b7376a54e",
       "tools": [
         {
           "name": "status",
@@ -6988,7 +6988,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -8047,8 +8047,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "86c2541001a0cec05e2fb53722442fe931b25d1633b65ded0914ae1796d55446",
-      "catalog_digest": "86c2541001a0cec05e2fb53722442fe931b25d1633b65ded0914ae1796d55446",
+      "generation": "ec728f849d547cf638ef60232c1c7124053f4cdc5407884182c7b3edaf97974d",
+      "catalog_digest": "ec728f849d547cf638ef60232c1c7124053f4cdc5407884182c7b3edaf97974d",
       "tools": [
         {
           "name": "status",
@@ -8083,7 +8083,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -9110,8 +9110,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2247768eac62ce5ff6dfa217daa95cb116ef04c5a50dccfd1e28ae120ddfab71",
-      "catalog_digest": "2247768eac62ce5ff6dfa217daa95cb116ef04c5a50dccfd1e28ae120ddfab71",
+      "generation": "0e765a4e4c001d3f8b84c5162bb0894772a72a09eb0ddf061fa7d81c282e4260",
+      "catalog_digest": "0e765a4e4c001d3f8b84c5162bb0894772a72a09eb0ddf061fa7d81c282e4260",
       "tools": [
         {
           "name": "status",
@@ -9146,7 +9146,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10167,8 +10167,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d8e9316e18d2f25c6016a9160f740cbb9001b31ddc5e79e30bad5859c7ed1de9",
-      "catalog_digest": "d8e9316e18d2f25c6016a9160f740cbb9001b31ddc5e79e30bad5859c7ed1de9",
+      "generation": "fcbbf6d85cc7443bd43be4cdcd53b247ae65f28066e194f04333d4420ef4797a",
+      "catalog_digest": "fcbbf6d85cc7443bd43be4cdcd53b247ae65f28066e194f04333d4420ef4797a",
       "tools": [
         {
           "name": "status",
@@ -10203,7 +10203,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -11442,8 +11442,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a6019216d4c44c8d3e8f22c7c77abebb2a1797d68d8dfaa23903313788421619",
-      "catalog_digest": "a6019216d4c44c8d3e8f22c7c77abebb2a1797d68d8dfaa23903313788421619",
+      "generation": "8e9fb75b9dfc60b77529b830a8cda00f92a227fc0e7e680c96afe6e0cb55983f",
+      "catalog_digest": "8e9fb75b9dfc60b77529b830a8cda00f92a227fc0e7e680c96afe6e0cb55983f",
       "tools": [
         {
           "name": "status",
@@ -11478,7 +11478,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -13915,8 +13915,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fd2e8c7e97870e91f94f21e07246615bb43c7265e3fed45a7030efa331348868",
-      "catalog_digest": "fd2e8c7e97870e91f94f21e07246615bb43c7265e3fed45a7030efa331348868",
+      "generation": "aefdbae2421e7ec52b11b6504f2102587794d9f1f32c7a897e2d601623f0fa9e",
+      "catalog_digest": "aefdbae2421e7ec52b11b6504f2102587794d9f1f32c7a897e2d601623f0fa9e",
       "tools": [
         {
           "name": "status",
@@ -13951,7 +13951,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -15146,8 +15146,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "47e271e4b16b6622bfd6b492cba68595db9ef2529934914d5e7e4ce533a86ad1",
-      "catalog_digest": "47e271e4b16b6622bfd6b492cba68595db9ef2529934914d5e7e4ce533a86ad1",
+      "generation": "d15cb9f91c95592d5bcd5541829c0c05387c46bfaefb29470900b5a318ace6be",
+      "catalog_digest": "d15cb9f91c95592d5bcd5541829c0c05387c46bfaefb29470900b5a318ace6be",
       "tools": [
         {
           "name": "status",
@@ -15182,7 +15182,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -16375,8 +16375,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2809b7e2014e5cb5b5afd7eebd780d1eb218f981b18c0c89f21dc6df0bb8ff11",
-      "catalog_digest": "2809b7e2014e5cb5b5afd7eebd780d1eb218f981b18c0c89f21dc6df0bb8ff11",
+      "generation": "ec77e4ff7e3d8961a7548d6ec98305efc92d70c66f8aad405418efe4ee15aa1e",
+      "catalog_digest": "ec77e4ff7e3d8961a7548d6ec98305efc92d70c66f8aad405418efe4ee15aa1e",
       "tools": [
         {
           "name": "status",
@@ -16411,7 +16411,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -17547,8 +17547,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7923c4a79c7364719cde5322889b2f7cc757a71d8efba65b3ad674d382cc2df6",
-      "catalog_digest": "7923c4a79c7364719cde5322889b2f7cc757a71d8efba65b3ad674d382cc2df6",
+      "generation": "89cf68b49e394f0f045625383ef0811103e3a1d0d82ee3f38aebaf296fc4ac64",
+      "catalog_digest": "89cf68b49e394f0f045625383ef0811103e3a1d0d82ee3f38aebaf296fc4ac64",
       "tools": [
         {
           "name": "status",
@@ -17583,7 +17583,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -18716,8 +18716,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2725d4130443f1a65558127dd8691b32e4785029a2f3b7081a5d4a50766e9eb9",
-      "catalog_digest": "2725d4130443f1a65558127dd8691b32e4785029a2f3b7081a5d4a50766e9eb9",
+      "generation": "0437f293eda6f0b1fad3784bd9f09c0fcf49c1dba9744a85f5cfbc5b73aac975",
+      "catalog_digest": "0437f293eda6f0b1fad3784bd9f09c0fcf49c1dba9744a85f5cfbc5b73aac975",
       "tools": [
         {
           "name": "status",
@@ -18752,7 +18752,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -19853,8 +19853,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "469a41b3f9b6f320d026a76b00ba95b97c93a8f31b901d163b888335cb768094",
-      "catalog_digest": "469a41b3f9b6f320d026a76b00ba95b97c93a8f31b901d163b888335cb768094",
+      "generation": "6a74ed308fb30e46de0f841a16c0b3f34419d6d3f4e3becbe64775293e888b4f",
+      "catalog_digest": "6a74ed308fb30e46de0f841a16c0b3f34419d6d3f4e3becbe64775293e888b4f",
       "tools": [
         {
           "name": "status",
@@ -19889,7 +19889,7 @@
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
-            "max_ms": 1830000
+            "max_ms": 2040000
           },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",

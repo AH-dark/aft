@@ -1,0 +1,1 @@
+Blocking shell waits now return before client timeouts while preserving default 30-minute waits; new sessions use a 34-minute reply timeout by default, while running sessions keep the timeout set when they started.

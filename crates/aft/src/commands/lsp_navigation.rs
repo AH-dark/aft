@@ -90,6 +90,15 @@ pub(crate) fn handle_lsp_navigation_deferred_with_restriction(
     ctx: Arc<AppContext>,
     force_restrict: bool,
 ) -> DispatchOutcome {
+    handle_lsp_navigation_deferred_with_reply_deadline(req, ctx, force_restrict, None)
+}
+
+pub(crate) fn handle_lsp_navigation_deferred_with_reply_deadline(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    force_restrict: bool,
+    reply_deadline: Option<Instant>,
+) -> DispatchOutcome {
     let Some(handler) = navigation_handler(&req.command) else {
         return DispatchOutcome::Immediate(Response::error(
             &req.id,
@@ -102,7 +111,7 @@ pub(crate) fn handle_lsp_navigation_deferred_with_restriction(
         return DispatchOutcome::Immediate(handler(req, &ctx));
     }
 
-    defer_lsp_navigation(req, ctx, force_restrict, handler)
+    defer_lsp_navigation(req, ctx, force_restrict, handler, reply_deadline)
 }
 
 fn navigation_handler(command: &str) -> Option<NavigationHandler> {
@@ -180,6 +189,7 @@ fn defer_lsp_navigation(
     ctx: Arc<AppContext>,
     force_restrict: bool,
     handler: NavigationHandler,
+    reply_deadline: Option<Instant>,
 ) -> DispatchOutcome {
     let request = RawRequest {
         id: req.id.clone(),
@@ -193,6 +203,7 @@ fn defer_lsp_navigation(
     let command = req.command.clone();
     let timeout_command = command.clone();
     let deadline = Instant::now() + DEFERRED_NAVIGATION_TIMEOUT;
+    let deadline = reply_deadline.map_or(deadline, |reply| deadline.min(reply));
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();

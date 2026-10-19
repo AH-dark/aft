@@ -424,15 +424,12 @@ pub(super) fn catalog(
     )
 }
 
-// A reply deadline starts at receipt, not at the command's first poll. Reserve
-// 30 seconds beyond the resolved blocking cap: up to 20 seconds for spawn
-// admission, up to 5 seconds to observe a command timeout instead of handing
-// back a task just before it dies, and 5 seconds for
-// finalization, writer queueing and relay egress. The margin extends the reply
-// deadline, not the command timeout, and no model argument controls it.
-// Watches do not spawn, but use the same conservative margin for admission,
-// terminal-state observation and delivering the reply under load.
-const WORKER_REPLY_MARGIN_MS: u64 = 30_000;
+// A 1,800,006 ms bash_watch execution lost its reply to Broca's 1,830 s
+// transport timeout: the old 30 s allowance did not cover dispatch and delivery
+// delay outside AFT's execution clock. Declare four minutes beyond the wait so
+// the reply-budget safety reserve preserves a full default 30-minute wait.
+// This extends the caller's reply window, never the command's hard timeout.
+pub(crate) const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
 const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
 
 /// Render a catalog directly from arguments for catalog conformance fixtures.

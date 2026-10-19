@@ -18,6 +18,7 @@ pub mod bash_wait_detach;
 pub mod bash_watch;
 pub mod bash_write;
 pub mod batch;
+pub(crate) mod blocking_wait;
 pub mod call_tree;
 pub mod callers;
 pub mod callgraph_borrowed;

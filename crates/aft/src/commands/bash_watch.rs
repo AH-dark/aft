@@ -246,6 +246,16 @@ fn poll_delay(elapsed: Duration) -> Duration {
 /// that would deliver an async watch's notification, so `background` only
 /// changes how long a worker waits (see [`effective_wait_ms`]).
 pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let budget =
+        crate::commands::blocking_wait::ReplyBudget::from_envelope(Instant::now(), &req.params);
+    handle_deferred_with_budget(req, ctx, budget)
+}
+
+pub(crate) fn handle_deferred_with_budget(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    budget: crate::commands::blocking_wait::ReplyBudget,
+) -> DispatchOutcome {
     let id = req.id.clone();
     let params = match parse_params(req) {
         Ok(params) => params,
@@ -267,7 +277,12 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
     let worker = req.worker_session();
     let worker_limit_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx);
     let primary_cap_ms = ctx.config().bash.watch_sync_max_ms;
-    let limit_ms = match effective_wait_ms(&params, worker, worker_limit_ms, primary_cap_ms) {
+    let wait_cap_ms = if worker {
+        crate::commands::blocking_wait::clamp_worker_wait_ms(worker_limit_ms)
+    } else {
+        worker_limit_ms
+    };
+    let limit_ms = match effective_wait_ms(&params, worker, wait_cap_ms, primary_cap_ms) {
         Ok(limit) => limit,
         Err(message) => {
             return DispatchOutcome::Immediate(Response::error(&id, "invalid_request", message))
@@ -328,6 +343,7 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
                 worker,
                 worker_limit_ms,
                 primary_cap_ms,
+                budget,
             };
             let Some(waited) = watch.wait(&worker_cancellation) else {
                 // Cancelled: the transport already answered the call.
@@ -391,20 +407,23 @@ struct WatchJob {
     worker: bool,
     worker_limit_ms: u64,
     primary_cap_ms: u64,
+    budget: crate::commands::blocking_wait::ReplyBudget,
 }
 
 impl WatchJob {
     /// Waits until the task exits, the pattern matches, or the limit passes.
     /// `None` when the call was cancelled first.
     fn wait(&self, cancellation: &crate::executor::JobCancellation) -> Option<Waited> {
-        let started = Instant::now();
-        let deadline = started + Duration::from_millis(self.limit_ms);
+        let started = self.budget.received_at;
+        let deadline = self
+            .budget
+            .cap(started + Duration::from_millis(self.limit_ms));
         let mut stdout = StreamScan::default();
         let mut stderr = StreamScan::default();
         let waited = |reason, matched| Waited {
             reason,
             elapsed_ms: started.elapsed().as_millis() as u64,
-            limit_ms: self.limit_ms,
+            limit_ms: deadline.saturating_duration_since(started).as_millis() as u64,
             matched,
         };
         loop {
@@ -433,6 +452,18 @@ impl WatchJob {
                 }
             }
             let now = Instant::now();
+            // A nearby process kill may extend an ordinary watch limit, never
+            // the reply deadline: the caller must receive its task id in time.
+            if now >= self.budget.deadline {
+                return Some(waited(
+                    if terminal {
+                        WaitReason::Exited
+                    } else {
+                        WaitReason::Timeout
+                    },
+                    None,
+                ));
+            }
             let kill_remaining = if self.worker {
                 self.registry
                     .hard_kill_remaining(&self.task_id, &self.session)
@@ -450,7 +481,8 @@ impl WatchJob {
                 poll_delay(started.elapsed())
             } else {
                 poll_delay(started.elapsed()).min(deadline - now)
-            };
+            }
+            .min(self.budget.deadline - now);
             if cancellation.wait_for_cancellation(pause) {
                 return None;
             }
@@ -853,6 +885,54 @@ mod tests {
 
     fn params(value: Value) -> BashWatchParams {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_watch_replies_before_short_client_deadline() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), storage.path());
+        let spawn: RawRequest = serde_json::from_value(json!({
+            "id":"start-watch-deadline", "command":"bash", "session_id":SESSION,
+            "worker_session":true,
+            "params":{"command":"sleep 60", "background":true,"timeout":120_000},
+        }))
+        .unwrap();
+        let launched = with_authenticated_principal(principal(project.path()), || {
+            crate::commands::bash::handle(&spawn, &ctx)
+        });
+        assert!(launched.success, "{launched:?}");
+        let task = launched.data["task_id"].as_str().unwrap();
+        struct StopTask(crate::bash_background::BgTaskRegistry, String);
+        impl Drop for StopTask {
+            fn drop(&mut self) {
+                let _ = self.0.kill(&self.1, SESSION);
+            }
+        }
+        let _stop = StopTask(ctx.bash_background().clone(), task.into());
+        let mut watch = request(task, SESSION);
+        watch.params["deadline_ms"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 800
+        );
+        let started = Instant::now();
+        let response = watch_with_wait_deadline(ctx, watch, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "reply arrived after safety cutoff: elapsed={elapsed:?}, client deadline=800ms"
+        );
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("still running"));
     }
 
     #[cfg(unix)]
