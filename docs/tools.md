@@ -278,6 +278,9 @@ finished it auto-promotes to a background task and returns a `taskId` while the 
 running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2000 })` polls
 briefly then hard-kills at 2s. `background: true` skips polling entirely.
 
+Completion previews in notices and wakes have common credential formats and secret-named child environment values masked; stdout/stderr files and `bash_status` tool results remain unchanged.
+After a daemon restart, a masked preview saved before the restart is replayed unchanged. A preview not yet saved is built from the output files only when the task was recorded as having no secret-named environment values; otherwise its preview is withheld because the secret values are no longer in memory to mask it, and `bash_status` reads the output.
+
 **Foreground example:**
 
 ```json

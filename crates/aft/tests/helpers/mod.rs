@@ -463,6 +463,16 @@ impl AftProcess {
             // message, and stderr_output() reads it back from the buffer.
             .stderr(Stdio::piped());
 
+        // Daemons launched by tests inherit the test runner's environment, and
+        // their unsandboxed child processes inherit it in turn. Start them
+        // without ambient credential-shaped variables unless a test explicitly
+        // adds one below, so unrelated tests do not depend on CI credentials.
+        for key in shared_test_env::secret_named_environment_keys(
+            aft::log_redact::is_secret_environment_key,
+        ) {
+            command.env_remove(key);
+        }
+
         for (key, value) in envs {
             command.env(key, value);
         }

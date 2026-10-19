@@ -12,6 +12,16 @@ use std::ffi::{OsStr, OsString};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// Return inherited credential-shaped names so test child processes can omit them.
+pub(crate) fn secret_named_environment_keys(
+    is_secret_environment_key: fn(&str) -> bool,
+) -> Vec<OsString> {
+    std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.to_str().is_some_and(is_secret_environment_key))
+        .collect()
+}
+
 fn process_env_mutex() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

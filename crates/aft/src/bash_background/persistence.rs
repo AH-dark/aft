@@ -537,6 +537,13 @@ pub enum BgMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedCompletionPreview {
+    pub output_preview: String,
+    pub output_truncated: bool,
+    pub bash_output_list_envelope: Option<crate::list_envelope::ListEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTask {
     pub schema_version: u32,
     /// Storage namespace captured at spawn, independent of later route binds.
@@ -587,6 +594,14 @@ pub struct PersistedTask {
     pub notify_on_completion: bool,
     #[serde(default = "default_compressed")]
     pub compressed: bool,
+    /// Only an explicit false permits rendering new output after a restart
+    /// without the task's in-memory environment credential values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_has_env_secrets: Option<bool>,
+    /// Fully rendered, credential-masked notice text, saved before delivery so
+    /// replay never needs the original environment values to reproduce it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_preview: Option<PersistedCompletionPreview>,
     #[serde(default)]
     pub pty_rows: Option<u16>,
     #[serde(default)]
@@ -690,6 +705,8 @@ impl PersistedTask {
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
+            completion_has_env_secrets: None,
+            completion_preview: None,
             pty_rows: None,
             pty_cols: None,
             scanner_report: Vec::new(),
@@ -820,6 +837,8 @@ impl From<BashTaskRow> for PersistedTask {
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
+            completion_has_env_secrets: None,
+            completion_preview: None,
             pty_rows: None,
             pty_cols: None,
             scanner_report: Vec::new(),

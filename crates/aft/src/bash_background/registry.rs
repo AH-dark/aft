@@ -907,6 +907,9 @@ struct WaitDetachState {
 const PENDING_WAIT_DETACH_TTL: Duration = Duration::from_secs(120);
 
 pub(crate) struct BgTask {
+    /// Absent after replay: secret values must never be persisted or recovered
+    /// from payload files. Completion notices withhold output when this is absent.
+    completion_secrets: Mutex<Option<crate::log_redact::SecretValues>>,
     pub(crate) task_id: String,
     pub(crate) session_id: String,
     pub(crate) paths: TaskPaths,
@@ -1975,28 +1978,11 @@ impl BgTaskRegistry {
             if let Some(job) = self.db_hint_job(&metadata.task_id) {
                 job.finish(&raw.text, metadata.exit_code);
             }
-            let endings: Vec<String> = [&raw.text[..stdout_end], &raw.text[stdout_end..]]
-                .into_iter()
-                .map(crate::compress::generic::strip_ansi)
-                .map(|text| crate::compress::line_cut::ensure_final_lines(&text, ""))
-                .filter(|text| !text.is_empty())
-                .collect();
+            let endings = stream_endings([&raw.text[..stdout_end], &raw.text[stdout_end..]]);
             let mut compressed =
                 self.compress_output(&metadata.command, raw.text, metadata.exit_code);
-            // Summary extractors may see stderr's final "Finished" line and
-            // conclude the tail is intact even though stdout's verdict vanished.
             // Repair all compressor tiers here, before either byte cap runs.
-            for ending in &endings {
-                let last = ending.lines().last().unwrap();
-                if !compressed.text.lines().any(|line| line.trim_end() == last) {
-                    compressed.text =
-                        crate::compress::line_cut::ensure_final_lines(ending, &compressed.text);
-                }
-            }
-            let final_lines = endings
-                .iter()
-                .map(|ending| ending.lines().last().unwrap().to_string())
-                .collect();
+            let final_lines = restore_stream_endings(&mut compressed.text, &endings);
             render_compressed_with_recovery(
                 buffer,
                 compressed,
@@ -3045,6 +3031,8 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
+        // The scanner masks the intact capture before constructing this match.
+        // Save that presentation verbatim so replay does not need task secrets.
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
@@ -3415,6 +3403,8 @@ impl BgTaskRegistry {
         };
         #[cfg(windows)]
         let capture_pipeline_status = false;
+        let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -3491,6 +3481,7 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(Some(completion_secrets)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -3759,6 +3750,8 @@ impl BgTaskRegistry {
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
+        let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -3830,6 +3823,7 @@ impl BgTaskRegistry {
 
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(Some(completion_secrets)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -4018,6 +4012,8 @@ impl BgTaskRegistry {
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
+        let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -4076,6 +4072,7 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(Some(completion_secrets)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -5442,6 +5439,7 @@ impl BgTaskRegistry {
         // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
+        let mut complete: Option<Vec<u8>> = None;
         loop {
             if !drain && bytes_read >= CHUNK as usize {
                 break;
@@ -5470,7 +5468,34 @@ impl BgTaskRegistry {
             if registry.file_cursor(cursor_key) != cursor {
                 continue;
             }
-            matches.extend(registry.scan_chunk(cursor_key, task_id, &bytes, start));
+            matches.extend(registry.scan_chunk(
+                cursor_key,
+                task_id,
+                &bytes,
+                start,
+                &mut |_, _, _, from, to| {
+                    // Scan in bounded chunks, but mask the intact capture only
+                    // when a watch fires so neither chunk edge can split a secret.
+                    if complete
+                        .as_ref()
+                        .is_none_or(|bytes| to > bytes.len() as u64)
+                    {
+                        complete = file
+                            .len()
+                            .ok()
+                            .filter(|len| *len < super::buffer::DISK_LIMIT_BYTES)
+                            .and_then(|len| file.read_range(0, len).ok());
+                    }
+                    let Some(complete) = complete.as_ref().filter(|bytes| to <= bytes.len() as u64)
+                    else {
+                        return (
+                            crate::log_redact::SECRET_PLACEHOLDER.to_string(),
+                            completion_preview::TRUNCATED_PREVIEW_WITHHELD.to_string(),
+                        );
+                    };
+                    self.render_watch_preview(task_id, complete, from as usize..to as usize)
+                },
+            ));
             drop(registry);
             if len < CHUNK as usize {
                 break;
@@ -7517,26 +7542,53 @@ impl BgTaskRegistry {
         if !snapshot.info.status.is_terminal() {
             return None;
         }
-        let (mut output_preview, output_truncated, cache) = if snapshot.info.mode == BgMode::Pty {
-            (String::new(), false, None)
-        } else {
-            self.ensure_terminal_output_cache(task)
-                .map(|cache| {
-                    let (preview, truncated) =
-                        completion_preview_for_cache(&cache, snapshot.exit_code);
-                    (preview, truncated, Some(cache))
-                })
-                .unwrap_or_else(|| (String::new(), false, None))
-        };
-        if let Ok(state) = task.lock_state() {
-            if let Some(note) = rendered_execution_note(&state.metadata) {
-                output_preview = format!("{note}\n{output_preview}");
-            }
-        }
-        self.append_db_hint(&task.task_id, &mut output_preview);
-        let bash_output_list_envelope = cache
-            .as_ref()
-            .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+        let metadata = task.lock_state().ok()?.metadata.clone();
+        let (output_preview, output_truncated, bash_output_list_envelope) =
+            if let Some(saved) = self.saved_completion_preview(&metadata) {
+                (
+                    saved.output_preview,
+                    saved.output_truncated,
+                    saved.bash_output_list_envelope,
+                )
+            } else {
+                let (mut output_preview, output_truncated, cache) =
+                    if snapshot.info.mode == BgMode::Pty {
+                        (String::new(), false, None)
+                    } else {
+                        let metadata = task.lock_state().ok()?.metadata.clone();
+                        self.ensure_terminal_output_cache(task)
+                            .map(|cache| {
+                                let (preview, truncated) = self.completion_preview_for_notice(
+                                    &metadata,
+                                    &cache,
+                                    Some(&task.paths),
+                                );
+                                (preview, truncated, Some(cache))
+                            })
+                            .unwrap_or_else(|| (String::new(), false, None))
+                    };
+                if let Ok(state) = task.lock_state() {
+                    if let Some(note) = rendered_execution_note(&state.metadata) {
+                        output_preview = format!("{note}\n{output_preview}");
+                    }
+                }
+                self.append_db_hint(&task.task_id, &mut output_preview);
+                let bash_output_list_envelope = cache
+                    .as_ref()
+                    .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+                self.mask_completion_text(&task.task_id, &mut output_preview);
+                let saved = self.save_completion_preview(
+                    &task.task_id,
+                    &output_preview,
+                    output_truncated,
+                    &bash_output_list_envelope,
+                );
+                (
+                    saved.output_preview,
+                    saved.output_truncated,
+                    saved.bash_output_list_envelope,
+                )
+            };
         Some(BgCompletion {
             task_id: snapshot.info.task_id,
             session_id: task.session_id.clone(),
@@ -8016,6 +8068,9 @@ impl BgTaskRegistry {
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(
+                (metadata.completion_has_env_secrets == Some(false)).then(Default::default),
+            ),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -9034,26 +9089,49 @@ impl BgTaskRegistry {
         // Completion reminders use the already-rendered terminal output and a
         // smaller, exit-aware head+tail cap. They never invoke the compressor
         // themselves.
-        let (mut output_preview, output_truncated) = render
-            .map(|cache| completion_preview_for_cache(cache, metadata.exit_code))
-            .unwrap_or_else(|| (String::new(), false));
-        if let Some(note) = rendered_execution_note(metadata) {
-            output_preview = format!("{note}\n{output_preview}");
-        }
-        append_remote_report(&mut output_preview, metadata);
-        if metadata.status == BgTaskStatus::Failed || metadata.status == BgTaskStatus::FateUnknown {
-            if let Some(reason) = metadata.status_reason.as_deref() {
-                output_preview = if output_preview.is_empty() {
-                    reason.to_string()
-                } else {
-                    format!("{reason}\n{output_preview}")
-                };
-            }
-        }
-        self.append_db_hint(&metadata.task_id, &mut output_preview);
-        let bash_output_list_envelope =
-            render.and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+        let (output_preview, output_truncated, bash_output_list_envelope) =
+            if let Some(saved) = self.saved_completion_preview(metadata) {
+                (
+                    saved.output_preview,
+                    saved.output_truncated,
+                    saved.bash_output_list_envelope,
+                )
+            } else {
+                let (mut output_preview, output_truncated) = render
+                    .map(|cache| self.completion_preview_for_notice(metadata, cache, paths))
+                    .unwrap_or_else(|| (String::new(), false));
+                if let Some(note) = rendered_execution_note(metadata) {
+                    output_preview = format!("{note}\n{output_preview}");
+                }
+                append_remote_report(&mut output_preview, metadata);
+                if metadata.status == BgTaskStatus::Failed
+                    || metadata.status == BgTaskStatus::FateUnknown
+                {
+                    if let Some(reason) = metadata.status_reason.as_deref() {
+                        output_preview = if output_preview.is_empty() {
+                            reason.to_string()
+                        } else {
+                            format!("{reason}\n{output_preview}")
+                        };
+                    }
+                }
+                self.append_db_hint(&metadata.task_id, &mut output_preview);
+                let bash_output_list_envelope = render
+                    .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
 
+                self.mask_completion_text(&metadata.task_id, &mut output_preview);
+                let saved = self.save_completion_preview(
+                    &metadata.task_id,
+                    &output_preview,
+                    output_truncated,
+                    &bash_output_list_envelope,
+                );
+                (
+                    saved.output_preview,
+                    saved.output_truncated,
+                    saved.bash_output_list_envelope,
+                )
+            };
         let token_counts = self.completion_token_counts(
             metadata,
             buffer,
@@ -10062,6 +10140,35 @@ fn normalize_piped_display_output(text: &mut String) {
         rendered.push(*character);
     }
     *text = rendered;
+}
+
+/// Each non-empty stream's final lines, with ANSI escapes stripped, for
+/// [`restore_stream_endings`]. Stdout and stderr are kept apart because the
+/// compressor only ever sees them joined.
+fn stream_endings(streams: [&str; 2]) -> Vec<String> {
+    streams
+        .into_iter()
+        .map(crate::compress::generic::strip_ansi)
+        .map(|text| crate::compress::line_cut::ensure_final_lines(&text, ""))
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+/// Put back any stream's final line that compression dropped, and return those
+/// final lines so the later byte caps keep them. Summary extractors may see
+/// stderr's final "Finished" line and conclude the tail is intact even though
+/// stdout's verdict vanished.
+fn restore_stream_endings(compressed: &mut String, endings: &[String]) -> Vec<String> {
+    for ending in endings {
+        let last = ending.lines().last().unwrap();
+        if !compressed.lines().any(|line| line.trim_end() == last) {
+            *compressed = crate::compress::line_cut::ensure_final_lines(ending, compressed);
+        }
+    }
+    endings
+        .iter()
+        .map(|ending| ending.lines().last().unwrap().to_string())
+        .collect()
 }
 
 fn render_compressed_with_recovery(
@@ -11922,6 +12029,13 @@ fn random_slug() -> String {
 #[path = "pty_completion_test.rs"]
 mod pty_completion_tests;
 
+#[cfg(test)]
+#[path = "completion_redaction_tests.rs"]
+mod completion_redaction_tests;
+
+#[path = "completion_preview.rs"]
+mod completion_preview;
+
 fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     let warning = metadata
         .remote
@@ -12246,7 +12360,7 @@ mod tests {
         ));
     }
 
-    fn insert_terminal_piped_task(
+    pub(super) fn insert_terminal_piped_task(
         registry: &BgTaskRegistry,
         dir: &tempfile::TempDir,
         command: &str,
@@ -12275,6 +12389,8 @@ mod tests {
             .insert_rehydrated_task(metadata, paths, true)
             .expect("insert terminal task");
         let task = registry.task_for_session(&task_id, "session").unwrap();
+        // This fixture models a live command; replay behavior has separate tests.
+        *task.completion_secrets.lock().unwrap() = Some(Default::default());
         (task_id, task)
     }
 
@@ -13914,6 +14030,9 @@ mod tests {
             .expect("insert terminal task");
         let task = registry.task_for_session(&task_id, "session").unwrap();
 
+        // Exercise head/tail sizing rather than restart withholding. The
+        // simulated command has a known environment with no secret variables.
+        *task.completion_secrets.lock().unwrap() = Some(Default::default());
         registry.post_terminal_transition(&task, true).unwrap();
         let completions = registry.drain_completions_for_session(Some("session"));
         assert_eq!(completions.len(), 1);
@@ -14509,6 +14628,17 @@ mod tests {
     }
 
     fn gate_tail_agent_text(command: &str, stdout: &str, stderr: &str) -> (String, String) {
+        gate_tail_agent_text_with_secrets(command, stdout, stderr, Default::default())
+    }
+
+    /// Returns the bash_status preview and the pushed completion preview for a
+    /// terminal task whose live child environment carried `secrets`.
+    fn gate_tail_agent_text_with_secrets(
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        secrets: crate::log_redact::SecretValues,
+    ) -> (String, String) {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
         let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
@@ -14527,6 +14657,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (task_id, task) =
             insert_terminal_piped_task(&registry, &dir, command, stdout, stderr, true);
+        *task.completion_secrets.lock().unwrap() = Some(secrets);
         let snapshot = registry
             .status(
                 &task_id,
@@ -14548,10 +14679,9 @@ mod tests {
         (snapshot.output_preview, completion)
     }
 
-    #[test]
-    fn gate_tail_fixture_keeps_verdict_through_extractors_and_caps() {
-        // Model command.sh in-process: this tests captured-output compression,
-        // not shell launching, and Windows need not have a working POSIX bash.
+    /// Models command.sh in-process: a Cargo-shaped gate whose stdout ends
+    /// with its verdict while stderr ends with Cargo's "Finished" line.
+    fn gate_tail_fixture_streams() -> (String, String) {
         let mut stdout = String::new();
         let mut stderr = String::new();
         for phase in 1..=2 {
@@ -14576,6 +14706,22 @@ mod tests {
             stdout.push_str(&format!("        PASS [   0.001s] gate::case_{index}\n"));
         }
         stdout.push_str("     Summary [   0.080s] 80 tests run: 80 passed, 0 skipped\n    ok (1s)\n==> generated files untouched by the build\n    ok (0s)\nGATE PASSED: all phases green\n");
+        (stdout, stderr)
+    }
+
+    // Commands covering each compressor tier the gate fixture can reach.
+    const GATE_TAIL_COMMANDS: [&str; 4] = [
+        "scripts/rust-test-gate.sh",
+        "cargo test --workspace",
+        "cargo nextest run --workspace",
+        "cargo test && printf done",
+    ];
+
+    #[test]
+    fn gate_tail_fixture_keeps_verdict_through_extractors_and_caps() {
+        // This tests captured-output compression, not shell launching, and
+        // Windows need not have a working POSIX bash.
+        let (stdout, stderr) = gate_tail_fixture_streams();
         assert_eq!(stdout.lines().count() + stderr.lines().count(), 327);
         assert_eq!(stdout.lines().last(), Some("GATE PASSED: all phases green"));
         assert!(stderr.lines().last().unwrap().contains("Finished"));
@@ -14584,12 +14730,7 @@ mod tests {
         // explicit cargo command takes the command tier; nextest and the shell
         // list take generic compression. Padding forces the 16 KiB reply cap
         // on those generic paths in addition to the 600-byte completion cap.
-        for command in [
-            "scripts/rust-test-gate.sh",
-            "cargo test --workspace",
-            "cargo nextest run --workspace",
-            "cargo test && printf done",
-        ] {
+        for command in GATE_TAIL_COMMANDS {
             for padding in [String::new(), cargo_verdict_noise("build context", 2000)] {
                 let (foreground, completion) =
                     gate_tail_agent_text(command, &(padding + &stdout), &stderr);
@@ -14600,6 +14741,39 @@ mod tests {
                     );
                     assert!(text.contains("Finished `test` profile"), "{text}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gate_tail_masked_completion_keeps_verdict() {
+        // A credential in the output sends the completion through the masked
+        // re-render, which must repair stdout's verdict like bash_status does.
+        let secret = "opaque-gate-deploy-credential";
+        let (stdout, stderr) = gate_tail_fixture_streams();
+        let stdout = format!("deploying with {secret}\n{stdout}");
+        let stderr = format!("   Uploading {secret}\n{stderr}");
+        for command in GATE_TAIL_COMMANDS {
+            for padding in [String::new(), cargo_verdict_noise("build context", 2000)] {
+                let secrets = crate::log_redact::SecretValues::from_environment([(
+                    std::ffi::OsStr::new("DEPLOY_TOKEN"),
+                    std::ffi::OsStr::new(secret),
+                )]);
+                let (_, completion) = gate_tail_agent_text_with_secrets(
+                    command,
+                    &(padding + &stdout),
+                    &stderr,
+                    secrets,
+                );
+                assert!(
+                    completion.contains("GATE PASSED: all phases green"),
+                    "masked completion lost the verdict for {command}: {completion}"
+                );
+                assert!(
+                    completion.contains("Finished `test` profile"),
+                    "{completion}"
+                );
+                assert!(!completion.contains(secret), "{completion}");
             }
         }
     }
@@ -18024,7 +18198,7 @@ mod tests {
         );
     }
 
-    fn registry_with_db_and_frames(
+    pub(super) fn registry_with_db_and_frames(
         storage: &Path,
     ) -> (
         BgTaskRegistry,
@@ -18636,7 +18810,9 @@ mod tests {
         assert!(leaks.is_empty(), "ticket persisted in {leaks:?}");
     }
 
-    fn pattern_match_frames(frames: &Mutex<Vec<PushFrame>>) -> Vec<BashPatternMatchFrame> {
+    pub(super) fn pattern_match_frames(
+        frames: &Mutex<Vec<PushFrame>>,
+    ) -> Vec<BashPatternMatchFrame> {
         frames
             .lock()
             .unwrap()
@@ -19362,6 +19538,7 @@ mod tests {
                 frame.task_id == task_id
                     && frame.reason == "pattern_match"
                     && frame.match_text == "READY"
+                    && frame.context == "READY\n"
             }),
             "rehydrate should deliver gap match: {matches:?}"
         );
@@ -19418,7 +19595,9 @@ mod tests {
             "late-stream match was not caught in one fair running scan; read {} bytes",
             work.artifact_bytes
         );
-        assert_eq!(work.artifact_bytes, 196612);
+        // Matching stays chunked. A hit rereads the intact capture once so
+        // credential masking precedes both the chunk and context-window cuts.
+        assert_eq!(work.artifact_bytes, 2 * 196612);
         assert_eq!(
             work.artifact_opens, 2,
             "fresh validation is shared by all chunks in this pass"
@@ -19606,13 +19785,15 @@ mod tests {
 
         let matches: Vec<_> = pattern_match_frames(&replay_frames)
             .into_iter()
-            .filter(|frame| frame.task_id == task_id && frame.match_text.contains("GAP-HIT"))
+            .filter(|frame| frame.task_id == task_id && frame.reason == "pattern_match")
             .collect();
         assert_eq!(
             matches.len(),
             1,
             "gap match must deliver exactly once: {matches:?}"
         );
+        assert_eq!(matches[0].match_text, "GAP-HIT");
+        assert_eq!(matches[0].context, "prefix GAP-HIT suffix\n");
         assert!(
             matches[0].match_offset >= cursor_before,
             "match offset should be at/after the persisted cursor ({cursor_before}), got {}",
@@ -19720,6 +19901,7 @@ mod tests {
                 frame.task_id == task_id
                     && frame.watch_id == "watch-00000001"
                     && frame.match_text == "(fail)"
+                    && frame.context == "release output ... (fail)"
             }),
             "durable pending match must redeliver without an in-memory task: {matches:?}"
         );

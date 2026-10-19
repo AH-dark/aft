@@ -2342,9 +2342,25 @@ mod pending_response_tests {
         let mut helper = Response::success("req-finalize", serde_json::json!({"value": true}));
         finalize_response(&mut helper, &helper_fixture.ctx, session_id, "read");
 
+        // Recovered previews include output-file pointers. Compare their content
+        // without treating the two fixtures' private storage roots as a mismatch.
+        let normalize = |response: &Response, storage: &Path| {
+            let mut value = serde_json::to_value(response).unwrap();
+            let preview = value["bg_completions"][0]["output_preview"]
+                .as_str()
+                .unwrap();
+            let root = storage.display().to_string();
+            assert!(
+                preview.contains(&root),
+                "recovery pointers missing: {preview}"
+            );
+            value["bg_completions"][0]["output_preview"] =
+                serde_json::json!(preview.replace(&root, "<storage>"));
+            value
+        };
         assert_eq!(
-            serde_json::to_value(&helper).unwrap(),
-            serde_json::to_value(&inline).unwrap()
+            normalize(&helper, helper_fixture._storage.path()),
+            normalize(&inline, inline_fixture._storage.path())
         );
         assert_eq!(
             helper.data["bg_completions"][0]["task_id"],
