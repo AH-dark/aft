@@ -8586,7 +8586,9 @@ mod tests {
                 .send(started.elapsed())
                 .expect("report watcher invalidation");
         });
-        let invalidation = invalidated_rx.recv_timeout(Duration::from_millis(500));
+        // The held lock would keep a regressed writer waiting for the full 30 s
+        // lock timeout, so a 10 s bound separates the cases even on a loaded runner.
+        let invalidation = invalidated_rx.recv_timeout(Duration::from_secs(10));
         let writer_still_waiting = matches!(
             done_rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -8605,7 +8607,7 @@ mod tests {
         );
         let elapsed = invalidation.expect("watcher invalidation blocked by disk lock wait");
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_secs(10),
             "watcher took {elapsed:?}"
         );
         assert_eq!(shared.read().expect("read invalidated cache").len(), 0);
