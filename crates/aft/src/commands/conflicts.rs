@@ -439,13 +439,13 @@ mod tests {
     use crate::context::default_language_provider_factory;
     use crate::protocol::RawRequest;
 
-    /// An empty `.git` directory makes Git print its ordinary "not a git
+    /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
     /// repository" message. That is damaged metadata, not proof of absence.
     #[test]
     fn corrupt_repository_metadata_is_a_git_failure_not_absence() {
         assert!(crate::developer_tools::git_usable());
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
         let error = git_toplevel(dir.path()).unwrap_err();
         assert!(error.starts_with("git rev-parse failed:"), "{error}");
     }

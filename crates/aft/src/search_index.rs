@@ -9216,7 +9216,7 @@ mod tests {
         }
     }
 
-    /// An empty `.git` directory makes Git print its ordinary "not a git
+    /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
     /// repository" message. That is damaged metadata, not proof of absence, so
     /// the root-commit probe must stay retryable instead of choosing the
     /// path-derived cache identity reserved for real non-repositories.
@@ -9224,10 +9224,28 @@ mod tests {
     fn corrupt_root_commit_metadata_is_not_path_identity_fallback() {
         assert!(crate::developer_tools::git_usable());
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join(".git")).unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
         assert!(matches!(
             git_root_commit_once_real(dir.path(), &mut ArtifactCacheKeyTimings::default()),
             RootCommitProbe::Transient(_)
+        ));
+    }
+
+    /// A `.git` folder without HEAD (for example only `info/exclude`) is not a
+    /// repository to Git, so it keeps the path-derived identity of a plain folder.
+    #[test]
+    fn stub_git_directory_root_commit_is_not_a_repository() {
+        assert!(crate::developer_tools::git_usable());
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_directory_for_test(dir.path());
+        assert!(matches!(
+            git_root_commit_once_real(dir.path(), &mut ArtifactCacheKeyTimings::default()),
+            RootCommitProbe::NotARepo
+        ));
+        assert!(matches!(
+            repo_root_commit_with_retry(dir.path()),
+            RootCommitResolution::NotARepo
         ));
     }
 

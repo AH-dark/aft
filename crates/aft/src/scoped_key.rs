@@ -348,13 +348,23 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// An empty `.git` directory makes Git print its ordinary "not a git
+    /// A `.git` folder without HEAD (for example only `info/exclude`) is not a
+    /// repository to Git, so the scope stays a plain folder.
+    #[test]
+    fn stub_git_directory_is_a_plain_folder() {
+        assert!(crate::developer_tools::git_usable());
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_probe::write_stub_git_directory_for_test(dir.path());
+        assert!(matches!(find_git_toplevel(dir.path()), Ok(None)));
+    }
+
+    /// A repository with a corrupt HEAD makes Git print its ordinary "not a git
     /// repository" message. That is damaged metadata, not proof of absence.
     #[test]
     fn corrupt_repository_metadata_is_a_probe_error_not_absence() {
         assert!(crate::developer_tools::git_usable());
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
         assert!(matches!(
             find_git_toplevel(dir.path()),
             Err(ScopedKeyError::GitProbe { .. })

@@ -87,18 +87,13 @@ fn classify_failure(
 }
 
 fn repository_marker_or_uncertainty(root: &Path) -> bool {
-    // Git prints its ordinary absence message for an incomplete `.git`
-    // directory too. A visible marker, or an ancestor whose marker cannot be
-    // checked, is uncertainty rather than absence.
+    // Git also prints its ordinary absence message when a `.git` it would
+    // normally accept is damaged (for example a corrupt HEAD). A marker that
+    // looks like a repository, or one that cannot be checked, is therefore
+    // uncertainty rather than absence.
     for ancestor in root.ancestors() {
-        match std::fs::symlink_metadata(ancestor.join(".git")) {
-            Ok(_) => return true,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(_) => return true,
+        if git_marker_is_repository_candidate(&ancestor.join(".git")) {
+            return true;
         }
         // A bare repository has no `.git` entry; recognise its layout instead.
         if ancestor.join("HEAD").exists()
@@ -109,6 +104,30 @@ fn repository_marker_or_uncertainty(root: &Path) -> bool {
         }
     }
     false
+}
+
+/// Whether a `.git` entry is something Git would treat as a repository.
+///
+/// Git only accepts a `.git` directory that holds a HEAD file; without one it
+/// keeps searching the parent directories. A stub such as a `.git` holding
+/// only `info/exclude` is therefore a plain folder, exactly as Git sees it.
+/// A `.git` file (a worktree or submodule link) is a candidate because Git
+/// follows it. Any entry whose state cannot be read counts as a candidate.
+fn git_marker_is_repository_candidate(marker: &Path) -> bool {
+    let absent = |error: &io::Error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    };
+    match std::fs::metadata(marker) {
+        Ok(metadata) if metadata.is_dir() => match std::fs::symlink_metadata(marker.join("HEAD")) {
+            Ok(_) => true,
+            Err(error) => !absent(&error),
+        },
+        Ok(_) => true,
+        Err(error) => !absent(&error),
+    }
 }
 
 fn unborn_head(root: &Path) -> bool {
@@ -173,6 +192,28 @@ fn unborn_head(root: &Path) -> bool {
         Ok(_) => true,
         Err(error) => error.kind() == io::ErrorKind::NotFound,
     }
+}
+
+/// Test fixture: a real repository whose HEAD file is corrupt, so Git rejects
+/// it and prints its ordinary absence message even though a repository exists.
+#[cfg(test)]
+pub(crate) fn init_repository_with_corrupt_head_for_test(path: &Path) {
+    assert!(command()
+        .args(["init", "--quiet"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(path.join(".git").join("HEAD"), "not a ref\n").unwrap();
+}
+
+/// Test fixture: a `.git` folder holding only `info/exclude` and no HEAD, which
+/// Git itself does not treat as a repository.
+#[cfg(test)]
+pub(crate) fn write_stub_git_directory_for_test(path: &Path) {
+    let info = path.join(".git").join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("exclude"), "ignored/\n").unwrap();
 }
 
 #[cfg(test)]
@@ -258,9 +299,25 @@ mod tests {
     #[test]
     fn corrupt_git_metadata_is_not_repository_absence() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
         assert_eq!(failure_kind(toplevel(dir.path())), FailureKind::Other);
         assert_eq!(failure_kind(root_commits(dir.path())), FailureKind::Other);
+    }
+
+    /// Git does not treat a `.git` folder without HEAD as a repository, so such
+    /// a stub stays a determinate "not a repository".
+    #[test]
+    fn stub_git_directory_without_head_is_repository_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_git_directory_for_test(dir.path());
+        assert_eq!(
+            failure_kind(toplevel(dir.path())),
+            FailureKind::NotRepository
+        );
+        assert_eq!(
+            failure_kind(root_commits(dir.path())),
+            FailureKind::NotRepository
+        );
     }
 
     #[test]
