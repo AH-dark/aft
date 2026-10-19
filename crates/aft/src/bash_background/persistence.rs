@@ -1430,10 +1430,34 @@ pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "metadata path has no name"))?;
-    write_task_in_dir(&dir, name, task)
+    write_task_in_dir(&dir, name, task, ReplaceSync::for_task(task))
 }
 
 pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Result<()> {
+    write_task_at_with(task, metadata, ReplaceSync::for_task(metadata))
+}
+
+/// Writes a remote task's output-progress checkpoint: a record whose only
+/// change since the last durable write is the saved output cursor (sequence
+/// number and byte lengths).
+///
+/// The new file's contents are synced before the rename, so a power loss can
+/// never expose a partly written record under the metadata name. The
+/// directory is not synced after the rename, so a power loss may leave the
+/// previous record in place instead. That is still a correct checkpoint: each
+/// saved cursor only ever covers output already synced to disk, and recovery
+/// truncates the output files to whichever cursor it finds and asks the
+/// runner to replay from there. The next state-change write syncs the
+/// directory and makes any earlier rename durable.
+pub fn write_task_checkpoint_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Result<()> {
+    write_task_at_with(task, metadata, ReplaceSync::File)
+}
+
+fn write_task_at_with(
+    task: &ResolvedTask,
+    metadata: &PersistedTask,
+    sync: ReplaceSync,
+) -> io::Result<()> {
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1444,10 +1468,41 @@ pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Resul
         TaskLayout::Directory => OsString::from(METADATA_FILE),
         TaskLayout::Flat => OsString::from(format!("{}.json", task.paths.task_id)),
     };
-    write_task_in_dir(&task.dirs.control, &name, metadata)
+    write_task_in_dir(&task.dirs.control, &name, metadata, sync)
 }
 
-fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io::Result<()> {
+/// How much of an atomic file replacement is synced to disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplaceSync {
+    /// Nothing is synced. The rename still protects readers from a partly
+    /// written file after a process kill, but not after a power loss.
+    None,
+    /// The new file's contents are synced before the rename; the directory
+    /// entry is not synced after it.
+    File,
+    /// The new file is synced before the rename and its directory after it,
+    /// so the replacement itself survives a power loss.
+    FileAndDirectory,
+}
+
+impl ReplaceSync {
+    /// Remote tasks and local fallbacks of remote tasks resume from their
+    /// metadata after a crash, so their records are written durably.
+    fn for_task(task: &PersistedTask) -> Self {
+        if task.remote.is_some() || task.local_fallback_started {
+            Self::FileAndDirectory
+        } else {
+            Self::None
+        }
+    }
+}
+
+fn write_task_in_dir(
+    dir: &PinnedDir,
+    name: &OsStr,
+    task: &PersistedTask,
+    sync: ReplaceSync,
+) -> io::Result<()> {
     crate::production_storage::refuse_write(&dir.path().join(name))?;
     #[cfg(test)]
     if task.status == BgTaskStatus::Running {
@@ -1467,12 +1522,7 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    atomic_replace(
-        dir,
-        name,
-        &content,
-        task.remote.is_some() || task.local_fallback_started,
-    )
+    atomic_replace(dir, name, &content, sync)
 }
 
 #[cfg(test)]
@@ -2177,7 +2227,7 @@ pub(crate) fn persist_terminal_exit(paths: &TaskPaths, metadata: &mut PersistedT
 }
 
 pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) -> io::Result<()> {
-    atomic_replace(dir, name, content, false)
+    atomic_replace(dir, name, content, ReplaceSync::None)
 }
 
 pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
@@ -2186,7 +2236,12 @@ pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
     file.sync_all()
 }
 
-fn atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8], durable: bool) -> io::Result<()> {
+fn atomic_replace(
+    dir: &PinnedDir,
+    name: &OsStr,
+    content: &[u8],
+    sync: ReplaceSync,
+) -> io::Result<()> {
     for _ in 0..32 {
         let temporary = random_temp_name()?;
         let mut file = match dir.open_new_file(&temporary) {
@@ -2196,14 +2251,14 @@ fn atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8], durable: bool) 
         };
         let result = (|| {
             file.write_all(content)?;
-            if durable {
+            if sync != ReplaceSync::None {
                 sync_task_file(&file)?;
             }
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
             dir.rename(&temporary, name)?;
-            if durable {
+            if sync == ReplaceSync::FileAndDirectory {
                 sync_task_file(&dir.file)?;
             }
             Ok(())

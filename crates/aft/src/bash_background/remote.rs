@@ -590,7 +590,7 @@ impl DirtyOutput {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct OutputProgress {
     last_seq: Option<u64>,
     stdout_len: u64,
@@ -629,7 +629,28 @@ struct TaskSink {
     // metadata until the files are synced. Cancellation also saves that metadata.
     output_progress: OutputProgress,
     last_progress_persist: Instant,
+    /// Runs between the checkpoint snapshot and its file write, so a test can
+    /// land another metadata write in that window.
+    #[cfg(test)]
+    before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
 }
+
+/// Longest time the saved output cursor of a running remote task may lag the
+/// output already received, unless a state change saves it sooner.
+///
+/// The saved cursor is read only when a daemon restart (or a host crash)
+/// resumes the task: recovery truncates the output files to the saved byte
+/// lengths and attaches from the saved sequence number, so the runner sends
+/// again everything received after the last checkpoint. A longer interval
+/// means fewer file syncs while output streams in, and a longer replay after
+/// a restart. It assumes the runner keeps at least this much recent output
+/// for reattach, which five seconds is far inside. If the runner has trimmed
+/// some of it, the replay starts with a truncation notice and the missing
+/// records are reported as lost output, never skipped silently. State
+/// changes (acceptance, start, terminal proof, truncation, gap recovery) are
+/// saved at once and do not wait for this interval.
+#[cfg(unix)]
+const PROGRESS_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 impl TaskSink {
@@ -688,6 +709,8 @@ impl TaskSink {
                 ..OutputProgress::of(&remote)
             },
             last_progress_persist: Instant::now(),
+            #[cfg(test)]
+            before_checkpoint_write: None,
         };
         let losses: Vec<_> = [
             (RemoteOutputStream::Stdout, stdout_len, remote.stdout_len),
@@ -777,17 +800,7 @@ impl TaskSink {
     }
 
     fn progress(&mut self, seq: u64, stream: Option<OutputStream>, len: u64) -> io::Result<()> {
-        let mut db = DeferredDbWrites::new(&self.registry, &self.task);
-        let mut state = self
-            .task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?;
-        let remote = state.metadata.remote.as_mut().unwrap();
         let previous = self.output_progress;
-        let previous_durable = OutputProgress::of(remote);
-        let previous_received = remote.output_received;
-        let was_running = remote.started.is_some() || remote.output_received;
         match stream {
             Some(OutputStream::Stdout) => self.output_progress.stdout_len = len,
             Some(OutputStream::Stderr) => self.output_progress.stderr_len = len,
@@ -795,31 +808,88 @@ impl TaskSink {
             Some(_) => unreachable!("unknown streams use unknown_output"),
         }
         self.output_progress.last_seq = Some(seq);
-        remote.output_received |= stream.is_some();
-        // Older runners omit Started. Their first output is still a durable
-        // running transition; subsequent output only checkpoints the replay cursor.
-        let became_running = !was_running && remote.output_received;
-        if !became_running && self.last_progress_persist.elapsed() < Duration::from_secs(1) {
-            return Ok(());
-        }
-        let result = self
-            .dirty
-            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())
-            .and_then(|()| {
-                self.output_progress
-                    .store(state.metadata.remote.as_mut().unwrap());
-                self.registry
-                    .persist_task_locked(&self.task, &state.metadata, &mut db)
-            });
-        if result.is_err() {
+        let became_running = {
+            let mut state = self
+                .task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
             let remote = state.metadata.remote.as_mut().unwrap();
-            previous_durable.store(remote);
-            remote.output_received = previous_received;
-            self.output_progress = previous;
+            let was_running = remote.started.is_some() || remote.output_received;
+            if was_running {
+                remote.output_received |= stream.is_some();
+            }
+            !was_running && stream.is_some()
+        };
+        let result = if became_running {
+            // Older runners omit Started. Their first output is still a
+            // running transition, saved durably at once like Started is.
+            self.commit(|remote| remote.output_received = true)
+        } else if self.last_progress_persist.elapsed() < PROGRESS_CHECKPOINT_INTERVAL {
+            return Ok(());
         } else {
-            self.last_progress_persist = Instant::now();
+            self.checkpoint_progress()
+        };
+        if result.is_err() {
+            // The stream consumer has not advanced past this record and will
+            // deliver it again, so its bytes are written again at the same offset.
+            self.output_progress = previous;
         }
         result
+    }
+
+    /// Saves the output cursor alone, without holding the task's state lock
+    /// across the file syncs and the metadata write.
+    fn checkpoint_progress(&mut self) -> io::Result<()> {
+        // A saved cursor must never cover output bytes that are not yet on
+        // disk: after a restart the output files are cut to the saved lengths.
+        self.dirty
+            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
+        let progress = self.output_progress;
+        let (snapshot, json_writes_seen, previous) = {
+            let mut state = self
+                .task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
+            let remote = state
+                .metadata
+                .remote
+                .as_mut()
+                .ok_or_else(|| io::Error::other("remote record absent"))?;
+            let previous = OutputProgress::of(remote);
+            // The output is synced, so any other writer (cancel, completion
+            // delivery) may now save this cursor too.
+            progress.store(remote);
+            (
+                state.metadata.clone(),
+                BgTaskRegistry::json_writes_seen(&self.task),
+                previous,
+            )
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.before_checkpoint_write.as_mut() {
+            hook();
+        }
+        let result = self
+            .registry
+            .persist_task_checkpoint(&self.task, &snapshot, json_writes_seen);
+        match result {
+            Ok(_) => {
+                self.last_progress_persist = Instant::now();
+                Ok(())
+            }
+            Err(error) => {
+                if let Ok(mut state) = self.task.state.lock() {
+                    if let Some(remote) = state.metadata.remote.as_mut() {
+                        if OutputProgress::of(remote) == progress {
+                            previous.store(remote);
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 }
 
