@@ -1,0 +1,1 @@
+- GitHub identity and Ruff version checks can no longer hang or read unbounded output, including when a leftover background process keeps their output open.
