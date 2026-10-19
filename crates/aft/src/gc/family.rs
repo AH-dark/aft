@@ -348,11 +348,21 @@ fn delete_unmarked(
     observer: Option<&dyn SweepObserver>,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
+    let segments = store.segments()?;
+    let segment_bytes = segments.iter().map(|row| row.byte_len).sum::<u64>();
+    // Allocated database pages include payloads, indexes and free space. If
+    // even this upper bound fits, no payload can be deleted under the budget.
+    // Otherwise use the exact sum, not this bound, to decide when to stop.
+    if store
+        .payload_bytes_upper_bound()?
+        .saturating_add(segment_bytes)
+        <= policy.byte_budget
+    {
+        return Ok(());
+    }
     // The total comes from SQLite's own sums, not from the listing, so the
     // budget check stays right when the listing below is cut at its bound.
-    let segments = store.segments()?;
-    let mut total =
-        store.usage()?.payload_bytes + segments.iter().map(|row| row.byte_len).sum::<u64>();
+    let mut total = store.usage()?.payload_bytes + segment_bytes;
     let rows = store.rows_oldest(bounds.max_rows_per_store)?;
     for row in rows {
         if total <= policy.byte_budget {

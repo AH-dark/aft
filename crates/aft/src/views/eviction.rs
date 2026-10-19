@@ -143,8 +143,6 @@ pub struct FamilyStoreUsage {
     /// Bytes of every file under `blobs/v2/<family>/`: plane databases with
     /// their write-ahead logs, segment files and the registry.
     pub file_bytes: u64,
-    /// `SUM(length(payload))` over every plane, as SQLite reports it.
-    pub payload_bytes: u64,
     pub complete: bool,
 }
 
@@ -631,17 +629,8 @@ fn measure_family_store(
 ) -> RegistryResult<FamilyStoreUsage> {
     let dir = family_dir(registry.storage(), registry.family())?;
     let (file_bytes, complete) = tree_bytes(&dir, deadline)?;
-    let mut payload_bytes = 0u64;
-    for plane in FamilyPlane::ALL {
-        if let Some(store) =
-            FamilyStoreReader::open_existing(registry.storage(), registry.family(), plane)?
-        {
-            payload_bytes = payload_bytes.saturating_add(store.usage()?.payload_bytes);
-        }
-    }
     Ok(FamilyStoreUsage {
         file_bytes,
-        payload_bytes,
         complete,
     })
 }
@@ -1791,6 +1780,104 @@ mod tests {
         registry.member(scope).unwrap().is_some()
     }
 
+    #[test]
+    fn enforcement_under_limit_runs_no_logical_aggregates() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        let root = storage.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let view = registry.register_view("active", &root).unwrap();
+        publish(&view, &[("file.txt", text(1, 2_000))], 4);
+        for plane in [FamilyPlane::Semantic, FamilyPlane::Callgraph] {
+            view.open_store(plane)
+                .unwrap()
+                .put_or_touch(&FamilyKey::new(plane, [1; 32]), b"unreferenced")
+                .unwrap();
+        }
+        crate::blob_store::v2::take_logical_aggregates();
+        let report = enforce(&registry, EnforceOptions::default()).unwrap();
+        assert_eq!(crate::blob_store::v2::take_logical_aggregates(), 0);
+        assert!(report.evicted.is_empty());
+        let sweep = report.sweep.unwrap();
+        assert_eq!(sweep.deleted_blobs, 0);
+        assert_eq!(sweep.deleted_segments, 0);
+        assert!(!report.stopped_early);
+    }
+
+    #[test]
+    fn enforcement_over_limit_preserves_gc_deleted_keys() {
+        fn run(enforcement: bool) -> Vec<FamilyKey> {
+            let storage = tempfile::tempdir().unwrap();
+            let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+            let root = storage.path().join("root");
+            fs::create_dir(&root).unwrap();
+            let view = registry.register_view("active", &root).unwrap();
+            let content = text(1, 2_000);
+            publish(&view, &[("file.txt", content.clone())], 4);
+            let protected = trigram_key(&content);
+            let orphan = FamilyKey::new(FamilyPlane::Trigram, [2; 32]);
+            let semantic = FamilyKey::new(FamilyPlane::Semantic, [3; 32]);
+            let graph = FamilyKey::new(FamilyPlane::Callgraph, [4; 32]);
+            let keys = [protected, orphan, semantic, graph];
+            for key in &keys[1..] {
+                view.open_store(key.plane())
+                    .unwrap()
+                    .put_or_touch(key, b"orphan")
+                    .unwrap();
+            }
+            registry.set_disk_budget(DiskBudget {
+                family_store_soft: 0,
+                family_store_hard: u64::MAX,
+                ..DiskBudget::default()
+            });
+            let sweep = if enforcement {
+                let report = enforce(&registry, EnforceOptions::default()).unwrap();
+                assert!(report.evicted.is_empty());
+                assert!(report.sweep_error.is_none());
+                report.sweep.unwrap()
+            } else {
+                family::sweep_family(&registry, None, FamilySweepPolicy { byte_budget: 0 }, None)
+                    .unwrap()
+            };
+            assert_eq!(sweep.deleted_blobs, 3);
+            assert_eq!(sweep.deleted_bytes, 3 * b"orphan".len() as u64);
+            assert_eq!(sweep.deleted_segments, 0);
+            let deleted = keys
+                .into_iter()
+                .filter(|key| !view.open_store(key.plane()).unwrap().contains(key).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(deleted, [orphan, semantic, graph]);
+            deleted
+        }
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn enforcement_payload_budget_uses_exact_totals_below_page_bound() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        let root = storage.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let view = registry.register_view("active", &root).unwrap();
+        let store = view.open_store(FamilyPlane::Semantic).unwrap();
+        let oldest = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+        let newest = FamilyKey::new(FamilyPlane::Semantic, [2; 32]);
+        store.put_or_touch(&oldest, b"orphan").unwrap();
+        store.put_or_touch(&newest, b"orphan").unwrap();
+        registry.set_disk_budget(DiskBudget {
+            family_payload: 6,
+            ..DiskBudget::default()
+        });
+        crate::blob_store::v2::take_logical_aggregates();
+        let report = enforce(&registry, EnforceOptions::default()).unwrap();
+        assert_eq!(crate::blob_store::v2::take_logical_aggregates(), 1);
+        let sweep = report.sweep.unwrap();
+        assert_eq!(sweep.deleted_blobs, 1);
+        assert_eq!(sweep.deleted_bytes, 6);
+        assert!(!store.contains(&oldest).unwrap());
+        assert!(store.contains(&newest).unwrap());
+    }
+
     /// Registers `scope`, publishes one generation of its own content, and
     /// ends its session.
     fn idle_view(registry: &FamilyRegistry, scope: &str, seed: u64, derived_kib: usize) {
@@ -2533,14 +2620,13 @@ mod tests {
         }
         eprintln!(
             "occupancy view_store_bytes={} ({:.6}% of the {} byte soft limit) family_store_file_bytes={} \
-             ({:.6}% of the {} byte soft limit) payload_bytes={} referenced_bytes={} shared_bytes={}",
+             ({:.6}% of the {} byte soft limit) referenced_bytes={} shared_bytes={}",
             usage.view_store_bytes,
             percent(usage.view_store_bytes, VIEW_STORE_SOFT_BYTES),
             VIEW_STORE_SOFT_BYTES,
             usage.family_store.file_bytes,
             percent(usage.family_store.file_bytes, FAMILY_STORE_SOFT_BYTES),
             FAMILY_STORE_SOFT_BYTES,
-            usage.family_store.payload_bytes,
             keys.referenced_bytes,
             keys.shared_bytes
         );

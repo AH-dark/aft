@@ -474,19 +474,23 @@ impl FamilyStore {
             return Ok(PutOrTouch::Quarantined);
         }
         let epoch = read_epoch(&tx)?;
-        let existing: Option<Vec<u8>> = tx
+        let existing: Option<(Vec<u8>, i64)> = tx
             .query_row(
-                "SELECT payload_digest FROM blob_payloads WHERE full_key = ?1",
+                "SELECT payload_digest, ref_epoch FROM blob_payloads WHERE full_key = ?1",
                 params![key.as_bytes().as_slice()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let outcome = match existing {
-            Some(stored) if stored.as_slice() == digest.as_bytes() => {
-                tx.execute(
-                    "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
-                    params![key.as_bytes().as_slice(), epoch as i64],
-                )?;
+            Some((stored, ref_epoch)) if stored.as_slice() == digest.as_bytes() => {
+                // Rewriting an unchanged epoch can rebuild payload overflow pages.
+                // Still compare the digest before accepting any reuse.
+                if ref_epoch < epoch as i64 {
+                    tx.execute(
+                        "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
+                        params![key.as_bytes().as_slice(), epoch as i64],
+                    )?;
+                }
                 PutOrTouch::Reused { ref_epoch: epoch }
             }
             Some(_) => return Err(StoreError::ConflictingPayload(*key)),
@@ -675,6 +679,17 @@ impl FamilyStore {
         usage(&self.inner)
     }
 
+    /// An upper bound on logical payload bytes, without scanning payload rows.
+    /// SQLite's page count includes the connection's current WAL snapshot, not
+    /// just pages already checkpointed into the main database file.
+    pub(crate) fn payload_bytes_upper_bound(&self) -> StoreResult<u64> {
+        let connection = lock(&self.inner.connection);
+        let page_count: u64 =
+            connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        Ok(page_count.saturating_mul(page_size))
+    }
+
     pub fn auto_vacuum_mode(&self) -> StoreResult<i64> {
         Ok(lock(&self.inner.connection)
             .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?)
@@ -834,11 +849,17 @@ impl FamilyStore {
 #[cfg(test)]
 thread_local! {
     static TOUCH_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOGICAL_AGGREGATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_touch_transactions() -> usize {
     TOUCH_TRANSACTIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_logical_aggregates() -> usize {
+    LOGICAL_AGGREGATES.with(|count| count.replace(0))
 }
 
 const DELETE_UNREFERENCED_SQL: &str =
@@ -1074,7 +1095,7 @@ fn contains(inner: &StoreInner, key: &FamilyKey) -> StoreResult<bool> {
     }
     Ok(lock(&inner.connection)
         .query_row(
-            "SELECT 1 FROM blob_payloads WHERE full_key = ?1",
+            "SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
             params![key.as_bytes().as_slice()],
             |_| Ok(()),
         )
@@ -1087,6 +1108,8 @@ fn usage(inner: &StoreInner) -> StoreResult<StoreUsage> {
     crate::views::io::WORK
         .logical_aggregates
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    LOGICAL_AGGREGATES.with(|count| count.set(count.get() + 1));
     let (rows, payload_bytes): (u64, u64) = connection.query_row(
         "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
         [],
