@@ -38,6 +38,21 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+/// Canonicalize `path` into a form `git worktree add` accepts. On Windows,
+/// canonicalize returns a verbatim path (`\\?\C:\...`), and git fails to create
+/// a worktree there ("could not create leading directories ... Invalid
+/// argument"), so the verbatim prefix of a local drive path is dropped.
+fn canonical_git_path(path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).unwrap();
+    #[cfg(windows)]
+    if let Some(rest) = canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        if !rest.starts_with("UNC\\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canonical
+}
+
 fn commit_all(root: &Path) {
     git(root, &["add", "."]);
     git(
@@ -287,7 +302,7 @@ fn atomic_save_reaches_callgraph_on_a_plain_checkout_with_views_off() {
 fn atomic_save_reaches_callgraph_on_a_linked_worktree_with_views_on() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let temp = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let base = canonical_git_path(temp.path());
     let owner = base.join("owner");
     init_repo(&owner);
     let checkout: PathBuf = base.join("checkout");
