@@ -78,10 +78,12 @@ fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
         vec![home.join("project")],
         &home,
     );
+    // Built one component at a time: the policy names the floor with the
+    // platform's own separators, so a "/"-joined literal differs on Windows.
     for (target, floor, rule, description) in [
         (
             home.join(".local/share/cortexkit/synapse/hy-memory"),
-            home.join(".local/share/cortexkit"),
+            home.join(".local").join("share").join("cortexkit"),
             "cortexkit_module_data",
             "module data store under ~/.local/share/cortexkit/<module>",
         ),
