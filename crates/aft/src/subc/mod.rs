@@ -12393,6 +12393,7 @@ mod tests {
             Arc::clone(&executor),
         ));
         let held_actor = Arc::clone(&actor);
+        let observed_actor = Arc::clone(&actor);
         let (held_tx, held_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let holder = std::thread::spawn(move || {
@@ -12554,11 +12555,21 @@ mod tests {
                 write_frame(&mut daemon, &frame)
                     .await
                     .map_err(|e| e.to_string())?;
+                // Releasing the standing actor's locks first lets the work they
+                // held back finish: the actor's one-time startup reconciliation,
+                // which creates and migrates a fresh aft.db, and the configure of
+                // the bind refused above, which still occupies this project
+                // root's executor lane, so this bind queues behind it. Neither
+                // waits on a timer, but creating the database is disk-bound and
+                // has taken seconds on a loaded machine, so wait for the reply
+                // itself. DAEMON_BIND_RELAY_TIMEOUT only guards against a hang:
+                // AFT answers or refuses every bind by ROUTE_BIND_DEADLINE,
+                // which is shorter.
                 let response =
-                    tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                    tokio::time::timeout(DAEMON_BIND_RELAY_TIMEOUT, read_frame(&mut daemon))
                         .await
                         .map_err(|_| {
-                            "route bind did not recover after releasing standing locks".to_string()
+                            "route bind was not answered after releasing standing locks".to_string()
                         })?
                         .map_err(|e| e.to_string())?
                         .unwrap();
@@ -12570,6 +12581,14 @@ mod tests {
                     serde_json::from_slice::<ModuleControlResponse>(&response.body).unwrap(),
                     ModuleControlResponse::RouteBindAck {}
                 ));
+                // The bind succeeded because the held-back reconciliation ran
+                // to completion on release, not because something gave up on it.
+                if !observed_actor.startup_reconciled_for_test() {
+                    return Err(
+                        "route bind was acknowledged before the startup reconciliation finished"
+                            .into(),
+                    );
+                }
                 Ok(())
             }
             .await
@@ -12586,7 +12605,12 @@ mod tests {
             "standing-test-settled".into(),
             Box::new(|_| Response::success("standing-test-settled", json!({}))),
         );
-        tokio::time::timeout(Duration::from_secs(2), settled)
+        // This job starts only after the root's earlier jobs have finished. The
+        // bind's configure tail may be one of them, and it waits for the
+        // post-bind open of a fresh aft.db. That open is disk-bound and has no
+        // fixed duration, so the timeout only catches a hang.
+        const SETTLE_HANG_GUARD: Duration = Duration::from_secs(30);
+        tokio::time::timeout(SETTLE_HANG_GUARD, settled)
             .await
             .expect("released bind work must settle before executor teardown")
             .unwrap();
