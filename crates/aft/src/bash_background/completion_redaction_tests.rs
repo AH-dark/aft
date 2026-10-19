@@ -249,3 +249,179 @@ fn bash_background_watch_matches_raw_token_but_masks_pushed_and_persisted_text()
         assert_eq!(persisted[0].context, pushed[0].context);
     }
 }
+
+fn assert_watch_preview_for_bytes(bytes: &[u8], expected: &str) {
+    let fixture = tempfile::tempdir().unwrap();
+    let (registry, _db, frames) = tests::registry_with_db_and_frames(fixture.path());
+    let (id, task) = tests::insert_terminal_piped_task(&registry, &fixture, "cmd", "", "", false);
+    std::fs::write(&task.paths.stdout, bytes).unwrap();
+    registry.ensure_task_row(&task);
+    registry
+        .register_watch(id, WatchPattern::regex("READY.*").unwrap(), true)
+        .unwrap();
+    let pushed = tests::pattern_match_frames(&frames);
+    assert_eq!(pushed.len(), 1);
+    assert_eq!(pushed[0].match_text, expected);
+    assert_eq!(
+        pushed[0].match_offset,
+        bytes
+            .windows(5)
+            .position(|window| window == b"READY")
+            .unwrap() as u64,
+    );
+    assert!(pushed[0].context.contains(expected));
+    assert!(registry.inner.watch_registry.lock().is_ok());
+    let persisted = registry.pending_pattern_matches_for_session("session");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].match_text, expected);
+}
+
+#[test]
+fn bash_background_watch_preview_handles_split_four_byte_character() {
+    let text = format!("{}READY😀", "a".repeat(65_530));
+    assert_watch_preview_for_bytes(text.as_bytes(), "READY😀");
+}
+
+#[test]
+fn bash_background_watch_preview_handles_random_multibyte_scan_cuts() {
+    let mut seed = 0x564_596_u64;
+    for character in ['é', '界', '😀'] {
+        for _ in 0..24 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let cut = 1 + (seed >> 32) as usize % (character.len_utf8() - 1);
+            let mut bytes = Vec::new();
+            for _ in 0..seed as usize % 24 {
+                bytes.extend_from_slice("é界😀".as_bytes());
+                bytes.extend_from_slice(&[0xff, 0xe2, 0x82]);
+            }
+            bytes.resize(64 * 1024 - "READY".len() - cut, b'a');
+            bytes.extend_from_slice(format!("READY{character}\nTAIL").as_bytes());
+            assert_watch_preview_for_bytes(&bytes, &format!("READY{character}"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_background_completion_redaction_preserves_pipeline_failure_warning() {
+    let token = format!("ghp_{}", "a".repeat(36));
+    for compressed in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let command = format!("sh -c 'printf \"%s\\n\" {token}; exit 1' | cat");
+        let id = registry
+            .spawn_with_shell_in_slot(
+                SpawnPlan::Unsandboxed,
+                &command,
+                super::super::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "pipeline-redaction".into(),
+                fixture.path().into(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                fixture.path().into(),
+                super::super::TaskSlot::Background { max: 10 },
+                true,
+                compressed,
+                Some(fixture.path().into()),
+            )
+            .unwrap();
+        let task = registry.task(&id).unwrap();
+        let start = Instant::now();
+        while !task.is_terminal() {
+            registry.poll_task(&task).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+        let status = registry
+            .status(&id, "pipeline-redaction", None, None, 8192)
+            .unwrap();
+        let warning = status.output_preview.lines().last().unwrap();
+        assert!(warning.contains("(segment 1 of 2) exited 1"), "{warning}");
+        let expected = warning.replace(&token, SECRET_PLACEHOLDER);
+        let snapshot = registry.completion_snapshot_for_task(&task).unwrap();
+        let queued = registry.pending_completions_for_session("pipeline-redaction");
+        assert_eq!(queued.len(), 1);
+        for completion in [&snapshot, &queued[0]] {
+            assert_eq!(completion.exit_code, Some(0));
+            assert!(!completion.output_preview.contains(&token));
+            assert!(completion.output_preview.contains(SECRET_PLACEHOLDER));
+            assert_eq!(completion.output_preview.lines().last().unwrap(), expected);
+            assert_eq!(completion.output_preview.matches("note:").count(), 1);
+        }
+    }
+}
+
+#[test]
+fn bash_background_completion_redaction_preserves_short_recovery_trailers() {
+    let token = format!("ghp_{}", "a".repeat(36));
+    for compressed in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let (_, task) = tests::insert_terminal_piped_task(
+            &registry,
+            &fixture,
+            "cmd",
+            &format!("{token}\n"),
+            "",
+            compressed,
+        );
+        let mut cache = registry.ensure_terminal_output_cache(&task).unwrap();
+        let mut recovery = cache.recovery.clone().unwrap_or_else(|| RecoveryContext {
+            final_lines: Vec::new(),
+            dropped_by_class: BTreeMap::new(),
+            had_inner_drop: false,
+            offset_hint_eligible: false,
+            offset_start_line: None,
+            byte_truncated: false,
+            disk_truncated_prefix_bytes: 0,
+            output_path: cache.output_path.clone(),
+            stderr_path: cache.stderr_path.clone(),
+            include_stderr_path: false,
+            artifact_access: cache.artifact_access.clone(),
+        });
+        recovery.byte_truncated = true;
+        recovery.had_inner_drop = true;
+        let marker = recovery_marker(&recovery).unwrap();
+        cache.output_preview = append_recovery_marker(&cache.output_preview, &marker);
+        cache.output_truncated = true;
+        cache.recovery = Some(recovery);
+        let metadata = task.state.lock().unwrap().metadata.clone();
+        let (preview, truncated) = registry.completion_preview_for_notice(&metadata, &cache);
+        assert!(truncated);
+        assert!(!preview.contains(&token));
+        assert!(preview.contains(SECRET_PLACEHOLDER));
+        assert_eq!(preview.matches(&marker).count(), 1, "{preview}");
+    }
+}
+
+#[test]
+fn bash_background_watch_preview_bounds_arbitrary_bytes_and_ranges() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, _) = tests::insert_terminal_piped_task(&registry, &fixture, "cmd", "", "", false);
+    let bytes = b"\xff\xc3\xa9\xe7\x95\x8c\xf0\x9f\x98\x80\xe2\x82";
+    for (range, expected) in [
+        (2..3, "é"),
+        (4..5, "界"),
+        (7..9, "😀"),
+        (11..12, "�"),
+        (0..usize::MAX, "�é界😀�"),
+        (usize::MAX..usize::MAX, ""),
+    ] {
+        let (matched, _) = registry.render_watch_preview(&id, bytes, range);
+        assert_eq!(matched, expected);
+    }
+    let mut seed = 0x596_564_u64;
+    for _ in 0..256 {
+        let mut bytes = Vec::new();
+        for _ in 0..64 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            bytes.push((seed >> 32) as u8);
+        }
+        let start = (seed >> 16) as usize % 96;
+        let end = (seed >> 32) as usize % 96;
+        let (matched, _) = registry.render_watch_preview(&id, &bytes, start..end);
+        assert!(String::from_utf8_lossy(&bytes).contains(&matched));
+    }
+}

@@ -36,9 +36,16 @@ impl BgTaskRegistry {
     pub(super) fn render_watch_preview(
         &self,
         task_id: &str,
-        text: &str,
-        mut range: std::ops::Range<usize>,
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
     ) -> (String, String) {
+        let text = String::from_utf8_lossy(bytes);
+        // A scan window can end inside a character that is intact in the full
+        // capture. Map source offsets using the full capture's decoding, not
+        // independently decoded prefixes, then include the whole character.
+        let mut range = lossy_watch_offset(bytes, range.start, false)
+            ..lossy_watch_offset(bytes, range.end, true);
+        align_watch_range(&text, &mut range);
         let task = self.task(task_id);
         let guard = task.as_ref().map(|task| {
             task.completion_secrets
@@ -53,21 +60,26 @@ impl BgTaskRegistry {
         };
         // The scanner finds the watch on raw bytes. Only its presentation is
         // masked, before the context window can split a credential.
-        let masked = secrets.redact_range(text, Some(&mut range));
+        let masked = secrets.redact_range(&text, Some(&mut range));
+        align_watch_range(&masked, &mut range);
+        let Some(matched) = masked.get(range.clone()) else {
+            return (
+                crate::log_redact::SECRET_PLACEHOLDER.to_string(),
+                TRUNCATED_PREVIEW_WITHHELD.to_string(),
+            );
+        };
         (
-            masked[range.clone()].to_string(),
+            matched.to_string(),
             super::super::watches::context_snippet(&masked, range.start, range.end),
         )
     }
 
     pub(super) fn completion_preview_for_notice(
         &self,
-        task_id: &str,
-        command: &str,
+        metadata: &PersistedTask,
         cache: &TerminalOutputCache,
-        exit_code: Option<i64>,
     ) -> (String, bool) {
-        let task = self.task(task_id);
+        let task = self.task(&metadata.task_id);
         let guard = task.as_ref().map(|task| {
             task.completion_secrets
                 .lock()
@@ -93,22 +105,43 @@ impl BgTaskRegistry {
         normalize_piped_display_output(&mut raw);
         let masked = secrets.redact(&raw);
         let mut safe_cache = cache.clone();
-        if let Cow::Owned(masked) = masked {
-            // Re-render only credential-bearing output. Ordinary completions
-            // reuse the terminal cache and never invoke the compressor twice.
-            safe_cache.output_preview = if cache.kind == TerminalOutputKind::Compressed {
-                self.compress_output(command, masked, exit_code).text
-            } else {
-                masked
-            };
-        }
-        safe_cache.output_preview = secrets.redact(&safe_cache.output_preview).into_owned();
         if let Some(recovery) = &mut safe_cache.recovery {
             for line in &mut recovery.final_lines {
                 *line = secrets.redact(line).into_owned();
             }
         }
-        completion_preview_for_cache(&safe_cache, exit_code)
+        if let Cow::Owned(masked) = masked {
+            // Re-render only credential-bearing output. Ordinary completions
+            // reuse the terminal cache and never invoke the compressor twice.
+            let body = if cache.kind == TerminalOutputKind::Compressed {
+                self.compress_output(&metadata.command, masked, metadata.exit_code)
+                    .text
+            } else {
+                masked
+            };
+            // Replacing the body also removes terminal-rendering trailers.
+            // Restore recovery notes and pipeline warnings before the smaller
+            // completion cap, including when the new body fits under that cap.
+            safe_cache.output_preview = if let Some(recovery) = &mut safe_cache.recovery {
+                let (preview, truncated) = if cache.kind == TerminalOutputKind::Raw {
+                    render_raw_body_with_recovery_marker(&body, recovery)
+                } else {
+                    render_body_with_recovery_marker(&body, recovery)
+                };
+                safe_cache.output_truncated |= truncated;
+                preview
+            } else {
+                body
+            };
+            normalize_piped_display_output(&mut safe_cache.output_preview);
+            append_pipeline_warning(
+                &mut safe_cache,
+                metadata,
+                task.as_ref().map(|task| &task.paths),
+            );
+        }
+        safe_cache.output_preview = secrets.redact(&safe_cache.output_preview).into_owned();
+        completion_preview_for_cache(&safe_cache, metadata.exit_code)
     }
 
     pub(super) fn mask_completion_text(&self, task_id: &str, text: &mut String) {
@@ -138,4 +171,31 @@ fn withheld_preview(reason: &str, cache: &TerminalOutputCache) -> (String, bool)
         text.push_str(&aft_redactor(path));
     }
     (text, true)
+}
+
+fn align_watch_range(text: &str, range: &mut std::ops::Range<usize>) {
+    range.start = text.floor_char_boundary(range.start.min(text.len()));
+    range.end = text.ceil_char_boundary(range.end.min(text.len()).max(range.start));
+}
+
+fn lossy_watch_offset(bytes: &[u8], offset: usize, round_up: bool) -> usize {
+    let mut source_start = 0;
+    let mut text_start = 0;
+    // utf8_chunks groups invalid bytes exactly as from_utf8_lossy does, so an
+    // invalid sequence contributes one replacement character in both mappings.
+    for chunk in bytes.utf8_chunks() {
+        let valid_end = source_start + chunk.valid().len();
+        if offset <= valid_end {
+            return text_start + offset.saturating_sub(source_start);
+        }
+        text_start += chunk.valid().len();
+        source_start = valid_end + chunk.invalid().len();
+        if offset < source_start {
+            return text_start + if round_up { '\u{FFFD}'.len_utf8() } else { 0 };
+        }
+        if !chunk.invalid().is_empty() {
+            text_start += '\u{FFFD}'.len_utf8();
+        }
+    }
+    text_start
 }

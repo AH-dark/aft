@@ -5465,13 +5465,7 @@ impl BgTaskRegistry {
                             completion_preview::TRUNCATED_PREVIEW_WITHHELD.to_string(),
                         );
                     };
-                    let from = String::from_utf8_lossy(&complete[..from as usize]).len();
-                    let to = String::from_utf8_lossy(&complete[..to as usize]).len();
-                    self.render_watch_preview(
-                        task_id,
-                        &String::from_utf8_lossy(&complete),
-                        from..to,
-                    )
+                    self.render_watch_preview(task_id, complete, from as usize..to as usize)
                 },
             ));
             drop(registry);
@@ -7519,14 +7513,11 @@ impl BgTaskRegistry {
         let (mut output_preview, output_truncated, cache) = if snapshot.info.mode == BgMode::Pty {
             (String::new(), false, None)
         } else {
+            let metadata = task.lock_state().ok()?.metadata.clone();
             self.ensure_terminal_output_cache(task)
                 .map(|cache| {
-                    let (preview, truncated) = self.completion_preview_for_notice(
-                        &task.task_id,
-                        &snapshot.info.command,
-                        &cache,
-                        snapshot.exit_code,
-                    );
+                    let (preview, truncated) =
+                        self.completion_preview_for_notice(&metadata, &cache);
                     (preview, truncated, Some(cache))
                 })
                 .unwrap_or_else(|| (String::new(), false, None))
@@ -9040,14 +9031,7 @@ impl BgTaskRegistry {
         // smaller, exit-aware head+tail cap. They never invoke the compressor
         // themselves.
         let (mut output_preview, output_truncated) = render
-            .map(|cache| {
-                self.completion_preview_for_notice(
-                    &metadata.task_id,
-                    &metadata.command,
-                    cache,
-                    metadata.exit_code,
-                )
-            })
+            .map(|cache| self.completion_preview_for_notice(metadata, cache))
             .unwrap_or_else(|| (String::new(), false));
         if let Some(note) = rendered_execution_note(metadata) {
             output_preview = format!("{note}\n{output_preview}");
