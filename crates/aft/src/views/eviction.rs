@@ -301,11 +301,149 @@ thread_local! {
     /// Directory walks started on this thread, so a test can prove that a
     /// path such as admission walks nothing.
     static TREE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TREE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    TREE_STATS.with(|stats| stats.set(stats.get() + 1));
+    fs::symlink_metadata(path)
+}
+
+/// Immutable artifacts are reconciled even if an out-of-band writer changes
+/// them in place. SQLite files, pins, markers and temporary files are never cached.
+const SIZE_RECONCILE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+pub(super) struct ViewSizeCache {
+    directory: Option<Vec<u64>>,
+    reconciled: Option<Instant>,
+    files: BTreeMap<PathBuf, u64>,
+}
+
+/// The size caches of one family's views, keyed by view directory. The
+/// registry owns them (see `FamilyRegistry::view_size_caches`), so they are
+/// dropped with the last handle on the registry instead of outliving the
+/// family for the rest of the process.
+pub(super) type ViewSizeCaches = BTreeMap<PathBuf, ViewSizeCache>;
+
+#[cfg(test)]
+thread_local! {
+    /// View size caches alive on this thread, so a test can prove that a
+    /// family's caches go away with its registry.
+    static LIVE_SIZE_CACHES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+impl Default for ViewSizeCache {
+    fn default() -> Self {
+        #[cfg(test)]
+        LIVE_SIZE_CACHES.with(|live| live.set(live.get() + 1));
+        Self {
+            directory: None,
+            reconciled: None,
+            files: BTreeMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ViewSizeCache {
+    fn drop(&mut self) {
+        LIVE_SIZE_CACHES.with(|live| live.set(live.get() - 1));
+    }
+}
+
+fn immutable_generation(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    [
+        ("manifest-", ".json"),
+        ("trigram-", ".bin"),
+        ("derived-", ".ref"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, suffix)| {
+        name.strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(suffix))
+            .filter(|generation| super::manifest_v2::GenerationName::parse(generation).is_some())
+    })
+}
+
+fn directory_identity(metadata: &fs::Metadata) -> Option<Vec<u64>> {
+    if !metadata.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(vec![
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+        ])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        // Without a directory identity, prefer the uncached accounting path.
+        None
+    }
+}
+
+fn view_tree_bytes(
+    dir: &Path,
+    deadline: Option<Instant>,
+    cache: &mut ViewSizeCache,
+) -> std::io::Result<(u64, bool)> {
+    let identity = measured_metadata(dir)
+        .ok()
+        .as_ref()
+        .and_then(directory_identity);
+    let reconcile = cache
+        .reconciled
+        .is_none_or(|last| last.elapsed() >= SIZE_RECONCILE_INTERVAL);
+    if identity.is_none() || identity != cache.directory || reconcile {
+        cache.files.clear();
+        cache.reconciled = Some(Instant::now());
+    }
+    cache.directory = identity;
+    let result = tree_bytes_inner(dir, deadline, Some(cache));
+    let after = measured_metadata(dir)
+        .ok()
+        .as_ref()
+        .and_then(directory_identity);
+    // Only artifacts with a durable manifest can be immutable. A namespace
+    // change during the walk could otherwise pair an unfinished ref/overlay
+    // with a manifest published after that file was measured.
+    if !matches!(result, Ok((_, true))) || after != cache.directory {
+        cache.files.clear();
+    } else {
+        let manifests = cache
+            .files
+            .keys()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| immutable_generation(path).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        cache.files.retain(|path, _| {
+            immutable_generation(path).is_some_and(|generation| manifests.contains(generation))
+        });
+    }
+    result
 }
 
 /// Total file bytes under `dir`, each file once, up to `MAX_WALK_DEPTH`
 /// levels. Symlinks are not followed and count nothing.
 fn tree_bytes(dir: &Path, deadline: Option<Instant>) -> std::io::Result<(u64, bool)> {
+    tree_bytes_inner(dir, deadline, None)
+}
+
+fn tree_bytes_inner(
+    dir: &Path,
+    deadline: Option<Instant>,
+    mut cache: Option<&mut ViewSizeCache>,
+) -> std::io::Result<(u64, bool)> {
     #[cfg(test)]
     TREE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut bytes = 0u64;
@@ -331,7 +469,19 @@ fn tree_bytes(dir: &Path, deadline: Option<Instant>) -> std::io::Result<(u64, bo
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            let metadata = match fs::symlink_metadata(entry.path()) {
+            let path = entry.path();
+            let immutable = depth == 0 && immutable_generation(&path).is_some();
+            if immutable {
+                if let Some(size) = cache
+                    .as_ref()
+                    .filter(|cache| cache.directory.is_some())
+                    .and_then(|cache| cache.files.get(&path))
+                {
+                    bytes = bytes.saturating_add(*size);
+                    continue;
+                }
+            }
+            let metadata = match measured_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -344,6 +494,11 @@ fn tree_bytes(dir: &Path, deadline: Option<Instant>) -> std::io::Result<(u64, bo
                 }
             } else if metadata.is_file() {
                 bytes = bytes.saturating_add(metadata.len());
+                if immutable {
+                    if let Some(cache) = cache.as_mut() {
+                        cache.files.insert(path, metadata.len());
+                    }
+                }
             }
         }
         if !complete {
@@ -424,8 +579,22 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
         complete: true,
         ..DiskUsage::default()
     };
-    for member in registry.members()? {
-        let (bytes, complete) = match tree_bytes(&member.view_dir, deadline) {
+    let members = registry.members()?;
+    // Taken out for the walk so the lock is not held across disk I/O; a
+    // concurrent measurement of the same family simply walks uncached.
+    let mut caches = std::mem::take(
+        &mut *registry
+            .view_size_caches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    caches.retain(|dir, _| members.iter().any(|member| &member.view_dir == dir));
+    for member in members {
+        let (bytes, complete) = match view_tree_bytes(
+            &member.view_dir,
+            deadline,
+            caches.entry(member.view_dir.clone()).or_default(),
+        ) {
             Ok(measured) => measured,
             Err(_) => (0, false),
         };
@@ -445,6 +614,10 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
             complete,
         });
     }
+    *registry
+        .view_size_caches()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = caches;
     usage.family_store = measure_family_store(registry, deadline)?;
     usage.complete &= usage.family_store.complete;
     // Best effort: a failed record only leaves admission an older one.
@@ -1242,6 +1415,190 @@ mod tests {
     use crate::views::RelPath;
 
     const FAMILY: &str = "family";
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_view_totals_avoid_repeated_stats() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        // A family with many retained generations, plus mutable pointer/marker files.
+        for index in 0..24 {
+            let scope = format!("view-{index}");
+            let root = storage.path().join(&scope);
+            fs::create_dir(&root).unwrap();
+            let view = registry.register_view(&scope, &root).unwrap();
+            fs::write(view.view_dir().join("derived-owner.sqlite"), vec![0; 8192]).unwrap();
+            fs::create_dir_all(view.view_dir().join("readers/current")).unwrap();
+            fs::write(view.view_dir().join("progress.marker"), b"reader").unwrap();
+            for generation in 0..64 {
+                let generation = format!("g2-{generation:064x}-1-1-{generation}");
+                fs::write(
+                    view.view_dir().join(format!("manifest-{generation}.json")),
+                    b"manifest",
+                )
+                .unwrap();
+                fs::write(
+                    view.view_dir().join(format!("trigram-{generation}.bin")),
+                    b"trigram",
+                )
+                .unwrap();
+                fs::write(
+                    view.view_dir().join(format!("derived-{generation}.ref")),
+                    b"owner",
+                )
+                .unwrap();
+            }
+        }
+        TREE_STATS.with(|stats| stats.set(0));
+        TREE_WALKS.with(|walks| walks.set(0));
+        let cold = measure(&registry, None).unwrap();
+        let cold_stats = TREE_STATS.with(|stats| stats.replace(0));
+        let warm = measure(&registry, None).unwrap();
+        let warm_stats = TREE_STATS.with(|stats| stats.replace(0));
+        let walks = TREE_WALKS.with(|walks| walks.get());
+        assert_eq!(walks, 2 * (24 + 1));
+        assert_eq!(cold.views, warm.views);
+        println!("disk measurement / 24 views x 64 generations: cold={cold_stats} lstat, warm={warm_stats} lstat, {walks} tree walks; two measurements per enforcement, interval={}s", ENFORCEMENT_INTERVAL.as_secs());
+        assert!(cold_stats > 24 * 64 * 3);
+        assert!(
+            warm_stats < cold_stats / 10,
+            "immutable generations were re-statted: cold={cold_stats}, warm={warm_stats}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_view_bytes_match_full_walk_through_changes_and_reconcile() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let generation = format!("g2-{}-1-1-1", "a".repeat(64));
+        let manifest = dir.join(format!("manifest-{generation}.json"));
+        fs::write(&manifest, b"manifest").unwrap();
+        fs::write(dir.join(format!("trigram-{generation}.bin")), b"overlay").unwrap();
+        let derived = dir.join(format!("derived-{generation}.sqlite"));
+        fs::write(&derived, b"database").unwrap();
+        fs::create_dir_all(dir.join("readers/generation")).unwrap();
+        fs::create_dir(dir.join("pins")).unwrap();
+        fs::create_dir(dir.join("nested-repo")).unwrap();
+        for name in [
+            "pins/live.json",
+            "readers/generation/marker",
+            "nested-repo/.gitignore",
+            ".aftignore",
+            "ignored.rs",
+        ] {
+            fs::write(dir.join(name), b"counted even if ignored by source walks").unwrap();
+        }
+        symlink(&manifest, dir.join("alias")).unwrap();
+        symlink("absent", dir.join("dangling")).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("pipe").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let _socket = UnixListener::bind(dir.join("socket")).unwrap();
+        let mut cache = ViewSizeCache::default();
+        for _ in 0..2 {
+            assert_eq!(
+                view_tree_bytes(dir, None, &mut cache).unwrap(),
+                tree_bytes(dir, None).unwrap()
+            );
+        }
+        // WAL checkpoints and marker refreshes change lengths without changing
+        // their parent directory's identity; these files must always be measured.
+        fs::write(&derived, vec![0; 8192]).unwrap();
+        fs::write(dir.join("pins/live.json"), b"refreshed marker").unwrap();
+        assert_eq!(
+            view_tree_bytes(dir, None, &mut cache).unwrap(),
+            tree_bytes(dir, None).unwrap()
+        );
+        fs::remove_file(dir.join(format!("trigram-{generation}.bin"))).unwrap();
+        fs::rename(&manifest, dir.join("renamed.json")).unwrap();
+        symlink("renamed.json", &manifest).unwrap();
+        assert_eq!(
+            view_tree_bytes(dir, None, &mut cache).unwrap(),
+            tree_bytes(dir, None).unwrap()
+        );
+        fs::remove_file(&manifest).unwrap();
+        fs::write(&manifest, b"replacement manifest").unwrap();
+        assert_eq!(
+            view_tree_bytes(dir, None, &mut cache).unwrap(),
+            tree_bytes(dir, None).unwrap()
+        );
+        fs::write(&manifest, b"out-of-band in-place drift is reconciled").unwrap();
+        cache.reconciled = Some(Instant::now() - SIZE_RECONCILE_INTERVAL);
+        assert_eq!(
+            view_tree_bytes(dir, None, &mut cache).unwrap(),
+            tree_bytes(dir, None).unwrap()
+        );
+        let deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            view_tree_bytes(dir, deadline, &mut cache).unwrap(),
+            tree_bytes(dir, deadline).unwrap()
+        );
+        assert!(cache.files.is_empty());
+        fs::create_dir_all(dir.join("too/deep/for-the-bound")).unwrap();
+        assert_eq!(
+            view_tree_bytes(dir, None, &mut cache).unwrap(),
+            tree_bytes(dir, None).unwrap()
+        );
+        assert!(cache.files.is_empty());
+    }
+
+    #[test]
+    fn warm_size_cache_preserves_eviction_decisions() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        for (seed, scope) in ["a", "b", "c"].into_iter().enumerate() {
+            idle_view(&registry, scope, seed as u64, 4);
+            set_last_bind(&registry, scope, seed as u64);
+        }
+        measure(&registry, None).unwrap();
+        let warm = measure(&registry, None).unwrap();
+        let mut full_total = 0;
+        for view in &warm.views {
+            let (bytes, complete) = tree_bytes(&view.view_dir, None).unwrap();
+            assert!(complete);
+            assert_eq!(view.bytes, bytes);
+            full_total += bytes;
+        }
+        let a_bytes = view_bytes(&warm, "a");
+        registry.set_disk_budget(budget(full_total - a_bytes, full_total * 2));
+        let report = enforce(&registry, EnforceOptions::default()).unwrap();
+        assert_eq!(report.evicted, vec![("a".to_owned(), a_bytes)]);
+        assert_eq!(report.after.view_store_bytes, full_total - a_bytes);
+        assert!(!registered(&registry, "a"));
+        assert!(registered(&registry, "b"));
+        assert!(registered(&registry, "c"));
+    }
+
+    /// A family's view size caches belong to its registry: once the last
+    /// handle on a measured registry is dropped, none of its caches remain,
+    /// so a long-running process does not keep them for closed families.
+    #[test]
+    fn size_caches_drop_with_their_registry() {
+        let storage = tempfile::tempdir().unwrap();
+        let live_before = LIVE_SIZE_CACHES.with(|live| live.get());
+        {
+            let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+            for (seed, scope) in ["a", "b"].into_iter().enumerate() {
+                idle_view(&registry, scope, seed as u64, 4);
+            }
+            measure(&registry, None).unwrap();
+            assert_eq!(
+                LIVE_SIZE_CACHES.with(|live| live.get()) - live_before,
+                2,
+                "one size cache per measured view"
+            );
+            assert_eq!(registry.view_size_caches().lock().unwrap().len(), 2);
+            wait_for_background_enforcement(&registry);
+        }
+        assert_eq!(
+            LIVE_SIZE_CACHES.with(|live| live.get()),
+            live_before,
+            "a dropped registry's size caches must be dropped with it"
+        );
+        let reopened = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        assert!(reopened.view_size_caches().lock().unwrap().is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

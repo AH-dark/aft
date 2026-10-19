@@ -5919,33 +5919,247 @@ fn walk_project_files_from_inner(
 }
 
 pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
+    project_walk_builder_with_admission(
+        search_root,
+        crate::project_content::is_excluded_with_file_type,
+    )
+}
+
+fn project_walk_builder_with_admission(
+    search_root: &Path,
+    excludes: fn(&Path, Option<&std::fs::FileType>) -> bool,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
-    crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(|entry| {
-        let file_type = entry.file_type();
-        if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref()) {
-            return false;
-        }
-        let name = entry.file_name().to_string_lossy();
-        if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
-            return !matches!(
-                name.as_ref(),
-                "node_modules"
-                    | "target"
-                    | "venv"
-                    | ".venv"
-                    | ".git"
-                    | "__pycache__"
-                    | ".tox"
-                    | "dist"
-                    | "build"
-            );
-        }
-        !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-    });
+    crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
+        move |entry| {
+            let file_type = entry.file_type();
+            if excludes(entry.path(), file_type.as_ref()) {
+                return false;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
+                return !matches!(
+                    name.as_ref(),
+                    "node_modules"
+                        | "target"
+                        | "venv"
+                        | ".venv"
+                        | ".git"
+                        | "__pycache__"
+                        | ".tox"
+                        | "dist"
+                        | "build"
+                );
+            }
+            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+        },
+    );
     builder
+}
+
+#[cfg(all(test, unix))]
+mod membership_admission_tests {
+    use super::*;
+    use crate::project_content::{is_excluded_with_file_type, legacy_walker_excludes};
+
+    fn inventory(root: &Path, legacy: bool) -> (Vec<PathBuf>, usize) {
+        let mut paths = Vec::new();
+        let counts = crate::db::file_identity::stat_probe::count_candidates(|| {
+            let builder = project_walk_builder_with_admission(
+                root,
+                if legacy {
+                    legacy_walker_excludes
+                } else {
+                    is_excluded_with_file_type
+                },
+            );
+            for entry in builder.build() {
+                paths.push(entry.unwrap().into_path());
+            }
+        });
+        paths.sort();
+        let stats = counts
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, count)| count)
+            .sum();
+        (paths, stats)
+    }
+
+    #[test]
+    fn membership_admission_identity_matches_legacy() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for dir in [".git", "models.db", "vendor/nested/.git", "state"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join(".gitignore"), "ignored.rs\n*.log\n").unwrap();
+        fs::write(root.join(".aftignore"), "aftignored.rs\n").unwrap();
+        for name in [
+            "source.rs",
+            "untracked.rs",
+            "ignored.rs",
+            "aftignored.rs",
+            "live.db",
+            "models.db/source.rs",
+            "vendor/nested/kept.log",
+            "vendor/nested/ignored.rs",
+            "state/generated.rs",
+        ] {
+            fs::write(root.join(name), "fn source() {}\n").unwrap();
+        }
+        fs::write(root.join("vendor/nested/.gitignore"), "ignored.rs\n").unwrap();
+        crate::project_content::register_storage_root(&root.join("state"));
+        symlink("state/generated.rs", root.join("storage-alias.rs")).unwrap();
+        symlink("source.rs", root.join("source-alias.rs")).unwrap();
+        symlink("absent", root.join("dangling.rs")).unwrap();
+        let database = crate::db::file_identity::IdentityConnection::open(
+            root.join("open.cache"),
+            "membership-parity",
+        )
+        .unwrap();
+        database
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE probe(value TEXT);")
+            .unwrap();
+        fs::hard_link(root.join("open.cache"), root.join("hard-alias.rs")).unwrap();
+        fs::hard_link(root.join("open.cache-shm"), root.join("shm-alias.rs")).unwrap();
+        symlink("hard-alias.rs", root.join("sqlite-alias.rs")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("pipe.rs").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let _socket = UnixListener::bind(root.join("socket.rs")).unwrap();
+
+        let (old, old_stats) = inventory(&root, true);
+        let (new, new_stats) = inventory(&root, false);
+        assert_eq!(
+            new, old,
+            "admission, including symlink identity, must match"
+        );
+        assert!(!new.contains(&root.join("storage-alias.rs")));
+        assert!(!new.contains(&root.join("sqlite-alias.rs")));
+        let members = new
+            .iter()
+            .filter(|path| fs::symlink_metadata(path).unwrap().is_file())
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members,
+            [
+                ".aftignore",
+                ".gitignore",
+                "models.db/source.rs",
+                "source.rs",
+                "untracked.rs",
+                "vendor/nested/.gitignore",
+                "vendor/nested/kept.log"
+            ]
+            .map(PathBuf::from)
+        );
+        println!("mixed membership fixture: legacy={old_stats} lstat, optimized={new_stats} lstat");
+        assert_eq!(
+            (old_stats, new_stats),
+            (22, 15),
+            "only redundant lstat calls should disappear"
+        );
+    }
+
+    /// The membership walker's stat budget, asserted exactly on a private tree
+    /// that nothing else touches between its walks.
+    #[test]
+    fn membership_walker_stat_counts() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for dir in [".git", "src/nested", "target"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        for name in [
+            "lib.rs",
+            "ignored.rs",
+            "src/main.rs",
+            "src/nested/deep.rs",
+            "target/built.rs",
+        ] {
+            fs::write(root.join(name), "fn source() {}\n").unwrap();
+        }
+        symlink("lib.rs", root.join("lib-alias.rs")).unwrap();
+
+        let (old, old_stats) = inventory(&root, true);
+        let (new, new_stats) = inventory(&root, false);
+        assert_eq!(new, old, "admission must match the legacy walker");
+        assert!(
+            new_stats > 0 && new_stats <= old_stats,
+            "legacy={old_stats} optimized={new_stats}"
+        );
+        let expected = [".gitignore", "lib.rs", "src/main.rs", "src/nested/deep.rs"]
+            .map(|name| root.join(name))
+            .to_vec();
+        use crate::views::first_load::{
+            ConfiguredMembershipWalker, MembershipWalker, MEMBERSHIP_WALKS,
+        };
+        MEMBERSHIP_WALKS.with(|walks| walks.set(0));
+        let counts = crate::db::file_identity::stat_probe::count_candidates(|| {
+            for _ in 0..3 {
+                let mut files = ConfiguredMembershipWalker.files(&root).unwrap();
+                files.sort();
+                assert_eq!(files, expected);
+            }
+        });
+        let walks = MEMBERSHIP_WALKS.with(|walks| walks.get());
+        assert_eq!(walks, 3, "each membership request walks once");
+        let stats = counts
+            .iter()
+            .filter(|(path, _)| path.starts_with(&root))
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        assert_eq!(
+            stats,
+            new_stats * walks,
+            "each walk spends exactly the optimized admission's stat calls"
+        );
+    }
+
+    /// Measures the stat calls of the real working checkout. It asserts
+    /// nothing exact: an editor or another job may change files between its
+    /// walks. Run with `--ignored --nocapture` to read the counts.
+    #[test]
+    #[ignore = "benchmark of the live checkout; prints counts only"]
+    fn membership_checkout_stat_counts_benchmark() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let (old, old_stats) = inventory(root, true);
+        let (new, new_stats) = inventory(root, false);
+        println!(
+            "checkout membership: legacy {} entries / {old_stats} lstat, optimized {} entries / {new_stats} lstat, saved={}",
+            old.len(),
+            new.len(),
+            old_stats.saturating_sub(new_stats)
+        );
+        use crate::views::first_load::{
+            ConfiguredMembershipWalker, MembershipWalker, MEMBERSHIP_WALKS,
+        };
+        MEMBERSHIP_WALKS.with(|walks| walks.set(0));
+        let counts = crate::db::file_identity::stat_probe::count_candidates(|| {
+            for _ in 0..3 {
+                let _ = ConfiguredMembershipWalker.files(root);
+            }
+        });
+        let walks = MEMBERSHIP_WALKS.with(|walks| walks.get());
+        let stats = counts
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        println!("three checkout membership requests: {walks} full walks, {stats} candidate identity lstat calls");
+    }
 }
 
 fn walk_project_files_from_inner_matching<F>(

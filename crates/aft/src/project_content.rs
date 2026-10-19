@@ -158,15 +158,31 @@ pub(crate) fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
 }
 
 fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<()> {
-    let known_directory = file_type.is_some_and(std::fs::FileType::is_dir);
-    let metadata = (!known_directory)
-        .then(|| crate::db::file_identity::candidate_metadata(path).ok())
-        .flatten();
-    if is_excluded_file_with_metadata(path, file_type, metadata.as_ref()) || is_storage_path(path) {
+    // Walker types are enough for name/storage exclusions and for entries that
+    // cannot alias SQLite. Regular files still need inode checks: a harmless
+    // source name may be a hard link to a live database or a newly created sidecar.
+    if is_storage_path(path)
+        || match file_type {
+            Some(_) => is_excluded_file_with_metadata(path, file_type, None),
+            None => {
+                crate::os_metadata::is_os_metadata_path(path)
+                    || crate::db::file_identity::is_registered_file_path(path)
+            }
+        }
+    {
         return Err(excluded_error());
     }
-    // A directory cannot be a live SQLite file, and walker entries already know its type.
-    if known_directory || metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+    if file_type.is_some_and(|kind| !kind.is_file() && !kind.is_symlink()) {
+        return Ok(());
+    }
+    let metadata = crate::db::file_identity::candidate_metadata(path).ok();
+    if file_type.is_none()
+        && has_sqlite_suffix(path)
+        && !metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
+    {
+        return Err(excluded_error());
+    }
+    if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
         return Ok(());
     }
     let excluded_alias = metadata
@@ -187,6 +203,30 @@ fn excluded_error() -> std::io::Error {
         std::io::ErrorKind::PermissionDenied,
         "internal storage and SQLite files are not project source",
     )
+}
+
+/// Independent pre-optimization oracle for walker admission parity tests,
+/// which run on Unix only.
+#[cfg(all(test, unix))]
+pub(crate) fn legacy_walker_excludes(path: &Path, file_type: Option<&std::fs::FileType>) -> bool {
+    let known_directory = file_type.is_some_and(std::fs::FileType::is_dir);
+    let metadata = (!known_directory)
+        .then(|| crate::db::file_identity::candidate_metadata(path).ok())
+        .flatten();
+    if is_excluded_file_with_metadata(path, file_type, metadata.as_ref()) || is_storage_path(path) {
+        return true;
+    }
+    if known_directory || metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+        return false;
+    }
+    let excluded_alias = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+        && path
+            .canonicalize()
+            .is_ok_and(|target| legacy_walker_excludes(&target, None));
+    excluded_alias
+        || crate::db::file_identity::is_live_sqlite_file_with_metadata(path, metadata.as_ref())
 }
 
 #[cfg(test)]
