@@ -21,12 +21,14 @@
  */
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 import { aftBinary, bootV2Host, toolResult, until } from "./v2-host.js";
 
 const hostBinary = process.env.AFT_V2_HOST_BINARY;
 const REWRITE = "cat probe.txt";
-const FORBIDDEN = "echo forbidden-probe";
+const FORBIDDEN_MARKER = "forbidden-probe.txt";
+const FORBIDDEN = `echo forbidden-probe > ${FORBIDDEN_MARKER}`;
 const WAITING = "sleep 45; echo waited-out";
 
 async function checkHost(label: string, removeBuiltins: boolean) {
@@ -75,8 +77,11 @@ async function checkHost(label: string, removeBuiltins: boolean) {
     await host.turn(session.id, "run the forbidden probe");
     const refused = toolResult(host.requests, FORBIDDEN);
     console.log(`[v2-tool-names:${label}] forbidden result=${JSON.stringify(refused)}`);
-    expect(refused).toContain('deny \\"shell\\" for \\"echo forbidden-probe\\"');
-    expect(refused).not.toContain("forbidden-probe\n");
+    // Check the filesystem independently of the host's rendering: a refusal
+    // must prevent the command from executing, not merely hide its stdout.
+    expect(existsSync(join(host.project, FORBIDDEN_MARKER))).toBe(false);
+    expect(refused).toBeDefined();
+    expect(JSON.parse(refused as string).error.type).toBe("permission.rejected");
 
     // A new message detaches a waiting shell call long before its command ends.
     const waitSession = await host.newSession("Waiting shell");
