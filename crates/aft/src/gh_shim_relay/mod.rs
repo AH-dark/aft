@@ -176,6 +176,11 @@ impl RouteScopes {
 /// The outbound call the relay makes. Production uses the daemon's own
 /// `reserved:aft` subc connection; tests use fakes that record the bodies.
 pub trait RelayTransport: Send + Sync {
+    /// Resolve only the daemon-recorded ticket checkout against its verified
+    /// local manifest, never a repository or working directory from the request.
+    fn read_repository(&self, project_root: &str) -> Result<String, String> {
+        crate::gh_shim::verified_worker_read_repository(std::path::Path::new(project_root))
+    }
     /// Send `body` to plexus's tool provider and return the parsed JSON reply.
     /// With `scope`, the route to plexus must be opened under that scope, so
     /// plexus sees its stamp; without one the route is unscoped.
@@ -375,25 +380,50 @@ async fn read_request<T: RelayTransport>(
 ) -> (RelayReply, &'static str) {
     let request = params.get("request").cloned().unwrap_or(Value::Null);
     let parsed = serde_json::from_value::<crate::gh_shim::read_contract::Request>(request.clone());
-    let validated = parsed
+    let parsed = match parsed
         .map_err(|error| error.to_string())
-        .and_then(|request| request.validate());
-    if let Err(message) = validated {
-        return (
-            RelayReply::refused("request_malformed", "request", message),
-            "-",
-        );
-    }
-    let Some(stamp) = stamp.filter(|_| transport.opens_scoped_routes()) else {
+        .and_then(|request| {
+            request.validate()?;
+            Ok(request)
+        }) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return (
+                RelayReply::refused("request_malformed", "request", message),
+                "-",
+            );
+        }
+    };
+    let Some(stamp) = stamp.filter(|stamp| worker_scope(stamp) && transport.opens_scoped_routes())
+    else {
         return (
             RelayReply::refused(
                 "agent_identity_required",
                 "scope",
-                "governed reads require the ticket's authenticated scoped route",
+                "governed reads require the ticket's authenticated worker scope",
             ),
             "-",
         );
     };
+    let bound = match transport.read_repository(&redeemed.project_root) {
+        Ok(bound) => bound,
+        Err(message) => {
+            return (
+                RelayReply::refused("repository_not_visible", "binding", message),
+                "-",
+            )
+        }
+    };
+    if parsed.repository() != bound {
+        return (
+            RelayReply::refused(
+                "repository_not_visible",
+                "binding",
+                "worker reads are limited to the ticket session's bound checkout repository",
+            ),
+            "-",
+        );
+    }
     // The selector reopens the redeemed session's scope at the same epoch.
     // Plexus receives its own target-specific stamp, including worker delegation;
     // AFT neither reads nor reconstructs the bot identity in that stamp.

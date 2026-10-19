@@ -131,6 +131,7 @@ fn tuple(args: &[OsString]) -> Option<String> {
 pub(super) fn candidate(args: &[OsString], manifest: &Manifest, platform: &str) -> bool {
     if manifest.manifest_version < 20
         || shim_disabled_by_operator()
+        || args.iter().any(|arg| arg.to_str().is_none())
         || args
             .iter()
             .any(|arg| matches!(arg.to_str(), Some("--help" | "-h")))
@@ -140,14 +141,7 @@ pub(super) fn candidate(args: &[OsString], manifest: &Manifest, platform: &str) 
     let Some(tuple) = tuple(args) else {
         return false;
     };
-    if tuple == "api"
-        && api_request_shape(args).is_some_and(|shape| {
-            shape
-                .method
-                .as_deref()
-                .is_some_and(|method| method != "GET")
-        })
-    {
+    if tuple == "api" && !api_read_candidate(args) {
         return false;
     }
     TUPLES.contains(&tuple.as_str())
@@ -155,6 +149,40 @@ pub(super) fn candidate(args: &[OsString], manifest: &Manifest, platform: &str) 
             .worker_reads
             .iter()
             .any(|row| row.tuple() == tuple && platform_matches(row.platform(), platform))
+}
+
+pub(super) fn identity_for_command(
+    args: &[OsString],
+    manifest: &Manifest,
+    paths: &StatePaths,
+    relay: &RelayContext,
+) -> Result<Option<bool>, String> {
+    if !candidate(args, manifest, current_platform()) {
+        return Ok(None);
+    }
+    lookup(paths, relay)
+}
+
+fn api_read_candidate(args: &[OsString]) -> bool {
+    let Ok(parsed) = parse_plan(args, "candidate/repository") else {
+        return false;
+    };
+    if parsed.flag("field") || parsed.flag("input") || parsed.positional.len() != 1 {
+        return false;
+    }
+    if parsed
+        .flags
+        .get("method")
+        .is_some_and(|methods| methods.len() != 1 || methods[0] != "GET")
+    {
+        return false;
+    }
+    let endpoint = &parsed.positional[0];
+    let path = url::Url::parse(endpoint)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| endpoint.split('?').next().unwrap_or(endpoint).to_string());
+    !path.trim_matches('/').eq_ignore_ascii_case("graphql")
 }
 
 pub(super) fn lookup(paths: &StatePaths, relay: &RelayContext) -> Result<Option<bool>, String> {
@@ -203,72 +231,27 @@ pub(super) fn last_lookup(paths: &StatePaths) -> Option<LookupRecord> {
     serde_json::from_slice(&fs::read(paths.root.join("read-session-lookup.json")).ok()?).ok()
 }
 
-fn fallback_with(
-    args: &[OsString],
-    reason: &str,
-    delegate: impl FnOnce(&[OsString]) -> i32,
-    error: &mut impl Write,
-) -> i32 {
-    let status = delegate(args);
-    if status != 0 {
-        let reason = reason.replace(['\n', '\r'], " ");
-        let _ = writeln!(
-            error,
-            "gh: governed read routing unavailable (identity lookup: {reason})"
-        );
-    }
-    status
-}
-
-pub(super) fn unavailable_fallback(args: &[OsString], reason: &str) -> i32 {
-    fallback_with(
-        args,
-        reason,
-        |args| {
-            let Some(gh) = resolve_real_gh(&executing_image()) else {
-                return refuse(RefusalCode::NoRealGh, "no upstream gh executable was found");
-            };
-            // Waiting, rather than exec, lets a failed compatibility passthrough
-            // explain the unavailable lookup. Upstream stdout/stderr stay inherited.
-            Command::new(gh)
-                .args(args)
-                .status()
-                .map(|status| status.code().unwrap_or(1))
-                .unwrap_or(1)
-        },
-        &mut io::stderr().lock(),
-    )
-}
-
 pub(super) fn dispatch(
     args: &[OsString],
     manifest: &Manifest,
     cwd: &Path,
     paths: &StatePaths,
+    identity: &mut impl FnMut(
+        &[OsString],
+        &Manifest,
+        &StatePaths,
+        &RelayContext,
+    ) -> Result<Option<bool>, String>,
 ) -> Option<i32> {
-    if !candidate(args, manifest, current_platform()) {
-        return None;
-    }
     let relay = RelayContext::from_process();
-    match lookup(paths, &relay) {
+    match identity(args, manifest, paths, &relay) {
         Ok(Some(false) | None) => return None,
-        Err(text) => return Some(unavailable_fallback(args, &text)),
+        Err(_) => return None,
         Ok(Some(true)) => {}
     }
-    // API paths are not repository selectors: otherwise naming another bound
-    // repository in the URL would silently change the bot whose authority is used.
-    let target = TargetRepository {
-        explicit: explicit_repo(args),
-        gh_repo: gh_repo_env(),
-        ..TargetRepository::default()
-    };
-    let Some(binding) = resolved_agent_binding(manifest, &target, cwd)
-        .or_else(|| checkout_agent_binding(manifest, cwd))
-    else {
-        return Some(refuse(
-            RefusalCode::UnboundTarget,
-            "worker reads require a repository bound to a bot; select it with --repo",
-        ));
+    let binding = match checkout_bound_repository(args, manifest, cwd) {
+        Ok(binding) => binding,
+        Err(text) => return Some(refuse(RefusalCode::UnboundTarget, &text)),
     };
     let plan = match plan_for_session(args, manifest, current_platform(), true, &binding.repo) {
         Ok(Some(plan)) => plan,
@@ -292,6 +275,24 @@ pub(super) fn dispatch(
             error.status()
         }
     })
+}
+
+fn checkout_bound_repository(
+    args: &[OsString],
+    manifest: &Manifest,
+    cwd: &Path,
+) -> Result<AgentBinding, String> {
+    let binding = worker_read_checkout_binding(manifest, cwd)
+        .ok_or("worker reads require this session's checkout to be bound to a bot")?;
+    for named in [explicit_repo(args), gh_repo_env()].into_iter().flatten() {
+        if canonical_repository_key(&named).as_deref() != Some(binding.repo.as_str()) {
+            return Err(format!(
+                "worker reads are bound to this checkout ({}) and cannot select {named}",
+                binding.repo
+            ));
+        }
+    }
+    Ok(binding)
 }
 
 #[derive(Debug)]
@@ -324,7 +325,7 @@ impl Plan {
     }
 }
 
-fn plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
+fn parse_plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
     let tuple = tuple(args).ok_or("missing read command")?;
     let (_, _, command_index) = command_head(args).ok_or("missing command")?;
     if !TUPLES.contains(&tuple.as_str()) {
@@ -390,6 +391,11 @@ fn plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
         }
         index += 1;
     }
+    Ok(result)
+}
+
+fn plan(args: &[OsString], repository: &str) -> Result<Plan, String> {
+    let mut result = parse_plan(args, repository)?;
     if let Some(repos) = result.flags.get("repo") {
         for repo in repos {
             if canonical_repository_key(repo).as_deref() != Some(repository) {
@@ -786,19 +792,10 @@ fn search_query(plan: &Plan) -> Result<String, String> {
         parts.push(format!("in:{value}"));
     }
     let query = parts.join(" ");
-    // Inspect inside quotes too. GitHub's search grammar accepts quoted values
-    // and boolean groups; none may smuggle a second repository restriction.
-    let qualifier = regex::Regex::new(r"(?i)(?:^|[^a-z0-9_])(?:repo|org|user)\s*:").unwrap();
-    if qualifier.is_match(&query) {
-        return Err("search repository/org/user qualifiers are not allowed; Plexus adds the bound repository".into());
-    }
-    if query.trim().is_empty() {
-        return Err("search requires a query (it need not include a repo qualifier)".into());
-    }
+    read_contract::validate_search(&query)?;
     if plan.flag("sort") || plan.flag("order") {
         return Err("search --sort/--order are not available in the pinned github_read draft; its args are q, page and per_page".into());
     }
-    read_contract::validate_search(&query)?;
     if plan.limit() > 1000 {
         return Err("GitHub search supports at most 1000 results".into());
     }

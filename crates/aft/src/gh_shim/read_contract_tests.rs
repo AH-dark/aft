@@ -386,3 +386,106 @@ fn read_draft_executor_crosses_real_daemon_framing_without_identity_or_retries()
     assert_eq!(reply.next_page(), Some(2));
     assert_eq!(daemon.requests.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn audit_encoded_reserved_bytes_are_rejected_by_the_shared_api_contract() {
+    for encoded in [
+        "%3a", "%3A", "%3f", "%3F", "%23", "%2f", "%2F", "%2e", "%2E",
+    ] {
+        let request = WireRequest::Get {
+            repository: "cortexkit/aft".into(),
+            args: GetArgs {
+                path: format!("compare/main{encoded}other...topic"),
+                query: BTreeMap::new(),
+                accept: Accept::Json,
+            },
+        };
+        assert!(request.validate().is_err(), "{encoded}");
+    }
+    assert!(wire(&ReadRequest::Get {
+        path: "/repos/cortexkit/aft/compare/main...topic".into(),
+        accept: None
+    })
+    .validate()
+    .is_ok());
+}
+
+#[test]
+fn audit_search_boolean_operators_and_parentheses_cannot_escape_appended_repo() {
+    for q in [
+        "needle OR other",
+        "needle AND other",
+        "needle NOT other",
+        "needle or other",
+        "(needle)",
+        "needle OR (other)",
+        "\"OR\"",
+        "\"a (label)\"",
+    ] {
+        let request = WireRequest::Code {
+            repository: "cortexkit/aft".into(),
+            args: SearchArgs {
+                q: q.into(),
+                page: Some(1),
+                per_page: Some(30),
+            },
+        };
+        assert!(request.validate().is_err(), "{q}");
+    }
+    assert!(read_contract::validate_search("needle language:Rust is:open").is_ok());
+}
+
+#[test]
+fn audit_search_repo_org_user_qualifiers_have_one_shared_guard() {
+    for q in [
+        "needle repo:other/repo",
+        "needle org:other",
+        "needle user:other",
+        "\"repo:other/repo\"",
+        "REPO:other/repo",
+        "-repo:other/repo",
+    ] {
+        assert!(read_contract::validate_search(q).is_err(), "{q}");
+    }
+    assert!(read_contract::validate_search("needle").is_ok());
+}
+
+#[test]
+fn audit_identity_lookup_reports_missing_connection_bad_ticket_and_old_daemon() {
+    use std::sync::Arc;
+    let missing = RelayContext {
+        connection_file: None,
+        ticket: Some("bad-ticket".into()),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(1),
+    };
+    assert!(relay_client::worker_session(&missing)
+        .unwrap_err()
+        .contains("connection"));
+    for (code, message) in [
+        ("ticket_unknown", "no live command ticket"),
+        (
+            "operation_unknown",
+            "old daemon has no session context operation",
+        ),
+    ] {
+        let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(move |body| {
+            assert_eq!(body["op"], crate::gh_shim_relay::SESSION_CONTEXT_OPERATION);
+            assert_eq!(body["params"], json!({"ticket":"bad-ticket"}));
+            json!({"op":crate::gh_shim_relay::SESSION_CONTEXT_OPERATION,"status":"error","data":{"refusal_code":code,"message":message}})
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("connection.json");
+        daemon.write_connection_file(&file);
+        let context = RelayContext {
+            connection_file: Some(file),
+            ticket: Some("bad-ticket".into()),
+            transient_delays: [Duration::ZERO; 2],
+            relay_budget: Duration::from_secs(1),
+        };
+        assert!(relay_client::worker_session(&context)
+            .unwrap_err()
+            .contains(message));
+        assert_eq!(daemon.requests.lock().unwrap().len(), 1);
+    }
+}

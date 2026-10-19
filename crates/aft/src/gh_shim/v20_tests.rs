@@ -761,6 +761,8 @@ fn v20_preparer_pins_test_only_fixture_and_preserves_every_v19_row() {
         .unwrap()
         .starts_with(&digest));
     let mut current: Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(current["manifest_version"], 20);
+    assert_eq!(current["issued_at_unix_secs"], 1_792_420_000_u64);
     let mut previous: Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(
         current["worker_reads"].as_array().unwrap().len(),
@@ -771,48 +773,14 @@ fn v20_preparer_pins_test_only_fixture_and_preserves_every_v19_row() {
         previous.as_object_mut().unwrap().remove(field);
     }
     assert_eq!(current, previous);
-    assert!(!run(&fixture, "1792326319").status.success());
-    let bad = dir.path().join("bad.json");
-    fs::write(&bad, [raw, b" ".to_vec()].concat()).unwrap();
-    assert!(!run(&bad, "1792420000").status.success());
-}
-
-#[test]
-fn v20_head_passthrough_is_byte_identical_when_lookup_is_unavailable() {
-    let raw = args(&["api", "repos/cortexkit/aft/issues", "--jq", ".[].title"]);
-    let mut diagnostics = Vec::new();
-    let mut calls = 0;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = fallback_with(
-        &raw,
-        "old daemon has no session-context operation",
-        |forwarded| {
-            calls += 1;
-            assert_eq!(forwarded, raw);
-            stdout.extend_from_slice(b"first\nsecond\n");
-            stderr.extend_from_slice(b"upstream warning\n");
-            0
-        },
-        &mut diagnostics,
-    );
-    assert_eq!(status, 0);
-    assert_eq!(calls, 1);
-    assert_eq!(stdout, b"first\nsecond\n");
-    assert_eq!(stderr, b"upstream warning\n");
-    assert!(diagnostics.is_empty());
-    let status = fallback_with(&raw, "connection refused", |_| 1, &mut diagnostics);
-    assert_eq!(status, 1);
-    assert_eq!(
-        diagnostics,
-        b"gh: governed read routing unavailable (identity lookup: connection refused)\n"
-    );
 }
 
 #[test]
 fn v20_status_records_the_last_lookup_outcome_and_reason() {
+    let _lock = crate::test_env::process_env_lock();
     let dir = tempfile::tempdir().unwrap();
     let paths = StatePaths::from_root(dir.path().to_path_buf());
+    crate::gh_shim::tests::write_signed_manifest(&paths, manifest(), unix_seconds());
     for (result, outcome, reason) in [
         (Ok(Some(true)), "worker", Value::Null),
         (Ok(Some(false)), "head", Value::Null),
@@ -966,4 +934,248 @@ fn v20_executor_uses_pinned_plexus_repo_get_request_and_success() {
             json!({"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","query":{"a":"b","per_page":"10"},"accept":"application/vnd.github+json"}})
         ]
     );
+}
+
+#[test]
+fn audit_candidate_excludes_payloads_methods_graphql_and_malformed_argv() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = manifest();
+    for suffix in [
+        vec!["-f", "a=b"],
+        vec!["-F", "a=b"],
+        vec!["--field=a=b"],
+        vec!["--raw-field", "a=b"],
+        vec!["--input", "f"],
+        vec!["--input=f"],
+        vec!["-X", "POST"],
+        vec!["-X", "GET", "-f", "a=b"],
+        vec!["-XPOST", "-XGET"],
+        vec!["--method"],
+        vec!["--unknown"],
+    ] {
+        let mut raw = vec!["api", "repos/cortexkit/aft/issues"];
+        raw.extend(suffix);
+        assert!(!candidate(&args(&raw), &manifest, "linux"), "{raw:?}");
+    }
+    for endpoint in [
+        "graphql",
+        "GRAPHQL",
+        "/GraphQL",
+        "/graphql/",
+        "https://api.github.com/GRAPHQL",
+    ] {
+        assert!(
+            !candidate(&args(&["api", endpoint]), &manifest, "linux"),
+            "{endpoint}"
+        );
+    }
+    assert!(candidate(
+        &args(&["api", "-X", "GET", "repos/cortexkit/aft/issues"]),
+        &manifest,
+        "linux"
+    ));
+    // Invalid read targets still reach read planning, not ambient gh passthrough.
+    assert!(candidate(
+        &args(&["api", "https://evil.example/repos/cortexkit/aft/issues"]),
+        &manifest,
+        "linux"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_candidate_rejects_non_utf8_native_arguments() {
+    use std::os::unix::ffi::OsStringExt;
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = manifest();
+    for mut argv in [
+        args(&["run", "view", "7"]),
+        args(&["api", "-X", "POST", "repos/cortexkit/aft/issues"]),
+    ] {
+        argv.push(OsString::from_vec(vec![0xff]));
+        assert!(!candidate(&argv, &manifest, "linux"));
+    }
+}
+
+#[test]
+fn audit_authorization_header_guard_has_a_discriminating_accept_value() {
+    let error = plan(
+        &args(&[
+            "api",
+            "repos/cortexkit/aft/pulls/7",
+            "-H",
+            "Authorization: application/vnd.github.diff",
+        ]),
+        "cortexkit/aft",
+    )
+    .unwrap_err();
+    assert!(error.contains("only an Accept"), "{error}");
+    assert!(plan(
+        &args(&[
+            "api",
+            "repos/cortexkit/aft/pulls/7",
+            "-H",
+            "Accept: application/vnd.github.diff"
+        ]),
+        "cortexkit/aft"
+    )
+    .is_ok());
+}
+
+#[test]
+fn audit_jq_child_receives_no_operator_credential_environment() {
+    let _lock = crate::test_env::process_env_lock();
+    let key = "GH_TOKEN";
+    let old = std::env::var_os(key);
+    std::env::set_var(key, "not-a-real-token");
+    let mut output = Vec::new();
+    let result = render::run(
+        &planned(&["api", "repos/cortexkit/aft/issues", "--jq", "env"]),
+        &mut |_| Ok(reply(json!([]))),
+        &mut output,
+    );
+    match old {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    result.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), json!({}));
+}
+
+#[test]
+fn audit_checkout_binding_cannot_be_retargeted_by_repo_flag() {
+    let _lock = crate::test_env::process_env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cortexkit/aft.git"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let manifest = manifest();
+    assert!(manifest.bindings.contains_key("cortexkit/common-auth"));
+    let old = std::env::var_os("GH_REPO");
+    std::env::set_var("GH_REPO", "cortexkit/aft");
+    let denied = checkout_bound_repository(
+        &args(&["repo", "view", "--repo", "cortexkit/common-auth"]),
+        &manifest,
+        dir.path(),
+    );
+    let control = checkout_bound_repository(
+        &args(&["repo", "view", "--repo", "cortexkit/aft"]),
+        &manifest,
+        dir.path(),
+    );
+    match old {
+        Some(value) => std::env::set_var("GH_REPO", value),
+        None => std::env::remove_var("GH_REPO"),
+    }
+    assert!(control.is_ok());
+    assert!(denied.is_err());
+}
+
+#[test]
+fn audit_checkout_binding_cannot_be_retargeted_by_gh_repo() {
+    let _lock = crate::test_env::process_env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cortexkit/aft.git"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let old = std::env::var_os("GH_REPO");
+    std::env::set_var("GH_REPO", "cortexkit/common-auth");
+    let result = checkout_bound_repository(&args(&["repo", "view"]), &manifest(), dir.path());
+    std::env::set_var("GH_REPO", "cortexkit/aft");
+    let control = checkout_bound_repository(&args(&["repo", "view"]), &manifest(), dir.path());
+    match old {
+        Some(value) => std::env::set_var("GH_REPO", value),
+        None => std::env::remove_var("GH_REPO"),
+    }
+    assert!(control.is_ok());
+    assert!(result.is_err());
+}
+
+fn preparer_probe(mode: &str) -> std::process::Output {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    let code = r#"
+import hashlib, importlib.util, json, pathlib, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location('prepare_v20', sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+raw = pathlib.Path(sys.argv[2]).read_bytes()
+mode = sys.argv[4]
+if mode == 'sha':
+    value = json.loads(raw); value['issued_at_unix_secs'] += 1
+    bad = m.encode(value).encode('utf-8')
+elif mode == 'format':
+    bad = raw + b' '
+    m.BASELINE_SHA256 = hashlib.sha256(bad).hexdigest()
+else:
+    bad = raw
+path = pathlib.Path(sys.argv[3]) / 'input.json'; path.write_bytes(bad)
+issued = 1792326319 if mode == 'timestamp' else 1792420000
+m.prepare(path, pathlib.Path(sys.argv[3]) / 'output.json', issued)
+"#;
+    Command::new("python3")
+        .args(["-c", code])
+        .arg(root.join("scripts/prepare-gh-shim-v20.py"))
+        .arg(root.join("crates/aft/tests/fixtures/gh_shim/v19-manifest.json"))
+        .arg(dir.path())
+        .arg(mode)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn audit_preparer_sha_guard_uses_canonically_formatted_changed_bytes() {
+    let output = preparer_probe("sha");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expected reviewed v19 baseline sha256")
+    );
+}
+
+#[test]
+fn audit_preparer_format_guard_is_independent_of_the_hash_guard() {
+    // preparer_probe imports scripts/prepare-gh-shim-v20.py in a child Python
+    // interpreter, appends a space to the test-only v19 manifest, and replaces
+    // that module's BASELINE_SHA256 with the new byte hash. Only the formatting
+    // check can then refuse; neither the script nor its pinned digest is edited.
+    let output = preparer_probe("format");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("baseline formatting differs"));
+}
+
+#[test]
+fn audit_preparer_timestamp_guard_has_a_valid_reviewed_baseline() {
+    let output = preparer_probe("timestamp");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be later"));
 }

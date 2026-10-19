@@ -20,6 +20,8 @@ struct FakeTransport {
     plexus_replies: Mutex<VecDeque<Result<Value, TransportError>>>,
     scoped: bool,
     plexus_scopes: Mutex<Vec<Option<ScopeSelector>>>,
+    read_binding: Mutex<Option<Result<String, String>>>,
+    read_roots: Mutex<Vec<String>>,
 }
 
 impl FakeTransport {
@@ -52,6 +54,17 @@ impl FakeTransport {
 }
 
 impl RelayTransport for FakeTransport {
+    fn read_repository(&self, project_root: &str) -> Result<String, String> {
+        self.read_roots
+            .lock()
+            .unwrap()
+            .push(project_root.to_string());
+        self.read_binding
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Ok("cortexkit/aft".into()))
+    }
     async fn plexus(
         &self,
         _project_root: &str,
@@ -1500,10 +1513,16 @@ fn read_params(ticket: &str) -> Value {
     json!({"ticket":ticket,"request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","accept":"application/vnd.github+json"}}})
 }
 
+fn read_worker_stamp() -> ScopeStamp {
+    let mut scope = delegating_stamp();
+    scope.kind = subc_protocol::scope::ScopeKind::Worker;
+    scope
+}
+
 #[test]
 fn read_relay_uses_github_read_and_the_ticket_scope_without_identity_fields() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read", "read-call", "/p");
-    for worker in [false, true] {
+    for worker in [true] {
         let transport = FakeTransport::scoped();
         let vector: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/gh_shim/v20-read-vectors.json"
@@ -1541,7 +1560,7 @@ fn read_relay_uses_github_read_and_the_ticket_scope_without_identity_fields() {
 fn read_relay_refuses_unknown_actions_unsafe_paths_and_caller_identity() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-invalid", "read-call", "/p");
     let transport = FakeTransport::scoped();
-    let scopes = scopes_for("ses-read-invalid", Some(delegating_stamp()));
+    let scopes = scopes_for("ses-read-invalid", Some(read_worker_stamp()));
     let base = read_params(ticket.value().unwrap());
     let mut cases = Vec::new();
     for path in [
@@ -1588,7 +1607,7 @@ fn read_relay_requires_live_ticket_and_scoped_transport_without_fallback() {
         &unscoped,
         READ_REQUEST_OPERATION,
         params,
-        &scopes_for("ses-read-scoped", Some(delegating_stamp())),
+        &scopes_for("ses-read-scoped", Some(read_worker_stamp())),
     );
     assert_eq!(reply.data["refusal_code"], "agent_identity_required");
     assert!(unscoped.calls().is_empty());
@@ -1604,7 +1623,7 @@ fn read_relay_requires_live_ticket_and_scoped_transport_without_fallback() {
 #[test]
 fn read_relay_preserves_tool_refusals_and_treats_error_frames_as_transport_errors() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-errors", "read-call", "/p");
-    let scopes = scopes_for("ses-read-errors", Some(delegating_stamp()));
+    let scopes = scopes_for("ses-read-errors", Some(read_worker_stamp()));
     let vector: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/gh_shim/v20-read-vectors.json"
     ))
@@ -1644,4 +1663,82 @@ fn read_relay_preserves_tool_refusals_and_treats_error_frames_as_transport_error
     assert_eq!(reply.data["refusal_code"], "decode_error");
     assert_eq!(reply.data["stage"], "plexus");
     assert_eq!(transport.calls().len(), 1);
+}
+
+#[test]
+fn audit_daemon_read_rejects_head_and_unparented_run_scopes() {
+    let ticket =
+        crate::gh_shim_ticket::ScopedTicket::issue("ses-read-head-audit", "read-call", "/p");
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v20-read-vectors.json"
+    ))
+    .unwrap();
+    for kind in [
+        subc_protocol::scope::ScopeKind::Head,
+        subc_protocol::scope::ScopeKind::Ephemeral,
+    ] {
+        let transport = FakeTransport::scoped();
+        transport.push_plexus(Ok(vector["get_success"].clone()));
+        let mut scope = delegating_stamp();
+        scope.kind = kind;
+        let (reply, _) = run_with_scopes(
+            &transport,
+            READ_REQUEST_OPERATION,
+            read_params(ticket.value().unwrap()),
+            &scopes_for("ses-read-head-audit", Some(scope)),
+        );
+        assert!(!reply.ok);
+        assert_eq!(reply.data["refusal_code"], "agent_identity_required");
+        assert!(transport.calls().is_empty());
+        assert!(transport.read_roots.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn audit_daemon_read_binds_repository_to_the_redeemed_checkout() {
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v20-manifest.json"
+    ))
+    .unwrap();
+    assert!(manifest["bindings"].get("cortexkit/aft").is_some());
+    assert!(manifest["bindings"].get("cortexkit/common-auth").is_some());
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        "ses-read-repo-audit",
+        "read-call",
+        "/trusted/session-checkout",
+    );
+    let transport = FakeTransport::scoped();
+    let mut params = read_params(ticket.value().unwrap());
+    params["project_root"] = json!("/forged/checkout");
+    params["request"]["repository"] = json!("cortexkit/common-auth");
+    let (reply, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        params,
+        &scopes_for("ses-read-repo-audit", Some(read_worker_stamp())),
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "repository_not_visible");
+    assert_eq!(
+        *transport.read_roots.lock().unwrap(),
+        vec!["/trusted/session-checkout"]
+    );
+    assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn audit_daemon_read_refuses_an_unverifiable_checkout_binding() {
+    let ticket =
+        crate::gh_shim_ticket::ScopedTicket::issue("ses-read-no-binding-audit", "read-call", "/p");
+    let transport = FakeTransport::scoped();
+    *transport.read_binding.lock().unwrap() = Some(Err("no verified manifest".into()));
+    let (reply, _) = run_with_scopes(
+        &transport,
+        READ_REQUEST_OPERATION,
+        read_params(ticket.value().unwrap()),
+        &scopes_for("ses-read-no-binding-audit", Some(read_worker_stamp())),
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "repository_not_visible");
+    assert!(transport.calls().is_empty());
 }

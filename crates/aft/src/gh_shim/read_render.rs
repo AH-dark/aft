@@ -1,6 +1,8 @@
 //! Fetch and render worker reads without invoking credential-bearing `gh`.
 
 use super::*;
+// Stdio carries only JSON and filter output for local jq; it is never used to
+// start gh. The jq child below receives an empty credential environment.
 use std::process::Stdio;
 
 fn failed(text: impl Into<String>) -> ReadError {
@@ -1053,7 +1055,10 @@ fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Resul
     if let Some(filter) = jq {
         // Run only the local data filter, with argv rather than a shell. gh's
         // credentials and network are not involved in rendering a JSON value.
-        let mut child = Command::new("jq")
+        let executable = which::which("jq")
+            .map_err(|error| failed(format!("--jq needs the local jq executable: {error}")))?;
+        let mut child = Command::new(executable)
+            .env_clear()
             .args(["-r", "--", filter])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

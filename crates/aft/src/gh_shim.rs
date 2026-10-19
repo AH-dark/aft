@@ -36,6 +36,10 @@ pub(crate) mod read_contract;
 mod rename_guard;
 mod worker_reads;
 
+#[cfg(test)]
+#[path = "gh_shim/security_audit_tests.rs"]
+mod security_audit_tests;
+
 pub const SCHEMA_FLOOR: u64 = 1;
 /// Envelope version that carries the manifest as exact signed bytes. Envelope
 /// v1 re-serialized the parsed manifest at verify time; envelope v2 verifies
@@ -627,6 +631,19 @@ pub fn run_from_env() -> i32 {
 }
 
 fn run(args: &[OsString]) -> i32 {
+    run_with(args, delegate, worker_reads::identity_for_command)
+}
+
+fn run_with(
+    args: &[OsString],
+    mut delegate: impl FnMut(&[OsString]) -> i32,
+    mut read_identity: impl FnMut(
+        &[OsString],
+        &Manifest,
+        &StatePaths,
+        &RelayContext,
+    ) -> Result<Option<bool>, String>,
+) -> i32 {
     let paths = StatePaths::from_process();
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
@@ -673,19 +690,18 @@ fn run(args: &[OsString]) -> i32 {
     let initial_manifest = resolve_manifest(&paths, now);
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
     if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
-        if worker_reads::candidate(args, manifest, current_platform()) {
-            match worker_reads::lookup(&paths, &RelayContext::from_process()) {
-                Ok(Some(true)) => return refuse(
+        match read_identity(args, manifest, &paths, &RelayContext::from_process()) {
+            Ok(Some(true)) => {
+                return refuse(
                     RefusalCode::ManifestRegressed,
                     "worker reads require a valid signed manifest; repair the installed manifest",
-                ),
-                Err(text) => return worker_reads::unavailable_fallback(args, &text),
-                Ok(Some(false) | None) => {}
+                )
             }
+            Err(_) | Ok(Some(false) | None) => {}
         }
         return match regressed_disposition(args, manifest, current_platform(), problem) {
             RegressedDisposition::Passthrough => {
-                delegate_after_invalid_manifest_notice(args, problem)
+                delegate_after_invalid_manifest_notice(args, problem, delegate)
             }
             RegressedDisposition::Refuse { code, text } => refuse(code, &text),
         };
@@ -700,7 +716,9 @@ fn run(args: &[OsString]) -> i32 {
     // or one that never verified) there are no bindings to compare against,
     // so those keep passing through as before.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
-        if let Some(status) = worker_reads::dispatch(args, manifest, &cwd, &paths) {
+        if let Some(status) =
+            worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
+        {
             return status;
         }
         // The operator's token works on every repository, bound or not, and
@@ -757,7 +775,9 @@ fn run(args: &[OsString]) -> i32 {
             ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
                 match invalid_manifest_problem.as_ref() {
-                    Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
+                    Some(problem) => {
+                        delegate_after_invalid_manifest_notice(args, problem, delegate)
+                    }
                     None => delegate(args),
                 }
             }
@@ -773,13 +793,13 @@ fn run(args: &[OsString]) -> i32 {
         ManifestResolution::Regressed { manifest, problem } => {
             return match regressed_disposition(args, &manifest, current_platform(), &problem) {
                 RegressedDisposition::Passthrough => {
-                    delegate_after_invalid_manifest_notice(args, &problem)
+                    delegate_after_invalid_manifest_notice(args, &problem, delegate)
                 }
                 RegressedDisposition::Refuse { code, text } => refuse(code, &text),
             }
         }
         ManifestResolution::Invalid(problem) => {
-            return delegate_after_invalid_manifest_notice(args, &problem)
+            return delegate_after_invalid_manifest_notice(args, &problem, delegate)
         }
         ManifestResolution::Dormant => return delegate(args),
     };
@@ -3103,6 +3123,41 @@ fn checkout_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
     resolved_agent_binding(manifest, &TargetRepository::default(), cwd)
 }
 
+pub(crate) fn verified_worker_read_repository(project_root: &Path) -> Result<String, String> {
+    let paths = StatePaths::from_process();
+    let ManifestResolution::Active(manifest) = resolve_manifest(&paths, unix_seconds()) else {
+        return Err("worker read relay requires a verified active manifest".into());
+    };
+    if manifest.manifest_version < 20 {
+        return Err("worker read relay requires manifest v20".into());
+    }
+    worker_read_checkout_binding(&manifest, project_root)
+        .map(|binding| binding.repo)
+        .ok_or_else(|| "the ticket's checkout has no bot binding".into())
+}
+
+fn worker_read_checkout_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBinding> {
+    let git = which::which("git").ok()?;
+    let mut command = Command::new(git);
+    command.env_clear().env("GIT_CONFIG_NOSYSTEM", "1");
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+    let output = command
+        .arg("-C")
+        .arg(project_root_for(cwd))
+        .args(["config", "--local", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let repo = canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())?;
+    let agent_id = manifest.bindings.get(&repo)?.clone();
+    Some(AgentBinding { repo, agent_id })
+}
+
 /// The target's binding, else the checkout's.
 ///
 /// Speech is governed by the target alone. This wider answer serves the
@@ -3263,15 +3318,25 @@ fn canonical_repository_key(value: &str) -> Option<String> {
     .trim_end_matches(".git")
     .trim_matches('/');
     let mut parts = path.split('/');
-    let owner = parts.next()?.trim();
-    let repository = parts.next()?.trim();
-    (!owner.is_empty() && !repository.is_empty() && parts.next().is_none()).then(|| {
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    (valid_repository_component(owner)
+        && valid_repository_component(repository)
+        && parts.next().is_none())
+    .then(|| {
         format!(
             "{}/{}",
             owner.to_ascii_lowercase(),
             repository.to_ascii_lowercase()
         )
     })
+}
+
+fn valid_repository_component(value: &str) -> bool {
+    !matches!(value, "" | "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn gh_session_id(agent_id: &str) -> String {
@@ -4089,7 +4154,11 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
     }
 }
 
-fn delegate_after_invalid_manifest_notice(args: &[OsString], problem: &ManifestProblem) -> i32 {
+fn delegate_after_invalid_manifest_notice(
+    args: &[OsString],
+    problem: &ManifestProblem,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
     // Missing manifests identify public installations and must remain silent.
     // An installed but invalid manifest instead signals a misconfigured
     // governed seat, so say which ambient identity will execute the fallback.
@@ -6923,6 +6992,7 @@ struct SelfReport {
     cached_manifest: CachedManifestReport,
     last_rung: LastRungReport,
     last_probe: Option<LastProbeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     last_read_lookup: Option<worker_reads::LookupRecord>,
     bypass_audit: Option<Vec<Value>>,
     bypass_audit_error: Option<String>,
@@ -7024,6 +7094,12 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
     } else {
         read_last_probe(paths)
     };
+    let last_read_lookup =
+        if !disabled && cached_manifest.version.is_some_and(|version| version >= 20) {
+            worker_reads::last_lookup(paths)
+        } else {
+            None
+        };
     SelfReport {
         shim_version: env!("CARGO_PKG_VERSION"),
         gh_routing_schema_floor: SCHEMA_FLOOR,
@@ -7034,11 +7110,7 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         cached_manifest,
         last_rung,
         last_probe,
-        last_read_lookup: if disabled {
-            None
-        } else {
-            worker_reads::last_lookup(paths)
-        },
+        last_read_lookup,
         bypass_audit,
         bypass_audit_error,
         executing_image: image
@@ -7711,7 +7783,7 @@ mod tests {
         )
     }
 
-    fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
+    pub(super) fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
         fs::create_dir_all(&paths.root).expect("state root");
         fs::write(
             &paths.manifest,
@@ -7900,7 +7972,6 @@ mod tests {
                 "cached_manifest",
                 "last_rung",
                 "last_probe",
-                "last_read_lookup",
                 "bypass_audit",
                 "bypass_audit_error",
                 "executing_image",

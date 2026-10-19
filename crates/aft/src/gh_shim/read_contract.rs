@@ -70,6 +70,14 @@ pub(crate) struct LogArgs {
 }
 
 impl Request {
+    pub(crate) fn repository(&self) -> &str {
+        match self {
+            Self::Get { repository, .. }
+            | Self::Code { repository, .. }
+            | Self::Issues { repository, .. }
+            | Self::JobLog { repository, .. } => repository,
+        }
+    }
     pub(crate) fn validate(&self) -> Result<(), String> {
         let repository = match self {
             Self::Get { repository, .. }
@@ -90,7 +98,7 @@ impl Request {
                         || path.contains(['\\', '?', '#', ':'])
                         || path.split('/').any(|part| matches!(part, "" | "." | ".."))
                         || path.bytes().any(|byte| byte.is_ascii_control())
-                        || ["%2f", "%5c", "%2e", "%25"]
+                        || ["%2f", "%5c", "%2e", "%3a", "%3f", "%23", "%25"]
                             .iter()
                             .any(|encoded| lower.contains(encoded)))
                 {
@@ -143,6 +151,10 @@ pub(crate) fn validate_search(q: &str) -> Result<(), String> {
     let qualifiers = regex::Regex::new(r"(?i)(?:^|[^a-z0-9_])(?:repo|org|user)\s*:").unwrap();
     if q.trim().is_empty() || qualifiers.is_match(q) {
         return Err("search requires a query without repository/org/user qualifiers; Plexus adds the bound repository".into());
+    }
+    let boolean = regex::Regex::new(r"(?i)\b(?:OR|AND|NOT)\b").unwrap();
+    if q.contains(['(', ')']) || boolean.is_match(q) {
+        return Err("worker search does not allow boolean operators or parentheses; Plexus appends a repository constraint".into());
     }
     Ok(())
 }

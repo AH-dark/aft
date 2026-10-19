@@ -27,8 +27,10 @@ pub struct Redeemed {
     /// Background task id, or the id of the tool call that ran `gh` directly.
     /// Empty while a background task is still being spawned.
     pub task_id: String,
-    /// Project the command ran for; used only to label the daemon's own
-    /// routes to prefrontal and plexus, never to choose who speaks.
+    /// Project root recorded by the daemon when it launched the command. The
+    /// read relay checks this checkout's signed repository binding; outbound
+    /// routes also use it as a label. The scope stamp, not this root, selects
+    /// the bot identity.
     pub project_root: String,
 }
 
