@@ -753,7 +753,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// Seatbelt profiles exist only on macOS, and the generated regexes assume its
+// slash-separated canonical paths; Windows paths would never match them.
+#[cfg(all(test, unix))]
 mod session_read_tests {
     use super::*;
     use aft::bash_background::persistence::{
