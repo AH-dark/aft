@@ -1444,6 +1444,12 @@ pub(crate) fn main() -> io::Result<()> {
                             .insert(uri.to_string(), (changed_diagnostics(), version.clone()));
                     }
                     delay_changed_diagnostics_if_requested();
+                    if std::env::var("AFT_FAKE_LSP_ECHO_CHANGES").ok().as_deref() == Some("1") {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new("custom/documentChangedContents", params.clone()),
+                        )?;
+                    }
                     if std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("1") {
                         write_notification(
                             &mut writer,

@@ -1,0 +1,1 @@
+- Several commands now keep Unicode text intact, require their edit inputs explicitly, honour the configured private-URL setting, tell the language server about AST and restore writes, and report an incomplete rollback without discarding its backup.

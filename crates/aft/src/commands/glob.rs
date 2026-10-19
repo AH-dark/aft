@@ -858,3 +858,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ordering_probe {
+    #[test]
+    fn glob_page_cap_keeps_newest_eligible_discovered_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..110 {
+            let path = dir.path().join(format!("file-{index:03}.txt"));
+            std::fs::write(&path, "eligible").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(1_600_000_000 + index, 0),
+            )
+            .unwrap();
+        }
+        let outcome = crate::grep_executor::ripgrep_glob(dir.path(), "*.txt", 100).unwrap();
+        let actual: Vec<_> = outcome
+            .files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let expected: Vec<_> = (10..110)
+            .rev()
+            .map(|index| format!("file-{index:03}.txt"))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}

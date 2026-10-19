@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::url_resolution::resolve_file_or_url;
 use crate::commands::read::{handle_github_zoom, is_github_read_target};
 use crate::commands::symbol_render::{
     build_container_outline, might_have_container_members, qualified_symbol_name,
@@ -15,7 +16,7 @@ use crate::lsp_hints;
 use crate::parser::{detect_language, json_document_value, node_text, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
-use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
+use crate::url_fetch::is_http_url;
 
 /// A reference to a called/calling function.
 #[derive(Debug, Clone, Serialize)]
@@ -235,33 +236,6 @@ fn is_followable_call(call: &RawCall, enrichment: &ZoomEnrichment) -> bool {
         && enrichment
             .imported_bindings
             .contains(&call.full_callee[..binding_end])
-}
-
-fn resolve_file_or_url(
-    req: &RawRequest,
-    ctx: &AppContext,
-    file: &str,
-) -> Result<PathBuf, Response> {
-    if is_http_url(file) {
-        let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-        let allow_private = ctx.config().url_fetch_allow_private
-            || req
-                .params
-                .get("allow_private")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-        return fetch_url_to_cache(
-            file,
-            &storage_dir,
-            UrlFetchOptions {
-                allow_private,
-                ..UrlFetchOptions::default()
-            },
-        )
-        .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
-    }
-
-    ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
 
 fn resolve_zoom_file(
@@ -1635,33 +1609,50 @@ fn ambiguous_symbol_selectors(matches: &[SymbolMatch]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    static DISTANCE_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod unicode_tests {
+    use super::*;
+
+    #[test]
+    fn unicode_distance_uses_linear_workspace() {
+        let source = "é".repeat(128);
+        let target = format!("{}x", "é".repeat(127));
+        assert_eq!(levenshtein_distance(&source, &target), 1);
+        assert_eq!(DISTANCE_CELLS.with(|count| count.get()), 2 * (128 + 1));
+        assert_eq!(levenshtein_distance("é", "e"), 1);
+        assert_eq!(levenshtein_distance("", "猫"), 1);
+    }
+}
+
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let s1_chars: Vec<char> = s1.chars().collect();
     let s2_chars: Vec<char> = s2.chars().collect();
     let len1 = s1_chars.len();
     let len2 = s2_chars.len();
 
-    let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
-
-    for i in 0..=len1 {
-        dp[i][0] = i;
-    }
-    for j in 0..=len2 {
-        dp[0][j] = j;
-    }
+    let mut previous: Vec<usize> = (0..=len2).collect();
+    let mut current = vec![0; len2 + 1];
+    #[cfg(test)]
+    DISTANCE_CELLS.with(|count| count.set(previous.len() + current.len()));
 
     for i in 1..=len1 {
+        current[0] = i;
         for j in 1..=len2 {
             if s1_chars[i - 1] == s2_chars[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
+                current[j] = previous[j - 1];
             } else {
-                dp[i][j] =
-                    1 + std::cmp::min(dp[i - 1][j], std::cmp::min(dp[i][j - 1], dp[i - 1][j - 1]));
+                current[j] = 1 + previous[j].min(current[j - 1]).min(previous[j - 1]);
             }
         }
+        std::mem::swap(&mut previous, &mut current);
     }
 
-    dp[len1][len2]
+    previous[len2]
 }
 
 fn suggest_close_symbols(query: &str, available: &[String], k: usize) -> Vec<String> {

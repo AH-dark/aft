@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
+use super::url_resolution::resolve_file_or_url;
 use crate::commands::read::{handle_github_outline, is_github_read_target};
 use crate::context::AppContext;
 use crate::edit;
@@ -21,7 +22,7 @@ use crate::parser::{
 };
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
-use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
+use crate::url_fetch::is_http_url;
 
 const MAX_OUTLINE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
@@ -314,33 +315,6 @@ fn include_tests_param(req: &RawRequest) -> bool {
         .or_else(|| req.params.get("include_tests"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
-}
-
-fn resolve_file_or_url(
-    req: &RawRequest,
-    ctx: &AppContext,
-    file: &str,
-) -> Result<PathBuf, Response> {
-    if is_http_url(file) {
-        let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-        let allow_private = ctx.config().url_fetch_allow_private
-            || req
-                .params
-                .get("allow_private")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-        return fetch_url_to_cache(
-            file,
-            &storage_dir,
-            UrlFetchOptions {
-                allow_private,
-                ..UrlFetchOptions::default()
-            },
-        )
-        .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
-    }
-
-    ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
 
 /// Build a nested outline tree from a flat symbol list.

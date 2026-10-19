@@ -12,6 +12,7 @@ pub(crate) use crate::grep_executor::ripgrep_glob;
 /// Matching lines the grep tool shows per page unless the caller asks for a
 /// different page size through `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 100;
+const MAX_GREP_OFFSET: usize = 100000;
 const MAX_LINE_CHARS: usize = 200;
 const MAX_MATCHES_PER_FILE: usize = 10;
 const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
@@ -27,6 +28,32 @@ pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 /// Text note for a grep or glob whose search path holds no searchable file.
 pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
     "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn grep_rejects_excessive_offset_before_pattern_compile() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for offset in [100001, u64::MAX] {
+            let req = serde_json::from_value(serde_json::json!({"id": "offset", "command": "grep", "pattern": "[", "offset": offset})).unwrap();
+            let response = handle_grep(&req, &ctx);
+            assert_eq!(
+                response.data["code"], "invalid_request",
+                "{:?}",
+                response.data
+            );
+        }
+        for offset in [0, 100000] {
+            let req = serde_json::from_value(serde_json::json!({"id": "offset", "command": "grep", "pattern": "[", "offset": offset})).unwrap();
+            assert_eq!(handle_grep(&req, &ctx).data["code"], "invalid_pattern");
+        }
+    }
+}
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     crate::bounded_io::command(req, ctx, handle_grep_inner)
@@ -66,8 +93,15 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .params
         .get("offset")
         .and_then(|value| value.as_u64())
-        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
         .unwrap_or(0);
+    if offset > MAX_GREP_OFFSET as u64 {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "grep: 'offset' must be at most 100000",
+        );
+    }
+    let offset = offset as usize;
     let max_results = offset.saturating_add(page_size);
 
     let compiled = match pattern_compile::compile(
@@ -292,7 +326,12 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     crate::views::parent::attach_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
-    if let Some(envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
+    if let Some(mut envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
+        // Once this page exhausts the accepted offset range, only a narrower
+        // search can reach the remaining matches; offset is no longer a knob.
+        if offset.saturating_add(page.rendered) > MAX_GREP_OFFSET {
+            envelope.narrow.retain(|knob| knob != "offset");
+        }
         body["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap_or_default();
     }
 
@@ -602,15 +641,16 @@ pub(crate) fn grep_page_text(
     };
 
     let next_offset = grep_next_offset(result, page, offset);
-    if page.byte_capped {
-        text.push_str(&format!(
-            "\n\n(Output reached the {GREP_MAX_OUTPUT_BYTES}-byte limit after {} of {} rows on this page; continue with offset={}.)",
-            page.rendered,
-            page.page_len,
-            offset.saturating_add(page.rendered)
-        ));
-    } else if let Some(next) = next_offset {
-        text.push_str(&format!("\n\n(More matches; continue with offset={next}.)"));
+    if let Some(next) = next_offset {
+        if page.byte_capped {
+            text.push_str(&format!(
+                "\n\n(Output reached the {GREP_MAX_OUTPUT_BYTES}-byte limit after {} of {} rows on this page; continue with offset={next}.)",
+                page.rendered,
+                page.page_len,
+            ));
+        } else {
+            text.push_str(&format!("\n\n(More matches; continue with offset={next}.)"));
+        }
     } else if offset > 0 && page.page_len == 0 {
         text.push_str(&format!(
             "\n\n(offset={offset} is past the last match; nothing left to show.)"
@@ -644,7 +684,7 @@ pub(crate) fn grep_next_offset(
         || result.truncated
         || result.total_matches > next
         || result.matches.len() > next;
-    (more && page.page_len > 0).then_some(next)
+    (more && page.page_len > 0 && next <= MAX_GREP_OFFSET).then_some(next)
 }
 
 /// Cut a matching line at `GREP_MAX_LINE_CHARS` characters and mark the cut.
@@ -795,6 +835,70 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/project")
+    }
+
+    #[test]
+    fn grep_offset_ceiling_ends_paging_with_a_narrowing_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("matches.txt");
+        std::fs::write(&file, "needle\n".repeat(100003)).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        for (offset, size, next) in [
+            (99999, 1, Some(100000)),
+            (100000, 1, None),
+            (99999, 2, None),
+        ] {
+            let req = serde_json::from_value(serde_json::json!({
+                "id": "offset-ceiling", "command": "grep", "path": file,
+                "pattern": "needle", "offset": offset, "max_results": size,
+            }))
+            .unwrap();
+            let response = handle_grep(&req, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["rendered_matches"], size);
+            let text = crate::subc_format::format_response("grep", &response, false);
+            if let Some(next) = next {
+                assert_eq!(response.data["next_offset"], next);
+                assert!(
+                    text.contains(&format!("continue with offset={next}")),
+                    "{text}"
+                );
+                continue;
+            }
+            assert!(
+                response.data["next_offset"].is_null(),
+                "{:?}",
+                response.data
+            );
+            let trailer = text.lines().last().unwrap();
+            assert!(trailer.starts_with(&format!("shown {size} of ")), "{text}");
+            assert!(
+                trailer.ends_with(" rows (cap) · narrow: path, include, exclude"),
+                "{text}"
+            );
+            assert!(!text.contains("continue with offset="), "{text}");
+        }
+    }
+
+    #[test]
+    fn grep_byte_cap_at_offset_ceiling_does_not_suggest_unusable_offset() {
+        let result = grep_result(Vec::new(), 100003, 1, 1, IndexStatus::Ready, true);
+        let page = GrepPage {
+            rows_text: "matches.txt\n100001: needle".into(),
+            rendered: 1,
+            page_len: 2,
+            lines_truncated: 0,
+            byte_capped: true,
+        };
+        assert_eq!(grep_next_offset(&result, &page, 100000), None);
+        let text = grep_page_text(&result, &page, 100000, true);
+        assert!(!text.contains("continue with offset="), "{text}");
     }
 
     #[test]
