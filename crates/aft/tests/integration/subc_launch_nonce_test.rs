@@ -175,6 +175,12 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
         // workspace. Snapshot builds without that metadata can omit the SHA; the
         // pipe nonce and child checks below do not depend on build provenance.
         let build_git_sha = &manifest["provenance"]["build_git_sha"];
+        // CI always builds from a full Git checkout, so a missing SHA there is a
+        // provenance regression rather than a snapshot build.
+        assert!(
+            !build_git_sha.is_null() || std::env::var_os("CI").is_none(),
+            "CI builds must embed the HELLO build Git SHA"
+        );
         if !build_git_sha.is_null() {
             let build_git_sha = build_git_sha
                 .as_str()
