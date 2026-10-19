@@ -1,6 +1,8 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
@@ -168,6 +170,7 @@ struct DiagnosticsCollection {
     /// gap, so it never makes the payload incomplete.
     not_applicable: BTreeMap<String, String>,
     scope_coverage_gaps: Vec<ScopedCoverageGap>,
+    scope_walk_truncated: bool,
     /// Whether the producer wait has ended. Settlement alone does not prove
     /// diagnostics authority: a quiescent server may not have reported yet.
     producers_settled: bool,
@@ -218,6 +221,7 @@ pub(crate) fn run_diagnostics_category(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     scope_was_provided: bool,
+    scope_candidates: Option<&ScopedCoverageCandidates>,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
     not_applicable: &[NotApplicableServer],
@@ -230,10 +234,12 @@ pub(crate) fn run_diagnostics_category(
     // server started earlier for another part of the project cannot add its
     // notes or failures to this answer.
     let scoped = scope_was_provided.then(|| {
-        let mut tsconfig_membership = TsconfigMembershipCache::new();
-        let candidates =
-            scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership);
+        let candidates = scope_candidates.map_or_else(
+            || scoped_coverage_candidates(snapshot, scope, &snapshot.config, sweep_deadline),
+            Clone::clone,
+        );
         let producer_keys = candidates
+            .files
             .iter()
             .flat_map(|file| producer_keys_for_file(file, &snapshot.config, &snapshot.project_root))
             .collect::<HashSet<_>>();
@@ -277,6 +283,7 @@ pub(crate) fn run_diagnostics_category(
                 &snapshot.config,
                 &snapshot.project_root,
                 &candidates
+                    .files
                     .iter()
                     .filter(|file| !saved.values().any(|check| check.covers(file)))
                     .cloned()
@@ -304,6 +311,9 @@ pub(crate) fn run_diagnostics_category(
             snapshot,
             expected_producers,
             scoped.as_ref().map(|(_, producer_keys)| producer_keys),
+            scoped
+                .as_ref()
+                .map(|(candidates, _)| candidates.files.as_slice()),
         )
     };
     collection.indexing_gaps = indexing_gaps
@@ -390,9 +400,13 @@ pub(crate) fn run_diagnostics_category(
             .diagnostics
             .retain(|row| !check.covers(&row.diagnostic.file));
         if let Some((candidates, _)) = &scoped {
-            collection
-                .saved_files
-                .extend(candidates.iter().filter(|file| check.covers(file)).cloned());
+            collection.saved_files.extend(
+                candidates
+                    .files
+                    .iter()
+                    .filter(|file| check.covers(file))
+                    .cloned(),
+            );
         }
         for (file, diagnostics) in check.diagnostics {
             let rows = diagnostics
@@ -446,10 +460,10 @@ pub(crate) fn run_diagnostics_category(
 
     if let Some((candidates, _)) = &scoped {
         collection.apply_scope(scope);
-        collection.record_scope_coverage_gaps(ctx, snapshot, candidates, sweep.as_ref());
-        // Per-file coverage gaps make the scoped verdict self-certifying:
-        // every scoped file is either covered by an authoritative report or
-        // named as a gap, so the payload is honest without waiting on global
+        collection.scope_walk_truncated = !candidates.walk_complete;
+        collection.record_scope_coverage_gaps(ctx, snapshot, &candidates.files, sweep.as_ref());
+        // Per-file gaps account for enumerated files; a truncated walk adds a
+        // separate gap for files we could not inventory. Neither needs global
         // quiescence signals that may describe files outside the scope.
         let uncovered = collection
             .scope_coverage_gaps
@@ -462,7 +476,7 @@ pub(crate) fn run_diagnostics_category(
         // File inventory is independent of analysis: warm collection performs
         // no sweep, and another scanner may exhaust its budget before reporting
         // a count. Keep uncovered files from being mistaken for an empty scope.
-        payload["scope_files"] = serde_json::json!(candidates.len());
+        payload["scope_files"] = serde_json::json!(candidates.files.len());
         if let Some(sweep) = sweep.as_mut() {
             // Files with authoritative diagnostics, counted the same way the
             // gap list is built, so the coverage line and the gap lines
@@ -503,9 +517,21 @@ fn collect_warm_working_set(
     snapshot: &InspectSnapshot,
     expected_producers: &[ServerKey],
     scope_producers: Option<&HashSet<ServerKey>>,
+    scoped_files: Option<&[PathBuf]>,
 ) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
+    // External workspace servers can publish unrelated files too. Retain only
+    // the requested files outside the project; unscoped collection stays local.
+    let scoped_files = scoped_files.map(|files| files.iter().cloned().collect::<HashSet<_>>());
+    let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
+    let accepts_file = |file: &Path| {
+        let file = crate::inspect::job::canonicalize_normalized(file);
+        file.starts_with(&project_root)
+            || scoped_files
+                .as_ref()
+                .is_some_and(|files| files.contains(&file))
+    };
     {
         let mut lsp = ctx.lsp();
         // Live language-server diagnostics come from queued events and the
@@ -516,8 +542,7 @@ fn collect_warm_working_set(
         collection.producer_reports = lsp
             .authoritative_diagnostic_reports()
             .filter(|(_, file, _)| {
-                file.starts_with(&snapshot.project_root)
-                    && !tsconfig_membership.should_skip_diagnostics(file)
+                accepts_file(file) && !tsconfig_membership.should_skip_diagnostics(file)
             })
             .map(|(server, file, diagnostics)| {
                 (
@@ -623,10 +648,7 @@ fn collect_warm_working_set(
     }
 
     collection.diagnostics.retain(|diagnostic| {
-        diagnostic
-            .diagnostic
-            .file
-            .starts_with(&snapshot.project_root)
+        accepts_file(&diagnostic.diagnostic.file)
             && !tsconfig_membership.should_skip_diagnostics(&diagnostic.diagnostic.file)
     });
     collection.sort_and_dedup();
@@ -646,6 +668,8 @@ enum ScopedFileCoverage {
     /// Only warming (provisional) reports exist: the reporting server has not
     /// reached quiescence yet.
     Warming,
+    /// An explicitly scoped external file is excluded from its TypeScript project.
+    ExcludedByTsconfig,
 }
 
 /// Test hook: force every scoped file to read as authoritatively covered.
@@ -686,70 +710,134 @@ fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> Scope
     ScopedFileCoverage::NoReport
 }
 
+#[derive(Clone)]
+pub(crate) struct ScopedCoverageCandidates {
+    pub files: Vec<PathBuf>,
+    pub walk_complete: bool,
+}
+
+/// Track budget rejection separately from iterator exhaustion: both end a walk,
+/// but only exhaustion proves the inventory is complete.
+#[derive(Clone)]
+pub(crate) struct ScopeWalkBudget {
+    deadline: Instant,
+    entry_limit: usize,
+    visited: Arc<AtomicUsize>,
+    truncated: Arc<AtomicBool>,
+}
+
+impl ScopeWalkBudget {
+    pub(crate) fn new(deadline: Option<Instant>) -> Self {
+        Self::with_entry_limit(deadline, 200_000)
+    }
+
+    fn with_entry_limit(deadline: Option<Instant>, entry_limit: usize) -> Self {
+        Self {
+            deadline: deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)),
+            entry_limit,
+            visited: Arc::new(AtomicUsize::new(0)),
+            truncated: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn keep_walking(&self) -> bool {
+        let allowed = Instant::now() < self.deadline
+            && self.visited.fetch_add(1, Ordering::Relaxed) < self.entry_limit;
+        if !allowed {
+            self.truncated.store(true, Ordering::Relaxed);
+        }
+        allowed
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        !self.truncated.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn scope_walk_gap() -> Value {
+    serde_json::json!({
+        "kind": "analysis_incomplete",
+        "producer": "scoped file walk",
+        "reason": "scope_walk_truncated: the scoped file walk reached its entry limit or deadline; file counts are lower bounds and unvisited files remain unchecked; narrow scope or retry aft_inspect",
+    })
+}
+
 /// Enumerate the files a scoped diagnostics verdict must cover.
 ///
 /// Explicit file roots are always candidates: naming a file is a direct claim
 /// on its diagnostics, including the "no producer applies" case. Directory
-/// roots are walked with the same filters applicability resolution uses;
+/// roots use the bounded project-file walker and the same ignore rules as the
+/// project census and the language-server discovery exclusions;
 /// only files with a registered producer are candidates there, because
 /// directories inevitably contain non-code files nobody expects diagnostics
-/// for. Files a tsconfig excludes from diagnostics are skipped in both cases.
-fn scoped_coverage_candidates(
+/// for. In-root files a tsconfig excludes are skipped. Explicit external files
+/// remain candidates so an excluded file is named as unchecked rather than clean.
+pub(crate) fn scoped_coverage_candidates(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     config: &Config,
-    tsconfig_membership: &mut TsconfigMembershipCache,
-) -> Vec<PathBuf> {
+    deadline: Option<Instant>,
+) -> ScopedCoverageCandidates {
+    scoped_coverage_candidates_with_budget(snapshot, scope, config, ScopeWalkBudget::new(deadline))
+}
+
+fn scoped_coverage_candidates_with_budget(
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+    config: &Config,
+    budget: ScopeWalkBudget,
+) -> ScopedCoverageCandidates {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
     } else {
         scope.roots().to_vec()
-    };
+    }
+    .into_iter()
+    .map(|root| crate::inspect::job::canonicalize_normalized(&root))
+    .collect::<Vec<_>>();
 
     let mut candidates = BTreeSet::new();
+    // A directory's raw entries, not just its recognized source files, must
+    // consume the budget so an ignored or unsupported tree cannot stall inspect.
+    let mut tsconfig_membership = TsconfigMembershipCache::new();
     for root in roots {
         if root.is_file() {
-            if tsconfig_membership.should_skip_diagnostics(&root) {
+            if root.starts_with(&snapshot.project_root)
+                && tsconfig_membership.should_skip_diagnostics(&root)
+            {
                 continue;
             }
-            candidates.insert(crate::inspect::job::canonicalize_normalized(&root));
+            candidates.insert(root);
             continue;
         }
-
-        // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-        let mut builder = ignore::WalkBuilder::new(&root);
-        builder.same_file_system(true).standard_filters(true);
-        let walker = crate::context::apply_project_ignore_rules(&mut builder, &root)
-            .filter_entry(|entry| {
+        let walk_budget = budget.clone();
+        let walk_root = root.clone();
+        let walker = crate::callgraph::walk_project_paths_while(
+            &root,
+            move |path| {
+                let depth = path
+                    .strip_prefix(&walk_root)
+                    .map_or(0, |path| path.components().count());
                 !crate::lsp::roots::skip_in_server_walk(
-                    entry.file_name().to_string_lossy().as_ref(),
-                    entry.depth(),
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    depth,
                 )
-            })
-            .build();
-
-        for entry in walker {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
+            },
+            move || walk_budget.keep_walking(),
+        );
+        for path in walker {
+            let has_producer = !servers_for_file(&path, config).is_empty();
+            if tsconfig_membership.should_skip_diagnostics(&path) || !has_producer {
                 continue;
             }
-            let path = entry.path();
-            if tsconfig_membership.should_skip_diagnostics(path)
-                || servers_for_file(path, config).is_empty()
-            {
-                continue;
-            }
-            candidates.insert(crate::inspect::job::canonicalize_normalized(path));
+            candidates.insert(path);
         }
     }
 
-    candidates.into_iter().collect()
+    ScopedCoverageCandidates {
+        files: candidates.into_iter().collect(),
+        walk_complete: budget.complete(),
+    }
 }
 
 /// The language servers that would analyze the files of a request scope.
@@ -757,8 +845,8 @@ pub(crate) fn scope_producer_keys(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
 ) -> HashSet<ServerKey> {
-    let mut tsconfig_membership = TsconfigMembershipCache::new();
-    scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership)
+    scoped_coverage_candidates(snapshot, scope, &snapshot.config, None)
+        .files
         .iter()
         .flat_map(|file| producer_keys_for_file(file, &snapshot.config, &snapshot.project_root))
         .collect()
@@ -804,10 +892,8 @@ impl DiagnosticsCollection {
     }
 
     fn record_unscoped_failure_files(&mut self, snapshot: &InspectSnapshot, scope: &JobScope) {
-        let mut membership = TsconfigMembershipCache::new();
-        let candidates =
-            scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut membership);
-        for file in candidates {
+        let candidates = scoped_coverage_candidates(snapshot, scope, &snapshot.config, None);
+        for file in candidates.files {
             for key in producer_keys_for_file(&file, &snapshot.config, &snapshot.project_root) {
                 if self.producer_failures_by_key.contains_key(&key) {
                     self.producer_failure_files
@@ -825,12 +911,12 @@ impl DiagnosticsCollection {
     /// excluded from authoritative counts.
     fn apply_scope(&mut self, scope: &JobScope) {
         self.uncertified_compiler_reports
-            .retain(|row| scope.contains(&row.diagnostic.file));
+            .retain(|row| scope_contains_canonical_file(scope, &row.diagnostic.file));
         self.producer_reports
-            .retain(|(_, file, _)| scope.contains(file));
+            .retain(|(_, file, _)| scope_contains_canonical_file(scope, file));
         self.diagnostics.retain(|diagnostic| {
             (!diagnostic.provisional || !self.indexing_gaps.is_empty())
-                && scope.contains(&diagnostic.diagnostic.file)
+                && scope_contains_canonical_file(scope, &diagnostic.diagnostic.file)
         });
     }
 
@@ -850,11 +936,18 @@ impl DiagnosticsCollection {
             return;
         }
         let active: HashSet<ServerKey> = ctx.lsp().active_server_keys().into_iter().collect();
+        let mut tsconfig_membership = TsconfigMembershipCache::new();
         for file in candidates {
             if self.saved_files.contains(file) {
                 continue;
             }
-            let coverage = scoped_file_coverage(ctx, &snapshot.config, file);
+            let coverage = if !file.starts_with(&snapshot.project_root)
+                && tsconfig_membership.should_skip_diagnostics(file)
+            {
+                ScopedFileCoverage::ExcludedByTsconfig
+            } else {
+                scoped_file_coverage(ctx, &snapshot.config, file)
+            };
             // A report published while `cargo check` was still running lacks
             // the compiler's errors, so it cannot certify the file.
             let checking = sweep.and_then(|sweep| {
@@ -910,8 +1003,14 @@ impl DiagnosticsCollection {
                 ScopedFileCoverage::Warming => {
                     "the reporting LSP server has not reached quiescence yet"
                 }
+                ScopedFileCoverage::ExcludedByTsconfig => {
+                    "the file is excluded from diagnostics by its tsconfig"
+                }
             };
-            let cause = if coverage == ScopedFileCoverage::NoProducer {
+            let cause = if matches!(
+                coverage,
+                ScopedFileCoverage::NoProducer | ScopedFileCoverage::ExcludedByTsconfig
+            ) {
                 CoverageCause::unattributed(reason)
             } else {
                 sweep
@@ -1012,6 +1111,7 @@ impl DiagnosticsCollection {
         self.is_reportable()
             && self.producer_failures.is_empty()
             && self.scope_coverage_gaps.is_empty()
+            && !self.scope_walk_truncated
             && self.checking_producers.is_empty()
     }
 
@@ -1129,7 +1229,11 @@ impl DiagnosticsCollection {
             serde_json::json!({
                 "kind": "uncovered_file",
                 "file": display_path(snapshot, &gap.file),
-                "reason": gap.reason,
+                "reason": if gap.file.starts_with(&snapshot.project_root) {
+                    gap.reason.to_string()
+                } else {
+                    format!("outside_project_root_unverified: {}", gap.reason)
+                },
                 "cause": {
                     "producer": gap.cause.producer,
                     "root": gap.cause.root.as_deref().map(|root| display_root(snapshot, root)),
@@ -1137,6 +1241,9 @@ impl DiagnosticsCollection {
                 },
             })
         }));
+        if self.scope_walk_truncated {
+            gaps.push(scope_walk_gap());
+        }
         for (producer, root) in self.servers_pending {
             let reason = self
                 .indexing_gaps
@@ -1213,6 +1320,17 @@ impl DiagnosticsCollection {
                 && left.diagnostic.source == right.diagnostic.source
         });
     }
+}
+
+fn scope_contains_canonical_file(scope: &JobScope, file: &Path) -> bool {
+    if scope.roots().is_empty() {
+        return scope.contains(file);
+    }
+    let file = crate::inspect::job::canonicalize_normalized(file);
+    scope.roots().iter().any(|root| {
+        let root = crate::inspect::job::canonicalize_normalized(root);
+        file.starts_with(&root)
+    })
 }
 
 fn severity_counts(diagnostics: &[CollectedDiagnostic]) -> (usize, usize, usize, usize) {
@@ -1478,7 +1596,7 @@ mod payload_count_tests {
             kind,
             root: PathBuf::from("/repo"),
         });
-        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None);
+        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None, None);
         assert!(!collection.is_complete());
         let payload = collection.into_payload(&snapshot());
         assert!(payload["errors"].is_null(), "{payload:#}");
@@ -1494,6 +1612,33 @@ mod payload_count_tests {
                 .contains_key(producer));
             assert!(payload["by_producer"][producer]["errors"].is_null());
         }
+    }
+
+    #[test]
+    fn external_reports_are_collected_only_for_the_requested_files() {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let outside = PathBuf::from("/external/selected.rs");
+        let unrelated = PathBuf::from("/external/unrelated.rs");
+        for file in [&outside, &unrelated] {
+            let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
+            diagnostic.file = file.clone();
+            ctx.lsp()
+                .diagnostics_store_mut_for_test()
+                .publish_with_kind(ServerKind::Rust, file.clone(), vec![diagnostic]);
+        }
+        let files = [outside.clone()];
+        let scoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files));
+        assert_eq!(scoped.diagnostics.len(), 1);
+        assert_eq!(scoped.diagnostics[0].diagnostic.file, outside);
+        assert_eq!(scoped.producer_reports.len(), 1);
+        assert_eq!(scoped.producer_reports[0].1, outside);
+
+        let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None);
+        assert!(unscoped.diagnostics.is_empty());
+        assert!(unscoped.producer_reports.is_empty());
     }
 
     #[test]
@@ -1716,6 +1861,7 @@ mod payload_count_tests {
                 &snapshot,
                 scope,
                 scoped,
+                None,
                 false,
                 std::slice::from_ref(&failure),
                 &[],
@@ -1919,7 +2065,6 @@ mod ignore_rule_candidate_tests {
     use crate::config::Config;
     use crate::context::ignore_rules_fixture as fixture;
     use crate::inspect::job::{InspectSnapshot, JobScope};
-    use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
     use crate::parser::SymbolCache;
 
     fn candidates(root: &Path) -> std::collections::BTreeSet<String> {
@@ -1934,9 +2079,10 @@ mod ignore_rule_candidate_tests {
             &snapshot,
             &JobScope::for_project(root.clone()),
             &snapshot.config,
-            &mut TsconfigMembershipCache::new(),
+            None,
         );
-        fixture::relative_set(&root, &files)
+        assert!(files.walk_complete);
+        fixture::relative_set(&root, &files.files)
     }
 
     #[test]
@@ -1949,5 +2095,141 @@ mod ignore_rule_candidate_tests {
         let plain_files = candidates(plain.path());
         fixture::assert_honours_ignore_rules(&plain_files, "non-git diagnostics candidates");
         assert_eq!(plain_files, candidates(git.path()));
+    }
+
+    #[test]
+    fn scoped_candidate_entry_limit_reports_incomplete_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        for index in 0..10 {
+            std::fs::write(root.join(format!("unsupported-{index}.txt")), "text").unwrap();
+        }
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-inspect"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let scope = JobScope::for_project(root);
+        let files = super::scoped_coverage_candidates_with_budget(
+            &snapshot,
+            &scope,
+            &snapshot.config,
+            super::ScopeWalkBudget::with_entry_limit(None, 4),
+        );
+        assert!(files.files.is_empty());
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let outcome = super::run_diagnostics_category(
+            &ctx,
+            &snapshot,
+            &scope,
+            true,
+            Some(&files),
+            true,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            Vec::new(),
+        );
+        let crate::inspect::job::JobOutcome::Fresh { payload } = outcome else {
+            panic!("expected diagnostics payload");
+        };
+        assert_eq!(payload["complete"], false, "{payload:#}");
+        assert!(
+            payload["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "analysis_incomplete" && gap["producer"] == "scoped file walk"
+            }),
+            "{payload:#}"
+        );
+    }
+
+    #[test]
+    fn scoped_candidate_deadline_retains_incomplete_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-inspect"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let files = scoped_coverage_candidates(
+            &snapshot,
+            &JobScope::for_project(root),
+            &snapshot.config,
+            Some(std::time::Instant::now()),
+        );
+        assert!(files.files.is_empty());
+        assert!(!files.walk_complete);
+    }
+
+    #[test]
+    fn scoped_candidates_share_applicability_inside_and_outside_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let other = tempfile::tempdir().unwrap();
+        let other_root = crate::inspect::job::canonicalize_normalized(other.path());
+        for (name, content) in [
+            ("package.json", "{}"),
+            ("tsconfig.json", "{\"include\":[\"*.ts\"]}"),
+            ("first.ts", "export const first = 1;"),
+            ("second.ts", "export const second = 2;"),
+        ] {
+            std::fs::write(root.join(name), content).unwrap();
+        }
+        let selected_files = |project_root: &Path| {
+            let snapshot = InspectSnapshot::new(
+                project_root.to_path_buf(),
+                project_root.join(".aft-inspect"),
+                Arc::new(Config::default()),
+                Arc::new(RwLock::new(SymbolCache::new())),
+            );
+            let candidates = scoped_coverage_candidates(
+                &snapshot,
+                &JobScope::from_roots(project_root.to_path_buf(), vec![root.clone()]),
+                &snapshot.config,
+                None,
+            );
+            assert!(candidates.walk_complete);
+            fixture::relative_set(&root, &candidates.files)
+        };
+        let typescript_only = ["first.ts".to_string(), "second.ts".to_string()].into();
+        assert_eq!(selected_files(&root), typescript_only);
+        assert_eq!(selected_files(&other_root), typescript_only);
+        std::fs::write(root.join("biome.json"), "{}").unwrap();
+        let with_json = [
+            "first.ts",
+            "second.ts",
+            "package.json",
+            "tsconfig.json",
+            "biome.json",
+        ]
+        .map(str::to_string)
+        .into();
+        assert_eq!(selected_files(&root), with_json);
+        assert_eq!(selected_files(&other_root), with_json);
+    }
+
+    #[test]
+    fn scoped_candidates_skip_nested_server_fixture_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("main.ts"), "export const main = 1;").unwrap();
+        for directory in ["fixtures", "testdata", "spikes"] {
+            let nested = temp.path().join(directory).join("workspace");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("package.json"), "{}").unwrap();
+            std::fs::write(nested.join("nested.ts"), "export const nested = 1;").unwrap();
+        }
+        assert_eq!(candidates(temp.path()), ["main.ts".to_string()].into());
+        assert_eq!(
+            candidates(&temp.path().join("fixtures/workspace")),
+            ["nested.ts".to_string()].into(),
+        );
     }
 }

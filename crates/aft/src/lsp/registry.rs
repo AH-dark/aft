@@ -940,34 +940,49 @@ pub(crate) fn servers_for_file_with_mode(
         .collect()
 }
 
-/// Biome analyzes only the files its configuration's `files.includes` lists
-/// and publishes nothing for the rest. Treating Biome as a producer for an
-/// excluded file (this repository's biome.json lists only package sources,
-/// so every `.json` under `crates/` is excluded) left that file a permanent
-/// "published no diagnostics" gap in every scoped inspect. A configuration
-/// without `files.includes`, or one that cannot be read, includes every file.
+/// Biome applies only when a project configuration governs the file, and
+/// analyzes only the files that configuration's `files.includes` lists.
+/// Treating it as a producer for an excluded file (this repository's
+/// biome.json lists only package sources, so every `.json` under `crates/` is
+/// excluded) left that file a permanent "published no diagnostics" gap in
+/// every scoped inspect. Like Biome itself, the configuration is found from
+/// the server's root upward, so a user who overrides `root_markers` (for
+/// example to `package.json`) keeps a biome.json that lives in a parent
+/// directory. The search stops at the enclosing repository's root, the same
+/// boundary workspace-root discovery uses. A configuration without
+/// `files.includes`, or one that cannot be read, includes every file.
 fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) -> bool {
     if server.kind != ServerKind::Biome {
         return false;
     }
     let Some(root) = server.workspace_root_with_mode(path, None, mode) else {
-        return false;
+        return true;
     };
-    let Some(config_path) = ["biome.json", "biome.jsonc"]
-        .iter()
-        .map(|name| root.join(name))
+    let mut reached_repository_root = false;
+    let Some(config_path) = root
+        .ancestors()
+        .take_while(|dir| {
+            let inside = !reached_repository_root;
+            reached_repository_root = dir.join(".git").exists();
+            inside
+        })
+        .flat_map(|dir| ["biome.json", "biome.jsonc"].map(|name| dir.join(name)))
         .find(|candidate| {
             super::applicability_cache::observe_path(candidate);
             candidate.is_file()
         })
     else {
-        return false;
+        return true;
     };
     let Some(includes) = biome_includes(&config_path) else {
         return false;
     };
     let path = mode.resolve(path);
-    let Ok(relative) = path.strip_prefix(&root) else {
+    // `files.includes` patterns are relative to the configuration's directory.
+    let Some(config_dir) = config_path.parent() else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(config_dir) else {
         return false;
     };
     !includes.includes(relative)
@@ -1588,6 +1603,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn biome_requires_its_config_even_with_git_marker() {
+        for worktree in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let file = root.join("package.json");
+            write_file(&file, "{}");
+            if worktree {
+                write_file(
+                    &root.join(".git"),
+                    "gitdir: ../main/.git/worktrees/external\n",
+                );
+            } else {
+                std::fs::create_dir(root.join(".git")).unwrap();
+            }
+            assert!(servers_for_file(&file, &Config::default()).is_empty());
+            for marker in ["biome.json", "biome.jsonc"] {
+                write_file(&root.join(marker), "{}");
+                let servers = servers_for_file(&file, &Config::default());
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].kind, ServerKind::Biome);
+                assert_eq!(
+                    servers[0].workspace_root_for_file(&file),
+                    Some(crate::inspect::job::canonicalize_normalized(root)),
+                );
+                std::fs::remove_file(root.join(marker)).unwrap();
+            }
+        }
+    }
+
     /// Biome is not a producer for a file its `files.includes` leaves out, so
     /// such a file is not an eternal "no diagnostics published" gap.
     #[test]
@@ -1825,8 +1870,8 @@ mod tests {
 
     #[test]
     fn test_servers_for_typescript_file() {
-        // TS files match TypeScript (primary) plus Biome / Oxlint / Eslint
-        // co-servers. The full set is asserted in `test_typescript_co_servers`.
+        // TypeScript applies without root markers. Configured co-servers are
+        // asserted separately in `test_typescript_co_servers`.
         let kinds = matching_kinds("/tmp/file.ts", &Config::default());
         assert!(
             kinds.contains(&ServerKind::TypeScript),
@@ -1890,7 +1935,10 @@ mod tests {
 
     #[test]
     fn test_typescript_co_servers() {
-        let kinds = matching_kinds("/tmp/file.ts", &Config::default());
+        let temp = tempfile::tempdir().unwrap();
+        write_file(&temp.path().join("biome.json"), "{}");
+        let file = temp.path().join("file.ts");
+        let kinds = matching_kinds(file.to_str().unwrap(), &Config::default());
         assert!(kinds.contains(&ServerKind::TypeScript));
         assert!(kinds.contains(&ServerKind::Biome));
         assert!(kinds.contains(&ServerKind::Oxlint));
@@ -1907,9 +1955,12 @@ mod tests {
             disabled_lsp: disabled,
             ..Config::default()
         };
+        let temp = tempfile::tempdir().unwrap();
+        write_file(&temp.path().join("biome.json"), "{}");
+        let file = temp.path().join("file.ts");
 
         assert_eq!(
-            matching_kinds("/tmp/file.ts", &config),
+            matching_kinds(file.to_str().unwrap(), &config),
             vec![ServerKind::TypeScript]
         );
     }
@@ -2288,6 +2339,42 @@ mod tests {
         assert!(
             !clangd.root_markers.is_empty(),
             "root_markers should inherit from built-in clangd, got empty",
+        );
+    }
+
+    #[test]
+    fn biome_with_overridden_root_markers_finds_config_in_a_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let package = repo.join("packages/app");
+        let file = package.join("src/index.ts");
+        write_file(&package.join("package.json"), "{}");
+        write_file(&file, "export const a = 1;");
+        let config = Config {
+            lsp_servers: vec![UserServerDef {
+                id: "biome".to_string(),
+                root_markers: vec!["package.json".to_string()],
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+        let has_biome = |config: &Config| {
+            matching_kinds(file.to_str().unwrap(), config).contains(&ServerKind::Biome)
+        };
+        assert!(!has_biome(&config), "no biome config anywhere: no producer");
+        write_file(&repo.join("biome.json"), "{}");
+        assert!(
+            has_biome(&config),
+            "biome.json in a parent governs the package"
+        );
+        write_file(
+            &repo.join("biome.json"),
+            r#"{"files":{"includes":["packages/other/**"]}}"#,
+        );
+        assert!(
+            !has_biome(&config),
+            "includes are relative to the config's directory, not the server root"
         );
     }
 

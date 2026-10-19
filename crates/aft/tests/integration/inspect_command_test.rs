@@ -19,7 +19,9 @@ use aft::inspect::{
     InspectPhaseId, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use aft::lsp::client::LspEvent;
+use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use aft::lsp::registry::ServerKind;
+use aft::lsp::roots::ServerKey;
 use aft::parser::{SymbolCache, TreeSitterProvider};
 use aft::protocol::RawRequest;
 use serde_json::{json, Value};
@@ -5170,6 +5172,503 @@ fn scoped_diagnostics_filter_warm_findings_to_the_scope() {
             .iter()
             .all(|item| unscoped_details.contains(item)),
         "scoped findings must survive in the unscoped payload: scoped={scoped_details:#?} unscoped={unscoped_details:#?}"
+    );
+}
+
+fn diagnostic_path(file: &Path) -> String {
+    file.to_string_lossy().replace('\\', "/")
+}
+
+fn external_typescript_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (temp, root) = fixture_project();
+    write_file(&root, "package.json", "{\"private\":true}\n");
+    write_file(&root, "tsconfig.json", "{\"include\":[\"*.ts\"]}\n");
+    let file = write_file(
+        &root,
+        "broken.ts",
+        "export const broken: number = \"not a number\";\n",
+    );
+    (
+        temp,
+        crate::helpers::canonicalize_like_product(&root),
+        crate::helpers::canonicalize_like_product(&file),
+    )
+}
+
+fn publish_external_typescript_report(
+    ctx: &AppContext,
+    root: &Path,
+    file: &Path,
+    diagnostics: Vec<StoredDiagnostic>,
+) {
+    ctx.lsp().diagnostics_store_mut_for_test().publish(
+        ServerKey {
+            kind: ServerKind::TypeScript,
+            root: root.to_path_buf(),
+        },
+        crate::helpers::canonicalize_like_product(file),
+        diagnostics,
+    );
+}
+
+fn external_error(file: &Path) -> StoredDiagnostic {
+    StoredDiagnostic {
+        file: crate::helpers::canonicalize_like_product(file),
+        line: 1,
+        column: 1,
+        end_line: 1,
+        end_column: 2,
+        severity: DiagnosticSeverity::Error,
+        message: "not assignable to number".into(),
+        code: Some("2322".into()),
+        source: Some("typescript".into()),
+    }
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_without_workspace_marker_counts_unchecked_files() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root) = fixture_project();
+    let files = [
+        write_file(&external_root, "first.ts", "export const first = 1;\n"),
+        write_file(&external_root, "second.ts", "export const second = 2;\n"),
+    ];
+    let ctx = configured_context(&root);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-rootless-directory",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": external_root,
+            "topK": 20,
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    for file in files {
+        let file = crate::helpers::canonicalize_like_product(&file);
+        assert!(
+            response["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "uncovered_file"
+                    && gap["file"] == diagnostic_path(&file)
+                    && gap["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("outside_project_root_unverified"))
+                    && gap["cause"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("no workspace root marker found"))
+            }),
+            "{response:#}"
+        );
+    }
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_counts_reported_files_and_keeps_rows() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, broken) = external_typescript_fixture();
+    let clean = write_file(&external_root, "clean.ts", "export const clean = 1;\n");
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(
+        &ctx,
+        &external_root,
+        &broken,
+        vec![external_error(&broken)],
+    );
+    publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-directory-reports",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": external_root,
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], true, "{response:#}");
+    assert!(
+        response["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == diagnostic_path(&broken)
+                && row["message"] == "not assignable to number"),
+        "external directory report was dropped: {response:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_names_unreported_file_gap() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, unreported) = external_typescript_fixture();
+    let reported = write_file(
+        &external_root,
+        "reported.ts",
+        "export const reported = 1;\n",
+    );
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(&ctx, &external_root, &reported, Vec::new());
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-directory-unreported",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": external_root,
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert!(
+        response["gaps"].as_array().unwrap().iter().any(|gap| {
+            gap["kind"] == "uncovered_file"
+                && gap["file"] == diagnostic_path(&unreported)
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("outside_project_root_unverified"))
+        }),
+        "external unreported file should be a named gap: {response:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_and_file_are_counted_once() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, broken) = external_typescript_fixture();
+    let clean = write_file(&external_root, "clean.ts", "export const clean = 1;\n");
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(
+        &ctx,
+        &external_root,
+        &broken,
+        vec![external_error(&broken)],
+    );
+    publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-directory-overlap",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": [external_root, clean],
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], true, "{response:#}");
+}
+
+#[test]
+fn scoped_diagnostics_external_biome_workspace_counts_json_with_authoritative_reports() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, broken) = external_typescript_fixture();
+    write_file(&external_root, "biome.json", "{}\n");
+    let clean = write_file(&external_root, "clean.ts", "export const clean = 1;\n");
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(
+        &ctx,
+        &external_root,
+        &broken,
+        vec![external_error(&broken)],
+    );
+    publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
+    let inspect_workspace = |id: &str| {
+        inspect(
+            &ctx,
+            json!({
+                "id": id, "command": "inspect", "sections": ["diagnostics"], "scope": external_root,
+            }),
+        )
+    };
+    let unchecked = inspect_workspace("inspect-outside-biome-unchecked");
+    assert_eq!(unchecked["success"], true, "{unchecked:#}");
+    assert_eq!(unchecked["scope_files"], 5, "{unchecked:#}");
+    assert_eq!(unchecked["complete"], false, "{unchecked:#}");
+    assert!(
+        unchecked["summary"]["diagnostics"]["errors"].is_null(),
+        "{unchecked:#}"
+    );
+    for name in ["package.json", "tsconfig.json", "biome.json"] {
+        assert!(
+            unchecked["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "uncovered_file"
+                    && gap["file"] == diagnostic_path(&external_root.join(name))
+            }),
+            "{unchecked:#}"
+        );
+    }
+    for name in ["package.json", "tsconfig.json", "biome.json"] {
+        ctx.lsp().diagnostics_store_mut_for_test().publish(
+            ServerKey {
+                kind: ServerKind::Biome,
+                root: external_root.clone(),
+            },
+            crate::helpers::canonicalize_like_product(&external_root.join(name)),
+            Vec::new(),
+        );
+    }
+    let response = inspect_workspace("inspect-outside-biome-reported");
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 5, "{response:#}");
+    assert_eq!(response["complete"], true, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["biome"]["errors"], 0,
+        "{response:#}"
+    );
+    assert!(response.get("gaps").is_none(), "{response:#}");
+}
+
+#[test]
+fn scoped_diagnostics_outside_project_root_report_error_or_named_gap() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+
+    let response =
+        scoped_diagnostics_inspect(&ctx, "inspect-outside-error", file.to_str().unwrap());
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(response["scope_files"], 1, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 1,
+        "{response:#}"
+    );
+    assert!(
+        response["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["file"] == diagnostic_path(&file)),
+        "{response:#}"
+    );
+    assert!(
+        response["text"]
+            .as_str()
+            .unwrap()
+            .contains("scope: 1 root, 1 file"),
+        "{response:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == ServerKind::TypeScript && key.root == external_root),
+        "external workspace must own its server"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_outside_project_root_unreported_is_named_gap() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    let reported = write_file(&external_root, "reported.ts", "export const ok = 1;\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    open_with_lsp(&ctx, &reported, "export const ok = 1;\n");
+    // Read the warm store without opening the scoped file: the server is live
+    // for this workspace but has never checked this particular file.
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-unreported", "command": "inspect",
+            "sections": ["diagnostics"], "scope": file,
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(response["scope_files"], 1, "{response:#}");
+    let gap = response["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gap| gap["kind"] == "uncovered_file" && gap["file"] == diagnostic_path(&file))
+        .unwrap_or_else(|| panic!("missing outside gap: {response:#}"));
+    assert!(
+        gap["reason"]
+            .as_str()
+            .unwrap()
+            .contains("outside_project_root_unverified"),
+        "{response:#}"
+    );
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_mixed_inside_and_outside_project_root() {
+    let (_temp, root, inside) = external_typescript_fixture();
+    let (_external, external_root, outside) = external_typescript_fixture();
+    let unreported = write_file(&external_root, "unreported.ts", "export const other = 1;\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-mixed-errors", "command": "inspect", "sections": ["diagnostics"],
+            "scope": [inside, outside],
+        }),
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 2,
+        "{response:#}"
+    );
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 2,
+        "{response:#}"
+    );
+    let rows = response["details"]["diagnostics"].as_array().unwrap();
+    assert!(
+        rows.iter().any(|row| row["file"] == "broken.ts"),
+        "{response:#}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["file"] == diagnostic_path(&outside)),
+        "{response:#}"
+    );
+
+    open_with_lsp(
+        &ctx,
+        &inside,
+        "export const broken: number = \"not a number\";\n",
+    );
+    let partial = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-mixed-gap", "command": "inspect", "sections": ["diagnostics"],
+            "scope": [inside, unreported],
+        }),
+    );
+    assert_eq!(partial["complete"], false, "{partial:#}");
+    assert_eq!(partial["scope_files"], 2, "{partial:#}");
+    assert!(
+        partial["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == "broken.ts"),
+        "{partial:#}"
+    );
+    assert!(
+        partial["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["file"] == diagnostic_path(&unreported)
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("outside_project_root_unverified"))),
+        "{partial:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_outside_project_root_without_producer_is_named_gap() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root) = fixture_project();
+    let file = write_file(&external_root, "unknown.aft-unknown", "not checked\n");
+    let file = crate::helpers::canonicalize_like_product(&file);
+    let ctx = configured_context(&root);
+    let response =
+        scoped_diagnostics_inspect(&ctx, "inspect-outside-no-producer", file.to_str().unwrap());
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(response["scope_files"], 1, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert!(
+        response["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["file"] == diagnostic_path(&file)
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("outside_project_root_unverified")
+                        && reason.contains("no LSP producer"))),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_outside_project_root_excluded_by_tsconfig_is_named_gap() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    write_file(
+        &external_root,
+        "tsconfig.json",
+        "{\"include\":[\"included.ts\"]}\n",
+    );
+    write_file(&external_root, "included.ts", "export const ok = 1;\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-excluded", "command": "inspect",
+            "sections": ["diagnostics"], "scope": file,
+        }),
+    );
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(response["scope_files"], 1, "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    assert!(
+        response["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["file"] == diagnostic_path(&file)
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("outside_project_root_unverified")
+                        && reason.contains("tsconfig"))),
+        "{response:#}"
     );
 }
 

@@ -11,7 +11,8 @@ use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::config::Config;
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::{
-    inspect_request_timeout, run_diagnostics_category, start_inspect_rust_checks, InspectRustCheck,
+    inspect_request_timeout, run_diagnostics_category, scope_walk_gap, scoped_coverage_candidates,
+    start_inspect_rust_checks, InspectRustCheck, ScopeWalkBudget,
 };
 #[cfg(test)]
 use crate::inspect::InspectBuilderState;
@@ -655,20 +656,35 @@ fn handle_inspect_payload(
     let scope_was_provided = scope_was_provided && !parsed_scope.roots.is_empty();
     let scope_roots = scope_was_provided.then_some(parsed_scope.roots.as_slice());
     let scope = parsed_scope.job;
+    let scope_walk_deadline =
+        request_deadline.map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP));
+    let scope_candidates = scope_roots.map(|_| {
+        scoped_coverage_candidates(&snapshot, &scope, &snapshot.config, scope_walk_deadline)
+    });
     // File accounting describes the selected corpus, not a scanner's progress.
     // Blocking requests already captured this inventory for stat verification.
     let scoped_inventory = scope_roots.map(|roots| {
-        let count = observed_stats.map_or_else(
-            || crate::callgraph::walk_project_files_in_scope(&snapshot.project_root, roots).count(),
-            |stats| {
-                stats
-                    .0
-                    .iter()
-                    .filter(|(file, _, _)| scope.contains(file))
-                    .count()
-            },
+        let (in_root_count, in_root_complete) = scoped_in_root_file_count(
+            &snapshot.project_root,
+            roots,
+            &scope,
+            scope_walk_deadline,
+            observed_stats,
         );
-        (roots, count as u64)
+        let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
+        // External directory roots contribute only files with a registered
+        // diagnostics producer; explicit file roots remain counted even when
+        // no producer can analyze that file.
+        let external_count = scope_candidates
+            .iter()
+            .flat_map(|candidates| &candidates.files)
+            .filter(|file| !file.starts_with(&project_root))
+            .count();
+        let complete = in_root_complete
+            && scope_candidates
+                .as_ref()
+                .is_none_or(|candidates| candidates.walk_complete);
+        (roots, (in_root_count + external_count) as u64, complete)
     });
     let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 
@@ -875,6 +891,7 @@ fn handle_inspect_payload(
                 &snapshot,
                 &scope,
                 scope_was_provided,
+                scope_candidates.as_ref(),
                 applicability_is_empty,
                 producer_failures,
                 not_applicable,
@@ -1057,6 +1074,36 @@ fn handle_inspect_payload(
     };
     append_inspect_runtime_notes(&mut payload, &runtime_notes);
     Response::success(&req.id, payload)
+}
+
+fn scoped_in_root_file_count(
+    project_root: &Path,
+    scope_roots: &[PathBuf],
+    scope: &JobScope,
+    deadline: Option<Instant>,
+    observed_stats: Option<&InspectRootStatSnapshot>,
+) -> (usize, bool) {
+    observed_stats.map_or_else(
+        || {
+            let budget = ScopeWalkBudget::new(deadline);
+            let walk_budget = budget.clone();
+            let count = crate::callgraph::walk_project_files_in_scope_while(
+                project_root,
+                scope_roots,
+                move || walk_budget.keep_walking(),
+            )
+            .count();
+            (count, budget.complete())
+        },
+        |stats| {
+            let count = stats
+                .0
+                .iter()
+                .filter(|(file, _, _)| scope.contains(file))
+                .count();
+            (count, true)
+        },
+    )
 }
 
 /// A linked worktree builds its call graph when a query first needs it, and
@@ -3092,7 +3139,7 @@ fn build_inspect_payload(
     sections: &Sections,
     top_k: usize,
     ctx: &AppContext,
-    scope: Option<(&[PathBuf], u64)>,
+    scope: Option<(&[PathBuf], u64, bool)>,
 ) -> Value {
     build_inspect_payload_with_offset(snapshot, payloads, sections, top_k, 0, ctx, scope)
 }
@@ -3104,11 +3151,12 @@ fn build_inspect_payload_with_offset(
     top_k: usize,
     offset: usize,
     ctx: &AppContext,
-    scope: Option<(&[PathBuf], u64)>,
+    scope: Option<(&[PathBuf], u64, bool)>,
 ) -> Value {
-    let scope_roots = scope.map(|(roots, _)| roots);
-    let scope_files = scope.map(|(_, files)| files);
-    let no_files_matched_scope = scope_files == Some(0);
+    let scope_roots = scope.map(|(roots, _, _)| roots);
+    let scope_files = scope.map(|(_, files, _)| files);
+    let scope_complete = scope.is_none_or(|(_, _, complete)| complete);
+    let no_files_matched_scope = scope_files == Some(0) && scope_complete;
     let mut summary = Map::new();
     let mut details = Map::new();
     let mut gaps = Vec::new();
@@ -3320,11 +3368,11 @@ fn build_inspect_payload_with_offset(
         }
     }
 
-    let complete = partial_summary_reason(&summary).is_none();
+    let complete = partial_summary_reason(&summary).is_none() && scope_complete;
     let text = render_inspect_text(
         &summary,
         &details,
-        scope_roots.map(|roots| (roots.len(), scope_files.unwrap_or(0))),
+        scope_roots.map(|roots| (roots.len(), scope_files.unwrap_or(0), scope_complete)),
     );
     let mut payload = serde_json::json!({
         "summary": Value::Object(summary),
@@ -3368,6 +3416,17 @@ fn build_inspect_payload_with_offset(
     if !gaps.is_empty() {
         payload["gaps"] = Value::Array(gaps);
     }
+    if !scope_complete {
+        payload["scope_files_complete"] = Value::Bool(false);
+        if !payload["gaps"].is_array() {
+            payload["gaps"] = serde_json::json!([]);
+        }
+        payload["gaps"]
+            .as_array_mut()
+            .unwrap()
+            .push(scope_walk_gap());
+        set_inspect_completion(payload.as_object_mut().unwrap());
+    }
     payload
 }
 
@@ -3375,7 +3434,7 @@ fn build_inspect_payload_with_offset(
 fn render_inspect_text(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
-    scope: Option<(usize, u64)>,
+    scope: Option<(usize, u64, bool)>,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -3383,16 +3442,19 @@ fn render_inspect_text(
         lines.push(format!("PARTIAL — {reason}"));
     }
 
-    if let Some((root_count, file_count)) = scope {
+    if let Some((root_count, file_count, complete)) = scope {
         let root_label = if root_count == 1 { "root" } else { "roots" };
         let file_label = if file_count == 1 { "file" } else { "files" };
-        let suffix = if file_count == 0 {
+        let suffix = if !complete {
+            " (file walk incomplete)"
+        } else if file_count == 0 {
             " (no analyzed files under this scope)"
         } else {
             ""
         };
+        let qualifier = if complete { "" } else { "at least " };
         lines.push(format!(
-            "scope: {root_count} {root_label}, {file_count} {file_label}{suffix}"
+            "scope: {root_count} {root_label}, {qualifier}{file_count} {file_label}{suffix}"
         ));
     }
 
@@ -3469,7 +3531,7 @@ fn render_inspect_text(
         summary,
         details,
         "duplicates",
-        scope.is_some_and(|(_, files)| files == 0),
+        scope.is_some_and(|(_, files, complete)| files == 0 && complete),
     );
     render_complexity_category(&mut lines, summary, details);
     render_cycles_category(&mut lines, summary, details);
@@ -5282,7 +5344,7 @@ mod render_text_tests {
         }));
         let details =
             summary_map(serde_json::json!({"diagnostics_uncovered_files": ["src/lib.rs"]}));
-        let text = render_inspect_text(&summary, &details, Some((1, 1)));
+        let text = render_inspect_text(&summary, &details, Some((1, 1, true)));
         assert_eq!(text, "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect.\nscope: 1 root, 1 file\nAffected files:\n  src/lib.rs\nCyclomatic complexity: 0 functions >= 10");
         let response = Response::success(
             "scoped-inspect",
@@ -5355,7 +5417,7 @@ mod render_text_tests {
                 )
             })
             .collect();
-        assert_eq!(render_inspect_text(&summary, &Map::new(), Some((1, 1))),
+        assert_eq!(render_inspect_text(&summary, &Map::new(), Some((1, 1, true))),
             "scope: 1 root, 1 file\nDuplicates: 0 groups touch the scope\nCyclomatic complexity: 0 functions >= 10\nDead code: 0\nUnused exports: 0");
     }
 
@@ -5824,7 +5886,7 @@ mod fresh_payload_tests {
             Default::default(),
         );
         let roots = [PathBuf::from("/repo/src")];
-        for scope in [None, Some((roots.as_slice(), 2))] {
+        for scope in [None, Some((roots.as_slice(), 2, true))] {
             let payload =
                 build_inspect_payload(&snapshot, &payloads, &Sections::all(), 10, &ctx, scope);
             let response = build_inspect_terminal(
@@ -5909,7 +5971,7 @@ mod fresh_payload_tests {
         );
     }
 
-    fn snapshot() -> InspectSnapshot {
+    pub(super) fn snapshot() -> InspectSnapshot {
         InspectSnapshot::new(
             PathBuf::from("/repo"),
             PathBuf::from("/repo/.aft"),
@@ -5918,7 +5980,7 @@ mod fresh_payload_tests {
         )
     }
 
-    fn fresh_payloads_for_all_categories() -> BTreeMap<InspectCategory, Value> {
+    pub(super) fn fresh_payloads_for_all_categories() -> BTreeMap<InspectCategory, Value> {
         InspectCategory::active()
             .iter()
             .copied()
@@ -6093,7 +6155,7 @@ mod fresh_payload_tests {
             &Sections::all(),
             1,
             &ctx,
-            Some((&[PathBuf::from("/repo/src")], 2)),
+            Some((&[PathBuf::from("/repo/src")], 2, true)),
         );
         let response = build_inspect_terminal(
             "scoped-cached-gap",
@@ -6431,7 +6493,7 @@ mod fresh_payload_tests {
             &Sections::all(),
             20,
             &ctx,
-            Some((&[PathBuf::from("/repo/packages")], 606)),
+            Some((&[PathBuf::from("/repo/packages")], 606, true)),
         );
         assert_eq!(payload["scope_files"], 606, "{payload:#}");
         assert!(
@@ -6465,7 +6527,7 @@ mod fresh_payload_tests {
             &Sections::all(),
             20,
             &ctx,
-            Some((&[PathBuf::from("/repo/src")], 1)),
+            Some((&[PathBuf::from("/repo/src")], 1, true)),
         );
         assert_eq!(payload["scope_files"], 1, "{payload:#}");
         assert!(
@@ -6790,7 +6852,7 @@ mod fresh_payload_tests {
             &Sections::summary_only(),
             5,
             &ctx,
-            Some((&roots, 12)),
+            Some((&roots, 12, true)),
         );
         let text = payload["text"].as_str().expect("text");
 
@@ -7081,7 +7143,7 @@ mod fresh_payload_tests {
             &Sections::summary_only(),
             5,
             &ctx,
-            Some((&roots, 1)),
+            Some((&roots, 1, true)),
         );
         let text = payload["text"].as_str().expect("text");
 
@@ -7477,6 +7539,91 @@ mod deferred_terminal_tests {
             started.elapsed() < Duration::from_millis(900),
             "inspect missed caller reply deadline: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn scoped_in_root_inventory_timeout_reports_lower_bound_and_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
+        let roots = vec![root.clone()];
+        let scope = JobScope::from_roots(root.clone(), roots.clone());
+        let (count, complete) =
+            scoped_in_root_file_count(&root, &roots, &scope, Some(Instant::now()), None);
+        assert_eq!((count, complete), (0, false));
+        let snapshot = fresh_payload_tests::snapshot();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let payload = build_inspect_payload(
+            &snapshot,
+            &fresh_payload_tests::fresh_payloads_for_all_categories(),
+            &Sections::summary_only(),
+            20,
+            &ctx,
+            Some((&roots, count as u64, complete)),
+        );
+        assert_eq!(payload["complete"], false, "{payload:#}");
+        assert_eq!(payload["scope_files_complete"], false, "{payload:#}");
+        assert!(
+            payload.get("no_files_matched_scope").is_none(),
+            "{payload:#}"
+        );
+        assert!(
+            payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("at least 0 files (file walk incomplete)"),
+            "{payload:#}"
+        );
+        assert!(
+            payload["gaps"].as_array().unwrap().iter().any(|gap| {
+                gap["kind"] == "analysis_incomplete" && gap["producer"] == "scoped file walk"
+            }),
+            "{payload:#}"
+        );
+    }
+
+    #[test]
+    fn scoped_in_root_inventory_does_not_realpath_each_file() {
+        const FILE_COUNT: usize = 32;
+
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let scope_root = root.join("src");
+        std::fs::create_dir_all(&scope_root).expect("create source directory");
+        let files = (0..FILE_COUNT)
+            .map(|index| {
+                let file = scope_root.join(format!("file-{index}.ts"));
+                std::fs::write(&file, "export const value = 1;\n").expect("write source file");
+                file
+            })
+            .collect::<Vec<_>>();
+        let scope_roots = vec![scope_root];
+        let scope = JobScope::from_roots(root.clone(), scope_roots.clone());
+
+        crate::inspect::job::CANONICALIZE_CALLS.with(|calls| {
+            *calls.borrow_mut() = Some(Vec::new());
+        });
+        let count = scoped_in_root_file_count(&root, &scope_roots, &scope, None, None);
+        let canonicalized = crate::inspect::job::CANONICALIZE_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .take()
+                .expect("canonicalization capture was armed")
+        });
+
+        assert_eq!(count, (FILE_COUNT, true));
+        assert!(
+            canonicalized.len() < FILE_COUNT,
+            "canonicalized {} paths for {FILE_COUNT} in-root files: {canonicalized:?}",
+            canonicalized.len()
+        );
+        assert!(
+            canonicalized.iter().all(|path| !files.contains(path)),
+            "an in-root source file was realpathed: {canonicalized:?}"
         );
     }
 
