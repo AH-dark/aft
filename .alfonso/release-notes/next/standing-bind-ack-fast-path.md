@@ -1,0 +1,1 @@
+- A project's first route bind no longer waits on standing-root setup when no standing roots are configured, which stopped Windows binds from being refused during configure.

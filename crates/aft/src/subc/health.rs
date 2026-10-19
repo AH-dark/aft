@@ -1424,7 +1424,7 @@ pub(super) fn pending_bind_breadcrumb(
     snapshot: &BindBlockerSnapshot,
 ) -> String {
     let blockers = if snapshot.blockers.is_empty() {
-        "none".to_string()
+        "none (scheduler admission only; executing configure may wait on I/O or locks)".to_string()
     } else {
         snapshot.blockers.join(", ")
     };
@@ -1459,7 +1459,7 @@ pub(super) fn pending_bind_breadcrumb(
         })
         .unwrap_or_default();
     format!(
-        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], in_flight_writer=[{}], reader_admissions_while_promoted_writer_waited={})",
+        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], admission_blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], in_flight_writer=[{}], reader_admissions_while_promoted_writer_waited={})",
         root_id.as_path().display(),
         duration_millis_u64(age),
         configure_request_id,
@@ -5430,6 +5430,33 @@ mod tests {
             route_bind_deadline_refusal(age, deadline, relay, &snapshot("running"));
         assert_eq!(code, "actor_not_ready");
         assert!(message.contains("configure did not finish"), "{message}");
+    }
+
+    #[test]
+    fn pending_bind_breadcrumb_does_not_claim_running_configure_has_no_io_waits() {
+        let (_dir, root) = test_root("breadcrumb-running");
+        let breadcrumb = pending_bind_breadcrumb(
+            RouteChannel {
+                channel: 7,
+                epoch: 1,
+            },
+            &root,
+            Duration::from_secs(6),
+            "subc-bind-7",
+            &BindBlockerSnapshot {
+                configure_state: "running",
+                configure_phase_timings: Some(
+                    "standing_bind=6000ms(reconciliation_lock=6000ms)".into(),
+                ),
+                blockers: Vec::new(),
+                oldest_queued_writer_age_ms: None,
+                in_flight_readers: Vec::new(),
+                in_flight_writer: None,
+                reader_admissions_while_promoted_writer_waited: 0,
+            },
+        );
+        assert!(breadcrumb.contains("admission_blockers=[none (scheduler admission only; executing configure may wait on I/O or locks)]"), "{breadcrumb}");
+        assert!(breadcrumb.contains("standing_bind=6000ms(reconciliation_lock=6000ms)"));
     }
 
     #[test]

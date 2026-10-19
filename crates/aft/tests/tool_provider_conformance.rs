@@ -222,7 +222,7 @@ impl Drop for Process {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = child.kill();
         let _ = child.wait();
-        if std::thread::panicking() {
+        if std::thread::panicking() || std::env::var_os("AFT_TEST_TRACE_DAEMON_STDERR").is_some() {
             eprintln!(
                 "conformance daemon stderr for {}:\n{}",
                 self.root.display(),
@@ -363,6 +363,10 @@ fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, Harn
         .env_remove("SUBC_LAUNCH_NONCE")
         .env_remove("AFT_STORAGE_DIR")
         .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+        .env(
+            "AFT_TEST_DATABASE_OPEN_GATE",
+            root.join("database-open-gate"),
+        )
         .env(
             "AFT_TEST_CALL_LEDGER_CONTROL",
             root.join("ledger-control.json"),
@@ -789,7 +793,7 @@ async fn premature_trigger_diagnostics_include_response_error_and_eof() {
     }
 }
 
-fn ledger_database(root: &Path) -> PathBuf {
+async fn ledger_database(root: &Path) -> PathBuf {
     fn visit(path: &Path) -> Option<PathBuf> {
         for entry in std::fs::read_dir(path).ok()? {
             let path = entry.ok()?.path();
@@ -803,7 +807,55 @@ fn ledger_database(root: &Path) -> PathBuf {
         }
         None
     }
-    visit(root).expect("fixture database exists")
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(path) = visit(root) {
+            // File creation and the bash tables precede the call-ledger migration.
+            // A refused call need not wait for it, so observe the ledger itself.
+            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                conn.busy_timeout(Duration::ZERO).unwrap();
+                if conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'call_ledger')",
+                    [], |row| row.get::<_, bool>(0),
+                ).unwrap_or(false) {
+                    return path;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited 30 seconds for the call_ledger migration in the module's aft.db under {}",
+            root.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(debug_assertions)]
+struct DatabaseOpenGate(PathBuf);
+
+#[cfg(debug_assertions)]
+impl DatabaseOpenGate {
+    fn hold(root: &Path) -> Self {
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join("database-open-gate");
+        std::fs::write(&path, b"hold").unwrap();
+        Self(path)
+    }
+
+    async fn entered(&self) {
+        wait_for_file(&self.0.with_extension("entered")).await;
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for DatabaseOpenGate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn scoped_stamp(carrier: &str, owner: &str, scope_ref: &str) -> RouteStamp {
@@ -939,7 +991,7 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     drop(process);
     // Direct database assertions and forced clock changes are offline: tests
     // never open another SQLite handle while the actor owns this database.
-    let path = ledger_database(&root);
+    let path = ledger_database(&root).await;
     let conn = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM call_ledger", [], |r| r
@@ -1032,7 +1084,7 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
     assert_eq!(response_json(&error)["isError"], true);
     assert!(response_json(&error).get("structuredContent").is_none());
     drop(process);
-    let path = ledger_database(&root);
+    let path = ledger_database(&root).await;
     let conn = rusqlite::Connection::open(&path).unwrap();
     for (carrier, owner) in [("carrier-a", "owner-a"), ("carrier-b", "owner-b")] {
         let row = ledger::get(
@@ -1084,7 +1136,7 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
         )
         .await;
     drop(process);
-    let path = ledger_database(&root);
+    let path = ledger_database(&root).await;
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute("DELETE FROM call_ledger", []).unwrap();
     conn.execute(
@@ -1152,10 +1204,92 @@ async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
     assert!(!marker.exists());
 }
 
+// The database-open gate exists only in debug builds of the daemon
+// (`configure::open_database_runtime`), so this test does too.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn s1_keyed_write_during_migration_fails_closed_then_retries_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let gate = DatabaseOpenGate::hold(&root);
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
+        .await
+        .unwrap();
+    gate.entered().await;
+    let marker = root.join("project/keyed-write.txt");
+    let body = json!({"name":"write","arguments":{"filePath":"keyed-write.txt","content":"first execution"},"call_key":"migration-write"});
+    let refused = route.terminal(body.clone()).await;
+    assert_eq!(refused.header.ty, FrameType::Response);
+    let refusal = response_json(&refused);
+    assert_eq!(refusal["isError"], true, "{refusal}");
+    assert_eq!(
+        refusal["structuredContent"]["code"], "database_initializing",
+        "{refusal}"
+    );
+    assert_eq!(refusal["structuredContent"]["retryable"], true, "{refusal}");
+    assert!(
+        !marker.exists(),
+        "a keyed write cannot run before ledger readiness"
+    );
+    drop(gate);
+    ledger_database(&root).await;
+    // The schema commits before the actor publishes its database handle.
+    let first = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = route.terminal(body.clone()).await;
+            if !is_database_initializing(&frame) {
+                break frame;
+            }
+            assert!(!marker.exists(), "a refused retry cannot execute the write");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("keyed write admission did not become ready within 30 seconds");
+    assert_eq!(first.header.ty, FrameType::Response);
+    assert_eq!(
+        response_json(&first)["isError"],
+        false,
+        "{}",
+        response_json(&first)
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "first execution");
+    std::fs::write(&marker, "after execution").unwrap();
+    let repeat = route.terminal(body).await;
+    assert_eq!(repeat.header.ty, first.header.ty);
+    assert_eq!(repeat.body, first.body);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "after execution",
+        "replay must not execute the write twice"
+    );
+    drop(process);
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
+    let (rows, state): (usize, String) = conn
+        .query_row(
+            "SELECT COUNT(*), state FROM call_ledger WHERE call_key = 'migration-write'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "the executed keyed write must have exactly one durable admission"
+    );
+    assert_eq!(state, "Settled");
+}
+
 #[tokio::test]
 async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
+    // Debug daemons honour the open gate, which holds the migration so the
+    // database assertions below must wait for readiness. Release daemons
+    // ignore it, and the readiness wait still covers the race.
+    #[cfg(debug_assertions)]
+    let gate = DatabaseOpenGate::hold(&root);
     let process = Subject::head().spawn(&root).await.unwrap();
     let route = bind_route_stamped_with_elicitation(
         &process,
@@ -1178,7 +1312,17 @@ async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() 
     assert_eq!(reply.header.ty, FrameType::Error);
     assert_eq!(response_json(&reply)["code"], "capability_not_admitted");
     assert!(!marker.exists());
-    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    #[cfg(debug_assertions)]
+    let release = {
+        gate.entered().await;
+        // Admission refusal intentionally precedes persistence readiness. Leave
+        // the migration held briefly so database assertions must observe readiness.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            drop(gate);
+        })
+    };
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     let executions: usize = conn
         .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
         .unwrap();
@@ -1187,6 +1331,8 @@ async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() 
         .query_row("SELECT COUNT(*) FROM call_ledger", [], |row| row.get(0))
         .unwrap();
     assert_eq!(admissions, 0);
+    #[cfg(debug_assertions)]
+    release.await.unwrap();
 }
 
 #[tokio::test]
@@ -1255,7 +1401,7 @@ async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
             "{case}: refusal must never spawn the shell"
         );
     }
-    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     let executions: usize = conn
         .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
         .unwrap();
@@ -1447,7 +1593,7 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
     }
     drop(wire);
     drop(process);
-    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM call_ledger WHERE late_entry IS NOT NULL",
@@ -1602,7 +1748,7 @@ async fn crash_before_dispatch(point: &str, shell: &str) {
         report.mechanism,
         cortexkit_role_harness::KillMechanism::FaultHookThenProcessKill
     );
-    let path = ledger_database(&root);
+    let path = ledger_database(&root).await;
     let conn = rusqlite::Connection::open(&path).unwrap();
     let key = Key {
         carrier: "reserved:carrier".into(),
@@ -1792,7 +1938,7 @@ async fn restart_recovers_shell_once(hold_running_record: bool) {
         assert_eq!(replay.body, refused.body);
         assert_approved_scoped_shell_result(&replay, &started);
         assert!(!finished.exists());
-        let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+        let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
         let key = Key {
             carrier: "reserved:carrier".into(),
             call_key: "recover-shell".into(),
@@ -1829,7 +1975,7 @@ async fn restart_recovers_shell_once(hold_running_record: bool) {
     };
     drop(wire);
     drop(process);
-    let path = ledger_database(&root);
+    let path = ledger_database(&root).await;
     let conn = rusqlite::Connection::open(&path).unwrap();
     let shell_key = Key {
         carrier: "reserved:carrier".into(),
@@ -2200,7 +2346,7 @@ async fn s2_withdraw_of_a_running_keyed_bash_kills_only_that_task() {
         first.body
     );
     drop(process);
-    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     let mut tasks = conn
         .prepare("SELECT json_extract(metadata,'$.call_key.key'), status, json_extract(metadata,'$.status_reason') FROM bash_tasks WHERE json_extract(metadata,'$.call_key.key') IN ('withdrawn','spared') ORDER BY 1")
         .unwrap()
@@ -2252,7 +2398,7 @@ async fn s2_settled_scoped_withdraw_is_identical_across_expiry_for_carrier_and_o
     assert_eq!(answer["answer"], "completed");
     assert_eq!(answer["result_retained"], true);
     drop(process);
-    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     conn.execute(
         "UPDATE call_ledger SET settled_at=settled_at-?1",
         [ledger::RETENTION_MS],
@@ -2302,7 +2448,7 @@ async fn s2_unobserved_scoped_row_answers_already_started_unknown() {
     drop(process);
     // A read admitted and dispatched, whose end AFT never observed before it
     // stopped: recovery settles it "started, end unobserved".
-    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     let key = Key {
         carrier: "reserved:carrier".into(),
         call_key: "unobserved".into(),

@@ -5,7 +5,10 @@
 //! root pass uses the existing executor's coalescable maintenance lane.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use parking_lot::Mutex;
 
@@ -96,6 +99,9 @@ pub(super) struct StandingActor {
     executor: Arc<Executor>,
     roots: StandingRoots,
     reconciliation: Mutex<()>,
+    /// Once a nonempty snapshot is observed, every bind must serialize with
+    /// standing reconciliation, including binds that remove the last entry.
+    handoff_required: AtomicBool,
     startup: std::sync::Once,
     /// The configuration startup reconciliation reads: defaults, plus the
     /// daemon's storage directory when one was given.
@@ -132,6 +138,7 @@ impl StandingActor {
             executor,
             roots: StandingRoots::default(),
             reconciliation: Mutex::new(()),
+            handoff_required: AtomicBool::new(false),
             startup: std::sync::Once::new(),
             startup_config: config.clone(),
             observed_config: Mutex::new(config),
@@ -198,12 +205,36 @@ impl StandingActor {
     /// not a timer or scheduler, and stale standing publication remains fenced
     /// even if a worker reaches its checkpoint late.
     pub(super) fn begin_session_bind(&self, ctx: &AppContext) {
+        ctx.begin_configure_ack_phase("standing_bind");
+        let snapshot = ctx.config().as_ref().clone();
+        if !snapshot.index.roots.is_empty() {
+            self.handoff_required.store(true, Ordering::Release);
+        } else if !self.handoff_required.load(Ordering::Acquire) {
+            // No standing snapshot has ever been admitted. In particular, the
+            // startup worker may still be initializing its empty database; that
+            // I/O cannot protect a publisher and must not hold up the bind ACK.
+            return;
+        }
+        ctx.begin_configure_ack_step("reconciliation_lock");
         let _reconciliation = self.reconciliation.lock();
+        // Empty-store initialization belongs to the standing worker, not the
+        // bind ACK. Keep the lock while checking both snapshots so an existing
+        // standing publisher can never be skipped by this fast path.
+        if snapshot.index.roots.is_empty() && self.roots.entries().is_empty() {
+            return;
+        }
+        ctx.begin_configure_ack_step("startup_reconcile");
         self.reconcile_startup_once();
-        let snapshot = ctx.config();
-        let snapshot = snapshot.as_ref().clone();
+        ctx.begin_configure_ack_step("snapshot_reconcile");
         if let Err(error) = self.roots.reconcile(&snapshot) {
             log::warn!("standing roots bind reconciliation refused: {error}");
+            return;
+        }
+        let entries = self.roots.entries();
+        // With no standing family there is nothing to revoke. Deriving an
+        // otherwise unused session key can spawn Git on a cold root, and must
+        // not hold its bind ACK hostage.
+        if entries.is_empty() {
             return;
         }
         let Some(session_root) = ctx
@@ -212,10 +243,10 @@ impl StandingActor {
         else {
             return;
         };
+        ctx.begin_configure_ack_step("session_cache_key");
         let session_key = ctx.memoized_artifact_cache_key(&session_root);
-        for entry in self
-            .roots
-            .entries()
+        ctx.begin_configure_ack_step("revoke_and_checkpoint");
+        for entry in entries
             .into_iter()
             .filter(|entry| entry.artifact_key == session_key)
         {
@@ -240,6 +271,9 @@ impl StandingActor {
         self.reconcile_startup_once();
         self.observe_config_snapshot();
         let snapshot = self.observed_config.lock().clone();
+        if !snapshot.index.roots.is_empty() {
+            self.handoff_required.store(true, Ordering::Release);
+        }
         let report = match self.roots.reconcile(&snapshot) {
             Ok(report) => report,
             Err(error) => {
@@ -285,6 +319,9 @@ impl StandingActor {
         entries: &[StandingRootEntry],
     ) -> HashSet<String> {
         let mut contended = HashSet::new();
+        if entries.is_empty() {
+            return contended;
+        }
         let sessions = self
             .executor
             .actor_entries()
@@ -730,6 +767,83 @@ fn root_fingerprint(root: &std::path::Path) -> Option<(u64, Option<u128>)> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_standing_bind_ack_does_not_derive_a_session_cache_key() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: false,
+                },
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let executor = Arc::new(Executor::new());
+        let root_id = ProjectRootId::from_path(root.path()).unwrap();
+        executor.register_actor(root_id.clone(), Arc::clone(&ctx));
+        let actor = Arc::new(
+            StandingActor::new(ctx.app(), Arc::clone(&executor))
+                .with_startup_storage_dir(storage.path()),
+        );
+        let bind_actor = Arc::clone(&actor);
+        let held_actor = Arc::clone(&actor);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            held_actor.hold_locks_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            });
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // This is the post-configure part of the bind job. A root with all
+        // artifact lanes disabled has no memoized key for it to reuse.
+        let (reply, _cancellation) = executor.submit_bind_cancellable_async(
+            root_id,
+            "subc-bind-empty-standing".into(),
+            Arc::new(move |ctx| {
+                bind_actor.begin_session_bind(ctx);
+                crate::protocol::Response::success(
+                    "subc-bind-empty-standing",
+                    serde_json::json!({}),
+                )
+            }),
+        );
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), reply).await;
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            reply
+                .expect("an empty standing startup must not delay the bind reply")
+                .unwrap()
+                .success
+        );
+        assert_eq!(
+            ctx.artifact_cache_key_derivation_count_for_test(),
+            0,
+            "bind completion must not wait for Git when no standing artifact family can contend"
+        );
+        assert!(
+            !storage.path().join("aft.db").exists(),
+            "empty standing storage initialization must not delay the bind reply"
+        );
+        actor.reconcile_at_startup();
+        assert!(storage.path().join("aft.db").exists());
+        actor.tick();
+        assert_eq!(ctx.artifact_cache_key_derivation_count_for_test(), 0);
+    }
+
     #[test]
     fn late_startup_reconciliation_preserves_a_bound_standing_snapshot() {
         use crate::config::{IndexConfig, IndexRootConfig};
@@ -791,8 +905,6 @@ mod tests {
             "frame-thread reconciliation passes"
         );
     }
-    use super::*;
-
     #[test]
     fn reconciliation_failure_logging_tracks_error_state_changes_and_recovery() {
         let mut failures = ReconciliationFailureLog::default();

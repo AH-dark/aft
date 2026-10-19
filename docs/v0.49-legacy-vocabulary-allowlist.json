@@ -2944,6 +2944,17 @@
     },
     {
       "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 1216,
+      "column": 52,
+      "token": "filePath",
+      "text": "let body = json!({\"name\":\"write\",\"arguments\":{\"filePath\":\"keyed-write.txt\",\"content\":\"first execution\"},\"call_key\":\"migration-write\"});",
+      "location": "line 1216, column 52",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The tool-provider v1 write wire schema requires filePath; this fixture tests durable keyed admission, not public agent argument naming."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
       "line": 1550,
       "column": 74,
       "token": "filePath",
