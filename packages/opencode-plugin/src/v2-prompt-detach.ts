@@ -1,13 +1,13 @@
 /**
  * OpenCode 2 has no `chat.message` hook. The equivalent is the session
  * `prompt` hook, which the host runs for every prompt before admitting it
- * (a steer into a busy session included) and whose edited `prompt` it keeps.
+ * (before queueing a message too) and whose edited `prompt` it keeps.
  * This module wires that hook to the same decision the OpenCode 1 entry makes
- * in `chat.message`: a new message detaches a waiting `bash({wait:true})` and
- * aborts a sync `bash_watch`, and the operator's `&detach` token is stripped
- * from the text before the model sees it.
+ * in `chat.message`: a steer detaches a waiting `bash({wait:true})` and aborts
+ * a sync `bash_watch`. Queued messages leave waits alone unless the operator
+ * includes `&detach`, which is stripped from the text before the model sees it.
  */
-import { detachStripEdits } from "@cortexkit/aft-bridge";
+import { containsStandaloneDetachKeyword, detachStripEdits } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import {
@@ -32,6 +32,7 @@ interface MentionCarrier {
 /** The fields of OpenCode 2's `SessionHooks["prompt"]` event this hook reads or edits. */
 export interface V2PromptHookEvent {
   readonly sessionID: string;
+  readonly delivery: "steer" | "queue";
   prompt: {
     text: string;
     files?: MentionCarrier[];
@@ -52,7 +53,7 @@ export interface V2PromptDetachRuntime {
    */
   readonly projectRoot: string;
   /**
-   * Read on every prompt so a live config reload of
+   * Read when deciding whether to detach so a live config reload of
    * `bash.detach_on_user_message` applies to the next message.
    */
   getConfig(): AftConfig;
@@ -114,6 +115,11 @@ export function interruptBashWaitsForV2Prompt(
   const prompt = event.prompt;
   const original = prompt.text;
   const synthetic = isAftOriginatedPrompt(event.metadata);
+  // A queued prompt cannot steer the active turn. Only an operator's explicit
+  // &detach can interrupt its waits; synthetic text is never a control token.
+  if (event.delivery === "queue" && (synthetic || !containsStandaloneDetachKeyword(original))) {
+    return false;
+  }
   const output = { parts: [{ type: "text", text: original, synthetic }] };
   const interrupted = interruptBashWaitsForChatMessage(
     runtime.pool,

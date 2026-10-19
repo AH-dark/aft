@@ -1,0 +1,88 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "bash",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "bash/T5/message_queue_keeps_wait",
+      "tool": "bash",
+      "trajectory": "T5",
+      "execution": "shared-server",
+      "prompt": "Wait for the foreground command to finish before answering the queued message.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-wait",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-message-queue-wait",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 8; printf finished-inline",
+                  "wait": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "the waited command writes stdout only"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "after-wait",
+          "response": {
+            "kind": "text",
+            "content": "The command finished inline."
+          }
+        },
+        {
+          "label": "after-queue",
+          "response": {
+            "kind": "text",
+            "content": "The queued message can now be answered."
+          }
+        }
+      ],
+      "expected_turns": ["call-wait", "after-wait", "after-queue"],
+      "controls": [
+        {
+          "id": "bash-message-queue-prompt",
+          "after_turn": "call-wait",
+          "delay_ms": 2000,
+          "wait_for_task": {
+            "status": "running",
+            "timeout_ms": 10000
+          },
+          "method": "POST",
+          "path": "/api/session/{{session_id}}/prompt",
+          "body": {
+            "text": "Status check for the next turn.",
+            "delivery": "queue"
+          },
+          "expected_status": 0,
+          "purpose": "message"
+        }
+      ],
+      "compare_call_id": "bash-message-queue-wait",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "inline_result",
+            "pattern": "^(?![\\s\\S]*Detached)(?=[\\s\\S]*(?<value>finished-inline))[\\s\\S]+$"
+          }
+        ],
+        "expected": {
+          "inline_result": "finished-inline"
+        }
+      },
+      "metadata": {
+        "host_timeout_ms": 60000
+      }
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+- OpenCode 2 queued messages no longer interrupt shell waits; steer messages and explicit `&detach` still do (#563, thanks @iceteaSA).
