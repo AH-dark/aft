@@ -201,11 +201,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.60.0";
+const ANNOUNCEMENT_VERSION = "0.61.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Call graphs stay current cheaply: a one-file edit updates a project's graph in seconds instead of minutes, and linked worktrees reuse their main checkout's graph until they change.",
-  "`aft_inspect` dead-code and unused-export results are more accurate on Rust, Go and TypeScript, and inspect uses far less memory on large projects.",
-  "OpenCode 2 gets native `shell` and `patch` tools, and stopped subagents are no longer woken by their own background commands.",
+  "OpenCode 2 now hands every AFT permission decision to OpenCode, so your permission rules and plugins apply to AFT tools too.",
+  "Shell sandboxing has per-role profiles: `sandbox.profile` (`off`, `relaxed`, `strict`) replaces `sandbox.enabled`, and `npx @cortexkit/aft doctor --fix` migrates your config.",
+  "Much lighter background work: fewer CPU spikes and disk writes, no indexing of your home folder or drive roots, and many reported issues fixed.",
 ];
 
 /**
