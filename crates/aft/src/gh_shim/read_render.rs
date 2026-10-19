@@ -394,7 +394,7 @@ fn native(
     plan: &Plan,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
 ) -> Result<Value, ReadError> {
-    let value = match plan.tuple.as_str() {
+    let mut value = match plan.tuple.as_str() {
         "search code" | "search issues" => {
             let mut query_text = search_query(plan).map_err(refused)?;
             if plan.tuple == "search issues" && !plan.flag("include-prs") {
@@ -673,6 +673,18 @@ fn native(
         "repo view" => get(format!("/repos/{}", plan.repository), execute)?,
         _ => return Err(refused("unimplemented read verb")),
     };
+    if plan.tuple == "search issues"
+        && plan
+            .value("json")
+            .is_some_and(|fields| fields.split(',').any(|field| field == "repository"))
+    {
+        if let Some(rows) = value.as_array_mut().filter(|rows| !rows.is_empty()) {
+            let repository = get(format!("/repos/{}", plan.repository), execute)?;
+            for row in rows {
+                row["repository"] = repository.clone();
+            }
+        }
+    }
     if let Value::String(_) = value {
         return Ok(value);
     }
@@ -848,9 +860,24 @@ fn normalize(row: &Value, tuple: &str) -> Value {
         ("commentsCount", "comments"),
         ("isLocked", "locked"),
         ("textMatches", "text_matches"),
+        ("path", "filename"),
     ] {
         if let Some(value) = row.get(rest) {
             result.insert(native.into(), value.clone());
+        }
+    }
+    if let Some(repository) = row
+        .get("repository")
+        .filter(|repository| repository.is_object())
+    {
+        result.insert("repository".into(), normalize(repository, "repo view"));
+    }
+    if let Some(author) = row.get("author").filter(|author| author.is_object()) {
+        result.insert("author".into(), actor(author));
+    }
+    if matches!(tuple, "run list" | "run view") {
+        if let Some(started) = row.get("run_started_at") {
+            result.insert("startedAt".into(), started.clone());
         }
     }
     for (native, rest) in [("author", "user"), ("mergedBy", "merged_by")] {

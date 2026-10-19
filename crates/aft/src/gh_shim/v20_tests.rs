@@ -893,3 +893,38 @@ fn v20_native_modifiers_are_not_silently_ignored() {
     );
     assert_eq!(value, json!([{"event":"pull_request","workflow":"CI"}]));
 }
+
+#[test]
+fn v20_rest_backed_json_hydrates_repository_and_preserves_native_aliases() {
+    let (value, _, _) = run_json(
+        &["run", "list", "--json", "startedAt"],
+        vec![json!({"workflow_runs":[{"id":9,"run_started_at":"2026-10-19T12:00:00Z"}]})],
+    );
+    assert_eq!(value, json!([{"startedAt":"2026-10-19T12:00:00Z"}]));
+    let (value, requests, _) = run_json(
+        &["search", "issues", "needle", "--json", "number,repository"],
+        vec![
+            json!({"items":[{"number":42,"repository_url":"https://api.github.com/repos/cortexkit/aft"}]}),
+            json!({"full_name":"cortexkit/aft","name":"aft","private":true}),
+        ],
+    );
+    assert_eq!(value[0]["repository"]["nameWithOwner"], "cortexkit/aft");
+    assert_eq!(value[0]["repository"]["isPrivate"], true);
+    assert!(
+        matches!(&requests[1], ReadRequest::Get { path, .. } if path == "/repos/cortexkit/aft")
+    );
+    let (value, _, _) = run_json(
+        &["release", "view", "v1", "--json", "author"],
+        vec![json!({"author":{"node_id":"user-id","login":"bot","type":"Bot"}})],
+    );
+    assert_eq!(value["author"]["id"], "user-id");
+    assert_eq!(value["author"]["is_bot"], true);
+    let (value, _, _) = run_json(
+        &["pr", "view", "42", "--json", "files"],
+        vec![
+            json!({"number":42}),
+            json!([{"filename":"src/lib.rs","additions":2,"deletions":1}]),
+        ],
+    );
+    assert_eq!(value["files"][0]["path"], "src/lib.rs");
+}
