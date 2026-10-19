@@ -1,0 +1,52 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "zoom",
+  "scenarios": [{
+  "schema_version": 1,
+  "id": "zoom/T2/read-rule-batch",
+  "tool": "zoom",
+  "trajectory": "T2",
+  "error_origin": "product",
+  "metadata": { "error_code": "permission_denied", "steering_pattern": "permission_denied: read" },
+  "execution": "standalone",
+  "auto": true,
+  "prompt": "Zoom both fixture symbols; the read rule denies the secret file.",
+  "fixture": "./read-rules/fixture",
+  "turns": [
+    {
+      "label": "call-zoom",
+      "response": {
+        "kind": "tool_calls",
+        "calls": [
+          {
+            "id": "zoom-read-rule-batch",
+            "name": "aft_zoom",
+            "arguments": {
+              "targets": [
+                { "path": "secret.ts", "symbol": "hiddenSymbol" },
+                { "path": "public.ts", "symbol": "visibleSymbol" }
+              ]
+            },
+            "non_mutating_evidence": { "reason": "zoom reads only authorized fixture symbols" }
+          }
+        ]
+      }
+    },
+    { "label": "finish", "response": { "kind": "text", "content": "done" } }
+  ],
+  "expected_turns": ["call-zoom", "finish"],
+  "compare_call_id": "zoom-read-rule-batch",
+  "comparison": {
+    "mode": "shape",
+    "rules": [
+      {
+        "kind": "field",
+        "field": "read_policy",
+        "pattern": "^(?![\\s\\S]*SECRET_CONTENT_MUST_NOT_ESCAPE)(?=[\\s\\S]*visibleSymbol)(?=[\\s\\S]*(?<value>permission_denied: read))[\\s\\S]+$"
+      }
+    ],
+    "expected": { "read_policy": "permission_denied: read" }
+  }
+  }]
+}

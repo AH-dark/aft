@@ -2464,6 +2464,24 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     }
 
     let mut out = Map::new();
+    if let Some(excluded) = map_in.get("_exclude_read_paths").and_then(Value::as_array) {
+        out.insert(
+            "_exclude_read_paths".into(),
+            Value::Array(
+                excluded
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|path| {
+                        Value::String(
+                            resolve_path_from_project_root(project_root, path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
     if let Some(include_tests) = map_in
         .get("includeTests")
         .filter(|value| !is_empty_param(value))

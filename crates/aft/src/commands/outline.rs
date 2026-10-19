@@ -1,7 +1,7 @@
 const LINE_COUNT_BYTES: u64 = 1024 * 1024;
 const ENTRY_BUDGET: usize = 10_000;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,6 +65,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     const MAX_OUTPUT_BYTES: usize = 30 * 1024;
+    let excluded = excluded_read_paths(req);
 
     if req
         .params
@@ -119,6 +120,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             req.session(),
             project_root.as_deref(),
+            &excluded,
         ) {
             Ok(result) => result,
             Err(resp) => return resp,
@@ -144,6 +146,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "collection_truncated": discovery.collection_truncated,
             "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
             "skipped_files": skipped_files,
+            "content_files": file_outlines.iter().map(|file| &file.absolute_path).collect::<Vec<_>>(),
         });
         crate::context::confinement::disclose_denied(&mut body);
         return Response::success(&req.id, body);
@@ -163,6 +166,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             req.session(),
             project_root.as_deref(),
+            &excluded,
         ) {
             Ok(result) => result,
             Err(resp) => return resp,
@@ -185,6 +189,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 "files_shown": rendered.shown,
                 "structure_footer": rendered.footer,
                 "skipped_files": skipped_files,
+                "content_files": file_outlines.iter().map(|file| &file.absolute_path).collect::<Vec<_>>(),
             }),
         );
     }
@@ -304,8 +309,21 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
     Response::success(
         &req.id,
-        serde_json::json!({ "text": text, "complete": complete }),
+        serde_json::json!({ "text": text, "complete": complete, "content_files": if is_http_url(file) { vec![] } else { vec![path] } }),
     )
+}
+
+/// Host adapters can re-render a held outline after applying their own read policy.
+/// This transport-only field is not part of the model-facing tool schema.
+fn excluded_read_paths(req: &RawRequest) -> HashSet<PathBuf> {
+    req.params
+        .get("_exclude_read_paths")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn include_tests_param(req: &RawRequest) -> bool {
@@ -474,6 +492,7 @@ fn insert_at_scope_indexed(
 
 /// Intermediate representation for multi-file tree rendering.
 struct FileOutline {
+    absolute_path: PathBuf,
     path: String, // relative path
     entries: Vec<OutlineEntry>,
     language: Option<LangId>,
@@ -1301,6 +1320,7 @@ fn handle_outline_files_mode(
     let multiple_targets = targets.len() >= 2;
     let project_root = ctx.config().project_root.clone();
     let include_tests = include_tests_param(req);
+    let excluded = excluded_read_paths(req);
 
     let mut file_entries = Vec::new();
     let mut directory_nodes = Vec::new();
@@ -1342,7 +1362,10 @@ fn handle_outline_files_mode(
         } else {
             &dir_path
         };
-        let discovery = discover_outline_files_for_files_mode(&dir_path);
+        let mut discovery = discover_outline_files_for_files_mode(&dir_path);
+        discovery
+            .files
+            .retain(|file| !excluded.contains(Path::new(file)));
         entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
@@ -1453,6 +1476,7 @@ fn handle_outline_files_mode(
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut response_data = serde_json::json!({
         "text": text,
+        "content_files": file_entries.iter().map(|file| &file.absolute_path).collect::<Vec<_>>(),
         "files": file_entries,
         "complete": !walk_truncated
             && !collection_truncated
@@ -2221,6 +2245,7 @@ fn outline_many_files(
     req_id: &str,
     session_id: &str,
     project_root: Option<&Path>,
+    excluded: &HashSet<PathBuf>,
 ) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
     let paths = files
         .iter()
@@ -2247,6 +2272,9 @@ fn outline_many_files(
     let mut fallback_parser = FileParser::new();
 
     for (file, path) in files.iter().zip(paths) {
+        if excluded.contains(&path) {
+            continue;
+        }
         if crate::bounded_io::metadata(&path).is_err() {
             skipped_files.push(SkippedFile::new(file, "file_not_found"));
             continue;
@@ -2311,6 +2339,7 @@ fn outline_many_files(
                             }
                         }
                         file_outlines.push(FileOutline {
+                            absolute_path: path.clone(),
                             path: rel_path,
                             entries,
                             language: detect_language(&path),
@@ -3183,6 +3212,43 @@ mod tests {
         (temp, files, ctx)
     }
 
+    #[test]
+    fn outline_content_files_and_internal_exclusions_preserve_allowed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let allowed = root.join("allowed.ts");
+        let denied = root.join("denied.ts");
+        std::fs::write(&allowed, "export function publicSymbol() {}\n").unwrap();
+        std::fs::write(&denied, "export function secretSymbol() {}\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for files_mode in [false, true] {
+            for exclude in [false, true] {
+                let args = serde_json::json!({"target":root, "files":files_mode,
+                    "_exclude_read_paths":if exclude { vec![denied.clone()] } else { vec![] }});
+                let translated =
+                    crate::subc_translate::subc_translate("outline", &args, &root).unwrap();
+                let mut request = serde_json::to_value(translated.args).unwrap();
+                request["id"] = serde_json::json!("read-policy");
+                request["command"] = serde_json::json!("outline");
+                let request: RawRequest = serde_json::from_value(request).unwrap();
+                let response = handle_outline(&request, &ctx);
+                assert!(response.success);
+                let paths = response.data["content_files"].as_array().unwrap();
+                assert!(paths.contains(&serde_json::json!(allowed)));
+                assert_eq!(paths.contains(&serde_json::json!(denied)), !exclude);
+                let text = response.data["text"].as_str().unwrap();
+                assert!(text.contains("allowed.ts"));
+                assert_eq!(text.contains("denied.ts"), !exclude);
+                if !files_mode {
+                    assert_eq!(text.contains("secretSymbol"), !exclude);
+                }
+            }
+        }
+    }
+
     fn navigation_counts(
         request: &RawRequest,
         ctx: &AppContext,
@@ -3490,7 +3556,8 @@ mod tests {
             "e.go\n  - fn   alpha 2:2\n  - fn   beta 3:3\n",
             "f.rs\n  E modu nested 1:3\n    E fn   alpha 2:2\n  tests: 1 items (lines 4-5)\n",
             "g.cpp\n  - fn   alpha 1:1\n  - fn   beta 2:2\n"),
-            "complete":true,"output_truncated":false,"files_shown":7,"structure_footer":"","skipped_files":[]})
+            "complete":true,"output_truncated":false,"files_shown":7,"structure_footer":"","skipped_files":[],
+            "content_files":files.iter().map(|file| file.canonicalize().unwrap()).collect::<Vec<_>>()})
         );
         let bodies = [
             "  E function alpha() {} 1:1\n  function beta() {} 2:2\n",
@@ -3507,6 +3574,7 @@ mod tests {
             )
             .unwrap();
             let expected = serde_json::json!({"id":"golden", "success":true, "complete":true,
+                "content_files":[path.canonicalize().unwrap()],
                 "text":format!("{}\n{body}", path.file_name().unwrap().to_str().unwrap())});
             assert_eq!(
                 serde_json::to_value(handle_outline(&request, &ctx)).unwrap(),
@@ -4305,8 +4373,15 @@ mod tests {
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, _) =
-            outline_many_files(&files, &ctx, "budget", "budget-session", None).unwrap();
+        let (outlines, _) = outline_many_files(
+            &files,
+            &ctx,
+            "budget",
+            "budget-session",
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
         let rendered = format_multi_file_tree(&outlines, 550, 3, false);
         assert!(rendered.text.len() <= 550, "{} bytes", rendered.text.len());
         assert_eq!(rendered.shown, 2, "{}", rendered.text);
@@ -4822,9 +4897,15 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, skipped) =
-            outline_many_files(&files, &ctx, "outline-fixture", "fixture-session", None)
-                .expect("outline fixture files");
+        let (outlines, skipped) = outline_many_files(
+            &files,
+            &ctx,
+            "outline-fixture",
+            "fixture-session",
+            None,
+            &HashSet::new(),
+        )
+        .expect("outline fixture files");
         assert!(skipped.is_empty(), "{skipped:?}");
         format_multi_file_tree(&outlines, 30 * 1024, files.len(), false).text
     }

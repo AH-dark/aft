@@ -6,7 +6,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, expandTilde, projectRootFor } from "./_shared.js";
+import { callBridge, expandTilde, projectRootFor, type ToolRuntime } from "./_shared.js";
 
 const UNSUPPORTED_ASK_HOST =
   "AFT requires OpenCode 1.15.5 or newer for permission asks; please upgrade OpenCode";
@@ -53,6 +53,11 @@ export function classifyPermissionError(
   error: unknown,
   fallbackMessage = "Permission denied.",
 ): PermissionAskFailure {
+  const nested =
+    typeof error === "object" && error !== null && "error" in error ? error.error : undefined;
+  if (stringProperty(nested, "_tag") === "Permission.BlockedError") {
+    return { kind: "rule_denied", message: permissionErrorMessage(error, fallbackMessage) };
+  }
   const tag = stringProperty(error, "_tag");
   const errorConstructor =
     typeof error === "object" && error !== null
@@ -217,6 +222,28 @@ export function resolveRelativePatterns(context: ToolContext, targets: string[])
 
 export function workspacePattern(_context: ToolContext): string {
   return ".";
+}
+
+/** Use native read's project-relative resource and error wording for OC2 source tools. */
+export async function assertV2ReadPermission(
+  context: ToolContext,
+  targetPath: string,
+): Promise<string | undefined> {
+  if ((context as ToolRuntime).hostVersion !== 2) return undefined;
+  try {
+    await runAsk(
+      context.ask({
+        permission: "read",
+        patterns: [permissionPath(context, targetPath)],
+        always: ["*"],
+        metadata: {},
+      }),
+    );
+    return undefined;
+  } catch (error) {
+    const failure = classifyPermissionError(error);
+    return failure.kind === "rule_denied" ? permissionRuleDenial("read") : failure.message;
+  }
 }
 
 export async function askEditPermission(
@@ -651,10 +678,11 @@ export async function assertAftSearchExternalPermission(
 
   const sessionKey = (context as { sessionID?: string }).sessionID ?? "unknown-session";
   const cacheKey = `${sessionKey}\0${externalRoot}`;
-  if (aftSearchExternalDecisionCache.has(cacheKey)) {
+  const cacheDecisions = (context as ToolRuntime).hostVersion !== 2;
+  if (cacheDecisions && aftSearchExternalDecisionCache.has(cacheKey)) {
     return aftSearchExternalDecisionCache.get(cacheKey);
   }
-  const pending = aftSearchExternalPendingAsks.get(cacheKey);
+  const pending = cacheDecisions ? aftSearchExternalPendingAsks.get(cacheKey) : undefined;
   if (pending) return pending;
 
   const rawGlob =
@@ -674,7 +702,7 @@ export async function assertAftSearchExternalPermission(
           },
         }),
       );
-      aftSearchExternalDecisionCache.set(cacheKey, undefined);
+      if (cacheDecisions) aftSearchExternalDecisionCache.set(cacheKey, undefined);
       return undefined;
     } catch (error) {
       const failure = classifyPermissionError(error, "Permission denied (aft_search_external).");
@@ -687,13 +715,13 @@ export async function assertAftSearchExternalPermission(
         permission: "aft_search_external",
         root: externalRoot,
       };
-      aftSearchExternalDecisionCache.set(cacheKey, denial);
+      if (cacheDecisions) aftSearchExternalDecisionCache.set(cacheKey, denial);
       return denial;
     } finally {
-      aftSearchExternalPendingAsks.delete(cacheKey);
+      if (cacheDecisions) aftSearchExternalPendingAsks.delete(cacheKey);
     }
   })();
-  aftSearchExternalPendingAsks.set(cacheKey, askPromise);
+  if (cacheDecisions) aftSearchExternalPendingAsks.set(cacheKey, askPromise);
   return askPromise;
 }
 

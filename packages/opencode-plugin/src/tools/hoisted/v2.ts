@@ -31,11 +31,6 @@ export function hoistedV2ToolConsumers(host: V2PermissionHostContext | object): 
       "AFT requires OpenCode 2.0.29 or newer: this V2 host has no permission.assert. Upgrade OpenCode before loading AFT.",
     );
   }
-  if (!domainMethod(host, "agent", "get") || !domainMethod(host, "session", "get")) {
-    throw new Error(
-      "AFT requires OpenCode 2.0.29 or newer with agent.get and session.get permission rules.",
-    );
-  }
   return {
     requestPermission: (request, context, signal) =>
       requestPermission(host as V2PermissionHostContext, request, context, signal),

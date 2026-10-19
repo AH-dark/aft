@@ -51,6 +51,7 @@ export interface V2PermissionRequest {
 }
 
 export interface V2DefinitionRuntime extends V2ExecutionContext {
+  hostVersion: 2;
   directory: string;
   /** Always true here; see `ToolRuntime.directoryIsSessionRoot` in `tools/_shared.ts`. */
   directoryIsSessionRoot: true;
@@ -321,6 +322,7 @@ function runtimeFor(
   const directory = location.directory;
   const worktree = location.project?.canonical ?? location.project?.directory ?? directory;
   return {
+    hostVersion: 2,
     sessionID: context.sessionID,
     messageID: context.messageID,
     agent: context.agent,

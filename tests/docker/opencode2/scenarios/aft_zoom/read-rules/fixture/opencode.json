@@ -1,0 +1,5 @@
+{
+  "permissions": [
+    { "action": "read", "resource": "secret.ts", "effect": "deny" }
+  ]
+}

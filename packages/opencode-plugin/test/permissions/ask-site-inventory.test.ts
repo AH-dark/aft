@@ -22,6 +22,7 @@ const ASK_SITE_FIXTURE = {
     "context.ask(",
     "context.ask(",
     "context.ask(",
+    "context.ask(",
   ],
 } as const;
 

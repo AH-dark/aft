@@ -1,10 +1,15 @@
+import { stat } from "node:fs/promises";
 import { coerceJsonCollectionParam } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
 import type { PluginContext } from "../types.js";
 import { callToolCall, isEmptyParam, resolvePathArg } from "./_shared.js";
-import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
+import {
+  assertExternalDirectoryPermission,
+  assertV2ReadPermission,
+  permissionDeniedResponse,
+} from "./permissions.js";
 
 const z = tool.schema;
 // `diagnostics_timeout_ms` is the server's whole-request terminal deadline.
@@ -63,6 +68,15 @@ async function resolveAndGateScope(
       serverValidatedRead: true,
     });
     if (denial) return { scope: undefined, denial };
+    if (
+      !(await stat(target).then(
+        (entry) => entry.isDirectory(),
+        () => false,
+      ))
+    ) {
+      const readDenial = await assertV2ReadPermission(context, target);
+      if (readDenial) return { scope: undefined, denial: readDenial };
+    }
   }
   return { scope: Array.isArray(scope) ? resolved : resolved[0] };
 }

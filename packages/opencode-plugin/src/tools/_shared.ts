@@ -96,6 +96,8 @@ export {
  * they adopt session-aware calls.
  */
 export interface ToolRuntime {
+  /** Set by the OpenCode 2 adapter; shared OC1 definitions keep their existing policy. */
+  hostVersion?: 2;
   /** Worktree root (preferred); falls back to `directory` when absent. */
   worktree?: string;
   /** Agent's working directory for this tool call. */
