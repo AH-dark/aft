@@ -583,6 +583,9 @@ enum BuilderAttemptTerminal {
 
 fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
     match outcome {
+        JobOutcome::Fresh { payload } if payload["status"] == "pending" => {
+            BuilderAttemptTerminal::Inconclusive
+        }
         JobOutcome::Fresh { payload } if callgraph_unavailable_payload(payload) => {
             BuilderAttemptTerminal::Failed("callgraph_unavailable".to_string())
         }
@@ -1464,7 +1467,11 @@ impl InspectManager {
                 );
                 reason = format!(
                     "{}; progress: {}; {estimate_text}",
-                    entry.detail_at(unix_millis_now()),
+                    if kind == "view_pending" {
+                        reason
+                    } else {
+                        entry.detail_at(unix_millis_now())
+                    },
                     entry.progress
                 );
                 payload["building"] = serde_json::json!({
@@ -1647,6 +1654,27 @@ impl InspectManager {
             return None;
         }
         Some(Arc::new(store))
+    }
+
+    pub(crate) fn checkout_view_unavailability(
+        &self,
+        snapshot: &InspectSnapshot,
+    ) -> CheckoutViewUnavailable {
+        let files = scope_files(
+            &snapshot.project_root,
+            &JobScope::for_project(snapshot.project_root.clone()),
+        );
+        match current_view_projection_result(
+            &snapshot.project_root,
+            &snapshot.inspect_dir,
+            &snapshot.config,
+            &files,
+        ) {
+            Err(reason) => reason,
+            // The reader opened, but the full coverage/freshness proof did not.
+            // Absence of that proof does not establish a source or config change.
+            Ok(_) => CheckoutViewUnavailable::Unverified,
+        }
     }
 
     pub(crate) fn tier2_builder_state_detail_at(
@@ -3775,7 +3803,7 @@ impl InspectManager {
                     }
                     None => {
                         phases.projection_skip_reason = Some(if job.config.views.enabled {
-                            "view_pending"
+                            "view_unavailable"
                         } else {
                             "no_callgraph"
                         })
@@ -3913,7 +3941,7 @@ impl InspectManager {
                         }
                         None => {
                             phases.projection_skip_reason = Some(if job.config.views.enabled {
-                                "view_pending"
+                                "view_unavailable"
                             } else {
                                 "no_callgraph"
                             })
@@ -3999,7 +4027,7 @@ impl InspectManager {
                 }
                 None => {
                     phases.projection_skip_reason = Some(if job.config.views.enabled {
-                        "view_pending"
+                        "view_unavailable"
                     } else {
                         "no_callgraph"
                     })
@@ -4010,6 +4038,30 @@ impl InspectManager {
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
+            if job.config.views.enabled {
+                let reason = current_view_projection_result(
+                    &job.project_root,
+                    &job.inspect_dir,
+                    &job.config,
+                    &callgraph_refresh_files,
+                )
+                .err()
+                .unwrap_or(CheckoutViewUnavailable::Unverified);
+                phases.projection_skip_reason = Some(reason.kind());
+                phases.log(job.category, &job.project_root);
+                // Preserve the last complete aggregate while publication is pending.
+                // Publishing the view requests a fresh pass even without another query.
+                return Ok(InspectScanSuccess {
+                    scanned_files: scan_files,
+                    contributions: Vec::new(),
+                    aggregate: serde_json::json!({
+                        "callgraph_available": false, "complete": false,
+                        "status": if matches!(reason, CheckoutViewUnavailable::Pending | CheckoutViewUnavailable::Busy) { "pending" } else { "unavailable" }, "code": reason.kind(),
+                        "reason": reason.reason(),
+                        "gaps": [{"kind": reason.kind(), "reason": reason.reason()}],
+                    }),
+                });
+            }
             if options.require_callgraph_snapshot {
                 if let Some(reason) = callgraph_path_identity_gap(job) {
                     return Ok(InspectScanSuccess {
@@ -5098,13 +5150,56 @@ fn open_writable_dead_code_store(
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum CheckoutViewUnavailable {
+    Pending,
+    Busy,
+    Unverified,
+    Failed(String),
+}
+
+impl From<String> for CheckoutViewUnavailable {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl CheckoutViewUnavailable {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Pending => "view_pending",
+            Self::Busy => "callgraph_building",
+            Self::Unverified => "view_unverified",
+            Self::Failed(_) => "view_unavailable",
+        }
+    }
+
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Pending => "dead code waits for this checkout's index view to publish; publication schedules a Tier-2 refresh automatically".into(),
+            Self::Busy => "checkout call graph view is temporarily locked; waiting for the published graph reader; retry aft_inspect".into(),
+            Self::Unverified => "checkout call graph view freshness could not be verified; retry aft_inspect after indexing settles".into(),
+            Self::Failed(error) => format!("checkout call graph view could not be read: {error}; retry aft_inspect after indexing recovers"),
+        }
+    }
+}
+
 fn current_view_projection_store(
     project_root: &Path,
     inspect_dir: &Path,
     config: &crate::config::Config,
     refresh_paths: &[PathBuf],
 ) -> Option<(ReadonlyCallGraphStore, String)> {
-    let result = (|| -> Result<Option<(ReadonlyCallGraphStore, String)>, String> {
+    current_view_projection_result(project_root, inspect_dir, config, refresh_paths).ok()
+}
+
+fn current_view_projection_result(
+    project_root: &Path,
+    inspect_dir: &Path,
+    config: &crate::config::Config,
+    refresh_paths: &[PathBuf],
+) -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
+    let result = (|| -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
         let storage = config
             .storage_dir
             .clone()
@@ -5125,7 +5220,7 @@ fn current_view_projection_store(
             note_checkout_view_refusal!(
                 "projection_unpublished: view_dir={view_dir:?} current_generation=None view=absent"
             );
-            return Ok(None);
+            return Err(CheckoutViewUnavailable::Pending);
         };
         let Some(generation) = view.current_generation().map_err(|error| {
             note_checkout_view_refusal!(
@@ -5139,7 +5234,7 @@ fn current_view_projection_store(
                 "projection_unpublished: view_dir={:?} current_generation=None",
                 view.view_dir()
             );
-            return Ok(None);
+            return Err(CheckoutViewUnavailable::Pending);
         };
         let pin =
             crate::pins::QueryPin::acquire(view.view_dir(), &generation).map_err(|error| {
@@ -5151,11 +5246,11 @@ fn current_view_projection_store(
             })?;
         let Some(head_fingerprint) = crate::views::cached_head_fingerprint(project_root) else {
             note_checkout_view_refusal!("projection_head_uncached: root={project_root:?} scope={scope} generation={generation} cached_head=None");
-            return Ok(None);
+            return Err(CheckoutViewUnavailable::Unverified);
         };
         if !crate::views::generation_matches_head(&generation, &head_fingerprint) {
             note_checkout_view_refusal!("projection_head_mismatch: root={project_root:?} generation={generation} cached_head={head_fingerprint}");
-            return Ok(None);
+            return Err(CheckoutViewUnavailable::Pending);
         }
         if !refresh_paths.is_empty() {
             let manifest = view
@@ -5164,7 +5259,7 @@ fn current_view_projection_store(
             if !crate::views::read::callgraph_paths_match(&manifest, project_root, refresh_paths)
                 .map_err(|error| error.to_string())?
             {
-                return Ok(None);
+                return Err(CheckoutViewUnavailable::Pending);
             }
         }
         let family = crate::search_index::artifact_cache_key(project_root);
@@ -5176,27 +5271,31 @@ fn current_view_projection_store(
             let manifest = view
                 .load_manifest(&generation)
                 .map_err(|error| error.to_string())?;
-            let crate::views::read::MainCheckoutGraph::Answer(store, main_generation) =
-                crate::views::read::main_checkout_callgraph(
-                    &storage,
-                    project_root,
-                    &family,
-                    &generation,
-                    &manifest,
-                )
-            else {
-                // Unbuilt, or main's database is locked for now: both are a
-                // pending view the next scan asks about again.
-                note_checkout_view_refusal!(
-                    "projection_not_built: root={project_root:?} generation={generation}"
-                );
-                return Ok(None);
+            let (store, main_generation) = match crate::views::read::main_checkout_callgraph(
+                &storage,
+                project_root,
+                &family,
+                &generation,
+                &manifest,
+            ) {
+                crate::views::read::MainCheckoutGraph::Answer(store, generation) => {
+                    (store, generation)
+                }
+                crate::views::read::MainCheckoutGraph::Busy => {
+                    return Err(CheckoutViewUnavailable::Busy)
+                }
+                crate::views::read::MainCheckoutGraph::Unavailable => {
+                    note_checkout_view_refusal!(
+                        "projection_not_built: root={project_root:?} generation={generation}"
+                    );
+                    return Err(CheckoutViewUnavailable::Pending);
+                }
             };
             crate::slog_debug!(
                 "tier2 view reader uses the main checkout graph root={} generation={generation} main_generation={main_generation}",
                 project_root.display()
             );
-            return Ok(Some((store, generation)));
+            return Ok((store, generation));
         }
         let store = crate::views::read::open_published_callgraph(
             project_root.to_path_buf(),
@@ -5209,19 +5308,16 @@ fn current_view_projection_store(
             note_checkout_view_refusal!("projection_callgraph_open: root={project_root:?} view_dir={:?} generation={generation} error={error}", view.view_dir());
             error.to_string()
         })?;
-        Ok(Some((store, generation)))
+        Ok((store, generation))
     })();
-    match result {
-        Ok(store) => store,
-        Err(error) => {
-            crate::slog_warn!(
-                "tier2 view reader unavailable root={}: {}",
-                project_root.display(),
-                error
-            );
-            None
-        }
+    if let Err(CheckoutViewUnavailable::Failed(error)) = &result {
+        crate::slog_warn!(
+            "tier2 view reader unavailable root={}: {}",
+            project_root.display(),
+            error
+        );
     }
+    result
 }
 
 /// The reader Tier-2 dead-code projection uses for `project_root`'s published
@@ -5240,17 +5336,21 @@ fn build_view_callgraph_snapshot(
     refresh_paths: &[PathBuf],
 ) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
     let started = Instant::now();
-    let Some((store, generation)) = current_view_projection_store(
+    let (store, generation) = match current_view_projection_result(
         &job.project_root,
         &job.inspect_dir,
         &job.config,
         refresh_paths,
-    ) else {
-        crate::slog_info!(
-            "tier2 dead_code: projection=none reason=view_pending root={}",
-            job.project_root.display()
-        );
-        return None;
+    ) {
+        Ok(store) => store,
+        Err(reason) => {
+            crate::slog_info!(
+                "tier2 dead_code: projection=none reason={} root={}",
+                reason.kind(),
+                job.project_root.display()
+            );
+            return None;
+        }
     };
     // View generations are immutable; never share a cache identity with a
     // mutable legacy database or project across a publication boundary.

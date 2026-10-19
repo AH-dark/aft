@@ -812,6 +812,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::inspect::MAX_INSPECT_HEADER_PARTS",
         reason: "the PARTIAL status line previews at most MAX_INSPECT_HEADER_PARTS incomplete parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
     },
+    ExclusionEntry {
+        file: "commands/inspect.rs",
+        enclosing_item: "incomplete_analysis_reason",
+        location_or_primitive: "commands::inspect::MAX_PARSE_FAILURE_FILES",
+        reason: "an incomplete-analysis explanation previews five parse-failure paths and says `+N more`; this is a coverage gap, not a findings page. The full failure count stays visible and scope can narrow the affected files; the preview never changes completeness",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.

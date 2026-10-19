@@ -734,6 +734,11 @@ fn handle_inspect_payload(
     let use_checkout_view = needs_ephemeral_view
         && snapshot.config.views.enabled
         && (checkout_routed || checkout_store.is_some());
+    let checkout_view_unavailability = (needs_ephemeral_view
+        && snapshot.config.views.enabled
+        && !checkout_routed
+        && checkout_store.is_none())
+    .then(|| manager.checkout_view_unavailability(&snapshot));
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -972,7 +977,7 @@ fn handle_inspect_payload(
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
-                    JobOutcome::Stale { .. } => "cached source contributions, file set, or analysis configuration changed; freshness could not be verified".into(),
+                    JobOutcome::Stale { .. } => "cached analysis freshness could not be verified".into(),
                     _ if snapshot.config.views.enabled => "checkout call graph view is not ready; no legacy or borrowed analysis was substituted".into(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
@@ -984,7 +989,20 @@ fn handle_inspect_payload(
                         *category,
                         InspectCategory::DeadCode | InspectCategory::UnusedExports
                     );
-                let mut payload = if callgraph_pending {
+                let mut payload = if let Some(unavailability) = checkout_view_unavailability
+                    .as_ref()
+                    .filter(|_| *category == InspectCategory::DeadCode)
+                {
+                    let mut payload = manager.tier2_incomplete_payload(
+                        &snapshot,
+                        *category,
+                        &scope,
+                        unavailability.kind(),
+                        unavailability.reason(),
+                    );
+                    payload["code"] = serde_json::json!(unavailability.kind());
+                    payload
+                } else if callgraph_pending {
                     let (observation, _) = view_callgraph_observation
                         .as_ref()
                         .expect("pending callgraph observation");
@@ -2258,6 +2276,8 @@ fn compact_inspect_reason(reason: &str) -> String {
         .join(" ")
 }
 
+const MAX_PARSE_FAILURE_FILES: usize = 5;
+
 fn incomplete_analysis_reason(value: &Value) -> String {
     let mut reasons = Vec::new();
     if let Some(files) = value
@@ -2266,7 +2286,21 @@ fn incomplete_analysis_reason(value: &Value) -> String {
         .filter(|files| !files.is_empty())
     {
         let label = if files.len() == 1 { "file" } else { "files" };
-        reasons.push(format!("{} {label} could not be parsed", files.len()));
+        let names = files
+            .iter()
+            .take(MAX_PARSE_FAILURE_FILES)
+            .filter_map(|file| file.get("file").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let mut reason = format!("{} {label} could not be parsed", files.len());
+        if !names.is_empty() {
+            reason.push_str(": ");
+            reason.push_str(&names.join(", "));
+            let remaining = files.len().saturating_sub(names.len());
+            if remaining > 0 {
+                reason.push_str(&format!(", +{remaining} more"));
+            }
+        }
+        reasons.push(reason);
     }
     if let Some(files) = value
         .get("skipped_files")
@@ -5082,6 +5116,19 @@ mod incomplete_reason_tests {
     use super::*;
 
     #[test]
+    fn inspect_view_pending_parse_failure_reason_names_files_and_remaining_count() {
+        let files = (0..10).map(|i| serde_json::json!({"file": format!("Alfonso/File{i}.swift"), "message": "tree-sitter parse contains syntax errors"})).collect::<Vec<_>>();
+        let reason = incomplete_analysis_reason(&serde_json::json!({"parse_errors": files}));
+        assert!(
+            reason.starts_with("10 files could not be parsed: Alfonso/File0.swift"),
+            "{reason}"
+        );
+        assert!(reason.contains("Alfonso/File4.swift"), "{reason}");
+        assert!(reason.ends_with("+5 more"), "{reason}");
+        assert!(!reason.contains("File5.swift"), "{reason}");
+    }
+
+    #[test]
     fn unreadable_file_skips_say_how_many_and_why_in_one_line() {
         let capped = serde_json::json!({
             "complete": false,
@@ -6269,7 +6316,7 @@ mod fresh_payload_tests {
         let response = header_response(&payloads, &Sections::summary_only());
         assert_header(
             &response,
-            "PARTIAL — unused exports incomplete: 1 file could not be parsed; retry aft_inspect.",
+            "PARTIAL — unused exports incomplete: 1 file could not be parsed: a.ts; retry aft_inspect.",
             false,
         );
         assert!(response.data["text"]

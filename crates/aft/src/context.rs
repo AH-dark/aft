@@ -8153,6 +8153,12 @@ impl AppContext {
                 let _ = gate.installed.send(report.generation.clone().unwrap());
             }
         }
+        if report.published && self.config().indexes.callgraph {
+            // A scan can finish before its checkout's graph is published. Retain
+            // pull demand even if that scan is still in flight; the maintenance
+            // scheduler dispatches it once the scan and admission gates settle.
+            let _ = self.request_tier2_refresh_pull();
+        }
         Ok(report)
     }
 
