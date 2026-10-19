@@ -1,1 +1,0 @@
-Checkpoint restore now requests edit permission for every checkpoint file on OpenCode V1/V2, enforcing path-based deny/allow/ask rules before writing; Pi retains its existing per-path project-root isolation without edit prompts.

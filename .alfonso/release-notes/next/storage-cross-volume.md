@@ -1,1 +1,0 @@
-- Storage on several volumes: legacy folder moves, state-file repair and filter-folder repair fall back to copying (or keep the original and say so) when a storage folder sits on another volume, retention retires a cache folder that is itself a mount point by emptying it on its own volume, and the storage migration checks free space on each destination volume.

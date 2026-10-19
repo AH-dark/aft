@@ -1,1 +1,0 @@
-- `read` of a pull request diff (`pr://N/diff` or `pr://N/diff/<path>`) works again; it failed with a `gh` flag error.

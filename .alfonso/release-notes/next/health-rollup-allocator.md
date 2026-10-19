@@ -1,1 +1,0 @@
-- The daemon's background health summary reuses its allocator reading for up to 30 seconds instead of taking a new one every 3 seconds, lowering its idle CPU use.

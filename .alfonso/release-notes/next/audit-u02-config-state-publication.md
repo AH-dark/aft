@@ -1,1 +1,0 @@
-- Config files and saved state are now written through a private temporary file and replaced atomically, and an empty HOME falls back to USERPROFILE when locating the config.

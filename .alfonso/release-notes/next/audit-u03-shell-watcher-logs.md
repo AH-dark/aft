@@ -1,1 +1,0 @@
-- - Shell commands start with a cleaner environment, the file watcher stays responsive under event bursts, wide characters render correctly in terminal sessions, and logs redact secrets more reliably.

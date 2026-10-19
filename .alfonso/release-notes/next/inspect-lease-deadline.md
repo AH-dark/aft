@@ -1,1 +1,0 @@
-- `aft_inspect` no longer waits past its time limit for another process's cache lock: the wait now counts setup time instead of starting over after it.

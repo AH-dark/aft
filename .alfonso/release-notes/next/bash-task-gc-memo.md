@@ -1,1 +1,0 @@
-- Background command cleanup no longer reopens every saved task on each pass: tasks it must keep are remembered and judged again only when their files change.

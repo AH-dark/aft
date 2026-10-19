@@ -1,1 +1,0 @@
-- The daemon log no longer fills with warnings for expected states (long-lived event streams, long bash_watch waits, routine backup cleanup, and semantic indexes waiting for their model); real failures still warn.
