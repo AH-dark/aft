@@ -16,7 +16,7 @@ use super::super::{
 use super::*;
 
 #[test]
-fn u22_poisoned_diagnostic_stage_remains_readable_and_updateable() {
+fn poisoned_diagnostic_stage_remains_readable_and_updateable() {
     let stage = Mutex::new(ProbeStage::CatalogList);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = stage.lock().unwrap();

@@ -7420,7 +7420,7 @@ mod v19_tests;
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn u22_supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
+    fn supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
         let mut command = Command::new("sh");
         command.args(["-c", "printf '123\\n'"]);
         assert_eq!(
@@ -7431,7 +7431,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u22_supplemental_numeric_id_probe_refuses_overflow_instead_of_parsing_a_prefix() {
+    fn supplemental_numeric_id_probe_refuses_overflow_instead_of_parsing_a_prefix() {
         let mut command = Command::new("sh");
         command.args([
             "-c",

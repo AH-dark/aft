@@ -2784,7 +2784,7 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn u22_ruff_availability_does_not_accept_a_probe_after_its_deadline() {
+    fn ruff_availability_does_not_accept_a_probe_after_its_deadline() {
         let mut command = Command::new("sh");
         command.args(["-c", "printf 'ruff 0.1.2\\n'"]);
         assert!(!ruff_version_command_available(command, Instant::now()));
@@ -2792,7 +2792,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u22_ruff_availability_refuses_overflow_instead_of_parsing_a_prefix() {
+    fn ruff_availability_refuses_overflow_instead_of_parsing_a_prefix() {
         let mut command = Command::new("sh");
         command.args([
             "-c",
@@ -2806,7 +2806,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u22_expired_deadline_does_not_join_descendant_held_pipes_after_child_exit() {
+    fn expired_deadline_does_not_join_descendant_held_pipes_after_child_exit() {
         let mut command = Command::new("sh");
         command
             .args(["-c", "sleep 1 & exit 0"])
@@ -2821,7 +2821,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u22_finite_probe_marks_overflow_instead_of_accepting_a_captured_prefix() {
+    fn finite_probe_marks_overflow_instead_of_accepting_a_captured_prefix() {
         let mut command = Command::new("sh");
         command.args(["-c", "printf '123\\n'; head -c 5000 /dev/zero"]);
         let output = capture_probe_command(
@@ -2837,7 +2837,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn u22_probe_cancellation_remains_active_after_child_exit() {
+    fn probe_cancellation_remains_active_after_child_exit() {
         let mut command = Command::new("sh");
         command
             .args(["-c", "sleep 1 & exit 0"])
