@@ -26,13 +26,28 @@ pub const SCHEMA_VERSION: u32 = 4;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
+// Cache writes serialize every entry while holding this cross-process lock.
+// Leave enough time for another AFT process to persist a large cache on a slow disk.
+const SYMBOL_CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SYMBOL_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 static WATCHED_CACHE_WRITE: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static LOCK_ACQUIRE_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_next_lock_acquisition(observer: std::sync::mpsc::Sender<()>) {
+    LOCK_ACQUIRE_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+}
 
 pub struct SymbolCacheLock {
     _guard: Option<fs_lock::LockGuard>,
+    storage_dir: PathBuf,
+    project_key: String,
+    project_root: PathBuf,
 }
 
 impl SymbolCacheLock {
@@ -44,23 +59,51 @@ impl SymbolCacheLock {
         let dir = storage_dir.join("symbols").join(project_key);
         let path = dir.join("symbols.lock");
         let access = crate::root_cache::ArtifactAccess::for_root(project_root);
+        let mut lock = Self {
+            _guard: None,
+            storage_dir: storage_dir.to_path_buf(),
+            project_key: project_key.to_string(),
+            project_root: project_root.to_path_buf(),
+        };
         if !access.allows_write(project_key, &path) {
-            return Ok(Self { _guard: None });
+            return Ok(lock);
         }
         crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
-        fs_lock::try_acquire(&path, Duration::from_secs(2))
-            .map(|guard| Self {
-                _guard: Some(guard),
-            })
-            .map_err(|error| match error {
-                fs_lock::AcquireError::Timeout => {
-                    std::io::Error::other("timed out acquiring symbol cache lock")
-                }
-                fs_lock::AcquireError::Io(error) => error,
-            })
+        #[cfg(test)]
+        LOCK_ACQUIRE_OBSERVER.with(|slot| {
+            if let Some(observer) = slot.borrow_mut().take() {
+                let _ = observer.send(());
+            }
+        });
+        lock._guard = Some(
+            fs_lock::try_acquire(&path, SYMBOL_CACHE_LOCK_TIMEOUT).map_err(
+                |error| match error {
+                    fs_lock::AcquireError::Timeout => {
+                        std::io::Error::other("timed out acquiring symbol cache lock")
+                    }
+                    fs_lock::AcquireError::Io(error) => error,
+                },
+            )?,
+        );
+        Ok(lock)
+    }
+
+    /// Persist under an already acquired disk lock. Shared-cache callers must
+    /// acquire this lock before taking a cache read guard so lock waits cannot
+    /// delay file-watcher invalidations.
+    pub fn write_to_disk(&self, cache: &SymbolCache) -> std::io::Result<()> {
+        if self._guard.is_none() {
+            return Ok(());
+        }
+        if cache.project_root().as_deref() != Some(self.project_root.as_path()) {
+            return Err(std::io::Error::other(
+                "symbol cache root does not match disk lock",
+            ));
+        }
+        write_to_disk_locked(cache, &self.storage_dir, &self.project_key)
     }
 }
 
@@ -154,6 +197,8 @@ pub fn read_from_disk(storage_dir: &Path, project_key: &str) -> Option<DiskSymbo
     }
 }
 
+/// Persist an unshared cache. Callers using a shared cache must acquire
+/// `SymbolCacheLock` before its read guard and use the lock's writer instead.
 pub fn write_to_disk(
     cache: &SymbolCache,
     storage_dir: &Path,
@@ -170,12 +215,29 @@ pub fn write_to_disk(
         return Ok(());
     }
     check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
+    let cache_lock = SymbolCacheLock::acquire(storage_dir, project_key, &project_root)?;
+    cache_lock.write_to_disk(cache)
+}
+
+fn write_to_disk_locked(
+    cache: &SymbolCache,
+    storage_dir: &Path,
+    project_key: &str,
+) -> std::io::Result<()> {
+    let project_root = cache.project_root().ok_or_else(|| {
+        std::io::Error::other("symbol cache project root is not set; cannot persist relative paths")
+    })?;
+    let dir = storage_dir.join("symbols").join(project_key);
+    let data_path = dir.join("symbols.bin");
+    let access = crate::root_cache::ArtifactAccess::for_root(&project_root);
+    if !access.allows_write(project_key, &data_path) {
+        return Ok(());
+    }
+    // Check under the lock: another process running a newer build may have
+    // written an incompatible cache while this writer waited.
+    check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
     #[cfg(test)]
     note_cache_write(&data_path);
-    let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key, &project_root)?;
-    // Checked again under the lock: another process running a newer build may
-    // have written its cache since the check above.
-    check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
     crate::private_storage::open_dir(storage_dir, &dir)?;
     let tmp_path = dir.join(format!(
         "symbols.bin.tmp.{}.{}.{}",
@@ -578,17 +640,59 @@ mod tests {
 
         let cache_a = test_cache(&project, "a");
         let cache_b = test_cache(&project, "b");
+        let held_lock = SymbolCacheLock::acquire(&storage, "unit-project", &project)
+            .expect("hold symbol cache lock while writers start");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
         let storage_a = storage.clone();
+        let start_a = std::sync::Arc::clone(&start);
+        let ready_a = ready_tx.clone();
+        let done_a = done_tx.clone();
         let writer_a = std::thread::spawn(move || {
-            write_to_disk(&cache_a, &storage_a, "unit-project").expect("write a");
-        });
-        let storage_b = storage.clone();
-        let writer_b = std::thread::spawn(move || {
-            write_to_disk(&cache_b, &storage_b, "unit-project").expect("write b");
+            start_a.wait();
+            ready_a.send(()).expect("report writer a ready");
+            let result = write_to_disk(&cache_a, &storage_a, "unit-project");
+            done_a.send(("a", result)).expect("report writer a result");
         });
 
-        writer_a.join().expect("writer a");
-        writer_b.join().expect("writer b");
+        let storage_b = storage.clone();
+        let start_b = std::sync::Arc::clone(&start);
+        let ready_b = ready_tx.clone();
+        let done_b = done_tx.clone();
+        let writer_b = std::thread::spawn(move || {
+            start_b.wait();
+            ready_b.send(()).expect("report writer b ready");
+            let result = write_to_disk(&cache_b, &storage_b, "unit-project");
+            done_b.send(("b", result)).expect("report writer b result");
+        });
+
+        start.wait();
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both symbol cache writers should start");
+        }
+        // Keep both writers contending longer than the former two-second wait.
+        std::thread::sleep(Duration::from_millis(2_500));
+        drop(held_lock);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let mut results = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            results.push(
+                done_rx
+                    .recv_timeout(remaining)
+                    .expect("symbol cache writers exceeded the 45-second test deadline"),
+            );
+        }
+        writer_a.join().expect("writer a thread");
+        writer_b.join().expect("writer b thread");
+        for (writer, result) in results {
+            result.unwrap_or_else(|error| panic!("write {writer}: {error}"));
+        }
 
         let loaded = read_from_disk(&storage, "unit-project").expect("load symbol cache");
         assert_eq!(loaded.len(), 1);

@@ -3263,8 +3263,8 @@ mod tests {
             .write()
             .unwrap()
             .set_project_root(temp.path().to_path_buf());
-        crate::symbol_cache_disk::write_to_disk(&cache.read().unwrap(), storage.path(), "layout")
-            .unwrap();
+        let disk_cache = cache.read().unwrap().clone();
+        crate::symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), "layout").unwrap();
         for disk in [true, false] {
             let mut loaded = crate::parser::SymbolCache::new();
             if disk {
