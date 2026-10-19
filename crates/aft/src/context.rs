@@ -17677,7 +17677,12 @@ mod configure_applicability_tests {
         );
         let census = crate::lifecycle_census::collect(&App::default(), &[ctx]);
         let health = serde_json::to_value(census).unwrap();
-        let metrics = &health["lsp"]["applicability_by_root"][root.display().to_string()];
+        // The census keys roots by their normalized form, which on Windows has
+        // no `\\?\` prefix; `fs::canonicalize` above returns the prefixed form.
+        let key = crate::inspect::job::canonicalize_normalized(&root)
+            .display()
+            .to_string();
+        let metrics = &health["lsp"]["applicability_by_root"][key];
         assert_eq!(metrics["full_walks"].as_u64().unwrap() - before, 0);
         assert_eq!(metrics["retained_content_batches"], 50);
         assert_eq!(metrics["hits"], 50);

@@ -791,6 +791,16 @@ struct DeferredViewRefresh {
     pending_epoch: Option<u64>,
 }
 
+/// The deferred-refresh map's key for `root`. Callers name the same checkout
+/// in different spellings: the configured cache root is the raw
+/// `fs::canonicalize` result (a `\\?\C:\...` verbatim path on Windows), while
+/// background Tier-2 jobs carry the normalized form. Both must reach one entry,
+/// or a publication bumps one key while the pending result and its dispatch
+/// live under another, and the owed refresh is never cleared or never fires.
+fn deferred_view_key(root: &Path) -> PathBuf {
+    crate::inspect::job::normalize_path(root)
+}
+
 pub struct InspectManager {
     deferred_view_refreshes: Mutex<HashMap<PathBuf, DeferredViewRefresh>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
@@ -1686,7 +1696,7 @@ impl InspectManager {
         self.deferred_view_refreshes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
+            .get(&deferred_view_key(root))
             .map_or(0, |state| state.publication_epoch)
     }
 
@@ -1694,7 +1704,7 @@ impl InspectManager {
         self.deferred_view_refreshes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(root.to_path_buf())
+            .entry(deferred_view_key(root))
             .or_default()
             .pending_epoch
             .get_or_insert(epoch);
@@ -1705,7 +1715,7 @@ impl InspectManager {
             .deferred_view_refreshes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = states.entry(root.to_path_buf()).or_default();
+        let state = states.entry(deferred_view_key(root)).or_default();
         state.publication_epoch = state.publication_epoch.wrapping_add(1);
         state.pending_epoch.is_some()
     }
@@ -1714,7 +1724,7 @@ impl InspectManager {
         self.deferred_view_refreshes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
+            .get(&deferred_view_key(root))
             .is_some_and(|state| {
                 state
                     .pending_epoch
@@ -1724,7 +1734,7 @@ impl InspectManager {
 
     pub(crate) fn try_deferred_view_refresh_ready(&self, root: &Path) -> Option<bool> {
         let states = self.deferred_view_refreshes.try_lock().ok()?;
-        Some(states.get(root).is_some_and(|state| {
+        Some(states.get(&deferred_view_key(root)).is_some_and(|state| {
             state
                 .pending_epoch
                 .is_some_and(|epoch| epoch != state.publication_epoch)
@@ -1737,7 +1747,7 @@ impl InspectManager {
                 .deferred_view_refreshes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(root)
+                .get_mut(&deferred_view_key(root))
             {
                 state.pending_epoch = None;
             }
@@ -5264,6 +5274,12 @@ impl CheckoutViewUnavailable {
         }
     }
 
+    /// True when the view's graph exists but its database was locked: a
+    /// moment of contention to retry, not a missing or broken graph.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy)
+    }
+
     pub(crate) fn reason(&self) -> String {
         match self {
             Self::Pending => "dead code waits for this checkout's index view to publish; publication schedules a Tier-2 refresh automatically".into(),
@@ -5396,7 +5412,13 @@ fn current_view_projection_result(
         )
         .map_err(|error| {
             note_checkout_view_refusal!("projection_callgraph_open: root={project_root:?} view_dir={:?} generation={generation} error={error}", view.view_dir());
-            error.to_string()
+            // A writer or checkpoint holding the published database locked says
+            // nothing about whether the graph exists; the next read can succeed.
+            if error.is_transient_lock_contention() {
+                CheckoutViewUnavailable::Busy
+            } else {
+                CheckoutViewUnavailable::Failed(error.to_string())
+            }
         })?;
         Ok((store, generation))
     })();

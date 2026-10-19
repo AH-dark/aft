@@ -221,7 +221,9 @@ impl Capture {
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self(DEPENDENCIES.replace(Some(Dependencies {
             id,
-            root: root.into(),
+            // Probed paths are recorded in normalized form (no Windows `\\?\`
+            // prefix), so the in-root test must compare against the same form.
+            root: crate::inspect::job::normalize_path(root),
             paths: HashMap::new(),
             inputs: HashSet::new(),
             input_identities: HashSet::new(),
@@ -361,6 +363,12 @@ impl ApplicabilityCache {
         let mut ready = true;
         let mut active_configurations = 0;
         let mut roots = HashSet::from([root.to_path_buf()]);
+        // Recorded inputs are normalized; watcher paths may arrive in the
+        // Windows verbatim (`\\?\C:\...`) form that `fs::canonicalize` returns.
+        let normalized_paths: Vec<_> = paths
+            .iter()
+            .map(|path| crate::inspect::job::normalize_path(path))
+            .collect();
         let file_states: Vec<_> = if content_only {
             paths.iter().map(|path| PathState::read(path)).collect()
         } else {
@@ -391,7 +399,7 @@ impl ApplicabilityCache {
                         active_configurations += 1;
                         ready &= state.result.is_some() && state.running.is_none();
                     }
-                    input_changed |= paths.iter().any(|path| {
+                    input_changed |= normalized_paths.iter().any(|path| {
                         state.inputs.contains(path)
                             || state
                                 .marker_names

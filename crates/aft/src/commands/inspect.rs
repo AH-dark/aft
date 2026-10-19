@@ -1007,16 +1007,23 @@ fn handle_inspect_payload(
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
-                let callgraph_pending = view_callgraph_observation
+                // A locked call-graph database is contention, not absence: both
+                // the query observation and the view reader's own open can see
+                // the lock, and either one makes the answer "pending, retry".
+                let callgraph_contended = view_callgraph_observation
                     .as_ref()
-                    .is_some_and(|(_, transient_lock_contention)| *transient_lock_contention)
+                    .is_some_and(|(_, transient_lock_contention)| *transient_lock_contention);
+                let callgraph_pending = (callgraph_contended
+                    || checkout_view_unavailability
+                        .as_ref()
+                        .is_some_and(|unavailability| unavailability.is_busy()))
                     && matches!(
                         *category,
                         InspectCategory::DeadCode | InspectCategory::UnusedExports
                     );
                 let mut payload = if let Some(unavailability) = checkout_view_unavailability
                     .as_ref()
-                    .filter(|_| *category == InspectCategory::DeadCode)
+                    .filter(|_| *category == InspectCategory::DeadCode && !callgraph_pending)
                 {
                     let mut payload = manager.tier2_incomplete_payload(
                         &snapshot,
@@ -1028,13 +1035,19 @@ fn handle_inspect_payload(
                     payload["code"] = serde_json::json!(unavailability.kind());
                     payload
                 } else if callgraph_pending {
-                    let (observation, _) = view_callgraph_observation
+                    // The observation may have opened the store after the lock
+                    // cleared; the reader's busy verdict still means building.
+                    let index = view_callgraph_observation
                         .as_ref()
-                        .expect("pending callgraph observation");
+                        .filter(|(_, contended)| *contended)
+                        .map_or_else(
+                            || crate::feature_status::IndexObservation::building().consumer_json(),
+                            |(observation, _)| observation.consumer_json(),
+                        );
                     serde_json::json!({
                         "status": "pending",
                         "code": "callgraph_building",
-                        "index": observation.consumer_json(),
+                        "index": index,
                         "building": { "state": "building" },
                         "reason": "waiting for or projecting the checkout call graph",
                         "complete": false,
