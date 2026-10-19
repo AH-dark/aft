@@ -26,7 +26,7 @@ describe.skipIf(!binary.binaryPath)("aft_safety purge permissions", () => {
         await mkdir(h.path("secrets"), { recursive: true });
         await writeFile(secret, "token=0\n");
         const write = await h.bridge.toolCall(sessionID, "write", {
-          filePath: secret,
+          path: secret,
           content: "token=1\n",
         });
         expect(write.success).not.toBe(false);
@@ -47,7 +47,7 @@ describe.skipIf(!binary.binaryPath)("aft_safety purge permissions", () => {
           expect(names).toEqual(["with-secret"]);
           const undo = await h.bridge.toolCall(sessionID, "safety", {
             op: "undo",
-            filePath: secret,
+            path: secret,
           });
           expect(undo.success).not.toBe(false);
           expect(await Bun.file(secret).text()).toBe("token=0\n");
@@ -56,7 +56,7 @@ describe.skipIf(!binary.binaryPath)("aft_safety purge permissions", () => {
           expect(names).toEqual([]);
           const undo = await h.bridge.toolCall(sessionID, "safety", {
             op: "undo",
-            filePath: secret,
+            path: secret,
           });
           expect(undo.success).toBe(false);
           expect(undo.code).toBe("no_undo_history");

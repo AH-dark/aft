@@ -1,6 +1,6 @@
 {
   "agent_args": {
-    "filePath": "src",
+    "path": "src",
     "op": "purge"
   },
   "project_root": "<PROJECT_ROOT>",

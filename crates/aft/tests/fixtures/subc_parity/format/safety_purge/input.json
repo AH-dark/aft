@@ -15,7 +15,7 @@
   "ctx": {
     "agent_args": {
       "op": "purge",
-      "filePath": "secret.env"
+      "path": "secret.env"
     },
     "project_root": "<PROJECT_ROOT>"
   }
