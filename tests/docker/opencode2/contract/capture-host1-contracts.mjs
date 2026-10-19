@@ -129,9 +129,9 @@ try {
   ];
   const observations = [];
   for (const [index, candidate] of candidates.entries()) {
-    const before = await readMockRequests(mock.requestsPath);
+    const before = await readMockRequests(mock);
     const result = await probeCandidate(candidate, index, root, executable);
-    const after = await readMockRequests(mock.requestsPath);
+    const after = await readMockRequests(mock);
     observations.push({
       ...result,
       mock_requests: after.length - before.length,
@@ -319,7 +319,7 @@ async function startAimock(prefix, base) {
   const requestsPath = join(base, "aimock-requests.json");
   await writeFile(script, `
     import { createRequire } from "node:module";
-    import { writeFile } from "node:fs/promises";
+    import { rename, writeFile } from "node:fs/promises";
     const require = createRequire(import.meta.url);
     const { LLMock } = require(process.env.AIMOCK_PACKAGE);
     const mock = new LLMock({ port: 0 });
@@ -327,14 +327,26 @@ async function startAimock(prefix, base) {
     mock.on({ predicate: () => true }, { content: "Scenario complete" });
     await mock.start();
     await writeFile(process.env.AIMOCK_READY, mock.url);
-    const save = () => writeFile(process.env.AIMOCK_REQUESTS, JSON.stringify(mock.getRequests()));
-    const timer = setInterval(() => { void save(); }, 100);
+    // Snapshots are written on request (SIGUSR2), numbered, and renamed into
+    // place, so the capture never reads a stale or half-written request list.
+    let seq = 0;
+    let writing = Promise.resolve();
+    const save = () => {
+      writing = writing.then(async () => {
+        seq += 1;
+        const temporary = process.env.AIMOCK_REQUESTS + ".tmp";
+        await writeFile(temporary, JSON.stringify({ seq, requests: mock.getRequests() }));
+        await rename(temporary, process.env.AIMOCK_REQUESTS);
+      });
+      return writing;
+    };
+    await save();
     const stop = async () => {
-      clearInterval(timer);
       await save();
       await mock.stop();
       process.exit(0);
     };
+    process.on("SIGUSR2", () => { void save(); });
     process.on("SIGTERM", () => { void stop(); });
     process.on("SIGINT", () => { void stop(); });
   `);
@@ -356,6 +368,7 @@ async function startAimock(prefix, base) {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     try {
       const url = (await readFile(readyPath, "utf8")).trim();
+      await readSnapshot(requestsPath);
       return { process: child, url, requestsPath };
     } catch {
       if (child.exitCode !== null) throw new Error(`aimock exited before listening: ${output}`);
@@ -366,11 +379,28 @@ async function startAimock(prefix, base) {
   throw new Error(`aimock did not listen within 10 seconds: ${output}`);
 }
 
-async function readMockRequests(path) {
-  try {
-    const values = JSON.parse(await readFile(path, "utf8"));
-    if (!Array.isArray(values)) return [];
-    return values.map((entry) => {
+async function readSnapshot(path) {
+  const snapshot = JSON.parse(await readFile(path, "utf8"));
+  if (!Number.isInteger(snapshot?.seq) || !Array.isArray(snapshot?.requests)) {
+    throw new Error(`aimock request snapshot is malformed: ${path}`);
+  }
+  return snapshot;
+}
+
+// Asks the mock for a fresh snapshot and waits until a newer one is in place.
+async function readMockRequests(mock) {
+  const previous = (await readSnapshot(mock.requestsPath)).seq;
+  mock.process.kill("SIGUSR2");
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const snapshot = await readSnapshot(mock.requestsPath);
+    if (snapshot.seq > previous) return requestEntries(snapshot.requests);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error("aimock did not write a fresh request snapshot within 10 seconds");
+}
+
+function requestEntries(values) {
+  return values.map((entry) => {
       const request = entry?.request ?? entry;
       const rawPath = request?.path ?? request?.url ?? request?.pathname ?? entry?.url ?? entry?.path;
       let requestPath;
@@ -382,10 +412,7 @@ async function readMockRequests(path) {
         }
       }
       return { path: requestPath, entry };
-    });
-  } catch {
-    return [];
-  }
+  });
 }
 
 function cleanOutput(output, base) {
