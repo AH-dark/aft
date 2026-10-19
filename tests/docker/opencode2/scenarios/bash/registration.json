@@ -847,7 +847,8 @@
           "method": "POST",
           "path": "/api/session/{{session_id}}/prompt",
           "body": {
-            "text": "Status check: are you still there?"
+            "text": "Status check: are you still there?",
+            "delivery": "steer"
           },
           "expected_status": 0,
           "purpose": "message"

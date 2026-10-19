@@ -44,12 +44,13 @@ function promptEvent(
 ): V2PromptHookEvent {
   return {
     sessionID: "session-v2",
+    delivery: "steer",
     ...extra,
     prompt: { text, ...extra.prompt },
   };
 }
 
-/** Run the hook the way the host does, then let the un-awaited detach send settle. */
+/** The host awaits this hook before durable inbox admission, for queue and steer alike. */
 async function runHook(runtime: V2PromptDetachRuntime, event: V2PromptHookEvent): Promise<void> {
   await Effect.runPromise(createV2PromptDetachHook(runtime)(event));
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -72,6 +73,40 @@ describe("OpenCode 2 prompt hook detaches waits", () => {
     expect(detached).toEqual(["session-v2"]);
     expect(isSyncWatchAborted("session-v2")).toBe(true);
     expect(event.prompt.text).toBe("what is taking so long?");
+  });
+
+  test("queue delivery leaves a wait:true bash and a sync bash_watch running", async () => {
+    const { runtime, detached } = recordingRuntime();
+    const event = promptEvent("tell me when it finishes", { delivery: "queue" });
+
+    await runHook(runtime, event);
+
+    expect(detached).toEqual([]);
+    expect(isSyncWatchAborted("session-v2")).toBe(false);
+    expect(event.prompt.text).toBe("tell me when it finishes");
+  });
+
+  test("steer delivery detaches a wait:true bash and aborts a sync bash_watch", async () => {
+    const { runtime, detached } = recordingRuntime();
+
+    await runHook(runtime, promptEvent("change direction now", { delivery: "steer" }));
+
+    expect(detached).toEqual(["session-v2"]);
+    expect(isSyncWatchAborted("session-v2")).toBe(true);
+  });
+
+  test.each([
+    {},
+    OPT_OUT,
+  ])("&detach in a queued message forces a detach with config %j", async (config) => {
+    const { runtime, detached } = recordingRuntime(config);
+    const event = promptEvent("please &detach now", { delivery: "queue" });
+
+    await runHook(runtime, event);
+
+    expect(detached).toEqual(["session-v2"]);
+    expect(isSyncWatchAborted("session-v2")).toBe(true);
+    expect(event.prompt.text).toBe("please now");
   });
 
   test("with the setting false a plain message leaves the waits alone", async () => {
@@ -116,9 +151,10 @@ describe("OpenCode 2 prompt hook detaches waits", () => {
 });
 
 describe("OpenCode 2 prompt hook treats AFT's own wakes as synthetic", () => {
-  test("an AFT completion wake detaches while the setting is on", async () => {
+  test("an AFT-marked steer prompt detaches while the setting is on", async () => {
     const { runtime, detached } = recordingRuntime();
     const event = promptEvent("[BACKGROUND BASH COMPLETED] bash-1", {
+      delivery: "steer",
       metadata: AFT_WAKE_METADATA,
     });
 

@@ -265,10 +265,11 @@ describe("V2 completion wakes end the session's waits", () => {
     return { host, sends: pushed.sends };
   }
 
-  test("an admitted completion detaches its own session's wait and aborts its sync watch", async () => {
+  test("an AFT completion wake delivered as steer detaches its session's wait and sync watch", async () => {
     __resetSyncWatchAbortForTests();
     const { host, sends } = await deliver({}, "session-wake");
     expect(host.synthetic).toHaveLength(1);
+    expect(host.synthetic[0]?.delivery).toBe("steer");
     expect(sends.filter((send) => send.command === "bash_wait_detach")).toEqual([
       { command: "bash_wait_detach", params: { session_id: "session-wake" } },
     ]);
