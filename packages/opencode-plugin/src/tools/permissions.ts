@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { execFileSync, relativePathEscapesRoot } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
+import { PermissionStepAbort } from "../permissions/v2.js";
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
 import type { PluginContext } from "../types.js";
 import { callBridge, expandTilde, projectRootFor, type ToolRuntime } from "./_shared.js";
@@ -241,6 +242,7 @@ export async function assertV2ReadPermission(
     );
     return undefined;
   } catch (error) {
+    if (error instanceof PermissionStepAbort) throw error;
     const failure = classifyPermissionError(error);
     return failure.kind === "rule_denied" ? permissionRuleDenial("read") : failure.message;
   }

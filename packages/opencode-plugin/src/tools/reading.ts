@@ -19,15 +19,18 @@ import {
   resolvePathArg,
   type ToolRuntime,
 } from "./_shared.js";
+import type { V2DefinitionRuntime } from "./definitions/v2.js";
 import { whenGhReadEnabled } from "./hoisted.js";
 import {
   assertExternalDirectoryPermission,
   assertV2ReadPermission,
+  classifyPermissionError,
   permissionDeniedResponse,
   permissionRuleDenial,
 } from "./permissions.js";
 
 const z = tool.schema;
+const READ_PERMISSION_CONCURRENCY = 8;
 
 /** GitHub discussion targets are fetched by the server, not read from disk. */
 function isGithubPathArg(value: unknown): boolean {
@@ -220,10 +223,13 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             );
           }
           const distinctFiles = new Set(contentFiles as string[]);
+          const unchecked = [...distinctFiles].filter((file) => !checkedReads.has(file));
+          const outcomes = await checkReadPaths(context, unchecked, (file, batchContext) =>
+            assertV2ReadPermission(batchContext, file),
+          );
+          for (const [file, denial] of outcomes) checkedReads.set(file, denial);
           let denied = 0;
           for (const file of distinctFiles) {
-            if (!checkedReads.has(file))
-              checkedReads.set(file, await assertV2ReadPermission(context, file));
             const denial = checkedReads.get(file);
             if (!denial) continue;
             if (denial !== permissionRuleDenial("read")) return permissionDeniedResponse(denial);
@@ -371,12 +377,16 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             const resolved = resolvedByInput.get(input);
             return resolved !== undefined && deniedPaths.has(resolved);
           };
-          for (const file of new Set(resolvedTargets)) {
-            const denial = await assertPathReadPermissions(ctx, context, file);
-            if (denial) {
-              if ((context as ToolRuntime).hostVersion !== 2)
-                return permissionDeniedResponse(denial);
-              deniedPaths.set(file, denial);
+          const distinctFiles = [...new Set(resolvedTargets)];
+          if ((context as ToolRuntime).hostVersion === 2) {
+            const outcomes = await checkReadPaths(context, distinctFiles, (file, batchContext) =>
+              assertPathReadPermissions(ctx, batchContext, file),
+            );
+            for (const [file, denial] of outcomes) if (denial) deniedPaths.set(file, denial);
+          } else {
+            for (const file of distinctFiles) {
+              const denial = await assertPathReadPermissions(ctx, context, file);
+              if (denial) return permissionDeniedResponse(denial);
             }
           }
 
@@ -481,6 +491,58 @@ export function formatZoomBatchResult(
     }
   }
   return { complete, symbols: entries, text: sections.join("\n\n") };
+}
+
+/** Bound host traffic without letting completion order change per-file outcomes. */
+async function checkReadPaths(
+  context: ToolContext,
+  files: string[],
+  check: (file: string, context: ToolContext) => Promise<string | undefined>,
+): Promise<Map<string, string | undefined>> {
+  const controller = new AbortController();
+  const ask = context.ask as V2DefinitionRuntime["ask"];
+  const batchContext: ToolContext = {
+    ...context,
+    ask: (request) => {
+      context.abort.throwIfAborted();
+      controller.signal.throwIfAborted();
+      return ask(request, controller.signal).catch((error) => {
+        if (classifyPermissionError(error).kind !== "rule_denied") controller.abort(error);
+        throw error;
+      });
+    },
+  };
+  const results: Array<string | undefined> = [];
+  let next = 0;
+  const worker = async () => {
+    try {
+      for (;;) {
+        context.abort.throwIfAborted();
+        controller.signal.throwIfAborted();
+        const index = next++;
+        const file = files[index];
+        if (file === undefined) return;
+        results[index] = await check(file, batchContext);
+        controller.signal.throwIfAborted();
+      }
+    } catch (error) {
+      controller.abort(error);
+      throw error;
+    }
+  };
+  const workers = Array.from(
+    { length: Math.min(READ_PERMISSION_CONCURRENCY, files.length) },
+    worker,
+  );
+  try {
+    await Promise.all(workers);
+  } catch {
+    // Rule denials remain per-file outcomes. A user rejection instead stops
+    // new asks and interrupts siblings before this tool reports one failure.
+    await Promise.allSettled(workers);
+    throw controller.signal.reason;
+  }
+  return new Map(files.map((file, index) => [file, results[index]]));
 }
 
 async function permissionKindForPath(resolvedPath: string): Promise<"file" | "directory"> {

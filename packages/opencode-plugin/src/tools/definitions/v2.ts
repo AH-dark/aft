@@ -59,7 +59,8 @@ export interface V2DefinitionRuntime extends V2ExecutionContext {
   worktree: string;
   abort: AbortSignal;
   metadata(update: Record<string, unknown>): void;
-  ask(request: V2PermissionRequest): Promise<void>;
+  /** A child signal can interrupt sibling batch assertions without aborting the whole tool. */
+  ask(request: V2PermissionRequest, permissionSignal?: AbortSignal): Promise<void>;
 }
 
 export interface V2BashExecution {
@@ -341,10 +342,17 @@ function runtimeFor(
         ),
       );
     },
-    ask: (asked) => {
+    ask: (asked, permissionSignal) => {
       const request = v2PermissionRequest(name, asked);
       if (consumers.requestPermission) {
-        return consumers.requestPermission(request, context, signal).catch((error) => {
+        if (permissionSignal?.aborted) return Promise.reject(permissionSignal.reason);
+        const requestSignal = permissionSignal
+          ? AbortSignal.any([signal, permissionSignal])
+          : signal;
+        return consumers.requestPermission(request, context, requestSignal).catch((error) => {
+          // A sibling's rejection cancels this assertion; preserve that rejection
+          // instead of turning the resulting interruption into a second step abort.
+          if (permissionSignal?.aborted) throw permissionSignal.reason;
           if (error instanceof PermissionStepAbort) onStepAbort(error.original);
           throw error;
         });
@@ -405,7 +413,7 @@ export function projectV2Tool(
               consumers.registerSession?.(context.sessionID);
             }
             const runtime = runtimeFor(name, location, context, signal, consumers, (error) => {
-              stepAbort = { error };
+              stepAbort ??= { error };
             });
             const input = executionArguments(name, rawInput);
             const result =
