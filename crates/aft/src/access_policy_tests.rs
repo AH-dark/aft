@@ -1100,6 +1100,68 @@ fn scratch_read_opened_handle_cannot_escape_after_authorization() {
     assert!(crate::task_temp_reads::open(&file).is_err());
 }
 
+fn assert_scratch_read_unregistered_path(path: &Path, project_root: &Path) {
+    let config = Config {
+        project_root: Some(project_root.to_path_buf()),
+        restrict_to_project_root: false,
+        ..Config::default()
+    };
+    let ctx = AppContext::new(Box::new(StubProvider), config);
+    let validated = ctx
+        .validate_read_path("policy-test", "policy-session", path)
+        .unwrap();
+    assert_eq!(validated, path);
+    let expected = b"unregistered scratch\n";
+    assert_eq!(crate::bounded_io::read(&validated, None).unwrap(), expected);
+    assert_eq!(crate::project_content::read(&validated).unwrap(), expected);
+    let mut file = crate::task_temp_reads::open(&validated).unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+    let response =
+        crate::commands::read::handle_read(&request("read", json!({"file": path})), &ctx);
+    assert!(response.success, "{:?}", response.data);
+}
+
+#[test]
+fn scratch_read_relative_unregistered_path_succeeds() {
+    let cwd = std::env::current_dir().unwrap();
+    let directory = tempfile::tempdir_in(&cwd).unwrap();
+    let scratch = directory.path().join(".sandbox-tmp-unregistered");
+    std::fs::create_dir(&scratch).unwrap();
+    let file = scratch.join("a.txt");
+    std::fs::write(&file, "unregistered scratch\n").unwrap();
+    assert_scratch_read_unregistered_path(file.strip_prefix(&cwd).unwrap(), directory.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn scratch_read_relative_symlinked_prefix_succeeds() {
+    let cwd = std::env::current_dir().unwrap();
+    let directory = tempfile::tempdir_in(&cwd).unwrap();
+    let real = directory.path().join("real");
+    let scratch = real.join(".sandbox-tmp-unregistered");
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::write(scratch.join("a.txt"), "unregistered scratch\n").unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let file = alias.join(".sandbox-tmp-unregistered/a.txt");
+    assert_scratch_read_unregistered_path(file.strip_prefix(&cwd).unwrap(), directory.path());
+    assert_scratch_read_unregistered_path(&file, directory.path());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn scratch_read_var_alias_prefix_succeeds() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    assert_ne!(directory.path(), directory.path().canonicalize().unwrap());
+    let scratch = directory.path().join(".sandbox-tmp-unregistered");
+    std::fs::create_dir(&scratch).unwrap();
+    let file = scratch.join("a.txt");
+    std::fs::write(&file, "unregistered scratch\n").unwrap();
+    assert_scratch_read_unregistered_path(&file, directory.path());
+}
+
 #[cfg(unix)]
 #[test]
 fn scratch_read_canonicalizes_alias_before_opening() {
