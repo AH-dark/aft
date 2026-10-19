@@ -164,6 +164,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_windows_probes.py -v
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
@@ -1139,18 +1140,23 @@ jobs:
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
 
-      # Reuse the just-linked library harness before uploading the archive, which
-      # omits its PDB. Keep both subprocess probes serial and out of the shards
-      # so the backtrace assertion has local symbols without a second build.
-      - name: Run the serial TLS probe from the archive build
-        run: cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess
-
-      - name: Run the serial backtrace probe with local PDB
-        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists
-
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.x"
+          # Python's tarfile can stream the zstd archive metadata from 3.14 on.
+          python-version: "3.14"
+
+      # Run the exact archive-built harness while its local PDB still exists.
+      # A package-scoped cargo test changes workspace feature unification and
+      # recompiles it; direct execution preserves both symbols and build reuse.
+      - name: Run the serial TLS probe from the archive build
+        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe tls
+        env:
+          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+
+      - name: Run the serial backtrace probe with local PDB
+        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe backtrace
+        env:
+          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
 
       - name: Prove split Rust test inventory and hash partitions are exact
         run: python scripts/rust-test-inventory-proof.py

@@ -241,17 +241,19 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         build = next(i for i, command in enumerate(commands) if command.startswith("cargo nextest archive "))
         proof = commands.index("python scripts/rust-test-inventory-proof.py")
 
-        for probe in (
-            "platform_verifier_tls_client_subprocess",
-            "panic_hook_preserves_default_backtrace_behavior_and_persists",
-        ):
-            command = f"cargo test -p agent-file-tools --lib {probe}"
+        for probe in ("tls", "backtrace"):
+            command = f'python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe {probe}'
             self.assertEqual(commands.count(command), 1, f"archive must run {probe} exactly once")
             self.assertLess(build, commands.index(command))
             self.assertLess(commands.index(command), proof)
             for job_id in suite["jobs"]:
                 if job_id.startswith("unit-windows-") and job_id != "unit-windows-nextest-archive":
-                    self.assertNotIn(probe, workflow_job(job_id))
+                    self.assertNotIn("ci-windows-probes.py", workflow_job(job_id))
+        self.assertFalse(any(command.startswith("cargo test ") for command in commands))
+        python = next(i for i, step in enumerate(archive["steps"]) if step.get("uses") == "actions/setup-python@v6")
+        tls = next(i for i, step in enumerate(archive["steps"]) if "--probe tls" in step.get("run", ""))
+        self.assertEqual(archive["steps"][python]["with"]["python-version"], "3.14")
+        self.assertLess(python, tls)
 
     def test_windows_libtest_shards_select_only_archive_partitions(self) -> None:
         root = Path(__file__).resolve().parents[2]
