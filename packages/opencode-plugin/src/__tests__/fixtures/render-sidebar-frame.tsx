@@ -38,6 +38,14 @@ const setup = await testRender(
   ),
   { width, height: 80 },
 );
-await setup.renderOnce();
-process.stdout.write(setup.captureCharFrame());
-setup.renderer.destroy();
+try {
+  // This opt-in delay simulates a slow renderer before its first frame.
+  const renderDelayMs = Number(process.env.AFT_SIDEBAR_TEST_RENDER_DELAY_MS ?? "0");
+  if (renderDelayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, renderDelayMs));
+  }
+  await setup.renderOnce();
+  process.stdout.write(setup.captureCharFrame());
+} finally {
+  setup.renderer.destroy();
+}

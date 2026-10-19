@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 
 /**
@@ -36,8 +36,14 @@ function snapshot(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function renderFrame(status: unknown): string[] {
-  const result = spawnSync(
+const RENDER_PROCESS_TIMEOUT_MS = 30_000;
+const TEST_TIMEOUT_MS = 45_000;
+
+async function renderFrame(
+  status: unknown,
+  extraEnv: Record<string, string> = {},
+): Promise<string[]> {
+  const child = spawn(
     process.execPath,
     [
       "--preload",
@@ -46,44 +52,122 @@ function renderFrame(status: unknown): string[] {
     ],
     {
       cwd: join(__dirname, "..", ".."),
-      encoding: "utf8",
       env: {
         ...process.env,
         AFT_SIDEBAR_SNAPSHOT: JSON.stringify(status),
         AFT_SIDEBAR_WIDTH: String(SIDEBAR_WIDTH),
+        ...extraEnv,
       },
-      timeout: 60_000,
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
-  if (result.status !== 0) throw new Error(`sidebar render failed: ${result.stderr}`);
-  return result.stdout.split("\n").map((line) => line.trimEnd());
+  let stdout = "";
+  let stderr = "";
+  // Decode as a stream so a multi-byte character split across pipe chunks
+  // (the frame contains "⚠" and "—") is never garbled.
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr?.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      complete();
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(() =>
+        reject(
+          new Error(
+            `sidebar render child timed out after ${RENDER_PROCESS_TIMEOUT_MS}ms waiting for the OpenTUI render fixture to exit; stderr: ${stderr.trim() || "(empty)"}; stdout: ${stdout.trim() || "(empty)"}`,
+          ),
+        ),
+      );
+    }, RENDER_PROCESS_TIMEOUT_MS);
+
+    child.once("error", (error) => {
+      finish(() =>
+        reject(
+          new Error(
+            `sidebar render child failed to start: ${error.message}; stderr: ${stderr.trim() || "(empty)"}; stdout: ${stdout.trim() || "(empty)"}`,
+          ),
+        ),
+      );
+    });
+    child.once("close", (code, signal) => {
+      finish(() => {
+        if (code !== 0) {
+          reject(
+            new Error(
+              `sidebar render child exited with code ${code ?? "null"}${signal ? ` and signal ${signal}` : ""}; stderr: ${stderr.trim() || "(empty)"}; stdout: ${stdout.trim() || "(empty)"}`,
+            ),
+          );
+          return;
+        }
+        resolve(stdout.split("\n").map((line) => line.trimEnd()));
+      });
+    });
+  });
 }
 
 describe("the sidebar at its real width", () => {
-  test("a long status value wraps under the value column and never overwrites its label", () => {
-    const frame = renderFrame(snapshot());
-    const semantic = frame.findIndex((line) => line.trim() === "Semantic Index");
-    expect(semantic).toBeGreaterThan(-1);
-    const status = frame[semantic + 1] ?? "";
-    expect(status).toMatch(/^ Status unavailable — ONNX Runtime/);
-    // The continuation lines start in the value column, under "unavailable".
-    const valueColumn = status.indexOf("unavailable");
-    const continuation = frame[semantic + 2] ?? "";
-    expect(continuation.search(/\S/)).toBe(valueColumn);
-    expect(frame.slice(semantic + 1, semantic + 4).join(" ")).toContain("doctor --fix");
-    for (const line of frame) expect(line.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
-  });
+  test(
+    "a long status value wraps under the value column and never overwrites its label",
+    async () => {
+      const frame = await renderFrame(snapshot());
+      const semantic = frame.findIndex((line) => line.trim() === "Semantic Index");
+      expect(semantic).toBeGreaterThan(-1);
+      const status = frame[semantic + 1] ?? "";
+      expect(status).toMatch(/^ Status unavailable — ONNX Runtime/);
+      // The continuation lines start in the value column, under "unavailable".
+      const valueColumn = status.indexOf("unavailable");
+      const continuation = frame[semantic + 2] ?? "";
+      expect(continuation.search(/\S/)).toBe(valueColumn);
+      expect(frame.slice(semantic + 1, semantic + 4).join(" ")).toContain("doctor --fix");
+      for (const line of frame) expect(line.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  test("missing developer tools read as git features off, not DEGRADED, and keep the explanation", () => {
-    const frame = renderFrame(snapshot());
-    expect(frame[1]).toContain("AFT");
-    expect(frame[1]).toContain("⚠ git features off");
-    expect(frame.join("\n")).not.toContain("DEGRADED");
-    expect(frame.join(" ")).toContain("xcode-select --install");
-  });
+  test(
+    "missing developer tools read as git features off, not DEGRADED, and keep the explanation",
+    async () => {
+      const frame = await renderFrame(snapshot());
+      expect(frame[1]).toContain("AFT");
+      expect(frame[1]).toContain("⚠ git features off");
+      expect(frame.join("\n")).not.toContain("DEGRADED");
+      expect(frame.join(" ")).toContain("xcode-select --install");
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  test("a real degradation still carries the DEGRADED badge", () => {
-    const frame = renderFrame(snapshot({ degraded_reasons: ["home_root"] }));
-    expect(frame[1]).toContain("DEGRADED");
-  });
+  test(
+    "a real degradation still carries the DEGRADED badge",
+    async () => {
+      const frame = await renderFrame(snapshot({ degraded_reasons: ["home_root"] }));
+      expect(frame[1]).toContain("DEGRADED");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "a render slower than the default 5 s test limit still yields the complete frame",
+    async () => {
+      // The child waits 6 s before its first frame, longer than Bun's default
+      // per-test limit, so this proves the helper waits for the child to exit
+      // and returns the whole frame rather than an early or empty read.
+      const frame = await renderFrame(snapshot(), { AFT_SIDEBAR_TEST_RENDER_DELAY_MS: "6000" });
+      expect(frame[1]).toContain("AFT");
+      expect(frame.findIndex((line) => line.trim() === "Semantic Index")).toBeGreaterThan(-1);
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
