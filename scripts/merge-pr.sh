@@ -182,27 +182,46 @@ submit_merge() {
 # then overlays the results GitHub has reported for this head. A configured
 # context without a result is still a pending check, not an absent requirement.
 read_required_checks() {
-  local protection_output rules_output output exit_code=0 name bucket context existing found i name_index
+  local protection_output rules_output output protection_error rules_error
+  local exit_code=0 name bucket context existing found i name_index classic_not_found=false
   local required_count=0 reported_count=0
   local -a required_contexts=() reported_names=()
   REQUIRED_PENDING=()
   REQUIRED_PROBLEM=""
 
   if protection_output=$("$OPERATOR_GH" api "repos/$OWNER_REPO/branches/$BASE_BRANCH/protection/required_status_checks" \
-      --jq 'if type != "object" then error("expected required-status-checks object") elif .checks? != null and (.checks | type) != "array" then error("malformed required checks") elif .contexts? != null and (.contexts | type) != "array" then error("malformed required contexts") elif ((.checks // []) | length) > 0 then .checks[] | if (.context | type) == "string" and .context != "" then .context else error("malformed required-check context") end elif ((.contexts // []) | length) > 0 then .contexts[] | if type == "string" and . != "" then . else error("malformed required context") end else empty end'); then
+      --jq 'if type != "object" then error("expected required-status-checks object") elif .checks? != null and (.checks | type) != "array" then error("malformed required checks") elif .contexts? != null and (.contexts | type) != "array" then error("malformed required contexts") elif ((.checks // []) | length) > 0 then .checks[] | if (.context | type) == "string" and .context != "" then .context else error("malformed required-check context") end elif ((.contexts // []) | length) > 0 then .contexts[] | if type == "string" and . != "" then . else error("malformed required context") end else empty end' 2>&1); then
     :
   else
-    REQUIRED_PROBLEM="could not read branch-protection required checks for base branch '$BASE_BRANCH' on PR #$PR"
-    return 0
+    protection_error=$protection_output
+    if [[ "$protection_error" =~ HTTP[[:space:]]+404|404[[:space:]]+Not[[:space:]]+Found ]]; then
+      # GitHub returns 404 when classic branch protection is not configured.
+      # The effective-rules endpoint below still determines whether checks apply.
+      classic_not_found=true
+      protection_output=""
+    elif [[ "$protection_error" == *malformed* || "$protection_error" == *"expected required-status-checks object"* ]]; then
+      REQUIRED_PROBLEM="malformed branch-protection required checks for base branch '$BASE_BRANCH' on PR #$PR"
+      return 0
+    else
+      REQUIRED_PROBLEM="could not read branch-protection required checks for base branch '$BASE_BRANCH' on PR #$PR"
+      return 0
+    fi
   fi
 
   # This endpoint returns the active rules that apply to the named branch,
   # including repository rulesets and inherited rulesets.
   if rules_output=$("$OPERATOR_GH" api "repos/$OWNER_REPO/rules/branches/$BASE_BRANCH" \
-      --jq 'if type != "array" then error("expected effective branch-rules list") else .[] | select(.type == "required_status_checks") | if (.parameters.required_status_checks | type) != "array" then error("malformed required-status-check rule") else .parameters.required_status_checks[] | if (.context | type) == "string" and .context != "" then .context else error("malformed ruleset context") end end end'); then
+      --jq 'if type != "array" then error("expected effective branch-rules list") else .[] | select(.type == "required_status_checks") | if (.parameters.required_status_checks | type) != "array" then error("malformed required-status-check rule") else .parameters.required_status_checks[] | if (.context | type) == "string" and .context != "" then .context else error("malformed ruleset context") end end end' 2>&1); then
     :
   else
-    REQUIRED_PROBLEM="could not read effective ruleset checks for base branch '$BASE_BRANCH' on PR #$PR"
+    rules_error=$rules_output
+    if [[ "$rules_error" == *malformed* || "$rules_error" == *"expected effective branch-rules list"* ]]; then
+      REQUIRED_PROBLEM="malformed effective ruleset checks for base branch '$BASE_BRANCH' on PR #$PR"
+    elif [[ "$classic_not_found" == true ]]; then
+      REQUIRED_PROBLEM="could not read effective ruleset checks for base branch '$BASE_BRANCH' on PR #$PR (classic branch protection returned 404)"
+    else
+      REQUIRED_PROBLEM="could not read effective ruleset checks for base branch '$BASE_BRANCH' on PR #$PR"
+    fi
     return 0
   fi
 

@@ -141,7 +141,7 @@ fn collect(
         }
     };
     let metrics = match File::open(log)
-        .and_then(|file| parse_log_tail(file, args.since_ms, byte_cap, line_cap))
+        .and_then(|file| parse_log_tail(file, args.since_ms, until_ms, byte_cap, line_cap))
     {
         Ok(value) => value,
         Err(error) => {
@@ -229,6 +229,7 @@ struct ToolSamples {
 fn parse_log_tail(
     mut file: File,
     since_ms: u64,
+    until_ms: u64,
     byte_cap: u64,
     line_cap: usize,
 ) -> io::Result<Value> {
@@ -249,7 +250,7 @@ fn parse_log_tail(
         let mut partial = Vec::new();
         input.read_until(b'\n', &mut partial)?;
     }
-    parse_log(input, since_ms, byte_cap, line_cap)
+    parse_log(input, since_ms, until_ms, byte_cap, line_cap)
 }
 
 fn log_timestamp(line: &str) -> Option<&str> {
@@ -267,11 +268,18 @@ fn log_timestamp(line: &str) -> Option<&str> {
     Some(timestamp)
 }
 
-fn parse_log(input: impl Read, since_ms: u64, byte_cap: u64, line_cap: usize) -> io::Result<Value> {
+fn parse_log(
+    input: impl Read,
+    since_ms: u64,
+    until_ms: u64,
+    byte_cap: u64,
+    line_cap: usize,
+) -> io::Result<Value> {
     // Take bounds even a single unterminated line before read_until can allocate it.
     // The extra byte distinguishes an exact fit from a truncated prefix.
     let mut input = BufReader::new(input.take(byte_cap.saturating_add(1)));
     let since = iso_seconds(since_ms);
+    let until = iso_seconds(until_ms);
     let fields = Regex::new(
         r"\b(total|queue|exec|cache_key_resolve|worktree_probe|elapsed_ms|derived_ms)=(\d+)",
     )
@@ -324,7 +332,8 @@ fn parse_log(input: impl Read, since_ms: u64, byte_cap: u64, line_cap: usize) ->
                 }
             }
         }
-        if line.chars().take(19).collect::<String>() < since {
+        let line_timestamp = line.chars().take(19).collect::<String>();
+        if line_timestamp < since || line_timestamp >= until {
             continue;
         }
         lines += 1;

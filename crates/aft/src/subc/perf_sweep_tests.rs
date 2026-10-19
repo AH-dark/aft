@@ -131,6 +131,7 @@ fn perf_sweep_log_caps_stop_the_iterator_and_report_truncation() {
             read: &bytes,
         },
         0,
+        u64::MAX,
         128,
         LOG_LINES,
     )
@@ -150,6 +151,7 @@ fn perf_sweep_log_caps_stop_the_iterator_and_report_truncation() {
             read: &bytes,
         },
         0,
+        u64::MAX,
         LOG_BYTES,
         2,
     )
@@ -163,10 +165,48 @@ fn perf_sweep_log_caps_stop_the_iterator_and_report_truncation() {
     );
     let exact = "2025-01-01T00:00:01 WARN one\n";
     assert_eq!(
-        parse_log(exact.as_bytes(), SINCE + 1_000, exact.len() as u64, 1).unwrap()["truncated"],
+        parse_log(
+            exact.as_bytes(),
+            SINCE + 1_000,
+            u64::MAX,
+            exact.len() as u64,
+            1
+        )
+        .unwrap()["truncated"],
         false
     );
 }
+
+#[test]
+fn perf_sweep_log_windows_are_half_open_and_consecutive_windows_cover_each_entry_once() {
+    let log = concat!(
+        "2025-01-01T00:00:00.000Z [aft] WARN slow tool_call name=window total=10ms queue=1ms exec=9ms\n",
+        "2025-01-01T00:00:01.000Z [aft] WARN slow tool_call name=window total=20ms queue=2ms exec=18ms\n",
+        "2025-01-01T00:00:02.000Z [aft] WARN slow tool_call name=window total=30ms queue=3ms exec=27ms\n",
+        "2025-01-01T00:00:03.000Z [aft] WARN slow tool_call name=window total=40ms queue=4ms exec=36ms\n",
+        "2025-01-01T00:00:04.000Z [aft] WARN slow tool_call name=window total=50ms queue=5ms exec=45ms\n",
+    );
+    let first = parse_log(log.as_bytes(), SINCE, SINCE + 2_000, LOG_BYTES, LOG_LINES).unwrap();
+    let second = parse_log(
+        log.as_bytes(),
+        SINCE + 2_000,
+        SINCE + 4_000,
+        LOG_BYTES,
+        LOG_LINES,
+    )
+    .unwrap();
+
+    assert_eq!(first["stats"]["slow_total"]["n"], 2);
+    assert_eq!(first["stats"]["slow_total"]["max"], 20);
+    assert_eq!(second["stats"]["slow_total"]["n"], 2);
+    assert_eq!(second["stats"]["slow_total"]["max"], 40);
+    assert_eq!(
+        first["stats"]["slow_total"]["n"].as_u64().unwrap()
+            + second["stats"]["slow_total"]["n"].as_u64().unwrap(),
+        4
+    );
+}
+
 #[test]
 fn perf_sweep_reads_recent_entries_from_bounded_log_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -233,7 +273,7 @@ fn perf_sweep_parser_matches_script_python_on_shared_fixture() {
         String::from_utf8_lossy(&output.stderr)
     );
     let expected: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let mut actual = parse_log(FIXTURE.as_bytes(), SINCE, LOG_BYTES, LOG_LINES).unwrap();
+    let mut actual = parse_log(FIXTURE.as_bytes(), SINCE, u64::MAX, LOG_BYTES, LOG_LINES).unwrap();
     for key in [
         "scanned_lines",
         "scanned_bytes",
