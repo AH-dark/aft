@@ -8,6 +8,7 @@ use serde_json::Value;
 pub(super) struct RollbackOutcome {
     restored: bool,
     deleted: HashSet<PathBuf>,
+    failed_deletions: Vec<PathBuf>,
     errors: Vec<String>,
 }
 
@@ -17,11 +18,13 @@ impl RollbackOutcome {
             Ok(()) => Self {
                 restored: true,
                 deleted: HashSet::new(),
+                failed_deletions: Vec::new(),
                 errors: Vec::new(),
             },
             Err(error) => Self {
                 restored: false,
                 deleted: HashSet::new(),
+                failed_deletions: Vec::new(),
                 errors: vec![error],
             },
         }
@@ -32,9 +35,11 @@ impl RollbackOutcome {
             Ok(()) => {
                 self.deleted.insert(path.to_path_buf());
             }
-            Err(error) => self
-                .errors
-                .push(format!("failed to delete {}: {error}", path.display())),
+            Err(error) => {
+                self.failed_deletions.push(path.to_path_buf());
+                self.errors
+                    .push(format!("failed to delete {}: {error}", path.display()));
+            }
         }
     }
 
@@ -53,6 +58,14 @@ impl RollbackOutcome {
         if !self.complete() {
             data["rollback_error"] = self.errors.join("; ").into();
             data["recovery_checkpoint"] = checkpoint.into();
+            if !self.failed_deletions.is_empty() {
+                data["recovery_remove_files"] = self
+                    .failed_deletions
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .into();
+            }
         }
     }
 
@@ -60,9 +73,21 @@ impl RollbackOutcome {
         if self.complete() {
             return message.to_string();
         }
-        format!(
+        let mut message = format!(
             "{message}; rollback incomplete: {}; recovery checkpoint: {checkpoint}",
             self.errors.join("; ")
-        )
+        );
+        // Checkpoints restore pre-existing files but cannot remove a newly
+        // created destination. Name the cleanup still required beside it.
+        if !self.failed_deletions.is_empty() {
+            let paths = self
+                .failed_deletions
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!("; remove created files: {paths}"));
+        }
+        message
     }
 }

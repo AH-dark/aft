@@ -3621,6 +3621,52 @@ mod rollback_tests {
     }
 
     #[test]
+    fn failed_created_destination_is_named_for_manual_removal() {
+        let (dir, file, ctx) = fixture();
+        let created = dir.path().join("created.ts");
+        ctx.backup()
+            .lock()
+            .snapshot_op_tombstone("recovery", "operation", &created, "created file")
+            .unwrap();
+        std::fs::write(&file, "after").unwrap();
+        // A directory at the created destination makes remove_file fail on
+        // every platform, without relying on the test user's permissions.
+        std::fs::create_dir(&created).unwrap();
+        let outcome = rollback_move(
+            &ctx,
+            "recovery",
+            "checkpoint",
+            "operation",
+            std::slice::from_ref(&created),
+        );
+        let response = move_error(
+            "move",
+            "source.ts",
+            std::slice::from_ref(&file),
+            std::slice::from_ref(&created),
+            "write failed",
+            "checkpoint",
+            &outcome,
+        );
+        ctx.checkpoint()
+            .lock()
+            .restore("recovery", "checkpoint")
+            .unwrap();
+        assert!(created.is_dir(), "the checkpoint does not cover new files");
+        assert_eq!(response.data["recovery_checkpoint"], "checkpoint");
+        assert_eq!(
+            response.data["recovery_remove_files"],
+            serde_json::json!([created.display().to_string()])
+        );
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("remove created files:"), "{message}");
+        assert!(
+            message.contains(&created.display().to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn complete_move_rollback_reports_completion_and_discards_backups() {
         let (_dir, file, ctx) = fixture();
         std::fs::write(&file, "after").unwrap();
@@ -3637,6 +3683,7 @@ mod rollback_tests {
         assert_eq!(response.data["rollback_complete"], true);
         assert_eq!(response.data["rolled_back"][0]["action"], "restored");
         assert!(response.data.get("rollback_error").is_none());
+        assert!(response.data.get("recovery_remove_files").is_none());
         assert_eq!(response.data["message"], "write failed");
         assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
         assert!(ctx
