@@ -7804,7 +7804,8 @@ impl SemanticIndex {
         self.shared_base.is_some()
     }
 
-    /// The shared replacement runs a view overlay reads, in order.
+    /// The replacement runs an index built by `for_view` holds by `Arc` from
+    /// the family arena (its `view_runs`), in the order they are searched.
     #[cfg(test)]
     pub(crate) fn view_runs_for_test(&self) -> &[Arc<SemanticVectors>] {
         &self.view_runs
