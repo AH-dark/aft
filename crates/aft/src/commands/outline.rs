@@ -3622,7 +3622,8 @@ mod tests {
             serde_json::json!({"id":"golden", "command":"outline", "files":files}),
         )
         .unwrap();
-        let response = serde_json::to_value(handle_outline(&request, &ctx)).unwrap();
+        let response =
+            canonical_content_files(serde_json::to_value(handle_outline(&request, &ctx)).unwrap());
         assert_eq!(
             response,
             serde_json::json!({"id":"golden","success":true,"text":concat!(
@@ -3654,10 +3655,28 @@ mod tests {
                 "content_files":[path.canonicalize().unwrap()],
                 "text":format!("{}\n{body}", path.file_name().unwrap().to_str().unwrap())});
             assert_eq!(
-                serde_json::to_value(handle_outline(&request, &ctx)).unwrap(),
+                canonical_content_files(
+                    serde_json::to_value(handle_outline(&request, &ctx)).unwrap()
+                ),
                 expected
             );
         }
+    }
+
+    /// `content_files` names the files that were read, in the spelling the
+    /// request resolved them to. On Windows that can be an 8.3 short name or a
+    /// verbatim path, so the golden compares the files' canonical identities.
+    fn canonical_content_files(mut response: serde_json::Value) -> serde_json::Value {
+        if let Some(files) = response
+            .get_mut("content_files")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for file in files {
+                let path = PathBuf::from(file.as_str().expect("content_files holds paths"));
+                *file = serde_json::json!(path.canonicalize().unwrap());
+            }
+        }
+        response
     }
 
     fn planner_fixture() -> (Vec<OutlineDirectoryNode>, Vec<OutlineFileEntry>) {
