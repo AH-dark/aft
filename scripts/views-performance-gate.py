@@ -102,6 +102,30 @@ def graph_witness(answer, callee):
             and all(child.get("resolved") is True for child in children))
 
 
+def lexical_witness(grep, glob, search, path, token):
+    """Require current content from the intended checkout, not a sibling's row.
+
+    Search may be partial because its semantic lane is disabled; this checks only
+    lexical usefulness, never full search coverage.
+    """
+    matches = grep.get("matches", [])
+    return (grep.get("success") is True and grep.get("complete") is True
+            and len(matches) == 1 and Path(matches[0].get("file", "")) == path
+            and token in matches[0].get("line_text", "")
+            and glob.get("success") is True and glob.get("complete") is True and glob.get("total") == 1
+            and [Path(file) for file in glob.get("files", [])] == [path]
+            and search.get("success") is True
+            and any(Path(row.get("file", "")) == path and token in row.get("snippet", "")
+                    for row in search.get("results", [])))
+
+
+def semantic_witness(answer, path, token):
+    return (answer.get("success") is True and answer.get("semantic_status") == "ready"
+            and answer.get("complete") is True
+            and any(Path(row.get("file", "")) == path and token in row.get("snippet", "")
+                    for row in answer.get("results", [])))
+
+
 def checked(args, cwd=None, env=None):
     return subprocess.check_output([str(arg) for arg in args], cwd=cwd, env=env, stderr=subprocess.PIPE).decode().strip()
 
@@ -421,56 +445,46 @@ class Acquisition:
         graph = {}
         while time.monotonic() < deadline:
             attempts += 1
-            completed = {}
+            checks = {}
+
+            def observe(plane, correct):
+                checks[plane] = correct
+                if correct and plane not in planes:
+                    planes[plane] = self.response_completed_s() - since
+
             grep = self.tool(channel, "grep", {"pattern": token, "path": PROBE}, state)
-            completed["grep"] = self.response_completed_s()
             glob = self.tool(channel, "glob", {"pattern": f"**/{PROBE}"}, state)
-            completed["glob"] = self.response_completed_s()
             search = self.tool(channel, "search", {"query": "probe_entry", "pattern": "probe_entry", "includeTests": True}, state)
-            completed["search"] = self.response_completed_s()
-            graph = self.tool(channel, "callgraph", {"path": PROBE, "symbol": "probe_entry", "op": "call_tree", "depth": 2, "includeTests": True}, state)
-            completed["callgraph"] = self.response_completed_s()
-            zoom = self.tool(channel, "zoom", {"path": PROBE, "symbols": "probe_entry", "callgraph": True}, state)
-            completed["zoom"] = self.response_completed_s()
-            inspect = self.tool(channel, "inspect", {"scope": PROBE, "sections": ["todos"]}, state)
-            completed["inspect"] = self.response_completed_s()
-            lexical_completed = max(completed[name] for name in ("grep", "glob", "search"))
-            observed_at = {"lexical_answer": lexical_completed, "lexical_indexed": lexical_completed,
-                           "callgraph": completed["callgraph"], "zoom": completed["zoom"],
-                           "inspect_todos": completed["inspect"]}
-            lexical_correct = (grep.get("success") is True and grep.get("complete") is True
-                               and len(grep.get("matches", [])) == 1 and token in grep["matches"][0]["line_text"]
-                               and glob.get("total") == 1 and glob.get("complete") is True
-                               and any(token in row.get("snippet", "") for row in search.get("results", [])))
+            lexical_correct = lexical_witness(grep, glob, search, self.roots[channel] / PROBE, token)
             lexical_indexed = (lexical_correct and grep.get("index", {}).get("trigram", {}).get("status") == "ready"
+                               and glob.get("index", {}).get("trigram", {}).get("status") == "ready"
+                               and search.get("lanes", {}).get("trigram", {}).get("status") == "ready"
                                and not grep.get("fallback") and not glob.get("fallback"))
-            checks = {
-                "lexical_answer": lexical_correct,
-                "lexical_indexed": lexical_indexed,
-                "callgraph": graph.get("success") is True and graph_witness(graph, callee),
-                "zoom": zoom.get("success") is True and token in zoom.get("content", "")
-                        and [row.get("name") for row in zoom.get("annotations", {}).get("calls_out", [])] == [callee],
-                "inspect_todos": inspect.get("success") is True and inspect.get("complete") is True
-                                 and token in json.dumps(inspect.get("details", {})),
-            }
+            observe("lexical_answer", lexical_correct)
+            observe("lexical_indexed", lexical_indexed)
+            graph = self.tool(channel, "callgraph", {"path": PROBE, "symbol": "probe_entry", "op": "call_tree", "depth": 2, "includeTests": True}, state)
+            observe("callgraph", graph.get("success") is True and graph_witness(graph, callee))
+            zoom = self.tool(channel, "zoom", {"path": PROBE, "symbols": "probe_entry", "callgraph": True}, state)
+            observe("zoom", zoom.get("success") is True and token in zoom.get("content", "")
+                    and [row.get("name") for row in zoom.get("annotations", {}).get("calls_out", [])] == [callee])
+            inspect = self.tool(channel, "inspect", {"scope": PROBE, "sections": ["todos"]}, state)
+            observe("inspect_todos", inspect.get("success") is True and inspect.get("complete") is True
+                    and token in json.dumps(inspect.get("details", {})))
             latest = checks
             if self.semantic:
                 semantic_answer = self.tool(channel, "search", {"query": "function probe returning the number twenty nine", "includeTests": True, "topK": 20}, state)
-                observed_at["semantic"] = self.response_completed_s()
                 semantic_status = semantic_answer.get("semantic_status")
-                checks["semantic"] = (semantic_status == "ready" and semantic_answer.get("complete") is True
-                                      and any(Path(row.get("file", "")).name == PROBE for row in semantic_answer.get("results", [])))
+                observe("semantic", semantic_witness(semantic_answer, self.roots[channel] / PROBE, token))
             else:
                 semantic_status = search.get("semantic_status")
-            for plane, correct in checks.items():
-                if correct and plane not in planes:
-                    planes[plane] = observed_at[plane] - since
             required = ["lexical_answer", "callgraph", "zoom", "inspect_todos"]
-            if self.semantic and require_indexed:
+            if self.semantic:
                 required.append("semantic")
             if require_indexed:
                 required.append("lexical_indexed")
             if all(checks[key] for key in required):
+                if sha(self.roots[channel] / PROBE) != expected_source_sha:
+                    raise MeasurementError(f"workload source changed during witness: {state}")
                 row = {"id": state, "channel": channel, "state_started_s": since,
                        "correct": True, "attempts": attempts,
                        "time_to_correct_s": time.monotonic() - since, "planes_s": planes,
@@ -530,7 +544,7 @@ class Acquisition:
                         temporary.write_text(contents)
                         temporary.replace(root / PROBE)
                     else:
-                        answer = self.tool(channel, "write", {"filePath": PROBE, "content": contents}, state)
+                        answer = self.tool(channel, "write", {"path": PROBE, "content": contents}, state)
                         if answer.get("success") is not True:
                             raise MeasurementError(f"public write failed: {state}")
                     self.witness(channel, state, contents == CHANGED, start)

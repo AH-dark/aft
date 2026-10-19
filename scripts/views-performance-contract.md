@@ -95,12 +95,16 @@ or honest building gaps. Bind ACK and per-plane witness times are recorded per
 root, along with their absolute monotonic origins. Each plane's clock uses the
 completion timestamp of its qualifying public responses, not the end of a batch
 that also waits for unrelated inspect/graph work. The lexical witness requires
-all three grep/glob/search responses, so its timestamp is their maximum. Clocks
+all three grep/glob/search responses, so its timestamp is their maximum. Completed
+plane observations survive a later tool timeout in the same polling attempt. Clocks
 remain polling upper bounds, not proof of when the daemon internally became ready. Root 0's cold/base construction is charged
 once and retained while marginal roots bind, with both base and total cost shown.
 These witnesses do not establish complete repository-wide coverage or independent
-cold parity. Semantic readiness additionally requires a real natural-language
-search with ready coverage and a witness-file row when enabled.
+cold parity. Indexed lexical readiness is required at bind/worktree creation;
+edit states record its time when observed but may succeed using a direct lexical
+answer. Semantic readiness additionally requires a real natural-language search
+with ready coverage and a current-state witness-file snippet on every state when
+enabled.
 
 Every edit/revert, atomic-save, public write, branch switch/return and transient
 worktree create/remove state has an independently enumerated expected ID.
@@ -125,7 +129,7 @@ counter regressions invalidate a comparison.
 | `source_hashes`, `source_hash_bytes` | `cache_freshness::hash_bytes` (search, parser, legacy semantic/graph verification), v1 semantic/callgraph source-key construction, v2 `ContentHash::of`; repeated hashes count repeatedly. Payload and embedding-text checksums are excluded. |
 | `content_reads` | Attempts to read/open admitted content via `project_content::read/open`, and actual bounded-I/O regular-file open attempts. `read_bounded` reaches the bounded hook, not a second hook. Failed open attempts count; files excluded before open do not. |
 | `content_read_bytes` | Successfully buffered bytes returned by `project_content::read` and bounded regular reads. Streaming `open` reads do not supply byte totals. |
-| `full_walks` | Requests for `search_index::project_walk_builder` (including subtree/bounded enumeration) and v1 publication's full Git-tree inventory. Counts initiated enumeration, even if it aborts, not proof a traversal completed. v2 configured membership uses the project builder. |
+| `full_walks` | Requests through `search_index::project_walk_builder` and its shared admission-aware builder (including subtree/bounded enumeration), plus v1 publication's full Git-tree inventory. Counts initiated enumeration, even if it aborts, not proof a traversal completed. v2 configured membership uses the project builder. |
 | `applicability_walks` | Actual uncached applicability discovery, including scoped discovery. Cache hits do not count. |
 | `logical_aggregates` | v1/v2 blob usage `COUNT/SUM(length(payload))` queries, including failed queries, once per actual query; cheap caller invocations that avoid SQL do not count. |
 | `own_generation_folds` | v2 checkout owner's `build_own_generation` after ownership validation, including attempts that subsequently fail. v1 publication is a different path, not mislabeled as a v2 fold. |

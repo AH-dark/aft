@@ -73,8 +73,10 @@ class MeasurementContractTests(unittest.TestCase):
         answers = {
             "grep": {"success": True, "complete": True, "matches": [{"line_text": token}],
                      "index": {"trigram": {"status": "ready"}}},
-            "glob": {"total": 1, "complete": True},
-            "search": {"results": [{"snippet": token}], "semantic_status": "disabled"},
+            "glob": {"success": True, "total": 1, "complete": True,
+                     "index": {"trigram": {"status": "ready"}}},
+            "search": {"success": True, "results": [{"snippet": token}], "semantic_status": "disabled",
+                       "lanes": {"trigram": {"status": "ready"}}},
             "callgraph": {"success": True, "name": "probe_entry",
                           "children": [{"name": "probe_alpha", "resolved": True}]},
             "zoom": {"success": True, "content": gate.BASE,
@@ -86,6 +88,8 @@ class MeasurementContractTests(unittest.TestCase):
 
         class TimedAcquisition(gate.Acquisition):
             def tool(self, _channel, name, _arguments, _state):
+                if name == "inspect" and getattr(self, "fail_inspect", False):
+                    raise gate.MeasurementError("inspect timed out")
                 self.queries.append({"start_s": 0, "wall_s": completed[name]})
                 return answers[name]
 
@@ -95,6 +99,9 @@ class MeasurementContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / gate.PROBE).write_text(gate.BASE)
+            answers["grep"]["matches"][0]["file"] = str(root / gate.PROBE)
+            answers["glob"]["files"] = [str(root / gate.PROBE)]
+            answers["search"]["results"][0]["file"] = str(root / gate.PROBE)
             acquisition = TimedAcquisition(None, root, 30, False, 60)
             acquisition.roots[1] = root
             with patch.object(gate.time, "monotonic", return_value=20):
@@ -102,6 +109,47 @@ class MeasurementContractTests(unittest.TestCase):
             self.assertEqual(row["planes_s"]["lexical_indexed"], 0.3)
             self.assertEqual(row["planes_s"]["callgraph"], 3)
             self.assertEqual(row["planes_s"]["inspect_todos"], 20)
+            acquisition.fail_inspect = True
+            with patch.object(gate.time, "monotonic", return_value=20):
+                with self.assertRaisesRegex(gate.MeasurementError, "inspect timed out"):
+                    acquisition.witness(1, "edit", False, 0)
+                acquisition.record_failed_state("inspect timed out")
+            partial = acquisition.witnesses[-1]
+            self.assertFalse(partial["correct"])
+            self.assertEqual(partial["planes_s"]["lexical_indexed"], 0.3)
+            self.assertEqual(partial["planes_s"]["callgraph"], 3)
+            self.assertNotIn("inspect_todos", partial["planes_s"])
+
+    def test_lexical_witness_rejects_sibling_rows(self):
+        path = Path("/intended") / gate.PROBE
+        sibling = str(Path("/sibling") / gate.PROBE)
+        token = "VIEWS_PERF_STATE_ALPHA"
+        grep = {"success": True, "complete": True, "matches": [{"file": str(path), "line_text": token}]}
+        glob = {"success": True, "complete": True, "total": 1, "files": [str(path)]}
+        search = {"success": True, "complete": False, "results": [{"file": str(path), "snippet": token}]}
+        self.assertTrue(gate.lexical_witness(grep, glob, search, path, token))
+        for answer, row in [(grep, grep["matches"][0]), (search, search["results"][0])]:
+            with self.subTest(answer=answer):
+                row["file"] = sibling
+                self.assertFalse(gate.lexical_witness(grep, glob, search, path, token))
+                row["file"] = str(path)
+        glob["files"] = [sibling]
+        self.assertFalse(gate.lexical_witness(grep, glob, search, path, token))
+        glob["files"] = [str(path)]
+        search["success"] = False
+        self.assertFalse(gate.lexical_witness(grep, glob, search, path, token))
+
+    def test_semantic_witness_requires_current_state(self):
+        path = Path("/intended") / gate.PROBE
+        token = "VIEWS_PERF_STATE_BETA"
+        row = {"file": str(path), "snippet": token}
+        answer = {"success": True, "complete": True, "semantic_status": "ready", "results": [row]}
+        self.assertTrue(gate.semantic_witness(answer, path, token))
+        row["snippet"] = "VIEWS_PERF_STATE_ALPHA"
+        self.assertFalse(gate.semantic_witness(answer, path, token))
+        row["snippet"] = token
+        row["file"] = str(Path("/sibling") / gate.PROBE)
+        self.assertFalse(gate.semantic_witness(answer, path, token))
 
     def test_timed_out_query_is_retained(self):
         class FailedBroker:
