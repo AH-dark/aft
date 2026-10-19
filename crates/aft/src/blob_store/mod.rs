@@ -16,6 +16,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 
 use crate::db::lifecycle::{SqliteStore, TrackedConnection};
 
+pub mod reclaim;
 pub mod v2;
 
 #[cfg(test)]
@@ -727,6 +728,12 @@ fn configure_connection(connection: &TrackedConnection) -> Result<(), BlobStoreE
     // concurrent first-open callers wait instead of failing immediately.
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
+    // Pointer maps must precede the first table. Existing NONE stores stay
+    // readable without an upgrade-time full rewrite; rebuilt files opt in.
+    let pages: u64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    if pages == 0 {
+        connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    }
     // Switching a rollback-journal file to WAL needs an exclusive lock, and
     // SQLite skips the busy handler on that upgrade when another connection
     // is mid-switch (it would risk a deadlock), so two first-openers racing on
@@ -871,6 +878,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_blob_stores_enable_incremental_vacuum_before_schema_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        for plane in [BlobPlane::Callgraph, BlobPlane::Semantic] {
+            let store = BlobStore::open(dir.path(), "fresh", plane).unwrap();
+            assert_eq!(
+                store
+                    .connection
+                    .pragma_query_value(None, "auto_vacuum", |r| r.get::<_, u32>(0))
+                    .unwrap(),
+                2
+            );
+        }
+    }
+
+    #[test]
     fn opening_populated_pre_presence_store_adds_no_payload_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blobs/existing/callgraph.sqlite");
@@ -932,6 +954,13 @@ mod tests {
         drop(connection);
 
         let store = BlobStore::open(dir.path(), "existing", BlobPlane::Callgraph).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "auto_vacuum", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
         assert_eq!(
             indexes(&store.connection),
             before,

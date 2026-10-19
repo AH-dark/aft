@@ -197,10 +197,9 @@ pub struct FamilySweepReport {
     pub deregistered: Vec<String>,
     /// True when deletion stopped at a row bound or the deadline.
     pub stopped_early: bool,
-    /// True when a store's freed space could not be fully returned to the
-    /// filesystem because another connection held its write-ahead log; the
-    /// next sweep returns it.
+    /// True when eligible space reclaim stopped at a page/time bound or lock.
     pub reclaim_deferred: bool,
+    pub space_reclaim: crate::blob_store::reclaim::ReclaimReport,
 }
 
 /// What one member contributes to marking.
@@ -355,7 +354,6 @@ fn delete_unmarked(
     let mut total =
         store.usage()?.payload_bytes + segments.iter().map(|row| row.byte_len).sum::<u64>();
     let rows = store.rows_oldest(bounds.max_rows_per_store)?;
-    let mut deleted_any = false;
     for row in rows {
         if total <= policy.byte_budget {
             break;
@@ -374,7 +372,6 @@ fn delete_unmarked(
             total = total.saturating_sub(row.payload_bytes);
             report.deleted_blobs += 1;
             report.deleted_bytes += row.payload_bytes;
-            deleted_any = true;
         }
     }
     for segment in segments.into_iter().take(bounds.max_rows_per_store) {
@@ -410,9 +407,10 @@ fn delete_unmarked(
             report.deleted_bytes += segment.byte_len;
         }
     }
-    if deleted_any && !store.reclaim_space()? {
-        report.reclaim_deferred = true;
-    }
+    // Retry large pre-existing free lists even if this pass deletes no rows.
+    let reclaimed = store.reclaim_space_bounded(bounds.deadline)?;
+    report.reclaim_deferred |= reclaimed.deferred;
+    report.space_reclaim.merge(reclaimed);
     Ok(())
 }
 
