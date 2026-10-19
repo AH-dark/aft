@@ -11,7 +11,8 @@ use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::config::Config;
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::{
-    inspect_request_timeout, run_diagnostics_category, start_inspect_rust_checks, InspectRustCheck,
+    inspect_request_timeout, run_diagnostics_category, scoped_coverage_candidates,
+    start_inspect_rust_checks, InspectRustCheck,
 };
 #[cfg(test)]
 use crate::inspect::InspectBuilderState;
@@ -42,6 +43,7 @@ const INSPECT_PHASE_WAIT_CAP: Duration = Duration::from_secs(60);
 /// stops before `diagnostics_timeout_ms`, while the client waits for that budget
 /// plus its transport headroom.
 const INSPECT_TERMINAL_MARGIN: Duration = Duration::from_secs(5);
+const INSPECT_SCOPE_WALK_ENTRY_LIMIT: usize = 200_000;
 
 struct ParsedScope {
     job: JobScope,
@@ -93,6 +95,15 @@ impl InspectRequestDeadline {
                 .saturating_duration_since(self.work_at)
                 .as_millis(),
         )
+    }
+}
+
+fn inspect_scope_walk_budget(deadline: Instant) -> impl Fn() -> bool + Send + Sync + 'static {
+    let visited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    move || {
+        Instant::now() < deadline
+            && visited.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                < INSPECT_SCOPE_WALK_ENTRY_LIMIT
     }
 }
 
@@ -655,28 +666,48 @@ fn handle_inspect_payload(
     let scope_was_provided = scope_was_provided && !parsed_scope.roots.is_empty();
     let scope_roots = scope_was_provided.then_some(parsed_scope.roots.as_slice());
     let scope = parsed_scope.job;
+    let scope_walk_deadline =
+        request_deadline.map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP));
+    let scope_candidates = scope_roots.map(|_| {
+        scoped_coverage_candidates(&snapshot, &scope, &snapshot.config, scope_walk_deadline)
+    });
     // File accounting describes the selected corpus, not a scanner's progress.
     // Blocking requests already captured this inventory for stat verification.
     let scoped_inventory = scope_roots.map(|roots| {
-        let count = observed_stats.map_or_else(
-            || crate::callgraph::walk_project_files_in_scope(&snapshot.project_root, roots).count(),
+        let mut files = observed_stats.map_or_else(
+            || {
+                let deadline =
+                    scope_walk_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
+                crate::callgraph::walk_project_files_in_scope_while(
+                    &snapshot.project_root,
+                    roots,
+                    inspect_scope_walk_budget(deadline),
+                )
+                .map(|file| crate::inspect::job::canonicalize_normalized(&file))
+                .collect::<BTreeSet<_>>()
+            },
             |stats| {
                 stats
                     .0
                     .iter()
                     .filter(|(file, _, _)| scope.contains(file))
-                    .count()
+                    .map(|(file, _, _)| crate::inspect::job::canonicalize_normalized(file))
+                    .collect::<BTreeSet<_>>()
             },
         );
-        // The project census cannot include explicit files in another
-        // workspace. Count those independently, including unsupported files
-        // whose diagnostics will be a named gap rather than a clean result.
-        let outside_files = roots
-            .iter()
-            .filter(|root| !root.starts_with(&snapshot.project_root) && root.is_file())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        (roots, (count + outside_files) as u64)
+        let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
+        // External directory roots contribute only files with a registered
+        // diagnostics producer; explicit file roots remain counted even when
+        // no producer can analyze that file.
+        files.extend(
+            scope_candidates
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|file| !file.starts_with(&project_root))
+                .cloned(),
+        );
+        (roots, files.len() as u64)
     });
     let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 
@@ -883,6 +914,7 @@ fn handle_inspect_payload(
                 &snapshot,
                 &scope,
                 scope_was_provided,
+                scope_candidates.as_deref(),
                 applicability_is_empty,
                 producer_failures,
                 not_applicable,

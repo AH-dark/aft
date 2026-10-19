@@ -19,7 +19,9 @@ use aft::inspect::{
     InspectPhaseId, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use aft::lsp::client::LspEvent;
+use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use aft::lsp::registry::ServerKind;
+use aft::lsp::roots::ServerKey;
 use aft::parser::{SymbolCache, TreeSitterProvider};
 use aft::protocol::RawRequest;
 use serde_json::{json, Value};
@@ -5191,6 +5193,151 @@ fn external_typescript_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         crate::helpers::canonicalize_like_product(&root),
         crate::helpers::canonicalize_like_product(&file),
     )
+}
+
+fn publish_external_typescript_report(
+    ctx: &AppContext,
+    root: &Path,
+    file: &Path,
+    diagnostics: Vec<StoredDiagnostic>,
+) {
+    ctx.lsp().diagnostics_store_mut_for_test().publish(
+        ServerKey {
+            kind: ServerKind::TypeScript,
+            root: root.to_path_buf(),
+        },
+        crate::helpers::canonicalize_like_product(file),
+        diagnostics,
+    );
+}
+
+fn external_error(file: &Path) -> StoredDiagnostic {
+    StoredDiagnostic {
+        file: crate::helpers::canonicalize_like_product(file),
+        line: 1,
+        column: 1,
+        end_line: 1,
+        end_column: 2,
+        severity: DiagnosticSeverity::Error,
+        message: "not assignable to number".into(),
+        code: Some("2322".into()),
+        source: Some("typescript".into()),
+    }
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_counts_reported_files_and_keeps_rows() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, broken) = external_typescript_fixture();
+    let clean = write_file(&external_root, "clean.ts", "export const clean = 1;\n");
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(
+        &ctx,
+        &external_root,
+        &broken,
+        vec![external_error(&broken)],
+    );
+    publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-directory-reports",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": external_root,
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], true, "{response:#}");
+    assert!(
+        response["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == diagnostic_path(&broken)
+                && row["message"] == "not assignable to number"),
+        "external directory report was dropped: {response:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_names_unreported_file_gap() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, unreported) = external_typescript_fixture();
+    let reported = write_file(
+        &external_root,
+        "reported.ts",
+        "export const reported = 1;\n",
+    );
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(&ctx, &external_root, &reported, Vec::new());
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-directory-unreported",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": external_root,
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert!(
+        response["gaps"].as_array().unwrap().iter().any(|gap| {
+            gap["kind"] == "uncovered_file"
+                && gap["file"] == diagnostic_path(&unreported)
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("outside_project_root_unverified"))
+        }),
+        "external unreported file should be a named gap: {response:#}"
+    );
+}
+
+#[test]
+fn scoped_diagnostics_external_directory_and_file_are_counted_once() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, broken) = external_typescript_fixture();
+    let clean = write_file(&external_root, "clean.ts", "export const clean = 1;\n");
+    let ctx = configured_context(&root);
+    publish_external_typescript_report(
+        &ctx,
+        &external_root,
+        &broken,
+        vec![external_error(&broken)],
+    );
+    publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-outside-directory-overlap",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": [external_root, clean],
+            "topK": 20,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["scope_files"], 2, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], true, "{response:#}");
 }
 
 #[test]

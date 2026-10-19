@@ -3841,19 +3841,25 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
     walk_project_files_filtered(root, |_| true)
 }
 
-/// Walk only the requested subtrees and the ancestors needed to reach them.
+/// Walk the requested project subtrees, stopping before the next raw walker
+/// advance when the caller's budget expires.
 /// Starting at the project root preserves ignored-parent and nested ignore
 /// rules; pruning before descent avoids traversing unrelated subtrees.
-pub(crate) fn walk_project_files_in_scope(
+pub(crate) fn walk_project_files_in_scope_while(
     root: &Path,
     scope_roots: &[PathBuf],
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     let roots = scope_roots.to_vec();
-    walk_project_files_filtered(root, move |path| {
-        roots
-            .iter()
-            .any(|root| path.starts_with(root) || root.starts_with(path))
-    })
+    walk_project_files_filtered_while(
+        root,
+        move |path| {
+            roots
+                .iter()
+                .any(|root| path.starts_with(root) || root.starts_with(path))
+        },
+        keep_walking,
+    )
 }
 
 fn walk_project_files_filtered(
@@ -3870,6 +3876,15 @@ pub(crate) fn walk_project_files_while(
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     walk_project_files_filtered_while(root, |_| true, keep_walking)
+}
+
+/// Walk all non-excluded files under a root, using the same bounded iterator
+/// and ignore rules as the source-file census.
+pub(crate) fn walk_project_paths_while(
+    root: &Path,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
+) -> impl Iterator<Item = PathBuf> {
+    walk_project_paths_filtered_while_with_builder(root, |_| true, keep_walking, |_| {})
 }
 
 fn walk_project_files_filtered_while(
@@ -3896,6 +3911,16 @@ pub(crate) fn walk_project_files_while_sorted_for_test(
 }
 
 fn walk_project_files_filtered_while_with_builder(
+    root: &Path,
+    include: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
+    configure_builder: impl FnOnce(&mut ignore::WalkBuilder),
+) -> impl Iterator<Item = PathBuf> {
+    walk_project_paths_filtered_while_with_builder(root, include, keep_walking, configure_builder)
+        .filter(|path| detect_language(path).is_some())
+}
+
+fn walk_project_paths_filtered_while_with_builder(
     root: &Path,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
@@ -3951,7 +3976,6 @@ fn walk_project_files_filtered_while_with_builder(
         .fuse()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
-        .filter(|entry| detect_language(entry.path()).is_some())
         .map(|entry| entry.into_path())
 }
 
