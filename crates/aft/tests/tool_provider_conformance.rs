@@ -834,8 +834,10 @@ async fn ledger_database(root: &Path) -> PathBuf {
     }
 }
 
+#[cfg(debug_assertions)]
 struct DatabaseOpenGate(PathBuf);
 
+#[cfg(debug_assertions)]
 impl DatabaseOpenGate {
     fn hold(root: &Path) -> Self {
         std::fs::create_dir_all(root).unwrap();
@@ -849,6 +851,7 @@ impl DatabaseOpenGate {
     }
 }
 
+#[cfg(debug_assertions)]
 impl Drop for DatabaseOpenGate {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -1201,6 +1204,9 @@ async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
     assert!(!marker.exists());
 }
 
+// The database-open gate exists only in debug builds of the daemon
+// (`configure::open_database_runtime`), so this test does too.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn s1_keyed_write_during_migration_fails_closed_then_retries_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -1279,6 +1285,10 @@ async fn s1_keyed_write_during_migration_fails_closed_then_retries_exactly_once(
 async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
+    // Debug daemons honour the open gate, which holds the migration so the
+    // database assertions below must wait for readiness. Release daemons
+    // ignore it, and the readiness wait still covers the race.
+    #[cfg(debug_assertions)]
     let gate = DatabaseOpenGate::hold(&root);
     let process = Subject::head().spawn(&root).await.unwrap();
     let route = bind_route_stamped_with_elicitation(
@@ -1302,13 +1312,16 @@ async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() 
     assert_eq!(reply.header.ty, FrameType::Error);
     assert_eq!(response_json(&reply)["code"], "capability_not_admitted");
     assert!(!marker.exists());
-    gate.entered().await;
-    // Admission refusal intentionally precedes persistence readiness. Leave the
-    // migration held briefly so database assertions must observe readiness.
-    let release = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        drop(gate);
-    });
+    #[cfg(debug_assertions)]
+    let release = {
+        gate.entered().await;
+        // Admission refusal intentionally precedes persistence readiness. Leave
+        // the migration held briefly so database assertions must observe readiness.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            drop(gate);
+        })
+    };
     let conn = rusqlite::Connection::open(ledger_database(&root).await).unwrap();
     let executions: usize = conn
         .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
@@ -1318,6 +1331,7 @@ async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() 
         .query_row("SELECT COUNT(*) FROM call_ledger", [], |row| row.get(0))
         .unwrap();
     assert_eq!(admissions, 0);
+    #[cfg(debug_assertions)]
     release.await.unwrap();
 }
 
