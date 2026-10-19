@@ -278,6 +278,9 @@ finished it auto-promotes to a background task and returns a `taskId` while the 
 running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2000 })` polls
 briefly then hard-kills at 2s. `background: true` skips polling entirely.
 
+Completion previews in notices and wakes have common credential formats and secret-named child environment values masked; stdout/stderr files and `bash_status` tool results remain unchanged.
+After a restart, previews are withheld because the in-memory credential values are no longer available; use `bash_status` to read the output.
+
 **Foreground example:**
 
 ```json

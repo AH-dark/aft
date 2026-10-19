@@ -294,6 +294,20 @@ impl BgBuffer {
             .unwrap_or_else(empty_bounded_read)
     }
 
+    /// Notice redaction needs contiguous input: a head/tail join could cut an
+    /// opaque credential into fragments that no format matcher can recognize.
+    pub(crate) fn read_complete_for_notice(&self) -> Option<String> {
+        let read = |stream| {
+            let source = self.source(stream)?;
+            let read = read_source_bounded(source, DISK_LIMIT_BYTES as usize).ok()?;
+            (!read.truncated).then_some(read.text)
+        };
+        Some(combine_streams(
+            &read(StreamKind::Stdout)?,
+            &read(StreamKind::Stderr)?,
+        ))
+    }
+
     pub fn stream_len(&self, stream: StreamKind) -> u64 {
         self.source(stream)
             .and_then(|source| source.open().and_then(|file| source.len(&file)).ok())

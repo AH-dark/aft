@@ -1334,6 +1334,15 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         let request = environment.and_then(|environment| {
+            *task
+                .completion_secrets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(crate::log_redact::SecretValues::from_environment(
+                    environment.iter().map(|(key, value)| {
+                        (std::ffi::OsStr::new(key), std::ffi::OsStr::new(value))
+                    }),
+                ));
             build_remote_request(
                 request_root,
                 &workdir,

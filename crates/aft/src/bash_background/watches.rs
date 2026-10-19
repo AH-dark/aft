@@ -257,19 +257,31 @@ impl WatchRegistry {
         task_id: &str,
         bytes: &[u8],
         start: u64,
+        render: &mut dyn FnMut(&str, usize, usize, u64, u64) -> (String, String),
     ) -> Vec<PatternMatch> {
         self.scan_cursors.insert(
             cursor_key.to_string(),
             start.saturating_add(bytes.len() as u64),
         );
-        self.scan_new_bytes_at(cursor_key, task_id, bytes, start)
+        self.scan_new_bytes_at(cursor_key, task_id, bytes, start, render)
     }
 
     pub fn scan_new_bytes(&mut self, task_id: &str, bytes: &[u8]) -> Vec<PatternMatch> {
         let base = self.scan_cursors.get(task_id).copied().unwrap_or(0);
         self.scan_cursors
             .insert(task_id.to_string(), base.saturating_add(bytes.len() as u64));
-        self.scan_new_bytes_at(task_id, task_id, bytes, base)
+        self.scan_new_bytes_at(
+            task_id,
+            task_id,
+            bytes,
+            base,
+            &mut |text, start, end, _, _| {
+                (
+                    text[start..end].to_string(),
+                    context_snippet(text, start, end),
+                )
+            },
+        )
     }
 
     fn scan_new_bytes_at(
@@ -278,6 +290,7 @@ impl WatchRegistry {
         task_id: &str,
         bytes: &[u8],
         base_offset: u64,
+        render: &mut dyn FnMut(&str, usize, usize, u64, u64) -> (String, String),
     ) -> Vec<PatternMatch> {
         let Some(watches) = self.watches.get(task_id).cloned() else {
             return Vec::new();
@@ -296,16 +309,23 @@ impl WatchRegistry {
         let mut matches = Vec::new();
         let mut remove_once = Vec::new();
         for watch in watches {
-            if let Some((text_start, text_end, source_start, matched)) =
+            if let Some((text_start, text_end, source_start, source_end)) =
                 find_match(&watch.pattern, &text, &scan_bytes, prefix_len)
             {
                 self.matched_tasks.insert(task_id.to_string());
+                let (match_text, context) = render(
+                    &text,
+                    text_start,
+                    text_end,
+                    scan_base_offset.saturating_add(source_start as u64),
+                    scan_base_offset.saturating_add(source_end as u64),
+                );
                 matches.push(PatternMatch {
                     watch_id: watch.watch_id.clone(),
                     task_id: watch.task_id.clone(),
-                    match_text: matched,
+                    match_text,
                     match_offset: scan_base_offset.saturating_add(source_start as u64),
-                    context: context_snippet(&text, text_start, text_end),
+                    context,
                     once: watch.once,
                 });
                 if watch.once {
@@ -330,15 +350,15 @@ fn find_match(
     text: &str,
     source: &[u8],
     min_source_end_exclusive: usize,
-) -> Option<(usize, usize, usize, String)> {
-    let make_match = |start: usize, end: usize, matched: String| {
+) -> Option<(usize, usize, usize, usize)> {
+    let make_match = |start: usize, end: usize| {
         let source_end = source_offset_for_lossy_utf8(source, end);
         (source_end > min_source_end_exclusive).then(|| {
             (
                 start,
                 end,
                 source_offset_for_lossy_utf8(source, start),
-                matched,
+                source_end,
             )
         })
     };
@@ -347,13 +367,12 @@ fn find_match(
             if needle.is_empty() {
                 return None;
             }
-            text.match_indices(needle).find_map(|(start, matched)| {
-                make_match(start, start + matched.len(), needle.clone())
-            })
+            text.match_indices(needle)
+                .find_map(|(start, matched)| make_match(start, start + matched.len()))
         }
-        WatchPattern::Regex(regex) => regex.find_iter(text).find_map(|matched| {
-            make_match(matched.start(), matched.end(), matched.as_str().to_string())
-        }),
+        WatchPattern::Regex(regex) => regex
+            .find_iter(text)
+            .find_map(|matched| make_match(matched.start(), matched.end())),
     }
 }
 
@@ -390,7 +409,7 @@ fn source_offset_for_lossy_utf8(source: &[u8], lossy_offset: usize) -> usize {
     source.len()
 }
 
-fn context_snippet(text: &str, start: usize, end: usize) -> String {
+pub(super) fn context_snippet(text: &str, start: usize, end: usize) -> String {
     let before_start = text[..start]
         .char_indices()
         .rev()

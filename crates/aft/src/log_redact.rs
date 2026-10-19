@@ -1,4 +1,4 @@
-//! Credential masking for text that is written to durable logs.
+//! Credential masking for durable logs and background completion previews.
 //!
 //! AFT log lines can quote URLs, error text from child processes and LSP
 //! servers, and other strings that occasionally carry a credential. Every line
@@ -66,8 +66,9 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 static GITHUB_PAT: LazyLock<Regex> = LazyLock::new(|| compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"));
 static GITHUB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"));
-static SK_API_KEY: LazyLock<Regex> =
-    LazyLock::new(|| compile(r"\bsk-(?:live-)?[A-Za-z0-9][A-Za-z0-9_-]{7,}\b"));
+static SK_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    compile(r"\bsk-(?:live-[A-Za-z0-9][A-Za-z0-9_-]{7,}|[A-Za-z0-9][A-Za-z0-9_-]{19,})\b")
+});
 static JWT: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"));
 static AWS_ACCESS_KEY_ID: LazyLock<Regex> =
@@ -88,77 +89,192 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// Mask credentials in `text`. Returns the input unchanged (borrowed) when it
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
+    redact_with_range(text, None)
+}
+
+fn redact_with_range<'a>(
+    text: &'a str,
+    mut range: Option<&mut std::ops::Range<usize>>,
+) -> Cow<'a, str> {
     let mut out = Cow::Borrowed(text);
     if text.contains("PRIVATE KEY-----") {
-        out = replace_in(out, &PRIVATE_KEY, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &PRIVATE_KEY, SECRET_PLACEHOLDER);
     }
     if text.contains("xox") {
-        out = replace_in(out, &SLACK_TOKEN, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &SLACK_TOKEN, SECRET_PLACEHOLDER);
     }
     if contains_ignore_ascii_case(text, "x-api-key") {
-        out = replace_in(out, &API_KEY_HEADER, format!("${{1}}{SECRET_PLACEHOLDER}"));
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &API_KEY_HEADER,
+            |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
+        );
     }
     if text.contains('"') {
         out = replace_in(
             out,
+            range.as_deref_mut(),
             &SECRET_JSON_FIELD,
-            format!("${{1}}{SECRET_PLACEHOLDER}${{3}}"),
+            |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}{}", &caps[1], &caps[3]),
         );
     }
     if contains_ignore_ascii_case(text, "secret_access_key") {
         out = replace_in(
             out,
+            range.as_deref_mut(),
             &AWS_SECRET_FIELD,
-            format!("${{1}}{SECRET_PLACEHOLDER}"),
+            |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
         );
     }
     if contains_ignore_ascii_case(text, "authorization") {
         out = replace_in(
             out,
+            range.as_deref_mut(),
             &AUTHORIZATION_HEADER,
-            format!("${{1}}{SECRET_PLACEHOLDER}"),
+            |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
         );
     }
     if text.contains("github_pat_") {
-        out = replace_in(out, &GITHUB_PAT, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &GITHUB_PAT, SECRET_PLACEHOLDER);
     }
     if needs_github_token_scan(text) {
-        out = replace_in(out, &GITHUB_TOKEN, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &GITHUB_TOKEN, SECRET_PLACEHOLDER);
     }
     if text.contains("sk-") {
-        out = replace_in(out, &SK_API_KEY, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &SK_API_KEY, SECRET_PLACEHOLDER);
     }
     if text.contains("eyJ") {
-        out = replace_in(out, &JWT, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &JWT, SECRET_PLACEHOLDER);
     }
     if ["AKIA", "ASIA", "AGPA", "AIDA", "AROA"]
         .iter()
         .any(|prefix| text.contains(prefix))
     {
-        out = replace_in(out, &AWS_ACCESS_KEY_ID, SECRET_PLACEHOLDER);
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &AWS_ACCESS_KEY_ID,
+            SECRET_PLACEHOLDER,
+        );
     }
     if text.contains("://") {
         out = replace_in(
             out,
+            range.as_deref_mut(),
             &URL_USERINFO,
-            format!("${{1}}{URL_CREDENTIAL_PLACEHOLDER}@"),
+            |caps: &Captures<'_>| format!("{}{URL_CREDENTIAL_PLACEHOLDER}@", &caps[1]),
         );
     }
     if text.contains('=') && (text.contains('?') || text.contains('&')) {
         out = replace_in(
             out,
+            range.as_deref_mut(),
             &CREDENTIAL_QUERY,
-            format!("${{1}}{SECRET_PLACEHOLDER}"),
+            |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
         );
-        out = replace_in(out, &KEY_QUERY, |caps: &Captures<'_>| {
-            if looks_like_secret(&caps[2]) {
-                format!("{}{SECRET_PLACEHOLDER}", &caps[1])
-            } else {
-                caps[0].to_string()
-            }
-        });
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &KEY_QUERY,
+            |caps: &Captures<'_>| {
+                if looks_like_secret(&caps[2]) {
+                    format!("{}{SECRET_PLACEHOLDER}", &caps[1])
+                } else {
+                    caps[0].to_string()
+                }
+            },
+        );
     }
     out
+}
+
+/// A command's credential values, retained only with its live in-memory task.
+/// Deliberately has no Debug or serialization implementation.
+#[derive(Default)]
+pub(crate) struct SecretValues(Vec<String>);
+
+impl SecretValues {
+    pub(crate) fn from_environment<'a>(
+        env: impl IntoIterator<Item = (&'a std::ffi::OsStr, &'a std::ffi::OsStr)>,
+    ) -> Self {
+        let mut values = Vec::new();
+        for (key, value) in env {
+            let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+                continue;
+            };
+            if value.chars().count() >= 8
+                && [
+                    "TOKEN",
+                    "SECRET",
+                    "KEY",
+                    "PASSWORD",
+                    "PASSWD",
+                    "CREDENTIAL",
+                    "AUTH",
+                ]
+                .iter()
+                .any(|part| contains_ignore_ascii_case(key, part))
+            {
+                values.push(value.to_owned());
+            }
+        }
+        values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        Self(values)
+    }
+
+    pub(crate) fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        self.redact_range(text, None)
+    }
+
+    pub(crate) fn redact_range<'a>(
+        &self,
+        text: &'a str,
+        mut range: Option<&mut std::ops::Range<usize>>,
+    ) -> Cow<'a, str> {
+        // Exact matches run first: a format-based replacement inside an opaque
+        // value must not leave the rest of that value visible.
+        let mut spans = Vec::new();
+        for value in &self.0 {
+            let mut start = 0;
+            while let Some(offset) = text[start..].find(value) {
+                let from = start + offset;
+                spans.push((from, from + value.len()));
+                start = from + text[from..].chars().next().unwrap().len_utf8();
+            }
+        }
+        let out = if spans.is_empty() {
+            Cow::Borrowed(text)
+        } else {
+            spans.sort_unstable();
+            let mut masked = String::new();
+            let mut copied = 0;
+            let mut spans = spans.into_iter().peekable();
+            while let Some((start, mut end)) = spans.next() {
+                while spans.peek().is_some_and(|(next, _)| *next <= end) {
+                    end = end.max(spans.next().unwrap().1);
+                }
+                masked.push_str(&text[copied..start]);
+                if let Some(range) = range.as_deref_mut() {
+                    map_redacted_range(
+                        range,
+                        masked.len(),
+                        masked.len() + end - start,
+                        SECRET_PLACEHOLDER.len(),
+                    );
+                }
+                masked.push_str(SECRET_PLACEHOLDER);
+                copied = end;
+            }
+            masked.push_str(&text[copied..]);
+            Cow::Owned(masked)
+        };
+        match redact_with_range(&out, range) {
+            Cow::Borrowed(_) => out,
+            Cow::Owned(masked) => Cow::Owned(masked),
+        }
+    }
 }
 
 fn needs_github_token_scan(text: &str) -> bool {
@@ -233,20 +349,131 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 /// Apply one pattern, keeping the borrowed input when nothing changed. A match
 /// can re-produce its own text (an already-masked `***@`, or a `key=` value
 /// that does not look secret), so equality is checked, not just match count.
-fn replace_in<'a, R: Replacer>(text: Cow<'a, str>, pattern: &Regex, replacer: R) -> Cow<'a, str> {
-    let replaced = match pattern.replace_all(&text, replacer) {
-        Cow::Borrowed(_) => None,
-        Cow::Owned(masked) if masked == *text => None,
-        Cow::Owned(masked) => Some(masked),
+fn replace_in<'a, R: Replacer>(
+    text: Cow<'a, str>,
+    mut range: Option<&mut std::ops::Range<usize>>,
+    pattern: &Regex,
+    mut replacer: R,
+) -> Cow<'a, str> {
+    // Capture storage is allocated by replace_all even when it finds no match.
+    // Keep the overwhelmingly common no-secret path allocation-free.
+    if !pattern.is_match(&text) {
+        return text;
+    }
+    let mut masked = String::new();
+    let mut copied = 0;
+    for caps in pattern.captures_iter(&text) {
+        let found = caps.get(0).unwrap();
+        masked.push_str(&text[copied..found.start()]);
+        let from = masked.len();
+        replacer.replace_append(&caps, &mut masked);
+        if masked[from..] != *found.as_str() {
+            if let Some(range) = range.as_deref_mut() {
+                map_redacted_range(range, from, from + found.len(), masked.len() - from);
+            }
+        }
+        copied = found.end();
+    }
+    masked.push_str(&text[copied..]);
+    if masked == *text {
+        text
+    } else {
+        Cow::Owned(masked)
+    }
+}
+
+/// Keep a watch's raw match anchored when a replacement changes byte lengths.
+/// A match touching a secret expands to cover the entire visible placeholder.
+fn map_redacted_range(
+    range: &mut std::ops::Range<usize>,
+    from: usize,
+    to: usize,
+    replacement_len: usize,
+) {
+    let shift = |position: usize| {
+        position
+            .saturating_sub(to - from)
+            .saturating_add(replacement_len)
     };
-    match replaced {
-        Some(masked) => Cow::Owned(masked),
-        None => text,
+    if range.start >= to {
+        range.start = shift(range.start);
+        range.end = shift(range.end);
+    } else if range.end > from {
+        range.start = range.start.min(from);
+        range.end = if range.end >= to {
+            shift(range.end)
+        } else {
+            from + replacement_len
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_exact_env_values_are_case_sensitive_and_overlap_safe() {
+        let environment = [
+            ("DEPLOY_tOkEn", "abcdefgh"),
+            ("MY_SECRET", "fghijklm"),
+            ("api_KEY", "key-value-long"),
+            ("PASSWORD", "password-value"),
+            ("PASSWD", "passwd-value"),
+            ("CREDENTIALS", "credential-value"),
+            ("AUTHORIZATION", "auth-value"),
+            ("tiny_TOKEN", "short"),
+            ("NORMAL_VALUE", "public-value"),
+        ];
+        let secrets = SecretValues::from_environment(
+            environment
+                .iter()
+                .map(|(key, value)| (std::ffi::OsStr::new(key), std::ffi::OsStr::new(value))),
+        );
+        assert_eq!(
+            secrets.redact("abcdefghijklm/abcdefgh"),
+            format!("{SECRET_PLACEHOLDER}/{SECRET_PLACEHOLDER}")
+        );
+        for (_, value) in &environment[..7] {
+            assert_eq!(
+                secrets.redact(&format!("before{value}after")),
+                format!("before{SECRET_PLACEHOLDER}after")
+            );
+        }
+        assert!(matches!(
+            secrets.redact("ABCDEFGH short public-value"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn completion_non_secret_corpus_stays_borrowed() {
+        for text in [
+            "running 42 tests\ntest task::sk-settings ... ok\ntest result: ok. 42 passed; 0 failed\n",
+            "commit 0f78c1bcb3ab4d501d6ebc491617b097416f9138\nAuthor: Example <user@example.com>\n    add task-settings\n",
+            "added 42 packages, and audited 128 packages in 2s\n12 packages are looking for funding\nfound 0 vulnerabilities\n",
+            "request 550e8400-e29b-41d4-a716-446655440000 fixture SGVsbG8gd29ybGQhYWJjZGVmZ2g=\n",
+            "sk-settings sk-something sk-words docs say sk- is a prefix; https://example.com/path\n",
+        ] {
+            assert!(matches!(SecretValues::default().redact(text), Cow::Borrowed(_)), "mangled: {text}");
+        }
+    }
+
+    #[test]
+    fn completion_64k_noop_is_allocation_free() {
+        let mut text = "running 42 tests\ntest task::sk-settings ... ok\n{\"status\":\"ok\"}\nhttps://example.com/path\n".repeat(1024);
+        text.truncate(64 * 1024);
+        let secrets = SecretValues::default();
+        let _ = secrets.redact(&text); // Initialize regex automata outside the measurement.
+        let start = std::time::Instant::now();
+        let (out, allocations) = crate::test_allocations::count(|| secrets.redact(&text));
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(allocations, 0);
+        eprintln!(
+            "64 KiB completion redaction: {:?}, {allocations} allocations",
+            start.elapsed()
+        );
+    }
     #[test]
     fn github_prefilter_only_scans_actual_token_prefixes() {
         for ordinary in [
@@ -266,8 +493,6 @@ mod tests {
             assert_eq!(super::aft_redactor(&token), super::SECRET_PLACEHOLDER);
         }
     }
-
-    use super::*;
 
     #[derive(serde::Deserialize)]
     struct Fixture {

@@ -907,6 +907,9 @@ struct WaitDetachState {
 const PENDING_WAIT_DETACH_TTL: Duration = Duration::from_secs(120);
 
 pub(crate) struct BgTask {
+    /// Absent after replay: secret values must never be persisted or recovered
+    /// from payload files. Completion notices withhold output when this is absent.
+    completion_secrets: Mutex<Option<crate::log_redact::SecretValues>>,
     pub(crate) task_id: String,
     pub(crate) session_id: String,
     pub(crate) paths: TaskPaths,
@@ -2758,6 +2761,10 @@ impl BgTaskRegistry {
                     )
                 })
             })
+            .map(|mut frame| {
+                self.mask_watch_text(&frame.task_id, &mut frame.match_text, &mut frame.context);
+                frame
+            })
             .collect()
     }
 
@@ -2989,6 +2996,12 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
+        let mut pattern_match = pattern_match.clone();
+        self.mask_watch_text(
+            task_id,
+            &mut pattern_match.match_text,
+            &mut pattern_match.context,
+        );
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
@@ -3435,6 +3448,10 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(Some(crate::sandbox_spawn::completion_secret_values(
+                &spawn_plan,
+                &env,
+            ))),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -3774,6 +3791,10 @@ impl BgTaskRegistry {
 
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(Some(crate::sandbox_spawn::completion_secret_values(
+                &spawn_plan,
+                &env,
+            ))),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -4020,6 +4041,10 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(Some(crate::sandbox_spawn::completion_secret_values(
+                &spawn_plan,
+                &env,
+            ))),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -5386,6 +5411,7 @@ impl BgTaskRegistry {
         // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
+        let mut complete: Option<Vec<u8>> = None;
         loop {
             if !drain && bytes_read >= CHUNK as usize {
                 break;
@@ -5414,7 +5440,40 @@ impl BgTaskRegistry {
             if registry.file_cursor(cursor_key) != cursor {
                 continue;
             }
-            matches.extend(registry.scan_chunk(cursor_key, task_id, &bytes, start));
+            matches.extend(registry.scan_chunk(
+                cursor_key,
+                task_id,
+                &bytes,
+                start,
+                &mut |_, _, _, from, to| {
+                    // Scan in bounded chunks, but mask the intact capture only
+                    // when a watch fires so neither chunk edge can split a secret.
+                    if complete
+                        .as_ref()
+                        .is_none_or(|bytes| to > bytes.len() as u64)
+                    {
+                        complete = file
+                            .len()
+                            .ok()
+                            .filter(|len| *len < super::buffer::DISK_LIMIT_BYTES)
+                            .and_then(|len| file.read_range(0, len).ok());
+                    }
+                    let Some(complete) = complete.as_ref().filter(|bytes| to <= bytes.len() as u64)
+                    else {
+                        return (
+                            crate::log_redact::SECRET_PLACEHOLDER.to_string(),
+                            completion_preview::TRUNCATED_PREVIEW_WITHHELD.to_string(),
+                        );
+                    };
+                    let from = String::from_utf8_lossy(&complete[..from as usize]).len();
+                    let to = String::from_utf8_lossy(&complete[..to as usize]).len();
+                    self.render_watch_preview(
+                        task_id,
+                        &String::from_utf8_lossy(&complete),
+                        from..to,
+                    )
+                },
+            ));
             drop(registry);
             if len < CHUNK as usize {
                 break;
@@ -7462,8 +7521,12 @@ impl BgTaskRegistry {
         } else {
             self.ensure_terminal_output_cache(task)
                 .map(|cache| {
-                    let (preview, truncated) =
-                        completion_preview_for_cache(&cache, snapshot.exit_code);
+                    let (preview, truncated) = self.completion_preview_for_notice(
+                        &task.task_id,
+                        &snapshot.info.command,
+                        &cache,
+                        snapshot.exit_code,
+                    );
                     (preview, truncated, Some(cache))
                 })
                 .unwrap_or_else(|| (String::new(), false, None))
@@ -7477,6 +7540,7 @@ impl BgTaskRegistry {
         let bash_output_list_envelope = cache
             .as_ref()
             .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+        self.mask_completion_text(&task.task_id, &mut output_preview);
         Some(BgCompletion {
             task_id: snapshot.info.task_id,
             session_id: task.session_id.clone(),
@@ -7956,6 +8020,7 @@ impl BgTaskRegistry {
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let task = Arc::new(BgTask {
+            completion_secrets: Mutex::new(None),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -8975,7 +9040,14 @@ impl BgTaskRegistry {
         // smaller, exit-aware head+tail cap. They never invoke the compressor
         // themselves.
         let (mut output_preview, output_truncated) = render
-            .map(|cache| completion_preview_for_cache(cache, metadata.exit_code))
+            .map(|cache| {
+                self.completion_preview_for_notice(
+                    &metadata.task_id,
+                    &metadata.command,
+                    cache,
+                    metadata.exit_code,
+                )
+            })
             .unwrap_or_else(|| (String::new(), false));
         if let Some(note) = rendered_execution_note(metadata) {
             output_preview = format!("{note}\n{output_preview}");
@@ -8994,6 +9066,7 @@ impl BgTaskRegistry {
         let bash_output_list_envelope =
             render.and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
 
+        self.mask_completion_text(&metadata.task_id, &mut output_preview);
         let token_counts = self.completion_token_counts(
             metadata,
             buffer,
@@ -9228,7 +9301,12 @@ impl BgTaskRegistry {
         }
     }
 
-    fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
+    fn emit_bash_pattern_match(&self, session_id: &str, mut pattern_match: PatternMatch) {
+        self.mask_watch_text(
+            &pattern_match.task_id,
+            &mut pattern_match.match_text,
+            &mut pattern_match.context,
+        );
         if !self.originating_session_has_live_route(session_id) {
             return;
         }
@@ -11862,6 +11940,13 @@ fn random_slug() -> String {
 #[path = "pty_completion_test.rs"]
 mod pty_completion_tests;
 
+#[cfg(test)]
+#[path = "completion_redaction_tests.rs"]
+mod completion_redaction_tests;
+
+#[path = "completion_preview.rs"]
+mod completion_preview;
+
 fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     let warning = metadata
         .remote
@@ -12186,7 +12271,7 @@ mod tests {
         ));
     }
 
-    fn insert_terminal_piped_task(
+    pub(super) fn insert_terminal_piped_task(
         registry: &BgTaskRegistry,
         dir: &tempfile::TempDir,
         command: &str,
@@ -12215,6 +12300,8 @@ mod tests {
             .insert_rehydrated_task(metadata, paths, true)
             .expect("insert terminal task");
         let task = registry.task_for_session(&task_id, "session").unwrap();
+        // This fixture models a live command; replay behavior has separate tests.
+        *task.completion_secrets.lock().unwrap() = Some(Default::default());
         (task_id, task)
     }
 
@@ -13854,6 +13941,9 @@ mod tests {
             .expect("insert terminal task");
         let task = registry.task_for_session(&task_id, "session").unwrap();
 
+        // Exercise head/tail sizing rather than restart withholding. The
+        // simulated command has a known environment with no secret variables.
+        *task.completion_secrets.lock().unwrap() = Some(Default::default());
         registry.post_terminal_transition(&task, true).unwrap();
         let completions = registry.drain_completions_for_session(Some("session"));
         assert_eq!(completions.len(), 1);
@@ -17964,7 +18054,7 @@ mod tests {
         );
     }
 
-    fn registry_with_db_and_frames(
+    pub(super) fn registry_with_db_and_frames(
         storage: &Path,
     ) -> (
         BgTaskRegistry,
@@ -18576,7 +18666,9 @@ mod tests {
         assert!(leaks.is_empty(), "ticket persisted in {leaks:?}");
     }
 
-    fn pattern_match_frames(frames: &Mutex<Vec<PushFrame>>) -> Vec<BashPatternMatchFrame> {
+    pub(super) fn pattern_match_frames(
+        frames: &Mutex<Vec<PushFrame>>,
+    ) -> Vec<BashPatternMatchFrame> {
         frames
             .lock()
             .unwrap()
@@ -19301,7 +19393,8 @@ mod tests {
             matches.iter().any(|frame| {
                 frame.task_id == task_id
                     && frame.reason == "pattern_match"
-                    && frame.match_text == "READY"
+                    && frame.match_text == crate::log_redact::SECRET_PLACEHOLDER
+                    && frame.context == completion_preview::RESTART_PREVIEW_WITHHELD
             }),
             "rehydrate should deliver gap match: {matches:?}"
         );
@@ -19358,7 +19451,9 @@ mod tests {
             "late-stream match was not caught in one fair running scan; read {} bytes",
             work.artifact_bytes
         );
-        assert_eq!(work.artifact_bytes, 196612);
+        // Matching stays chunked. A hit rereads the intact capture once so
+        // credential masking precedes both the chunk and context-window cuts.
+        assert_eq!(work.artifact_bytes, 2 * 196612);
         assert_eq!(
             work.artifact_opens, 2,
             "fresh validation is shared by all chunks in this pass"
@@ -19546,12 +19641,17 @@ mod tests {
 
         let matches: Vec<_> = pattern_match_frames(&replay_frames)
             .into_iter()
-            .filter(|frame| frame.task_id == task_id && frame.match_text.contains("GAP-HIT"))
+            .filter(|frame| frame.task_id == task_id && frame.reason == "pattern_match")
             .collect();
         assert_eq!(
             matches.len(),
             1,
             "gap match must deliver exactly once: {matches:?}"
+        );
+        assert_eq!(matches[0].match_text, crate::log_redact::SECRET_PLACEHOLDER);
+        assert_eq!(
+            matches[0].context,
+            completion_preview::RESTART_PREVIEW_WITHHELD
         );
         assert!(
             matches[0].match_offset >= cursor_before,
@@ -19659,7 +19759,8 @@ mod tests {
             matches.iter().any(|frame| {
                 frame.task_id == task_id
                     && frame.watch_id == "watch-00000001"
-                    && frame.match_text == "(fail)"
+                    && frame.match_text == crate::log_redact::SECRET_PLACEHOLDER
+                    && frame.context == completion_preview::RESTART_PREVIEW_WITHHELD
             }),
             "durable pending match must redeliver without an in-memory task: {matches:?}"
         );

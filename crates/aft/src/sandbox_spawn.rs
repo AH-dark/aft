@@ -4937,6 +4937,42 @@ fn isolated_environment_for_plan(
     }
 }
 
+/// Snapshot the environment selected for the child, not the daemon's ambient
+/// credentials. Unsandboxed children intentionally inherit the parent's environment.
+pub(crate) fn completion_secret_values(
+    plan: &SpawnPlan,
+    request_environment: &HashMap<String, String>,
+) -> crate::log_redact::SecretValues {
+    let mut environment =
+        isolated_environment_for_plan(plan, request_environment).unwrap_or_else(|| {
+            let mut environment: ChildEnvironment = std::env::vars_os().collect();
+            environment.extend(
+                request_environment
+                    .iter()
+                    .map(|(key, value)| (key.into(), value.into())),
+            );
+            environment
+        });
+    environment.retain(|key, _| {
+        !key.to_str().is_some_and(|key| {
+            crate::agent_child_env::is_subc_credential_env_key(key)
+                || key == crate::privacy_spawn::CONTROL_ENV
+                || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
+        })
+    });
+    if let Some(ticket) = memory_only_ticket(request_environment) {
+        environment.insert(
+            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+            ticket.into(),
+        );
+    }
+    crate::log_redact::SecretValues::from_environment(
+        environment
+            .iter()
+            .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
+    )
+}
+
 fn sandboxed_child_environment(
     request_environment: &HashMap<String, String>,
     temp_dir: &Path,
