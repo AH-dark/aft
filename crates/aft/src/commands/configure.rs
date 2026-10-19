@@ -6123,7 +6123,17 @@ fn schedule_artifact_loads_admitted(
                 let outcome = match build_result {
                     Ok(Ok(ready)) => SemanticBuildOutcome::Ready(ready),
                     Ok(Err(error)) => {
-                        slog_warn!("failed to build semantic index: {}", error);
+                        match crate::synapse_embed::classify_semantic_build_failure(&error) {
+                            crate::synapse_embed::SemanticBuildFailureClass::ModelLoading => {
+                                slog_info!(
+                                    "semantic index build waiting for Synapse model: {}",
+                                    error
+                                );
+                            }
+                            crate::synapse_embed::SemanticBuildFailureClass::Failure => {
+                                slog_warn!("failed to build semantic index: {}", error);
+                            }
+                        }
                         SemanticBuildOutcome::Failed(error)
                     }
                     Err(_) => {

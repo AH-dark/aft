@@ -11,6 +11,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The outcome that determines whether a failed publication is expected during
+/// startup or should be treated as a fault in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationFailureKind {
+    SemanticIndexWaiting,
+    Failure,
+}
+
+fn classify_publication_failure(error: &str) -> PublicationFailureKind {
+    if error == crate::context::VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX {
+        PublicationFailureKind::SemanticIndexWaiting
+    } else {
+        PublicationFailureKind::Failure
+    }
+}
+
 /// One retry deadline for both inline and detached publications of a root.
 /// Keeping it on the context preserves the delay when another scheduler wake
 /// supersedes a detached job without changing the checkout.
@@ -69,10 +85,19 @@ impl PublicationRetry {
         }
         self.error = Some(error.to_owned());
         self.due = Some(Instant::now() + self.delay);
-        // Report the first repeat, then summarize the final count on recovery
-        // or an edit. A permanently broken checkout must not flood the log.
-        let warn = self.failures <= 2;
-        if warn {
+        let waiting =
+            classify_publication_failure(error) == PublicationFailureKind::SemanticIndexWaiting;
+        // Report real failures early, then summarize them on recovery or an
+        // edit. Waiting for the semantic index is expected during warm-up.
+        let warn = self.failures <= 2 && !waiting;
+        if waiting {
+            log::debug!(
+                "content-addressed view publication waiting root={} repeat_count={} retry_ms={} error={}",
+                root.display(), self.failures, self.delay.as_millis(), error
+            );
+            #[cfg(test)]
+            tests::record_failure(root, self.delay, self.failures, false);
+        } else if warn {
             log::warn!(
                 "content-addressed view publication failed root={} repeat_count={} retry_ms={} error={}",
                 root.display(), self.failures, self.delay.as_millis(), error

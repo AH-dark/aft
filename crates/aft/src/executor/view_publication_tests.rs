@@ -10,6 +10,29 @@ use crate::{
 use crossbeam_channel::{Receiver, Sender};
 use std::{path::Path, time::Duration};
 
+#[test]
+fn semantic_index_wait_is_classified_without_changing_retry_backoff() {
+    let message = crate::context::VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX;
+    assert_eq!(
+        classify_publication_failure(message),
+        PublicationFailureKind::SemanticIndexWaiting
+    );
+    assert_eq!(
+        classify_publication_failure("view I/O failed writing manifest: permission denied"),
+        PublicationFailureKind::Failure
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let mut retry = PublicationRetry::default();
+    retry.failed(root.path(), message);
+    assert_eq!(retry.failures, 1);
+    assert_eq!(retry.delay, Duration::from_secs(1));
+    retry.failed(root.path(), message);
+    assert_eq!(retry.failures, 2);
+    assert_eq!(retry.delay, Duration::from_secs(2));
+    assert!(retry.due().is_some());
+}
+
 static CAS_TIMINGS: LazyLock<Mutex<HashMap<PathBuf, Vec<Duration>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub(super) fn record_cas(root: PathBuf, elapsed: Duration) {

@@ -3015,57 +3015,102 @@ impl BackupStore {
     }
 
     fn gc_stale_sessions(&mut self, ttl_hours: u32) {
-        let backups_dir = match self.backups_dir() {
-            Some(d) if d.exists() => d,
-            _ => return,
+        let Some(backups_dir) = self.backups_dir().filter(|path| path.exists()) else {
+            return;
         };
+        let started = std::time::Instant::now();
         let ttl_secs = u64::from(if ttl_hours == 0 { 72 } else { ttl_hours }) * 60 * 60;
         let cutoff = current_timestamp().saturating_sub(ttl_secs);
+        let mut removed = 0usize;
+        let mut kept = 0usize;
+        let mut errors = 0usize;
         let entries = match std::fs::read_dir(&backups_dir) {
             Ok(entries) => entries,
-            Err(_) => return,
+            Err(error) => {
+                errors += 1;
+                crate::slog_info!(
+                    "backup session retention sweep removed={removed} kept={kept} errors={errors} elapsed_ms={} error={error}",
+                    started.elapsed().as_millis()
+                );
+                return;
+            }
         };
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
             let session_dir = entry.path();
             if !session_dir.is_dir() || session_dir.join("meta.json").exists() {
                 continue;
             }
             // Stack acquisition uses this stable gate too. While it is held no
             // writer can create a new lease under the directory being collected.
-            let Ok(Some(_gate)) = session_gc_gate(&session_dir, false) else {
-                continue;
+            let gate = match session_gc_gate(&session_dir, false) {
+                Ok(Some(gate)) => gate,
+                Ok(None) => {
+                    kept += 1;
+                    continue;
+                }
+                Err(_) => {
+                    kept += 1;
+                    errors += 1;
+                    continue;
+                }
             };
-            let Ok(Some(stack_leases)) = acquire_inactive_session_leases(&session_dir) else {
-                continue;
+            let stack_leases = match acquire_inactive_session_leases(&session_dir) {
+                Ok(Some(stack_leases)) => stack_leases,
+                Ok(None) => {
+                    kept += 1;
+                    continue;
+                }
+                Err(_) => {
+                    kept += 1;
+                    errors += 1;
+                    continue;
+                }
             };
             let Some(last_accessed) = Self::read_session_last_accessed(&session_dir) else {
+                kept += 1;
                 continue;
             };
             if last_accessed >= cutoff {
+                kept += 1;
                 continue;
             }
             // All stack leases were inactive. Release our probe leases before
             // deletion; the stable gate still excludes new stack acquisitions.
             drop(stack_leases);
-            if let Err(e) = std::fs::remove_dir_all(&session_dir) {
+            if let Err(error) = std::fs::remove_dir_all(&session_dir) {
+                errors += 1;
+                kept += 1;
                 crate::slog_warn!(
                     "failed to remove stale backup session {}: {}",
                     session_dir.display(),
-                    e
+                    error
                 );
             } else {
+                removed += 1;
                 self.hydrated_entries
                     .get_mut()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|path, _| !path.starts_with(&session_dir));
-                crate::slog_warn!(
+                crate::slog_debug!(
                     "removed stale backup session {} (last_accessed={})",
                     session_dir.display(),
                     last_accessed
                 );
             }
+            drop(gate);
         }
+        crate::slog_info!(
+            "backup session retention sweep removed={removed} kept={kept} errors={errors} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
 
     /// One-time migration: move pre-session flat layout into the default
@@ -5648,6 +5693,44 @@ mod tests {
             fs::read(repair.session_dir(session).unwrap().join("payload")).unwrap(),
             b"beforeafter"
         );
+    }
+
+    #[test]
+    fn stale_session_gc_summarizes_removals_and_kept_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let backups = storage.path().join("backups");
+        let stale = backups.join("stale-session");
+        let fresh = backups.join("fresh-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(
+            stale.join("session.json"),
+            serde_json::to_vec(&serde_json::json!({"last_accessed": 1})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            fresh.join("session.json"),
+            serde_json::to_vec(&serde_json::json!({"last_accessed": current_timestamp()})).unwrap(),
+        )
+        .unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 1);
+
+        let (_, lines) = crate::logging::capture_log_lines(|| store.gc_stale_sessions(1));
+
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(lines.iter().any(|line| {
+            line.starts_with("INFO ")
+                && line.contains("backup session retention sweep removed=1 kept=1 errors=0")
+                && line.contains("elapsed_ms=")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("DEBUG ") && line.contains("removed stale backup session")
+        }));
+        assert!(!lines.iter().any(|line| {
+            line.starts_with("WARN ") && line.contains("removed stale backup session")
+        }));
     }
 
     #[test]

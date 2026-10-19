@@ -8404,6 +8404,47 @@ async fn hold_for_consent(
     }
 }
 
+/// Return bash_watch's normal synchronous wait window for the deadline warning.
+/// The warning uses this value only; the handler still owns and enforces the wait.
+fn bash_watch_warning_wait_ms(
+    arguments: &Value,
+    worker: bool,
+    worker_limit_ms: u64,
+    primary_cap_ms: u64,
+) -> Option<u64> {
+    let arguments = arguments.get("params").unwrap_or(arguments);
+    let requested = match arguments
+        .get("timeout_ms")
+        .or_else(|| arguments.get("timeoutMs"))
+    {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let requested = value.as_u64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+            })?;
+            if requested == 0 {
+                return None;
+            }
+            Some(requested)
+        }
+    };
+    let background = arguments
+        .get("background")
+        .and_then(crate::subc_translate::model_boolean)
+        .unwrap_or(false);
+    Some(if worker && background {
+        worker_limit_ms
+    } else if worker {
+        requested.unwrap_or(worker_limit_ms).min(worker_limit_ms)
+    } else {
+        requested
+            .unwrap_or(crate::commands::bash_watch::DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
+            .min(primary_cap_ms)
+    })
+}
+
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
@@ -8794,6 +8835,19 @@ async fn handle_tool_call(
         .map(|key| tool_provider::LedgerEdge::key(&identity, key));
     let bare_name = call.name;
     let arguments = strip_agent_preview_arg_owned(call.arguments);
+    if bare_name == "bash_watch" {
+        if let Some(ctx) = executor.actor_context(&identity.root) {
+            let worker_limit_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx);
+            if let Some(wait_ms) = bash_watch_warning_wait_ms(
+                &arguments,
+                role.is_worker(),
+                worker_limit_ms,
+                ctx.config().bash.watch_sync_max_ms,
+            ) {
+                metrics.set_bash_watch_unanswered_wait(route_id, frame.header.corr, wait_ms);
+            }
+        }
+    }
     // Decided before the arguments move into the job: slow-call logging needs
     // to know whether a person is waiting on this call.
     let caller = if manifest::is_native_plumbing_call(&bare_name, &arguments) {
