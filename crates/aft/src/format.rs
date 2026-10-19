@@ -239,12 +239,46 @@ fn wait_with_timeout(
     )
 }
 
+// The optional gh numeric-ID lookup and Ruff version check are best-effort probes.
+// Their short budget is separate from primary GitHub requests and formatter runs.
+pub(crate) const AVAILABILITY_PROBE_BUDGET: Duration = Duration::from_secs(3);
+const PROBE_CAPTURE_BYTES: usize = 4096;
+
+/// Bound the child and pipe lifetime together; callers must reject truncated output.
+pub(crate) fn capture_probe_command(
+    mut command: Command,
+    tool: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<SubprocessOutcome, FormatError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate_in_process_group(&mut command);
+    let child = command.spawn().map_err(|error| FormatError::Failed {
+        tool: tool.to_string(),
+        stderr: error.to_string(),
+    })?;
+    wait_with_deadline_with_limit(child, tool, deadline, cancelled, PROBE_CAPTURE_BYTES)
+}
+
 /// Share output capture and process-tree cleanup with deadline-bound inspect checks.
 pub(crate) fn wait_with_deadline(
+    child: Child,
+    command: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<SubprocessOutcome, FormatError> {
+    wait_with_deadline_with_limit(child, command, deadline, cancelled, MAX_CAPTURE_BYTES)
+}
+
+fn wait_with_deadline_with_limit(
     mut child: Child,
     command: &str,
     deadline: Instant,
     cancelled: impl Fn() -> bool,
+    capture_bytes: usize,
 ) -> Result<SubprocessOutcome, FormatError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     let timeout_secs = remaining
@@ -259,12 +293,12 @@ pub(crate) fn wait_with_deadline(
     let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let stdout_closed = closed_tx.clone();
     let stdout_thread = thread::spawn(move || {
-        let output = read_bounded_to_string(stdout_pipe, MAX_CAPTURE_BYTES);
+        let output = read_bounded_to_string(stdout_pipe, capture_bytes);
         let _ = stdout_closed.send(());
         output
     });
     let stderr_thread = thread::spawn(move || {
-        let output = read_bounded_to_string(stderr_pipe, MAX_CAPTURE_BYTES);
+        let output = read_bounded_to_string(stderr_pipe, capture_bytes);
         let _ = closed_tx.send(());
         output
     });
@@ -275,7 +309,7 @@ pub(crate) fn wait_with_deadline(
 
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
+            Ok(Some(status)) if open_pipes == 0 => {
                 let (stdout, stdout_truncated) = stdout_thread.join().unwrap_or_default();
                 let (stderr, stderr_truncated) = stderr_thread.join().unwrap_or_default();
                 return Ok(SubprocessOutcome {
@@ -285,7 +319,7 @@ pub(crate) fn wait_with_deadline(
                     truncated: stdout_truncated || stderr_truncated,
                 });
             }
-            Ok(None) => {
+            Ok(Some(_)) | Ok(None) => {
                 let now = Instant::now();
                 if now >= deadline || cancelled() {
                     kill_process_tree(&mut child);
@@ -301,9 +335,8 @@ pub(crate) fn wait_with_deadline(
                 }
                 let remaining = deadline - now;
                 if open_pipes > 0 {
-                    // Wait for a pipe to close, or for the deadline. Joining
-                    // the readers after exit already waits for the pipes, so
-                    // waiting for them here first delays nothing.
+                    // Child exit does not prove EOF: a descendant may still own
+                    // a pipe. Keep deadline/cancellation active until both close.
                     match closed_rx.recv_timeout(remaining.min(EXIT_POLL_MAX)) {
                         Ok(()) => open_pipes -= 1,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -665,20 +698,22 @@ fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
         Some(command) => command,
         None => return false,
     };
-    let mut version_command = match external_tool_command(&command, &["--version"]) {
+    let version_command = match external_tool_command(&command, &["--version"]) {
         Ok(command) => command,
         Err(_) => return false,
     };
-    let output = match version_command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
+    ruff_version_command_available(version_command, Instant::now() + AVAILABILITY_PROBE_BUDGET)
+}
+
+fn ruff_version_command_available(version_command: Command, deadline: Instant) -> bool {
+    let output = match capture_probe_command(version_command, "ruff", deadline, || {
+        crate::executor::current_job_cancelled()
+    }) {
+        Ok(output) if !output.truncated => output,
+        _ => return false,
     };
 
-    let version_str = String::from_utf8_lossy(&output.stdout);
+    let version_str = output.stdout;
     // Parse "ruff X.Y.Z" or just "X.Y.Z".
     let version_part = version_str
         .trim()
@@ -2747,6 +2782,79 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn u22_ruff_availability_does_not_accept_a_probe_after_its_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'ruff 0.1.2\\n'"]);
+        assert!(!ruff_version_command_available(command, Instant::now()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u22_ruff_availability_refuses_overflow_instead_of_parsing_a_prefix() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'ruff 0.1.2\\n'; head -c 5000 /dev/zero | tr '\\000' ' '",
+        ]);
+        assert!(!ruff_version_command_available(
+            command,
+            Instant::now() + AVAILABILITY_PROBE_BUDGET
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u22_expired_deadline_does_not_join_descendant_held_pipes_after_child_exit() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 1 & exit 0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_in_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        let result = wait_with_deadline(child, "held-pipes", Instant::now(), || false);
+        assert!(matches!(result, Err(FormatError::Timeout { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u22_finite_probe_marks_overflow_instead_of_accepting_a_captured_prefix() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '123\\n'; head -c 5000 /dev/zero"]);
+        let output = capture_probe_command(
+            command,
+            "probe",
+            Instant::now() + AVAILABILITY_PROBE_BUDGET,
+            || false,
+        )
+        .unwrap();
+        assert!(output.truncated);
+        assert!(output.stdout.len() <= PROBE_CAPTURE_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u22_probe_cancellation_remains_active_after_child_exit() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 1 & exit 0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_in_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        let result = wait_with_deadline(
+            child,
+            "held-pipes",
+            Instant::now() + AVAILABILITY_PROBE_BUDGET,
+            || true,
+        );
+        assert!(matches!(result, Err(FormatError::Timeout { .. })));
+    }
+
     use super::*;
     use std::fs;
     use std::io::Write;

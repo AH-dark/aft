@@ -547,6 +547,14 @@ impl ExchangeIo for SubcExchangeIo<'_> {
     }
 }
 
+fn lock_probe_stage(stage: &Mutex<ProbeStage>) -> std::sync::MutexGuard<'_, ProbeStage> {
+    // ProbeStage records diagnostic progress only; it never authorizes or settles a call.
+    // Its stored variant remains valid after a panic and can be read or replaced safely.
+    stage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Exchange<'a, Io> {
     io: &'a Io,
     ticket: &'a str,
@@ -569,7 +577,7 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
     /// nothing left the request is not sent at all, which is a known
     /// not-sent outcome rather than an unknown one.
     async fn send(&self, body: &Value) -> Result<Vec<u8>, RouteOutcome> {
-        *self.stage.lock().unwrap() = ProbeStage::Request;
+        *lock_probe_stage(self.stage) = ProbeStage::Request;
         let bytes = serde_json::to_vec(body)
             .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
         let now = self.io.now();
@@ -880,14 +888,14 @@ pub(super) fn route(
             let consumer = SubcConsumer::connect(&connection_file, options)
                 .await
                 .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
-            *setup_stage.lock().unwrap() = ProbeStage::CatalogList;
+            *lock_probe_stage(&setup_stage) = ProbeStage::CatalogList;
             let catalog = consumer
                 .catalog_list()
                 .await
                 .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
             let module_id = relay_holder(&catalog.modules)
                 .ok_or_else(|| RouteOutcome::Unavailable(RELAY_UNSERVED_TEXT.to_string()))?;
-            *setup_stage.lock().unwrap() = ProbeStage::OpenRoute;
+            *lock_probe_stage(&setup_stage) = ProbeStage::OpenRoute;
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface { module_id },
@@ -909,14 +917,14 @@ pub(super) fn route(
             // is a timeout on a busy host, not a missing daemon.
             Ok(Err(RouteOutcome::GovernanceUnavailable)) if started.elapsed() >= SETUP_TIMEOUT => {
                 return RouteOutcome::GovernanceUnavailableTimedOut {
-                    stage: *stage.lock().unwrap(),
+                    stage: *lock_probe_stage(&stage),
                     elapsed_ms: SETUP_TIMEOUT.as_millis() as u64,
                 }
             }
             Ok(Err(outcome)) => return outcome,
             Err(_) => {
                 return RouteOutcome::GovernanceUnavailableTimedOut {
-                    stage: *stage.lock().unwrap(),
+                    stage: *lock_probe_stage(&stage),
                     elapsed_ms: SETUP_TIMEOUT.as_millis() as u64,
                 }
             }

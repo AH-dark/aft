@@ -15,6 +15,19 @@ use super::super::{
 };
 use super::*;
 
+#[test]
+fn u22_poisoned_diagnostic_stage_remains_readable_and_updateable() {
+    let stage = Mutex::new(ProbeStage::CatalogList);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = stage.lock().unwrap();
+        panic!("injected diagnostic holder panic");
+    }))
+    .is_err());
+    assert!(matches!(*lock_probe_stage(&stage), ProbeStage::CatalogList));
+    *lock_probe_stage(&stage) = ProbeStage::Request;
+    assert!(matches!(*lock_probe_stage(&stage), ProbeStage::Request));
+}
+
 /// Plexus's closed refusal taxonomy, copied from plexus-core's
 /// `tests/github_acceptance/main.rs` (see tests/fixtures/plexus/SOURCE.md).
 const CLOSED_CODES: &[&str] = &[
