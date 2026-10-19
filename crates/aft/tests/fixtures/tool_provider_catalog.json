@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "34b6699589803c798ab71d0eae04c10107a8dee2364c2d071db3d492166d15f8",
-      "catalog_digest": "34b6699589803c798ab71d0eae04c10107a8dee2364c2d071db3d492166d15f8",
+      "generation": "ebb781fb7ceb8098c025aed39576e14b77be1447a2a5c109c6adb31fa4a5d285",
+      "catalog_digest": "ebb781fb7ceb8098c025aed39576e14b77be1447a2a5c109c6adb31fa4a5d285",
       "tools": [
         {
           "name": "status",
@@ -50,7 +50,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -63,7 +63,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -77,7 +77,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -1166,9 +1166,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "8f03762b42d0ccbcdced11ccea1c0261a5623535e0d29024bae6d53aa8cd6125",
-        "preflight_digest": "8f03762b42d0ccbcdced11ccea1c0261a5623535e0d29024bae6d53aa8cd6125",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "6c13f4ee0b1c75f92d35b3bd1d7b0abae31944c87c2ffa79f87744946f62cbb3",
+        "preflight_digest": "6c13f4ee0b1c75f92d35b3bd1d7b0abae31944c87c2ffa79f87744946f62cbb3",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -1217,8 +1217,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5cecd0fbebf3085d2c7b29f3dbbc867b11136ce182a998181350c291a2390d29",
-      "catalog_digest": "5cecd0fbebf3085d2c7b29f3dbbc867b11136ce182a998181350c291a2390d29",
+      "generation": "c168301122ed28bf7eeda390dc5b739b4144e8276167c9678bf657bfafccf3b3",
+      "catalog_digest": "c168301122ed28bf7eeda390dc5b739b4144e8276167c9678bf657bfafccf3b3",
       "tools": [
         {
           "name": "status",
@@ -1251,7 +1251,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -1264,7 +1264,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -1278,7 +1278,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -2367,9 +2367,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "a5c7653e23043830eda6a088504322832c50f89692d34fd0e7c148cba5a8794a",
-        "preflight_digest": "a5c7653e23043830eda6a088504322832c50f89692d34fd0e7c148cba5a8794a",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "230bdf0cf288e52f3f7b87d83d6a31acc3a4dcd23c78fda8fcee7322c0da0c3f",
+        "preflight_digest": "230bdf0cf288e52f3f7b87d83d6a31acc3a4dcd23c78fda8fcee7322c0da0c3f",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -3542,8 +3542,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "cff2f34fe2d80e0725ebd60e1c0bfb4ad26c394e19f40cd9f8b204f19fa4e4e2",
-      "catalog_digest": "cff2f34fe2d80e0725ebd60e1c0bfb4ad26c394e19f40cd9f8b204f19fa4e4e2",
+      "generation": "c72711e6680ecb35c61aa576eb9361107999f2b954cb74c38a7b0f916311f5e5",
+      "catalog_digest": "c72711e6680ecb35c61aa576eb9361107999f2b954cb74c38a7b0f916311f5e5",
       "tools": [
         {
           "name": "status",
@@ -3576,7 +3576,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -3589,7 +3589,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -3603,7 +3603,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -4647,9 +4647,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "6f043c3663d0c6b6aabf825c6727a8a7c84aca1b2499e8ca20970f1ad6f01214",
-        "preflight_digest": "6f043c3663d0c6b6aabf825c6727a8a7c84aca1b2499e8ca20970f1ad6f01214",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "eb65bf54b8b3951802c53189cd98a1fa26cb2159e24a71cfd2885da9f8ba2126",
+        "preflight_digest": "eb65bf54b8b3951802c53189cd98a1fa26cb2159e24a71cfd2885da9f8ba2126",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -4699,8 +4699,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "86710c08ed1d20db77bf829087344c3db78f112b2dda019a5fcc384a965e8169",
-      "catalog_digest": "86710c08ed1d20db77bf829087344c3db78f112b2dda019a5fcc384a965e8169",
+      "generation": "093aaae6bca17a58f249bf7dec0ace54fd7a4da2d447c72742192e5e97e6b72e",
+      "catalog_digest": "093aaae6bca17a58f249bf7dec0ace54fd7a4da2d447c72742192e5e97e6b72e",
       "tools": [
         {
           "name": "status",
@@ -4733,7 +4733,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -4746,7 +4746,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -4760,7 +4760,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -5801,9 +5801,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "a90c7006b077eedb8df1efc2df4add61254f76c7a4e22c90199b60f795dc62f7",
-        "preflight_digest": "a90c7006b077eedb8df1efc2df4add61254f76c7a4e22c90199b60f795dc62f7",
+        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "9870d9cb8d5b26b200ec39261a62139a5609edcb9ad687eb1917ab6d9c67c72c",
+        "preflight_digest": "9870d9cb8d5b26b200ec39261a62139a5609edcb9ad687eb1917ab6d9c67c72c",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -5854,8 +5854,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5c1e6373005edb9b33c84d99031a86e3e0bb63b9354bf483c7255b95bb3506b4",
-      "catalog_digest": "5c1e6373005edb9b33c84d99031a86e3e0bb63b9354bf483c7255b95bb3506b4",
+      "generation": "3adb5c224426be79cef2cdcdb772b0af7088104585a700696ac2b5f6220828ba",
+      "catalog_digest": "3adb5c224426be79cef2cdcdb772b0af7088104585a700696ac2b5f6220828ba",
       "tools": [
         {
           "name": "status",
@@ -5888,7 +5888,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -5901,7 +5901,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -5915,7 +5915,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -6900,9 +6900,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "45629cd02a7f6aae12a34e61cf49c49146a397f2aff3ac1d37cd00cf47331e0f",
-        "preflight_digest": "45629cd02a7f6aae12a34e61cf49c49146a397f2aff3ac1d37cd00cf47331e0f",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "80a49aaf23f94a79cfbeb06e36cda066b197d312a3339007c4311f1dda913ef7",
+        "preflight_digest": "80a49aaf23f94a79cfbeb06e36cda066b197d312a3339007c4311f1dda913ef7",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -6952,8 +6952,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e4296c95cab19611a0207cdb7988f0da5f6964a09693c1735ffe11173484bbbd",
-      "catalog_digest": "e4296c95cab19611a0207cdb7988f0da5f6964a09693c1735ffe11173484bbbd",
+      "generation": "686eaa21722d68032a75136cafa3476bc05b87e7e46750eac5392ead47580888",
+      "catalog_digest": "686eaa21722d68032a75136cafa3476bc05b87e7e46750eac5392ead47580888",
       "tools": [
         {
           "name": "status",
@@ -6986,7 +6986,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -6999,7 +6999,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -7013,7 +7013,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -7995,9 +7995,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "0bf1e9f5cbdd027593d25157955bb743907bb70ca32920a1bd1001bd03d47c73",
-        "preflight_digest": "0bf1e9f5cbdd027593d25157955bb743907bb70ca32920a1bd1001bd03d47c73",
+        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "55aec4affba3e2514bf6671e7d0af87e6c9a6f697ff1f1d5905b9d31afe97c0b",
+        "preflight_digest": "55aec4affba3e2514bf6671e7d0af87e6c9a6f697ff1f1d5905b9d31afe97c0b",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -8047,8 +8047,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "86c2541001a0cec05e2fb53722442fe931b25d1633b65ded0914ae1796d55446",
-      "catalog_digest": "86c2541001a0cec05e2fb53722442fe931b25d1633b65ded0914ae1796d55446",
+      "generation": "3f4e88e5a2177112ed6675de2edb14cbb8edb400eee954c2d73c2d62f84b183f",
+      "catalog_digest": "3f4e88e5a2177112ed6675de2edb14cbb8edb400eee954c2d73c2d62f84b183f",
       "tools": [
         {
           "name": "status",
@@ -8081,7 +8081,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -8094,7 +8094,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -8108,7 +8108,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -9058,9 +9058,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "07a7cdd2a64175c7579e5018886ab1177ceb2a4f41b42f113327b4f7b94034d0",
-        "preflight_digest": "07a7cdd2a64175c7579e5018886ab1177ceb2a4f41b42f113327b4f7b94034d0",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "f8fddaa6976807859328547e7f9fc669bf6fad23633928b1a6fab316c7a9d0a8",
+        "preflight_digest": "f8fddaa6976807859328547e7f9fc669bf6fad23633928b1a6fab316c7a9d0a8",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -9110,8 +9110,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2247768eac62ce5ff6dfa217daa95cb116ef04c5a50dccfd1e28ae120ddfab71",
-      "catalog_digest": "2247768eac62ce5ff6dfa217daa95cb116ef04c5a50dccfd1e28ae120ddfab71",
+      "generation": "5d84769cd74eceb35b0af86076c4bf85b12d4b73168c4526a20e45e17d34b9ea",
+      "catalog_digest": "5d84769cd74eceb35b0af86076c4bf85b12d4b73168c4526a20e45e17d34b9ea",
       "tools": [
         {
           "name": "status",
@@ -9144,7 +9144,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -9157,7 +9157,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -9171,7 +9171,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -10118,9 +10118,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "d5e4676681d2a415a504ffbd1ad9de7ec9019f4c1af19716625145de29002f51",
-        "preflight_digest": "d5e4676681d2a415a504ffbd1ad9de7ec9019f4c1af19716625145de29002f51",
+        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "c4261b46fafbd5efd7d58e086c38cbb43c8dab5441e612a789796ee42d9b1421",
+        "preflight_digest": "c4261b46fafbd5efd7d58e086c38cbb43c8dab5441e612a789796ee42d9b1421",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -10167,8 +10167,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d8e9316e18d2f25c6016a9160f740cbb9001b31ddc5e79e30bad5859c7ed1de9",
-      "catalog_digest": "d8e9316e18d2f25c6016a9160f740cbb9001b31ddc5e79e30bad5859c7ed1de9",
+      "generation": "8d052246a5c014163951857430b5c32f64609408b96ca44518c106dc03d0825c",
+      "catalog_digest": "8d052246a5c014163951857430b5c32f64609408b96ca44518c106dc03d0825c",
       "tools": [
         {
           "name": "status",
@@ -10201,7 +10201,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -10214,7 +10214,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -10228,7 +10228,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -10287,7 +10287,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -10301,7 +10301,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -11390,9 +11390,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "8f03762b42d0ccbcdced11ccea1c0261a5623535e0d29024bae6d53aa8cd6125",
-        "preflight_digest": "8f03762b42d0ccbcdced11ccea1c0261a5623535e0d29024bae6d53aa8cd6125",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "6c13f4ee0b1c75f92d35b3bd1d7b0abae31944c87c2ffa79f87744946f62cbb3",
+        "preflight_digest": "6c13f4ee0b1c75f92d35b3bd1d7b0abae31944c87c2ffa79f87744946f62cbb3",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -11442,8 +11442,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a6019216d4c44c8d3e8f22c7c77abebb2a1797d68d8dfaa23903313788421619",
-      "catalog_digest": "a6019216d4c44c8d3e8f22c7c77abebb2a1797d68d8dfaa23903313788421619",
+      "generation": "524752ac3b49ee3c88368eb2faf8ee003ce2e029ca2bc5eb63aedcc0a25cb1c4",
+      "catalog_digest": "524752ac3b49ee3c88368eb2faf8ee003ce2e029ca2bc5eb63aedcc0a25cb1c4",
       "tools": [
         {
           "name": "status",
@@ -11476,7 +11476,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -11489,7 +11489,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -11503,7 +11503,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -11562,7 +11562,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -11576,7 +11576,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -12665,9 +12665,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "a5c7653e23043830eda6a088504322832c50f89692d34fd0e7c148cba5a8794a",
-        "preflight_digest": "a5c7653e23043830eda6a088504322832c50f89692d34fd0e7c148cba5a8794a",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "230bdf0cf288e52f3f7b87d83d6a31acc3a4dcd23c78fda8fcee7322c0da0c3f",
+        "preflight_digest": "230bdf0cf288e52f3f7b87d83d6a31acc3a4dcd23c78fda8fcee7322c0da0c3f",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -12719,8 +12719,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bd61c6a9669d5caab98c2a46af3eca07d0257074080462522a7c59243a00ad5d",
-      "catalog_digest": "bd61c6a9669d5caab98c2a46af3eca07d0257074080462522a7c59243a00ad5d",
+      "generation": "2fc5bd3029ba411b1c8ede30bd313aa987e3902e56c81d03bdd856d32324f0bd",
+      "catalog_digest": "2fc5bd3029ba411b1c8ede30bd313aa987e3902e56c81d03bdd856d32324f0bd",
       "tools": [
         {
           "name": "status",
@@ -12759,7 +12759,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -12773,7 +12773,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -13915,8 +13915,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fd2e8c7e97870e91f94f21e07246615bb43c7265e3fed45a7030efa331348868",
-      "catalog_digest": "fd2e8c7e97870e91f94f21e07246615bb43c7265e3fed45a7030efa331348868",
+      "generation": "ff3a348b826c1fa8c3722d6b70b351e3b093543d2c86000254b17a06ef484c51",
+      "catalog_digest": "ff3a348b826c1fa8c3722d6b70b351e3b093543d2c86000254b17a06ef484c51",
       "tools": [
         {
           "name": "status",
@@ -13949,7 +13949,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -13962,7 +13962,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -13976,7 +13976,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -14035,7 +14035,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -14049,7 +14049,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -15093,9 +15093,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "6f043c3663d0c6b6aabf825c6727a8a7c84aca1b2499e8ca20970f1ad6f01214",
-        "preflight_digest": "6f043c3663d0c6b6aabf825c6727a8a7c84aca1b2499e8ca20970f1ad6f01214",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "eb65bf54b8b3951802c53189cd98a1fa26cb2159e24a71cfd2885da9f8ba2126",
+        "preflight_digest": "eb65bf54b8b3951802c53189cd98a1fa26cb2159e24a71cfd2885da9f8ba2126",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -15146,8 +15146,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "47e271e4b16b6622bfd6b492cba68595db9ef2529934914d5e7e4ce533a86ad1",
-      "catalog_digest": "47e271e4b16b6622bfd6b492cba68595db9ef2529934914d5e7e4ce533a86ad1",
+      "generation": "8a0cdcdeab2d21c8fee22f6d2f34815094b81083964e6edf5aa143af4912f38a",
+      "catalog_digest": "8a0cdcdeab2d21c8fee22f6d2f34815094b81083964e6edf5aa143af4912f38a",
       "tools": [
         {
           "name": "status",
@@ -15180,7 +15180,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -15193,7 +15193,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -15207,7 +15207,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -15266,7 +15266,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -15280,7 +15280,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -16321,9 +16321,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "a90c7006b077eedb8df1efc2df4add61254f76c7a4e22c90199b60f795dc62f7",
-        "preflight_digest": "a90c7006b077eedb8df1efc2df4add61254f76c7a4e22c90199b60f795dc62f7",
+        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "9870d9cb8d5b26b200ec39261a62139a5609edcb9ad687eb1917ab6d9c67c72c",
+        "preflight_digest": "9870d9cb8d5b26b200ec39261a62139a5609edcb9ad687eb1917ab6d9c67c72c",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -16375,8 +16375,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2809b7e2014e5cb5b5afd7eebd780d1eb218f981b18c0c89f21dc6df0bb8ff11",
-      "catalog_digest": "2809b7e2014e5cb5b5afd7eebd780d1eb218f981b18c0c89f21dc6df0bb8ff11",
+      "generation": "95fe8d094b6c913306ca8b32b7f9ea531d31183fbba6a095d86bae34ba65460f",
+      "catalog_digest": "95fe8d094b6c913306ca8b32b7f9ea531d31183fbba6a095d86bae34ba65460f",
       "tools": [
         {
           "name": "status",
@@ -16409,7 +16409,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -16422,7 +16422,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -16436,7 +16436,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -16495,7 +16495,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -16509,7 +16509,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -17494,9 +17494,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "45629cd02a7f6aae12a34e61cf49c49146a397f2aff3ac1d37cd00cf47331e0f",
-        "preflight_digest": "45629cd02a7f6aae12a34e61cf49c49146a397f2aff3ac1d37cd00cf47331e0f",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "80a49aaf23f94a79cfbeb06e36cda066b197d312a3339007c4311f1dda913ef7",
+        "preflight_digest": "80a49aaf23f94a79cfbeb06e36cda066b197d312a3339007c4311f1dda913ef7",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -17547,8 +17547,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7923c4a79c7364719cde5322889b2f7cc757a71d8efba65b3ad674d382cc2df6",
-      "catalog_digest": "7923c4a79c7364719cde5322889b2f7cc757a71d8efba65b3ad674d382cc2df6",
+      "generation": "88d8b236d98750a51e639574fbcce32d5917d3a56c78c710510343d08b9cd265",
+      "catalog_digest": "88d8b236d98750a51e639574fbcce32d5917d3a56c78c710510343d08b9cd265",
       "tools": [
         {
           "name": "status",
@@ -17581,7 +17581,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -17594,7 +17594,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -17608,7 +17608,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -17667,7 +17667,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -17681,7 +17681,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -18663,9 +18663,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "0bf1e9f5cbdd027593d25157955bb743907bb70ca32920a1bd1001bd03d47c73",
-        "preflight_digest": "0bf1e9f5cbdd027593d25157955bb743907bb70ca32920a1bd1001bd03d47c73",
+        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "55aec4affba3e2514bf6671e7d0af87e6c9a6f697ff1f1d5905b9d31afe97c0b",
+        "preflight_digest": "55aec4affba3e2514bf6671e7d0af87e6c9a6f697ff1f1d5905b9d31afe97c0b",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -18716,8 +18716,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2725d4130443f1a65558127dd8691b32e4785029a2f3b7081a5d4a50766e9eb9",
-      "catalog_digest": "2725d4130443f1a65558127dd8691b32e4785029a2f3b7081a5d4a50766e9eb9",
+      "generation": "1db4bae734c4117dc6330d335473ba9f07a40bd75a75b499fc76c321dc185e7f",
+      "catalog_digest": "1db4bae734c4117dc6330d335473ba9f07a40bd75a75b499fc76c321dc185e7f",
       "tools": [
         {
           "name": "status",
@@ -18750,7 +18750,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -18763,7 +18763,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -18777,7 +18777,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -18836,7 +18836,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -18850,7 +18850,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -19800,9 +19800,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "07a7cdd2a64175c7579e5018886ab1177ceb2a4f41b42f113327b4f7b94034d0",
-        "preflight_digest": "07a7cdd2a64175c7579e5018886ab1177ceb2a4f41b42f113327b4f7b94034d0",
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "f8fddaa6976807859328547e7f9fc669bf6fad23633928b1a6fab316c7a9d0a8",
+        "preflight_digest": "f8fddaa6976807859328547e7f9fc669bf6fad23633928b1a6fab316c7a9d0a8",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -19853,8 +19853,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "469a41b3f9b6f320d026a76b00ba95b97c93a8f31b901d163b888335cb768094",
-      "catalog_digest": "469a41b3f9b6f320d026a76b00ba95b97c93a8f31b901d163b888335cb768094",
+      "generation": "28afa78d9b9446f9f660d03cc32d7bc481c050e718385b3404d2d0f6c102bbd4",
+      "catalog_digest": "28afa78d9b9446f9f660d03cc32d7bc481c050e718385b3404d2d0f6c102bbd4",
       "tools": [
         {
           "name": "status",
@@ -19887,7 +19887,7 @@
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. Do not change or delete files a background command uses until it finishes. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "reply": {
             "max_ms": 1830000
           },
@@ -19900,7 +19900,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -19914,7 +19914,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -19973,7 +19973,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms; AFT may hand back a still-running task earlier to leave transport headroom. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -19987,7 +19987,7 @@
                 "type": "string"
               },
               "wait": {
-                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
                 "type": "boolean"
               },
               "sandbox": {
@@ -20934,9 +20934,9 @@
         }
       ],
       "system_text": {
-        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n",
-        "item_digest": "d5e4676681d2a415a504ffbd1ad9de7ec9019f4c1af19716625145de29002f51",
-        "preflight_digest": "d5e4676681d2a415a504ffbd1ad9de7ec9019f4c1af19716625145de29002f51",
+        "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n",
+        "item_digest": "c4261b46fafbd5efd7d58e086c38cbb43c8dab5441e612a789796ee42d9b1421",
+        "preflight_digest": "c4261b46fafbd5efd7d58e086c38cbb43c8dab5441e612a789796ee42d9b1421",
         "tool_names": [
           "apply_patch",
           "ast_replace",

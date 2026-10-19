@@ -1533,6 +1533,7 @@ struct PendingBashAsk {
     worker_session: bool,
     /// The call selected the catalog's worker preset rather than a plugin flag.
     worker_preset: bool,
+    reply_budget: crate::commands::blocking_wait::ReplyBudget,
     asked_at: Instant,
     expires_at: Instant,
 }
@@ -3241,7 +3242,7 @@ async fn handle_bash_elicitation_reply(
                 // A call admitted through a permission prompt runs on a bind
                 // without first-party trust; remote runs are not offered there.
                 remote_policy::RemoteSource::None,
-                Instant::now(),
+                pending.reply_budget,
             );
             return Ok(());
         }
@@ -8489,6 +8490,10 @@ async fn handle_tool_call(
         Ok(envelope) => envelope,
         Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
     };
+    let reply_budget = crate::commands::blocking_wait::ReplyBudget::from_envelope(
+        phase_trace.received_at(),
+        &envelope,
+    );
     if flow_read::intercept(&identity, &envelope) {
         return flow_read::dispatch(
             tx,
@@ -9089,8 +9094,9 @@ async fn handle_tool_call(
                     repeat,
                     worker_session: role.is_worker(),
                     worker_preset,
+                    reply_budget,
                     asked_at: Instant::now(),
-                    expires_at: Instant::now() + bash_elicitation_timeout(),
+                    expires_at: reply_budget.cap(Instant::now() + bash_elicitation_timeout()),
                 },
             );
             return send_reliable_writer_frame(tx, metrics, ask_frame, "bash elicitation request")
@@ -9154,7 +9160,7 @@ async fn handle_tool_call(
             access_grants::alfonso_worker(&identity),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
             remote_policy::source(&identity, call.preset.as_deref()),
-            phase_trace.received_at(),
+            reply_budget,
         );
         return Ok(());
     }
@@ -9278,10 +9284,11 @@ async fn handle_tool_call(
                     }
                     Ok(prepared) => {
                         let outcome = if bare_name_for_run == "inspect" {
-                            crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                            crate::commands::inspect::handle_inspect_deferred_with_reply_deadline(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
+                                Some(reply_budget.deadline),
                             )
                         } else if bare_name_for_run == "delete" {
                             crate::commands::delete_file::handle_delete_deferred_with_restriction(
@@ -9290,15 +9297,17 @@ async fn handle_tool_call(
                                 matches!(bind_trust, BindTrust::Untrusted),
                             )
                         } else if bare_name_for_run == "bash_watch" {
-                            crate::commands::bash_watch::handle_deferred(
+                            crate::commands::bash_watch::handle_deferred_with_budget(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
+                                reply_budget,
                             )
                         } else {
-                            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
+                            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
+                                Some(reply_budget.deadline),
                             )
                         };
                         match outcome {
@@ -10875,6 +10884,16 @@ pub(crate) mod test_support {
 
     #[tokio::test]
     async fn scoped_worker_watch_recovers_under_route_harness_before_replay() {
+        scoped_worker_watch_case(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_worker_watch_uses_envelope_client_deadline() {
+        scoped_worker_watch_case(true).await;
+    }
+
+    async fn scoped_worker_watch_case(short_deadline: bool) {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
@@ -10940,6 +10959,60 @@ pub(crate) mod test_support {
             ),
             made_tool_call: AtomicBool::new(false),
         }));
+        let live_task = if short_deadline {
+            ctx.update_config(|config| config.experimental_bash_background = true);
+            let spawn = serde_json::from_value(json!({
+                "id":"start-scoped-watch", "command":"bash", "session_id":session,
+                "worker_session":true,
+                "params":{"command":"sleep 10", "background":true, "timeout":10000},
+            }))
+            .unwrap();
+            let launched = crate::sandbox_spawn::with_authenticated_principal(
+                identity.spawn_principal.clone(),
+                || crate::commands::bash::handle(&spawn, &ctx),
+            );
+            assert!(launched.success, "{launched:?}");
+            Some(launched.data["task_id"].as_str().unwrap().to_string())
+        } else {
+            None
+        };
+        struct StopTask(
+            crate::bash_background::BgTaskRegistry,
+            Option<String>,
+            String,
+        );
+        impl Drop for StopTask {
+            fn drop(&mut self) {
+                if let Some(task) = &self.1 {
+                    let _ = self.0.kill(task, &self.2);
+                }
+            }
+        }
+        let _stop = StopTask(
+            ctx.bash_background().clone(),
+            live_task.clone(),
+            session.into(),
+        );
+        let task_id = live_task.as_deref().unwrap_or(task_id);
+        let started = Instant::now();
+        let received_at = if short_deadline {
+            started - Duration::from_millis(400)
+        } else {
+            started
+        };
+        let mut body = json!({
+            "name": "bash_watch", "preset": "worker",
+            "arguments": {"taskId": task_id, "timeoutMs": 1_800_000},
+        });
+        if short_deadline {
+            body["deadline_ms"] = json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 1_000
+            );
+        }
         let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
             FrameType::Request,
@@ -10947,11 +11020,7 @@ pub(crate) mod test_support {
             41,
             1,
             7,
-            serde_json::to_vec(&json!({
-                "name": "bash_watch", "preset": "worker",
-                "arguments": {"taskId": task_id, "timeoutMs": 1_800_000},
-            }))
-            .unwrap(),
+            serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
         let (writer, mut replies) = mpsc::channel(8);
@@ -10967,7 +11036,7 @@ pub(crate) mod test_support {
             &frame,
             None,
             None,
-            PhaseTrace::new(Instant::now()),
+            PhaseTrace::new(received_at),
             &routes,
             &HashMap::new(),
             &ReclaimedRoutes::default(),
@@ -11007,6 +11076,16 @@ pub(crate) mod test_support {
             }
         }).await.expect("scoped watch must recover before its 30-minute window");
         assert!(response.success, "{response:?}");
+        if short_deadline {
+            assert_eq!(response.data["status"], "running", "{response:?}");
+            assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+            assert!(
+                started.elapsed() < Duration::from_millis(650),
+                "queued watch missed shortened reply cutoff: {:?}",
+                started.elapsed()
+            );
+            return;
+        }
         assert_eq!(response.data["status"], "failed");
         assert_eq!(response.data["exit_code"], 1);
         assert_eq!(response.data["waited"]["reason"], "exited");
@@ -14169,6 +14248,7 @@ mod tests {
                     repeat: None,
                     worker_session: false,
                     worker_preset: false,
+                    reply_budget: Instant::now().into(),
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + Duration::from_secs(60),
                 },

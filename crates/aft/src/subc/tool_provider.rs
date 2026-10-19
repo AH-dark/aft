@@ -371,7 +371,7 @@ pub(super) fn broca_text(names: &[&str], worker: bool) -> String {
     let mut text = String::from("# Agent File Tools\n\n");
     code_tool_lines(&mut text, has);
     if has("bash") {
-        text.push_str("Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n");
+        text.push_str("Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline), then hands back a still-running task; no completion subscriber is required.\n");
     }
     if worker {
         text.push_str(WORKER_SCOPE_LINE);
@@ -390,7 +390,7 @@ pub(super) fn worker_text(names: &[&str]) -> String {
     let mut text = String::from("# Agent File Tools\n\n");
     code_tool_lines(&mut text, has);
     if has("bash") {
-        text.push_str("Use bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\n");
+        text.push_str("Use bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline) and reports that the command is still running.\n");
     }
     if has("bash_watch") {
         text.push_str("A command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\n");
@@ -3087,7 +3087,7 @@ mod tests {
             assert_eq!(names(&worker), expected, "pwsh={available}");
             let watch = description(&worker, "bash_watch");
             assert!(watch.contains("never wakes you"), "{watch}");
-            assert!(watch.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
+            assert!(watch.contains("`bash.worker_wait_max_ms`, configured default 30 minutes; AFT shortens waits for transport headroom, capped at 27m27s without a client deadline"));
             let mut worded = vec!["bash", "bash_status", "bash_watch"];
             if available {
                 worded.push("powershell");
@@ -3147,7 +3147,7 @@ mod tests {
                 system_text_digest(text)
             );
             assert!(text.contains("bash_watch"), "{text}");
-            assert!(text.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
+            assert!(text.contains("`bash.worker_wait_max_ms`, configured default 30 minutes; shortened for transport headroom, capped at 27m27s without a client deadline"));
             for phrase in HEAD_ONLY_WORDING {
                 assert!(!text.to_lowercase().contains(phrase), "{phrase:?}: {text}");
             }
@@ -3515,7 +3515,7 @@ mod tests {
             let worker = role.is_worker();
             assert_eq!(
                 orchestrate::blocking_wait_cap_ms(true, 1_800_000),
-                Some(1_800_000),
+                Some(1_647_000),
                 "{role:?} wait cap"
             );
             let promotion = orchestrate::format_promotion_message(

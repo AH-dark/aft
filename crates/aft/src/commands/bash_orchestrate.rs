@@ -505,9 +505,11 @@ pub fn build_bash_outcome(
         &task_id,
         detach_on_user_message,
     ));
+    // Reply headroom shortens the wait, not the command's idle-kill renewal.
+    let worker_kill_renew_ms = worker_wait_max_ms(ctx);
     let worker_cap_ms = blocking_wait_cap_ms(
         params.block_to_completion || params.wait,
-        worker_wait_max_ms(ctx),
+        worker_kill_renew_ms,
     );
     let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
         select_foreground_wait_window_ms(
@@ -536,11 +538,11 @@ pub fn build_bash_outcome(
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
         // All blocking calls have a wait cap, but only delegated workers renew
         // the default hard kill. A primary session keeps its original limit.
-        if let Some(cap_ms) = worker_cap_ms.filter(|_| worker_session) {
+        if worker_session && worker_cap_ms.is_some() {
             ctx.bash_background().renew_hard_kill(
                 &task_id_for_poll,
                 &session_id_for_poll,
-                Duration::from_millis(cap_ms),
+                Duration::from_millis(worker_kill_renew_ms),
             );
         }
         // Foreground polls only need task state. Terminal snapshots still
@@ -1247,11 +1249,12 @@ pub(crate) fn worker_wait_max_ms(ctx: &AppContext) -> u64 {
 }
 
 /// Every session's blocking bash call (`wait: true` or `block_to_completion`)
-/// is bounded by `bash.worker_wait_max_ms`. Ordinary foreground calls use the
+/// is bounded by `bash.worker_wait_max_ms` and the transport-safe fallback cap.
+/// Ordinary foreground calls use the
 /// shorter foreground window. The cap returns control without changing an
 /// explicit command timeout, which still governs the process's lifetime.
 pub(crate) fn blocking_wait_cap_ms(blocking: bool, limit_ms: u64) -> Option<u64> {
-    blocking.then_some(limit_ms)
+    blocking.then(|| crate::commands::blocking_wait::clamp_worker_wait_ms(limit_ms))
 }
 
 pub(crate) fn select_foreground_wait_window_ms(

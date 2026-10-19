@@ -1180,13 +1180,31 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     ctx: Arc<AppContext>,
     force_restrict: bool,
 ) -> DispatchOutcome {
+    handle_inspect_deferred_with_reply_deadline(req, ctx, force_restrict, None)
+}
+
+pub(crate) fn handle_inspect_deferred_with_reply_deadline(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    force_restrict: bool,
+    reply_deadline: Option<Instant>,
+) -> DispatchOutcome {
     if req.worker_session() {
         ctx.lsp().disable_rust_cargo_for_worker();
     }
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
-    let deadline = InspectRequestDeadline::from_config(&ctx.config());
+    let mut deadline = InspectRequestDeadline::from_config(&ctx.config());
+    if let Some(reply_deadline) = reply_deadline {
+        deadline.terminal_at = deadline.terminal_at.min(reply_deadline);
+        deadline.budget = deadline
+            .terminal_at
+            .saturating_duration_since(Instant::now());
+        deadline.work_at = deadline
+            .work_at
+            .min(deadline.terminal_at - INSPECT_TERMINAL_MARGIN.min(deadline.budget / 2));
+    }
     let snapshot = match inspect_preflight(req, &ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
@@ -7428,6 +7446,38 @@ mod deferred_terminal_tests {
             assert!(Instant::now() < deadline, "inspect terminal timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn deferred_inspect_respects_caller_reply_deadline() {
+        let _serial = deferred_inspect_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "hello\n").unwrap();
+        let ctx = deferred_test_context(root.path());
+        let (started_rx, _release_tx) = install_deferred_inspect_body_gate_for_test();
+        let started = Instant::now();
+        let request = serde_json::from_value(serde_json::json!({
+            "id":"inspect-client-deadline", "command":"inspect", "sections":["todos"], "scope":"note.txt"
+        })).unwrap();
+        let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred_with_reply_deadline(
+            &request,
+            ctx.clone(),
+            false,
+            Some(started + Duration::from_millis(500)),
+        ) else {
+            panic!("inspect must defer");
+        };
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let response = wait_for_pending_terminal(&mut pending, &ctx);
+        assert_eq!(
+            response.data["failure_reason"], "inspect_request_timeout",
+            "{response:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "inspect missed caller reply deadline: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
