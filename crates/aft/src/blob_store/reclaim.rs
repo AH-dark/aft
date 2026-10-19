@@ -143,7 +143,11 @@ fn reclaim_inner(
     let after: u64 = connection.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
     report.reclaimed_pages = free.saturating_sub(after);
     report.reclaimed_bytes = report.reclaimed_pages * page_size;
-    report.deferred |= after >= pages.div_ceil(5) && after * page_size >= policy.min_free_bytes;
+    // Judge what remains against the database's current size: reclaiming pages
+    // shrinks the file, so the starting page count understates the free share.
+    let remaining_pages: u64 = connection.pragma_query_value(None, "page_count", |r| r.get(0))?;
+    report.deferred |=
+        after >= remaining_pages.div_ceil(5) && after * page_size >= policy.min_free_bytes;
     Ok(report)
 }
 
@@ -193,6 +197,36 @@ mod tests {
         }
         assert!(pages(&c) < initial);
         assert!(pages(&c) > initial - 100);
+    }
+
+    #[test]
+    fn deferred_matches_eligibility_of_the_shrunk_database() {
+        // Free shares near the 20% line, so a pass can drop the remaining share
+        // below 20% of the starting size while it still exceeds 20% of the new one.
+        for deleted in 95..=140 {
+            let c = fixture("INCREMENTAL", deleted);
+            let report = reclaim_with_policy(
+                &c,
+                None,
+                &|| false,
+                Policy {
+                    min_free_bytes: 0,
+                    max_pages: 8,
+                    step_pages: 4,
+                },
+            )
+            .unwrap();
+            let free: u64 = c
+                .pragma_query_value(None, "freelist_count", |r| r.get(0))
+                .unwrap();
+            let eligible = free > 0 && free >= pages(&c).div_ceil(5);
+            assert_eq!(
+                report.deferred,
+                eligible,
+                "deleted={deleted}: free={free} pages={}",
+                pages(&c)
+            );
+        }
     }
 
     #[test]
