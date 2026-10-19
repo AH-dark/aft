@@ -1057,3 +1057,42 @@ fn describe_session_agent_mismatch(
 #[cfg(test)]
 #[path = "gh_shim_relay_client_tests.rs"]
 mod tests;
+
+/// Resolve worker policy from the ticket's daemon-stamped route, never from a
+/// caller-supplied session id or an environment variable claiming to be a worker.
+pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, String> {
+    let Some(ticket) = relay.ticket.as_deref().filter(|ticket| !ticket.is_empty()) else {
+        return Ok(None);
+    };
+    let connection = relay
+        .connection_file
+        .as_ref()
+        .ok_or("worker read session lookup requires the AFT daemon connection")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(SETUP_TIMEOUT, async {
+            let consumer = SubcConsumer::connect(connection, ConsumerOptions {
+                call_timeout: SETUP_TIMEOUT, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
+            }).await.map_err(|error| format!("worker read session lookup failed: {error}"))?;
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            let route = consumer.open_route(
+                RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
+                BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-session"),
+                CallOptions::default(),
+            ).await.map_err(|error| format!("worker read session lookup is unavailable; restart the AFT daemon: {error}"))?;
+            let request = json!({"op": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "params": {"ticket": ticket}});
+            let reply = consumer.request(&route, serde_json::to_vec(&request).map_err(|error| error.to_string())?, CallOptions::default()).await;
+            let _ = consumer.close_handle(&route, CloseRouteOptions::default()).await;
+            let bytes = reply.map_err(|error| format!("worker read session lookup failed: {error}"))?;
+            let envelope: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if envelope["status"] != "ok" {
+                if envelope["data"]["refusal_code"] == "session_unscoped" { return Ok(None); }
+                return Err(format!("worker read session lookup refused: {}", envelope["data"]["message"].as_str().unwrap_or("no authenticated session context")));
+            }
+            envelope["data"]["worker"].as_bool().map(Some).ok_or_else(|| "the daemon returned no authenticated worker context".to_string())
+        }).await.map_err(|_| "worker read session lookup timed out; the command was not run".to_string())?
+    })
+}

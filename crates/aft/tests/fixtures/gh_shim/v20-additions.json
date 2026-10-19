@@ -1,0 +1,23 @@
+{
+  "manifest_version": 20,
+  "worker_reads": [
+    { "tuple": "api", "platform": ["macos", "linux"] },
+    { "tuple": "run list", "platform": ["macos", "linux"] },
+    { "tuple": "run view", "platform": ["macos", "linux"] },
+    { "tuple": "pr list", "platform": ["macos", "linux"] },
+    { "tuple": "pr view", "platform": ["macos", "linux"] },
+    { "tuple": "pr diff", "platform": ["macos", "linux"] },
+    { "tuple": "pr files", "platform": ["macos", "linux"] },
+    { "tuple": "pr checks", "platform": ["macos", "linux"] },
+    { "tuple": "issue list", "platform": ["macos", "linux"] },
+    { "tuple": "issue view", "platform": ["macos", "linux"] },
+    { "tuple": "issue comments", "platform": ["macos", "linux"] },
+    { "tuple": "workflow list", "platform": ["macos", "linux"] },
+    { "tuple": "workflow view", "platform": ["macos", "linux"] },
+    { "tuple": "release list", "platform": ["macos", "linux"] },
+    { "tuple": "release view", "platform": ["macos", "linux"] },
+    { "tuple": "repo view", "platform": ["macos", "linux"] },
+    { "tuple": "search code", "platform": ["macos", "linux"] },
+    { "tuple": "search issues", "platform": ["macos", "linux"] }
+  ]
+}

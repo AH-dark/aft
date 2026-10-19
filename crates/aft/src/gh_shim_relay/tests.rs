@@ -1390,3 +1390,108 @@ fn the_relay_has_no_assertion_mint_call() {
     assert!(!source.contains("assertion_mint"));
     assert!(!source.contains("ManagementSurface"));
 }
+
+#[test]
+fn session_context_uses_the_redeemed_ticket_and_authenticated_worker_stamp() {
+    use subc_protocol::scope::ScopeKind;
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-context", "context-call", "/p");
+    let transport = FakeTransport::scoped();
+    for (kind, parented, expected) in [
+        (ScopeKind::Head, false, false),
+        (ScopeKind::Worker, false, true),
+        (ScopeKind::Ephemeral, false, false),
+        (ScopeKind::Ephemeral, true, true),
+    ] {
+        let mut scope = serde_json::to_value(delegating_stamp()).unwrap();
+        scope["kind"] = serde_json::to_value(kind).unwrap();
+        if parented {
+            scope["parent"] = json!({"owner":scope["owner"],"ref":"head-parent","scope_epoch":7});
+        }
+        let scope: ScopeStamp = serde_json::from_value(scope).unwrap();
+        let (reply, _) = run_with_scopes(
+            &transport,
+            SESSION_CONTEXT_OPERATION,
+            json!({"ticket":ticket.value().unwrap(),"worker":!expected,"session_id":"ses-forged"}),
+            &scopes_for("ses-context", Some(scope)),
+        );
+        assert!(reply.ok, "{:?}", reply.data);
+        assert_eq!(reply.data["worker"], expected);
+    }
+    for mut scope in [
+        delegating_stamp(),
+        stamp(Some("agent-fixture"), true, false),
+    ] {
+        scope.kind = ScopeKind::Worker;
+        if scope.owner_authorized {
+            scope.owner = subc_protocol::Principal::Reserved {
+                module_id: "other-owner".into(),
+            };
+        }
+        let (reply, _) = run_with_scopes(
+            &transport,
+            SESSION_CONTEXT_OPERATION,
+            json!({"ticket":ticket.value().unwrap()}),
+            &scopes_for("ses-context", Some(scope)),
+        );
+        assert_eq!(reply.data["worker"], false);
+    }
+    let (reply, _) = run(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":"0123456789abcdef0123456789abcdef","worker":true}),
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "ticket_unknown");
+    assert!(
+        transport.calls().is_empty(),
+        "session classification never contacts Plexus"
+    );
+}
+
+#[test]
+fn session_context_refuses_ambiguous_scopes_instead_of_guessing_head() {
+    let ticket =
+        crate::gh_shim_ticket::ScopedTicket::issue("ses-ambiguous-context", "context-call", "/p");
+    let transport = FakeTransport::scoped();
+    let mut scopes = scopes_for("ses-ambiguous-context", Some(delegating_stamp()));
+    let mut worker = delegating_stamp();
+    worker.kind = subc_protocol::scope::ScopeKind::Worker;
+    scopes.push("ses-ambiguous-context", Some(worker));
+    let (reply, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":ticket.value().unwrap()}),
+        &scopes,
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "session_unscoped");
+    assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn session_context_replayed_ticket_cannot_restore_worker_routing() {
+    let ticket =
+        crate::gh_shim_ticket::ScopedTicket::issue("ses-replay-context", "context-call", "/p");
+    let value = ticket.value().unwrap().to_string();
+    let transport = FakeTransport::scoped();
+    let mut worker = delegating_stamp();
+    worker.kind = subc_protocol::scope::ScopeKind::Worker;
+    let scopes = scopes_for("ses-replay-context", Some(worker));
+    let (live, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":value}),
+        &scopes,
+    );
+    assert_eq!(live.data["worker"], true);
+    drop(ticket);
+    let (replay, _) = run_with_scopes(
+        &transport,
+        SESSION_CONTEXT_OPERATION,
+        json!({"ticket":value}),
+        &scopes,
+    );
+    assert!(!replay.ok);
+    assert_eq!(replay.data["refusal_code"], "ticket_unknown");
+    assert!(transport.calls().is_empty());
+}

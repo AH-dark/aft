@@ -513,6 +513,11 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         kind: ManagementOperationKind::Query,
                         description: None,
                     },
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::SESSION_CONTEXT_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
                     // Operator-only early removal of undo backups (`aft backups
                     // purge`). The daemon owns live backup caches, so the purge
                     // runs here to change memory, disk and database together.
@@ -746,6 +751,10 @@ mod tests {
                 ),
                 (
                     crate::gh_shim_relay::BINDINGS_READ_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::gh_shim_relay::SESSION_CONTEXT_OPERATION,
                     &ManagementOperationKind::Query,
                 ),
                 (
@@ -988,6 +997,7 @@ mod tests {
             .extend([
                 json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
                 json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
+                json!({"name": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "kind": "query"}),
                 json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
             ]);
         // AFT registers not-ready and flips itself ready after warm-up (see

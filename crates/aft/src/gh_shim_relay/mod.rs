@@ -40,6 +40,8 @@ pub const BOT_REQUEST_OPERATION: &str = "gh_shim.bot_request";
 /// check. Params: `{ticket}`; an `agent_id` the shim still sends is ignored,
 /// because the reply lists every repository's binding whichever agent asks.
 pub const BINDINGS_READ_OPERATION: &str = "gh_shim.bindings_read";
+/// Inspect the ticket's daemon-stamped session kind, without contacting Plexus.
+pub const SESSION_CONTEXT_OPERATION: &str = "gh_shim.session_context";
 
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
 /// The handle connection named in `bindings.read`. Plexus uses the name only
@@ -51,7 +53,10 @@ const BINDINGS_READ_CONNECTION_ID: &str = "github-handle-aft-alfonso";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn is_relay_operation(operation: &str) -> bool {
-    matches!(operation, BOT_REQUEST_OPERATION | BINDINGS_READ_OPERATION)
+    matches!(
+        operation,
+        BOT_REQUEST_OPERATION | BINDINGS_READ_OPERATION | SESSION_CONTEXT_OPERATION
+    )
 }
 
 /// Plexus answers a tool call either with its facade reply directly or wrapped
@@ -303,6 +308,16 @@ pub async fn relay<T: RelayTransport>(
             redeemed.task_id.clone()
         };
         match call.operation {
+            SESSION_CONTEXT_OPERATION => {
+                match call.route_scopes.for_session(&redeemed.session_id) {
+                    Some(stamp) => RelayReply::relayed(json!({"worker": worker_scope(stamp)})),
+                    None => RelayReply::refused(
+                        "session_unscoped",
+                        "scope",
+                        "the ticket has no unambiguous daemon-stamped session",
+                    ),
+                }
+            }
             BINDINGS_READ_OPERATION => {
                 path = PATH_UNSCOPED;
                 bindings_read(transport, &redeemed).await
@@ -328,6 +343,17 @@ pub async fn relay<T: RelayTransport>(
         reply.outcome_label().escape_debug(),
     ));
     reply
+}
+
+/// Match the worker rule used for access grants: parented runs inherit worker
+/// policy, while an unparented run belongs to the head.
+fn worker_scope(stamp: &ScopeStamp) -> bool {
+    use subc_protocol::scope::ScopeKind;
+    use subc_protocol::Principal;
+    stamp.owner_authorized
+        && matches!(&stamp.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
+        && (stamp.kind == ScopeKind::Worker
+            || (stamp.kind == ScopeKind::Ephemeral && stamp.parent.is_some()))
 }
 
 /// Read plexus's repository-to-agent bindings for the shim's version check.

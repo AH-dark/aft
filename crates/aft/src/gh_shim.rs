@@ -33,6 +33,7 @@ use crate::db::github_read_cache::{invalidate_github_read_cache_resource, Github
 use subc_protocol::{BindIdentity, RouteTarget};
 
 mod rename_guard;
+mod worker_reads;
 
 pub const SCHEMA_FLOOR: u64 = 1;
 /// Envelope version that carries the manifest as exact signed bytes. Envelope
@@ -671,6 +672,16 @@ fn run(args: &[OsString]) -> i32 {
     let initial_manifest = resolve_manifest(&paths, now);
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
     if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
+        if worker_reads::candidate(args, manifest, current_platform()) {
+            match worker_reads::lookup(&paths, &RelayContext::from_process()) {
+                Ok(Some(true)) => return refuse(
+                    RefusalCode::ManifestRegressed,
+                    "worker reads require a valid signed manifest; repair the installed manifest",
+                ),
+                Err(text) => return worker_reads::unavailable_fallback(args, &text),
+                Ok(Some(false) | None) => {}
+            }
+        }
         return match regressed_disposition(args, manifest, current_platform(), problem) {
             RegressedDisposition::Passthrough => {
                 delegate_after_invalid_manifest_notice(args, problem)
@@ -688,6 +699,9 @@ fn run(args: &[OsString]) -> i32 {
     // or one that never verified) there are no bindings to compare against,
     // so those keep passing through as before.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
+        if let Some(status) = worker_reads::dispatch(args, manifest, &cwd, &paths) {
+            return status;
+        }
         // The operator's token works on every repository, bound or not, and
         // an agent holding it could reach GitHub around the shim, so this
         // check comes before any target is resolved.
@@ -3442,10 +3456,13 @@ struct Manifest {
     repository_sections: BTreeMap<String, RepositorySection>,
     #[serde(default)]
     bindings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    worker_reads: Vec<TupleDecl>,
 }
 
 impl Manifest {
     fn validate(&self) -> Result<(), String> {
+        worker_reads::validate_class(self)?;
         if self.artifact_id != MANIFEST_ARTIFACT_ID {
             return Err(format!("unexpected artifact id {}", self.artifact_id));
         }
@@ -6905,6 +6922,7 @@ struct SelfReport {
     cached_manifest: CachedManifestReport,
     last_rung: LastRungReport,
     last_probe: Option<LastProbeReport>,
+    last_read_lookup: Option<worker_reads::LookupRecord>,
     bypass_audit: Option<Vec<Value>>,
     bypass_audit_error: Option<String>,
     executing_image: Option<String>,
@@ -7015,6 +7033,11 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         cached_manifest,
         last_rung,
         last_probe,
+        last_read_lookup: if disabled {
+            None
+        } else {
+            worker_reads::last_lookup(paths)
+        },
         bypass_audit,
         bypass_audit_error,
         executing_image: image
@@ -7876,6 +7899,7 @@ mod tests {
                 "cached_manifest",
                 "last_rung",
                 "last_probe",
+                "last_read_lookup",
                 "bypass_audit",
                 "bypass_audit_error",
                 "executing_image",
