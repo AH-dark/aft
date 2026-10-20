@@ -10457,9 +10457,24 @@ mod dead_code_projection_tests {
         );
         let first_state = manager.previous_dead_code_rollup_state(&root).unwrap();
 
+        let live_file = root.join("src").join("live.ts");
+        let live_relative = live_file.strip_prefix(&root).expect("relative live file");
+        let contribution_count_before_delete = cache
+            .load_tier2_contributions(InspectCategory::DeadCode)
+            .expect("load contributions before delete")
+            .len();
         cache
-            .delete_tier2_contribution(InspectCategory::DeadCode, Path::new("src/live.ts"))
+            .delete_tier2_contribution(InspectCategory::DeadCode, live_relative)
             .unwrap();
+        let contribution_count_after_delete = cache
+            .load_tier2_contributions(InspectCategory::DeadCode)
+            .expect("load contributions after delete")
+            .len();
+        assert_eq!(
+            contribution_count_after_delete + 1,
+            contribution_count_before_delete,
+            "deleting the live file must remove exactly one contribution row"
+        );
         let changed_contributions = read();
         assert!(
             !Arc::ptr_eq(
