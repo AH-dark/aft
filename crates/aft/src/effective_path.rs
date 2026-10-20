@@ -675,6 +675,8 @@ fn spawn_retrying_executable_file_busy(command: &mut Command, purpose: &str) -> 
                 if error.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && retry < SPAWN_BUSY_RETRY_COUNT =>
             {
+                #[cfg(test)]
+                busy_retry_hook::run();
                 std::thread::sleep(SPAWN_BUSY_RETRY_DELAY);
             }
             Err(error) => {
@@ -685,6 +687,34 @@ fn spawn_retrying_executable_file_busy(command: &mut Command, purpose: &str) -> 
     }
 
     unreachable!("the final spawn attempt returns or exits the retry loop")
+}
+
+/// Lets a test act at the moment a spawn hit a busy executable and is about
+/// to retry, on the thread that spawns. Parallel tests do not see each
+/// other's hooks.
+#[cfg(all(test, unix))]
+mod busy_retry_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run() {
+        HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Run `body` with `hook` called before each busy-file retry.
+    pub(super) fn with<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let value = body();
+        HOOK.with(|slot| *slot.borrow_mut() = None);
+        value
+    }
 }
 
 #[cfg(unix)]
@@ -1438,11 +1468,24 @@ eval "$2"
     #[cfg(target_os = "linux")]
     #[test]
     fn login_shell_probe_survives_concurrent_fork_stress() {
+        use std::os::fd::AsRawFd;
         const ITERATIONS: usize = 128;
-        const FORK_CHILD_DELAY: libc::timespec = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 15_000_000,
-        };
+
+        fn cloexec_pipe() -> (libc::c_int, libc::c_int) {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            (fds[0], fds[1])
+        }
+        fn write_byte(fd: libc::c_int) {
+            assert_eq!(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) }, 1);
+        }
+        fn read_byte(fd: libc::c_int) {
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) },
+                1
+            );
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let shell = dir.path().join("shell");
@@ -1452,39 +1495,34 @@ eval "$2"
         );
         write_executable_shim(&shell, &body);
 
-        let (request_fork, fork_requests) = std::sync::mpsc::channel();
-        let (fork_complete, forked_children) = std::sync::mpsc::channel();
-        let forker = std::thread::spawn(move || {
-            while fork_requests.recv().is_ok() {
-                // The child keeps the inherited writable descriptor until exec,
-                // reproducing the window that can make a concurrent shell spawn busy.
-                let pid = unsafe { libc::fork() };
-                if pid == 0 {
-                    let executable = b"/bin/true\0";
-                    let argv = [executable.as_ptr().cast(), std::ptr::null()];
-                    unsafe {
-                        libc::nanosleep(&FORK_CHILD_DELAY, std::ptr::null_mut());
-                        libc::execv(executable.as_ptr().cast(), argv.as_ptr());
-                        libc::_exit(127);
-                    }
-                }
-                let _ = fork_complete.send(pid);
-                if pid > 0 {
-                    unsafe {
-                        libc::waitpid(pid, std::ptr::null_mut(), 0);
-                    }
-                }
-            }
-        });
-
         let expected = Some(OsString::from("/custom/bin:/usr/bin"));
         let mut failed_probe = None;
         for _ in 0..ITERATIONS {
             fs::write(&shell, &body).unwrap();
             let writable = fs::OpenOptions::new().write(true).open(&shell).unwrap();
-            request_fork.send(()).unwrap();
-            let pid = forked_children.recv().unwrap();
+            let writable_fd = writable.as_raw_fd();
+            // The child holds its copy of the writable descriptor until the
+            // test writes to `release`, reproducing the fork-to-exec window
+            // that makes a concurrent shell spawn busy. It then closes the
+            // descriptor and reports that on `closed`. No timing is involved.
+            let (release_read, release_write) = cloexec_pipe();
+            let (closed_read, closed_write) = cloexec_pipe();
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // Only async-signal-safe calls between fork and _exit.
+                unsafe {
+                    let mut byte = 0u8;
+                    libc::read(release_read, (&mut byte as *mut u8).cast(), 1);
+                    libc::close(writable_fd);
+                    libc::write(closed_write, b"x".as_ptr().cast(), 1);
+                    libc::_exit(0);
+                }
+            }
             assert!(pid > 0, "fork failed with {pid}");
+            unsafe {
+                libc::close(release_read);
+                libc::close(closed_write);
+            }
             drop(writable);
 
             let error = Command::new(&shell)
@@ -1496,15 +1534,41 @@ eval "$2"
                 "expected Linux ETXTBSY, got {error}"
             );
 
-            let actual = probe_login_shell_path_once(&shell, Duration::from_secs(1));
+            // The probe's first spawn finds the file busy too. Its retry hook
+            // releases the child and waits until the descriptor is closed, so
+            // the retry that follows must succeed.
+            let busy_retries = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let hook_retries = std::rc::Rc::clone(&busy_retries);
+            let actual = super::busy_retry_hook::with(
+                move || {
+                    hook_retries.set(hook_retries.get() + 1);
+                    if hook_retries.get() == 1 {
+                        write_byte(release_write);
+                        read_byte(closed_read);
+                    }
+                },
+                || probe_login_shell_path_once(&shell, Duration::from_secs(10)),
+            );
+            if busy_retries.get() == 0 {
+                // The probe never saw the file busy, so the child was never
+                // released by the hook. Release it here before reaping.
+                write_byte(release_write);
+            }
+            unsafe {
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                libc::close(release_write);
+                libc::close(closed_read);
+            }
+            assert!(
+                busy_retries.get() >= 1,
+                "the probe's first spawn must find the file busy and retry"
+            );
             if actual != expected {
                 failed_probe = Some(actual);
                 break;
             }
         }
 
-        drop(request_fork);
-        forker.join().unwrap();
         assert_eq!(
             failed_probe, None,
             "login-shell PATH probe failed during a fork/spawn race"
