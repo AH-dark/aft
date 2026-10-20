@@ -162,6 +162,39 @@ fn grants_head_policy_rechecks_revocation_at_source_epoch() {
     assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
 }
 
+#[test]
+fn grants_head_policy_uses_latest_observed_restrictions() {
+    let (_dir, ctx, head, worker) = fixture();
+    let target = worker.project_root.join("shared");
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    let newer = at_epoch(&head, 10);
+    register(&newer, &ctx).unwrap();
+    store::set_mode(
+        &db.lock().unwrap(),
+        &scope_key(&newer),
+        crate::access_policy::ApprovalMode::Ask,
+    )
+    .unwrap();
+    let caller = worker_at_parent_epoch(&worker, "head", 12);
+    let error = remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &caller,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
+}
+
 fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
     RouteIdentityData {
         root: identity.root.clone(),
