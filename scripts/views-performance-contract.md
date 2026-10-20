@@ -133,6 +133,9 @@ counter regressions invalidate a comparison.
 | `applicability_walks` | Actual uncached applicability discovery, including scoped discovery. Cache hits do not count. |
 | `logical_aggregates` | v1/v2 blob usage `COUNT/SUM(length(payload))` queries, including failed queries, once per actual query; cheap caller invocations that avoid SQL do not count. |
 | `own_generation_folds` | v2 checkout owner's `build_own_generation` after ownership validation, including attempts that subsequently fail. v1 publication is a different path, not mislabeled as a v2 fold. |
+| `dispatch_blobs_decoded`, `dispatch_files_resolved`, `dispatch_sites_resolved` | Derived-view method-call pass in `views::materialization`: parse blobs it decoded, files whose method-call sites it resolved and rows it reconciled, and sites it resolved. An incremental 1-file republication should add about one decoded blob and only the affected files. |
+| `dispatch_full_passes` | Method-call passes that resolved every file (cold builds, generations without the per-file dispatch inputs, resolver-configuration changes). |
+| `dispatch_type_target_files` | Rust files whose method-call receiver type targets the selected join resolved. |
 
 These sites cover both current views and legacy indexing work, but are **not**
 a whole-program source-I/O interposer. Raw direct reads/hashes elsewhere,

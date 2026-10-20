@@ -1157,6 +1157,20 @@ fn materialize_reading(
     stats.dispatch_type_target_files = joined.dispatch_type_targets.len();
     stats.dispatch_type_target_decoded_blobs = joined.dispatch_type_target_decoded_blobs;
     stats.dispatch_full = dispatch_work.full;
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let work = &super::io::WORK;
+        work.dispatch_blobs_decoded
+            .fetch_add(dispatch_work.decoded_blobs as u64, Relaxed);
+        work.dispatch_files_resolved
+            .fetch_add(dispatch_work.resolved_files as u64, Relaxed);
+        work.dispatch_sites_resolved
+            .fetch_add(dispatch_work.resolved_sites as u64, Relaxed);
+        work.dispatch_full_passes
+            .fetch_add(u64::from(dispatch_work.full), Relaxed);
+        work.dispatch_type_target_files
+            .fetch_add(joined.dispatch_type_targets.len() as u64, Relaxed);
+    }
     profile.finish("dispatch");
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
@@ -1168,9 +1182,25 @@ fn materialize_reading(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_materialization_version', ?1)",
         [MATERIALIZATION_VERSION],
     )?;
+    let wal_before_commit = commit_stage
+        .enabled
+        .then(|| profile::wal_len(database_path));
     commit_stage.finish("metadata", format_args!(""));
     transaction.commit()?;
-    commit_stage.finish("sqlite_commit", format_args!(""));
+    if let Some(wal_before) = wal_before_commit {
+        let autocheckpoint = connection
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
+            .ok();
+        commit_stage.finish(
+            "sqlite_commit",
+            format_args!(
+                "wal_bytes_before={wal_before} wal_bytes_after={} wal_autocheckpoint={autocheckpoint:?}",
+                profile::wal_len(database_path)
+            ),
+        );
+    } else {
+        commit_stage.finish("sqlite_commit", format_args!(""));
+    }
     profile.finish("commit");
     if let Some(probe) = write_probe {
         probe.finish(&connection, database_path);

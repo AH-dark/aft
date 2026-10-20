@@ -391,7 +391,7 @@ impl WriteProbe {
     }
 }
 
-fn wal_len(path: &std::path::Path) -> u64 {
+pub(super) fn wal_len(path: &std::path::Path) -> u64 {
     let mut wal = path.as_os_str().to_os_string();
     wal.push("-wal");
     std::fs::metadata(wal).map_or(0, |metadata| metadata.len())

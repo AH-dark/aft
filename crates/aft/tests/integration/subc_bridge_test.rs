@@ -12910,6 +12910,11 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         "applicability_walks",
         "logical_aggregates",
         "own_generation_folds",
+        "dispatch_blobs_decoded",
+        "dispatch_files_resolved",
+        "dispatch_sites_resolved",
+        "dispatch_full_passes",
+        "dispatch_type_target_files",
     ] {
         assert!(
             work[field].is_u64(),

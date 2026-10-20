@@ -2078,10 +2078,26 @@ fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
                 .path()
                 .join(format!("independent-{label}-{every_file}.sqlite"));
             std::fs::copy(&base_db, &db).unwrap();
+            let work_before = crate::views::io::work_snapshot();
             dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(every_file));
             let stats = apply_manifest_diff(&db, &base, next, &f.blobs);
             dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(false));
             let stats = stats.unwrap();
+            // The process-wide counters other tests also add to cover at least
+            // this pass's own work.
+            let work_after = crate::views::io::work_snapshot();
+            for (field, own) in [
+                ("dispatch_blobs_decoded", stats.dispatch_decoded_blobs),
+                ("dispatch_files_resolved", stats.dispatch_resolved_files),
+                ("dispatch_sites_resolved", stats.dispatch_resolved_sites),
+            ] {
+                let added =
+                    work_after[field].as_u64().unwrap() - work_before[field].as_u64().unwrap();
+                assert!(
+                    added >= own as u64,
+                    "{label}: views_work {field} added {added} < {own}"
+                );
+            }
             assert_snapshot_parity(&snapshot(&cold), &snapshot(&db));
             assert!(!stats.dispatch_full, "{label}: {stats:?}");
             assert_eq!(stats.dispatch_decoded_blobs, 1, "{label}: {stats:?}");
