@@ -69,6 +69,118 @@ fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }
 
+fn worker_at_parent_epoch(worker: &RouteIdentity, parent: &str, epoch: u64) -> RouteIdentity {
+    let mut data = copied_identity(worker);
+    let parent_stamp = data.scope.as_mut().unwrap().parent.as_mut().unwrap();
+    parent_stamp.scope_ref = parent.into();
+    parent_stamp.scope_epoch = epoch;
+    RouteIdentity(Arc::new(data))
+}
+
+#[test]
+fn grants_head_policy_survives_an_unregistered_parent_epoch() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = worker_at_parent_epoch(&worker, "head", 12);
+    remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        operation(json!({}), "grants.list", &worker, &ctx).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn grants_head_policy_never_crosses_identity_future_or_end_boundaries() {
+    let (_dir, ctx, head, worker) = fixture();
+    let different = worker_at_parent_epoch(&worker, "different-head", 12);
+    let future = worker_at_parent_epoch(&worker, "head", 6);
+    let mut other_owner = copied_identity(&worker_at_parent_epoch(&worker, "head", 12));
+    other_owner
+        .scope
+        .as_mut()
+        .unwrap()
+        .parent
+        .as_mut()
+        .unwrap()
+        .owner =
+        serde_json::from_value(json!({"kind":"reserved","module_id":"another-owner"})).unwrap();
+    for caller in [different, future, RouteIdentity(Arc::new(other_owner))] {
+        let error = remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+            &caller,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+    }
+    let mut ended = scope_key(&head);
+    ended.epoch = 10;
+    store::end_scope_grants(&ctx.db().unwrap().lock().unwrap(), &ended).unwrap();
+    for epoch in [10, 12] {
+        let caller = worker_at_parent_epoch(&worker, "head", epoch);
+        let error = remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+            &caller,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+    }
+}
+
+#[test]
+fn grants_head_policy_rechecks_revocation_at_source_epoch() {
+    let (_dir, ctx, head, worker) = fixture();
+    let caller = worker_at_parent_epoch(&worker, "head", 12);
+    let target = worker.project_root.join("shared");
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &caller,
+        &ctx,
+    )
+    .unwrap();
+    operation(json!({"path":target}), "grants.revoke", &head, &ctx).unwrap();
+    let error = remote_policy::catalog(json!({"preset":"worker"}), &caller, &ctx).unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
+}
+
+fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
+    RouteIdentityData {
+        root: identity.root.clone(),
+        project_root: identity.project_root.clone(),
+        harness: identity.harness.clone(),
+        session: identity.session.clone(),
+        role: identity.role,
+        trust: identity.trust,
+        spawn_principal: identity.spawn_principal.clone(),
+        consumer_elicitation_capable: identity.consumer_elicitation_capable,
+        disabled_tools: identity.disabled_tools.clone(),
+        scope: identity.scope.clone(),
+        call_mode: identity.call_mode.clone(),
+        run_scope: OnceLock::new(),
+        made_tool_call: AtomicBool::new(false),
+        run_owner: None,
+    }
+}
+
 #[test]
 fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
     let dir = tempfile::tempdir().unwrap();
@@ -95,7 +207,12 @@ fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
             "credential path",
         ),
     ] {
-        let error = validate(&json!([{"path":target,"mode":"write"}]), Some(&policy)).unwrap_err();
+        let error = validate(
+            &json!([{"path":target,"mode":"write"}]),
+            Some(&policy),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "plan_param_refused");
         assert_eq!(
             error.detail,
@@ -216,7 +333,10 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
         .is_none());
     }
     assert_eq!(
-        validate(&json!({}), None).unwrap_err().detail.unwrap()["reason"],
+        validate(&json!({}), None, None)
+            .unwrap_err()
+            .detail
+            .unwrap()["reason"],
         "malformed"
     );
     let oversized = Value::Array(
@@ -225,7 +345,10 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
             .collect(),
     );
     assert_eq!(
-        validate(&oversized, None).unwrap_err().detail.unwrap()["index"],
+        validate(&oversized, None, None)
+            .unwrap_err()
+            .detail
+            .unwrap()["index"],
         64
     );
 }
@@ -791,7 +914,7 @@ fn delegated_launch() -> (
         let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
             .unwrap()
             .unwrap();
-        validate(&raw, Some(&policy)).unwrap();
+        validate(&raw, Some(&policy), None).unwrap();
     }
     (dir, ctx, head, worker, outside, raw)
 }

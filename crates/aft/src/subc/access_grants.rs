@@ -522,7 +522,13 @@ pub(super) fn resolve_unlocked<S: PartialEq, R, T, E>(
     }
 }
 
-fn param_refused(index: usize, path: Value, reason: &str) -> subc_protocol::ErrorBody {
+fn param_refused(
+    index: usize,
+    path: Value,
+    reason: &str,
+    head: Option<&ScopeKey>,
+) -> subc_protocol::ErrorBody {
+    log::info!("allow_paths refused: index={index} reason={reason} path={path} head={head:?}");
     let mut error = refusal(
         "plan_param_refused",
         format!("allow_paths[{index}]: {reason}"),
@@ -536,21 +542,23 @@ fn param_refused(index: usize, path: Value, reason: &str) -> subc_protocol::Erro
 pub(super) fn validate(
     raw: &Value,
     head: Option<&AccessPolicy>,
+    head_key: Option<&ScopeKey>,
 ) -> Result<Vec<AccessGrant>, subc_protocol::ErrorBody> {
     let list = raw
         .as_array()
-        .ok_or_else(|| param_refused(0, Value::Null, "malformed"))?;
+        .ok_or_else(|| param_refused(0, Value::Null, "malformed", head_key))?;
     if list.len() > 64 {
         return Err(param_refused(
             64,
             list[64].get("path").cloned().unwrap_or(Value::Null),
             "malformed",
+            head_key,
         ));
     }
     let mut grants: Vec<AccessGrant> = Vec::new();
     for (index, entry) in list.iter().enumerate() {
         let path_value = entry.get("path").cloned().unwrap_or(Value::Null);
-        let malformed = || param_refused(index, path_value.clone(), "malformed");
+        let malformed = || param_refused(index, path_value.clone(), "malformed", head_key);
         let object = entry.as_object().ok_or_else(malformed)?;
         let path = object
             .get("path")
@@ -574,7 +582,7 @@ pub(super) fn validate(
             return Err(malformed());
         }
         if !Path::new(path).is_absolute() {
-            return Err(param_refused(index, path_value, "not_absolute"));
+            return Err(param_refused(index, path_value, "not_absolute", head_key));
         }
         let grant = AccessGrant {
             path: policy_path(Path::new(path)),
@@ -582,10 +590,15 @@ pub(super) fn validate(
             operation: mode,
         };
         let Some(head) = head else {
-            return Err(param_refused(index, path_value, "head_not_held"));
+            return Err(param_refused(
+                index,
+                path_value,
+                "head_policy_unknown",
+                head_key,
+            ));
         };
         if let Some(floor) = head.capability_floor(mode, GrantKind::Subtree, &grant.path) {
-            let mut error = param_refused(index, path_value, "denied_floor");
+            let mut error = param_refused(index, path_value, "denied_floor", head_key);
             error.message.push_str(&format!(
                 " ({}: {})",
                 floor.rule.description(),
@@ -598,7 +611,7 @@ pub(super) fn validate(
             return Err(error);
         }
         if head.head_policy(&grant) != HeadPolicy::Allow {
-            return Err(param_refused(index, path_value, "head_not_held"));
+            return Err(param_refused(index, path_value, "head_not_held", head_key));
         }
         if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
             if mode == AccessOperation::Write {
@@ -617,13 +630,14 @@ pub(super) fn catalog(
     ctx: &AppContext,
     preset: &str,
 ) -> Result<(), subc_protocol::ErrorBody> {
+    let head_key = head_scope(identity);
     if identity
         .scope
         .as_ref()
         .is_some_and(|stamp| !stamp.owner_authorized)
     {
         if let Some(raw) = raw {
-            validate(raw, None)?;
+            validate(raw, None, head_key.as_ref())?;
         }
         return Ok(());
     }
@@ -632,7 +646,7 @@ pub(super) fn catalog(
     }
     let Some(db) = ctx.db() else {
         if let Some(raw) = raw {
-            validate(raw, None)?;
+            validate(raw, None, head_key.as_ref())?;
         }
         return Ok(());
     };
@@ -640,11 +654,15 @@ pub(super) fn catalog(
         db.lock()
             .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))
     };
-    let head_key = head_scope(identity);
     let read_head = |conn: &rusqlite::Connection| {
         head_key
             .as_ref()
-            .map(|key| policy_snapshot(conn, key))
+            .map(|key| {
+                store::head_policy_scope(conn, key)?
+                    .map(|resolved| policy_snapshot(conn, &resolved))
+                    .transpose()
+                    .map(Option::flatten)
+            })
             .transpose()
             .map(Option::flatten)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))
@@ -668,7 +686,7 @@ pub(super) fn catalog(
     loop {
         let head = snapshot.clone().map(|policy| policy.resolve(&storage));
         if let Some(raw) = raw {
-            validate(raw, head.as_ref())?;
+            validate(raw, head.as_ref(), head_key.as_ref())?;
         }
         let Some(key) = launch.as_ref() else {
             return Ok(());
@@ -686,7 +704,7 @@ pub(super) fn catalog(
         let chosen = stored.as_ref().or(raw).unwrap_or(&empty);
         #[cfg(test)]
         unlocked_hook::run(unlocked_hook::Point::LaunchValidation);
-        let grants = validate(chosen, head.as_ref())?;
+        let grants = validate(chosen, head.as_ref(), head_key.as_ref())?;
         let conn = lock()?;
         let current = read_head(&conn)?;
         if current != snapshot {
