@@ -299,8 +299,8 @@ fn local_os_name() -> &'static str {
 /// lost. Silence on an open stream is never bounded; only recovery attempts
 /// that bring no record are. While the job may still be queued or running on
 /// the runner, AFT keeps trying: it stops only once the job's own limits (the
-/// runner's queue wait limit plus the command's run timeout, counted from when
-/// AFT submitted it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
+/// runner's queue wait limit plus the command's run timeout, counted from AFT's
+/// latest submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
 /// after recovery began. Accepted jobs can disappear with a wiped runner state;
 /// AFT must not resubmit them.
 #[cfg(unix)]
@@ -313,6 +313,9 @@ struct ReattachBudget {
     deadline: Option<tokio::time::Instant>,
     /// Failed recovery attempts since the last record; selects the next pause.
     attempts: u32,
+    /// A test shortened the budget: the job's limits stay treated as passed.
+    #[cfg(test)]
+    budget_override: bool,
     #[cfg(test)]
     clock: Option<Arc<tests::ReattachClock>>,
     #[cfg(test)]
@@ -325,22 +328,14 @@ struct ReattachBudget {
 impl ReattachBudget {
     fn new(_root: &Path, metadata: &PersistedTask) -> Self {
         let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
-        // A remote task records the run timeout AFT sent with the job: the
-        // caller's `timeout`, or the 30-minute background default when the
-        // call named none. A record without one predates that; assume the
-        // default, the most AFT has sent for an untimed call.
-        let recorded_timeout = metadata.timeout_ms.map(Duration::from_millis);
-        let run_timeout = recorded_timeout.unwrap_or(DEFAULT_BG_TIMEOUT);
-        let job_end_ms = metadata
-            .started_at
-            .saturating_add(duration_ms(queue_wait))
-            .saturating_add(duration_ms(run_timeout));
-        let until_job_end = Duration::from_millis(job_end_ms.saturating_sub(unix_millis()));
+        let (until_job_end, recorded_timeout, run_timeout) = Self::until_job_end(metadata);
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
         #[cfg(test)]
-        let (grace, until_job_end) = match tests::take_reattach_budget(_root) {
+        let budget_override = tests::take_reattach_budget(_root);
+        #[cfg(test)]
+        let (grace, until_job_end) = match budget_override {
             Some(budget) => (budget, Duration::ZERO),
             None => (grace, until_job_end),
         };
@@ -360,11 +355,64 @@ impl ReattachBudget {
             deadline: None,
             attempts: 0,
             #[cfg(test)]
+            budget_override: budget_override.is_some(),
+            #[cfg(test)]
             clock_job_end: clock.as_ref().map(|clock| clock.now() + until_job_end),
             #[cfg(test)]
             clock,
             #[cfg(test)]
             clock_deadline: None,
+        }
+    }
+
+    /// How long until the runner's own limits for the task's latest
+    /// submission have passed, with the recorded run timeout (if any) and the
+    /// run timeout assumed from it.
+    ///
+    /// The limits count from the latest submission: a resubmission after a
+    /// draining refusal starts a new queue wait and run on the runner, which
+    /// can come many minutes after the task first started. A record without a
+    /// resubmission time counts from the task's start.
+    fn until_job_end(metadata: &PersistedTask) -> (Duration, Option<Duration>, Duration) {
+        // A remote task records the run timeout AFT sent with the job: the
+        // caller's `timeout`, or the 30-minute background default when the
+        // call named none. A record without one predates that; assume the
+        // default, the most AFT has sent for an untimed call.
+        let recorded_timeout = metadata.timeout_ms.map(Duration::from_millis);
+        let run_timeout = recorded_timeout.unwrap_or(DEFAULT_BG_TIMEOUT);
+        let submitted_at = metadata
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.retry.as_ref())
+            .and_then(|retry| retry.resubmitted_at_ms)
+            .unwrap_or(metadata.started_at);
+        let job_end_ms = submitted_at
+            .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT))
+            .saturating_add(duration_ms(run_timeout));
+        (
+            Duration::from_millis(job_end_ms.saturating_sub(unix_millis())),
+            recorded_timeout,
+            run_timeout,
+        )
+    }
+
+    /// The job was submitted again after a draining refusal. Its limits now
+    /// count from that submission, recorded in `metadata`, and a recovery
+    /// deadline fixed for the earlier submission no longer applies.
+    fn resubmitted(&mut self, metadata: &PersistedTask) {
+        let (until_job_end, _, _) = Self::until_job_end(metadata);
+        #[cfg(test)]
+        let until_job_end = if self.budget_override {
+            Duration::ZERO
+        } else {
+            until_job_end
+        };
+        self.job_end = tokio::time::Instant::now() + until_job_end;
+        self.deadline = None;
+        #[cfg(test)]
+        {
+            self.clock_job_end = self.clock.as_ref().map(|clock| clock.now() + until_job_end);
+            self.clock_deadline = None;
         }
     }
 
@@ -473,6 +521,12 @@ pub(crate) struct DrainingRetry {
     first_refusal_at_ms: Option<u64>,
     next_retry_at_ms: Option<u64>,
     waited_ms: Option<u64>,
+    /// When AFT last submitted the job again after a draining refusal, in
+    /// Unix milliseconds. The runner's queue wait and run timeout count from
+    /// that submission, so re-attach limits do too. Records written before
+    /// this field existed lack it and count from the task's start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resubmitted_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1812,6 +1866,7 @@ impl BgTaskRegistry {
             let Some(stream) = self.submit_draining_retry(&client, &task, &root).await? else {
                 return Ok(());
             };
+            recovery.resubmitted(&task.state.lock().map_err(|_| "task lock poisoned")?.metadata);
             stream
         } else if let Some((request, local)) = initial.take() {
             let request = match request {
@@ -1834,6 +1889,7 @@ impl BgTaskRegistry {
                         first_refusal_at_ms: None,
                         next_retry_at_ms: None,
                         waited_ms: None,
+                        resubmitted_at_ms: None,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1928,6 +1984,9 @@ impl BgTaskRegistry {
                                 return Ok(());
                             };
                             stream = next;
+                            recovery.resubmitted(
+                                &task.state.lock().map_err(|_| "task lock poisoned")?.metadata,
+                            );
                             recovery.reset();
                             continue;
                         }
@@ -2089,6 +2148,9 @@ impl BgTaskRegistry {
                 .ok_or("draining retry request absent")?;
             retry.attempts = retry.attempts.saturating_add(1);
             retry.next_retry_at_ms = None;
+            // Written with the dispatch, so a restart that re-attaches to this
+            // submission counts its limits from it, not from the first one.
+            retry.resubmitted_at_ms = Some(unix_millis());
             state.metadata.execution_note = Some(format!(
                 "remote execution requested on {RUNNER_ID} after maintenance wait"
             ));

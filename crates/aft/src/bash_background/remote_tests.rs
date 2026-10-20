@@ -5452,6 +5452,132 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     let requests = exec_runs(&daemon);
     assert_eq!(requests.len(), 3);
     assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    // The record keeps when the accepted resubmission was sent, so re-attach
+    // limits count from it after a restart too.
+    let saved = read_task(&registry.task(&task_id).unwrap().paths.json).unwrap();
+    let resubmitted_at = saved
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.retry.as_ref())
+        .and_then(|retry| retry.resubmitted_at_ms);
+    assert!(
+        resubmitted_at.is_some_and(|at| at >= saved.started_at),
+        "the accepted resubmission must record its time: {resubmitted_at:?}"
+    );
+}
+
+/// A draining retry the runner accepts late starts a new queue wait and run
+/// there. AFT's re-attach limit must count from that resubmission, both in
+/// the worker that sent it and after a daemon restart reads the record back.
+#[tokio::test]
+async fn reattach_limit_counts_from_a_late_draining_resubmission() {
+    const MINUTE_MS: u64 = 60_000;
+    let dir = tempfile::tempdir().unwrap();
+    let now = unix_millis();
+    let mut metadata = PersistedTask::starting(
+        "bash-0000000000000002".into(),
+        "session".into(),
+        "cargo test".into(),
+        dir.path().into(),
+        None,
+        // An untimed runon records the 30-minute background default.
+        Some(30 * MINUTE_MS),
+        true,
+        false,
+    );
+    // Submitted first nine minutes ago; the runner drained until now.
+    metadata.started_at = now - 9 * MINUTE_MS;
+    metadata.remote = Some(RemoteTask {
+        accepted_platform: None,
+        connection_file: None,
+        explicit_runon: true,
+        harness: "runner".into(),
+        session: "session".into(),
+        requested_platform: None,
+        requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: false,
+        started: None,
+        job_id: None,
+        last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
+        stdout_len: 0,
+        stderr_len: 0,
+        unknown_len: 0,
+        cancel_requested: false,
+        terminal: None,
+        fallback_digest: None,
+        env_not_forwarded: None,
+        queue_position: None,
+        output_received: false,
+        retry: Some(DrainingRetry {
+            request_digest: "digest".into(),
+            attempts: 1,
+            first_refusal_at_ms: Some(metadata.started_at),
+            next_retry_at_ms: None,
+            waited_ms: None,
+            resubmitted_at_ms: None,
+        }),
+        output_incomplete: None,
+        workspace_holder: None,
+    });
+    let minutes_left = |budget: &ReattachBudget| {
+        budget
+            .job_end
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs_f64()
+            / 60.0
+    };
+    // 5 minutes of queue wait plus 30 of run, counted from the submission.
+    let full_window = 35.0;
+
+    let mut budget = ReattachBudget::new(dir.path(), &metadata);
+    let before = minutes_left(&budget);
+    assert!(
+        (full_window - 9.5..=full_window - 9.0).contains(&before),
+        "before the resubmission the limit counts from the first submission: {before:.2} minutes left"
+    );
+
+    metadata
+        .remote
+        .as_mut()
+        .unwrap()
+        .retry
+        .as_mut()
+        .unwrap()
+        .resubmitted_at_ms = Some(now);
+    budget.resubmitted(&metadata);
+    let live = minutes_left(&budget);
+    assert!(
+        live >= full_window - 0.5,
+        "the worker that resubmitted must get the full window from the resubmission: {live:.2} minutes left"
+    );
+
+    let record = dir.path().join("task.json");
+    write_task(&record, &metadata).unwrap();
+    let reloaded = read_task(&record).unwrap();
+    let restarted = minutes_left(&ReattachBudget::new(dir.path(), &reloaded));
+    assert!(
+        restarted >= full_window - 0.5,
+        "a restarted daemon must count from the recorded resubmission: {restarted:.2} minutes left"
+    );
+
+    // A record written before the resubmission time existed still loads and
+    // counts from the task's start.
+    let mut older = serde_json::to_value(&reloaded).unwrap();
+    let removed = older["remote"]["retry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resubmitted_at_ms");
+    assert!(removed.is_some());
+    let older: PersistedTask = serde_json::from_value(older).unwrap();
+    let fallback = minutes_left(&ReattachBudget::new(dir.path(), &older));
+    assert!(
+        (full_window - 9.5..=full_window - 9.0).contains(&fallback),
+        "an older record counts from the task's start: {fallback:.2} minutes left"
+    );
 }
 
 fn draining_budgets() -> &'static Mutex<HashMap<PathBuf, u64>> {
