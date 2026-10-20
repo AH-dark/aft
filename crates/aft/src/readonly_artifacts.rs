@@ -1119,6 +1119,91 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_lookup_reloads_identity_after_configure_replaces_repository() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().join("checkout");
+        let replacement = project.path().join("replacement");
+        for (path, name) in [
+            (&root, "original_needle"),
+            (&replacement, "replacement_needle"),
+        ] {
+            fs::create_dir_all(path.join("src")).unwrap();
+            fs::write(path.join("src/lib.rs"), format!("pub fn {name}() {{}}\n")).unwrap();
+            init_git(path);
+            commit_all(path);
+        }
+        let root = fs::canonicalize(root).unwrap();
+        let bind = || {
+            let owner = borrowed_context(&root, storage.path());
+            let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "replace-repository",
+                "command": "configure",
+                "project_root": root,
+                "harness": "opencode",
+                "storage_dir": storage.path(),
+                "config": [{
+                    "tier": "user",
+                    "source": "/fixture/aft.jsonc",
+                    "doc": serde_json::json!({
+                        "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                        "views": { "enabled": false },
+                    }).to_string(),
+                }],
+            }))
+            .unwrap();
+            let response = serde_json::to_value(crate::commands::configure::handle_configure(
+                &request, &owner,
+            ))
+            .unwrap();
+            assert_eq!(response["success"], true, "{response}");
+            owner
+                .cached_artifact_cache_key(&root)
+                .expect("settled repository identity")
+        };
+        let original_key = bind();
+        build_search_artifact(&root, storage.path());
+        let session = tempfile::tempdir().unwrap();
+        let borrower = borrowed_context(session.path(), storage.path());
+        let first = cached_search_index(&borrower, &root, storage.path());
+        assert_eq!(
+            first
+                .grep("original_needle", true, &[], &[], &root, 10)
+                .matches
+                .len(),
+            1
+        );
+
+        fs::rename(&root, project.path().join("retired")).unwrap();
+        fs::rename(replacement, &root).unwrap();
+        let replacement_key = bind();
+        assert_ne!(replacement_key, original_key);
+        build_search_artifact(&root, storage.path());
+        let second = cached_search_index(&borrower, &root, storage.path());
+        assert_eq!(
+            second
+                .grep("replacement_needle", true, &[], &[], &root, 10)
+                .matches
+                .len(),
+            1,
+            "the next borrow must open configure's new repository identity"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            borrower
+                .memoized_readonly_artifact_cache_key(&root, storage.path())
+                .unwrap(),
+            replacement_key
+        );
+        assert_eq!(borrower.artifact_cache_key_derivation_count_for_test(), 2);
+        assert!(std::sync::Arc::ptr_eq(
+            &second,
+            &cached_search_index(&borrower, &root, storage.path())
+        ));
+    }
+
+    #[test]
     fn readonly_identity_lookup_never_persists_and_refuses_a_busy_legacy_database() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let project = tempfile::tempdir().unwrap();

@@ -59,6 +59,48 @@ fn record_path(root: &Path, storage: &Path) -> PathBuf {
     storage.join("root-identities").join(format!("{hash}.json"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+    #[cfg(windows)]
+    created: u64,
+}
+
+/// The caller supplies a canonical root so checking a memo requires just one
+/// stat of the record, not another filesystem traversal to resolve the root.
+pub(crate) fn record_stamp(
+    canonical_root: &Path,
+    storage: &Path,
+) -> io::Result<Option<RecordStamp>> {
+    let metadata = match std::fs::metadata(record_path(canonical_root, storage)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+    Ok(Some(RecordStamp {
+        modified: metadata.modified()?,
+        len: metadata.len(),
+        #[cfg(unix)]
+        identity: (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ),
+        // Rust's stable Windows API lacks a file ID; creation time distinguishes
+        // replacement records when their size and modification time match.
+        #[cfg(windows)]
+        created: metadata.creation_time(),
+    }))
+}
+
 pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> {
     Ok(read_record(root, storage)?.map(|record| record.identity))
 }
@@ -442,6 +484,30 @@ pub(crate) fn nearest_git_marker(root: &Path) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_stamp_detects_same_size_same_mtime_replacement() {
+        let project = tempfile::tempdir().unwrap();
+        let root = canonical_root(project.path());
+        let storage = tempfile::tempdir().unwrap();
+        assert_eq!(record_stamp(&root, storage.path()).unwrap(), None);
+        bind(&root, storage.path(), |_, _| {
+            Ok(IdentityChoice::retained(Identity::Path))
+        })
+        .unwrap();
+        let path = record_path(&root, storage.path());
+        let before = record_stamp(&root, storage.path()).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
+        filetime::set_file_mtime(
+            &replacement,
+            filetime::FileTime::from_last_modification_time(&metadata),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(record_stamp(&root, storage.path()).unwrap(), before);
+    }
 
     #[test]
     fn saved_identity_never_reads_the_legacy_database_pin() {

@@ -3643,6 +3643,11 @@ struct BorrowedIndexCacheKey {
     artifact: crate::readonly_artifacts::BorrowedArtifactGeneration,
 }
 
+struct ReadonlyArtifactCacheKey {
+    record: Option<crate::root_identity::RecordStamp>,
+    key: String,
+}
+
 type BorrowedSearchResult = crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>;
 
 #[derive(Debug, Default)]
@@ -4097,7 +4102,8 @@ pub struct AppContext {
     parked_configure_tail:
         parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
-    readonly_artifact_cache_keys: parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), String>>,
+    readonly_artifact_cache_keys:
+        parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), ReadonlyArtifactCacheKey>>,
     artifact_cache_key_derivations: AtomicU64,
     borrowed_index_cache: parking_lot::Mutex<BorrowedIndexCache>,
     /// Successful git worktree probes, keyed by canonical root and guarded by
@@ -6700,15 +6706,46 @@ impl AppContext {
         canonical_root: &Path,
         storage: &Path,
     ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        self.memoized_readonly_artifact_cache_key_with(canonical_root, storage, || {
+            crate::search_index::artifact_cache_key_read_only(canonical_root, storage)
+        })
+    }
+
+    fn memoized_readonly_artifact_cache_key_with(
+        &self,
+        canonical_root: &Path,
+        storage: &Path,
+        derive: impl FnOnce() -> Result<String, crate::search_index::ArtifactCacheKeyProbeError>,
+    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
         let cache_key = (canonical_root.to_path_buf(), storage.to_path_buf());
-        let mut keys = self.readonly_artifact_cache_keys.lock();
-        if let Some(key) = keys.get(&cache_key) {
-            return Ok(key.clone());
+        let before = crate::root_identity::record_stamp(canonical_root, storage);
+        if let Ok(record) = &before {
+            let keys = self.readonly_artifact_cache_keys.lock();
+            if let Some(entry) = keys.get(&cache_key).filter(|entry| entry.record == *record) {
+                return Ok(entry.key.clone());
+            }
         }
-        let key = crate::search_index::artifact_cache_key_read_only(canonical_root, storage)?;
+        // Git and legacy database probes must not hold the context-wide mutex:
+        // one slow root must not delay readers of unrelated roots.
+        let key = derive()?;
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
-        keys.insert(cache_key, key.clone());
+        // Only remember a derivation whose record stayed stable. Unreadable
+        // metadata or a concurrent configure leaves this lookup uncached.
+        if let (Ok(before), Ok(after)) = (
+            before,
+            crate::root_identity::record_stamp(canonical_root, storage),
+        ) {
+            if before == after {
+                self.readonly_artifact_cache_keys.lock().insert(
+                    cache_key,
+                    ReadonlyArtifactCacheKey {
+                        record: after,
+                        key: key.clone(),
+                    },
+                );
+            }
+        }
         Ok(key)
     }
 
@@ -15103,6 +15140,58 @@ pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> 
         .get(&(root.to_path_buf(), session_id.to_string()))
         .copied()
         .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod readonly_artifact_cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn slow_readonly_identity_derivation_does_not_block_other_roots() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let slow = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let slow_root = std::fs::canonicalize(slow.path()).unwrap();
+        let other_root = std::fs::canonicalize(other.path()).unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config::default(),
+        ));
+        let expected = ctx
+            .memoized_readonly_artifact_cache_key(&other_root, storage.path())
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slow_ctx = Arc::clone(&ctx);
+        let slow_storage = storage.path().to_path_buf();
+        let slow_worker = std::thread::spawn(move || {
+            slow_ctx.memoized_readonly_artifact_cache_key_with(&slow_root, &slow_storage, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                crate::search_index::artifact_cache_key_read_only(&slow_root, &slow_storage)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let other_ctx = Arc::clone(&ctx);
+        let other_storage = storage.path().to_path_buf();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let other_worker = std::thread::spawn(move || {
+            finished_tx
+                .send(other_ctx.memoized_readonly_artifact_cache_key(&other_root, &other_storage))
+                .unwrap();
+        });
+        let result = finished_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        slow_worker.join().unwrap().unwrap();
+        other_worker.join().unwrap();
+        assert_eq!(
+            result
+                .expect("another root must finish while the first derivation is paused")
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]
