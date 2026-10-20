@@ -958,3 +958,57 @@ callers, 312,039 queries, selected through the crate-wide Rust module domain)
 and the type-target trace load (868 traces through the same domain) remain,
 and the SQLite commit of 157 pages took about 1 s in both after runs against
 ~78 ms before; that commit cost is not yet explained.
+
+### Commit phase, WAL size and work counters (rebased on bdbf17caf)
+
+**The roughly 1 s commit is device sync latency, not a checkpoint or extra
+writes.** With `AFT_VIEW_PROFILE` the commit stage now prints the WAL size
+around `COMMIT` and the connection's `wal_autocheckpoint`. In every run the
+setting is 0 and the WAL grows from 0 bytes to the frames of this one
+transaction (432,632–494,432 bytes, 109–124 frames), so no checkpoint runs
+inside `COMMIT`. A separate `PASSIVE` checkpoint of those frames takes
+0.6–34 ms. A 1-file edit's transaction writes 120–160 pages in total, so
+index churn in the new tables is a handful of pages. The commit time varies
+between runs of identical code: 0.95–2.1 ms in four samples, and 1.0–1.3 s in
+four others. Under `strace -T`, the slow 1,211 ms commit was the two WAL
+`fsync` calls (0.700 s and 0.489 s). The bench's probe commit right after it,
+one row on a separate connection, waited 1.99 s in its own `fsync`. In the
+same run, the commit after a `sync(2)` (6.2 s) took 2 ms, with WAL `fsync`s of
+0.25 ms and 1.2 ms. The runner's `/motor-home` is XFS on md RAID and shared
+with other jobs. Durability needs those two syncs (`synchronous=FULL`), so
+nothing is changed. The earlier ~78 ms baseline commit sat at the end of a
+120 s pass, which is a different load window, not a different amount of work.
+
+**WAL growth is transient.** Publication schedules a TRUNCATE checkpoint of
+every derived database it publishes, cold or incremental
+(`generation::schedule_derived_checkpoint`, 250 ms after the pointer moves).
+After that checkpoint the cold database for this repository (5,434 entries) is
+1,205,866,496 bytes. The new tables take:
+
+| object | bytes | share |
+| --- | ---: | ---: |
+| `view_dispatch_files` | 99,864,576 | 8.28% |
+| `idx_view_dispatch_dependencies_dependency` | 20,901,888 | 1.73% |
+| `view_dispatch_dependencies` | 20,365,312 | 1.69% |
+| `sqlite_autoindex_view_dispatch_files_1` | 299,008 | 0.02% |
+| **total** | **141,430,784** | **11.73%** |
+
+**Work counters.** `metrics.views_work` gains `dispatch_blobs_decoded`,
+`dispatch_files_resolved`, `dispatch_sites_resolved`, `dispatch_full_passes`
+and `dispatch_type_target_files`. `MaterializeStats` is unchanged.
+
+**1-file publication on the rebased branch** (`update_bench` edit-1, debug,
+shared runner, every run with `parity equal=true` where parity ran):
+
+| run | wall s | load/select | selected join (ordinary surface replay; type-target traces + replay) | dispatch | commit |
+| --- | ---: | ---: | --- | ---: | ---: |
+| fastest | 5.29 | 418 ms | 4,050 ms (1,884; 479 + 344) | 265 ms | 43 ms |
+| after `sync(2)` | 6.97 | 660 ms | 5,426 ms (2,523; 599 + 600) | 270 ms | 42 ms |
+| traced | 7.03 | 678 ms | 5,760 ms (3,116; 409 + 572) | 176 ms | 23 ms |
+| slow device sync | 7.01 | 485 ms | 4,759 ms (2,423; 445 + 454) | 175 ms | 1,232 ms |
+
+The 3-second target is still not met. The largest remaining cost is the
+ordinary join's surface replay, which already existed: 953 callers and
+313,905 queries, selected through the always-dirty crate-wide Rust module
+domain. Reading and replaying the type-target traces of 873 files selected
+through the same domain adds 0.8–1.2 s.
