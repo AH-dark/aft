@@ -631,6 +631,133 @@ fn merge_grant(grants: &mut Vec<AccessGrant>, grant: AccessGrant) {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum LaunchTarget {
+    Existing { identity: [u64; 2] },
+    Future { parent: PathBuf },
+}
+
+fn missing_target(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+fn launch_target_identity(path: &Path) -> std::io::Result<[u64; 2]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = crate::bounded_io::metadata(path)?;
+        Ok([metadata.dev(), metadata.ino()])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        };
+        crate::bounded_io::run(path, None, |path| {
+            let file = std::fs::OpenOptions::new()
+                .access_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)?;
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            // SAFETY: the live file owns the handle and the successful call
+            // initializes the writable information buffer before it is read.
+            let info = unsafe {
+                if GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                info.assume_init()
+            };
+            Ok([
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            ])
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+fn save_launch_target(path: &Path) -> std::io::Result<LaunchTarget> {
+    match launch_target_identity(path) {
+        Ok(identity) => Ok(LaunchTarget::Existing { identity }),
+        Err(error) if missing_target(&error) => {
+            // Preserve the ancestor used to resolve a future destination. Its
+            // disappearance must not silently move the grant to a higher root.
+            let mut parent = path.parent();
+            while let Some(candidate) = parent {
+                match crate::bounded_io::metadata(candidate) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        return Ok(LaunchTarget::Future {
+                            parent: candidate.into(),
+                        })
+                    }
+                    Ok(_) => return Err(std::io::ErrorKind::NotADirectory.into()),
+                    Err(error) if missing_target(&error) => parent = candidate.parent(),
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn launch_inputs(saved: &Value) -> Value {
+    let mut inputs = saved.clone();
+    if let Some(entries) = inputs.as_array_mut() {
+        for entry in entries {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("target");
+            }
+        }
+    }
+    inputs
+}
+
+fn restorable_launch_target(
+    entry: &Value,
+    grant: &AccessGrant,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    let target = entry
+        .get("target")
+        .map(|target| serde_json::from_value::<LaunchTarget>(target.clone()))
+        .transpose()
+        .map_err(|error| restore_refusal(&grant.path, "invalid_launch_target", error))?;
+    match (launch_target_identity(&grant.path), target) {
+        (Ok(current), Some(LaunchTarget::Existing { identity })) => Ok(current == identity),
+        (Ok(_), _) => Ok(true),
+        (Err(error), Some(LaunchTarget::Existing { .. })) if missing_target(&error) => Ok(false),
+        (Err(error), Some(LaunchTarget::Future { parent })) if missing_target(&error) => {
+            let metadata = crate::bounded_io::metadata(&parent).map_err(|error| {
+                restore_refusal(&grant.path, crate::bounded_io::timeout_code(&error), error)
+            })?;
+            if !metadata.is_dir() {
+                return Err(restore_refusal(
+                    &grant.path,
+                    "not_a_directory",
+                    "launch parent is no longer a directory",
+                ));
+            }
+            Ok(true)
+        }
+        // Legacy rows do not establish that the target ever existed. An absent
+        // target is therefore retryable rather than permanently discarded.
+        (Err(error), _) => Err(restore_refusal(
+            &grant.path,
+            crate::bounded_io::timeout_code(&error),
+            error,
+        )),
+    }
+}
+
 /// Revived workers do not fetch another catalog. Validate only saved launch
 /// entries against current head authority, dropping invalid siblings. Filesystem
 /// probes run unlocked; the install transaction rechecks all stored inputs.
@@ -769,16 +896,12 @@ pub(super) fn restore_launch_before(
                         *resolution_progress.lock().unwrap_or_else(|e| e.into_inner()) = grant.path.clone();
                         #[cfg(test)]
                         launch_state.note_probe(&grant.path);
-                        match crate::bounded_io::metadata(&grant.path) {
-                            Ok(_) => {}
-                            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
-                                launch_state.mark_absent(&saved_key, grant);
-                                continue;
-                            }
-                            Err(error) => return Err(restore_refusal(&grant.path, crate::bounded_io::timeout_code(&error), error)),
+                        if !restorable_launch_target(entry, &grant)? {
+                            launch_state.mark_absent(&saved_key, grant);
+                            continue;
                         }
                     }
-                    match validate(&json!([entry]), head.as_ref(), saved_head_key.as_ref()) {
+                    match validate(&launch_inputs(&json!([entry])), head.as_ref(), saved_head_key.as_ref()) {
                         Ok(valid) => {
                             for grant in valid {
                                 // Launch paths are saved canonically. A symlink retarget
@@ -922,10 +1045,47 @@ pub(super) fn catalog(
             launch_params(&conn, key)?
         };
         let empty = json!([]);
-        let chosen = stored.as_ref().or(raw).unwrap_or(&empty);
+        let stored_inputs = stored.as_ref().map(launch_inputs);
+        let chosen = stored_inputs.as_ref().or(raw).unwrap_or(&empty);
         #[cfg(test)]
         unlocked_hook::run(unlocked_hook::Point::LaunchValidation);
-        let grants = validate(chosen, head.as_ref(), head_key.as_ref())?;
+        let mut grants = validate(chosen, head.as_ref(), head_key.as_ref())?;
+        if let Some(stored) = &stored {
+            let mut restorable = Vec::new();
+            for grant in grants {
+                let entry = stored.as_array().unwrap().iter().find(|entry| {
+                    entry.get("path").and_then(Value::as_str).map(Path::new)
+                        == Some(grant.path.as_path())
+                });
+                // Catalog refetches validate current head authority above, but
+                // cannot turn a saved path into authority over a new object.
+                if let Some(entry) = entry {
+                    if !ctx.launch_grant_state.is_absent(key, &grant) {
+                        if restorable_launch_target(entry, &grant)? {
+                            restorable.push(grant);
+                        } else {
+                            ctx.launch_grant_state.mark_absent(key, grant);
+                        }
+                    }
+                }
+            }
+            grants = restorable;
+        }
+        // Save the validated canonical authority and its launch-time target
+        // before taking the database lock, since identity probes can block.
+        let saved = if let Some(stored) = &stored {
+            stored.clone()
+        } else {
+            Value::Array(grants.iter().map(|grant| {
+            let target = save_launch_target(&grant.path)
+                .map_err(|error| restore_refusal(&grant.path, crate::bounded_io::timeout_code(&error), error))?;
+            Ok(json!({
+                "path": grant.path,
+                "mode": if grant.operation == AccessOperation::Write { "write" } else { "read" },
+                "target": target,
+            }))
+        }).collect::<Result<_, subc_protocol::ErrorBody>>()?)
+        };
         let conn = lock()?;
         let current = read_head(&conn)?;
         if current != snapshot {
@@ -937,12 +1097,6 @@ pub(super) fn catalog(
         if launch_params(&conn, key)? != stored {
             continue;
         }
-        // Store the authority that was actually validated, not a symlink spelling
-        // that could point at a different subtree when a worker is revived.
-        let saved = Value::Array(grants.iter().map(|grant| json!({
-            "path": grant.path,
-            "mode": if grant.operation == AccessOperation::Write { "write" } else { "read" },
-        })).collect());
         store::materialize(&conn, key, &saved, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
         return Ok(());

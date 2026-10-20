@@ -33,13 +33,19 @@ struct WireRestore {
 
 impl WireRestore {
     async fn new() -> Self {
+        Self::with_future_target(false).await
+    }
+
+    async fn with_future_target(future: bool) -> Self {
         let (dir, ctx, head, _) = default_fixture();
         ctx.update_config(|config| config.experimental_bash_background = true);
         let worker = identity(&head.project_root, "worker", "worker", Some("head"));
         register(&worker, &ctx).unwrap();
         let target = policy_path(&dir.path().join("saved-launch"));
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("probe.txt"), "granted content").unwrap();
+        if !future {
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("probe.txt"), "granted content").unwrap();
+        }
         std::fs::write(head.project_root.join("probe.txt"), "checkout content").unwrap();
         let healthy = dir.path().join("healthy-launch");
         std::fs::create_dir_all(&healthy).unwrap();
@@ -75,6 +81,7 @@ impl WireRestore {
                 executor,
                 |request, ctx| match request.command.as_str() {
                     "read" => crate::commands::read::handle_read(&request, ctx),
+                    "write" => crate::commands::write::handle_write(&request, ctx),
                     "bash" => crate::commands::bash::handle(&request, ctx),
                     _ => Response::success(request.id, json!({"executed":true})),
                 },
@@ -162,13 +169,24 @@ impl WireRestore {
     }
 
     async fn call_tool(&mut self, corr: u64, name: &str, arguments: Value) {
+        self.call_tool_with_deadline(corr, name, arguments, 700)
+            .await;
+    }
+
+    async fn call_tool_with_deadline(
+        &mut self,
+        corr: u64,
+        name: &str,
+        arguments: Value,
+        deadline_ms: u64,
+    ) {
         self.send(
             FrameType::Request,
             41,
             corr,
             json!({
                 "name":name, "preset":"worker", "arguments":arguments,
-                "deadline_ms":crate::bash_background::persistence::unix_millis() + 700,
+                "deadline_ms":crate::bash_background::persistence::unix_millis() + deadline_ms,
             }),
         )
         .await;
@@ -206,7 +224,7 @@ impl WireRestore {
         );
     }
 
-    async fn stop(mut self) {
+    async fn stop(&mut self) {
         self.send(FrameType::Goodbye, 0, 999, json!({})).await;
         self.module.take().unwrap().join().unwrap().unwrap();
     }
@@ -226,6 +244,146 @@ impl WireRestore {
             launcher,
         ))
     }
+}
+
+#[tokio::test]
+async fn grants_future_write_target_survives_revive_and_creates_directory() {
+    if !in_isolated_process("grants_future_write_target_survives_revive_and_creates_directory") {
+        return;
+    }
+    let mut wire = WireRestore::with_future_target(true).await;
+    let target = wire.target.clone();
+    wire.call_tool_with_deadline(99, "read", json!({"path":"probe.txt"}), 30_000)
+        .await;
+    let revived = wire.reply(99, Duration::from_secs(5)).await.unwrap();
+    let revived: Value = serde_json::from_slice(&revived.body).unwrap();
+    assert_eq!(revived["structuredContent"]["success"], true, "{revived}");
+    assert!(!target.exists(), "revival must not create the destination");
+    wire.call_tool_with_deadline(
+        100,
+        "write",
+        json!({
+        "path":target.join("created.txt"), "content":"created",
+        }),
+        30_000,
+    )
+    .await;
+    let reply = wire.reply(100, Duration::from_secs(5)).await.unwrap();
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+    assert_eq!(
+        std::fs::read_to_string(target.join("created.txt")).unwrap(),
+        "created"
+    );
+    wire.stop().await;
+}
+
+#[tokio::test]
+async fn grants_restore_cannot_extend_caller_start_deadline() {
+    if !in_isolated_process("grants_restore_cannot_extend_caller_start_deadline") {
+        return;
+    }
+    let mut wire = WireRestore::new().await;
+    let _launcher = wire.install_shell_launcher();
+    let marker = wire.revived.project_root.join("must-not-start");
+    let stall = crate::bounded_io::stall_running_helper(&wire.target);
+    wire.call_tool(
+        100,
+        "bash",
+        json!({"command":format!("touch '{}'", marker.display())}),
+    )
+    .await;
+    stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
+    let reply = wire.reply(100, Duration::from_secs(5)).await.unwrap();
+    drop(stall);
+    wire.stop().await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(
+        !marker.exists(),
+        "command started after its caller's deadline: {body}"
+    );
+    assert_eq!(
+        body["structuredContent"]["code"], "bash_start_deadline",
+        "{body}"
+    );
+}
+
+#[test]
+fn grants_legacy_missing_target_remains_retryable() {
+    let (_dir, ctx, head, worker) = default_fixture();
+    let target = head.project_root.join("legacy-target");
+    std::fs::create_dir(&target).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    {
+        let db = ctx.db().unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE access_launch_params SET params=?1",
+                [json!([{"path":target,"mode":"write"}]).to_string()],
+            )
+            .unwrap();
+    }
+    std::fs::remove_dir(&target).unwrap();
+    let revived = at_epoch(&worker, 8);
+    let refused = restore_launch(&revived, &ctx, "worker").unwrap_err();
+    assert_eq!(refused.detail.unwrap()["retryable"], true);
+    assert!(!ctx.launch_grant_state.is_absent(
+        &launch_key(&revived, "worker").unwrap(),
+        &AccessGrant {
+            path: target.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }
+    ));
+    std::fs::create_dir(&target).unwrap();
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    let db = ctx.db().unwrap();
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .iter()
+        .any(|grant| grant.path == target));
+}
+
+#[test]
+fn grants_replaced_target_does_not_inherit_launch_identity() {
+    let (_dir, ctx, head, worker) = default_fixture();
+    let target = head.project_root.join("original-target");
+    std::fs::create_dir(&target).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    std::fs::rename(&target, head.project_root.join("moved-original")).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    let revived = at_epoch(&worker, 8);
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    let db = ctx.db().unwrap();
+    assert!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived))
+            .unwrap()
+            .is_empty(),
+        "replacement object inherited launch authority"
+    );
+    let refetched = at_epoch(&worker, 9);
+    remote_policy::catalog(json!({"preset":"worker"}), &refetched, &ctx).unwrap();
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&refetched))
+        .unwrap()
+        .is_empty());
+    let fresh = context(&head.project_root, &ctx.storage_dir());
+    let restarted = at_epoch(&worker, 10);
+    restore_launch(&restarted, &fresh, "worker").unwrap();
+    let db = fresh.db().unwrap();
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&restarted))
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -306,14 +464,17 @@ async fn grants_stalled_restore_runs_bash_with_reduced_profile() {
         .unwrap();
     }
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call_tool(
+    // Restoration may use its full internal wait while this caller still has
+    // enough absolute time to receive the shell's task handle.
+    wire.call_tool_with_deadline(
         100,
         "bash",
         json!({"command":format!("touch '{}'", marker.display())}),
+        30_000,
     )
     .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reply = wire.reply(100, Duration::from_secs(5)).await.unwrap();
+    let reply = wire.reply(100, Duration::from_secs(15)).await.unwrap();
     assert!(!wire
         .ctx
         .launch_grants_materialized(&scope_key(&wire.revived)));

@@ -78,12 +78,12 @@ impl ReplyBudget {
         deadline.min(self.deadline)
     }
 
-    /// Add only the measured grant-restoration wait to the shell's reply budget;
-    /// leave other queue delays and the startup limit unchanged.
+    /// Refund restoration time only to the internal startup allowance. The
+    /// caller's absolute reply deadline, including delivery margin, stays fixed.
     pub(crate) fn after_launch_restore(self, elapsed: Duration) -> Self {
         Self {
             received_at: self.received_at + elapsed,
-            deadline: self.deadline + elapsed,
+            deadline: self.deadline,
         }
     }
 }
@@ -111,17 +111,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_restore_wait_refunds_only_the_measured_delay() {
+    fn launch_restore_wait_refunds_startup_but_not_caller_deadline() {
         let receipt = Instant::now() - Duration::from_secs(20);
         let budget = ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(2)));
         assert!(budget.deadline < Instant::now());
         let shifted = budget.after_launch_restore(Duration::from_secs(20));
-        assert!(shifted.deadline > Instant::now());
+        assert!(shifted.deadline < Instant::now());
         assert_eq!(
             shifted.received_at - budget.received_at,
             Duration::from_secs(20)
         );
-        assert_eq!(shifted.deadline - budget.deadline, Duration::from_secs(20));
+        assert_eq!(shifted.deadline, budget.deadline);
         assert_eq!(
             budget.after_launch_restore(Duration::ZERO).deadline,
             budget.deadline

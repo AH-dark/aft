@@ -493,6 +493,39 @@ async fn grants_revived_launch_first_call_restores_without_catalog() {
 }
 
 #[test]
+fn grants_future_targets_restore_only_while_launch_parent_exists() {
+    let (_dir, ctx, head, worker) = fixture();
+    let parent = head.project_root.join("existing-parent");
+    std::fs::create_dir(&parent).unwrap();
+    let future = parent.join("future").join("nested");
+    let created = parent.join("created-later");
+    remote_policy::catalog(
+        catalog_request(json!([
+            {"path":future,"mode":"write"},
+            {"path":created,"mode":"write"}
+        ])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    std::fs::remove_dir(&parent).unwrap();
+    let revived = at_epoch(&worker, 8);
+    let refused = restore_launch(&revived, &ctx, "worker").unwrap_err();
+    assert_eq!(refused.detail.unwrap()["retryable"], true);
+    std::fs::create_dir_all(&created).unwrap();
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    let db = ctx.db().unwrap();
+    let restored = store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap();
+    assert_eq!(restored.len(), 2);
+    for target in [&future, &created] {
+        assert!(restored
+            .iter()
+            .any(|grant| &grant.path == target && grant.operation == AccessOperation::Write));
+    }
+    assert!(!future.exists());
+}
+
+#[test]
 fn grants_revived_launch_failed_restore_refuses_and_retries() {
     let (_dir, ctx, head, worker) = fixture();
     let worker = at_epoch(&worker, 1);
@@ -709,10 +742,14 @@ fn grants_revived_launch_drops_and_logs_revoked_head_and_floor() {
             }]
         );
         assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap().len(), 3);
-        assert_eq!(
-            store::launch_params(&conn, &launch_key(&revived, "worker").unwrap()).unwrap(),
-            Some(raw)
-        );
+        let mut saved = store::launch_params(&conn, &launch_key(&revived, "worker").unwrap())
+            .unwrap()
+            .unwrap();
+        for entry in saved.as_array_mut().unwrap() {
+            assert_eq!(entry["target"]["state"], "existing");
+            assert!(entry.as_object_mut().unwrap().remove("target").is_some());
+        }
+        assert_eq!(saved, raw);
         store::revoke(&conn, &scope_key(&revived), &policy_path(&held)).unwrap();
     }
     let (result, lines) =
