@@ -439,6 +439,46 @@ pub fn preview_launch(
     row.map(|(_, json)| decode(&json)).transpose()
 }
 
+/// Saved capabilities that have not been installed in this epoch. Reading them
+/// must not probe the filesystem: an unavailable mount is precisely why callers
+/// need this refusal-only description. Restoration alone validates and installs.
+pub fn unrestored_launch(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Vec<AccessGrant>> {
+    let scope = ScopeKey::from_policy(key);
+    let materialized: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM access_materialized WHERE owner=?1 AND scope_ref=?2 AND epoch=?3)",
+        params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
+        |r| r.get(0),
+    )?;
+    if materialized {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = preview_launch(conn, key)? else {
+        return Ok(Vec::new());
+    };
+    raw.as_array()
+        .ok_or(rusqlite::Error::InvalidQuery)?
+        .iter()
+        .map(|entry| {
+            let path = entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            let operation = match entry.get("mode").and_then(serde_json::Value::as_str) {
+                Some("read") => AccessOperation::Read,
+                Some("write") => AccessOperation::Write,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(AccessGrant {
+                path,
+                kind: GrantKind::Subtree,
+                operation,
+            })
+        })
+        .collect()
+}
+
 /// A call can restore only persisted launch inputs, never standing consent grants.
 /// The immediate transaction serializes the marker check, params carry-forward,
 /// current-head validation and grant installation, even across database handles.

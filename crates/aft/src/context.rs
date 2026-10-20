@@ -13291,6 +13291,12 @@ impl AppContext {
         // Only mutations validate write locations (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
         reject_github_address(req_id, path)?;
+        self.check_unrestored_path(
+            req_id,
+            &crate::inspect::job::normalize_path(&self.resolve_relative_path(path)),
+            None,
+            true,
+        )?;
         let Some(PathRestrictionContext {
             raw_root,
             resolved_root,
@@ -13370,6 +13376,12 @@ impl AppContext {
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
+        self.check_unrestored_path(
+            req_id,
+            &crate::inspect::job::normalize_path(&self.resolve_relative_path(path)),
+            artifact_session_id,
+            false,
+        )?;
         let Some(PathRestrictionContext {
             raw_root,
             resolved_root,
@@ -13446,6 +13458,90 @@ impl AppContext {
             false,
         )?;
         Ok(resolved)
+    }
+
+    /// Read saved launch entries without resolving their paths or caching a
+    /// failure. These entries can explain a refusal but cannot authorize access.
+    pub(crate) fn unrestored_launch_grants(
+        &self,
+        req_id: &str,
+    ) -> Result<Vec<crate::access_policy::AccessGrant>, crate::protocol::Response> {
+        let crate::access_policy::AskRoute::Consent {
+            launch: Some(key), ..
+        } = crate::access_policy::current_ask_route()
+        else {
+            return Ok(Vec::new());
+        };
+        let unavailable = |message: String| {
+            crate::protocol::Response::error_with_data(
+                req_id,
+                "grants_unavailable",
+                message,
+                serde_json::json!({"detail":{"retryable":true,"phase":"launch_grant_restore","path":key.project_root}}),
+            )
+        };
+        let db = self
+            .db()
+            .ok_or_else(|| unavailable("scope persistence unavailable; retry".into()))?;
+        let conn = db
+            .lock()
+            .map_err(|_| unavailable("grant database lock poisoned; retry".into()))?;
+        crate::db::access_grants::unrestored_launch(&conn, &key)
+            .map_err(|error| unavailable(format!("launch grants unavailable: {error}; retry")))
+    }
+
+    pub(crate) fn unrestored_grant_refusal(req_id: &str, path: &Path) -> crate::protocol::Response {
+        crate::protocol::Response::error_with_data(
+            req_id,
+            "grants_unavailable",
+            format!(
+                "launch grant for {} is not restored; retry after the path recovers",
+                path.display()
+            ),
+            serde_json::json!({"detail":{"retryable":true,"path":path,"phase":"launch_grant_restore"}}),
+        )
+    }
+
+    fn check_unrestored_path(
+        &self,
+        req_id: &str,
+        path: &Path,
+        artifact_session: Option<&str>,
+        preserve_final: bool,
+    ) -> Result<(), crate::protocol::Response> {
+        use crate::access_policy::{AccessDecision, AccessDenial, AccessOperation};
+        let operation = if artifact_session.is_some() {
+            AccessOperation::Read
+        } else {
+            AccessOperation::Write
+        };
+        let pending = self.unrestored_launch_grants(req_id)?;
+        let Some(grant) = pending.iter().find(|grant| grant.covers(operation, path)) else {
+            return Ok(());
+        };
+        let owned_artifact = artifact_session.is_some_and(|session| {
+            self.bash_background
+                .is_session_owned_artifact_path(session, path)
+                || self
+                    .bash_background
+                    .is_session_owned_scratch_path(session, path)
+                || self.bash_background.is_readable_task_path(session, path)
+        });
+        let policy = self.access_policy(req_id)?;
+        let decision = if preserve_final {
+            policy.decide_tree_write(path)
+        } else {
+            policy.decide(operation, path, owned_artifact)
+        };
+        // This check grants nothing. Canonical resolution and the usual policy
+        // still follow, including floors, symlink checks and owned-artifact rules.
+        if !matches!(
+            decision,
+            AccessDecision::Allow | AccessDecision::Deny(AccessDenial::Floor)
+        ) {
+            return Err(Self::unrestored_grant_refusal(req_id, &grant.path));
+        }
+        Ok(())
     }
 
     /// Use the effective configuration snapshot selected for the current tool route.
@@ -13627,7 +13723,7 @@ impl AppContext {
                     }),
                 ));
             }
-            AskRoute::Consent { once } => once,
+            AskRoute::Consent { once, .. } => once,
         };
         if once.iter().any(|grant| grant.covers(operation, identity)) {
             return Ok(());
@@ -13742,6 +13838,7 @@ impl AppContext {
                     .bash_background
                     .is_readable_task_path(session, &identity)
         });
+        self.check_unrestored_path(req_id, &identity, artifact_session, preserve_final)?;
         let policy = self.access_policy(req_id)?;
         let decision = if preserve_final {
             policy.decide_tree_write(&identity)

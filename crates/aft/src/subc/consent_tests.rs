@@ -2717,7 +2717,7 @@ static RERUN_CANCELLED: AtomicBool = AtomicBool::new(false);
 /// approvals) waits until its job is cancelled, and records whether it was.
 #[cfg(unix)]
 fn blocking_rerun_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
-    if let AskRoute::Consent { once } = crate::access_policy::current_ask_route() {
+    if let AskRoute::Consent { once, .. } = crate::access_policy::current_ask_route() {
         if !once.is_empty() {
             RERUN_STARTED.store(true, Ordering::SeqCst);
             let deadline = Instant::now() + Duration::from_secs(10);

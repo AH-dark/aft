@@ -39,6 +39,7 @@ fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Res
     let _ask =
         crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
             once: vec![],
+            launch: access_grants::launch_key(route, "worker"),
         }));
     let format =
         crate::subc_format::FormatContext::from_tool_call(name, &args, &route.project_root);

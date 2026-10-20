@@ -294,7 +294,10 @@ pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRo
         return crate::access_policy::AskRoute::Unavailable;
     }
     if identity.scope.as_ref().is_some_and(alfonso) {
-        crate::access_policy::AskRoute::Consent { once: Vec::new() }
+        crate::access_policy::AskRoute::Consent {
+            once: Vec::new(),
+            launch: launch_key(identity, "worker"),
+        }
     } else {
         crate::access_policy::AskRoute::Lowered
     }

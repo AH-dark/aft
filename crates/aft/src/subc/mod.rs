@@ -5384,11 +5384,20 @@ where
                                 Err(decoded) => decoded,
                             }
                         } else { decoded };
-                        if let Some(Err(error)) = decoded.launch_restore.as_ref() {
-                            if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error.clone()).await {
-                                break Err(error);
+                        // An unrestored grant must not block unrelated checkout work;
+                        // path checks distinguish it from independently allowed access.
+                        // Shell targets are unknown before execution. Send the restore
+                        // error now: its wait may have used the shell's startup budget,
+                        // which would otherwise mask the cause as a startup timeout.
+                        let shell = decoded.body().ok().and_then(|body| body.get("name")).and_then(Value::as_str)
+                            .is_some_and(|name| matches!(name, "bash" | "powershell"));
+                        if shell {
+                            if let Some(Err(error)) = decoded.launch_restore.as_ref() {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error.clone()).await {
+                                    break Err(error);
+                                }
+                                continue;
                             }
-                            continue;
                         }
                         let decoded = if !ledger_waited && !management_routes.contains(&route) {
                             match ledger_edge.defer(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {

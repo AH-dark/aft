@@ -370,8 +370,18 @@ async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str)
 }
 
 async fn first_read_response(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) -> Value {
+    first_read_path_response(ctx, identity, preset, None).await
+}
+
+async fn first_read_path_response(
+    ctx: Arc<AppContext>,
+    identity: RouteIdentity,
+    preset: &str,
+    target: Option<PathBuf>,
+) -> Value {
     ctx.update_config(|config| config.project_root = Some(identity.project_root.clone()));
-    let target = identity.project_root.join("first-call.txt");
+    let target = target.unwrap_or_else(|| identity.project_root.join("first-call.txt"));
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::fs::write(&target, "first call").unwrap();
     let executor = Arc::new(Executor::new());
     executor.register_actor(identity.root.clone(), ctx.clone());
@@ -402,9 +412,6 @@ async fn first_read_response(ctx: Arc<AppContext>, identity: RouteIdentity, pres
         Ok(()) => waits.next().await,
         Err(decoded) => decoded,
     };
-    if let Some(Err(error)) = decoded.launch_restore {
-        return serde_json::to_value(error).unwrap();
-    }
     let frame = decoded.frame;
     let (writer, mut replies) = mpsc::channel(8);
     let (bash_tx, _bash_rx) = mpsc::channel(8);
@@ -504,9 +511,16 @@ fn grants_revived_launch_failed_restore_refuses_and_retries() {
         .build()
         .unwrap();
     let (_, lines) = crate::logging::capture_log_lines(|| {
-        let refused = runtime.block_on(first_read_response(ctx.clone(), revived.clone(), "worker"));
-        assert_eq!(refused["code"], "grants_unavailable");
-        assert_eq!(refused["detail"]["retryable"], true);
+        let body = runtime.block_on(first_read_path_response(
+            ctx.clone(),
+            revived.clone(),
+            "worker",
+            Some(target.join("first-call.txt")),
+        ));
+        let refused = &body["structuredContent"];
+        assert_eq!(refused["code"], "grants_unavailable", "{body}");
+        assert_eq!(refused["detail"]["retryable"], true, "{body}");
+        assert_eq!(refused["detail"]["path"], json!(target), "{body}");
     });
     assert!(
         lines
@@ -546,6 +560,39 @@ fn grants_revived_launch_failed_restore_refuses_and_retries() {
             kind: GrantKind::Subtree,
             operation: AccessOperation::Write,
         }]
+    );
+}
+
+#[test]
+fn grants_unrestored_launch_refuses_bash_before_spawn() {
+    let (_dir, ctx, head, worker) = default_fixture();
+    let target = head.project_root.join("shared");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 8);
+    register(&revived, &ctx).unwrap();
+    let _scope = crate::access_policy::scope_guard(Some(scope_key(&revived)));
+    let _ask = crate::access_policy::ask_route_guard(Some(ask_route(&revived)));
+    let marker = worker.project_root.join("bash-ran");
+    let request = RawRequest {
+        id: "unrestored-shell".into(),
+        command: "bash".into(),
+        session_id: None,
+        lsp_hints: None,
+        params: json!({"command":format!("touch '{}'", marker.display())}),
+    };
+    let response = crate::commands::bash::handle(&request, &ctx);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "grants_unavailable");
+    assert_eq!(response.data["detail"]["path"], json!(target));
+    assert_eq!(response.data["detail"]["retryable"], true);
+    assert!(
+        !marker.exists(),
+        "unrestored launch grants must refuse before shell execution"
     );
 }
 

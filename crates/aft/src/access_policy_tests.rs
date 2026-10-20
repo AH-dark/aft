@@ -824,6 +824,7 @@ fn scratch_read_context() -> (
     let ask =
         crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
             once: Vec::new(),
+            launch: None,
         }));
     (directory, ctx, scratch, (guard, ask))
 }
