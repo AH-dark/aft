@@ -1109,17 +1109,22 @@ mod tests {
         );
         // The snapshot predates the gh shim relay operations and the backup
         // purge, so they are appended to its management operation list here.
-        management
+        // It also predates `bash.kill_scope`, which the manifest lists first.
+        let operations = management
             .get_mut("operations")
             .and_then(Value::as_array_mut)
-            .expect("management operations")
-            .extend([
-                json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
-                json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
-                json!({"name": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "kind": "query"}),
-                json!({"name": crate::gh_shim_relay::READ_REQUEST_OPERATION, "kind": "query"}),
-                json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
-            ]);
+            .expect("management operations");
+        operations.insert(
+            0,
+            json!({"name": crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION, "kind": "mutate"}),
+        );
+        operations.extend([
+            json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
+            json!({"name": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "kind": "query"}),
+            json!({"name": crate::gh_shim_relay::READ_REQUEST_OPERATION, "kind": "query"}),
+            json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
+        ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");
