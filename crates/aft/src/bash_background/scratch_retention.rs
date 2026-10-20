@@ -136,6 +136,9 @@ impl BgTaskRegistry {
     /// Release the kept scratch of every finished task that ran under
     /// `scope`, which has ended. Does no filesystem work here: the watchdog
     /// picks the tasks up and the scratch cleanup worker deletes the folders.
+    /// A task that reaches scratch cleanup only after this pass is not listed
+    /// yet; `cleanup_terminal_task_temp_at` checks the ended scopes itself
+    /// and deletes its scratch instead of keeping it.
     pub(super) fn release_scope_scratch(&self, scope: &subc_protocol::scope::ScopeStamp) {
         let task_ids: Vec<String> = self
             .inner

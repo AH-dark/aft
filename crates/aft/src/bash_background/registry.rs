@@ -8086,8 +8086,23 @@ impl BgTaskRegistry {
                 }
             };
             if now_ms < delete_at {
-                self.retain_scratch(&task.task_id, path, delete_at);
-                return Ok(true);
+                self.retain_scratch(&task.task_id, path.clone(), delete_at);
+                // List the scratch before reading the ended scopes: a scope end
+                // records itself before it reads this list, so either it sees
+                // the entry and releases it, or this check sees the scope end.
+                let scope_ended = state
+                    .metadata
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| self.scope_revoked(scope));
+                if !scope_ended {
+                    return Ok(true);
+                }
+                // The session's scope ended before this command's scratch was
+                // listed, so its scope-end pass could not release it. Nothing
+                // will read the scratch any more: delete it now.
+                state.scratch_released = true;
+                self.forget_retained_scratch(&task.task_id);
             }
         }
         if let Some(result) = state.temp_cleanup.as_ref() {
@@ -8177,8 +8192,14 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
-        let revoked = self
-            .inner
+        if self.scope_revoked(scope) {
+            self.kill_scope(scope);
+        }
+    }
+
+    /// Whether `scope` has ended, as recorded by [`Self::kill_scope`].
+    fn scope_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) -> bool {
+        self.inner
             .revoked_scopes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -8186,10 +8207,7 @@ impl BgTaskRegistry {
                 serde_json::to_string(&scope.owner).expect("principal is JSON"),
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
-            ));
-        if revoked {
-            self.kill_scope(scope);
-        }
+            ))
     }
 
     /// Whether any task is still under watch, without waiting: `None` when
@@ -14302,6 +14320,54 @@ mod tests {
         wait_for_released_scratch(&registry, ended);
         assert!(!ended_scratch.exists(), "ended scope kept its scratch");
         let (other, other_scratch) = &kept[1];
+        assert!(registry.cleanup_terminal_task_temp(other).unwrap());
+        assert!(
+            other_scratch.is_dir(),
+            "another scope's scratch was deleted"
+        );
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 1);
+        wait_for_task_temp_cleanup(&registry, other);
+    }
+
+    /// A command can finish just before its scope ends and reach scratch
+    /// cleanup only afterwards. The scope-end pass then finds nothing listed
+    /// to release, so cleanup itself must see that the scope has ended and
+    /// delete the scratch now instead of keeping it for the retention time.
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_scope_ended_before_cleanup_deletes_early() {
+        let stamp = |scope_ref: &str| {
+            subc_protocol::scope::ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "owner".into(),
+                },
+                scope_ref,
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true)
+        };
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut finished = Vec::new();
+        for scope_ref in ["ended", "other"] {
+            let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+            task.lock_state().unwrap().metadata.scope = Some(stamp(scope_ref));
+            let (scratch, _) = attach_scratch(&task);
+            finished.push((task, scratch));
+        }
+        // The scope ends while both commands have finished but neither has
+        // been through scratch cleanup, so no scratch is listed as kept yet.
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
+        registry.kill_scope(&stamp("ended"));
+
+        let (ended, ended_scratch) = &finished[0];
+        wait_for_released_scratch(&registry, ended);
+        assert!(
+            !ended_scratch.exists(),
+            "scratch of a scope that ended before cleanup was kept"
+        );
+        let (other, other_scratch) = &finished[1];
         assert!(registry.cleanup_terminal_task_temp(other).unwrap());
         assert!(
             other_scratch.is_dir(),
