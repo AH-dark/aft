@@ -83,6 +83,7 @@ export type {
   ConfigureDroppedKey,
   ConfigureWarning,
   ConfigureWarningsContext,
+  ShellTimeoutOutcome,
   StatusSnapshot,
 } from "./bridge.js";
 export {
@@ -205,8 +206,11 @@ export {
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
+  SHELL_TIMEOUT_UNKNOWN_DISPOSITION,
   SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
+  shellTimeoutNotStartedDisposition,
+  shellTimeoutTaskDisposition,
   toolErrorFromResponse,
 } from "./error-contract.js";
 // --- feature-based configuration policy (shared with crates/aft feature_config.rs) ---

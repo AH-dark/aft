@@ -17,6 +17,7 @@ import {
   BASH_HOST_FALLBACK_BANNER,
   BASH_RUNON_DESCRIPTION,
   type BinaryBridge,
+  BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -1350,6 +1351,48 @@ describe("bash tool adapter", () => {
           },
         }),
     ).rejects.toThrow("invalid request from engine");
+    expect(confirmations).toHaveLength(0);
+  });
+
+  test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const confirmations: unknown[] = [];
+    const bridge = {
+      send: async () => {
+        throw new BridgeTransportTimeoutError(
+          "bash",
+          70_000,
+          '[aft-bridge] Request "bash" (id=7) timed out after 70000ms',
+          { kind: "task_started", taskId: "bash-late1" },
+        );
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+    );
+
+    let captured: unknown;
+    try {
+      await tools.get("bash")!.execute("call", { command: "sleep 600" }, undefined, undefined, {
+        cwd: projectRoot,
+        hasUI: true,
+        ui: {
+          confirm: async (...args) => {
+            confirmations.push(args);
+            return true;
+          },
+        },
+      });
+    } catch (error) {
+      captured = error;
+    }
+
+    const message = (captured as Error).message;
+    expect(message).toContain("timed out after 70000ms");
+    expect(message).toContain("Use bash_status or bash_watch with task ID bash-late1");
+    expect(message).not.toContain("no task");
+    // A command that may be running must never be re-run on the host.
     expect(confirmations).toHaveLength(0);
   });
 
