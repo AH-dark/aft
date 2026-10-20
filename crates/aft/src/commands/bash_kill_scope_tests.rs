@@ -58,7 +58,7 @@ impl Tasks {
         .unwrap()
     }
 
-    fn pause(&self, scope: &ScopeStamp) -> Response {
+    fn cancel(&self, scope: &ScopeStamp) -> Response {
         handle_bash_kill_scope(
             json!({"scope": scope}),
             Some(&scope.owner),
@@ -103,7 +103,7 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
     assert!(crate::bash_background::process::is_process_alive(
         pid as u32
     ));
-    let reply = tasks.pause(&stamp);
+    let reply = tasks.cancel(&stamp);
     assert!(reply.success, "{reply:?}");
     let killed = reply.data["killed"].as_array().unwrap();
     assert_eq!(killed.len(), 2);
@@ -119,10 +119,13 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
             snapshot.exit_code,
             snapshot.info.status_reason.as_deref(),
         );
-        assert!(rendered.contains("killed (paused by owner)"), "{rendered}");
+        assert!(
+            rendered.contains("killed (cancelled by owner)"),
+            "{rendered}"
+        );
         let notices = tasks.registry.take_cancelled_call_notices(session);
         assert_eq!(notices.len(), 1);
-        assert!(notices[0].contains("killed (paused by owner)"));
+        assert!(notices[0].contains("killed (cancelled by owner)"));
         assert!(tasks
             .registry
             .take_cancelled_call_notices(session)
@@ -146,7 +149,7 @@ fn bash_kill_scope_leaves_other_scope_owner_and_epoch_alone() {
         let task = tasks.start(&other, &session, "sleep 30", true);
         others.push((task, session));
     }
-    let reply = tasks.pause(&stamp);
+    let reply = tasks.cancel(&stamp);
     assert!(reply.success, "{reply:?}");
     assert_eq!(reply.data["killed"].as_array().unwrap().len(), 1);
     for (task, session) in others {
@@ -198,10 +201,10 @@ fn bash_kill_scope_second_call_is_noop() {
     let tasks = Tasks::new();
     let stamp = scope("worker");
     tasks.start(&stamp, "session", "sleep 30", true);
-    let first = tasks.pause(&stamp);
+    let first = tasks.cancel(&stamp);
     assert!(first.success, "{first:?}");
     assert_eq!(first.data["killed"].as_array().unwrap().len(), 1);
-    let second = tasks.pause(&stamp);
+    let second = tasks.cancel(&stamp);
     assert!(second.success, "{second:?}");
     assert_eq!(second.data["killed"], json!([]));
     assert_eq!(second.data["not_found"], 0);
@@ -216,7 +219,7 @@ fn bash_kill_scope_allows_same_worker_and_codemode_scope_to_resume() {
             stamp.attributes.run_id = Some("run-id".into());
         }
         tasks.start(&stamp, &stamp.scope_ref, "sleep 30", true);
-        let reply = tasks.pause(&stamp);
+        let reply = tasks.cancel(&stamp);
         assert!(reply.success, "{reply:?}");
         let resumed = tasks.start(&stamp, &stamp.scope_ref, "sleep 30", true);
         tasks.registry.kill_scope_if_revoked(&stamp);
@@ -229,7 +232,7 @@ fn bash_kill_scope_allows_same_worker_and_codemode_scope_to_resume() {
                 .status,
             BgTaskStatus::Running
         );
-        assert!(tasks.pause(&stamp).success);
+        assert!(tasks.cancel(&stamp).success);
     }
 }
 
@@ -244,7 +247,7 @@ fn bash_kill_scope_success_wire_fixture_matches_handler() {
     let stamp: ScopeStamp =
         serde_json::from_value(case["request"]["params"]["scope"].clone()).unwrap();
     let task = tasks.start(&stamp, "pause-session", "sleep 30", true);
-    let reply = tasks.pause(&stamp);
+    let reply = tasks.cancel(&stamp);
     assert!(reply.success, "{reply:?}");
     let mut expected = case["reply"].clone();
     expected["data"]["killed"][0]["task_id"] = json!(task);
@@ -274,7 +277,7 @@ fn bash_kill_scope_completion_is_an_expected_owner_stop() {
     let tasks = Tasks::new();
     let stamp = scope("worker");
     let task = tasks.start(&stamp, "session", "sleep 30", true);
-    assert!(tasks.pause(&stamp).success);
+    assert!(tasks.cancel(&stamp).success);
     let completions = tasks.registry.pending_completions_for_session("session");
     let completion = completions
         .iter()
@@ -285,13 +288,13 @@ fn bash_kill_scope_completion_is_an_expected_owner_stop() {
     assert!(
         completion
             .output_preview
-            .contains("[killed (paused by owner); expected stop, not a command failure]"),
+            .contains("[killed (cancelled by owner); expected stop, not a command failure]"),
         "{completion:?}"
     );
 }
 
 #[test]
-fn bash_kill_scope_next_bash_family_reply_names_pause_once() {
+fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.project_root = Some(dir.path().into());
@@ -302,7 +305,7 @@ fn bash_kill_scope_next_bash_family_reply_names_pause_once() {
     };
     let stamp = scope("worker");
     let task = tasks.start(&stamp, "session", "sleep 30", true);
-    assert!(tasks.pause(&stamp).success);
+    assert!(tasks.cancel(&stamp).success);
     let mut response = Response::success("next", json!({}));
     let mut unrelated = String::new();
     crate::response_finalize::finalize_tool_response(
@@ -313,7 +316,7 @@ fn bash_kill_scope_next_bash_family_reply_names_pause_once() {
         "read",
         false,
     );
-    assert!(!unrelated.contains("paused by owner"));
+    assert!(!unrelated.contains("cancelled by owner"));
     let mut next = String::new();
     crate::response_finalize::finalize_tool_response(
         &mut response,
@@ -324,7 +327,7 @@ fn bash_kill_scope_next_bash_family_reply_names_pause_once() {
         false,
     );
     assert!(
-        next.contains(&format!("task {task}: killed (paused by owner)")),
+        next.contains(&format!("task {task}: killed (cancelled by owner)")),
         "{next}"
     );
     let mut again = String::new();
@@ -336,5 +339,5 @@ fn bash_kill_scope_next_bash_family_reply_names_pause_once() {
         "bash",
         false,
     );
-    assert!(!again.contains("paused by owner"));
+    assert!(!again.contains("cancelled by owner"));
 }
