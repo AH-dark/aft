@@ -7104,8 +7104,8 @@ pub(crate) fn resolve_root_identity_with_recheck(
 ) -> Result<crate::root_identity::Identity, ArtifactCacheKeyProbeError> {
     let mut choose = |pinned_path: bool,
                       saved: Option<&crate::root_identity::Identity>|
-     -> std::io::Result<crate::root_identity::Identity> {
-        use crate::root_identity::Identity;
+     -> std::io::Result<crate::root_identity::IdentityChoice> {
+        use crate::root_identity::{Identity, IdentityChoice};
         let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
         let canonical_key =
             artifact_cache_key_memo_root_key(&crate::root_identity::canonical_root(probe_root));
@@ -7141,7 +7141,7 @@ pub(crate) fn resolve_root_identity_with_recheck(
             if memo.is_some() {
                 return Err(std::io::Error::other("a standing path identity conflicts with an existing repository memo; explicit identity migration is required"));
             }
-            return Ok(Identity::Path);
+            return Ok(IdentityChoice::retained(Identity::Path));
         }
         if !crate::developer_tools::git_usable() {
             return match memo {
@@ -7154,19 +7154,21 @@ pub(crate) fn resolve_root_identity_with_recheck(
                             "legacy repository scope cannot be recovered without Git",
                         ));
                     }
-                    Ok(identity)
+                    Ok(IdentityChoice::retained(identity))
                 }
-                None => Ok(Identity::Path),
+                None => Ok(IdentityChoice::retained(Identity::Path)),
             };
         }
         let marker = match crate::root_identity::nearest_git_marker(probe_root) {
             Ok(Some(_)) => GitMarkerState::Present,
             Ok(None) => root_git_marker_state(probe_root, git_common_dir),
-            Err(_) if saved.is_some() => return Ok(saved.unwrap().clone()),
+            Err(_) if saved.is_some() => {
+                return Ok(IdentityChoice::retained(saved.unwrap().clone()))
+            }
             Err(error) => return Err(error),
         };
         if marker == GitMarkerState::Absent && memo.is_none() && saved.is_none() {
-            return Ok(Identity::Path);
+            return Ok(IdentityChoice::retained(Identity::Path));
         }
         match repo_root_commit_with_retry_profiled(probe_root, timings) {
             RootCommitResolution::Commit(root_commit) => {
@@ -7184,14 +7186,17 @@ pub(crate) fn resolve_root_identity_with_recheck(
                         );
                     }
                 }
-                Identity::git(probe_root, root_commit)
+                Identity::git(probe_root, root_commit).map(IdentityChoice::verified)
             }
             // A verified non-repository or unborn replacement must not inherit
             // the committed repository identity retained in an older memo.
-            RootCommitResolution::NotARepo => Ok(Identity::Path),
-            RootCommitResolution::Failed(_) if saved.is_some() => Ok(saved.unwrap().clone()),
+            RootCommitResolution::NotARepo => Ok(IdentityChoice::verified(Identity::Path)),
+            RootCommitResolution::Failed(_) if saved.is_some() => {
+                Ok(IdentityChoice::retained(saved.unwrap().clone()))
+            }
             RootCommitResolution::Failed(_) if memo.is_some() => {
                 Identity::git(probe_root, memo.unwrap().git_root_commit)
+                    .map(IdentityChoice::retained)
             }
             RootCommitResolution::Failed(detail) => Err(std::io::Error::other(detail)),
             RootCommitResolution::Cancelled => {
@@ -7210,7 +7215,8 @@ pub(crate) fn resolve_root_identity_with_recheck(
             Ok(Some(identity)) => Ok(identity),
             Ok(None) => crate::root_identity::select(probe_root, storage_root, |pinned| {
                 choose(pinned, None)
-            }),
+            })
+            .map(|choice| choice.identity),
             Err(error) => Err(error),
         }
     };
@@ -7942,7 +7948,9 @@ fn cached_root_commit(project_root: &Path, stamp: &RootCommitStamp) -> Option<St
 
 /// Cache only the digest, not Git configuration contents. Background identity
 /// checks watch directory/HEAD inode and time metadata as well as history inputs.
-pub(crate) fn repository_identity_stamp(root: &Path) -> String {
+/// An unmodeled history view has no reusable stamp, even if those paths are stable.
+pub(crate) fn repository_identity_stamp(root: &Path) -> Option<String> {
+    let history = RootCommitStamp::capture(root)?;
     let marker = crate::root_identity::nearest_git_marker(root)
         .map(|directory| directory.map(|directory| directory.join(".git")));
     let mut paths = Vec::new();
@@ -7979,10 +7987,11 @@ pub(crate) fn repository_identity_stamp(root: &Path) -> String {
     let git_env: BTreeMap<_, _> = std::env::vars_os()
         .filter(|(name, _)| name.to_str().is_some_and(|name| name.starts_with("GIT_")))
         .collect();
-    let history = RootCommitStamp::capture(root);
-    blake3::hash(format!("{marker:?}|{watched:?}|{history:?}|{git_env:?}").as_bytes())
-        .to_hex()
-        .to_string()
+    Some(
+        blake3::hash(format!("{marker:?}|{watched:?}|{history:?}|{git_env:?}").as_bytes())
+            .to_hex()
+            .to_string(),
+    )
 }
 
 /// The repository state that decides `git rev-list --max-parents=0 HEAD`.
@@ -13460,6 +13469,155 @@ mod tests {
             "an uncertain probe must keep the saved identity without a legacy memo"
         );
         assert!(!storage.join(ARTIFACT_CACHE_KEY_MEMO_FILE).exists());
+    }
+
+    fn certification_fixture_repository(root: &Path, content: &str, author: &serde_json::Value) {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("lib.rs"), content).unwrap();
+        upgrade_fixture_git(root, &["init", "-q"], author);
+        upgrade_fixture_git(root, &["add", "."], author);
+        upgrade_fixture_git(root, &["commit", "-q", "-m", content], author);
+    }
+
+    fn certification_standing_config(root: &Path, storage: &Path) -> crate::config::Config {
+        crate::config::Config {
+            storage_dir: Some(storage.to_path_buf()),
+            index: crate::config::IndexConfig {
+                roots: vec![crate::config::IndexRootConfig {
+                    path: root.display().to_string(),
+                    indexes: vec![crate::config::IndexKind::Search],
+                }],
+            },
+            ..crate::config::Config::default()
+        }
+    }
+
+    #[test]
+    fn unmodeled_history_never_reuses_a_standing_identity_stamp() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        assert!(crate::developer_tools::git_usable());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repository");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/root_identity_upgrade/cases.json"
+        ))
+        .unwrap();
+        certification_fixture_repository(&root, "initial history", &fixture["commit"]);
+        let output = upgrade_fixture_git(
+            &root,
+            &["commit-tree", "HEAD^{tree}", "-m", "unrelated history"],
+            &fixture["commit"],
+        );
+        let replacement = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let included = directory.path().join("included.gitconfig");
+        fs::write(&included, "[core]\nlogAllRefUpdates = true\n").unwrap();
+        upgrade_fixture_git(
+            &root,
+            &["config", "include.path", included.to_str().unwrap()],
+            &fixture["commit"],
+        );
+        let root = fs::canonicalize(root).unwrap();
+        assert!(
+            RootCommitStamp::capture(&root).is_none(),
+            "the fixture must decline history caching"
+        );
+        let standing = crate::standing_roots::StandingRoots::default();
+        let config = certification_standing_config(&root, &directory.path().join("storage"));
+        let old = standing.reconcile(&config).unwrap().active_entries[0]
+            .artifact_key
+            .clone();
+        let expected = artifact_key_from_git_identity(&replacement);
+        assert_ne!(old, expected);
+        let marker_before = RootCommitFileIdentity::of(&root.join(".git"), true);
+        let head_before = RootCommitFileIdentity::of(&root.join(".git/HEAD"), false);
+        let branch = upgrade_fixture_git(&root, &["symbolic-ref", "HEAD"], &fixture["commit"]);
+        let branch = String::from_utf8(branch.stdout).unwrap();
+        fs::write(
+            root.join(".git").join(branch.trim()),
+            format!("{replacement}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            RootCommitFileIdentity::of(&root.join(".git"), true),
+            marker_before
+        );
+        assert_eq!(
+            RootCommitFileIdentity::of(&root.join(".git/HEAD"), false),
+            head_before
+        );
+        let before = root_commit_git_runs_for_test(&root);
+        let new = standing
+            .reconcile_background(&config)
+            .unwrap()
+            .active_entries[0]
+            .artifact_key
+            .clone();
+        assert_eq!(
+            new, expected,
+            "an unmodeled branch-ref change must re-verify identity"
+        );
+        assert!(root_commit_git_runs_for_test(&root) > before);
+        let before = root_commit_git_runs_for_test(&root);
+        standing.reconcile_background(&config).unwrap();
+        assert!(
+            root_commit_git_runs_for_test(&root) > before,
+            "unmodeled history must verify on every pass"
+        );
+    }
+
+    #[test]
+    fn failed_replacement_probe_does_not_certify_the_replacement_stamp() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        assert!(crate::developer_tools::git_usable());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("checkout");
+        let replacement = directory.path().join("replacement");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/root_identity_upgrade/cases.json"
+        ))
+        .unwrap();
+        certification_fixture_repository(&root, "first checkout", &fixture["commit"]);
+        certification_fixture_repository(&replacement, "second checkout", &fixture["commit"]);
+        let replacement_commit =
+            upgrade_fixture_git(&replacement, &["rev-parse", "HEAD"], &fixture["commit"]);
+        let expected = artifact_key_from_git_identity(
+            String::from_utf8(replacement_commit.stdout).unwrap().trim(),
+        );
+        let root = fs::canonicalize(root).unwrap();
+        let config = certification_standing_config(&root, &directory.path().join("storage"));
+        let standing = crate::standing_roots::StandingRoots::default();
+        let old = standing.reconcile(&config).unwrap().active_entries[0]
+            .artifact_key
+            .clone();
+        assert_ne!(old, expected);
+        fs::rename(&root, directory.path().join("archived-checkout")).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+        {
+            let _probe = force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![root.clone()],
+                "temporary replacement probe failure",
+            );
+            assert_eq!(
+                standing
+                    .reconcile_background(&config)
+                    .unwrap()
+                    .active_entries[0]
+                    .artifact_key,
+                old
+            );
+        }
+        let before = root_commit_git_runs_for_test(&root);
+        let recovered = standing
+            .reconcile_background(&config)
+            .unwrap()
+            .active_entries[0]
+            .artifact_key
+            .clone();
+        assert_eq!(
+            recovered, expected,
+            "a failed check must not certify the replacement's metadata"
+        );
+        assert!(root_commit_git_runs_for_test(&root) > before);
     }
 
     #[test]
