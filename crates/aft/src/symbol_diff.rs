@@ -149,13 +149,29 @@ pub(crate) fn symbol_diff_file(
                 changed.push(new_symbol);
             }
         }
-        for new_symbol in changed {
-            let index = old_symbols
+        // Pair every changed declaration whose signature still exists before
+        // pairing the rest by position. Otherwise an added overload declared
+        // earlier could take the old declaration of a body-only change, and
+        // the two would be reported the wrong way round.
+        let mut is_modified = vec![false; changed.len()];
+        for (index, new_symbol) in changed.iter().enumerate() {
+            if let Some(old_index) = old_symbols
                 .iter()
                 .position(|old| old.entry.signature_line == new_symbol.entry.signature_line)
-                .or_else(|| (!old_symbols.is_empty()).then_some(0));
-            if let Some(index) = index {
-                old_symbols.remove(index);
+            {
+                old_symbols.remove(old_index);
+                is_modified[index] = true;
+            }
+        }
+        for flag in is_modified.iter_mut().filter(|flag| !**flag) {
+            if old_symbols.is_empty() {
+                break;
+            }
+            old_symbols.remove(0);
+            *flag = true;
+        }
+        for (new_symbol, is_modified) in changed.into_iter().zip(is_modified) {
+            if is_modified {
                 modified.push(new_symbol.entry);
             } else {
                 added.push(new_symbol.entry);
@@ -688,6 +704,27 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("String"));
+    }
+
+    #[test]
+    fn added_overload_does_not_take_a_body_changed_overloads_old_declaration() {
+        let old = b"class Box {\n int run(int x) { return 1; }\n int run(String x) {\n  return 2;\n }\n}\n";
+        let new = b"class Box {\n int run(int x) { return 1; }\n int run(long x) { return 4; }\n int run(String x) {\n  return 3;\n }\n}\n";
+        let diff = symbol_diff_file(LangId::Java, Path::new("Box.java"), Some(old), Some(new));
+        let signatures = |entries: &[SymbolDiffEntry]| -> Vec<String> {
+            entries
+                .iter()
+                .filter(|entry| entry.name == "run")
+                .map(|entry| entry.signature_line.clone().unwrap_or_default())
+                .collect()
+        };
+        let added = signatures(&diff.added);
+        let modified = signatures(&diff.modified);
+        assert_eq!(added.len(), 1, "added: {added:?}");
+        assert!(added[0].contains("long"), "added: {added:?}");
+        assert_eq!(modified.len(), 1, "modified: {modified:?}");
+        assert!(modified[0].contains("String"), "modified: {modified:?}");
+        assert!(signatures(&diff.removed).is_empty());
     }
 
     #[test]
