@@ -14,8 +14,8 @@
 //! entry back to the watchdog, which schedules the deletion on the scratch
 //! cleanup worker exactly as it did when deletion happened at exit. A record
 //! that is pruned, or a session scope that ends, releases the scratch early.
-//! The orphan sweep in `sandbox_spawn/task_temp.rs` still reclaims
-//! directories that no replayed record lists, after a day.
+//! As before, the stale sweep in `sandbox_spawn/task_temp.rs` reclaims, after
+//! a day, scratch whose task record is gone or was never replayed.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -134,8 +134,8 @@ impl BgTaskRegistry {
     }
 
     /// Release the kept scratch of every finished task that ran under
-    /// `scope`, which has ended. Only touches the in-memory list and task
-    /// state; the deletion itself runs on the scratch cleanup worker.
+    /// `scope`, which has ended. Does no filesystem work here: the watchdog
+    /// picks the tasks up and the scratch cleanup worker deletes the folders.
     pub(super) fn release_scope_scratch(&self, scope: &subc_protocol::scope::ScopeStamp) {
         let task_ids: Vec<String> = self
             .inner
