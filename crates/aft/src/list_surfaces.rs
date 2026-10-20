@@ -294,7 +294,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "gh_shim/read_contract.rs",
-        enclosing_item: "validate",
+        enclosing_item: "validate, validate_path",
         location_or_primitive: "MAX_REPLY_BYTES job ranges and per_page <= 100",
         reason: "closed GitHub read wire validation refuses oversized ranges and page sizes; it does not truncate an AFT result list",
     },
@@ -313,7 +313,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "gh_shim/read_render.rs",
         enclosing_item: "list, search, native",
-        location_or_primitive: "per_page 100 and native gh --limit selection",
+        location_or_primitive: "per_page 100, items.iter().take(remaining), items.iter().take(plan.limit() - rows.len()) and native gh --limit selection",
         reason: "REST API paging and gh-compatible explicit output limits, not an AFT tool result list; over-return is a fetch error",
     },
     ExclusionEntry {

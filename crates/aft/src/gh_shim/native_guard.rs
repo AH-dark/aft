@@ -5,16 +5,12 @@ use super::*;
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ShellSignals {
     pub(super) sandboxed: bool,
-    pub(super) worker_marked: bool,
-    pub(super) ticket_present: bool,
 }
 
 impl ShellSignals {
     pub(super) fn from_process() -> Self {
         Self {
             sandboxed: native_sandbox_active(),
-            worker_marked: std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_some(),
-            ticket_present: std::env::var_os(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).is_some(),
         }
     }
 }
@@ -55,29 +51,36 @@ pub(super) fn permission_with(
     signals: ShellSignals,
     lookup: impl FnOnce(&RelayContext) -> Result<Option<bool>, String>,
 ) -> Result<(), String> {
+    // Denied access to the worker-jail canary proves confinement even without
+    // a ticket. Reject it regardless of the daemon's session lookup result.
+    if signals.sandboxed {
+        if relay
+            .ticket
+            .as_deref()
+            .is_none_or(|ticket| ticket.is_empty())
+        {
+            return Err("no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here".into());
+        }
+        return Err(
+            "operator gh is not available inside the worker jail; use governed reads or bot speech"
+                .into(),
+        );
+    }
     if relay
         .ticket
         .as_deref()
         .is_some_and(|ticket| !ticket.is_empty())
     {
-        return match lookup(relay) {
-            Ok(Some(false)) if !signals.worker_marked => Ok(()),
-            Ok(Some(true)) => Err("operator gh is not available to worker sessions; use governed reads or bot speech".into()),
-            _ => Err("the gh-shim ticket did not authenticate a head session; operator gh is not available here".into()),
-        };
+        if matches!(lookup(relay), Ok(Some(true))) {
+            return Err(
+                "operator gh is not available to worker sessions; use governed reads or bot speech"
+                    .into(),
+            );
+        }
     }
-    if signals.sandboxed {
-        return Err(
-            "no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here"
-                .into(),
-        );
-    }
-    if signals.worker_marked || signals.ticket_present {
-        return Err(
-            "no valid gh-shim ticket for this agent shell; operator gh is not available here"
-                .into(),
-        );
-    }
+    // The main agent can have a ticket without an authenticated session scope
+    // when prefrontal-core is offline. In an unconfined shell, a failed or empty
+    // lookup does not establish worker status.
     Ok(())
 }
 

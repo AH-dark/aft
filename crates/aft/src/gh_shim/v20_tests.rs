@@ -652,6 +652,158 @@ fn v20_checks_render_and_preserve_failure_and_pending_exit_codes() {
 }
 
 #[test]
+fn review_list_paging_keeps_size_and_trims_without_duplicate_rows() {
+    let plan = planned(&["run", "list", "--limit", "150", "--json", "databaseId"]);
+    let mut calls = 0;
+    let mut output = Vec::new();
+    render::run(&plan, &mut |request| {
+        calls += 1;
+        let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+        let WireRequest::Get { args, .. } = wire else { panic!("not a list") };
+        let page: usize = args.query["page"].parse().unwrap();
+        let size: usize = args.query["per_page"].parse().unwrap();
+        let start = (page - 1) * size;
+        Ok(ReadReply::Get(GetReply {
+            status: 200,
+            body: json!({"workflow_runs": (start..start + size).map(|id| json!({"id":id})).collect::<Vec<_>>()}),
+            next_page: Some(page as u64 + 1),
+        }))
+    }, &mut output).unwrap();
+    let rows: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        rows,
+        json!((0..150)
+            .map(|id| json!({"databaseId":id}))
+            .collect::<Vec<_>>())
+    );
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn review_search_paging_keeps_size_and_trims_without_duplicate_rows() {
+    for verb in ["code", "issues"] {
+        let plan = planned(&["search", verb, "needle", "--limit", "150", "--json", "url"]);
+        let mut calls = 0;
+        let mut output = Vec::new();
+        render::run(
+            &plan,
+            &mut |request| {
+                calls += 1;
+                let ReadRequest::Search { page, per_page, .. } = request else {
+                    panic!("not a search")
+                };
+                let start = (page - 1) * per_page;
+                Ok(ReadReply::Search(read_contract::SearchReply {
+                    total_count: 300,
+                    incomplete_results: false,
+                    items: (start..start + per_page)
+                        .map(|id| json!({"html_url":format!("https://github.com/check/{id}")}))
+                        .collect(),
+                    next_page: Some(page + 1),
+                }))
+            },
+            &mut output,
+        )
+        .unwrap();
+        let rows: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            rows,
+            json!((0..150)
+                .map(|id| json!({"url":format!("https://github.com/check/{id}")}))
+                .collect::<Vec<_>>()),
+            "{verb}"
+        );
+        assert_eq!(calls, 2);
+    }
+}
+
+#[test]
+fn review_checks_include_failure_or_pending_status_from_later_page() {
+    for (state, expected) in [("failure", 1), ("pending", 8)] {
+        let plan = planned(&["pr", "checks", "42", "--json", "name,bucket"]);
+        let mut calls = 0;
+        let mut output = Vec::new();
+        let status = render::run(
+            &plan,
+            &mut |request| {
+                calls += 1;
+                let ReadRequest::Get { path, .. } = request else {
+                    panic!("not a GET")
+                };
+                match calls {
+                    1 => Ok(reply(json!({"head":{"sha":"abc"}}))),
+                    2 => Ok(reply(json!({"check_runs":[]}))),
+                    3 => Ok(ReadReply::Get(GetReply {
+                        status: 200,
+                        body: json!({"statuses":[{"context":"first","state":"success"}]}),
+                        next_page: Some(2),
+                    })),
+                    4 => {
+                        assert!(
+                            path.ends_with("/commits/abc/status?per_page=100&page=2"),
+                            "{path}"
+                        );
+                        Ok(reply(
+                            json!({"statuses":[{"context":"later","state":state}]}),
+                        ))
+                    }
+                    _ => panic!("unexpected request"),
+                }
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(status, expected, "lost page 2 {state} status");
+        let rows: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(rows[1]["name"], "later");
+        assert_eq!(calls, 4);
+    }
+}
+
+#[test]
+fn review_failed_log_steps_use_precise_half_open_intervals() {
+    let plan = planned(&["run", "view", "8", "--log-failed"]);
+    let log = b"2026-10-19T10:00:02.1000000Z passing\n2026-10-19T10:00:02.2000000Z boundary failure\n2026-10-19T10:00:02.3000000Z failure\n2026-10-19T10:00:02.4000000Z after failure\n";
+    let mut output = Vec::new();
+    render::run(&plan, &mut |request| match request {
+        ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[{"id":42,"name":"build","conclusion":"failure","steps":[
+            {"name":"setup","started_at":"2026-10-19T10:00:02Z","completed_at":"2026-10-19T10:00:02.2Z","conclusion":"success"},
+            {"name":"test","started_at":"2026-10-19T10:00:02.20Z","completed_at":"2026-10-19T10:00:02.4Z","conclusion":"failure"},
+            {"name":"cleanup","started_at":"2026-10-19T10:00:02.400Z","completed_at":"2026-10-19T10:00:03Z","conclusion":"success"}
+        ]}]}))),
+        ReadRequest::JobLog { range: Some(range), .. } => {
+            let start = range.offset as usize;
+            let end = (start + 13).min(log.len());
+            Ok(log_reply(&log[start..end], range.offset, log.len() as u64))
+        }
+        _ => panic!("unexpected request"),
+    }, &mut output).unwrap();
+    assert_eq!(String::from_utf8(output).unwrap(), "build\ttest\t2026-10-19T10:00:02.2000000Z boundary failure\nbuild\ttest\t2026-10-19T10:00:02.3000000Z failure\n");
+}
+
+#[test]
+fn review_named_branch_and_release_tag_allow_encoded_slashes() {
+    let (value, _, status) = run_json(
+        &["release", "view", "release/v1", "--json", "tagName"],
+        vec![json!({"tag_name":"release/v1"})],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(value["tagName"], "release/v1");
+    let (value, _, status) = run_json(
+        &["pr", "checks", "42", "--required", "--json", "name"],
+        vec![
+            json!({"head":{"sha":"abc"},"base":{"ref":"release/1.x"}}),
+            json!({"check_runs":[]}),
+            json!({"statuses":[{"context":"CI","state":"success"}]}),
+            json!({"contexts":["CI"]}),
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(value, json!([{"name":"CI"}]));
+}
+
+#[test]
 fn v20_api_pagination_follows_integer_pages_without_changing_repository() {
     let plan = planned(&[
         "api",

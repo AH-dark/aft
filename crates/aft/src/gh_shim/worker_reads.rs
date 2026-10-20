@@ -722,8 +722,7 @@ fn api_plan(plan: &Plan) -> Result<ReadRequest, String> {
 }
 
 fn validate_api_path<'a>(raw: &'a str, repository: &str) -> Result<&'a str, String> {
-    // Reject encoded separators/dot segments as well as literal traversal; URL
-    // normalization must never turn a reviewed repository into another target.
+    // Match the repository literally before allowing any encoded name segment.
     let path = raw.strip_prefix('/').unwrap_or(raw);
     let endpoint = path.split('?').next().unwrap_or(path);
     let prefix = format!("repos/{repository}/");
@@ -736,13 +735,11 @@ fn validate_api_path<'a>(raw: &'a str, repository: &str) -> Result<&'a str, Stri
     {
         return Err(format!("worker API reads require /repos/{repository}/…; URLs, GraphQL and other repositories are refused"));
     }
-    if endpoint.contains('%')
-        || endpoint
-            .split('/')
-            .any(|part| matches!(part, "." | "..") || part.is_empty())
-    {
+    if endpoint.replace("%2F", "").replace("%2f", "").contains('%') {
         return Err("worker API endpoint contains an unsafe path segment".into());
     }
+    let relative = endpoint.strip_prefix(&prefix).unwrap_or("");
+    read_contract::validate_path(relative)?;
     Ok(raw)
 }
 

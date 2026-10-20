@@ -53,10 +53,9 @@ fn list(
 ) -> Result<Vec<Value>, ReadError> {
     let mut rows = Vec::new();
     let mut page = 1_u64;
+    // GitHub offsets each page by per_page, so shrinking it repeats rows.
+    let per_page = limit.unwrap_or(100).min(100);
     loop {
-        let per_page = limit
-            .map(|limit| (limit - rows.len()).min(100))
-            .unwrap_or(100);
         if per_page == 0 {
             return Ok(rows);
         }
@@ -84,7 +83,8 @@ fn list(
         if items.len() > per_page {
             return Err(failed("GitHub returned more rows than requested"));
         }
-        rows.extend(items.iter().cloned());
+        let remaining = limit.map_or(items.len(), |limit| limit - rows.len());
+        rows.extend(items.iter().take(remaining).cloned());
         if limit == Some(rows.len()) {
             return Ok(rows);
         }
@@ -103,8 +103,8 @@ fn search(
 ) -> Result<Vec<Value>, ReadError> {
     let mut rows = Vec::new();
     let mut page = 1;
+    let per_page = plan.limit().min(100);
     while rows.len() < plan.limit() {
-        let per_page = (plan.limit() - rows.len()).min(100);
         let reply = fetch(
             &ReadRequest::Search {
                 action: action.to_string(),
@@ -126,7 +126,10 @@ fn search(
         if items.len() > per_page {
             return Err(failed("search returned more rows than requested"));
         }
-        rows.extend(items.iter().cloned());
+        rows.extend(items.iter().take(plan.limit() - rows.len()).cloned());
+        if rows.len() == plan.limit() {
+            break;
+        }
         let Some(next) = advance_page(page, reply.next_page)? else {
             break;
         };
@@ -759,14 +762,13 @@ fn checks(
         None,
         execute,
     )?;
-    let statuses = get(
+    let statuses = list(
         plan.path(&format!("commits/{}/status", segment(sha))),
+        Some("statuses"),
+        None,
         execute,
     )?;
-    for status in statuses["statuses"]
-        .as_array()
-        .ok_or_else(|| failed("commit status has no statuses array"))?
-    {
+    for status in statuses {
         rows.push(json!({"name": status["context"], "status": status["state"], "conclusion": status["state"], "html_url": status["target_url"], "started_at": status["created_at"], "completed_at": status["updated_at"], "description": status["description"]}));
     }
     let wants_workflow = plan.value("json").is_some_and(|fields| {
@@ -1467,22 +1469,37 @@ struct LogFormatter<'a, W> {
     output: &'a mut W,
 }
 
+// GitHub's log and step times are UTC. Compare whole seconds and decimal
+// fractions separately so differing fractional widths preserve full precision.
+fn log_timestamp(value: &str) -> Option<(&str, &str)> {
+    let value = value.strip_suffix('Z')?;
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if seconds.len() != 19
+        || !seconds
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                10 => byte == b'T',
+                13 | 16 => byte == b':',
+                _ => byte.is_ascii_digit(),
+            })
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((seconds, fraction.trim_end_matches('0')))
+}
+
 impl<W: Write> LogFormatter<'_, W> {
     fn line(&mut self, line: &[u8]) -> io::Result<()> {
         let timestamp = line.split(|byte| *byte == b' ').next().unwrap_or_default();
         let timestamp = std::str::from_utf8(timestamp).unwrap_or("");
-        let step = self.job["steps"].as_array().and_then(|steps| {
-            steps.iter().find(|step| {
-                let start = step["started_at"]
-                    .as_str()
-                    .and_then(|value| value.get(..19))
-                    .unwrap_or("~");
-                let end = step["completed_at"]
-                    .as_str()
-                    .and_then(|value| value.get(..19))
-                    .unwrap_or("~");
-                let timestamp = timestamp.get(..19).unwrap_or("");
-                timestamp >= start && timestamp <= end
+        let step = log_timestamp(timestamp).and_then(|timestamp| {
+            self.job["steps"].as_array()?.iter().find(|step| {
+                let start = step["started_at"].as_str().and_then(log_timestamp);
+                let end = step["completed_at"].as_str().and_then(log_timestamp);
+                matches!((start, end), (Some(start), Some(end)) if start <= timestamp && timestamp < end)
             })
         });
         if self.failed_only && !step.is_some_and(|step| step["conclusion"] == "failure") {

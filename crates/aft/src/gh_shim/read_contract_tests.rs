@@ -12,6 +12,63 @@ fn get() -> ReadRequest {
         accept: None,
     }
 }
+
+#[test]
+fn review_encoded_slash_is_limited_to_endpoint_name_segments() {
+    for path in [
+        "branches/release%2F1.x/protection/required_status_checks",
+        "releases/tags/release%2fv1",
+        "commits/release%2F1.x/status",
+    ] {
+        let request = ReadRequest::Get {
+            path: format!("/repos/cortexkit/aft/{path}"),
+            accept: None,
+        };
+        assert!(
+            executor::wire_request("cortexkit/aft", &request).is_ok(),
+            "{path}"
+        );
+        assert!(
+            plan(
+                &[
+                    OsString::from("api"),
+                    OsString::from(format!("repos/cortexkit/aft/{path}"))
+                ],
+                "cortexkit/aft"
+            )
+            .is_ok(),
+            "{path}"
+        );
+    }
+    for path in [
+        "/repos/cortexkit%2Faft/issues",
+        "/repos/cortexkit/aft%2Fother/issues",
+        "/repos/cortexkit/aft/branches%2Frelease/1.x/protection/required_status_checks",
+        "/repos/cortexkit/aft/branches/release%2F1.x/protection%2Frequired_status_checks",
+        "/repos/cortexkit/aft/releases%2Ftags/release%2Fv1",
+        "/repos/cortexkit/aft/releases/tags/release%252Fv1",
+        "/repos/cortexkit/aft/issues/42%2Fcomments",
+        "/repos/cortexkit/aft/releases/tags/release%2F..%2Fissues",
+        "/repos/cortexkit/aft/branches/%2Frelease/protection/required_status_checks",
+    ] {
+        let request = ReadRequest::Get {
+            path: path.into(),
+            accept: None,
+        };
+        assert!(
+            executor::wire_request("cortexkit/aft", &request).is_err(),
+            "{path}"
+        );
+        assert!(
+            plan(
+                &[OsString::from("api"), OsString::from(path)],
+                "cortexkit/aft"
+            )
+            .is_err(),
+            "{path}"
+        );
+    }
+}
 fn wire(request: &ReadRequest) -> WireRequest {
     executor::wire_request("cortexkit/aft", request).unwrap()
 }
@@ -538,12 +595,12 @@ fn audit_identity_timeout_does_not_claim_the_command_was_not_run() {
 }
 
 #[test]
-fn audit_native_head_permission_requires_affirmative_head_attribution() {
+fn audit_native_permission_combines_canary_and_daemon_worker_evidence() {
     use std::sync::Arc;
-    for (data, allowed) in [
-        (json!({"worker":false,"head":true}), true),
+    for (data, worker) in [
+        (json!({"worker":false,"head":true}), false),
         (json!({"worker":false}), false),
-        (json!({"worker":true,"head":false}), false),
+        (json!({"worker":true,"head":false}), true),
     ] {
         let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(
             move |body| json!({"op":body["op"],"status":"ok","data":data}),
@@ -557,15 +614,13 @@ fn audit_native_head_permission_requires_affirmative_head_attribution() {
             transient_delays: [Duration::ZERO; 2],
             relay_budget: Duration::from_secs(1),
         };
-        let permission = super::super::native_guard::permission_with(
-            &context,
-            super::super::native_guard::ShellSignals {
-                sandboxed: true,
-                worker_marked: false,
-                ticket_present: true,
-            },
-            relay_client::worker_session,
-        );
-        assert_eq!(permission.is_ok(), allowed);
+        for sandboxed in [false, true] {
+            let permission = super::super::native_guard::permission_with(
+                &context,
+                super::super::native_guard::ShellSignals { sandboxed },
+                relay_client::worker_session,
+            );
+            assert_eq!(permission.is_ok(), !sandboxed && !worker);
+        }
     }
 }

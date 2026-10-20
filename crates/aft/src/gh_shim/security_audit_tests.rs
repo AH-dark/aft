@@ -245,11 +245,7 @@ fn audit_worker_native_exit_is_closed_for_every_legacy_command_shape() {
         let status = native_guard::dispatch_with(
             &args(&raw),
             &relay(Some("worker-ticket")),
-            native_guard::ShellSignals {
-                sandboxed: true,
-                worker_marked: false,
-                ticket_present: true,
-            },
+            native_guard::ShellSignals { sandboxed: true },
             |_| Ok(Some(true)),
             |_| panic!("worker reached operator gh: {raw:?}"),
         );
@@ -264,11 +260,7 @@ fn audit_authenticated_head_keeps_native_argv_and_exit_status() {
     let status = native_guard::dispatch_with(
         &argv,
         &relay(Some("head-ticket")),
-        native_guard::ShellSignals {
-            sandboxed: true,
-            worker_marked: false,
-            ticket_present: true,
-        },
+        native_guard::ShellSignals { sandboxed: false },
         |_| Ok(Some(false)),
         |forwarded| {
             calls.push(forwarded.to_vec());
@@ -286,21 +278,118 @@ fn audit_authenticated_head_keeps_native_argv_and_exit_status() {
 }
 
 #[test]
-fn audit_unattributed_agent_never_gets_operator_gh() {
-    for signals in [
-        native_guard::ShellSignals {
-            sandboxed: true,
-            ..Default::default()
-        },
-        native_guard::ShellSignals {
-            worker_marked: true,
-            ..Default::default()
-        },
-        native_guard::ShellSignals {
-            ticket_present: true,
-            ..Default::default()
-        },
-    ] {
+fn review_unscoped_head_ticket_preserves_native_passthrough() {
+    for outcome in [Ok(None), Err("prefrontal-core unavailable".into())] {
+        let argv = args(&["pr", "view", "42"]);
+        let mut calls = Vec::new();
+        let status = native_guard::dispatch_with(
+            &argv,
+            &relay(Some("unscoped-head-ticket")),
+            native_guard::ShellSignals::default(),
+            |_| outcome,
+            |forwarded| {
+                calls.push(forwarded.to_vec());
+                27
+            },
+        );
+        assert_eq!(status, 27);
+        assert_eq!(calls, vec![argv]);
+    }
+}
+
+#[test]
+fn review_unscoped_head_keeps_v19_and_missing_manifest_reads() {
+    for missing in [false, true] {
+        let fixture = Fixture::new(19);
+        if missing {
+            fs::remove_file(&fixture.paths.manifest).unwrap();
+        }
+        let argv = args(&["pr", "view", "42"]);
+        let status = run_with(
+            &argv,
+            |forwarded| {
+                native_guard::dispatch_with(
+                    forwarded,
+                    &relay(Some("unscoped-head-ticket")),
+                    native_guard::ShellSignals::default(),
+                    |_| Ok(None),
+                    |native_args| {
+                        assert_eq!(native_args, argv);
+                        27
+                    },
+                )
+            },
+            |_, _, _, _| Ok(None),
+        );
+        assert_eq!(status, 27, "missing manifest: {missing}");
+    }
+}
+
+#[test]
+fn review_canary_denial_overrides_missing_or_head_scope() {
+    for outcome in [Ok(None), Ok(Some(false)), Err("no scope".into())] {
+        let status = native_guard::dispatch_with(
+            &args(&["pr", "view", "42"]),
+            &relay(Some("ticket")),
+            native_guard::ShellSignals { sandboxed: true },
+            |_| outcome,
+            |_| panic!("jailed worker reached native gh"),
+        );
+        assert_eq!(status, 86);
+    }
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn review_stamped_worker_reaches_governed_read_instead_of_native_gh() {
+    use std::sync::Arc;
+    let fixture = Fixture::new(20);
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(|body| {
+        let data = if body["op"] == crate::gh_shim_relay::SESSION_CONTEXT_OPERATION {
+            json!({"worker":true,"head":false,"repository":"cortexkit/aft"})
+        } else {
+            assert_eq!(body["op"], crate::gh_shim_relay::READ_REQUEST_OPERATION);
+            assert_eq!(body["params"]["request"]["repository"], "cortexkit/aft");
+            assert_eq!(body["params"]["request"]["args"]["path"], "pulls/42");
+            json!({"result":{"status":200,"body":{"number":42},"next_page":null},"isError":false})
+        };
+        json!({"op":body["op"],"status":"ok","data":data})
+    }));
+    let file = fixture.home.path().join("connection.json");
+    daemon.write_connection_file(&file);
+    let config = fixture.home.path().join("cortexkit/aft.jsonc");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        json!({"subc":{"connection_file":file}}).to_string(),
+    )
+    .unwrap();
+    let _ticket = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        Some(OsStr::new("worker-ticket")),
+    );
+    let status = run_with(
+        &args(&["pr", "view", "42", "--json", "number"]),
+        |_| panic!("stamped worker reached native gh"),
+        worker_reads::identity_for_command,
+    );
+    assert_eq!(status, 0);
+    let requests = daemon.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|body| body["op"] == crate::gh_shim_relay::READ_REQUEST_OPERATION)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn audit_unattributed_jailed_worker_never_gets_operator_gh() {
+    for signals in [native_guard::ShellSignals {
+        sandboxed: true,
+        ..Default::default()
+    }] {
         let status = native_guard::dispatch_with(
             &args(&["api", "repos/cortexkit/aft/issues"]),
             &relay(None),
@@ -313,7 +402,7 @@ fn audit_unattributed_agent_never_gets_operator_gh() {
     for outcome in [Err("old daemon".into()), Ok(None)] {
         assert!(native_guard::permission_with(
             &relay(Some("bad-ticket")),
-            native_guard::ShellSignals::default(),
+            native_guard::ShellSignals { sandboxed: true },
             |_| outcome
         )
         .is_err());
@@ -723,11 +812,7 @@ fn audit_worker_speech_still_uses_governed_relay_not_native_gh() {
             native_guard::dispatch_with(
                 forwarded,
                 &relay,
-                native_guard::ShellSignals {
-                    sandboxed: true,
-                    worker_marked: true,
-                    ticket_present: true,
-                },
+                native_guard::ShellSignals { sandboxed: true },
                 |_| Ok(Some(true)),
                 |_| panic!("worker speech reached native gh"),
             )

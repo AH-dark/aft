@@ -91,19 +91,7 @@ impl Request {
         match self {
             Self::Get { args, .. } => {
                 let path = &args.path;
-                let lower = path.to_ascii_lowercase();
-                if !path.is_empty()
-                    && (path.starts_with('/')
-                        || path.contains("//")
-                        || path.contains(['\\', '?', '#', ':'])
-                        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
-                        || path.bytes().any(|byte| byte.is_ascii_control())
-                        || ["%2f", "%5c", "%2e", "%3a", "%3f", "%23", "%25"]
-                            .iter()
-                            .any(|encoded| lower.contains(encoded)))
-                {
-                    return Err("path must be repository-relative; only the empty string names the repository root".into());
-                }
+                validate_path(path)?;
                 if matches!(args.accept, Accept::Diff | Accept::Patch) {
                     let parts: Vec<_> = path.split('/').collect();
                     if parts.len() != 2
@@ -145,6 +133,47 @@ impl Request {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_path(path: &str) -> Result<(), String> {
+    let lower = path.to_ascii_lowercase();
+    let parts: Vec<_> = path.split('/').collect();
+    // Only these endpoints interpret one segment as a branch, tag or commit
+    // ref. Encoded slashes cannot change endpoint structure or repository scope.
+    let name_index = match parts.as_slice() {
+        ["branches", _]
+        | ["branches", _, "protection"]
+        | ["branches", _, "protection", "required_status_checks"]
+        | ["commits", _]
+        | ["commits", _, "status" | "statuses" | "check-runs"] => Some(1),
+        ["releases", "tags", _] => Some(2),
+        _ => None,
+    };
+    if !path.is_empty()
+        && (path.starts_with('/')
+            || path.contains("//")
+            || path.contains(['\\', '?', '#', ':'])
+            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            || path.bytes().any(|byte| byte.is_ascii_control())
+            || parts.iter().enumerate().any(|(index, part)| {
+                let part = part.to_ascii_lowercase();
+                part.contains("%2f")
+                    && (name_index != Some(index)
+                        || part
+                            .replace("%2f", "/")
+                            .split('/')
+                            .any(|part| matches!(part, "" | "." | "..")))
+            })
+            || ["%5c", "%2e", "%3a", "%3f", "%23", "%25"]
+                .iter()
+                .any(|encoded| lower.contains(encoded)))
+    {
+        return Err(
+            "path must be repository-relative; only the empty string names the repository root"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_search(q: &str) -> Result<(), String> {
