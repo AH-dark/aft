@@ -411,7 +411,7 @@ fn view_tree_bytes(
         cache.reconciled = Some(Instant::now());
     }
     cache.directory = identity;
-    let result = tree_bytes_inner(dir, deadline, Some(cache));
+    let result = tree_bytes_inner(dir, deadline, Some(cache), None);
     let after = measured_metadata(dir)
         .ok()
         .as_ref()
@@ -438,13 +438,25 @@ fn view_tree_bytes(
 /// Total file bytes under `dir`, each file once, up to `MAX_WALK_DEPTH`
 /// levels. Symlinks are not followed and count nothing.
 fn tree_bytes(dir: &Path, deadline: Option<Instant>) -> std::io::Result<(u64, bool)> {
-    tree_bytes_inner(dir, deadline, None)
+    tree_bytes_inner(dir, deadline, None, None)
+}
+
+/// Walks `dir` like [`tree_bytes`] but stops as soon as the counted bytes pass
+/// `limit`, reporting the walk incomplete: a caller that only needs to know
+/// whether a tree fits a budget gains nothing from counting the rest.
+fn tree_bytes_within(
+    dir: &Path,
+    deadline: Option<Instant>,
+    limit: u64,
+) -> std::io::Result<(u64, bool)> {
+    tree_bytes_inner(dir, deadline, None, Some(limit))
 }
 
 fn tree_bytes_inner(
     dir: &Path,
     deadline: Option<Instant>,
     mut cache: Option<&mut ViewSizeCache>,
+    limit: Option<u64>,
 ) -> std::io::Result<(u64, bool)> {
     #[cfg(test)]
     TREE_WALKS.with(|walks| walks.set(walks.get() + 1));
@@ -460,7 +472,10 @@ fn tree_bytes_inner(
         };
         let remaining = MAX_WALK_ENTRIES.saturating_sub(read);
         for entry in entries.take(remaining.saturating_add(1)) {
-            if read >= MAX_WALK_ENTRIES || past(deadline) {
+            if read >= MAX_WALK_ENTRIES
+                || past(deadline)
+                || limit.is_some_and(|limit| bytes > limit)
+            {
                 complete = false;
                 break;
             }
@@ -655,6 +670,23 @@ pub(crate) fn family_file_bytes(
 ) -> RegistryResult<(u64, bool)> {
     let dir = family_dir(storage, family)?;
     Ok(tree_bytes(&dir, deadline)?)
+}
+
+/// True when a complete walk of the family's files finds at most `budget`
+/// bytes. The walk stops as soon as the count passes the budget, and a zero
+/// budget is answered without walking, since no non-empty family fits it.
+pub(crate) fn family_files_within(
+    storage: &Path,
+    family: &str,
+    deadline: Option<Instant>,
+    budget: u64,
+) -> RegistryResult<bool> {
+    if budget == 0 {
+        return Ok(false);
+    }
+    let dir = family_dir(storage, family)?;
+    let (bytes, complete) = tree_bytes_within(&dir, deadline, budget)?;
+    Ok(complete && bytes <= budget)
 }
 
 /// `SUM(length(payload))` over every plane store of the family, for reports
@@ -1444,6 +1476,39 @@ mod tests {
     use crate::views::RelPath;
 
     const FAMILY: &str = "family";
+
+    /// Deciding whether a family fits its budget never walks for a zero
+    /// budget and stops counting once the budget is passed, so an over-budget
+    /// sweep does not pay for a full walk that cannot save it any work.
+    #[cfg(unix)]
+    #[test]
+    fn family_budget_walk_skips_zero_budget_and_stops_once_exceeded() {
+        let storage = tempfile::tempdir().unwrap();
+        let dir = crate::blob_store::v2::family_dir(storage.path(), FAMILY).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..200 {
+            fs::write(dir.join(format!("segment-{index}.bin")), vec![0u8; 1024]).unwrap();
+        }
+
+        TREE_WALKS.with(|walks| walks.set(0));
+        assert!(!family_files_within(storage.path(), FAMILY, None, 0).unwrap());
+        assert_eq!(
+            TREE_WALKS.with(|walks| walks.get()),
+            0,
+            "a zero budget walked"
+        );
+
+        TREE_STATS.with(|stats| stats.set(0));
+        assert!(!family_files_within(storage.path(), FAMILY, None, 4 * 1024).unwrap());
+        let early = TREE_STATS.with(|stats| stats.replace(0));
+        assert!(
+            early <= 6,
+            "the walk kept counting past the budget: {early} stats for 200 files"
+        );
+
+        assert!(family_files_within(storage.path(), FAMILY, None, 1024 * 1024).unwrap());
+        assert_eq!(TREE_STATS.with(|stats| stats.get()), 200);
+    }
 
     #[cfg(unix)]
     #[test]

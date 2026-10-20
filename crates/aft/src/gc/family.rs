@@ -374,12 +374,13 @@ pub(crate) fn sweep_with(
     let within_budget = match small {
         SmallFamilyCheck::Never => false,
         SmallFamilyCheck::FileWalk => matches!(
-            crate::views::eviction::family_file_bytes(
+            crate::views::eviction::family_files_within(
                 registry.storage(),
                 registry.family(),
                 bounds.deadline,
+                policy.byte_budget,
             ),
-            Ok((bytes, true)) if bytes <= policy.byte_budget
+            Ok(true)
         ),
         #[cfg(test)]
         SmallFamilyCheck::Assumed(bytes) => bytes <= policy.byte_budget,
