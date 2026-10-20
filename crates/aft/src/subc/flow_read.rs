@@ -304,6 +304,45 @@ async fn dispatch_with_wait(
                     if !active_tool_call_is_registered(&active, route, corr) {
                         return Err(Refusal::IoError.error());
                     }
+                    if let Some(sweep) = sweep {
+                        // perf.sweep samples the daemon (a profiler child and
+                        // the daemon log), not the parent project. As an
+                        // executor job it would hold the project's read lane
+                        // for the whole sample, up to 35 s, and stall every
+                        // write on that project. It runs on its own thread,
+                        // still bounded by `deadline`. The busy guard moves
+                        // with it, so a second sweep stays refused until this
+                        // sample ends, even after the deadline has answered.
+                        let child = child.clone();
+                        let (done, answer) = oneshot::channel();
+                        #[cfg(test)]
+                        let before_read = hooks.before_read;
+                        let spawned = std::thread::Builder::new()
+                            .name("aft-perf-sweep".into())
+                            .spawn(move || {
+                                let _sweep = sweep;
+                                #[cfg(test)]
+                                if let Some(before_read) = before_read {
+                                    before_read();
+                                }
+                                let _ = done.send(
+                                    unexpired(&child)
+                                        .map_err(Refusal::error)
+                                        .and_then(|_| super::perf_sweep::run(&envelope, deadline)),
+                                );
+                            });
+                        if spawned.is_err() {
+                            return Err(Refusal::IoError.error());
+                        }
+                        #[cfg(test)]
+                        if let Some(submitted) = hooks.submitted {
+                            let _ = submitted.send(());
+                        }
+                        // A sweep thread that panics drops `done` unanswered.
+                        return answer
+                            .await
+                            .unwrap_or_else(|_| Err(Refusal::IoError.error()));
+                    }
                     let request_id = format!("flow-read-{}-{corr}", route.channel);
                     let job_id = request_id.clone();
                     let rx = resubmit_active_tool_call(
@@ -320,14 +359,9 @@ async fn dispatch_with_wait(
                             if let Some(before_read) = hooks.before_read {
                                 before_read();
                             }
-                            let result = if let Some(_sweep) = sweep {
-                                unexpired(identity.scope.as_ref().expect("child route was checked"))
-                                    .map_err(Refusal::error)
-                                    .and_then(|_| super::perf_sweep::run(&envelope, deadline))
-                            } else {
+                            let result =
                                 read_as_parent(&identity, &parent, &envelope, ctx, deadline)
-                                    .map_err(Refusal::error)
-                            };
+                                    .map_err(Refusal::error);
                             Response::success(
                                 job_id,
                                 match result {
