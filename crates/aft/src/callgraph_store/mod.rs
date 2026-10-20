@@ -3564,6 +3564,10 @@ fn workspace_crate_prefix_cache_for_root(
 #[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
     #[cfg(test)]
+    ordinary_wal_autocheckpoint_pages: Option<i64>,
+    #[cfg(test)]
+    refresh_wal_payload_bytes: u64,
+    #[cfg(test)]
     wal_policy: Option<Arc<Mutex<refresh_wal::Policy>>>,
     #[cfg(test)]
     idle_writer_held: Option<crossbeam_channel::Sender<()>>,
@@ -6193,6 +6197,17 @@ impl CallGraphStore {
             WriterConnectionRole::Refresh => configure_generation_connection(&conn, role)?,
             WriterConnectionRole::Build => configure_build_connection(&conn)?,
         }
+        #[cfg(test)]
+        if role == WriterConnectionRole::Generation {
+            // A root-local threshold makes automatic WAL checkpoints observable
+            // with a small test graph. Refresh and build roles keep their
+            // normal configuration.
+            if let Some(pages) =
+                refresh_worker_test_seam(&project_root).ordinary_wal_autocheckpoint_pages
+            {
+                conn.set_wal_autocheckpoint(pages)?;
+            }
+        }
         if let Some(lease) = writer_lease.as_ref() {
             verify_writer_lease(lease)?;
         }
@@ -7351,6 +7366,22 @@ impl CallGraphStore {
         conn.configure_refresh_wal()?;
         self.refresh_wal.lock().unwrap().before_begin(&conn);
         let tx = conn.transaction()?;
+        #[cfg(test)]
+        {
+            let payload_bytes =
+                refresh_worker_test_seam(&self.project_root).refresh_wal_payload_bytes;
+            if payload_bytes > 0 {
+                // Exercise a large real WAL transaction without making the
+                // parser extract tens of thousands of unrelated definitions.
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS refresh_wal_test_payload (data BLOB)",
+                )?;
+                tx.execute(
+                    "INSERT INTO refresh_wal_test_payload VALUES (zeroblob(?1))",
+                    [payload_bytes],
+                )?;
+            }
+        }
         for update in &resolution_updates {
             store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;
         }
