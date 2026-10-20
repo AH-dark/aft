@@ -5418,7 +5418,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     // Before acceptance the runner has not confirmed it copied the inputs.
     assert_eq!(
         remote_phase_note(&metadata, now).as_deref(),
-        Some("submitting to the runner (capturing inputs; not accepted yet)")
+        Some("submitting to the runner (capturing inputs; not accepted yet; queued for remote admission)")
     );
     let remote = metadata.remote.as_mut().unwrap();
     remote.accepted = true;

@@ -842,7 +842,7 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
         .filter(|remote| remote.terminal.is_none() || !remote.accepted && remote.retry.is_some())?;
     let phase = RemotePhase::of(remote);
     if phase == RemotePhase::Submitting {
-        return Some("submitting to the runner (capturing inputs; not accepted yet)".to_string());
+        return Some("submitting to the runner (capturing inputs; not accepted yet; queued for remote admission)".to_string());
     }
     if phase == RemotePhase::Running {
         // The request asks the runner for this many whole seconds (see
@@ -2000,6 +2000,18 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
                 hinted = Some(HintedRetry::start(&root, request.clone()));
             }
+            if task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_requested)
+            {
+                self.remote_terminal(&task, Verdict::Cancelled, None);
+                return Ok(());
+            }
             match client.run(&request).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
@@ -2042,6 +2054,16 @@ impl BgTaskRegistry {
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                         .await?;
                     cancelled = true;
+                } else {
+                    // Before the runner accepts the submission, there is no job
+                    // ID for exec.cancel or attach. Cancel the active call instead.
+                    // The SDK closes its receiver, so this cannot prove the job stopped.
+                    client.cancel_submission(&stream).await.map_err(|error| {
+                        format!(
+                        "remote cancellation before acceptance failed; outcome unknown: {error}"
+                    )
+                    })?;
+                    return Err("remote cancellation requested before acceptance; outcome unknown: no job ID to recover terminal proof".into());
                 }
             }
             let result = tokio::select! {
