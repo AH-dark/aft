@@ -111,6 +111,10 @@ impl VectorPool {
     fn prune(&mut self) {
         self.by_digest.retain(|_, vector| vector.strong_count() > 0);
         self.by_chunk.retain(|_, vector| vector.strong_count() > 0);
+        // `retain` keeps the table's allocation, which `memory()` reports;
+        // return it once the views that filled it are gone.
+        self.by_digest.shrink_to_fit();
+        self.by_chunk.shrink_to_fit();
         self.live_after_prune = self.by_digest.len() + self.by_chunk.len();
     }
 }
