@@ -875,6 +875,16 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    /// Ids of tasks whose aft.db row write found no handle attached. A
+    /// configured root opens aft.db after its bind is acknowledged and
+    /// releases the handle while it is unbound, so its tasks can be written
+    /// to disk with no handle in place. Installing a handle writes each listed
+    /// task's current row; without that, a task that finished in the gap would
+    /// keep a missing or stale (still running) row.
+    db_writes_awaiting_pool: Mutex<HashSet<String>>,
+    /// Whether the current interval without a handle has been logged, so the
+    /// skipped writes are reported once per interval instead of once each.
+    db_detached_logged: AtomicBool,
     /// Harness of the most recent configure of this root. Routes from several
     /// harnesses share the root, so this is only a fallback for a task,
     /// session or request that cannot name its own harness (a spawn with no
@@ -1305,6 +1315,8 @@ impl BgTaskRegistry {
                 session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                db_writes_awaiting_pool: Mutex::new(HashSet::new()),
+                db_detached_logged: AtomicBool::new(false),
                 db_harness: RwLock::new(None),
                 session_harnesses: Mutex::new(HashMap::new()),
                 session_task_ids: Mutex::new(HashMap::new()),
@@ -1562,17 +1574,53 @@ impl BgTaskRegistry {
             *slot = Some(conn);
         }
         self.inner.compression_aggregates.clear();
-        // Tasks started while no handle was installed have no row yet; the
-        // in-memory task is authoritative, so write their rows now.
-        let running = self
+        self.inner.db_detached_logged.store(false, Ordering::SeqCst);
+        // Taken after the handle is installed: a write that found no handle
+        // recorded its task while holding the handle's read lock, so it is
+        // either in this set or saw the new handle and wrote its own row.
+        let awaiting = self
+            .inner
+            .db_writes_awaiting_pool
+            .lock()
+            .map(|mut awaiting| std::mem::take(&mut *awaiting))
+            .unwrap_or_default();
+        let tasks = self
             .inner
             .tasks
             .lock()
             .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        for task in running.into_iter().filter(|task| !task.is_terminal()) {
-            self.ensure_task_row(&task);
+        let mut written = 0usize;
+        for task in tasks {
+            if awaiting.contains(&task.task_id) {
+                // Its last row write was skipped, so the row is missing or
+                // older than the task, whatever its status now.
+                self.write_current_task_row(&task);
+                written += 1;
+            } else if !task.is_terminal() {
+                // The in-memory task is authoritative while it runs; write
+                // its row if it has none.
+                self.ensure_task_row(&task);
+            }
         }
+        if written > 0 {
+            crate::slog_info!(
+                "wrote {written} bash_task row(s) skipped while aft.db was not attached to this registry"
+            );
+        }
+    }
+
+    /// Writes the task's current metadata as its aft.db row, in the same
+    /// order as the JSON writes it mirrors.
+    fn write_current_task_row(&self, task: &BgTask) {
+        // Declared first so it drops last: the row is written after both
+        // locks below are released.
+        let mut db = DeferredDbWrites::new(self, task);
+        let Ok(state) = task.lock_state() else {
+            return;
+        };
+        let _json_writes = task.db_write_order.lock_json_writes();
+        db.capture(&state.metadata);
     }
 
     pub fn clear_db_pool(&self) {
@@ -2317,20 +2365,47 @@ impl BgTaskRegistry {
         *task.db_write_order.lock_json_writes()
     }
 
-    fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
-        let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
-        let Some(pool) = pool else {
-            // A registry without a harness belongs to an unconfigured library
-            // context, which never has a database. A configured one without a
-            // handle is missing a row it should have; a later watch
-            // registration or erased-row check writes it once the handle is
-            // installed.
-            if self.fallback_db_harness().is_some() {
-                crate::slog_warn!(
-                    "dual-write bash_task to DB skipped for {}: aft.db is not attached to this registry",
-                    metadata.task_id
-                );
+    /// Records that `task_id`'s aft.db row write found no handle attached, and
+    /// logs the first such write of each interval without a handle.
+    fn queue_task_row_until_db_attaches(&self, task_id: &str) {
+        if let Ok(mut awaiting) = self.inner.db_writes_awaiting_pool.lock() {
+            // Ids of tasks this registry no longer holds have nothing left to
+            // write; drop them as the set grows so a root whose database never
+            // opens does not keep every id it ever ran. `try_lock`, because a
+            // caller may already hold the task map.
+            if awaiting.len() >= 1024 && awaiting.len().is_power_of_two() {
+                if let Ok(tasks) = self.inner.tasks.try_lock() {
+                    awaiting.retain(|id| tasks.contains_key(id));
+                }
             }
+            awaiting.insert(task_id.to_string());
+        }
+        if !self.inner.db_detached_logged.swap(true, Ordering::SeqCst) {
+            crate::slog_info!(
+                "aft.db is not attached to this registry yet; bash_task rows (first: {task_id}) are written when it attaches"
+            );
+        }
+    }
+
+    fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
+        let pool = {
+            let slot = self.inner.db_pool.read().ok();
+            let pool = slot.as_ref().and_then(|slot| (*slot).clone());
+            if pool.is_none() {
+                // A registry without a harness belongs to an unconfigured
+                // library context, which never has a database. A configured
+                // one opens aft.db after its bind is acknowledged and releases
+                // it while unbound, so this write is expected; the task is
+                // queued and `set_db_pool` writes its current row. The read
+                // lock is held while queueing so `set_db_pool` cannot drain
+                // the queue between this check and the insert.
+                if self.fallback_db_harness().is_some() {
+                    self.queue_task_row_until_db_attaches(&metadata.task_id);
+                }
+            }
+            pool
+        };
+        let Some(pool) = pool else {
             return;
         };
         let harness = metadata
@@ -16899,6 +16974,77 @@ mod tests {
         .expect("bash_tasks row");
         assert_eq!(row.status, "completed");
         let _ = registry.kill(&task_id, "session");
+    }
+
+    /// A configured registry can write tasks while it has no aft.db handle:
+    /// the database opens after the bind is acknowledged and is released
+    /// while the root is unbound. Those skipped row writes must land when a
+    /// handle is installed, including for tasks that finished in the gap.
+    #[cfg(unix)]
+    #[test]
+    fn bash_task_rows_skipped_without_aft_db_are_written_when_it_attaches() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let spawn = |command: &str| {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    command,
+                    "session".to_string(),
+                    storage.path().to_path_buf(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    storage.path().to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(storage.path().to_path_buf()),
+                )
+                .unwrap()
+        };
+        let row_status = |task_id: &str| {
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                task_id,
+            )
+            .unwrap()
+            .map(|row| row.status)
+        };
+
+        // Written as running while attached, then killed while detached.
+        let killed = spawn(LONG_RUNNING_COMMAND);
+        let attached_status = row_status(&killed).expect("row written while attached");
+        assert!(
+            !matches!(attached_status.as_str(), "killed" | "completed"),
+            "{attached_status}"
+        );
+        registry.clear_db_pool();
+        let _ = registry.kill(&killed, "session");
+        wait_for_terminal_snapshot(
+            &registry,
+            &killed,
+            "session",
+            storage.path(),
+            storage.path(),
+        );
+        // Started and finished entirely while detached.
+        let finished = spawn(QUICK_SUCCESS_COMMAND);
+        wait_for_terminal_snapshot(
+            &registry,
+            &finished,
+            "session",
+            storage.path(),
+            storage.path(),
+        );
+        assert_eq!(row_status(&killed), Some(attached_status));
+        assert_eq!(row_status(&finished), None);
+
+        registry.set_db_pool(Arc::clone(&db));
+
+        assert_eq!(row_status(&killed).as_deref(), Some("killed"));
+        assert_eq!(row_status(&finished).as_deref(), Some("completed"));
     }
 
     /// Companion to the above for the kill path: when a kill observes an
