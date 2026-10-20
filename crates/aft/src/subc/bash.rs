@@ -99,6 +99,8 @@ enum BashSpawnControl {
         /// The configured wait limit bounding a blocking call in any session
         /// (`wait: true` or `block_to_completion`).
         worker_cap_ms: Option<u64>,
+        /// Cached before polling so the reply watchdog never needs task locks.
+        blocking_handoff_response: Option<Response>,
         /// For a blocking call: the instant its wait hands a remote task back
         /// to the background, and that wait in milliseconds from when the
         /// call arrived (see `remote_block_handback_ms`).
@@ -1535,6 +1537,26 @@ pub(super) fn submit_deferred_bash(
                         ctx.bash_background()
                             .begin_wait_mode_session(&session_for_spawn, &task_id);
                     }
+                    // The watchdog can beat a queued poll or promotion. Prepare
+                    // the same blocking-wait guidance while task state is still
+                    // available, rather than reading it on the deadline path.
+                    let blocking_handoff_response = worker_cap_ms.map(|cap| {
+                        let kill_note = crate::commands::bash_orchestrate::kill_deadline_note(
+                            ctx.bash_background(), &task_id, &session_for_spawn, worker_session,
+                        );
+                        Response::success(&request_id_for_spawn, json!({
+                            "output": format!(
+                                "{}\nKill deadline recorded at launch (worker waits may extend the default):{kill_note}",
+                                crate::commands::bash_orchestrate::format_worker_wait_limit_message(
+                                    &task_id, cap, cap, None,
+                                    format_context_for_spawn.bash_watch_available.unwrap_or(worker_session),
+                                ),
+                            ),
+                            "duration_ms": cap,
+                            "task_id": task_id,
+                            "status": "running",
+                        }))
+                    });
                     if let Some(tx) = spawn_control_tx.take() {
                         let _ = tx.send(BashSpawnControl::Foreground {
                             task_id,
@@ -1551,6 +1573,7 @@ pub(super) fn submit_deferred_bash(
                             detach_on_user_message,
                             worker_session,
                             worker_cap_ms,
+                            blocking_handoff_response,
                             remote_handback,
                         });
                     }
@@ -1842,6 +1865,7 @@ pub(super) fn submit_deferred_bash(
                 detach_on_user_message,
                 worker_session,
                 worker_cap_ms,
+                blocking_handoff_response,
                 remote_handback,
             }) => {
                 let phase = if detach_on_user_message {
@@ -1918,7 +1942,7 @@ pub(super) fn submit_deferred_bash(
                         wait_for_bash_reply_deadline(reply_deadline).await;
                     } => {
                         if claim.claim_for_deadline_handoff() {
-                            let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session));
+                            let response = blocking_handoff_response.unwrap_or_else(|| deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session)));
                             // Status-bar formatting can wait on diagnostic-cache or
                             // fleet-reader mutexes, so omit it from the deadline reply.
                             // Recording repeated calls only updates in-memory state.
@@ -2013,7 +2037,7 @@ fn startup_deadline_response(
             let cap = blocking_cap_ms.unwrap();
             Response::success(request_id, json!({
                 "output": crate::commands::bash_orchestrate::format_worker_wait_limit_message(
-                    task_id, cap, cap, "", bash_watch_available,
+                    task_id, cap, cap, None, bash_watch_available,
                 ),
                 "duration_ms": cap,
                 "task_id": task_id,
@@ -3926,6 +3950,7 @@ mod grant_path_tests {
             arguments,
             received_at,
             server_completion,
+            false,
             metrics,
             BashWaitCancel {
                 run_scope: None,
@@ -3947,6 +3972,7 @@ mod grant_path_tests {
         arguments: Value,
         received_at: impl Into<crate::commands::blocking_wait::ReplyBudget>,
         server_completion: bool,
+        worker_session: bool,
         metrics: Arc<DispatchPathMetrics>,
         cancel: BashWaitCancel,
     ) -> mpsc::Receiver<BashDeferredCompletion> {
@@ -3986,7 +4012,7 @@ mod grant_path_tests {
             None,
             None,
             repeat,
-            false,
+            worker_session,
             false,
             false,
             server_completion,
@@ -4304,6 +4330,7 @@ mod grant_path_tests {
                 arguments,
                 Instant::now(),
                 false,
+                false,
                 metrics,
                 cancel,
             )
@@ -4617,6 +4644,7 @@ mod grant_path_tests {
                     json!({"command":"uname -s", "runon":"linux", "timeout":10000}),
                     Instant::now(),
                     false,
+                    false,
                     metrics.clone(),
                     cancel.clone(),
                 )
@@ -4711,6 +4739,7 @@ mod grant_path_tests {
                     remote_runon_stub,
                     json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
                     Instant::now(),
+                    false,
                     false,
                     metrics.clone(),
                     cancel.clone(),
@@ -4924,6 +4953,7 @@ mod grant_path_tests {
                         remote_runon_stub,
                         json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
                         Instant::now(),
+                        false,
                         false,
                         metrics,
                         cancel.clone(),
@@ -6643,6 +6673,168 @@ mod grant_path_tests {
         );
         timing.committed.notify_one();
         response
+    }
+
+    fn gated_native_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+        BashTimingForTest::wait(&timing.admission, "task admission");
+        #[cfg(not(windows))]
+        let response = running_bash_stub(req, ctx);
+        #[cfg(windows)]
+        let response = crate::bash_background::spawn(
+            &req.id,
+            req.session(),
+            "ping -n 60 127.0.0.1",
+            crate::bash_background::BashShell::Powershell,
+            PathBuf::from("powershell.exe"),
+            None,
+            None,
+            crate::bash_background::HardKill::from_timeout_ms(None),
+            ctx,
+            false,
+            false,
+            false,
+            false,
+            24,
+            80,
+            Vec::new(),
+            false,
+            None,
+            None,
+        );
+        assert!(response.success, "{response:?}");
+        *timing.task_id.lock().unwrap() = Some(
+            response.data["task_id"]
+                .as_str()
+                .expect("registered task id")
+                .to_string(),
+        );
+        timing.committed.notify_one();
+        response
+    }
+
+    #[tokio::test]
+    async fn blocking_bash_deadline_handoff_preserves_wait_limit_guidance() {
+        // Force the reply watchdog to win while the ordinary wait is blocked
+        // on the executor and task lock, rather than depending on timer jitter.
+        for worker_session in [true, false] {
+            for mode in ["wait", "block_to_completion", "foreground"] {
+                let (dir, root) = super::super::test_support::test_root("blocking-handoff");
+                let ctx = super::super::test_support::test_ctx();
+                ctx.update_config(|config| {
+                    config.bash.worker_wait_max_ms = 1500;
+                    config.foreground_wait_window_ms = 1500;
+                    config.project_root = Some(root.as_path().into());
+                    config.storage_dir = Some(dir.path().join("storage"));
+                    config.sandbox.profile.head = crate::config::SandboxMode::Off;
+                    config.sandbox.profile.worker = crate::config::SandboxMode::Off;
+                });
+                let executor = Arc::new(Executor::new());
+                executor.register_actor(root.clone(), ctx.clone());
+                let received_at = Instant::now();
+                let timing = BashTimingForTest::new(received_at);
+                let command = if cfg!(windows) {
+                    "ping -n 60 127.0.0.1"
+                } else {
+                    "sleep 60"
+                };
+                let mut arguments = json!({"command": command, "foreground_orchestrate": true});
+                if mode != "foreground" {
+                    arguments[mode] = json!(true);
+                }
+                let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
+                    deadline_test_call_controlled(
+                        &executor,
+                        &root,
+                        gated_native_running_stub,
+                        arguments,
+                        received_at,
+                        false,
+                        worker_session,
+                        Arc::new(DispatchPathMetrics::new()),
+                        BashWaitCancel {
+                            run_scope: None,
+                            scope: None,
+                            late_results: false,
+                            ledger_carrier: None,
+                            connection: PersistentCancelSignal::new(),
+                            route: PersistentCancelSignal::new(),
+                            drain: drain::ModuleDrainWindow::default(),
+                        },
+                    )
+                });
+                BashTimingForTest::event(&timing.startup.armed, "startup deadline armed").await;
+                BashTimingForTest::release(&timing.admission);
+                tokio::select! {
+                    biased;
+                    done = rx.recv() => panic!("startup answered before registration: {:?}", done.unwrap().response_for_test()),
+                    _ = BashTimingForTest::event(&timing.committed, "task registered") => {},
+                }
+                let task_id = timing.task_id.lock().unwrap().clone().unwrap();
+                let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+                BashTimingForTest::event(&timing.reply.armed, "reply watchdog armed").await;
+                let (held_tx, held_rx) = oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let holder = executor.submit_async(
+                    root,
+                    Lane::Mutating,
+                    "held-writer".into(),
+                    Box::new(move |_| {
+                        let _state = task.state.lock().unwrap();
+                        held_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                        Response::success("held-writer", json!({}))
+                    }),
+                );
+                held_rx.await.unwrap();
+                timing.reply.fire.notify_one();
+                let done = tokio::time::timeout(Duration::from_millis(2300), rx.recv()).await;
+                let _ = release_tx.send(());
+                holder.await.unwrap();
+                let _ = ctx.bash_background().kill(&task_id, "deadline-session");
+                let done = done
+                    .expect("reply must bypass the held writer and task lock")
+                    .unwrap();
+                let result = done.result.expect("deadline handoff response");
+                assert!(result.response.success, "{:?}", result.response);
+                assert_eq!(result.response.data["task_id"], task_id);
+                assert_eq!(result.response.data["status"], "running");
+                if mode == "foreground" {
+                    assert!(
+                        result.text.contains("was promoted to background"),
+                        "{}",
+                        result.text
+                    );
+                    assert!(
+                        !result.text.contains("worker wait limit"),
+                        "{}",
+                        result.text
+                    );
+                    continue;
+                }
+                assert!(
+                    result.text.contains("still running after 1.5s"),
+                    "worker={worker_session} {mode}: {}",
+                    result.text
+                );
+                assert!(result.text.contains("it was not killed"), "{}", result.text);
+                assert!(
+                    result.text.contains("AFT kills this task at "),
+                    "{}",
+                    result.text
+                );
+                assert!(
+                    result.text.contains("its default background limit"),
+                    "{}",
+                    result.text
+                );
+                assert!(
+                    !result.text.contains("was promoted to background"),
+                    "{}",
+                    result.text
+                );
+            }
+        }
     }
 
     #[tokio::test]

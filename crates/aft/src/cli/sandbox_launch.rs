@@ -349,8 +349,18 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 
 #[cfg(target_os = "linux")]
 fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::AppliedLandlock) {
+    // Landlock's filesystem rights do not mediate AF_UNIX connect. Removing the
+    // address from the environment does not hide predictable session-bus paths.
+    let session_bus_reason = if profile.worker_jail {
+        " session_dbus_keyring_reason=Landlock_does_not_mediate_AF_UNIX_connect"
+    } else {
+        ""
+    };
     if profile.mode == aft::config::SandboxMode::Relaxed {
         let mut denies = Vec::new();
+        if profile.worker_jail {
+            denies.push("session_dbus_keyring".to_string());
+        }
         for path in profile.read_deny.iter().chain(&profile.data_policy.deny) {
             denies.push(format!("read:{}", path.display()));
         }
@@ -366,11 +376,14 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
             denies.push(format!("read:{}*", path.display()));
             denies.push(format!("write:{}*", path.display()));
         }
-        eprintln!("sandbox-launch: profile=relaxed unenforced=[{}] (Landlock cannot subtract denies from default-allow root grants)", denies.join(","));
+        eprintln!("sandbox-launch: profile=relaxed unenforced=[{}] (Landlock cannot subtract denies from default-allow root grants){session_bus_reason}", denies.join(","));
         return;
     }
     let write_roots = profile.write_allow_roots();
     let mut unenforced = Vec::new();
+    if profile.worker_jail {
+        unenforced.push("session_dbus_keyring");
+    }
     if profile
         .write_deny_nested
         .iter()
@@ -434,7 +447,7 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     if applied.yama_same_uid_exposed {
         eprint!(" proc_same_uid_exposure=[environ,maps,mem] yama_ptrace_scope=zero_or_unknown");
     }
-    eprintln!();
+    eprintln!("{session_bus_reason}");
 }
 
 #[cfg(target_os = "linux")]

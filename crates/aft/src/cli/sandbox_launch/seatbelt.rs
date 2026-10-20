@@ -135,6 +135,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         ));
     }
 
+    render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
 }
 
@@ -155,6 +156,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         .chain(&profile.deny_prefixes)
         .chain(&profile.read_deny)
         .chain(&profile.data_policy.deny)
+        .chain(&profile.keychain_deny)
         .flat_map(|path| path.ancestors().skip(1))
         .collect::<std::collections::BTreeSet<_>>();
     for ancestor in ancestors {
@@ -230,7 +232,41 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
             }
         }
     }
+    render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
+}
+
+fn render_worker_keychain_denies(
+    source: &mut String,
+    profile: &SandboxProfile,
+) -> Result<(), String> {
+    if !profile.worker_jail {
+        return Ok(());
+    }
+    // These are Security.framework's keychain and authorization endpoints, not
+    // a com.apple.security.* wildcard. Trust evaluation and code-signing services
+    // remain governed by the profile's default allow policy.
+    for service in [
+        "com.apple.SecurityServer", // Legacy file-keychain API (securityd).
+        "com.apple.securityd.xpc",  // SecItem API (secd).
+        "com.apple.securityd.systemkeychain", // System-keychain API in recovery.
+        "com.apple.authd",          // Authorization Services rights and interaction.
+        "com.apple.security.agent", // Keychain unlock / ACL prompts.
+        "com.apple.security.agent.login", // Privileged login-session agent.
+        "com.apple.security.authhost", // Authorization mechanism host.
+        "com.apple.security.authtrampoline", // Authorization execution trampoline.
+    ] {
+        source.push_str(&format!("(deny mach-lookup (global-name \"{service}\"))\n"));
+    }
+    // Keep these last: neither writable project roots nor private-store read
+    // exceptions may reopen a keychain directory. Match case aliases as well.
+    for path in &profile.keychain_deny {
+        source.push_str(&format!(
+            "(deny file-read* file-write* {})\n",
+            relaxed_filter(path, false)?
+        ));
+    }
+    Ok(())
 }
 
 fn render_relaxed_scopes(
@@ -413,6 +449,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_keychain_mach_denies_preserve_trust_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![dir.path().to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            profile.worker_jail = false;
+            let head = render_profile(&profile).unwrap();
+            assert!(!head.contains("mach-lookup"));
+            profile.worker_jail = true;
+            let source = render_profile(&profile).unwrap();
+            for service in [
+                "com.apple.SecurityServer",
+                "com.apple.securityd.xpc",
+                "com.apple.securityd.systemkeychain",
+                "com.apple.security.agent",
+                "com.apple.security.agent.login",
+                "com.apple.authd",
+                "com.apple.security.authhost",
+                "com.apple.security.authtrampoline",
+            ] {
+                assert!(
+                    source.contains(&format!("(deny mach-lookup (global-name \"{service}\"))")),
+                    "missing {service}: {source}"
+                );
+            }
+            for service in ["com.apple.trustd", "com.apple.trustd.agent"] {
+                assert!(
+                    !source.contains(&format!("(global-name \"{service}\")")),
+                    "trust service must remain default-allowed"
+                );
+            }
+            assert!(source.contains("(allow default)"));
+        }
+    }
+
+    #[test]
+    fn worker_keychain_files_override_even_enclosing_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![dir.path().to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        profile.worker_jail = true;
+        profile.keychain_deny = vec![
+            dir.path().join("Library/Keychains"),
+            Path::new("/Library/Keychains").to_path_buf(),
+        ];
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            for path in &profile.keychain_deny {
+                let deny = format!(
+                    "(deny file-read* file-write* {})",
+                    relaxed_filter(path, false).unwrap()
+                );
+                assert!(
+                    source.contains(&deny),
+                    "missing final keychain file deny: {source}"
+                );
+                assert!(source.find(&deny).unwrap() > source.rfind("(allow ").unwrap());
+                if mode == aft::config::SandboxMode::Relaxed {
+                    for ancestor in path.ancestors().skip(1) {
+                        let unlink_deny = format!(
+                            "(deny file-write-unlink (literal \"{}\"))",
+                            escape_path(ancestor).unwrap()
+                        );
+                        assert!(
+                            source.contains(&unlink_deny),
+                            "keychain ancestor can be renamed: {source}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn relaxed_regex_literal_escapes_dot_once() {
         assert_eq!(
             relaxed_filter(Path::new("/tmp/a.b"), false).unwrap(),
@@ -470,6 +606,8 @@ mod tests {
         let profile = SandboxProfile {
             v: 1,
             mode: aft::config::SandboxMode::Strict,
+            worker_jail: false,
+            keychain_deny: Vec::new(),
             deny_prefixes: Vec::new(),
             data_policy: Default::default(),
             writable_roots: vec![project],

@@ -1806,6 +1806,7 @@ fn build_native_profile(
             profile.writable_roots.dedup();
             profile.writable_files = jail.files;
         }
+        protect_worker_credential_services(&mut profile, &home)?;
         profile = profile
             .canonicalize_for_launch()
             .map_err(|error| error.to_string())?;
@@ -2009,6 +2010,8 @@ fn build_relaxed_profile(
     let mut profile = SandboxProfile {
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
+        worker_jail: false,
+        keychain_deny: Vec::new(),
         deny_prefixes: Vec::new(),
         data_policy: stores,
         writable_roots: writable,
@@ -2024,9 +2027,70 @@ fn build_relaxed_profile(
         temp_dir: temp.to_path_buf(),
     };
     add_relaxed_cargo_credential_denies(&mut profile, cargo_homes);
+    protect_worker_credential_services(&mut profile, home)?;
     profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())
+}
+
+/// Mark only authenticated, sandboxed workers for credential-service isolation.
+#[cfg(unix)]
+fn protect_worker_credential_services(
+    profile: &mut SandboxProfile,
+    _home: &Path,
+) -> Result<(), String> {
+    profile.worker_jail = worker_jail_active();
+    #[cfg(target_os = "macos")]
+    if profile.worker_jail {
+        // Security.framework uses the account's home even when the daemon was
+        // started with an alternate HOME. Protect both locations.
+        profile.keychain_deny = vec![
+            _home.join("Library/Keychains"),
+            macos_account_home()?.join("Library/Keychains"),
+            PathBuf::from("/Library/Keychains"),
+        ];
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_account_home() -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    // A caller-owned buffer keeps getpwuid_r safe across concurrent launches.
+    let mut buffer = vec![0u8; 16384];
+    // SAFETY: the passwd and byte buffer are writable for their declared sizes;
+    // result is inspected only after getpwuid_r reports a populated entry.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return Err(format!(
+            "cannot resolve account home for keychain isolation (getpwuid_r: {status})"
+        ));
+    }
+    // SAFETY: a successful getpwuid_r initialized entry and its pw_dir points
+    // into the live buffer. Copy the string before the buffer is released.
+    let path = unsafe {
+        let entry = entry.assume_init();
+        if entry.pw_dir.is_null() {
+            return Err("account home is missing for keychain isolation".into());
+        }
+        PathBuf::from(OsStr::from_bytes(
+            std::ffi::CStr::from_ptr(entry.pw_dir).to_bytes(),
+        ))
+    };
+    if !path.is_absolute() {
+        return Err("account home is not absolute for keychain isolation".into());
+    }
+    Ok(path)
 }
 
 /// Build the same control-file denies for project and granted write roots,
@@ -5033,10 +5097,13 @@ fn sandboxed_child_environment(
         // dynamic-loader or shell/interpreter startup hook here would execute
         // code OUTSIDE confinement, so those keys are dropped even though they
         // arrived through the (otherwise honored) request environment.
+        // Workers also drop session-bus discovery; Linux still reports that
+        // direct connections to a known bus path are not isolated by Landlock.
         if is_preexec_hijack_env_key(key.as_str())
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
+            || (worker_jail_active() && key == "DBUS_SESSION_BUS_ADDRESS")
         {
             continue;
         }
@@ -5411,6 +5478,68 @@ mod windows_pty_environment_tests {
 #[cfg(test)]
 pub(crate) mod environment_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_keychain_policy_only_marks_worker_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![dir.path().to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        protect_worker_credential_services(&mut profile, dir.path()).unwrap();
+        assert!(!profile.worker_jail);
+        assert!(profile.keychain_deny.is_empty());
+        with_worker_jail(true, || {
+            protect_worker_credential_services(&mut profile, dir.path())
+        })
+        .unwrap();
+        assert!(profile.worker_jail);
+        #[cfg(target_os = "macos")]
+        {
+            assert!(profile
+                .keychain_deny
+                .contains(&dir.path().join("Library/Keychains")));
+            assert!(profile
+                .keychain_deny
+                .contains(&macos_account_home().unwrap().join("Library/Keychains")));
+            assert!(profile
+                .keychain_deny
+                .contains(&PathBuf::from("/Library/Keychains")));
+        }
+        let profile = profile.canonicalize_for_launch().unwrap();
+        let decoded: SandboxProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        assert!(decoded.worker_jail);
+        assert_eq!(decoded.keychain_deny, profile.keychain_deny);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_session_bus_address_is_stripped_without_changing_heads() {
+        let request = HashMap::from([(
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            "unix:path=/run/user/1000/bus".to_string(),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let head = with_worker_jail(false, || sandboxed_child_environment(&request, dir.path()));
+        assert_eq!(
+            head.get(OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
+            Some(&OsString::from("unix:path=/run/user/1000/bus"))
+        );
+        let worker = with_worker_jail(true, || sandboxed_child_environment(&request, dir.path()));
+        assert!(!worker.contains_key(OsStr::new("DBUS_SESSION_BUS_ADDRESS")));
+        assert!(!sandbox_base_environment_key(OsStr::new(
+            "DBUS_SESSION_BUS_ADDRESS"
+        )));
+    }
 
     const REENTRY: &str = "AFT_TEST_RELAXED_ENV_REENTRY";
 
@@ -9257,6 +9386,8 @@ mod read_allow_tests {
         let profile = SandboxProfile {
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
+            worker_jail: false,
+            keychain_deny: Vec::new(),
             deny_prefixes: Vec::new(),
             data_policy: crate::sandbox_profile::SandboxDataPolicy {
                 deny: vec![

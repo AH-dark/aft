@@ -2968,6 +2968,14 @@ fn register_hashline_for_configure(
     }
 }
 
+fn log_artifact_owner_note(note: &str) {
+    if note.ends_with("(read-only borrow)") {
+        slog_info!("{}", note);
+    } else {
+        slog_warn!("{}", note);
+    }
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -3852,7 +3860,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             .as_ref()
             .and_then(|status| status.note.as_ref())
         {
-            slog_warn!("{}", note);
+            log_artifact_owner_note(note);
         }
     }
     ctx.begin_configure_ack_phase("storage_capability_probe");
@@ -8266,6 +8274,32 @@ fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+
+    #[test]
+    fn routine_log_level_owner_borrow_is_info_but_problems_stay_warn() {
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            super::log_artifact_owner_note(
+                "sharing the repo index family owned by /repo (read-only borrow)",
+            );
+            super::log_artifact_owner_note(
+                "sharing the repo index family; owner manifest is malformed; not repairing it from a linked worktree",
+            );
+        });
+
+        assert_eq!(lines.len(), 2, "captured owner notes: {lines:?}");
+        assert!(lines[0].starts_with("INFO "), "{}", lines[0]);
+        assert!(
+            lines[0].contains("sharing the repo index family owned by /repo (read-only borrow)"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].starts_with("WARN "), "{}", lines[1]);
+        assert!(
+            lines[1].contains("owner manifest is malformed"),
+            "{}",
+            lines[1]
+        );
+    }
 
     /// The watcher only sees changes made after it subscribes, so its start
     /// must complete before the first request after configure is served and

@@ -1936,8 +1936,9 @@ impl LspClient {
                 self.state = ServerState::Exited;
                 self.child_registry.untrack(self.child_pid);
                 return Err(LspError::Timeout(format!(
-                    "timed out waiting for {:?} to exit",
-                    self.kind
+                    "timed out waiting for {:?} to exit; did not exit within {}ms; killed and reaped",
+                    self.kind,
+                    SHUTDOWN_TIMEOUT.as_millis(),
                 )));
             }
             thread::sleep(EXIT_POLL_INTERVAL);

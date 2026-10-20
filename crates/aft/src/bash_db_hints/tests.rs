@@ -225,6 +225,8 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
         data_policy: Default::default(),
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: crate::config::SandboxMode::Strict,
+        worker_jail: false,
+        keychain_deny: Vec::new(),
         deny_prefixes: Vec::new(),
         writable_roots: vec![dir.path().to_path_buf()],
         writable_files: Vec::new(),
