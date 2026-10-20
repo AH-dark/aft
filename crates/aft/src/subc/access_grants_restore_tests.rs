@@ -418,6 +418,17 @@ async fn grants_deleted_target_is_not_reprobed_or_regranted() {
         read["structuredContent"]["detail"]["retryable"], false,
         "{read}"
     );
+    let next_epoch = at_epoch(&wire.revived, 9);
+    restore_launch(&next_epoch, &wire.ctx, "worker").unwrap();
+    assert_eq!(wire.ctx.launch_grant_state.probe_count(&target), 1);
+    {
+        let db = wire.ctx.db().unwrap();
+        let restored = store::list(&db.lock().unwrap(), &scope_key(&next_epoch)).unwrap();
+        assert!(
+            !restored.iter().any(|grant| grant.path == target),
+            "a new route epoch must not grant a replacement object"
+        );
+    }
     wire.stop().await;
 }
 

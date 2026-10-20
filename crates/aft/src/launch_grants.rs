@@ -46,6 +46,12 @@ struct State {
 #[derive(Default)]
 pub(crate) struct LaunchGrantState(parking_lot::Mutex<State>);
 
+fn session_key(key: &PolicyKey) -> PolicyKey {
+    let mut key = key.clone();
+    key.epoch = 0;
+    key
+}
+
 impl LaunchGrantState {
     pub(crate) fn clear(&self) {
         *self.0.lock() = State::default();
@@ -55,15 +61,16 @@ impl LaunchGrantState {
         self.0
             .lock()
             .absent
-            .get(key)
+            .get(&session_key(key))
             .is_some_and(|grants| grants.contains(grant))
     }
 
     /// After a grant path is confirmed missing, recreating an object at that
-    /// path must not restore the grant in this session. A new launch is required.
+    /// path must not restore the grant in this session. New explicit authority
+    /// is required, rather than a route rebind or an epoch change.
     pub(crate) fn mark_absent(&self, key: &PolicyKey, grant: AccessGrant) {
         let mut state = self.0.lock();
-        let grants = state.absent.entry(key.clone()).or_default();
+        let grants = state.absent.entry(session_key(key)).or_default();
         if !grants.contains(&grant) {
             grants.push(grant);
         }
@@ -75,7 +82,11 @@ impl LaunchGrantState {
         pending: Vec<AccessGrant>,
     ) -> Vec<UnrestoredGrant> {
         let state = self.0.lock();
-        let absent = state.absent.get(key).map(Vec::as_slice).unwrap_or_default();
+        let absent = state
+            .absent
+            .get(&session_key(key))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut result: Vec<_> = pending
             .iter()
             .filter(|grant| !absent.contains(grant))
@@ -94,9 +105,8 @@ impl LaunchGrantState {
         key: &PolicyKey,
         grants: &[UnrestoredGrant],
     ) -> Vec<UnrestoredGrant> {
-        let mut session = key.clone();
         // Route epochs may change while the worker's session stays the same.
-        session.epoch = 0;
+        let session = session_key(key);
         let mut state = self.0.lock();
         let reported = state.reported.entry(session).or_default();
         grants
