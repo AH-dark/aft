@@ -647,7 +647,13 @@ mod tests {
                 .map(|key| (key, std::env::var_os(key)))
                 .collect(),
         );
-        std::env::set_var("PATH", root.path());
+        // Put the fake gh first but keep the rest of PATH: tests running in
+        // parallel that do not take the env lock still need to find git.
+        let mut search_path = vec![root.path().to_path_buf()];
+        search_path.extend(std::env::split_paths(
+            &restore.0[0].1.clone().unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(search_path).unwrap());
         std::env::set_var("AFT_STORAGE_DIR", root.path().join("storage"));
         let gh = root.path().join("gh");
         std::fs::write(&gh,b"#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf invoked > \"$0.ran\"\nprintf 'https://github.com/cortexkit/aft/issues/7#issuecomment-1\\n'\n").unwrap();
