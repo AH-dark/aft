@@ -224,6 +224,7 @@ mod source_replacement {
             && copied.gid() == original.gid()
             && copied.mode() == original.mode()
             && xattrs::snapshot(replacement).is_ok_and(|actual| actual == wanted)
+            && xattrs::platform_acls_match(&source, replacement)
     }
 
     /// Other platforms offer no checked way to copy ACLs, so a replacement
@@ -396,9 +397,79 @@ mod source_replacement {
         ) -> io::Result<()> {
             Ok(())
         }
+
+        /// Linux ACLs, including an access ACL a new file inherits from its
+        /// directory's default ACL, are the `system.posix_acl_access`
+        /// attribute, so the attribute comparison already covers them.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn platform_acls_match(_source: &File, _replacement: &File) -> bool {
+            true
+        }
+
+        /// macOS ACLs are not extended attributes. A new file can inherit
+        /// entries from its directory's inheritable ACEs, and `fcopyfile` is
+        /// not relied on to remove them, so both ACLs are read back and must
+        /// be equal (or both absent).
+        #[cfg(target_os = "macos")]
+        pub(crate) fn platform_acls_match(source: &File, replacement: &File) -> bool {
+            match (extended_acl_text(source), extended_acl_text(replacement)) {
+                (Ok(original), Ok(copied)) => original == copied,
+                _ => false,
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        mod acl_sys {
+            use std::ffi::{c_char, c_int, c_void};
+            /// `ACL_TYPE_EXTENDED` from `<sys/acl.h>`.
+            pub(super) const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+            extern "C" {
+                pub(super) fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;
+                pub(super) fn acl_to_text(acl: *mut c_void, len: *mut libc::ssize_t)
+                    -> *mut c_char;
+                pub(super) fn acl_free(object: *mut c_void) -> c_int;
+            }
+        }
+
+        /// The file's extended ACL as text, or `None` when it has no ACL.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn extended_acl_text(file: &File) -> io::Result<Option<String>> {
+            // SAFETY: the descriptor is open for the duration of the call.
+            let acl =
+                unsafe { acl_sys::acl_get_fd_np(file.as_raw_fd(), acl_sys::ACL_TYPE_EXTENDED) };
+            if acl.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() == Some(libc::ENOENT) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+            // SAFETY: `acl` is a live ACL returned above; a null length
+            // pointer is allowed.
+            let text = unsafe { acl_sys::acl_to_text(acl, std::ptr::null_mut()) };
+            let result = if text.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                // SAFETY: acl_to_text returns a NUL-terminated string.
+                Ok(Some(
+                    unsafe { CStr::from_ptr(text) }
+                        .to_string_lossy()
+                        .into_owned(),
+                ))
+            };
+            // SAFETY: both objects were allocated by the ACL library and are
+            // freed exactly once.
+            unsafe {
+                if !text.is_null() {
+                    acl_sys::acl_free(text.cast());
+                }
+                acl_sys::acl_free(acl);
+            }
+            result
+        }
     }
 }
-
 /// Convert 0-indexed line/col to a byte offset within `source`.
 ///
 /// Tree-sitter columns are byte-indexed within the line, so `col` is a byte
@@ -2356,6 +2427,124 @@ mod source_write_access_tests {
         write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn edit_does_not_add_an_acl_inherited_from_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("inheriting");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("plain.txt");
+        // Created before the directory gains an inheritable entry, so the
+        // original has no ACL of its own.
+        std::fs::write(&path, "old\n").unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "group:everyone allow read,file_inherit"])
+            .arg(&folder)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let acl_of = |path: &Path| {
+            source_replacement::xattrs::extended_acl_text(&std::fs::File::open(path).unwrap())
+                .unwrap()
+        };
+        let probe = folder.join("probe.txt");
+        std::fs::write(&probe, "").unwrap();
+        assert!(
+            acl_of(&probe).is_some(),
+            "a new file in the folder must inherit an ACL for this test to mean anything"
+        );
+        assert_eq!(acl_of(&path), None);
+
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(acl_of(&path), None);
+        let mode = atomic_write_source(&path, b"third\n").unwrap();
+        eprintln!("inherited-ACL directory write took {mode:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        assert_eq!(acl_of(&path), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn edit_does_not_add_an_acl_inherited_from_the_default_acl() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("inheriting");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("plain.txt");
+        // Created before the directory gains a default ACL, so the original
+        // has no access ACL of its own.
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Default ACL u::rwx, u:<other>:r, g::rwx, m::rwx, o::r. The named
+        // entry makes new files store a real access ACL instead of folding
+        // a minimal one into their mode bits.
+        const UNDEFINED_ID: u32 = u32::MAX;
+        // SAFETY: geteuid has no preconditions.
+        let other_user = unsafe { libc::geteuid() } + 1;
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 7u16, UNDEFINED_ID),
+            (0x02, 4, other_user),
+            (0x04, 7, UNDEFINED_ID),
+            (0x10, 7, UNDEFINED_ID),
+            (0x20, 4, UNDEFINED_ID),
+        ] {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        let default_name = CString::new("system.posix_acl_default").unwrap();
+        let c_folder = CString::new(folder.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated strings and a live byte slice.
+        let set = unsafe {
+            libc::setxattr(
+                c_folder.as_ptr(),
+                default_name.as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            set,
+            0,
+            "the test file system must support default ACLs: {}",
+            std::io::Error::last_os_error()
+        );
+        let access_name = CString::new("system.posix_acl_access").unwrap();
+        let acl_of = |path: &Path| {
+            let file = std::fs::File::open(path).unwrap();
+            source_replacement::xattrs::snapshot(&file)
+                .unwrap()
+                .get(access_name.as_c_str())
+                .cloned()
+        };
+        let probe = folder.join("probe.txt");
+        std::fs::write(&probe, "").unwrap();
+        assert!(
+            acl_of(&probe).is_some(),
+            "a new file in the folder must inherit an access ACL for this test to mean anything"
+        );
+        assert_eq!(acl_of(&path), None);
+
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(acl_of(&path), None);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mode = atomic_write_source(&path, b"third\n").unwrap();
+        eprintln!("inherited default-ACL write took {mode:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        assert_eq!(acl_of(&path), None);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
