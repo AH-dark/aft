@@ -2490,13 +2490,13 @@ fn build_health_diagnostic_rollup(
     ))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "health_rollup_bench.rs"]
 mod rollup_bench;
 
 macro_rules! rollup_mark {
     ($timer:ident, $step:literal) => {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         $timer.mark($step);
     };
 }
@@ -2507,7 +2507,7 @@ fn build_health_diagnostic_rollup_from_actors(
     shared_app: &App,
     actor_entries: Vec<(ProjectRootId, Arc<AppContext>)>,
 ) -> HealthDiagnosticRollup {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     let mut timer = rollup_bench::Timer::new();
     struct RootCandidate {
         root_label: String,
@@ -5346,6 +5346,72 @@ mod tests {
             census["roots"][label.as_str()]["memory_measured_age_ms"].is_u64(),
             "the census row must carry its age: {census}"
         );
+    }
+
+    /// Reads add files to a root's symbol cache far more often than edits
+    /// change its trigram index, and the trigram walk visits every indexed
+    /// file. A symbol-cache change must re-walk only the symbol cache, an
+    /// edit only the trigram index, and the reported age must stay that of
+    /// the oldest walk still in use.
+    #[test]
+    fn rollup_rewalks_only_the_index_whose_shape_changed() {
+        let ctx = test_ctx();
+        let mut index = crate::search_index::SearchIndex::new();
+        index.index_file(Path::new("/rollup-split/a.rs"), b"fn a() {}");
+        *ctx.search_index().write().unwrap() = Some(index);
+        let measure = || {
+            let before = crate::context::memory_index_walks_for_test();
+            let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
+            let after = crate::context::memory_index_walks_for_test();
+            (
+                [
+                    after[0] - before[0],
+                    after[1] - before[1],
+                    after[2] - before[2],
+                ],
+                rollup.measured_age_ms.expect("rollup age"),
+            )
+        };
+        // No semantic index is installed, so there is nothing to walk there.
+        assert_eq!(
+            measure().0,
+            [0, 1, 1],
+            "the first rollup walks both indexes"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(measure().0, [0, 0, 0], "an unchanged root was walked again");
+
+        ctx.symbol_cache().write().unwrap().insert(
+            std::path::PathBuf::from("/rollup-split/read.rs"),
+            std::time::SystemTime::UNIX_EPOCH,
+            1,
+            blake3::hash(b"read"),
+            Vec::new(),
+        );
+        let (walks, age) = measure();
+        assert_eq!(
+            walks,
+            [0, 0, 1],
+            "a read must re-walk only the symbol cache"
+        );
+        assert!(
+            age >= 30,
+            "the reused trigram walk is the oldest figure, got age {age}"
+        );
+
+        ctx.search_index()
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .index_file(Path::new("/rollup-split/b.rs"), b"fn b() {}");
+        let (walks, age) = measure();
+        assert_eq!(
+            walks,
+            [0, 1, 0],
+            "an edit must re-walk only the trigram index"
+        );
+        assert!(age < 30, "every walk in use is recent, got age {age}");
     }
 
     #[test]

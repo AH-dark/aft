@@ -1997,12 +1997,28 @@ impl SearchIndex {
         self.max_file_size
     }
 
+    /// Whether `path` belongs to this index's corpus: it lies under the
+    /// index root in a form [`Self::write_to_disk`] can store as a relative
+    /// path. An index without a root (built in memory) admits every path.
+    pub(crate) fn admits_path(&self, path: &Path) -> bool {
+        self.project_root.as_os_str().is_empty()
+            || storable_relative_path(&self.project_root, path).is_some()
+    }
+
     pub(crate) fn apply_search_update(&mut self, update: PreparedSearchUpdate) {
         let PreparedSearchUpdate { path, file } = update;
         // Prepared updates use filesystem-canonical paths, but borrowed indexes
         // can have a plain Windows root. Match the stored root's spelling before
         // replacing its exact path key.
         let path = self.respell_under_stored_root(path);
+        if !self.admits_path(&path) {
+            // AFT's own writes report every path they touched, and a session
+            // may edit files in a sibling checkout or a temporary directory.
+            // Such a file is not part of this root's corpus, and one stored
+            // entry outside the root would make every later `write_to_disk`
+            // refuse the whole cache.
+            return;
+        }
         self.remove_resolved_file(&path, &path);
         match file {
             PreparedSearchPath::Indexed(file) => {
@@ -4834,18 +4850,12 @@ fn build_postings_header_bytes(plan: &CacheWritePlan) -> std::io::Result<Vec<u8>
     for (file_id, file) in plan.files.iter().enumerate() {
         let file_id =
             u32::try_from(file_id).map_err(|_| std::io::Error::other("too many files to cache"))?;
-        let path = cache_relative_path(&plan.project_root, &file.path)
-            .or_else(|| {
-                fs::canonicalize(&file.path)
-                    .ok()
-                    .and_then(|canonical| cache_relative_path(&plan.project_root, &canonical))
-            })
-            .ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "refusing to cache path outside project root: {}",
-                    file.path.display()
-                ))
-            })?;
+        let path = storable_relative_path(&plan.project_root, &file.path).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "refusing to cache path outside project root: {}",
+                file.path.display()
+            ))
+        })?;
         let path = path.to_string_lossy();
         let path_len = u32::try_from(path.len())
             .map_err(|_| std::io::Error::other("cached path too large"))?;
@@ -6318,6 +6328,19 @@ pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
     let normalized_path = normalize_path(path);
     let relative = normalized_path.strip_prefix(&normalized_root).ok()?;
     validate_cached_relative_path(relative)
+}
+
+/// The relative path a disk cache stores for `path` under `root`: taken as
+/// spelled, or else after resolving `path` on disk (an alias spelling such as
+/// macOS `/var` for `/private/var`). `None` for a path outside `root`.
+/// Admission into an index and the cache writer share this one rule, so an
+/// admitted path can always be written.
+pub(crate) fn storable_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    cache_relative_path(root, path).or_else(|| {
+        fs::canonicalize(path)
+            .ok()
+            .and_then(|canonical| cache_relative_path(root, &canonical))
+    })
 }
 
 /// Canonical parent directories recur throughout one artifact reload. Cache only
@@ -9768,6 +9791,36 @@ mod tests {
         // report work it did not do.
         assert_eq!(summary.scanned, 0);
         assert_eq!(summary.removed, 0);
+    }
+
+    /// The cache writer stores paths relative to the root and refuses the
+    /// whole cache if one entry lies outside it. An update for an outside
+    /// path must therefore never enter the index, whichever caller sends it.
+    #[test]
+    fn update_for_a_path_outside_the_root_is_not_admitted() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = fs::canonicalize(dir.path()).expect("canonical temp dir");
+        let project = base.join("project");
+        let sibling = base.join("project-sibling");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sibling).expect("create sibling dir");
+        fs::write(project.join("inside.rs"), "fn inside() {}").expect("write inside");
+        let outside = sibling.join("outside.rs");
+        fs::write(&outside, "fn outside() {}").expect("write outside");
+
+        let mut index = SearchIndex::build(&project);
+        let files_before = index.path_to_id.len();
+        index.update_file(&outside);
+        assert!(!index.path_to_id.contains_key(&outside));
+        assert_eq!(index.path_to_id.len(), files_before);
+        let added = project.join("added.rs");
+        fs::write(&added, "fn added() {}").expect("write added");
+        index.update_file(&added);
+        assert!(
+            index.path_to_id.contains_key(&added),
+            "in-root updates still apply"
+        );
+        assert!(index.write_to_disk(&base.join("cache"), None));
     }
 
     fn lexical_rank_mixed_storage_fixture() -> (tempfile::TempDir, SearchIndex) {

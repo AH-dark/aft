@@ -1014,16 +1014,15 @@ struct ConfigureWarmState {
 /// look unchanged. A bound on how late a missed change can show.
 const PATH_STATUS_REREAD_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long the health rollup reuses a root's index memory walk while the
-/// indexes' shape counters stay the same. A bound on how late an in-place
+/// How long the health rollup reuses one index's memory walk while that
+/// index's shape counters stay the same. A bound on how late an in-place
 /// change that leaves every counter alone can show.
 const HEALTH_MEMORY_REUSE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The three per-entry index walks of a memory estimate (semantic, trigram,
-/// symbols), with the shape counters read just before them.
+/// symbols). `measured_at` is when the oldest of them was taken.
 #[derive(Clone, Debug)]
 struct WalkedMemory {
-    shape: Option<MemoryShape>,
     measured_at: Instant,
     /// The semantic walk before the live worker bytes are added.
     semantic: crate::memory::MemoryEstimate,
@@ -1031,10 +1030,26 @@ struct WalkedMemory {
     symbols: crate::memory::MemoryEstimate,
 }
 
-/// Counters of the semantic index, trigram index and symbol cache that move
-/// when their memory walks would most likely change (see each type's
-/// `memory_shape`). A missing index counts as its own shape.
-type MemoryShape = (Option<[u64; 9]>, Option<[u64; 11]>, [u64; 3]);
+/// One index's last memory walk, with the shape counters read just before it
+/// (see each type's `memory_shape`; `None` stands for a missing index).
+#[derive(Clone, Debug)]
+struct IndexMemoryWalk<S> {
+    shape: S,
+    measured_at: Instant,
+    estimate: crate::memory::MemoryEstimate,
+}
+
+/// The health rollup's reusable walks, kept per index. Reads add files to the
+/// symbol cache far more often than edits change the trigram or semantic
+/// index, and the symbol cache is cheap to walk while the other two visit
+/// every indexed file; keeping them apart means a read re-walks only the
+/// symbol cache.
+#[derive(Clone, Debug, Default)]
+struct HealthMemoryWalks {
+    semantic: Option<IndexMemoryWalk<Option<[u64; 9]>>>,
+    trigram: Option<IndexMemoryWalk<Option<[u64; 11]>>>,
+    symbols: Option<IndexMemoryWalk<[u64; 3]>>,
+}
 
 /// Length and modification time of a view's derived database and of its
 /// write-ahead log, `None` for a file that does not exist.
@@ -1148,14 +1163,51 @@ impl Drop for ProjectApplicabilityHold {
 thread_local! {
     /// Path-status database reads made on this thread.
     static PATH_STATUS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Walks of a root's resident indexes for a memory estimate made on this
-    /// thread.
+    /// Memory estimates on this thread that walked at least one of a root's
+    /// resident indexes.
     static MEMORY_ESTIMATE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Walks of each resident index on this thread: semantic, trigram and
+    /// symbol cache, in that order.
+    static MEMORY_INDEX_WALKS: std::cell::RefCell<[usize; 3]> = const { std::cell::RefCell::new([0; 3]) };
 }
 
 #[cfg(test)]
 pub(crate) fn memory_estimate_walks_for_test() -> usize {
     MEMORY_ESTIMATE_WALKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn memory_index_walks_for_test() -> [usize; 3] {
+    MEMORY_INDEX_WALKS.with(|walks| *walks.borrow())
+}
+
+/// Reuse one index's cached memory walk while its shape is unchanged and the
+/// walk is younger than [`HEALTH_MEMORY_REUSE_INTERVAL`]; otherwise walk it
+/// again. `shape` is `None` when the index was locked. Returns the estimate,
+/// when it was measured, and whether this call walked.
+fn reuse_or_walk_index_memory<S: PartialEq>(
+    cached: &mut Option<IndexMemoryWalk<S>>,
+    shape: Option<S>,
+    walk: impl FnOnce() -> crate::memory::MemoryEstimate,
+) -> (crate::memory::MemoryEstimate, Instant, bool) {
+    if let (Some(shape), Some(previous)) = (shape.as_ref(), cached.as_ref()) {
+        if &previous.shape == shape && previous.measured_at.elapsed() < HEALTH_MEMORY_REUSE_INTERVAL
+        {
+            return (previous.estimate.clone(), previous.measured_at, false);
+        }
+    }
+    let measured_at = Instant::now();
+    let estimate = walk();
+    // A walk that found its index locked is never reused, so the next rollup
+    // tries again rather than serving `busy` for 30 s.
+    *cached = shape
+        .filter(|_| estimate.status != "busy")
+        .map(|shape| IndexMemoryWalk {
+            shape,
+            measured_at,
+            estimate: estimate.clone(),
+        });
+    (estimate, measured_at, true)
 }
 
 #[derive(Debug)]
@@ -3674,7 +3726,7 @@ pub struct AppContext {
     /// cache that the health rollup made for its memory estimate. A later
     /// rollup reuses it while those indexes' `memory_shape` counters are
     /// unchanged (see `memory_root_snapshot_and_rollup`).
-    health_memory_walk: parking_lot::Mutex<Option<WalkedMemory>>,
+    health_memory_walk: parking_lot::Mutex<HealthMemoryWalks>,
     /// At most one diagnostics collector may outlive its caller's budget.
     /// Later edits queue their latest disk contents instead of growing a pool
     /// of threads waiting on a slow handshake or the same manager mutex.
@@ -4415,7 +4467,7 @@ impl AppContext {
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
             view_path_status_cache: parking_lot::Mutex::new(None),
-            health_memory_walk: parking_lot::Mutex::new(None),
+            health_memory_walk: parking_lot::Mutex::new(HealthMemoryWalks::default()),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
@@ -13348,34 +13400,48 @@ impl AppContext {
     }
 
     fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
-        self.memory_estimates_from(self.walk_index_memory(None))
-    }
-
-    /// The shape counters of this root's semantic index, trigram index and
-    /// symbol cache, or `None` when any of them is locked (its estimate would
-    /// then be `busy`, which is never reused).
-    fn memory_shape(&self) -> Option<MemoryShape> {
-        let semantic = self
-            .semantic_index
-            .try_read()
-            .ok()?
-            .as_ref()
-            .map(SemanticIndex::memory_shape);
-        let trigram = match self.search_index.try_read().ok()?.as_ref() {
-            Some(index) => Some(index.memory_shape()?),
-            None => None,
-        };
-        let symbols = self.symbol_cache.try_read().ok()?.memory_shape();
-        Some((semantic, trigram, symbols))
-    }
-
-    /// Walk every entry of the semantic index, trigram index and symbol cache
-    /// for their memory estimates. These are the costly parts of an estimate.
-    fn walk_index_memory(&self, shape: Option<MemoryShape>) -> WalkedMemory {
         #[cfg(test)]
         MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
-        let measured_at = Instant::now();
-        let semantic = match self.semantic_index.try_read() {
+        let walked = WalkedMemory {
+            measured_at: Instant::now(),
+            semantic: self.walk_semantic_memory(),
+            trigram: self.walk_trigram_memory(),
+            symbols: self.walk_symbol_memory(),
+        };
+        self.memory_estimates_from(walked)
+    }
+
+    /// Shape counters of the semantic index; the outer `None` means its lock
+    /// is held (its estimate would then be `busy`, which is never reused).
+    fn semantic_memory_shape(&self) -> Option<Option<[u64; 9]>> {
+        Some(
+            self.semantic_index
+                .try_read()
+                .ok()?
+                .as_ref()
+                .map(SemanticIndex::memory_shape),
+        )
+    }
+
+    /// Shape counters of the trigram index; the outer `None` means it is
+    /// locked.
+    fn trigram_memory_shape(&self) -> Option<Option<[u64; 11]>> {
+        match self.search_index.try_read().ok()?.as_ref() {
+            Some(index) => Some(Some(index.memory_shape()?)),
+            None => Some(None),
+        }
+    }
+
+    /// Shape counters of the symbol cache; `None` means it is locked.
+    fn symbol_memory_shape(&self) -> Option<[u64; 3]> {
+        Some(self.symbol_cache.try_read().ok()?.memory_shape())
+    }
+
+    /// Walk every entry of the semantic index for its memory estimate.
+    fn walk_semantic_memory(&self) -> crate::memory::MemoryEstimate {
+        #[cfg(test)]
+        MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[0] += 1);
+        match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
                 .map(SemanticIndex::estimated_memory)
@@ -13386,8 +13452,14 @@ impl AppContext {
                 .map(SemanticIndex::estimated_memory)
                 .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("entries", 0)),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
-        };
-        let trigram = match self.search_index.try_read() {
+        }
+    }
+
+    /// Walk every entry of the trigram index for its memory estimate.
+    fn walk_trigram_memory(&self) -> crate::memory::MemoryEstimate {
+        #[cfg(test)]
+        MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[1] += 1);
+        match self.search_index.try_read() {
             Ok(index) => index
                 .as_ref()
                 .map(SearchIndex::estimated_memory)
@@ -13398,18 +13470,17 @@ impl AppContext {
                 .map(SearchIndex::estimated_memory)
                 .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("files", 0)),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
-        };
-        let symbols = match self.symbol_cache.try_read() {
+        }
+    }
+
+    /// Walk every entry of the symbol cache for its memory estimate.
+    fn walk_symbol_memory(&self) -> crate::memory::MemoryEstimate {
+        #[cfg(test)]
+        MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[2] += 1);
+        match self.symbol_cache.try_read() {
             Ok(cache) => cache.estimated_memory(),
             Err(TryLockError::Poisoned(error)) => error.into_inner().estimated_memory(),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
-        };
-        WalkedMemory {
-            shape,
-            measured_at,
-            semantic,
-            trigram,
-            symbols,
         }
     }
 
@@ -13626,37 +13697,67 @@ impl AppContext {
     ///
     /// The index walks inside an estimate visit every entry of the root's
     /// resident indexes, and the rollup asks for every root every few seconds.
-    /// So the last walk is reused while the indexes' shape counters stay the
-    /// same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]. The cheap
-    /// subsystem estimates are always taken fresh. The rollup's
-    /// `measured_age_ms` says how old the walked figures are.
+    /// So each index's last walk is reused while that index's shape counters
+    /// stay the same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]; a change
+    /// to one index re-walks only that index. The cheap subsystem estimates
+    /// are always taken fresh. The rollup's `measured_age_ms` is the age of
+    /// the oldest walk in use. A missing index has nothing to walk, so it is
+    /// never reused and never makes the figures look older.
     pub(crate) fn memory_root_snapshot_and_rollup(
         &self,
     ) -> (
         crate::memory::RootMemorySnapshot,
         crate::memory::RootMemoryRollup,
     ) {
-        let shape = self.memory_shape();
-        let cached = self.health_memory_walk.lock().clone();
-        let walked = match cached {
-            Some(cached)
-                if shape.is_some()
-                    && cached.shape == shape
-                    && cached.measured_at.elapsed() < HEALTH_MEMORY_REUSE_INTERVAL =>
-            {
-                cached
-            }
-            _ => {
-                let walked = self.walk_index_memory(shape);
-                // A walk that found an index locked is never reused, so the
-                // next rollup tries again rather than serving `busy` for 30 s.
-                let reusable = shape.is_some()
-                    && [&walked.semantic, &walked.trigram, &walked.symbols]
-                        .iter()
-                        .all(|estimate| estimate.status != "busy");
-                *self.health_memory_walk.lock() = reusable.then(|| walked.clone());
-                walked
-            }
+        let semantic_shape = self.semantic_memory_shape();
+        let trigram_shape = self.trigram_memory_shape();
+        let symbol_shape = self.symbol_memory_shape();
+        let now = Instant::now();
+        let mut walks = self.health_memory_walk.lock();
+        let mut walked_any = false;
+        let mut oldest = now;
+        let semantic = if semantic_shape == Some(None) {
+            walks.semantic = None;
+            crate::memory::MemoryEstimate::estimated(0).count("entries", 0)
+        } else {
+            let (estimate, measured_at, walked) =
+                reuse_or_walk_index_memory(&mut walks.semantic, semantic_shape, || {
+                    self.walk_semantic_memory()
+                });
+            walked_any |= walked;
+            oldest = oldest.min(measured_at);
+            estimate
+        };
+        let trigram = if trigram_shape == Some(None) {
+            walks.trigram = None;
+            crate::memory::MemoryEstimate::estimated(0).count("files", 0)
+        } else {
+            let (estimate, measured_at, walked) =
+                reuse_or_walk_index_memory(&mut walks.trigram, trigram_shape, || {
+                    self.walk_trigram_memory()
+                });
+            walked_any |= walked;
+            oldest = oldest.min(measured_at);
+            estimate
+        };
+        let (symbols, measured_at, walked) =
+            reuse_or_walk_index_memory(&mut walks.symbols, symbol_shape, || {
+                self.walk_symbol_memory()
+            });
+        walked_any |= walked;
+        oldest = oldest.min(measured_at);
+        drop(walks);
+        #[cfg(test)]
+        if walked_any {
+            MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
+        }
+        #[cfg(not(test))]
+        let _ = walked_any;
+        let walked = WalkedMemory {
+            measured_at: oldest,
+            semantic,
+            trigram,
+            symbols,
         };
         let measured_age_ms =
             u64::try_from(walked.measured_at.elapsed().as_millis()).unwrap_or(u64::MAX);
