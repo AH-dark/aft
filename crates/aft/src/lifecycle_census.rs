@@ -257,7 +257,8 @@ thread_local! {
     static THREAD_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+// Only the census test reads it, and that test runs where threads can be named.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn thread_classifications_for_test() -> usize {
     THREAD_CLASSIFICATIONS.with(std::cell::Cell::get)
 }
