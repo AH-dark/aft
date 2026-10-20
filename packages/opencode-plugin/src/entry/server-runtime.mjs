@@ -49,9 +49,9 @@ const defaults = {
   registerWorkflowHints: registerV2WorkflowHints,
   // `getConfig` returns the Location's current config, which a live reload
   // replaces; the wake consumer reads it when a completion arrives.
-  toolConsumers: (context, config, getConfig = () => config) => ({
+  toolConsumers: (context, config, getConfig = () => config, getBridge) => ({
     ...hoistedV2ToolConsumers(context),
-    ...createV2RuntimeConsumer(context, getConfig),
+    ...createV2RuntimeConsumer(context, getConfig, getBridge),
   }),
   acquireBridge,
   releaseBridge,
@@ -90,7 +90,12 @@ async function bootLocation(context, location, dependencies) {
     dependencies,
   );
   let liveConfig = config;
-  const consumers = dependencies.toolConsumers(context, config, () => liveConfig);
+  const consumers = dependencies.toolConsumers(
+    context,
+    config,
+    () => liveConfig,
+    () => pool.getBridge(canonicalDirectory),
+  );
   // Only a rejected configuration keeps AFT out of a project; there is no
   // config switch that turns it off.
   const isProjectEnabled = createProjectAcceptance(directory, dependencies);
@@ -114,6 +119,7 @@ async function bootLocation(context, location, dependencies) {
     },
     configOverrides: environment.configOverrides,
     subcConnectionFile: config.subc?.connection_file,
+    ...consumers.transportOptions,
     ...subcWakes?.handlers,
   });
   environment.attach(pool);

@@ -2155,7 +2155,7 @@ function capDeliveredAwaitingAck(state: SessionBgState, sessionID?: string): voi
   }
 }
 
-function isPatternMatchEntry(value: unknown): value is PatternMatchEntry {
+export function isPatternMatchEntry(value: unknown): value is PatternMatchEntry {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const match = value as Record<string, unknown>;
   return (

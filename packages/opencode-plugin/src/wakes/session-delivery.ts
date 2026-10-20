@@ -48,6 +48,12 @@ export interface CompletionWake {
   readonly notificationID?: string;
 }
 
+export interface PatternMatchWake extends CompletionWake {
+  readonly watchID: string;
+  readonly matchOffset: number;
+  readonly reason?: string;
+}
+
 export interface StatusOnlyUpdate {
   readonly sessionID: string;
   readonly text: string;
@@ -57,40 +63,71 @@ export interface StatusOnlyUpdate {
 
 /**
  * Admit V2 session updates as synthetic input so machine-written notices are
- * not rendered as user turns. Completions wake execution; status does not.
+ * not rendered as user turns. Completions and pattern matches wake execution;
+ * status does not.
  */
 export class V2SessionDelivery {
-  private readonly admittedCompletions = new Set<string>();
+  private readonly admittedWakes = new Set<string>();
   private disposed = false;
 
   constructor(private readonly session: V2SessionAdmission) {}
 
   completion(input: CompletionWake): Effect.Effect<boolean, unknown> {
+    return this.admitWake(
+      input,
+      [...new Set(input.taskIDs)].map(
+        (taskID) => `${input.sessionID}\0${taskID}\0${input.notificationID ?? "completion"}`,
+      ),
+      "Background bash completed",
+    );
+  }
+
+  patternMatch(input: PatternMatchWake): Effect.Effect<boolean, unknown> {
+    // A sticky watch can match repeatedly before the task completes. Neither
+    // its later offsets nor the task's completion may share a delivery key.
+    return this.admitWake(
+      input,
+      [
+        JSON.stringify([
+          "pattern",
+          input.sessionID,
+          input.taskIDs,
+          input.watchID,
+          input.matchOffset,
+          input.reason,
+        ]),
+      ],
+      "Background bash pattern matched",
+    );
+  }
+
+  private admitWake(
+    input: CompletionWake,
+    keys: string[],
+    description: string,
+  ): Effect.Effect<boolean, unknown> {
     return Effect.suspend(() => {
       if (this.disposed) return Effect.succeed(false);
-      const keys = [...new Set(input.taskIDs)].map(
-        (taskID) => `${input.sessionID}\0${taskID}\0${input.notificationID ?? "completion"}`,
-      );
-      if (keys.length === 0 || keys.every((key) => this.admittedCompletions.has(key))) {
+      if (keys.length === 0 || keys.every((key) => this.admittedWakes.has(key))) {
         return Effect.succeed(false);
       }
-      const reserved = keys.filter((key) => !this.admittedCompletions.has(key));
-      for (const key of reserved) this.admittedCompletions.add(key);
+      const reserved = keys.filter((key) => !this.admittedWakes.has(key));
+      for (const key of reserved) this.admittedWakes.add(key);
 
       return Effect.suspend(() =>
         this.session.get({ sessionID: input.sessionID }).pipe(
           Effect.flatMap((session) => {
-            // A committed revert deletes synthetic input admitted after its
-            // boundary. Keep the completion unacknowledged and retryable instead.
+            // A staged revert can later delete synthetic input after its
+            // boundary. Keep the wake unacknowledged and retryable instead.
             if (session.revert) {
               return Effect.fail(
-                new Error("Background bash completion deferred: session has a staged revert"),
+                new Error("Background bash wake deferred: session has a staged revert"),
               );
             }
             return this.session.synthetic({
               sessionID: input.sessionID,
               text: input.text,
-              description: "Background bash completed",
+              description,
               delivery: "steer",
               metadata: {
                 ...input.metadata,
@@ -106,8 +143,7 @@ export class V2SessionDelivery {
           Effect.sync(() => {
             // Reserve while admission is in flight, but a failed or interrupted
             // admission must not suppress the bridge's next delivery attempt.
-            if (Exit.isFailure(exit))
-              for (const key of reserved) this.admittedCompletions.delete(key);
+            if (Exit.isFailure(exit)) for (const key of reserved) this.admittedWakes.delete(key);
           }),
         ),
         Effect.map(() => true),
@@ -133,6 +169,6 @@ export class V2SessionDelivery {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.admittedCompletions.clear();
+    this.admittedWakes.clear();
   }
 }

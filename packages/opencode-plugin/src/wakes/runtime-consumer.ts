@@ -19,6 +19,7 @@ import {
   handleSubcBgEventsNudge,
   holdBgCompletion,
   markBgCompletionDelivered,
+  isPatternMatchEntry,
   type PatternMatchEntry,
 } from "../bg-notifications.js";
 import type { AftConfig } from "../config.js";
@@ -60,6 +61,9 @@ interface WakeRoute {
   patternMatch?(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<boolean>;
   /** Record a status-only long-running reminder in its session. */
   longRunning(reminder: BashLongRunningPayload): Promise<void>;
+  /** Optional for route registrations created before pattern-match delivery was added. */
+  standalonePatternMatch?(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<void>;
+  drainPatterns?(sessionID: string): Promise<void>;
 }
 
 /** A completion that arrived while no Location had its session registered. */
@@ -225,15 +229,35 @@ export function __resetV2WakeRoutesForTests(): void {
   state.warnedUnrouted.clear();
 }
 
-const sharedBridgeOptions: Pick<BridgeOptions, "onBashCompletion" | "onBashLongRunning"> = {
+async function routePatternMatch(
+  match: PatternMatchEntry,
+  bridge: AftProjectTransport,
+): Promise<void> {
+  // A bridge can push frames for sessions owned by another host. Never admit
+  // or acknowledge those frames on behalf of a registered local session.
+  await wakeRouteState().routes.get(match.session_id)?.standalonePatternMatch?.(match, bridge);
+}
+
+const sharedBridgeOptions: Pick<
+  BridgeOptions,
+  "onBashCompletion" | "onBashLongRunning" | "onBashPatternMatch"
+> = {
   onBashCompletion: async (completion, bridge) => {
     await routeCompletion(completion, bridge);
   },
   onBashLongRunning: routeLongRunning,
+  onBashPatternMatch: routePatternMatch,
+};
+
+const sharedTransportOptions: Pick<AftTransportFactoryOptions, "onBgEventsNudge"> = {
+  onBgEventsNudge: (_root, sessionID) => {
+    void wakeRouteState().routes.get(sessionID)?.drainPatterns?.(sessionID);
+  },
 };
 
 export interface V2RuntimeConsumer extends V2ToolConsumers {
   readonly bridgeOptions: typeof sharedBridgeOptions;
+  readonly transportOptions: typeof sharedTransportOptions;
   dispose(): void;
   subcWakes(
     getPool: () => AftTransportPool,
@@ -295,12 +319,106 @@ function detachWaitsForCompletion(
 export function createV2RuntimeConsumer(
   context: V2WakeHostContext,
   getConfig: () => AftConfig = () => ({}),
+  getBridge?: () => AftProjectTransport,
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
   const sessions = new Set<string>();
-  let disposed = false;
   let subcPool: (() => AftTransportPool) | undefined;
+  const pendingMatches = new Map<
+    string,
+    {
+      match: PatternMatchEntry;
+      bridge: AftProjectTransport;
+      admitted: boolean;
+    }
+  >();
+  const matching = new Map<string, Promise<void>>();
+  const draining = new Map<string, Promise<void>>();
+  let disposed = false;
   const route: WakeRoute = {
+    standalonePatternMatch: async (match, bridge) => {
+      const key = JSON.stringify([
+        match.session_id,
+        match.task_id,
+        match.watch_id,
+        match.match_offset,
+        match.reason,
+      ]);
+      const active = matching.get(key);
+      if (active) return active;
+      const pending = pendingMatches.get(key) ?? { match, bridge, admitted: false };
+      pendingMatches.set(key, pending);
+      const deliver = async () => {
+        if (disposed) return;
+        if (await resolveIsSubagent(context, match.session_id)) {
+          await awaitV2ExecutionSettlement(context, match.session_id);
+          if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return;
+        }
+        if (!pending.admitted) {
+          const text = formatPatternMatchReminder([match]);
+          const admitted = await Effect.runPromise(
+            delivery.patternMatch({
+              sessionID: match.session_id,
+              taskIDs: [match.task_id],
+              watchID: match.watch_id,
+              matchOffset: match.match_offset,
+              reason: match.reason,
+              text,
+              metadata: { source: "aft", kind: "bash_pattern_match", watch_id: match.watch_id },
+            }),
+          );
+          if (!admitted) {
+            pendingMatches.delete(key);
+            return;
+          }
+          pending.admitted = true;
+          detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
+        }
+        // The daemon deletes an acknowledged once-watch, but only clears a
+        // sticky watch's pending match so it can keep scanning later output.
+        const ack = await pending.bridge.send("bash_ack_completions", {
+          session_id: match.session_id,
+          task_ids: [match.task_id],
+        });
+        if (ack.success === false)
+          throw new Error(String(ack.message ?? "pattern acknowledgement failed"));
+        pendingMatches.delete(key);
+      };
+      const attempt = deliver()
+        .catch((error) => {
+          warn(
+            `[bash_pattern_match] delivery of watch ${match.watch_id} to session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        })
+        .finally(() => matching.delete(key));
+      matching.set(key, attempt);
+      return attempt;
+    },
+    drainPatterns: async (sessionID) => {
+      if (!getBridge || disposed) return;
+      const active = draining.get(sessionID);
+      if (active) return active;
+      const drain = async () => {
+        const bridge = getBridge();
+        const response = await bridge.send("bash_drain_completions", { session_id: sessionID });
+        if (response.success === false || disposed) return;
+        if (!Array.isArray(response.pending_matches)) return;
+        for (const match of response.pending_matches.filter(isPatternMatchEntry)) {
+          // A drain is scoped to its requesting session, even if a malformed
+          // response includes a frame for another registered session.
+          if (match.session_id === sessionID) await routePatternMatch(match, bridge);
+        }
+      };
+      const attempt = drain()
+        .catch((error) => {
+          warn(
+            `[bash_pattern_match] drain for session ${sessionID} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        })
+        .finally(() => draining.delete(sessionID));
+      draining.set(sessionID, attempt);
+      return attempt;
+    },
     completion: async (completion, bridge, acknowledge = true) => {
       // The host deleted this session. Holding or delivering the completion
       // would recreate notification state nothing releases again, so drop it
@@ -421,10 +539,15 @@ export function createV2RuntimeConsumer(
     const { routes } = wakeRouteState();
     routes.set(sessionID, route);
     deliverUnrouted(sessionID, bridge);
+    for (const { match, bridge } of pendingMatches.values()) {
+      if (match.session_id === sessionID) void route.standalonePatternMatch?.(match, bridge);
+    }
+    void route.drainPatterns?.(sessionID);
   };
 
   return {
     bridgeOptions: sharedBridgeOptions,
+    transportOptions: sharedTransportOptions,
     registerSession,
     subcWakes: (getPool, directory) => {
       subcPool = getPool;
@@ -494,6 +617,7 @@ export function createV2RuntimeConsumer(
     },
     dispose: () => {
       disposed = true;
+      pendingMatches.clear();
       delivery.dispose();
       const { routes } = wakeRouteState();
       // Another Location may have registered the session since; leave its route.
