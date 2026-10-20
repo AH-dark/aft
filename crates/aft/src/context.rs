@@ -10697,7 +10697,7 @@ impl AppContext {
         }
         for wait in submission.resource_waits {
             crate::slog_info!(
-                "tier2 refresh waiting for the inspect cache writer lease: category={}, resource_retry_at_unix_ms={}",
+                "tier2 refresh waiting out a resource retry (inspect cache writer lease or locked call graph view): category={}, resource_retry_at_unix_ms={}",
                 wait.category,
                 wait.retry_at_ms
             );
@@ -16214,6 +16214,88 @@ mod callgraph_store_for_ops_tests {
                 .is_some(),
             "unused-export analysis should resolve after the database lock is released: {:#}",
             response.data
+        );
+    }
+
+    /// An automatic dead-code refresh that finds the published graph's
+    /// database locked has nothing else to wake it: the lock clearing is not a
+    /// view publication and not a source edit. It must keep a timed retry, so
+    /// on a quiet checkout dead code refreshes by itself once the lock clears.
+    #[test]
+    fn views_busy_dead_code_refresh_retries_after_lock_clears_without_edit() {
+        use crate::inspect::{InspectCategory, InspectSnapshot, JobScope, Tier2TriggerReason};
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.ctx.set_harness(crate::harness::Harness::Opencode);
+        fixture.publish();
+        let manager = fixture.ctx.inspect_manager();
+        let config = fixture.ctx.config();
+        let wait_idle = |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while manager.tier2_any_in_flight() {
+                assert!(Instant::now() < deadline, "{what} did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            manager.drain_completions();
+        };
+
+        let busy = fixture.hold_pinned_derived_busy();
+        fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+        assert!(fixture.ctx.request_tier2_refresh_pull());
+        let dispatched_at = Instant::now();
+        assert_eq!(
+            fixture
+                .ctx
+                .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+            Some(Tier2TriggerReason::Pull)
+        );
+        wait_idle("refresh against the locked view");
+        let retry_at = manager
+            .try_tier2_resource_retry_at(&config)
+            .flatten()
+            .expect("a refresh that found the view locked must keep a timed retry");
+        assert!(
+            retry_at
+                <= dispatched_at
+                    + crate::inspect::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF
+                    + Duration::from_secs(60),
+            "the retry must fall within the resource retry bound"
+        );
+        let detail = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
+        assert!(detail.contains("call graph view"), "{detail}");
+
+        drop(busy);
+        assert!(!fixture.ctx.tier2_pull_demand_pending());
+        manager.expire_tier2_resource_waits_for_test();
+        assert!(
+            fixture.ctx.tier2_refresh_dispatch_due(),
+            "a quiet checkout must come due for the retry without an edit"
+        );
+        assert_eq!(
+            fixture
+                .ctx
+                .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+            Some(Tier2TriggerReason::ResourceRetry)
+        );
+        wait_idle("retry after the lock cleared");
+        let outcome = manager.tier2_read_cached_readonly(
+            InspectSnapshot {
+                project_root: fixture.root.clone(),
+                inspect_dir: fixture.ctx.inspect_dir(),
+                config: config.clone(),
+                symbol_cache: fixture.ctx.symbol_cache(),
+                inspect_writer: true,
+                callgraph_writer: true,
+            },
+            InspectCategory::DeadCode,
+            JobScope::for_project(fixture.root.clone()),
+        );
+        let payload = outcome.payload().expect("dead-code result after the retry");
+        assert_eq!(payload["callgraph_available"], true, "{payload:#}");
+        assert!(payload["count"].as_u64().is_some(), "{payload:#}");
+        assert_eq!(
+            manager.try_tier2_resource_retry_at(&config),
+            Some(None),
+            "a successful retry must not leave another one armed"
         );
     }
 

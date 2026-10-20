@@ -464,10 +464,38 @@ impl BuilderStateEntry {
         ));
     }
 
+    /// Record a pass that found the published call graph view's database
+    /// locked. Nothing else would wake the category once the lock clears: the
+    /// lock clearing is neither a view publication nor a source edit, and the
+    /// pass already consumed any owed publication refresh. So it keeps a
+    /// resource retry with the same bound as a cache writer lease wait. The
+    /// lock says nothing about the inputs, so it is not a failure and does not
+    /// pause retries.
+    fn record_view_busy_wait(&mut self) {
+        self.state = None;
+        self.suspension = None;
+        self.last_failure = None;
+        self.identical_failures = 0;
+        self.retry_paused_until = None;
+        let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
+        self.resource_retry_at = Some((
+            Instant::now() + delay,
+            unix_millis_now().saturating_add(delay.as_millis() as u64),
+        ));
+    }
+
     fn detail_at(&self, now_ms: u64) -> String {
         if let Some((_, retry_at_ms)) = self.resource_retry_at {
+            // Only a cache writer lease wait sets its own state; a resource
+            // retry without it was armed by a locked view database.
+            let waiting_for = if self.state == Some(InspectBuilderState::WaitingForCacheWriterLease)
+            {
+                "the inspect cache writer lease"
+            } else {
+                "the locked checkout call graph view"
+            };
             return format!(
-                "waiting for the inspect cache writer lease; automatic resource retry at unix_ms={retry_at_ms}"
+                "waiting for {waiting_for}; automatic resource retry at unix_ms={retry_at_ms}"
             );
         }
         if let Some(suspension) = self.suspension.as_ref() {
@@ -577,12 +605,20 @@ fn run_tier2_pass_with_deadline<T>(
 enum BuilderAttemptTerminal {
     Succeeded,
     CacheWriterLeaseWait,
+    /// The published call graph view's database was locked.
+    ViewBusyWait,
     Failed(String),
     Inconclusive,
 }
 
 fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
     match outcome {
+        JobOutcome::Fresh { payload }
+            if payload["status"] == "pending"
+                && payload["code"] == CheckoutViewUnavailable::Busy.kind() =>
+        {
+            BuilderAttemptTerminal::ViewBusyWait
+        }
         JobOutcome::Fresh { payload } if payload["status"] == "pending" => {
             BuilderAttemptTerminal::Inconclusive
         }
@@ -1178,6 +1214,12 @@ impl InspectManager {
                     .entry(key.clone())
                     .or_insert_with(|| BuilderStateEntry::new(InspectBuilderState::Building))
                     .record_cache_writer_wait();
+            }
+            BuilderAttemptTerminal::ViewBusyWait => {
+                states
+                    .entry(key.clone())
+                    .or_insert_with(|| BuilderStateEntry::new(InspectBuilderState::Building))
+                    .record_view_busy_wait();
             }
             BuilderAttemptTerminal::Failed(terminal) => {
                 let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
@@ -2326,6 +2368,21 @@ impl InspectManager {
         }
         self.record_flight_start(&key);
         self.finish_tier2_flight(&key, outcome);
+    }
+
+    /// Bring every armed resource retry due now, standing in for its delay
+    /// elapsing, so a test need not sleep through the real backoff.
+    #[cfg(test)]
+    pub(crate) fn expire_tier2_resource_waits_for_test(&self) {
+        let mut states = self
+            .builder_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in states.values_mut() {
+            if entry.resource_retry_at.is_some() {
+                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
+            }
+        }
     }
 
     /// Release per-project inspect caches so their SQLite readers and writer
