@@ -947,9 +947,10 @@ pub(crate) struct RegistryInner {
         Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     /// Session owners of output files recovered from task records on disk.
-    /// Directory handles prevent cached permissions from following a replaced I/O directory.
+    /// Identity snapshots prevent cached permissions from following a replaced
+    /// I/O directory without keeping a descriptor open for each historical task.
     persisted_artifact_owners:
-        Mutex<HashMap<PathBuf, (String, Arc<super::persistence::PinnedDir>)>>,
+        Mutex<HashMap<PathBuf, (String, super::persistence::DirectorySnapshot)>>,
     task_read_records: Mutex<VecDeque<(PathBuf, Arc<task_access::TaskReadRecord>)>>,
     #[cfg(test)]
     task_access_work: task_access::WorkCounters,
@@ -1584,11 +1585,7 @@ impl BgTaskRegistry {
             })
     }
 
-    fn persisted_artifact_owner(
-        &self,
-        session_id: &str,
-        requested: &Path,
-    ) -> Option<Arc<super::persistence::PinnedDir>> {
+    fn persisted_artifact_owner(&self, session_id: &str, requested: &Path) -> Option<()> {
         let cached = self
             .inner
             .persisted_artifact_owners
@@ -1596,9 +1593,15 @@ impl BgTaskRegistry {
             .ok()?
             .get(requested)
             .cloned();
-        if let Some((owner, io)) = cached {
-            return (owner == session_id && io.open_file(requested.file_name()?, false).is_ok())
-                .then_some(io);
+        if let Some((owner, snapshot)) = cached {
+            if owner != session_id {
+                return None;
+            }
+            let io = snapshot.reopen().ok()?;
+            return io
+                .open_file(requested.file_name()?, false)
+                .is_ok()
+                .then_some(());
         }
         // A task record may not have been loaded since the daemon restarted.
         // Check the record named by the output path, not neighboring tasks or files.
@@ -1637,12 +1640,13 @@ impl BgTaskRegistry {
         {
             return None;
         }
-        let io = Arc::clone(&resolved.dirs.io);
-        self.inner.persisted_artifact_owners.lock().ok()?.insert(
-            requested.to_path_buf(),
-            (session_id.to_string(), Arc::clone(&io)),
-        );
-        Some(io)
+        let snapshot = resolved.dirs.io.snapshot().ok()?;
+        self.inner
+            .persisted_artifact_owners
+            .lock()
+            .ok()?
+            .insert(requested.to_path_buf(), (session_id.to_string(), snapshot));
+        Some(())
     }
 
     pub fn read_artifact_path(
@@ -12521,6 +12525,14 @@ fn release_terminal_io_handles(task: &BgTask) -> bool {
         _ => (None, false),
     };
     drop(handles);
+    // An adopted process's pidfd or kqueue is useful only until it becomes
+    // terminal. History must not keep the exit observer's descriptor alive.
+    #[cfg(unix)]
+    if runtime_released {
+        if let Ok(mut observer) = task.adopted_exit.lock() {
+            *observer = Default::default();
+        }
+    }
     runtime_released && task.terminal_reader_done.load(Ordering::SeqCst)
 }
 

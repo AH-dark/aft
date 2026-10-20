@@ -1,12 +1,13 @@
 use super::*;
-use crate::bash_background::persistence::{PinnedDir, ResolvedTask, TaskLayout};
+use crate::bash_background::persistence::{DirectorySnapshot, PinnedDir, TaskLayout};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
 const TASK_READ_RECORD_CAPACITY: usize = 64;
 
 pub(super) struct TaskReadRecord {
-    resolved: ResolvedTask,
+    paths: TaskPaths,
+    directories: [DirectorySnapshot; 3],
     metadata: PersistedTask,
 }
 
@@ -38,8 +39,108 @@ mod tests {
         paths
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn task_read_cache_is_bounded_and_eviction_releases_handles() {
+    fn finished_and_recovered_tasks_keep_descriptor_count_bounded() {
+        // Isolate /proc/self/fd from other tests opening files concurrently.
+        const CHILD: &str = "AFT_TASK_DESCRIPTOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "bash_background::registry::task_access::tests::finished_and_recovered_tasks_keep_descriptor_count_bounded",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "descriptor test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let count = || fs::read_dir("/proc/self/fd").unwrap().count();
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let baseline = count();
+        let mut peak = baseline;
+        for index in 0..520 {
+            let paths = record(&registry, storage.path(), index);
+            assert!(registry.is_session_owned_artifact_path("session", &paths.stdout));
+            peak = peak.max(count());
+            assert!(
+                count() <= baseline + 16,
+                "finished task {index}: descriptor count {} exceeds baseline {baseline} + 16",
+                count()
+            );
+        }
+        registry.replay_session(storage.path(), "session").unwrap();
+        assert_eq!(registry.inner.tasks.lock().unwrap().len(), 520);
+        for task in registry.task_arcs() {
+            // Model the process monitor acquired while an adopted task was
+            // running, then exercise the same terminal release as the watchdog.
+            assert!(!task
+                .adopted_exit
+                .lock()
+                .unwrap()
+                .marker_due(Some(std::process::id()), Instant::now()));
+            assert!(release_terminal_io_handles(&task));
+        }
+        let after_replay = count();
+        assert!(
+            after_replay <= baseline + 16,
+            "replay retained task descriptors: {after_replay}, baseline {baseline}"
+        );
+        println!(
+            "520 tasks: baseline={baseline}, finished_peak={peak}, after_replay={after_replay}"
+        );
+    }
+
+    #[test]
+    fn cached_artifact_ownership_rejects_foreign_sessions() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        assert!(registry.is_session_owned_artifact_path("session", &paths.stdout));
+        assert!(!registry.is_session_owned_artifact_path("foreign", &paths.stdout));
+    }
+
+    #[test]
+    fn cached_artifact_ownership_rejects_replaced_io_directory() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        assert!(registry.is_session_owned_artifact_path("session", &paths.stdout));
+        fs::rename(&paths.io_dir, paths.dir.join("old-io")).unwrap();
+        fs::create_dir(&paths.io_dir).unwrap();
+        fs::write(&paths.stdout, "replacement output").unwrap();
+        assert!(!registry.is_session_owned_artifact_path("session", &paths.stdout));
+    }
+
+    #[test]
+    fn cached_task_reads_reject_replaced_directories() {
+        for name in ["task", "control", "io"] {
+            let registry = BgTaskRegistry::default();
+            let storage = tempfile::tempdir().unwrap();
+            let paths = record(&registry, storage.path(), 0);
+            let path = match name {
+                "task" => &paths.dir,
+                "control" => &paths.control_dir,
+                _ => &paths.io_dir,
+            };
+            fs::rename(path, path.with_extension("old")).unwrap();
+            fs::create_dir(path).unwrap();
+            assert!(registry.task_read_record(&paths.dir).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn task_read_cache_is_bounded_and_eviction_releases_records() {
         let registry = BgTaskRegistry::default();
         let storage = tempfile::tempdir().unwrap();
         let first = record(&registry, storage.path(), 0);
@@ -48,19 +149,19 @@ mod tests {
             record(&registry, storage.path(), index);
             assert!(
                 registry.inner.task_read_records.lock().unwrap().len() <= 64,
-                "the pinned task-read cache must hold at most 64 records"
+                "the task-read cache must hold at most 64 records"
             );
         }
         assert!(
             first_record.upgrade().is_none(),
-            "eviction must close handles"
+            "eviction must release the cached record"
         );
         assert!(registry.is_readable_task_path("session", &first.stdout));
     }
 
     #[cfg(unix)]
     #[test]
-    fn task_read_cache_identity_failure_releases_handles() {
+    fn task_read_cache_identity_failure_releases_records() {
         let registry = BgTaskRegistry::default();
         let storage = tempfile::tempdir().unwrap();
         let paths = record(&registry, storage.path(), 0);
@@ -69,13 +170,13 @@ mod tests {
         assert!(registry.task_read_record(&paths.dir).is_none());
         assert!(
             cached.upgrade().is_none(),
-            "a stale record must not retain handles"
+            "a stale record must leave the cache"
         );
         assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn task_read_cache_cleanup_releases_deleted_task_handles() {
+    fn task_read_cache_cleanup_releases_deleted_task_records() {
         let registry = BgTaskRegistry::default();
         let storage = tempfile::tempdir().unwrap();
         let paths = record(&registry, storage.path(), 0);
@@ -88,13 +189,13 @@ mod tests {
         );
         assert!(
             cached.upgrade().is_none(),
-            "cleanup must close cached handles"
+            "cleanup must release the cached record"
         );
         assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn task_read_cache_retention_releases_deleted_task_handles() {
+    fn task_read_cache_retention_releases_deleted_task_records() {
         let registry = BgTaskRegistry::default();
         let storage = tempfile::tempdir().unwrap();
         let paths = record(&registry, storage.path(), 0);
@@ -108,7 +209,7 @@ mod tests {
         );
         assert!(
             cached.upgrade().is_none(),
-            "retention must close cached handles"
+            "retention must release the cached record"
         );
         assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
     }
@@ -223,7 +324,7 @@ impl BgTaskRegistry {
             });
         }
         let record = self.task_read_record(task_directory(path)?)?;
-        let paths = &record.resolved.paths;
+        let paths = &record.paths;
         if ![&paths.dir, &paths.control_dir, &paths.io_dir]
             .into_iter()
             .any(|directory| path == directory)
@@ -280,16 +381,11 @@ impl BgTaskRegistry {
             let mut records = self.inner.task_read_records.lock().ok()?;
             if let Some(index) = records.iter().position(|(path, _)| path == root) {
                 // Take the record out first so a failed identity check also
-                // releases the cache's directory handles.
+                // discards the stale permission record.
                 let (path, record) = records.remove(index)?;
-                record.resolved.dirs.task.ensure_current_identity().ok()?;
-                record
-                    .resolved
-                    .dirs
-                    .control
-                    .ensure_current_identity()
-                    .ok()?;
-                record.resolved.dirs.io.ensure_current_identity().ok()?;
+                for directory in &record.directories {
+                    directory.reopen().ok()?;
+                }
                 records.push_back((path, Arc::clone(&record)));
                 return Some(record);
             }
@@ -309,13 +405,21 @@ impl BgTaskRegistry {
         {
             return None;
         }
-        let record = Arc::new(TaskReadRecord { resolved, metadata });
+        let record = Arc::new(TaskReadRecord {
+            paths: resolved.paths,
+            directories: [
+                resolved.dirs.task.snapshot().ok()?,
+                resolved.dirs.control.snapshot().ok()?,
+                resolved.dirs.io.snapshot().ok()?,
+            ],
+            metadata,
+        });
         let mut records = self.inner.task_read_records.lock().ok()?;
         if let Some((_, existing)) = records.iter().find(|(path, _)| path == root) {
             return Some(Arc::clone(existing));
         }
-        // Keep only a small working set: each record owns three pinned
-        // directories, so retaining historical records would exhaust handles.
+        // Keep only a small working set of permission metadata. Directory
+        // snapshots carry no handles and are revalidated on each cache hit.
         if records.len() >= TASK_READ_RECORD_CAPACITY {
             records.pop_front();
         }
@@ -448,7 +552,7 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
-    /// The read-only exception is pinned and cached per bundle, never per file.
+    /// The read-only exception is identity-checked per bundle, never per file.
     /// Bash's separate output-file exception remains exact-file-only: permission
     /// to inspect a task folder must not let a shell command enter that folder.
     pub(crate) fn is_readable_task_path(&self, session: &str, path: &Path) -> bool {
@@ -461,8 +565,8 @@ impl BgTaskRegistry {
         let Some(record) = self.task_read_record(root) else {
             return false;
         };
-        let own_io = record.metadata.session_id == session
-            && path.starts_with(&record.resolved.paths.io_dir);
+        let own_io =
+            record.metadata.session_id == session && path.starts_with(&record.paths.io_dir);
         if !own_io && !self.head_reads_record(&record) {
             return false;
         }

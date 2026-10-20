@@ -223,7 +223,66 @@ pub struct PinnedDir {
     path: PathBuf,
 }
 
+/// A directory's identity without an open handle. Historical read permissions
+/// reopen the directory and compare identities instead of pinning it forever.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectorySnapshot {
+    path: PathBuf,
+    identity: DirectoryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index: (u32, u32),
+}
+
+impl DirectorySnapshot {
+    pub(crate) fn reopen(&self) -> io::Result<PinnedDir> {
+        let current = PinnedDir::open(&self.path)?;
+        if current.identity()? != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "registered directory path identity changed",
+            ));
+        }
+        Ok(current)
+    }
+}
+
 impl PinnedDir {
+    fn identity(&self) -> io::Result<DirectoryIdentity> {
+        #[cfg(unix)]
+        {
+            let metadata = self.file.metadata()?;
+            Ok(DirectoryIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let info = windows_file_information(&self.file)?;
+            Ok(DirectoryIdentity {
+                volume: info.volume_serial_number,
+                index: (info.file_index_high, info.file_index_low),
+            })
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> io::Result<DirectorySnapshot> {
+        Ok(DirectorySnapshot {
+            path: self.path.clone(),
+            identity: self.identity()?,
+        })
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         #[cfg(test)]
         work_counts::record_open();
@@ -467,6 +526,7 @@ impl PinnedDir {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) fn ensure_current_identity(&self) -> io::Result<()> {
         let current = Self::open(&self.path)?;
         if !self.same_identity(&current)? {
