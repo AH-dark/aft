@@ -1222,7 +1222,36 @@ async fn worker_jail_account_home_anchor_survives_replaced_or_missing_home() {
         return;
     }
     let mut jail = Jail::start().await;
-    let reply = jail.bash("env -i PATH=\"$PATH\" gh version; echo NO_HOME_EXIT=$?; env -i HOME=/nonexistent PATH=\"$PATH\" gh version; echo WRONG_HOME_EXIT=$?").await;
+    let upstream = jail.worktree.join("upstream-gh");
+    std::fs::create_dir(&upstream).unwrap();
+    executable(
+        &upstream.join("gh"),
+        "#!/bin/sh\nprintf 'NATIVE_GH_DISPATCHED\\n'\n",
+    );
+    // Use a local upstream so losing the fence cannot enter an operator's gh
+    // wrapper or start network/authentication work. Kill the whole process group
+    // on timeout so descendants cannot keep the tool's output pipes open.
+    let script = r#"import os, signal, shutil, subprocess, sys
+shim = shutil.which('gh')
+assert shim, 'managed gh shim missing'
+for label, extra in [('NO_HOME', {}), ('WRONG_HOME', {'HOME': '/nonexistent'})]:
+    child = subprocess.Popen([shim, 'version'], env={'PATH': sys.argv[1], **extra},
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        output, _ = child.communicate(timeout=5)
+        code = child.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        output, _ = child.communicate(timeout=2)
+        code = 124
+    print(output.decode(errors='replace'), end='')
+    print(f'{label}_EXIT={code}', flush=True)
+"#;
+    let reply = jail.tool("bash", json!({
+        "command": format!("python3 -B -c {} {}", quote(Path::new(script)), quote(&upstream)),
+        "timeout": 20_000,
+        "wait": true,
+    })).await;
     assert!(reply.contains("NO_HOME_EXIT=86"), "{reply}");
     assert!(reply.contains("WRONG_HOME_EXIT=86"), "{reply}");
     assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
