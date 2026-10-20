@@ -1011,6 +1011,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     }
 
     let mut pending = Vec::new();
+    let mut replay_parked = BTreeSet::new();
     let installed =
         ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
             let installed = if let Some(store) = reopened {
@@ -1033,14 +1034,16 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                 // This take and the refresh worker's post-defer re-check form a
                 // check-then-act handoff: one site sees parked paths with a
                 // ready current store, so neither site needs to poll alone.
-                pending = ctx
-                    .take_pending_callgraph_store_paths()
+                // The paths stay parked until the worker has them (see below).
+                let (paths, parked) = ctx.pending_callgraph_store_paths_for_replay();
+                pending = paths
                     .into_iter()
                     .filter(|path| {
                         invalidates_workspace_crate_prefix_cache(path)
                             || !watcher_path_is_generated_for_callgraph(ctx, path)
                     })
                     .collect();
+                replay_parked = parked;
                 true
             } else {
                 false
@@ -1066,9 +1069,10 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     };
 
     if installed {
-        if !pending.is_empty() {
-            let _ = ctx.enqueue_callgraph_store_refresh(pending);
-        }
+        // Enqueue before clearing the sink, so the paths are never in neither
+        // place while an answer reads both.
+        let enqueued = pending.is_empty() || ctx.enqueue_callgraph_store_refresh(pending.clone());
+        ctx.settle_replayed_callgraph_store_paths(&replay_parked, &pending, enqueued);
         let _ = ctx.request_tier2_refresh_pull();
     }
     if terminal {

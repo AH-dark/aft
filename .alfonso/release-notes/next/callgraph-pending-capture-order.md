@@ -1,0 +1,1 @@
+Call-graph answers no longer report themselves complete when a file change moves between the watcher's flush window, the watcher drain and the call-graph refresh queue while the answer is being prepared.

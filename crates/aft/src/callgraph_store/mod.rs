@@ -2150,26 +2150,35 @@ impl RefreshBatch {
         // lets the batch finish that missed replay, but only once the lease no
         // longer has a live owner.
         for sink in &self.pending_sinks {
+            // Leave the paths parked until the worker queue holds them again:
+            // an answer reads the queue and then the sink, and removing them
+            // first would leave a moment in which neither holds them.
             let paths = {
-                let mut pending = sink.lock();
+                let pending = sink.lock();
                 self.paths
                     .iter()
-                    .filter(|path| pending.remove(*path))
+                    .filter(|path| pending.contains(*path))
                     .cloned()
                     .collect::<Vec<_>>()
             };
             if paths.is_empty() {
                 continue;
             }
-            let _ = enqueue_callgraph_store_refresh_inner(
+            let enqueued = enqueue_callgraph_store_refresh_inner(
                 self.root.callgraph_dir.clone(),
                 self.root.project_root.clone(),
-                paths,
+                paths.clone(),
                 Arc::clone(sink),
                 self.refresh_states.clone(),
                 self.ticket.clone(),
                 Some(Arc::new(self.keepalive.clone())),
             );
+            if enqueued {
+                let mut pending = sink.lock();
+                for path in &paths {
+                    pending.remove(path);
+                }
+            }
         }
     }
 

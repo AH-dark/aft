@@ -1750,7 +1750,7 @@ pub(crate) struct WatcherDrainSliceState {
 }
 
 /// File changes the call graph has not taken yet, as root-relative paths with
-/// `/` separators. See [`AppContext::callgraph_unapplied_changes`].
+/// `/` separators. See [`AppContext::pending_changes_for_query`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallgraphUnappliedChanges {
     /// Files whose changes the root's call-graph store has not applied.
@@ -1768,11 +1768,85 @@ impl CallgraphUnappliedChanges {
     }
 }
 
-pub(crate) struct WatcherDrainGuard<'a>(&'a AtomicUsize);
+/// File changes an answer may not reflect, captured just before the answer is
+/// computed: `watcher` says whether unsorted watcher events exist, and
+/// `callgraph` names files the call graph has not applied. See
+/// [`AppContext::pending_changes_for_query`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryPendingChanges {
+    /// The dispatch channel or the watcher drain still holds file changes.
+    pub watcher: bool,
+    /// Files the call graph has not taken yet; empty unless requested.
+    pub callgraph: CallgraphUnappliedChanges,
+}
+
+/// Points between two stage reads of [`AppContext::pending_changes_for_query`]
+/// where a test can move a file one stage downstream.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingCaptureBoundary {
+    /// After the flush-window set, before the dispatch channel and drain.
+    AfterFlushWindow,
+    /// After the first pending-sink read, before the refresh worker's queue.
+    BeforeWorkerQueue,
+}
+
+#[cfg(test)]
+type PendingCaptureHook = Box<dyn FnMut(PendingCaptureBoundary)>;
+
+#[cfg(test)]
+thread_local! {
+    static PENDING_CAPTURE_HOOK: std::cell::RefCell<Option<PendingCaptureHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` at each capture boundary reached on this thread until the
+/// returned guard is dropped.
+#[cfg(test)]
+pub(crate) fn install_pending_capture_hook_for_test(
+    hook: impl FnMut(PendingCaptureBoundary) + 'static,
+) -> PendingCaptureHookGuard {
+    PENDING_CAPTURE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    PendingCaptureHookGuard
+}
+
+#[cfg(test)]
+pub(crate) struct PendingCaptureHookGuard;
+
+#[cfg(test)]
+impl Drop for PendingCaptureHookGuard {
+    fn drop(&mut self) {
+        PENDING_CAPTURE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn pending_capture_boundary_for_test(boundary: PendingCaptureBoundary) {
+    let hook = PENDING_CAPTURE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(boundary);
+        PENDING_CAPTURE_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// Counts a watcher drain while it runs. The second counter advances when a
+/// drain starts and again when it ends, so a pending-changes capture can tell
+/// that a drain moved work while the capture was reading (see
+/// [`AppContext::watcher_query_has_pending_changes`]).
+pub(crate) struct WatcherDrainGuard<'a> {
+    in_flight: &'a AtomicUsize,
+    activity: &'a AtomicU64,
+}
 
 impl Drop for WatcherDrainGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.activity.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -3704,6 +3778,8 @@ pub struct AppContext {
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
     watcher_drains_in_flight: AtomicUsize,
+    /// Advances when a watcher drain starts and when it ends.
+    watcher_drain_activity: AtomicU64,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
@@ -4460,6 +4536,7 @@ impl AppContext {
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
             watcher_drains_in_flight: AtomicUsize::new(0),
+            watcher_drain_activity: AtomicU64::new(0),
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
@@ -5665,32 +5742,73 @@ impl AppContext {
 
     /// A drain takes its continuation out of the slot while applying it, so
     /// an empty slot alone does not prove that indexed answers are current.
+    ///
+    /// The reads run while a drain on another thread may move work from the
+    /// dispatch channel into its continuation and back into the slot. A drain
+    /// advances `watcher_drain_activity` when it starts and when it ends, so
+    /// reading it before and after the channel, slot and in-flight count
+    /// catches any drain that moved work between those reads.
     pub fn watcher_query_has_pending_changes(&self) -> bool {
-        self.watcher_drains_in_flight.load(Ordering::Acquire) > 0 || self.watcher_drain_has_work()
+        let activity = self.watcher_drain_activity.load(Ordering::Acquire);
+        self.watcher_drain_has_work()
+            || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
+            || self.watcher_drain_activity.load(Ordering::Acquire) != activity
     }
 
-    /// File changes the watcher has delivered that the call graph serving this
-    /// root's answers has not taken yet. Source files the watcher thread still
-    /// holds in its flush window count for both kinds of graph. The legacy
-    /// store also counts paths queued, running, or parked in its refresh
-    /// worker and paths deferred until a writable store is ready. A
-    /// per-checkout view counts paths waiting out the publication quiet window
-    /// and paths carried by a publication that has not installed its
-    /// generation. Events in the dispatch channel or in a drain that has not
-    /// sorted them yet are not listed here; `watcher_query_has_pending_changes`
-    /// covers them without naming files.
-    pub fn callgraph_unapplied_changes(&self) -> CallgraphUnappliedChanges {
+    /// What an answer computed now may be missing, captured before the answer
+    /// is computed.
+    ///
+    /// A changed file travels the watcher thread's flush window, then the
+    /// dispatch channel and the watcher drain, then (for the legacy store)
+    /// the refresh worker's queue and running batch, and is either committed
+    /// or parked in the pending sink. Other threads move it while this runs,
+    /// and each of them writes the next stage before clearing the one before.
+    /// Reading the stages in the direction a file travels therefore never
+    /// misses it: if it moves between two reads, the later read finds it
+    /// downstream. The sink is read before and after the worker queue because
+    /// files move both ways between them (a batch that cannot commit parks its
+    /// files in the sink; a ready store replays the sink into the worker).
+    ///
+    /// `callgraph` lists files by name: source files still in the flush
+    /// window count for both kinds of graph; the legacy store also counts
+    /// files queued, running or parked in its refresh worker and files
+    /// deferred until a writable store is ready; a per-checkout view counts
+    /// files waiting out the publication quiet window and files carried by a
+    /// publication that has not installed its generation. Files in the
+    /// dispatch channel or inside a running drain are not named; `watcher`
+    /// covers them.
+    pub fn pending_changes_for_query(&self, include_callgraph: bool) -> QueryPendingChanges {
+        let include_callgraph = include_callgraph && self.config().indexes.callgraph;
+        let unflushed = if include_callgraph {
+            self.watcher_counters().unflushed_paths()
+        } else {
+            BTreeSet::new()
+        };
+        #[cfg(test)]
+        pending_capture_boundary_for_test(PendingCaptureBoundary::AfterFlushWindow);
+        let watcher = self.watcher_query_has_pending_changes();
         let mut changes = CallgraphUnappliedChanges::default();
-        if !self.config().indexes.callgraph {
-            return changes;
+        if !include_callgraph {
+            return QueryPendingChanges {
+                watcher,
+                callgraph: changes,
+            };
         }
-        let roots: Vec<PathBuf> = [
-            self.callgraph_project_root(),
-            self.config().project_root.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let project_root = self.callgraph_project_root();
+        let mut store_paths: BTreeSet<PathBuf> = self.pending_callgraph_store_paths.lock().clone();
+        #[cfg(test)]
+        pending_capture_boundary_for_test(PendingCaptureBoundary::BeforeWorkerQueue);
+        if let Some(project_root) = project_root.as_deref() {
+            store_paths.extend(crate::callgraph_store::callgraph_refresh_unapplied_paths(
+                project_root,
+            ));
+        }
+        store_paths.extend(self.pending_callgraph_store_paths.lock().iter().cloned());
+
+        let roots: Vec<PathBuf> = [project_root, self.config().project_root.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
         let relative = |path: &Path| -> String {
             let shown = roots
                 .iter()
@@ -5698,24 +5816,7 @@ impl AppContext {
                 .unwrap_or(path);
             shown.to_string_lossy().replace('\\', "/")
         };
-        let mut store_paths: BTreeSet<PathBuf> = self
-            .pending_callgraph_store_paths
-            .lock()
-            .iter()
-            .cloned()
-            .collect();
-        if let Some(project_root) = self.callgraph_project_root() {
-            store_paths.extend(crate::callgraph_store::callgraph_refresh_unapplied_paths(
-                &project_root,
-            ));
-        }
-        // Files still in the watcher thread's flush window are not yet in the
-        // dispatch channel, so nothing else reports them as changing.
-        let unflushed = self
-            .watcher_counters()
-            .unflushed_paths()
-            .into_iter()
-            .map(|path| relative(&path));
+        let unflushed = unflushed.iter().map(|path| relative(path));
         if self.config().views.enabled {
             changes.view_paths.extend(unflushed);
         } else {
@@ -5727,7 +5828,9 @@ impl AppContext {
         if self.config().views.enabled {
             // A view answers for every file the call graph indexes; edits to
             // other files (an editor's temporary save file, for example) are
-            // published too but cannot change a call-graph answer.
+            // published too but cannot change a call-graph answer. The drain's
+            // publication paths are read before the publication jobs they are
+            // handed to.
             if let Some(state) = self.watcher_drain_slice.lock().as_ref() {
                 if state.view_publication_due.is_some() && state.view_publication_paths.is_empty() {
                     changes.whole_checkout = true;
@@ -5752,12 +5855,19 @@ impl AppContext {
                 );
             }
         }
-        changes
+        QueryPendingChanges {
+            watcher,
+            callgraph: changes,
+        }
     }
 
     pub(crate) fn watcher_drain_guard(&self) -> WatcherDrainGuard<'_> {
         self.watcher_drains_in_flight.fetch_add(1, Ordering::AcqRel);
-        WatcherDrainGuard(&self.watcher_drains_in_flight)
+        self.watcher_drain_activity.fetch_add(1, Ordering::AcqRel);
+        WatcherDrainGuard {
+            in_flight: &self.watcher_drains_in_flight,
+            activity: &self.watcher_drain_activity,
+        }
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
@@ -9322,7 +9432,7 @@ impl AppContext {
                     drop(store);
                     let reopened =
                         CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
-                    let mut pending = Vec::new();
+                    let mut replay = None;
                     let outcome = self.with_current_callgraph_store_rx(
                         receiver_generation,
                         receiver_epoch,
@@ -9341,7 +9451,7 @@ impl AppContext {
                                     // check-then-act handoff: the store is installed before the
                                     // take, so one site sees parked paths with a ready store and
                                     // neither site needs to poll alone.
-                                    pending = self.take_pending_callgraph_store_paths();
+                                    replay = Some(self.pending_callgraph_store_paths_for_replay());
                                     if let Some(force_token) = fulfilled_force_token {
                                         self.fulfill_callgraph_store_force_token(force_token);
                                     }
@@ -9361,8 +9471,12 @@ impl AppContext {
                             CallgraphStoreAccess::Building
                         };
                     };
-                    if !pending.is_empty() {
-                        let _ = self.enqueue_callgraph_store_refresh(pending);
+                    if let Some((paths, parked)) = replay {
+                        // Enqueue before clearing the sink, so the paths are
+                        // never in neither place while an answer reads both.
+                        let enqueued =
+                            paths.is_empty() || self.enqueue_callgraph_store_refresh(paths.clone());
+                        self.settle_replayed_callgraph_store_paths(&parked, &paths, enqueued);
                     }
                     if matches!(&outcome, CallgraphStoreAccess::Ready(_)) {
                         let _ = self.request_tier2_refresh_pull();
@@ -9886,6 +10000,48 @@ impl AppContext {
     /// the sink. Replaying those would index foreign files into the new root's
     /// store (refresh accepts absolute out-of-root paths).
     pub fn take_pending_callgraph_store_paths(&self) -> Vec<PathBuf> {
+        let parked = std::mem::take(&mut *self.pending_callgraph_store_paths.lock());
+        self.replayable_pending_callgraph_store_paths(parked)
+    }
+
+    /// The parked paths a ready store should replay, plus every path that was
+    /// parked, without removing any of them. They stay in the sink, where
+    /// answers report them as pending, until
+    /// [`Self::settle_replayed_callgraph_store_paths`] runs after the refresh
+    /// worker has taken them: removing them first would leave a moment in
+    /// which no stage an answer reads holds them.
+    pub(crate) fn pending_callgraph_store_paths_for_replay(
+        &self,
+    ) -> (Vec<PathBuf>, BTreeSet<PathBuf>) {
+        let parked = self.pending_callgraph_store_paths.lock().clone();
+        (
+            self.replayable_pending_callgraph_store_paths(parked.clone()),
+            parked,
+        )
+    }
+
+    /// Finish a replay started with
+    /// [`Self::pending_callgraph_store_paths_for_replay`]. When the refresh
+    /// worker accepted the replayed paths, every path that was parked leaves
+    /// the sink, as [`Self::take_pending_callgraph_store_paths`] would have
+    /// done. When it did not, the replayed paths stay parked for the next
+    /// ready store and only the dropped ones leave.
+    pub(crate) fn settle_replayed_callgraph_store_paths(
+        &self,
+        parked: &BTreeSet<PathBuf>,
+        replayed: &[PathBuf],
+        enqueued: bool,
+    ) {
+        let replayed: BTreeSet<&PathBuf> = replayed.iter().collect();
+        let mut pending = self.pending_callgraph_store_paths.lock();
+        for path in parked {
+            if enqueued || !replayed.contains(path) {
+                pending.remove(path);
+            }
+        }
+    }
+
+    fn replayable_pending_callgraph_store_paths(&self, parked: BTreeSet<PathBuf>) -> Vec<PathBuf> {
         let roots: Vec<PathBuf> = [
             self.canonical_cache_root_opt(),
             self.config().project_root.clone(),
@@ -9893,7 +10049,7 @@ impl AppContext {
         .into_iter()
         .flatten()
         .collect();
-        std::mem::take(&mut *self.pending_callgraph_store_paths.lock())
+        parked
             .into_iter()
             .filter(|path| {
                 let in_root = pending_path_in_roots(path, &roots);
@@ -14834,6 +14990,129 @@ mod callgraph_store_for_ops_tests {
             },
         ));
         ([project, storage], ctx)
+    }
+
+    /// Build a successful call-graph answer and attach its pending-changes
+    /// gaps the way dispatch does, with `hook` called at each stage boundary
+    /// of the pending-changes capture.
+    fn call_tree_answer_with_capture_hook(
+        ctx: &AppContext,
+        hook: impl FnMut(super::PendingCaptureBoundary) + 'static,
+    ) -> crate::protocol::Response {
+        let _hook = super::install_pending_capture_hook_for_test(hook);
+        let (watcher, callgraph) = crate::response_finalize::query_pending(ctx, "call_tree");
+        let mut response = crate::protocol::Response::success("cg", json!({"children": ["stale"]}));
+        crate::response_finalize::attach_watcher_query_gap(&mut response, watcher);
+        crate::response_finalize::attach_callgraph_pending_gaps(&mut response, callgraph.as_ref());
+        response
+    }
+
+    fn names_pending_file(response: &crate::protocol::Response, path: &str) -> bool {
+        response.data["complete"] == false
+            && response.data["gaps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|gap| gap["path"] == path)
+    }
+
+    /// The watcher thread hands a flush window's files to the dispatch
+    /// channel and only then clears the window. A flush that lands while an
+    /// answer is capturing what is pending must not hide the file from both
+    /// reads: the window is read first, so it still names the file.
+    #[test]
+    fn a_flush_between_two_capture_reads_still_names_the_file() {
+        let (_dirs, ctx) = cold_build_context();
+        let root = std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap())
+            .expect("canonical root");
+        ctx.set_canonical_cache_root(root.clone());
+        let source = root.join("src/lib.rs");
+        let (tx, rx) = crate::watcher_filter::watcher_dispatch_channel();
+        *ctx.watcher_rx().lock() = Some(rx);
+        let counters = ctx.watcher_counters();
+        counters.note_unflushed_paths([&source]);
+
+        let mut flushed = false;
+        let response = call_tree_answer_with_capture_hook(&ctx, move |boundary| {
+            if boundary != super::PendingCaptureBoundary::AfterFlushWindow || flushed {
+                return;
+            }
+            flushed = true;
+            tx.send(WatcherDispatchEvent::Paths(vec![source.clone()]))
+                .expect("dispatch the flushed file");
+            counters.clear_unflushed_paths();
+        });
+
+        assert!(
+            names_pending_file(&response, "src/lib.rs"),
+            "the answer must be marked incomplete and name the flushed file: {:#}",
+            response.data
+        );
+    }
+
+    /// A refresh batch that cannot commit parks its files in the pending sink
+    /// and only then leaves the worker. A batch that does so while an answer is
+    /// capturing what is pending must not hide the file from both reads: the
+    /// sink is read again after the worker queue.
+    #[test]
+    fn a_refresh_parked_between_two_capture_reads_still_names_the_file() {
+        let (_dirs, ctx) = cold_build_context();
+        let root = std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap())
+            .expect("canonical root");
+        let family = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &family, false);
+        ctx.set_canonical_cache_root(root.clone());
+        let worker = std::rc::Rc::new(
+            crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.clone()),
+        );
+        crate::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::ZERO,
+            false,
+        );
+        // The worker's writer open fails, so the batch can only park its file.
+        crate::callgraph_store::set_callgraph_refresh_worker_test_open_failure(root.clone(), true);
+        let (held, release) =
+            crate::callgraph_store::install_callgraph_refresh_worker_test_gate(root.clone());
+        let source = root.join("src/lib.rs");
+        assert!(ctx.enqueue_callgraph_store_refresh([source.clone()]));
+        held.recv_timeout(Duration::from_secs(12))
+            .expect("the refresh batch must be running");
+
+        let hook_ctx = Arc::clone(&ctx);
+        let hook_worker = std::rc::Rc::clone(&worker);
+        let mut release = Some(release);
+        let response = call_tree_answer_with_capture_hook(&ctx, move |boundary| {
+            if boundary != super::PendingCaptureBoundary::BeforeWorkerQueue {
+                return;
+            }
+            let Some(release) = release.take() else {
+                return;
+            };
+            // With heavy work no longer allowed the batch is not kept waiting
+            // for a writable store: it parks its file and leaves the worker.
+            hook_ctx.set_heavy_root_work_allowed(false);
+            release.send(()).expect("release the refresh batch");
+            assert!(
+                hook_worker.wait(Duration::from_secs(12)),
+                "refresh worker hung"
+            );
+        });
+
+        assert!(
+            ctx.pending_callgraph_store_paths.lock().contains(&source),
+            "the batch must have parked its file in the sink"
+        );
+        assert!(
+            crate::callgraph_store::callgraph_refresh_unapplied_paths(&root).is_empty(),
+            "the batch must have left the worker"
+        );
+        assert!(
+            names_pending_file(&response, "src/lib.rs"),
+            "the answer must be marked incomplete and name the parked file: {:#}",
+            response.data
+        );
+        crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
     }
 
     #[test]
