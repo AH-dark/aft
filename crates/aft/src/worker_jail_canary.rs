@@ -285,9 +285,9 @@ fn macos_probe(path: &Path) -> Probe {
             resolved.display()
         ),
     };
-    // A worker cannot delete or rename the canary inside the jail, so only a
-    // canary that was never created reports ENOENT. Inside the jail its
-    // metadata is denied (EPERM), which still means it exists.
+    // Worker profiles permit metadata for this path and its ancestors. A missing
+    // file is not evidence of confinement, even when a policy would deny data.
+    // An outer sandbox may still hide metadata; record that error separately.
     let metadata = std::fs::symlink_metadata(&resolved);
     let stat = match &metadata {
         Ok(metadata) if metadata.is_file() => "stat ok".to_string(),

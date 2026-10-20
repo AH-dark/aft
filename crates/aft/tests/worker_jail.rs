@@ -1257,6 +1257,35 @@ for label, extra in [('NO_HOME', {}), ('WRONG_HOME', {'HOME': '/nonexistent'})]:
     assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_canary_metadata_is_readable_but_data_and_writes_are_denied() {
+    let script = r#"import errno, os, pathlib, pwd
+homes = {os.environ['HOME'], pwd.getpwuid(os.geteuid()).pw_dir}
+for home in homes:
+    marker = pathlib.Path(home) / '.local/share/cortexkit/aft/gh-shim-worker-jail/canary'
+    marker.resolve(strict=True)
+    for path in [marker, *marker.parents]:
+        path.lstat()
+    for flags in [os.O_RDONLY, os.O_WRONLY]:
+        try:
+            fd = os.open(marker, flags)
+        except OSError as error:
+            assert error.errno in (errno.EACCES, errno.EPERM), error
+        else:
+            os.close(fd)
+            raise AssertionError(f'canary data access allowed: {marker}, flags={flags}')
+print('CANARY_METADATA_ONLY')
+"#;
+    for profile in ["strict", "relaxed"] {
+        let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
+        let reply = jail
+            .bash(&format!("python3 -B -c {}", quote(Path::new(script))))
+            .await;
+        assert!(reply.contains("CANARY_METADATA_ONLY"), "{profile}: {reply}");
+    }
+}
+
 /// The canary sits in the account's default storage, so a configured storage
 /// root elsewhere still leaves it denied and the fence in place.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
