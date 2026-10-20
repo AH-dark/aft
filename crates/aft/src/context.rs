@@ -13748,7 +13748,7 @@ impl AppContext {
                 format!(
                     "path not found: {}; did you mean {}?",
                     original.display(),
-                    suggestion.display()
+                    crate::inspect::job::normalize_path(&suggestion).display()
                 ),
             ));
         }

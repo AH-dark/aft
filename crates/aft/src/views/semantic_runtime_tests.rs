@@ -1935,6 +1935,9 @@ impl RecoveringBackend {
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
+                // Windows inherits the listener's nonblocking mode on accept.
+                // Use blocking I/O so HTTP reads wait for request bytes.
+                stream.set_nonblocking(false).unwrap();
                 let response_status = status.load(Ordering::SeqCst) as u16;
                 if response_status == 0 {
                     // Keep the port reserved between retries, but close requests
@@ -2008,8 +2011,17 @@ impl Drop for RecoveringBackend {
 #[test]
 fn offline_backend_port_cannot_be_stolen_before_start() {
     let mut backend = RecoveringBackend::offline();
-    let refusal = std::net::TcpStream::connect(backend.addr).unwrap_err();
-    assert_eq!(refusal.kind(), std::io::ErrorKind::ConnectionRefused);
+    let refusal = std::net::TcpStream::connect_timeout(&backend.addr, Duration::from_millis(100))
+        .unwrap_err();
+    // A bound, non-listening socket can refuse a connection or leave its SYN
+    // unanswered (as on Darwin). Neither outcome makes the backend available.
+    assert!(
+        matches!(
+            refusal.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "unexpected offline connection error: {refusal}"
+    );
     let stolen = std::net::TcpListener::bind(backend.addr);
     if let Ok(stolen) = stolen {
         let start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

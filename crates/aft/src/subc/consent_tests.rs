@@ -3641,6 +3641,33 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
     );
 }
 
+fn worker_filesystem_root(f: &Fixture) -> &Path {
+    f.head_root.ancestors().last().unwrap()
+}
+
+fn assert_worker_outside_read_denied(f: &Fixture, reply: &Value) {
+    #[cfg(not(windows))]
+    {
+        assert_eq!(code(reply), "access_pending", "{reply}");
+        assert_eq!(f.fake.calls("consent.request").len(), 1);
+    }
+    #[cfg(windows)]
+    {
+        // The consent wire contract accepts slash-rooted paths, not drive paths.
+        // Native Windows requests must fail closed before any ask is placed.
+        assert_eq!(code(reply), "access_not_placed", "{reply}");
+        assert_eq!(
+            reply["structuredContent"]["reason"],
+            "consent_path_unrepresentable"
+        );
+        for method in ["consent.request", "consent.await", "consent.withdraw"] {
+            assert!(f.fake.calls(method).is_empty(), "{method}");
+        }
+        assert!(f.asks().is_empty());
+        assert!(f.worker_grants().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -3651,7 +3678,7 @@ async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
         "worker-path-{}",
         f.dir.path().file_name().unwrap().to_string_lossy()
     );
-    let requested = Path::new("/").join(&name);
+    let requested = worker_filesystem_root(&f).join(&name);
     let counterpart = checkout.join(&name);
     assert!(std::fs::symlink_metadata(&requested).is_err());
     std::fs::create_dir_all(&counterpart).unwrap();
@@ -3668,6 +3695,7 @@ async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
         .await;
 
     assert_eq!(code(&reply), "path_not_found_did_you_mean", "{reply}");
+    assert!(!text(&reply).contains(r"\\?\"), "{reply}");
     assert_eq!(
         text(&reply),
         format!(
@@ -3688,8 +3716,7 @@ async fn consent_worker_existing_outside_path_still_asks_once() {
 
     let reply = f.read(&f.worker, &target, 7).await;
 
-    assert_eq!(code(&reply), "access_pending", "{reply}");
-    assert_eq!(f.fake.calls("consent.request").len(), 1);
+    assert_worker_outside_read_denied(&f, &reply);
 }
 
 #[tokio::test]
@@ -3701,13 +3728,12 @@ async fn consent_worker_missing_path_without_checkout_counterpart_still_asks() {
         "missing-worker-path-{}",
         f.dir.path().file_name().unwrap().to_string_lossy()
     );
-    let target = Path::new("/").join(name);
+    let target = worker_filesystem_root(&f).join(name);
     assert!(std::fs::symlink_metadata(&target).is_err());
 
     let reply = f.read(&f.worker, &target, 7).await;
 
-    assert_eq!(code(&reply), "access_pending", "{reply}");
-    assert_eq!(f.fake.calls("consent.request").len(), 1);
+    assert_worker_outside_read_denied(&f, &reply);
     assert!(!text(&reply).contains("did you mean"));
 }
 
@@ -3723,14 +3749,13 @@ async fn consent_worker_dotdot_and_symlink_escapes_are_not_suggested() {
     );
     let outside = checkout.parent().unwrap().join(&name);
     std::fs::write(&outside, "outside the checkout\n").unwrap();
-    let requested = Path::new("/").join("..").join(&name);
-    let normalized_requested = Path::new("/").join(&name);
+    let requested = worker_filesystem_root(&f).join("..").join(&name);
+    let normalized_requested = worker_filesystem_root(&f).join(&name);
     assert!(std::fs::symlink_metadata(&normalized_requested).is_err());
 
     let dotdot_reply = f.read(&f.worker, &requested, 7).await;
-    assert_eq!(code(&dotdot_reply), "access_pending", "{dotdot_reply}");
+    assert_worker_outside_read_denied(&f, &dotdot_reply);
     assert!(!text(&dotdot_reply).contains("did you mean"));
-    assert_eq!(f.fake.calls("consent.request").len(), 1);
 
     #[cfg(unix)]
     {

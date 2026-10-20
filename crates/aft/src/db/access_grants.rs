@@ -713,6 +713,7 @@ mod tests {
     #[test]
     fn grants_revived_launch_failed_install_rolls_back_carry_forward() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
         let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
         let first = scope("worker", 1);
         let second = scope("worker", 2);
@@ -720,7 +721,10 @@ mod tests {
             register_scope(&conn, key, None, &Config::default()).unwrap();
         }
         let grant = AccessGrant {
-            path: dir.path().join("outside"),
+            // Grants use canonical policy identities, including temp-directory aliases.
+            path: crate::access_policy::policy_path(
+                &dir.path().join("nested").join("..").join("outside"),
+            ),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };

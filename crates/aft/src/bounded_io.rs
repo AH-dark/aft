@@ -1361,8 +1361,11 @@ mod modes_macos_tests {
     #[test]
     fn macos_first_touch_timeout_never_mutates_after_probe_release() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("protected");
-        std::fs::create_dir(&root).unwrap();
+        let protected = dir.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        // Exercise aliased roots on every Unix host, not only macOS's /var.
+        let root = dir.path().join("alias");
+        std::os::unix::fs::symlink(&protected, &root).unwrap();
         let target = root.join("file.txt");
         std::fs::write(&target, "before").unwrap();
         let fifo = dir.path().join("answer");
@@ -1380,8 +1383,9 @@ mod modes_macos_tests {
         // The access cap starts only after the helper is scheduled. A short
         // whole-request budget can expire during unrelated preflight I/O and
         // never reach the blocked directory, especially on a loaded test host.
+        // Preflight probes the canonical directory, not the request's alias.
         let budget = Budget::after(Duration::from_secs(30))
-            .with_path_access_budget(&root, Duration::from_millis(100));
+            .with_path_access_budget(&root.canonicalize().unwrap(), Duration::from_millis(100));
         let response = with_budget(Some(budget.clone()), || {
             crate::commands::write::handle_write(&request, &ctx)
         });
