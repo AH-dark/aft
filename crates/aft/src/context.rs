@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -3707,6 +3707,11 @@ pub struct AppContext {
     /// root's exact `PathBuf` spelling, so reconfiguration never reuses a
     /// canonical root selected for another configured value.
     path_restriction_root_memo: parking_lot::Mutex<Option<PathRestrictionRootMemo>>,
+    /// Confirmed launch materializations shared by this root's routes. Missing
+    /// params and failed restores are not cached, so later calls can retry.
+    launch_grants_materialized: parking_lot::Mutex<HashSet<crate::db::access_grants::ScopeKey>>,
+    #[cfg(test)]
+    launch_restore_attempts: AtomicUsize,
     #[cfg(test)]
     path_restriction_root_canonicalizations: AtomicUsize,
     force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
@@ -4518,6 +4523,9 @@ impl AppContext {
             config_live: crate::config_live::ConfigLiveState::default(),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
+            launch_grants_materialized: parking_lot::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            launch_restore_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
             force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
@@ -6775,15 +6783,38 @@ impl AppContext {
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         self.app.set_db(conn);
         self.compression_aggregates.clear();
+        self.launch_grants_materialized.lock().clear();
     }
 
     pub fn clear_db(&self) {
         self.app.clear_db();
         self.compression_aggregates.clear();
+        self.launch_grants_materialized.lock().clear();
     }
 
     pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.app.db()
+    }
+
+    pub(crate) fn launch_grants_materialized(
+        &self,
+        scope: &crate::db::access_grants::ScopeKey,
+    ) -> bool {
+        self.launch_grants_materialized.lock().contains(scope)
+    }
+
+    pub(crate) fn memoize_launch_grants(&self, scope: crate::db::access_grants::ScopeKey) {
+        self.launch_grants_materialized.lock().insert(scope);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_launch_restore_attempt(&self) {
+        self.launch_restore_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_restore_attempts(&self) -> usize {
+        self.launch_restore_attempts.load(Ordering::Relaxed)
     }
 
     /// Mark persistence as initializing for a configure that just committed,

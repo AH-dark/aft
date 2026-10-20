@@ -613,15 +613,127 @@ pub(super) fn validate(
         if head.head_policy(&grant) != HeadPolicy::Allow {
             return Err(param_refused(index, path_value, "head_not_held", head_key));
         }
-        if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
-            if mode == AccessOperation::Write {
-                prior.operation = mode;
-            }
-        } else {
-            grants.push(grant);
-        }
+        merge_grant(&mut grants, grant);
     }
     Ok(grants)
+}
+
+fn merge_grant(grants: &mut Vec<AccessGrant>, grant: AccessGrant) {
+    if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
+        if grant.operation == AccessOperation::Write {
+            prior.operation = grant.operation;
+        }
+    } else {
+        grants.push(grant);
+    }
+}
+
+/// Revived workers do not fetch another catalog. Validate only saved launch
+/// entries against current head authority, dropping invalid siblings. Filesystem
+/// probes run unlocked; the install transaction rechecks all stored inputs.
+pub(super) fn restore_launch(
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+    preset: &str,
+) -> Result<store::LaunchRestore, subc_protocol::ErrorBody> {
+    let Some(key) = launch_key(identity, preset) else {
+        return Ok(store::LaunchRestore::NoParams);
+    };
+    #[cfg(test)]
+    ctx.note_launch_restore_attempt();
+    let db = ctx
+        .db()
+        .ok_or_else(|| refusal("grants_unavailable", "scope persistence unavailable"))?;
+    let lock = || {
+        db.lock()
+            .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))
+    };
+    let head_key = head_scope(identity);
+    let read_head = |conn: &rusqlite::Connection| {
+        head_key
+            .as_ref()
+            .map(|key| {
+                store::head_policy_scope(conn, key)?
+                    .map(|resolved| policy_snapshot(conn, &resolved))
+                    .transpose()
+                    .map(Option::flatten)
+            })
+            .transpose()
+            .map(Option::flatten)
+    };
+    let unavailable = |e: rusqlite::Error| refusal("grants_unavailable", e.to_string());
+    {
+        let conn = lock()?;
+        register_on(&conn, identity, ctx)?;
+    }
+    loop {
+        let (snapshot, raw) = {
+            let conn = lock()?;
+            (
+                read_head(&conn).map_err(unavailable)?,
+                store::preview_launch(&conn, &key).map_err(unavailable)?,
+            )
+        };
+        let Some(raw) = raw else {
+            return Ok(store::LaunchRestore::NoParams);
+        };
+        let head = snapshot
+            .clone()
+            .map(|policy| policy.resolve(&ctx.storage_dir()));
+        let entries = raw
+            .as_array()
+            .ok_or_else(|| unavailable(rusqlite::Error::InvalidQuery))?;
+        let mut grants = Vec::new();
+        let mut dropped = Vec::new();
+        for entry in entries {
+            match validate(&json!([entry]), head.as_ref(), head_key.as_ref()) {
+                Ok(valid) => {
+                    for grant in valid {
+                        // Launch paths are saved canonically. A symlink retarget
+                        // must not turn the same spelling into new authority.
+                        // Legacy noncanonical inputs fail closed on revival.
+                        if entry.get("path").and_then(Value::as_str).map(Path::new)
+                            != Some(grant.path.as_path())
+                        {
+                            dropped.push(format!("launch allow_paths dropped: path={} mode={} reason=\"launch_path_changed\"",
+                                entry["path"], entry["mode"]));
+                        } else {
+                            merge_grant(&mut grants, grant);
+                        }
+                    }
+                }
+                Err(error) => dropped.push(format!(
+                    "launch allow_paths dropped: path={} mode={} reason={}",
+                    entry.get("path").unwrap_or(&Value::Null),
+                    entry.get("mode").unwrap_or(&Value::Null),
+                    error
+                        .detail
+                        .as_ref()
+                        .and_then(|d| d.get("reason"))
+                        .unwrap_or(&Value::Null),
+                )),
+            }
+        }
+        let conn = lock()?;
+        let mut changed = false;
+        let restored = store::restore_launch(&conn, &key, |conn, current_raw| {
+            if *current_raw != raw || read_head(conn)? != snapshot {
+                changed = true;
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(grants)
+        });
+        if changed {
+            continue;
+        }
+        let restored = restored.map_err(unavailable)?;
+        if restored == store::LaunchRestore::Materialized {
+            for message in dropped {
+                crate::slog_warn!("{message}");
+            }
+        }
+        return Ok(restored);
+    }
 }
 
 pub(super) fn catalog(
@@ -716,7 +828,13 @@ pub(super) fn catalog(
         if launch_params(&conn, key)? != stored {
             continue;
         }
-        store::materialize(&conn, key, chosen, &grants)
+        // Store the authority that was actually validated, not a symlink spelling
+        // that could point at a different subtree when a worker is revived.
+        let saved = Value::Array(grants.iter().map(|grant| json!({
+            "path": grant.path,
+            "mode": if grant.operation == AccessOperation::Write { "write" } else { "read" },
+        })).collect());
+        store::materialize(&conn, key, &saved, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
         return Ok(());
     }

@@ -181,6 +181,426 @@ fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
     }
 }
 
+fn at_epoch(identity: &RouteIdentity, epoch: u64) -> RouteIdentity {
+    let mut data = copied_identity(identity);
+    data.scope.as_mut().unwrap().scope_epoch = epoch;
+    RouteIdentity(Arc::new(data))
+}
+
+#[cfg(unix)]
+#[test]
+fn grants_revived_launch_symlink_changes_never_widen_authority() {
+    let (_dir, ctx, head, worker) = fixture();
+    let original = head.project_root.join("original");
+    let other = head.project_root.join("other");
+    let alias = head.project_root.join("alias");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    std::os::unix::fs::symlink(&original, &alias).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":alias,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&other, &alias).unwrap();
+    let revived = at_epoch(&worker, 8);
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    let db = ctx.db().unwrap();
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: original.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    std::fs::remove_dir(&original).unwrap();
+    std::os::unix::fs::symlink(&other, &original).unwrap();
+    let changed = at_epoch(&worker, 9);
+    restore_launch(&changed, &ctx, "worker").unwrap();
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&changed))
+        .unwrap()
+        .is_empty());
+}
+
+async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) {
+    ctx.update_config(|config| config.project_root = Some(identity.project_root.clone()));
+    let target = identity.project_root.join("first-call.txt");
+    std::fs::write(&target, "first call").unwrap();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(identity.root.clone(), ctx.clone());
+    let confinement = remote_policy::CarriedConfinement::read(&ctx, &identity);
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        7,
+        serde_json::to_vec(&json!({
+            "op":"tool.call", "name":"read", "preset":preset,
+            "arguments":{"filePath":target}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(8);
+    let (bash_tx, _bash_rx) = mpsc::channel(8);
+    let (touch_tx, _touch_rx) = mpsc::channel(8);
+    let (entries, _deferred_rx) = mpsc::unbounded_channel();
+    handle_tool_call(
+        &writer,
+        &frame,
+        None,
+        Some(confinement),
+        PhaseTrace::new(Instant::now()),
+        &routes,
+        &HashMap::new(),
+        &ReclaimedRoutes::default(),
+        &mut HashMap::new(),
+        &executor,
+        &Arc::default(),
+        &Arc::new(PendingDeferredSetups::default()),
+        &Arc::new(Notify::new()),
+        &PersistentCancelSignal::new(),
+        &bash_tx,
+        &touch_tx,
+        &Arc::new(DispatchPathMetrics::new()),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut 1,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        |request, ctx| crate::commands::read::handle_read(&request, ctx),
+        &DeferredResponseSender {
+            entries,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        },
+        false,
+        1024 * 1024,
+        &drain::ModuleDrainWindow::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .expect("first read must terminate")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
+    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+}
+
+#[tokio::test]
+async fn grants_revived_launch_first_call_restores_without_catalog() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let target = head.project_root.join("shared");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    let conn = ctx.db().unwrap();
+    let conn = conn.lock().unwrap();
+    let expected = vec![AccessGrant {
+        path: policy_path(&target),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    }];
+    assert_eq!(store::list(&conn, &scope_key(&revived)).unwrap(), expected);
+    assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap(), expected);
+    let markers: i64 = conn
+        .query_row("SELECT COUNT(*) FROM access_materialized", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(markers, 2, "old-epoch history must remain intact");
+}
+
+#[test]
+fn grants_revived_launch_failed_restore_continues_and_retries() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let target = head.project_root.join("shared");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    let db = ctx.db().unwrap();
+    db.lock().unwrap().execute_batch("CREATE TRIGGER fail_restore BEFORE INSERT ON access_grants WHEN NEW.epoch='2' BEGIN SELECT RAISE(ABORT,'injected restore failure'); END;").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        runtime.block_on(first_read(ctx.clone(), revived.clone(), "worker"))
+    });
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("launch_grant_restore_failed:")
+                && line.contains(&format!("owner={}", scope_key(&revived).owner))
+                && line.contains("scope_ref=worker epoch=2 code=grants_unavailable")
+                && line.contains("injected restore failure")),
+        "{lines:?}"
+    );
+    assert_eq!(ctx.launch_restore_attempts(), 1);
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
+    crate::access_policy::with_scope(Some(scope_key(&revived)), || {
+        assert_ne!(
+            ctx.access_policy("read")
+                .unwrap()
+                .decide(AccessOperation::Read, &target, false),
+            AccessDecision::Allow
+        );
+    });
+    db.lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_restore;")
+        .unwrap();
+    runtime.block_on(first_read(ctx.clone(), revived.clone(), "worker"));
+    assert_eq!(
+        ctx.launch_restore_attempts(),
+        2,
+        "failed restores must retry"
+    );
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn grants_revived_launch_memo_skips_restore_database_on_second_call() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let ctx = Arc::new(ctx);
+    for epoch in [1, 2] {
+        let identity = at_epoch(&worker, epoch);
+        first_read(ctx.clone(), identity.clone(), "worker").await;
+        assert_eq!(ctx.launch_restore_attempts(), epoch as usize);
+        // Separately constructed routes for the same scope reuse the cached
+        // launch result instead of repeating its database check.
+        first_read(ctx.clone(), at_epoch(&worker, epoch), "worker").await;
+        assert_eq!(
+            ctx.launch_restore_attempts(),
+            epoch as usize,
+            "second call must not enter the restore database path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grants_revived_launch_no_params_is_not_memoized() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    assert_eq!(
+        ctx.launch_restore_attempts(),
+        2,
+        "no params is not a definite materialization"
+    );
+    let target = head.project_root.join("late-launch");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    assert_eq!(ctx.launch_restore_attempts(), 3);
+    let db = ctx.db().unwrap();
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    first_read(ctx.clone(), revived, "worker").await;
+    assert_eq!(ctx.launch_restore_attempts(), 3);
+}
+
+#[tokio::test]
+async fn grants_revived_launch_does_not_copy_ask_earned_grants() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    remote_policy::catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap();
+    let earned = AccessGrant {
+        path: policy_path(&head.project_root.join("consented")),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    {
+        let db = ctx.db().unwrap();
+        // Consent installs standing grants, not launch parameters.
+        store::insert(&db.lock().unwrap(), &scope_key(&worker), &earned).unwrap();
+    }
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert!(store::list(&conn, &scope_key(&revived)).unwrap().is_empty());
+    assert_eq!(
+        store::list(&conn, &scope_key(&worker)).unwrap(),
+        vec![earned]
+    );
+}
+
+#[test]
+fn grants_revived_launch_drops_and_logs_revoked_head_and_floor() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let held = head.project_root.join("held");
+    let revoked = worker.project_root.join("revoked");
+    let denied = head.project_root.join("denied");
+    let grant = AccessGrant {
+        path: policy_path(&revoked),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    {
+        let db = ctx.db().unwrap();
+        store::insert(&db.lock().unwrap(), &scope_key(&head), &grant).unwrap();
+    }
+    let raw = json!([
+        {"path":held,"mode":"write"},
+        {"path":revoked,"mode":"read"},
+        {"path":denied,"mode":"read"}
+    ]);
+    remote_policy::catalog(catalog_request(raw.clone()), &worker, &ctx).unwrap();
+    operation(json!({"path":revoked}), "grants.revoke", &head, &ctx).unwrap();
+    ctx.update_config(|config| config.sandbox.read_deny.push(denied.clone()));
+    register(&head, &ctx).unwrap();
+    let revived = at_epoch(&worker, 2);
+    let (result, lines) =
+        crate::logging::capture_log_lines(|| restore_launch(&revived, &ctx, "worker"));
+    result.unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for (path, reason) in [(&revoked, "head_not_held"), (&denied, "denied_floor")] {
+        assert!(
+            lines.iter().any(|line| {
+                line.contains(&format!("path={}", json!(path)))
+                    && line.contains("mode=\"read\"")
+                    && line.contains(&format!("reason=\"{reason}\""))
+            }),
+            "missing named drop for {path:?}: {lines:?}"
+        );
+    }
+    let db = ctx.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            store::list(&conn, &scope_key(&revived)).unwrap(),
+            vec![AccessGrant {
+                path: policy_path(&held),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Write,
+            }]
+        );
+        assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap().len(), 3);
+        assert_eq!(
+            store::launch_params(&conn, &launch_key(&revived, "worker").unwrap()).unwrap(),
+            Some(raw)
+        );
+        store::revoke(&conn, &scope_key(&revived), &policy_path(&held)).unwrap();
+    }
+    let (result, lines) =
+        crate::logging::capture_log_lines(|| restore_launch(&revived, &ctx, "worker"));
+    result.unwrap();
+    assert!(
+        lines.is_empty(),
+        "repeat call must not revalidate: {lines:?}"
+    );
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn grants_revived_launch_isolates_ref_owner_session_and_preset() {
+    for dimension in [
+        "ref",
+        "owner",
+        "session",
+        "preset",
+        "principal",
+        "harness",
+        "root",
+    ] {
+        let (dir, ctx, head, worker) = fixture();
+        let worker = at_epoch(&worker, 1);
+        remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
+            &worker,
+            &ctx,
+        )
+        .unwrap();
+        let mut data = copied_identity(&at_epoch(&worker, 2));
+        let mut preset = "worker";
+        match dimension {
+            "ref" => data.scope.as_mut().unwrap().scope_ref = "other".into(),
+            "owner" => {
+                data.scope.as_mut().unwrap().owner =
+                    serde_json::from_value(json!({"kind":"direct"})).unwrap()
+            }
+            "session" => data.session = "other".into(),
+            "preset" => preset = "head",
+            "principal" => {
+                if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                {
+                    *principal_id = Some("reserved:other".into());
+                }
+            }
+            "harness" => data.harness = "other".into(),
+            _ => {
+                data.project_root = dir.path().join("other-root");
+                std::fs::create_dir(&data.project_root).unwrap();
+                data.root = ProjectRootId::from_path(&data.project_root).unwrap();
+            }
+        }
+        let other = RouteIdentity(Arc::new(data));
+        let ctx = Arc::new(ctx);
+        first_read(ctx.clone(), other.clone(), preset).await;
+        let db = ctx.db().unwrap();
+        assert!(
+            store::list(&db.lock().unwrap(), &scope_key(&other))
+                .unwrap()
+                .is_empty(),
+            "{dimension}"
+        );
+    }
+}
+
 #[test]
 fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
     let dir = tempfile::tempdir().unwrap();
