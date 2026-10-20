@@ -17,6 +17,10 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
+/// Request budget for a mutation's path checks when no caller budget exists.
+/// It matches the budget agent tool calls already run under, so a native
+/// request and a tool call wait equally long for a helper to be scheduled.
+pub(crate) const MUTATION_BUDGET: Duration = Duration::from_secs(25);
 const MAX_IO_THREADS: usize = 64;
 static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
 static HELPERS: LazyLock<Arc<Limiter>> = LazyLock::new(|| Arc::new(Limiter::new(MAX_IO_THREADS)));
@@ -317,6 +321,7 @@ thread_local! {
     // that map per file. Its workers remember successful lookups locally.
     static DIRECTORIES: RefCell<(u64, HashMap<PathBuf, Access>)> = RefCell::new((0, HashMap::new()));
     static HELPER_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static MUTATION_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(crate) struct Scope(Option<Budget>);
 impl Drop for Scope {
@@ -330,6 +335,30 @@ pub(crate) fn current() -> Option<Budget> {
 pub(crate) fn enter_if_absent(duration: Duration) -> Scope {
     let budget = current().unwrap_or_else(|| Budget::after(duration));
     Scope(CURRENT.with(|current| current.replace(Some(budget))))
+}
+/// Scope for the path checks of a mutation the user asked for (delete, edit,
+/// write, ...). A helper that has not started yet has touched nothing, and a
+/// mutation has no partial answer to return, so a slow-to-schedule helper (a
+/// loaded machine, or a Windows process whose thread start waits on a
+/// long-running DLL load) may wait for admission until the request deadline
+/// instead of the per-access cap. Once the helper starts, the usual access
+/// cap applies unchanged, so a blocked filesystem still fails as
+/// `read_blocked` within that cap.
+pub(crate) struct MutationScope {
+    previous: bool,
+    _scope: Scope,
+}
+impl Drop for MutationScope {
+    fn drop(&mut self) {
+        MUTATION_ADMISSION.with(|flag| flag.set(self.previous));
+    }
+}
+pub(crate) fn enter_mutation() -> MutationScope {
+    let scope = enter_if_absent(MUTATION_BUDGET);
+    MutationScope {
+        previous: MUTATION_ADMISSION.with(|flag| flag.replace(true)),
+        _scope: scope,
+    }
 }
 pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -> T {
     let _scope = enter(budget);
@@ -519,8 +548,13 @@ fn run_with_timeout<T: Send + 'static>(
     let queued = Instant::now();
     let request_deadline = request_deadline(at);
     // Without a request deadline, queueing and access each get their own cap.
-    let queue_deadline =
-        request_deadline.map_or(queued + access_budget, |at| at.min(queued + access_budget));
+    // Inside a mutation, a helper may wait to be admitted and scheduled until
+    // the request deadline, because nothing has run yet; see `MutationScope`.
+    let queue_deadline = match request_deadline {
+        Some(at) if MUTATION_ADMISSION.with(std::cell::Cell::get) => at,
+        Some(at) => at.min(queued + access_budget),
+        None => queued + access_budget,
+    };
     if let Some(probe) = &probe {
         probe.set_deadline(queue_deadline, None);
     }
@@ -593,13 +627,22 @@ fn run_with_timeout<T: Send + 'static>(
     if let Some(counts) = &measurements {
         counts.spawns.fetch_add(1, Ordering::Relaxed);
     }
-    let mut wait_until = queue_deadline;
+    let mut wait_until = queue_deadline.min(queued + access_budget);
     loop {
         match rx.recv_timeout(wait_until.saturating_duration_since(Instant::now())) {
             Ok(result) => return result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let state = probe.state.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(started) = state.started else {
+                    // A mutation may wait for admission past one access cap.
+                    // Look again at least once per cap, so a helper that
+                    // starts late and then hangs still fails at its own
+                    // access deadline instead of at the request deadline.
+                    let now = Instant::now();
+                    if now < queue_deadline {
+                        wait_until = queue_deadline.min(now + access_budget);
+                        continue;
+                    }
                     return Err(failure(
                     path,
                     "read_io_queue_timeout",

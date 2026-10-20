@@ -12929,6 +12929,9 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        // Mutating tools validate here, so a helper that is merely slow to be
+        // scheduled must not refuse the user's change (see `MutationScope`).
+        let _io = crate::bounded_io::enter_mutation();
         self.validate_path_with_artifact_session(req_id, path, None)
     }
 
@@ -12943,7 +12946,8 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
+        // Only mutations validate write locations (see `MutationScope`).
+        let _io = crate::bounded_io::enter_mutation();
         reject_github_address(req_id, path)?;
         let Some(PathRestrictionContext {
             raw_root,
