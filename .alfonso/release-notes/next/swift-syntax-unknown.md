@@ -1,1 +1,1 @@
-- New Swift files now report syntax as unknown with a reason when compiler confirmation times out or is unavailable, instead of incorrectly reporting a definite syntax error; confirmed valid and invalid compiler verdicts are unchanged.
+- A new Swift file is no longer reported as having a syntax error when the Swift compiler could not finish checking it; AFT reports the check as unknown instead.
