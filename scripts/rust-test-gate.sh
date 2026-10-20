@@ -188,6 +188,13 @@ announce_gate_line() {
 
 announce_gate_line "gate log: $gate_log"
 
+# An error that ends the gate before or between phases goes to stderr and into
+# the gate log, so a downloaded log still says why the job failed.
+gate_error() {
+  printf '%s\n' "$1" >&2
+  printf '%s\n' "$1" >> "$gate_log"
+}
+
 failed_test_phases=0
 first_test_failure=0
 
@@ -361,11 +368,11 @@ for p in sorted(seen): print(p)
 }
 
 if [[ "$runner" != "nextest" && "$runner" != "cargo" ]]; then
-  echo "Unsupported AFT_RUST_TEST_RUNNER='$runner' (expected 'nextest' or 'cargo')" >&2
+  gate_error "Unsupported AFT_RUST_TEST_RUNNER='$runner' (expected 'nextest' or 'cargo')"
   exit 2
 fi
 if [[ "$unit_runner" != "cargo" && "$unit_runner" != "nextest" ]]; then
-  echo "Unsupported AFT_UNIT_TEST_RUNNER='$unit_runner' (expected 'cargo' or 'nextest')" >&2
+  gate_error "Unsupported AFT_UNIT_TEST_RUNNER='$unit_runner' (expected 'cargo' or 'nextest')"
   exit 2
 fi
 
@@ -387,14 +394,14 @@ if [[ "$runner" == "cargo" ]]; then
 fi
 
 if ! command -v cargo-nextest >/dev/null 2>&1; then
-  echo "cargo-nextest is required; install it with: cargo install cargo-nextest --locked" >&2
+  gate_error "cargo-nextest is required; install it with: cargo install cargo-nextest --locked"
   exit 127
 fi
 
 extract_nextest_archive_for_prewarm() {
   local archive_file="${1:-${AFT_NEXTEST_ARCHIVE_FILE:-}}"
   if [[ -z "$archive_file" ]]; then
-    echo "AFT_NEXTEST_ARCHIVE_FILE is required to extract a nextest archive" >&2
+    gate_error "AFT_NEXTEST_ARCHIVE_FILE is required to extract a nextest archive"
     return 2
   fi
 
@@ -435,7 +442,7 @@ else
     case "$selected_phase" in
       lib|lib-shard|nextest|watcher|conformance|storm) ;;
       *)
-        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, lib-shard, nextest, watcher, conformance, storm, or all)" >&2
+        gate_error "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, lib-shard, nextest, watcher, conformance, storm, or all)"
         exit 2
         ;;
     esac
@@ -511,11 +518,11 @@ fi
 
 if phase_enabled lib-shard; then
   if [[ "$unit_runner" != "nextest" ]]; then
-    echo "The lib-shard phase requires AFT_UNIT_TEST_RUNNER=nextest" >&2
+    gate_error "The lib-shard phase requires AFT_UNIT_TEST_RUNNER=nextest"
     exit 2
   fi
   if [[ -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" || -z "${AFT_NEXTEST_PARTITION:-}" ]]; then
-    echo "The lib-shard phase requires AFT_NEXTEST_ARCHIVE_FILE and AFT_NEXTEST_PARTITION" >&2
+    gate_error "The lib-shard phase requires AFT_NEXTEST_ARCHIVE_FILE and AFT_NEXTEST_PARTITION"
     exit 2
   fi
   if [[ -n "${AFT_NEXTEST_ARCHIVE_BIN_FILE:-}" ]]; then

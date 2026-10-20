@@ -126,6 +126,15 @@ sys.exit(0)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(calls, [])
 
+    def test_error_before_any_phase_is_kept_in_the_gate_log(self):
+        # CI uploads only the gate log, so the reason a gate stopped before its
+        # first phase must be in it, not only on stderr.
+        result, calls = self.run_gate("bogus")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
+        self.assertIn("Unsupported AFT_GATE_PHASES entry 'bogus'", result.stderr)
+        self.assertIn("Unsupported AFT_GATE_PHASES entry 'bogus'", result.gate_log)
+
     def test_leaked_child_holding_runner_output_does_not_hold_the_gate_open(self):
         # The leaked child lives 30s. A gate that pipes phase output through a
         # reader waiting for end-of-file (`tee`) stays open until it exits.
