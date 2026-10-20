@@ -1094,6 +1094,68 @@ async fn worker_jail_denies_native_gh_credentials() {
     assert!(!reply.contains("TOKENS_PRESENT"), "{reply}");
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_credential_floor_covers_daemon_home_and_config_overrides() {
+    if !native_available() {
+        return;
+    }
+    const FILES: &[&str] = &[
+        "home/.config/gh/hosts.yml",
+        "custom-gh/hosts.yml",
+        "xdg/config/gh/hosts.yml",
+        "home/.ssh/key",
+        "home/.gnupg/key",
+        "home/.aws/credentials",
+        "home/.config/gcloud/key",
+        "home/.azure/key",
+        "home/.netrc",
+        "home/.git-credentials",
+        "home/.config/git/credentials",
+        "home/.docker/config.json",
+        "home/.npmrc",
+        "home/.pypirc",
+        "home/.cargo/credentials.toml",
+    ];
+    for profile in ["strict", "relaxed"] {
+        if profile == "relaxed" && cfg!(target_os = "linux") {
+            continue;
+        }
+        let mut jail = Jail::start_with_layout_and_env(
+            None,
+            None,
+            true,
+            profile,
+            false,
+            false,
+            |base, command| {
+                for path in FILES {
+                    let path = base.join(path);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, "synthetic-credential").unwrap();
+                }
+                command.env("GH_CONFIG_DIR", base.join("custom-gh"));
+            },
+        )
+        .await;
+        let command = FILES.iter().enumerate().map(|(index, path)| {
+            let path = quote(&jail.base.join(path));
+            format!("if /bin/cat {path} >/dev/null 2>&1; then echo READABLE_{index}; else echo READ_DENIED_{index}; fi; if : >>{path} 2>/dev/null; then echo WRITABLE_{index}; else echo WRITE_DENIED_{index}; fi")
+        }).collect::<Vec<_>>().join("; ");
+        let reply = jail.bash(&command).await;
+        for (index, path) in FILES.iter().enumerate() {
+            assert!(
+                reply.contains(&format!("READ_DENIED_{index}\n")),
+                "{profile} {path}: {reply}"
+            );
+            assert!(
+                reply.contains(&format!("WRITE_DENIED_{index}\n")),
+                "{profile} {path}: {reply}"
+            );
+        }
+    }
+}
+
 /// Opt in on an unlocked Mac: creates and removes only a uniquely named test item.
 #[cfg(target_os = "macos")]
 #[tokio::test]

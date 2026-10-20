@@ -412,6 +412,9 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     if profile.worker_jail {
         unenforced.push("session_dbus_keyring");
     }
+    if !profile.deny_prefixes.is_empty() {
+        unenforced.push("credential_filename_prefix_future_entries_unenforced_on_landlock");
+    }
     if profile
         .write_deny_nested
         .iter()
