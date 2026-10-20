@@ -1060,6 +1060,125 @@ fn assert_stripped_gh_refused(reply: &str) {
     assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
 }
 
+/// Even without the gh shim, workers must not read ~/.config/gh/hosts.yml or
+/// inherit GH_TOKEN or GITHUB_TOKEN from the daemon.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_denies_native_gh_credentials() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start_with_layout_and_env(
+        None,
+        None,
+        true,
+        "strict",
+        false,
+        false,
+        |base, command| {
+            let config = base.join("home/.config/gh");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("hosts.yml"), "test-only-gh-token").unwrap();
+            command.env("GH_TOKEN", "test-only-gh-token");
+            command.env("GITHUB_TOKEN", "test-only-github-token");
+        },
+    )
+    .await;
+    let reply = jail.bash("if /bin/cat \"$HOME/.config/gh/hosts.yml\" >/dev/null 2>&1; then echo HOSTS_READABLE; else echo HOSTS_DENIED; fi; if [ \"${GH_TOKEN+x}${GITHUB_TOKEN+x}\" = '' ]; then echo TOKENS_ABSENT; else echo TOKENS_PRESENT; fi").await;
+    assert!(reply.contains("HOSTS_DENIED"), "{reply}");
+    assert!(reply.contains("TOKENS_ABSENT"), "{reply}");
+    assert!(!reply.contains("HOSTS_READABLE"), "{reply}");
+    assert!(!reply.contains("TOKENS_PRESENT"), "{reply}");
+}
+
+/// Opt in on an unlocked Mac: creates and removes only a uniquely named test item.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires an unlocked login keychain and explicit test-item consent"]
+async fn worker_jail_login_keychain_test_item_is_unreadable() {
+    assert_eq!(
+        std::env::var("AFT_TEST_LOGIN_KEYCHAIN").as_deref(),
+        Ok("1"),
+        "run explicitly with AFT_TEST_LOGIN_KEYCHAIN=1 on an unlocked Mac"
+    );
+    let service = format!(
+        "aft-worker-jail-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let account = "aft-credential-isolation-test";
+    let secret = "disposable-test-value-not-an-operator-token";
+    let login = run(Command::new("/usr/bin/security").args(["default-keychain", "-d", "user"]));
+    let keychain = PathBuf::from(login.trim().trim_matches('"'));
+    assert!(
+        keychain.is_file(),
+        "login keychain unavailable: {}",
+        keychain.display()
+    );
+    let keychain = keychain.to_str().unwrap();
+    struct Cleanup(String, String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("/usr/bin/security")
+                .args([
+                    "delete-generic-password",
+                    "-s",
+                    &self.0,
+                    "-a",
+                    "aft-credential-isolation-test",
+                    &self.1,
+                ])
+                .output();
+        }
+    }
+    run(Command::new("/usr/bin/security").args([
+        "add-generic-password",
+        "-s",
+        &service,
+        "-a",
+        account,
+        "-w",
+        secret,
+        "-T",
+        "/usr/bin/security",
+        keychain,
+    ]));
+    let _cleanup = Cleanup(service.clone(), keychain.into());
+    let baseline = run(Command::new("/usr/bin/security").args([
+        "find-generic-password",
+        "-s",
+        &service,
+        "-a",
+        account,
+        "-w",
+        keychain,
+    ]));
+    assert_eq!(
+        baseline.trim(),
+        secret,
+        "test item must be readable outside the jail"
+    );
+    let mut jail = Jail::start().await;
+    let reply = jail.bash(&format!(
+        "/usr/bin/security find-generic-password -s '{service}' -a '{account}' -w {}; echo KEYCHAIN_EXIT=$?", quote(Path::new(keychain))
+    )).await;
+    assert!(
+        reply.contains("KEYCHAIN_EXIT="),
+        "probe did not execute: {reply}"
+    );
+    assert!(
+        !reply.contains(secret),
+        "worker read the disposable login-keychain secret: {reply}"
+    );
+    assert!(
+        !reply.contains("KEYCHAIN_EXIT=0"),
+        "worker queried the login-keychain item: {reply}"
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn worker_jail_fences_operator_gh_and_its_canary_resists_tampering() {
