@@ -382,6 +382,10 @@ fn an_answer_given_before_the_watcher_took_the_save_is_not_judged_by_later_evide
 
     // Hold the watcher's intake across the save and the first question.
     std::fs::write(&gate, b"held").unwrap();
+    // Hold its flush until both answers are in, so the daemon cannot refresh
+    // the call graph before `callers` is asked however long this test pauses.
+    let flush_hold = base.join("watcher-intake.gate.flush-hold");
+    std::fs::write(&flush_hold, b"held").unwrap();
     atomic_save(&file, BETA_SOURCE);
     let saved = Instant::now();
     let mut evidence = SaveEvidence::default();
@@ -403,6 +407,7 @@ fn an_answer_given_before_the_watcher_took_the_save_is_not_judged_by_later_evide
             std::thread::sleep(Duration::from_millis(5));
         }
     });
+    std::fs::remove_file(&flush_hold).unwrap();
     // The round must really have straddled the delivery, or this test proves
     // nothing: the first answer predates it, the second knows about it.
     assert!(

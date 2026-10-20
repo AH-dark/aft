@@ -2586,6 +2586,8 @@ impl WatcherFilterThread {
     }
 
     fn flush_pending_with_wait(&mut self, deadline: Instant, pause: impl FnMut()) -> bool {
+        #[cfg(feature = "test-timing-hooks")]
+        hold_watcher_flush_for_test(&self.shutdown);
         let flushed = self.flush_raw_paths_with_wait(deadline, pause);
         // Paths kept for another window (an ignore-rule change still being
         // acknowledged) remain unflushed; everything else has been handed to
@@ -2712,6 +2714,22 @@ fn hold_watcher_intake_for_test(shutdown: &AtomicBool) {
         return;
     };
     while gate.exists() && !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Test seam: while `<gate>.flush-hold` exists, the watcher thread keeps taken-in
+/// paths in its flush window instead of handing them on, so an edit it has
+/// received stays pending until the test has asked its question.
+#[cfg(feature = "test-timing-hooks")]
+fn hold_watcher_flush_for_test(shutdown: &AtomicBool) {
+    let Some(gate) = watcher_intake_gate_for_test() else {
+        return;
+    };
+    let mut hold = gate.as_os_str().to_owned();
+    hold.push(".flush-hold");
+    let hold = PathBuf::from(hold);
+    while hold.exists() && !shutdown.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(5));
     }
 }
