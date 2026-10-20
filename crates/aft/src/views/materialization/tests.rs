@@ -1784,10 +1784,12 @@ impl DifferentialCorpus {
             }
             16 => {
                 // A sibling file of the same package declares the receiver
-                // type of the unchanged `Pet`.
+                // type of the unchanged `Pet`, and the function the unchanged
+                // `Loud` calls, which the package file listing finds.
                 if self.toggle_file(
                     "gosvc/cat.go",
-                    "package svc\n\ntype Cat struct{}\n\nfunc (c Cat) Purr() {}\n",
+                    "package svc\n\ntype Cat struct{}\n\nfunc (c Cat) Purr() {}\n\n\
+                     func pick() Dog { return Dog{} }\n",
                 ) {
                     "add go sibling cat.go".into()
                 } else {
