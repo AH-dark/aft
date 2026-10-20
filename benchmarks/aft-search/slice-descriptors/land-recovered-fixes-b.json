@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/subc/consent_tests.rs",
+    "crates/aft/src/views/semantic_runtime_tests.rs"
+  ],
+  "slices": ["land-recovered-fixes-b"],
+  "note": "The ranking fence hit is crates/aft/src/commands/semantic_search/mod.rs. Only worker path preflight and refusal guidance change there; admitted searches retain identical engines, candidates, scores and ranking. The remaining changes restore launch grants within saved authority, resolve same-head reconnect policies, report shutdown persistence failures, prioritize requested inspect causes, bound PTY setup cleanup, and remove test-only port and deadline races. No ranking mechanism is wired or changed. Evidence is the package lib, binary, integration and list-envelope suites plus named mutation regressions and 100 Linux repetitions of each flake regression."
+}

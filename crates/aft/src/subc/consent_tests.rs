@@ -423,6 +423,21 @@ fn scope_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         other => panic!("unexpected scope test command: {other}"),
     }
 }
+fn glob_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::glob::handle_glob(&request, ctx)
+}
+
+fn grep_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::grep::handle_grep(&request, ctx)
+}
+
+fn aft_search_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::semantic_search::handle_semantic_search(&request, ctx)
+}
+
+fn ast_search_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::ast_search::handle_ast_search(&request, ctx)
+}
 
 impl Fixture {
     /// Send one `read` tool call on `identity`'s route and return the reply body.
@@ -466,6 +481,24 @@ impl Fixture {
             .unwrap();
         serde_json::from_slice(&reply.body).unwrap()
     }
+    async fn checkout_tool(
+        &self,
+        identity: &RouteIdentity,
+        name: &str,
+        arguments: Value,
+        corr: u64,
+        dispatch: DispatchFn,
+    ) -> Value {
+        let mut replies = self
+            .send_tool(identity, name, arguments, corr, dispatch)
+            .await;
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("the call ends with one terminal frame")
+            .expect("writer stays open");
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+
     async fn send_tool(
         &self,
         identity: &RouteIdentity,
@@ -3591,4 +3624,174 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
         std::fs::read_to_string(roots[0].join("scratch.rs")).unwrap(),
         "fn scratch_marker() {}\n"
     );
+}
+
+#[tokio::test]
+async fn consent_worker_glob_suggests_existing_checkout_path_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let checkout = f.ctx.config().project_root.clone().unwrap();
+    let name = format!(
+        "worker-path-{}",
+        f.dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let requested = Path::new("/").join(&name);
+    let counterpart = checkout.join(&name);
+    assert!(std::fs::symlink_metadata(&requested).is_err());
+    std::fs::create_dir_all(&counterpart).unwrap();
+    std::fs::write(counterpart.join("match.rs"), "fn match_here() {}\n").unwrap();
+
+    let reply = f
+        .checkout_tool(
+            &f.worker,
+            "glob",
+            json!({"pattern": "*.rs", "path": requested}),
+            7,
+            glob_dispatch,
+        )
+        .await;
+
+    assert_eq!(code(&reply), "path_not_found_did_you_mean", "{reply}");
+    assert_eq!(
+        text(&reply),
+        format!(
+            "path not found: {}; did you mean {}?",
+            requested.display(),
+            counterpart.display()
+        )
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
+}
+
+#[tokio::test]
+async fn consent_worker_existing_outside_path_still_asks_once() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let target = f.dir.path().join("elsewhere.txt");
+
+    let reply = f.read(&f.worker, &target, 7).await;
+
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+}
+
+#[tokio::test]
+async fn consent_worker_missing_path_without_checkout_counterpart_still_asks() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let name = format!(
+        "missing-worker-path-{}",
+        f.dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let target = Path::new("/").join(name);
+    assert!(std::fs::symlink_metadata(&target).is_err());
+
+    let reply = f.read(&f.worker, &target, 7).await;
+
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+    assert!(!text(&reply).contains("did you mean"));
+}
+
+#[tokio::test]
+async fn consent_worker_dotdot_and_symlink_escapes_are_not_suggested() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let checkout = f.ctx.config().project_root.clone().unwrap();
+    let name = format!(
+        "escaped-worker-path-{}",
+        f.dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let outside = checkout.parent().unwrap().join(&name);
+    std::fs::write(&outside, "outside the checkout\n").unwrap();
+    let requested = Path::new("/").join("..").join(&name);
+    let normalized_requested = Path::new("/").join(&name);
+    assert!(std::fs::symlink_metadata(&normalized_requested).is_err());
+
+    let dotdot_reply = f.read(&f.worker, &requested, 7).await;
+    assert_eq!(code(&dotdot_reply), "access_pending", "{dotdot_reply}");
+    assert!(!text(&dotdot_reply).contains("did you mean"));
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let link_name = format!(
+            "worker-path-link-{}",
+            f.dir.path().file_name().unwrap().to_string_lossy()
+        );
+        symlink(&outside, checkout.join(&link_name)).unwrap();
+        let symlink_reply = f.read(&f.worker, &Path::new("/").join(link_name), 8).await;
+        assert_eq!(code(&symlink_reply), "access_pending", "{symlink_reply}");
+        assert!(!text(&symlink_reply).contains("did you mean"));
+        assert_eq!(f.fake.calls("consent.request").len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn consent_worker_searches_of_filesystem_root_refuse_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let checkout = f.ctx.config().project_root.clone().unwrap();
+    let expected = format!("use your checkout instead: {}", checkout.display());
+    let cases: [(&str, Value, DispatchFn); 4] = [
+        (
+            "glob",
+            json!({"pattern": "*.rs", "path": "/"}),
+            glob_dispatch,
+        ),
+        (
+            "grep",
+            json!({"pattern": "needle", "path": "/"}),
+            grep_dispatch,
+        ),
+        (
+            "search",
+            json!({"query": "needle", "path": "/"}),
+            aft_search_dispatch,
+        ),
+        (
+            "ast_search",
+            json!({"pattern": "console.log($MSG)", "lang": "javascript", "paths": ["/"]}),
+            ast_search_dispatch,
+        ),
+    ];
+
+    for (index, (name, arguments, dispatch)) in cases.into_iter().enumerate() {
+        let reply = f
+            .checkout_tool(&f.worker, name, arguments, 7 + index as u64, dispatch)
+            .await;
+        assert_eq!(code(&reply), "worker_root_search", "{name}: {reply}");
+        assert_eq!(
+            reply["structuredContent"]["message"].as_str().unwrap_or(""),
+            expected,
+            "{name}: {reply}"
+        );
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+}
+
+#[tokio::test]
+async fn consent_stamped_head_search_of_filesystem_root_keeps_todays_behavior() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+
+    let reply = f
+        .checkout_tool(
+            &f.head,
+            "search",
+            json!({"query": "needle", "path": "/"}),
+            7,
+            aft_search_dispatch,
+        )
+        .await;
+
+    assert_eq!(code(&reply), "not_a_git_root", "{reply}");
+    assert!(f.fake.calls("consent.request").is_empty());
 }

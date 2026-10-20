@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -2782,6 +2782,16 @@ struct PathRestrictionContext {
     path_for_resolution: PathBuf,
 }
 
+/// Marks explicit roots passed to search tools so their worker-only refusal
+/// for a filesystem-root search can be handled at the shared path gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerSearchTool {
+    Glob,
+    Grep,
+    AftSearch,
+    AstGrepSearch,
+}
+
 /// Per-context memo for the configured project root used by containment checks.
 ///
 /// `resolved_root` is the bare output from `fs::canonicalize`; it must not be
@@ -2812,6 +2822,50 @@ mod lexical_comparison_tests {
             );
         }
     }
+}
+
+fn relative_components_under_root(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    match components.next()? {
+        Component::Prefix(_) => match components.next()? {
+            Component::RootDir => {}
+            _ => return None,
+        },
+        Component::RootDir => {}
+        _ => return None,
+    }
+
+    let mut relative = PathBuf::new();
+    for component in components {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+fn checkout_counterpart(original: &Path, checkout: &Path) -> Option<PathBuf> {
+    let relative = relative_components_under_root(original)?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+
+    // Normalize before probing so a spelling such as /../secret never stats
+    // the unnormalized path supplied by the caller.
+    let normalized_original = normalize_path(original);
+    match std::fs::symlink_metadata(&normalized_original) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        _ => return None,
+    }
+
+    let checkout = std::fs::canonicalize(checkout).ok()?;
+    let candidate = normalize_path(&checkout.join(relative));
+    if !candidate.starts_with(&checkout) {
+        return None;
+    }
+
+    let canonical_candidate = std::fs::canonicalize(&candidate).ok()?;
+    canonical_candidate
+        .starts_with(&checkout)
+        .then_some(canonical_candidate)
 }
 
 fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
@@ -13220,7 +13274,7 @@ impl AppContext {
         // Mutating tools validate here, so a helper that is merely slow to be
         // scheduled must not refuse the user's change (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
-        self.validate_path_with_artifact_session(req_id, path, None)
+        self.validate_path_with_artifact_session(req_id, path, None, None)
     }
 
     /// Validate a write location without following its final path component.
@@ -13243,7 +13297,7 @@ impl AppContext {
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
-            self.check_path_access(req_id, path, path, None, true)?;
+            self.check_path_access(req_id, path, path, None, None, true)?;
             return Ok(path.to_path_buf());
         };
         let normalized = normalize_path(&path_for_resolution);
@@ -13271,7 +13325,7 @@ impl AppContext {
         })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
-        self.check_path_access(req_id, path, &resolved, None, true)?;
+        self.check_path_access(req_id, path, &resolved, None, None, true)?;
         Ok(resolved)
     }
 
@@ -13287,7 +13341,7 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id));
+        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id), None);
         if crate::context::confinement::for_request(req_id) {
             // Canonical targets and symlink destinations are private outside the
             // fence. Always report the caller's spelling, including on failure.
@@ -13297,11 +13351,22 @@ impl AppContext {
         }
     }
 
+    pub(crate) fn validate_search_path(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+        search_tool: WorkerSearchTool,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_path_with_artifact_session(req_id, path, Some(session_id), Some(search_tool))
+    }
+
     fn validate_path_with_artifact_session(
         &self,
         req_id: &str,
         path: &Path,
         artifact_session_id: Option<&str>,
+        search_tool: Option<WorkerSearchTool>,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
@@ -13321,12 +13386,19 @@ impl AppContext {
                     let resolved = crate::bounded_io::canonicalize(path).map_err(|error| {
                         crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
                     })?;
-                    self.check_path_access(req_id, path, &resolved, artifact_session_id, false)?;
+                    self.check_path_access(
+                        req_id,
+                        path,
+                        &resolved,
+                        artifact_session_id,
+                        search_tool,
+                        false,
+                    )?;
                     return Ok(resolved);
                 }
             }
             // Root restriction is disabled, so retain ordinary callers' spelling.
-            self.check_path_access(req_id, path, path, artifact_session_id, false)?;
+            self.check_path_access(req_id, path, path, artifact_session_id, search_tool, false)?;
             return Ok(path.to_path_buf());
         };
 
@@ -13365,7 +13437,14 @@ impl AppContext {
             resolve(req_id, &path_for_resolution, &resolved_root, &raw_root)?
         };
 
-        self.check_path_access(req_id, path, &resolved, artifact_session_id, false)?;
+        self.check_path_access(
+            req_id,
+            path,
+            &resolved,
+            artifact_session_id,
+            search_tool,
+            false,
+        )?;
         Ok(resolved)
     }
 
@@ -13451,6 +13530,69 @@ impl AppContext {
         }
     }
 
+    fn checkout_root_for_message(&self) -> Option<PathBuf> {
+        let root = self
+            .config()
+            .project_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())?;
+        Some(root)
+    }
+
+    fn current_call_is_worker(&self) -> bool {
+        let Some(scope) = crate::access_policy::current_scope() else {
+            return false;
+        };
+        let Some(db) = self.db() else {
+            return false;
+        };
+        let Ok(conn) = db.lock() else {
+            return false;
+        };
+        crate::db::access_grants::is_worker(&conn, &scope).unwrap_or(false)
+    }
+
+    fn worker_root_search_refusal(
+        &self,
+        req_id: &str,
+        original: &Path,
+        search_tool: Option<WorkerSearchTool>,
+    ) -> Option<crate::protocol::Response> {
+        search_tool?;
+        if !relative_components_under_root(&normalize_path(original))
+            .is_some_and(|relative| relative.as_os_str().is_empty())
+            || !self.current_call_is_worker()
+            || !matches!(
+                crate::access_policy::current_ask_route(),
+                crate::access_policy::AskRoute::Consent { .. }
+            )
+        {
+            return None;
+        }
+        let checkout = self.checkout_root_for_message()?;
+        Some(crate::protocol::Response::error(
+            req_id,
+            "worker_root_search",
+            format!("use your checkout instead: {}", checkout.display()),
+        ))
+    }
+
+    fn checkout_path_suggestion(&self, original: &Path) -> Option<PathBuf> {
+        if !original.has_root() || !self.current_call_is_worker() {
+            return None;
+        }
+        let checkout = self.checkout_root_for_message()?;
+        if crate::bounded_io::current().is_some() {
+            crate::bounded_io::run(original, None, move |path| {
+                Ok(checkout_counterpart(&path, &checkout))
+            })
+            .ok()
+            .flatten()
+        } else {
+            checkout_counterpart(original, &checkout)
+        }
+    }
+
     /// Resolve an `ask` decision for the call on this thread. A lowered route
     /// treats the ask as allow. A consent route allows only what an
     /// `allow_once` answer approved for this dispatch; anything else refuses
@@ -13490,6 +13632,17 @@ impl AppContext {
         if once.iter().any(|grant| grant.covers(operation, identity)) {
             return Ok(());
         }
+        if let Some(suggestion) = self.checkout_path_suggestion(original) {
+            return Err(crate::protocol::Response::error(
+                req_id,
+                "path_not_found_did_you_mean",
+                format!(
+                    "path not found: {}; did you mean {}?",
+                    original.display(),
+                    suggestion.display()
+                ),
+            ));
+        }
         // A directory is asked for as a subtree so one answer covers what the
         // tool reads beneath it. The probe stays on the bounded helper when
         // one is active, like every other path probe on the request path.
@@ -13527,9 +13680,13 @@ impl AppContext {
         original: &Path,
         resolved: &Path,
         artifact_session: Option<&str>,
+        search_tool: Option<WorkerSearchTool>,
         preserve_final: bool,
     ) -> Result<(), crate::protocol::Response> {
         use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
+        if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
+            return Err(response);
+        }
         let operation = if artifact_session.is_some() {
             AccessOperation::Read
         } else {
