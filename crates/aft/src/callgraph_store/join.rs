@@ -1648,10 +1648,17 @@ impl DispatchTypeTargetTrace {
         !self.probes.is_disjoint(paths)
     }
 
-    fn replays(&self, index: &impl super::ResolverIndex) -> bool {
-        self.queries
-            .iter()
-            .all(|(query, expected)| query.answer(index) == *expected)
+    /// True when every recorded answer is unchanged in `index`. Traces share
+    /// many queries (a crate's module parents, for one), so answers are kept
+    /// in `answers` for the next trace checked against the same index.
+    fn replays<'q>(
+        &'q self,
+        index: &impl super::ResolverIndex,
+        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+    ) -> bool {
+        self.queries.iter().all(|(query, expected)| {
+            *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+        })
     }
 }
 
@@ -1673,11 +1680,13 @@ pub(crate) type DispatchTypeTargetTraces<'p> =
 pub(crate) enum DispatchTypeTargetPlan<'p> {
     /// Every Rust file of the manifest, as a cold build does.
     All,
-    /// The files of `recompute`, plus every file whose previous trace depends
-    /// on a changed path, on a file whose index surface this join rebuilt, or
-    /// on the crate-wide module domain, and then either probed a path that was
-    /// added or removed or reads an index answer that changed. Other files
-    /// keep their previous targets.
+    /// Resolve every file of `recompute`. Other Rust files are checked only
+    /// when their previous trace depends on a path of `recompute`, on a path
+    /// of `membership_changed`, on a file whose index entry this join had to
+    /// rebuild, or on the crate-wide module domain. A checked file is resolved
+    /// again when its trace probed an added or removed path, or when one of
+    /// the index answers it recorded is different now. Every other file keeps
+    /// its previous targets.
     Selected {
         recompute: &'p BTreeSet<String>,
         membership_changed: &'p BTreeSet<String>,
@@ -2572,9 +2581,11 @@ fn join_manifest_with_surfaces(
                 seeds.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
                 let traces = traces(&seeds)?;
                 let mut files = recompute.clone();
+                let mut answers = BTreeMap::new();
                 for (file, trace) in &traces {
                     if !files.contains(file)
-                        && (trace.probes_any(membership_changed) || !trace.replays(&index))
+                        && (trace.probes_any(membership_changed)
+                            || !trace.replays(&index, &mut answers))
                     {
                         files.insert(file.clone());
                     }

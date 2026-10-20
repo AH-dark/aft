@@ -1158,6 +1158,7 @@ fn materialize_reading(
     stats.dispatch_type_target_decoded_blobs = joined.dispatch_type_target_decoded_blobs;
     stats.dispatch_full = dispatch_work.full;
     profile.finish("dispatch");
+    let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
@@ -1167,7 +1168,9 @@ fn materialize_reading(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_materialization_version', ?1)",
         [MATERIALIZATION_VERSION],
     )?;
+    commit_stage.finish("metadata", format_args!(""));
     transaction.commit()?;
+    commit_stage.finish("sqlite_commit", format_args!(""));
     profile.finish("commit");
     if let Some(probe) = write_probe {
         probe.finish(&connection, database_path);

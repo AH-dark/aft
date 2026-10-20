@@ -1554,10 +1554,16 @@ impl DifferentialCorpus {
 
     /// Apply one randomly chosen edit and describe it.
     fn step(&mut self) -> String {
+        let choice = self.next(14);
+        self.apply(choice)
+    }
+
+    /// Apply edit number `choice` and describe it.
+    fn apply(&mut self, choice: usize) -> String {
         let id = self.next_id;
         self.next_id += 1;
         let modules = self.typescript_modules();
-        match self.next(13) {
+        match choice {
             0 => {
                 // Insert a symbol before the others, renumbering every ordinal
                 // after it, so incoming references must be relinked.
@@ -1674,6 +1680,18 @@ impl DifferentialCorpus {
                 );
                 "insert rust method call at the start of board.rs".into()
             }
+            12 => {
+                // Unchanged importers of the type keep their source but lose
+                // or regain the receiver type their calls resolve through.
+                let shapes = self.files.get_mut("src/shapes.rs").unwrap();
+                if shapes.contains("pub struct Tile;") {
+                    *shapes = shapes.replace("pub struct Tile;", "pub struct Tile2;");
+                    "rename rust type Tile".into()
+                } else {
+                    *shapes = shapes.replace("pub struct Tile2;", "pub struct Tile;");
+                    "restore rust type Tile".into()
+                }
+            }
             11 => {
                 if self.files.remove("circle.ts").is_some() {
                     "remove circle.ts".into()
@@ -1702,15 +1720,25 @@ impl DifferentialCorpus {
 fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
     let f = fixture();
     let conn = Connection::open(&f.blobs).unwrap();
-    // These seeds collectively exercise every corpus edit with fewer redundant
-    // all-pairs SQLite materializations.
-    for seed in [1_u64, 2, 4] {
+    // The random seeds collectively exercise every corpus edit with few
+    // redundant all-pairs SQLite materializations. The two fixed walks then go
+    // through every method-call edit, so each one is compared whatever the
+    // random choices were.
+    let scripts = [1_u64, 2, 4]
+        .into_iter()
+        .map(|seed| (seed, None))
+        .chain([(7, Some([6, 8, 9, 12])), (8, Some([7, 10, 12, 11]))])
+        .collect::<Vec<_>>();
+    for (seed, script) in scripts {
         let mut corpus = DifferentialCorpus::new(seed);
         let mut versions = Vec::new();
         let mut steps = Vec::new();
         for step in 0..5 {
             if step > 0 {
-                steps.push(corpus.step());
+                steps.push(match script {
+                    Some(script) => corpus.apply(script[step - 1]),
+                    None => corpus.step(),
+                });
             }
             let files = corpus
                 .files
@@ -2021,13 +2049,15 @@ fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
     };
     let base = version(None);
     let cases = [
-        // Moves every site of f3 without changing what any file declares.
+        // Prepends a function to f3.ts, which renumbers every method-call site
+        // of that file but changes no class or method any file declares.
         (
             "body edit",
             version(Some("export function first() { return 0; }\n")),
             1,
         ),
-        // Declares a method named run5, which f5's calls resolve to.
+        // Adds to f3.ts a class with a method named run5, which the calls in
+        // f5.ts resolve to by name.
         (
             "new method",
             version(Some("export class Extra { run5() { return 5; } }\n")),

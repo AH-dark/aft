@@ -231,8 +231,8 @@ pub(super) fn reusable(transaction: &Transaction<'_>) -> Result<bool> {
     )?)
 }
 
-/// The stored receiver type target traces of the files whose trace depends
-/// on one of `seeds`.
+/// Reads, from `view_dispatch_files`, the receiver type target trace of each
+/// file whose stored trace dependencies include one of `seeds`.
 pub(super) fn type_target_traces(
     transaction: &Transaction<'_>,
     seeds: &BTreeSet<String>,
