@@ -108,6 +108,12 @@ pub struct SandboxProfile {
     pub v: u32,
     #[serde(default)]
     pub mode: crate::config::SandboxMode,
+    /// Authenticated worker boundary; head shells leave this false.
+    #[serde(default)]
+    pub worker_jail: bool,
+    /// macOS keychain directories denied after all file grants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keychain_deny: Vec<PathBuf>,
     /// Deny reads and writes to credential filenames starting with these paths
     /// (for example ~/.cargo/credentials.toml), including future suffixes.
     #[serde(default)]
@@ -165,6 +171,8 @@ impl SandboxProfile {
         Ok(Self {
             v: SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
+            worker_jail: false,
+            keychain_deny: Vec::new(),
             deny_prefixes: Vec::new(),
             data_policy: SandboxDataPolicy::default(),
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
@@ -207,6 +215,13 @@ impl SandboxProfile {
         Ok(Self {
             v: self.v,
             mode: self.mode,
+            worker_jail: self.worker_jail,
+            keychain_deny: canonicalize_denies(
+                self.keychain_deny,
+                "keychain_deny",
+                &mut deny_paths,
+                true,
+            )?,
             deny_prefixes: canonicalize_denies(
                 self.deny_prefixes,
                 "deny_prefixes",
@@ -1342,6 +1357,8 @@ mod tests {
         let profile = SandboxProfile {
             v: SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
+            worker_jail: false,
+            keychain_deny: Vec::new(),
             deny_prefixes: Vec::new(),
             data_policy: SandboxDataPolicy::default(),
             writable_roots: vec![root.clone()],

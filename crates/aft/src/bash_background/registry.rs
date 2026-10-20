@@ -12474,6 +12474,8 @@ mod tests {
                 data_policy: Default::default(),
                 v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
                 mode: crate::config::SandboxMode::Strict,
+                worker_jail: false,
+                keychain_deny: Vec::new(),
                 deny_prefixes: Vec::new(),
                 writable_roots: Vec::new(),
                 writable_files: Vec::new(),
