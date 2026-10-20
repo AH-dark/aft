@@ -1,1 +1,0 @@
-- LSP discovery now reuses cached applicability after ordinary content edits, while still refreshing for file, workspace, ignore-rule and dependency changes; health reports include per-checkout cache counters and timings.

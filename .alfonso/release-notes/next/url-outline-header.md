@@ -1,1 +1,0 @@
-- URL outlines now show the requested URL instead of a private cache filename, and explain how to zoom into a heading.

@@ -1,1 +1,0 @@
-- Codemode programs a head agent runs can now call every AFT tool with exactly that agent's access: its root, policy, sandbox and undo history. A call that would need a permission prompt is refused with `permission_ask_unavailable`; background commands a program starts are killed when its run ends.

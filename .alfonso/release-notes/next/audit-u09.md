@@ -1,1 +1,0 @@
-- Edits and syntax rollbacks now replace files atomically and keep their permissions, ACLs, extended attributes, owner, group and hard links (when an atomic replacement can't keep them, the file is rewritten in place). `apply_patch` rejects malformed patches and ambiguous inexact matches before writing anything, and symbol diffs track each overload separately.
