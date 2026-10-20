@@ -30,7 +30,11 @@ const STATUS_CADENCE: Duration = Duration::from_millis(2_500);
 /// diagnostic read.
 const READER_FRESH_WINDOW_MS: u64 = 10_000;
 const DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
-const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// Upper bound of the doubling backoff between failed discoveries or failed
+/// holder route opens. A holder that is restarting is usually back within a
+/// few doublings; one that stays unreachable is asked once a minute rather
+/// than every few seconds.
+const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
 const STATUS_HOLDER_MODULE: &str = "prefrontal-core";
@@ -139,6 +143,111 @@ struct FleetStatusInner {
     route_live: AtomicBool,
     state: parking_lot::Mutex<ClientState>,
     next_revision: AtomicU64,
+    /// The holder route the dial stopped reopening, if any. The health report
+    /// lists it (see [`stopped_routes_snapshot`]).
+    stopped_route: parking_lot::Mutex<Option<StoppedRoute>>,
+}
+
+impl FleetStatusInner {
+    fn new(wire_tx: Option<mpsc::Sender<StatusWireRequest>>, route_live: bool) -> Self {
+        Self {
+            wire_tx,
+            route_live: AtomicBool::new(route_live),
+            state: parking_lot::Mutex::new(ClientState::default()),
+            next_revision: AtomicU64::new(1),
+            stopped_route: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+/// A holder route the status dial will not open again for one session,
+/// because the holder (or the daemon) refused the open with a code that
+/// subc-protocol classes as terminal: asking again gets the same answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoppedRoute {
+    target: String,
+    session: String,
+    harness: String,
+    project_root: String,
+    code: String,
+    message: String,
+    stopped_at_unix_ms: u64,
+}
+
+impl StoppedRoute {
+    fn to_value(&self) -> Value {
+        json!({
+            "component": "fleet_status",
+            "target": self.target,
+            "session": self.session,
+            "harness": self.harness,
+            "project_root": self.project_root,
+            "refusal": { "code": self.code, "message": self.message },
+            "stopped_at_unix_ms": self.stopped_at_unix_ms,
+        })
+    }
+}
+
+/// Every dialing status client in this process, so the health report can list
+/// the routes they stopped reopening. Production has one dial per daemon
+/// connection; dropped clients are pruned whenever the list is touched.
+static DIAL_CLIENTS: parking_lot::Mutex<Vec<Weak<FleetStatusInner>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+fn register_dial_client(inner: &Arc<FleetStatusInner>) {
+    let mut clients = DIAL_CLIENTS.lock();
+    clients.retain(|client| client.strong_count() > 0);
+    clients.push(Arc::downgrade(inner));
+}
+
+/// The holder routes the status dials stopped reopening after a terminal
+/// refusal, one row per route, for the health report's `stopped_routes`.
+pub(crate) fn stopped_routes_snapshot() -> Value {
+    let mut clients = DIAL_CLIENTS.lock();
+    clients.retain(|client| client.strong_count() > 0);
+    Value::Array(
+        clients
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter_map(|client| {
+                client
+                    .stopped_route
+                    .lock()
+                    .as_ref()
+                    .map(StoppedRoute::to_value)
+            })
+            .collect(),
+    )
+}
+
+/// Why opening the holder route failed, as far as retrying it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RouteOpenFailure {
+    /// The holder or the daemon refused with a code subc-protocol classes as
+    /// terminal (`error_codes::is_retryable_route_open` is false for it), such
+    /// as a holder whose bind check rejects this session's project.
+    Refused { code: String, message: String },
+    /// A failure a later attempt can get past: a lost connection, a timeout,
+    /// or a holder that is restarting or warming up.
+    Transient(String),
+}
+
+impl RouteOpenFailure {
+    fn from_call_error(error: &subc_client_rs::CallError) -> Self {
+        let refusal = match error {
+            subc_client_rs::CallError::Module(body) => Some(body),
+            other => other.route_open_refusal(),
+        };
+        match refusal {
+            Some(body) if !subc_protocol::error_codes::is_retryable_route_open(&body.code) => {
+                Self::Refused {
+                    code: body.code.clone(),
+                    message: body.message.clone(),
+                }
+            }
+            _ => Self::Transient(error.to_string()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -161,28 +270,25 @@ impl FleetStatusClient {
         route_live: bool,
     ) -> (Self, mpsc::Receiver<StatusWireRequest>) {
         let (wire_tx, wire_rx) = mpsc::channel(capacity);
-        (
-            Self {
-                inner: Arc::new(FleetStatusInner {
-                    wire_tx: Some(wire_tx),
-                    route_live: AtomicBool::new(route_live),
-                    state: parking_lot::Mutex::new(ClientState::default()),
-                    next_revision: AtomicU64::new(1),
-                }),
-            },
-            wire_rx,
-        )
+        let inner = Arc::new(FleetStatusInner::new(Some(wire_tx), route_live));
+        register_dial_client(&inner);
+        (Self { inner }, wire_rx)
     }
 
     pub(crate) fn dormant() -> Self {
         Self {
-            inner: Arc::new(FleetStatusInner {
-                wire_tx: None,
-                route_live: AtomicBool::new(false),
-                state: parking_lot::Mutex::new(ClientState::default()),
-                next_revision: AtomicU64::new(1),
-            }),
+            inner: Arc::new(FleetStatusInner::new(None, false)),
         }
+    }
+
+    /// The holder route this client's dial stopped reopening, if any.
+    #[cfg(test)]
+    pub(crate) fn stopped_route(&self) -> Option<StoppedRoute> {
+        self.inner.stopped_route.lock().clone()
+    }
+
+    fn set_stopped_route(&self, stopped: Option<StoppedRoute>) {
+        *self.inner.stopped_route.lock() = stopped;
     }
 
     pub(crate) fn set_route_live(&self, route_live: bool) {
@@ -284,7 +390,7 @@ pub(crate) struct StatusWireRequest {
     client: Weak<FleetStatusInner>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct FleetRouteIdentity {
     project_root: String,
     harness: String,
@@ -443,7 +549,7 @@ trait StatusConsumer {
         &self,
         target: RouteTarget,
         identity: BindIdentity,
-    ) -> Result<Self::Route, String>;
+    ) -> Result<Self::Route, RouteOpenFailure>;
     fn push_events(&self, route: &Self::Route) -> Result<mpsc::Receiver<PushEvent>, String>;
     /// The channel this connection knows the route by, which the daemon's
     /// route-close pushes name.
@@ -473,7 +579,7 @@ impl StatusConsumer for SubcConsumer {
         &self,
         target: RouteTarget,
         identity: BindIdentity,
-    ) -> Result<Self::Route, String> {
+    ) -> Result<Self::Route, RouteOpenFailure> {
         SubcConsumer::open_route(
             self,
             target,
@@ -484,7 +590,7 @@ impl StatusConsumer for SubcConsumer {
             },
         )
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| RouteOpenFailure::from_call_error(&error))
     }
 
     fn push_events(&self, route: &Self::Route) -> Result<mpsc::Receiver<PushEvent>, String> {
@@ -512,7 +618,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
     consumer: C,
     client: FleetStatusClient,
     mut wire_rx: mpsc::Receiver<StatusWireRequest>,
-    route_identity: FleetRouteIdentity,
+    mut route_identity: FleetRouteIdentity,
     mut pending_request: Option<StatusWireRequest>,
 ) {
     let (connection_state_tx, mut connection_state_rx) = mpsc::unbounded_channel();
@@ -530,6 +636,12 @@ async fn run_connected_status_dial<C: StatusConsumer>(
     // itself, because the daemon's close push can arrive after the dial has
     // already let the route go, and is replaced only by the next open.
     let mut last_route_channel: Option<u16> = None;
+    // Set when the holder refused to open the route for `route_identity` with a
+    // terminal code. The dial then never opens it again for that identity; a
+    // publish from another session, project or harness replaces the identity
+    // and gets its own single attempt. A daemon reconnect does not clear it:
+    // the holder, not the connection, made the decision.
+    let mut refused_identity: Option<FleetRouteIdentity> = None;
 
     let mut route: Option<C::Route> = None;
     let mut route_events = None;
@@ -539,7 +651,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         if tokio::time::Instant::now() >= next_discovery_at {
             match consumer.catalog_list().await {
                 Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
-                    if route.is_none() && reopen_forbidden.is_none() {
+                    if route.is_none() && reopen_forbidden.is_none() && refused_identity.is_none() {
                         // `BindIdentity::new` leaves the registered project id
                         // unset: the dial has no resolved id to send.
                         let identity = BindIdentity::new(
@@ -571,8 +683,37 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                                     client.set_route_live(false);
                                 }
                             },
-                            Err(error) => {
-                                log::debug!("fleet status dial: route unavailable: {error}");
+                            Err(RouteOpenFailure::Refused { code, message }) => {
+                                log::warn!(
+                                    "fleet status dial: {STATUS_HOLDER_MODULE} refused the status route for session {} (harness {}, project {}): {code}: {message}; not reopening it for this session",
+                                    route_identity.session,
+                                    route_identity.harness,
+                                    route_identity.project_root,
+                                );
+                                client.set_stopped_route(Some(StoppedRoute {
+                                    target: STATUS_HOLDER_MODULE.to_string(),
+                                    session: route_identity.session.clone(),
+                                    harness: route_identity.harness.clone(),
+                                    project_root: route_identity.project_root.clone(),
+                                    code,
+                                    message,
+                                    stopped_at_unix_ms: unix_now_ms(),
+                                }));
+                                refused_identity = Some(route_identity.clone());
+                                client.set_route_live(false);
+                            }
+                            Err(RouteOpenFailure::Transient(error)) => {
+                                // Log the first failure of a run at info so the
+                                // AFT log shows the route is down; the retries
+                                // after it log at debug.
+                                if discovery_backoff == DISCOVERY_INITIAL_BACKOFF {
+                                    log::info!(
+                                        "fleet status dial: {STATUS_HOLDER_MODULE} route unavailable for session {}: {error}; retrying with backoff",
+                                        route_identity.session,
+                                    );
+                                } else {
+                                    log::debug!("fleet status dial: route unavailable: {error}");
+                                }
                                 client.set_route_live(false);
                             }
                         }
@@ -606,6 +747,23 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         }
 
         if let Some(request) = pending_request.take() {
+            if route.is_none() {
+                let requested = FleetRouteIdentity::from(&request);
+                if refused_identity
+                    .as_ref()
+                    .is_some_and(|refused| *refused != requested)
+                {
+                    // The refusal was about the identity the route was opened
+                    // under, not about every session: open once for this one.
+                    route_identity = requested;
+                    refused_identity = None;
+                    client.set_stopped_route(None);
+                    discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
+                    next_discovery_at = tokio::time::Instant::now();
+                    pending_request = Some(request);
+                    continue;
+                }
+            }
             let Some(opened_route) = route.as_ref() else {
                 request.complete_unavailable();
                 continue;
@@ -894,6 +1052,7 @@ mod tests {
         catalog_calls: Arc<AtomicU64>,
         publish_calls: Arc<AtomicU64>,
         succeeds_on: Option<usize>,
+        failure: RouteOpenFailure,
         connection_callback: Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
         push_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>>,
         control_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<ControlPush>>>>,
@@ -932,13 +1091,13 @@ mod tests {
             &self,
             _target: RouteTarget,
             _identity: BindIdentity,
-        ) -> Result<usize, String> {
+        ) -> Result<usize, RouteOpenFailure> {
             let mut attempts = self.attempts.lock();
             attempts.push(tokio::time::Instant::now());
             if self.succeeds_on == Some(attempts.len()) {
                 Ok(attempts.len())
             } else {
-                Err("module_rejected/classification_unavailable".to_owned())
+                Err(self.failure.clone())
             }
         }
 
@@ -962,6 +1121,20 @@ mod tests {
         }
     }
 
+    /// A failure the dial may retry: the holder is restarting.
+    fn transient_failure() -> RouteOpenFailure {
+        RouteOpenFailure::Transient("route.open refused: module_reloading".to_owned())
+    }
+
+    /// The terminal refusal seen live: prefrontal-core's bind check could not
+    /// classify the session's project.
+    fn terminal_refusal() -> RouteOpenFailure {
+        RouteOpenFailure::Refused {
+            code: "project_origin_unclassifiable".to_owned(),
+            message: "the project origin could not be classified".to_owned(),
+        }
+    }
+
     async fn dial_with_rejections(
         succeeds_on: Option<usize>,
     ) -> (
@@ -969,8 +1142,27 @@ mod tests {
         Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
         Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
     ) {
+        let (task, attempts, callback, _client) =
+            dial_failing_with(succeeds_on, transient_failure(), "session-1").await;
+        (task, attempts, callback)
+    }
+
+    /// Start a dial whose route opens fail with `failure` (except attempt
+    /// `succeeds_on`), after a first publish from `session`. Returns the dial
+    /// task, the open attempt times, the connection-state callback and the
+    /// client the dial serves.
+    async fn dial_failing_with(
+        succeeds_on: Option<usize>,
+        failure: RouteOpenFailure,
+        session: &str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+        Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
+        FleetStatusClient,
+    ) {
         let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
-        assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
+        assert!(!client.publish(Path::new("/tmp/project"), "opencode", session, "local"));
         let first_request = wire_rx.try_recv().expect("first discovery request");
         let identity = FleetRouteIdentity::from(&first_request);
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -981,19 +1173,20 @@ mod tests {
             catalog_calls: Arc::default(),
             publish_calls: Arc::default(),
             succeeds_on,
+            failure,
             connection_callback: callback.clone(),
             push_sender: Arc::default(),
             control_sender: Arc::default(),
         };
         let task = tokio::spawn(run_connected_status_dial(
             consumer,
-            client,
+            client.clone(),
             wire_rx,
             identity,
             Some(first_request),
         ));
         tokio::task::yield_now().await;
-        (task, attempts, callback)
+        (task, attempts, callback, client)
     }
 
     #[tokio::test]
@@ -1013,6 +1206,7 @@ mod tests {
             catalog_calls: catalog_calls.clone(),
             publish_calls: publish_calls.clone(),
             succeeds_on: Some(1),
+            failure: transient_failure(),
             connection_callback: Arc::default(),
             push_sender: Arc::default(),
             control_sender: Arc::default(),
@@ -1082,6 +1276,7 @@ mod tests {
         let consumer = RejectingConsumer {
             attempts: attempts.clone(),
             succeeds_on: Some(1),
+            failure: transient_failure(),
             advertises_status_line: true,
             catalog_calls: Arc::default(),
             publish_calls: Arc::default(),
@@ -1175,36 +1370,268 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn rejected_binds_back_off_to_cap() {
-        let (task, attempts, _) = dial_with_rejections(None).await;
-        let start = attempts.lock()[0];
-        for tick in 1..=71 {
-            advance_and_observe(
-                &attempts,
-                DISCOVERY_INITIAL_BACKOFF,
-                1 + [1, 3, 7, 15, 31, 51, 71]
-                    .iter()
-                    .filter(|&&attempt_tick| attempt_tick <= tick)
-                    .count(),
-            )
-            .await;
+    /// Advance the paused clock by `total` in steps of the initial backoff, so
+    /// every open the dial schedules runs at its exact deadline.
+    async fn advance_in_steps(total: Duration) {
+        let steps = total.as_millis() / DISCOVERY_INITIAL_BACKOFF.as_millis();
+        for _ in 0..steps {
+            tokio::time::advance(DISCOVERY_INITIAL_BACKOFF).await;
+            tokio::task::yield_now().await;
         }
-        let observed: Vec<_> = attempts.lock().iter().map(|at| *at - start).collect();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_open_failures_back_off_with_growing_gaps_to_a_bound() {
+        let (task, attempts, _) = dial_with_rejections(None).await;
+        advance_in_steps(Duration::from_secs(200)).await;
+        let opened_at = attempts.lock().clone();
+        task.abort();
+        let gaps: Vec<_> = opened_at.windows(2).map(|pair| pair[1] - pair[0]).collect();
         assert_eq!(
-            observed,
+            gaps,
             vec![
-                Duration::ZERO,
                 Duration::from_millis(250),
-                Duration::from_millis(750),
-                Duration::from_millis(1750),
-                Duration::from_millis(3750),
-                Duration::from_millis(7750),
-                Duration::from_millis(12750),
-                Duration::from_millis(17750),
-            ]
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(32),
+                DISCOVERY_MAX_BACKOFF,
+                DISCOVERY_MAX_BACKOFF,
+            ],
+            "a restarting holder is retried with doubling gaps up to the bound"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_refusal_gets_one_open_attempt_per_session() {
+        let session = "terminal-refusal-session-1";
+        let (task, attempts, _, client) =
+            dial_failing_with(None, terminal_refusal(), session).await;
+        advance_in_steps(Duration::from_secs(600)).await;
+        // Later publishes from the refused session do not bring the route back.
+        for _ in 0..3 {
+            client.publish(Path::new("/tmp/project"), "opencode", session, "local");
+            advance_in_steps(Duration::from_secs(5)).await;
+        }
+        assert_eq!(
+            attempts.lock().len(),
+            1,
+            "a terminal refusal ends the route opens for its session"
+        );
+        let stopped = client
+            .stopped_route()
+            .expect("the stopped route is recorded");
+        assert_eq!(stopped.session, session);
+        assert_eq!(stopped.target, STATUS_HOLDER_MODULE);
+        assert_eq!(stopped.code, "project_origin_unclassifiable");
+        let health = stopped_routes_snapshot();
+        assert!(
+            health
+                .as_array()
+                .expect("stopped routes are a list")
+                .iter()
+                .any(|row| {
+                    row["session"] == session
+                        && row["target"] == STATUS_HOLDER_MODULE
+                        && row["refusal"]["code"] == "project_origin_unclassifiable"
+                }),
+            "the health report names the stopped route: {health}"
+        );
+
+        // A publish from another session gets one attempt of its own, and its
+        // refusal stops that session's route the same way.
+        let other = "terminal-refusal-session-2";
+        client.publish(Path::new("/tmp/other-project"), "opencode", other, "local");
+        advance_in_steps(Duration::from_secs(600)).await;
+        assert_eq!(attempts.lock().len(), 2, "one open for the second session");
+        assert_eq!(
+            client.stopped_route().map(|stopped| stopped.session),
+            Some(other.to_owned())
         );
         task.abort();
+    }
+
+    /// A subc daemon that answers HELLO and refuses every `route.open` with
+    /// `code`, counting the opens it was sent. Returns the connection file to
+    /// dial (inside the returned directory) and the open count.
+    async fn refusing_daemon(
+        code: &'static str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Arc<AtomicU64>) {
+        use subc_protocol::{
+            Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION,
+        };
+        use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let key = vec![0x42; subc_transport::KEY_LEN];
+        let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+        let opens = Arc::new(AtomicU64::new(0));
+        let server_opens = Arc::clone(&opens);
+        let server_key = key.clone();
+        tokio::spawn(async move {
+            let flags = Flags::new(false, Priority::Passive, false);
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let key = server_key.clone();
+                let opens = Arc::clone(&server_opens);
+                tokio::spawn(async move {
+                    if subc_transport::authenticate_server(
+                        &mut stream,
+                        &key,
+                        &daemon_id,
+                        "subc-test",
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                        let header = frame.header;
+                        let reply = match header.ty {
+                            FrameType::Hello => Frame::build(
+                                FrameType::HelloAck,
+                                flags,
+                                0,
+                                0,
+                                header.corr,
+                                serde_json::to_vec(&ModuleHelloAckBody {
+                                    negotiated_ver: PROTOCOL_VERSION,
+                                    subc_ops: Vec::new(),
+                                    subc_capabilities: Vec::new(),
+                                    storage: None,
+                                    machine_id: None,
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                            FrameType::Request if header.channel == 0 => {
+                                let body: Value =
+                                    serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
+                                if body.get("op").and_then(Value::as_str) != Some("route.open") {
+                                    continue;
+                                }
+                                opens.fetch_add(1, Ordering::Relaxed);
+                                Frame::build(
+                                    FrameType::Error,
+                                    flags,
+                                    0,
+                                    0,
+                                    header.corr,
+                                    serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                                        code,
+                                        "refused by the fake daemon",
+                                    ))
+                                    .unwrap(),
+                                )
+                                .unwrap()
+                            }
+                            _ => continue,
+                        };
+                        if subc_transport::write_frame(&mut stream, &reply)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("connection.json");
+        connection_file::write_atomic(
+            &file,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                }],
+                key,
+                daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "fleet-status-refusal-test".to_string(),
+            },
+        )
+        .unwrap();
+        (dir, file, opens)
+    }
+
+    async fn connect_to(file: &Path) -> SubcConsumer {
+        SubcConsumer::connect(
+            file,
+            ConsumerOptions {
+                call_timeout: Duration::from_secs(5),
+                ..ConsumerOptions::default()
+            },
+        )
+        .await
+        .expect("the fake daemon accepts the connection")
+    }
+
+    fn holder_target() -> RouteTarget {
+        RouteTarget::ManagementSurface {
+            module_id: STATUS_HOLDER_MODULE.to_string(),
+        }
+    }
+
+    /// The production open path, through the real subc client: a holder's
+    /// terminal refusal reaches the daemon once (the client does not retry it
+    /// either) and the dial sees it as terminal.
+    #[tokio::test]
+    async fn a_holder_refusal_through_the_subc_client_is_terminal_and_sent_once() {
+        let (_dir, file, opens) = refusing_daemon("project_origin_unclassifiable").await;
+        let consumer = connect_to(&file).await;
+        let failure = StatusConsumer::open_route(
+            &consumer,
+            holder_target(),
+            BindIdentity::new("/tmp/project", "runner", "session-1"),
+        )
+        .await
+        .expect_err("the fake daemon refuses every open");
+        assert_eq!(
+            failure,
+            RouteOpenFailure::Refused {
+                code: "project_origin_unclassifiable".to_owned(),
+                message: "refused by the fake daemon".to_owned(),
+            }
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+    }
+
+    /// A refusal subc-protocol classes as retryable (the holder is reloading)
+    /// stays transient even after the client's own retries run out.
+    #[tokio::test]
+    async fn a_reloading_holder_through_the_subc_client_is_transient() {
+        let (_dir, file, opens) = refusing_daemon("module_reloading").await;
+        let consumer = connect_to(&file).await;
+        let error = SubcConsumer::open_route(
+            &consumer,
+            holder_target(),
+            BindIdentity::new("/tmp/project", "runner", "session-1"),
+            CallOptions {
+                timeout: Duration::from_millis(400),
+                route_retry_deadline: Duration::from_millis(400),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .expect_err("the fake daemon refuses every open");
+        assert!(
+            matches!(
+                RouteOpenFailure::from_call_error(&error),
+                RouteOpenFailure::Transient(_)
+            ),
+            "{error}"
+        );
+        assert!(opens.load(Ordering::Relaxed) >= 1);
     }
 
     #[tokio::test(start_paused = true)]
