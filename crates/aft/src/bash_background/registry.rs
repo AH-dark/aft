@@ -1731,7 +1731,9 @@ impl BgTaskRegistry {
             .map(|cursor| cursor.total_examined)
     }
 
-    #[cfg(test)]
+    // Only the Unix unreadable-session replay test uses this; Windows cannot
+    // make a session directory unreadable the same way.
+    #[cfg(all(test, unix))]
     pub(crate) fn expire_project_replay_backoff_for_test(&self) {
         if let Some(cursor) = self.inner.project_replay_scan.lock().unwrap().as_mut() {
             for failure in cursor.failures.values_mut() {
