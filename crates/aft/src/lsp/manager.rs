@@ -872,8 +872,26 @@ pub struct LspManager {
     /// answers a close within moments, so an old entry no longer guards
     /// anything, and without the cap a long session inspecting many files
     /// kept one entry per file for good.
-    inspect_closed_documents: HashMap<(ServerKey, PathBuf), u64>,
+    inspect_closed_documents: HashMap<(ServerKey, PathBuf), InspectClosedDocument>,
     inspect_close_sequence: u64,
+    /// Documents AFT reopened (or edited) while the server's reply to a
+    /// scoped inspect's earlier `didClose` was still on its way. A server
+    /// handles messages in order, so that reply arrives before anything it
+    /// says about the reopened document; storing it would make the reopened
+    /// file read as checked clean before the server analyzed it, and a
+    /// scoped inspect waiting for a newer report would accept it. The first
+    /// unversioned publish for such a document is taken as that reply: an
+    /// empty one is ignored, and either way the entry ends (see
+    /// `is_late_close_reply`). Entries are only kept for servers whose reply
+    /// can be told apart from the reopened document's report: those that
+    /// answered a close before, and those that tag their reports with the
+    /// document version, which a reply to a close never carries. Values are
+    /// insertion order from `inspect_close_sequence`, for the same cap.
+    late_close_replies: HashMap<(ServerKey, PathBuf), u64>,
+    /// Servers seen answering a scoped inspect's `didClose` with a publish.
+    close_answering_servers: HashSet<ServerKey>,
+    /// Servers seen tagging a publish with the document version.
+    versioned_publish_servers: HashSet<ServerKey>,
     /// The latest pushed diagnostics per file from rust-analyzer instances
     /// that also answer pull requests. In that mode rust-analyzer reports its
     /// own analysis through pull and its `cargo check` results through push,
@@ -903,6 +921,32 @@ thread_local! {
 /// How many documents closed by a scoped inspect `LspManager` remembers (see
 /// `LspManager::inspect_closed_documents`).
 const INSPECT_CLOSED_DOCUMENTS_CAP: usize = 4_096;
+
+/// A document a scoped inspect closed (see
+/// `LspManager::inspect_closed_documents`).
+#[derive(Debug, Clone, Copy)]
+struct InspectClosedDocument {
+    /// Insertion order, so the oldest entries are forgotten first.
+    sequence: u64,
+    /// Whether the server's empty reply to the close has arrived.
+    answered: bool,
+}
+
+/// Forget the oldest quarter of `entries` once it grows past
+/// [`INSPECT_CLOSED_DOCUMENTS_CAP`]. Dropping a quarter at once keeps the
+/// scan rare.
+fn forget_oldest_past_cap<K, V>(entries: &mut HashMap<K, V>, sequence: impl Fn(&V) -> u64)
+where
+    K: Eq + std::hash::Hash,
+{
+    if entries.len() <= INSPECT_CLOSED_DOCUMENTS_CAP {
+        return;
+    }
+    let mut sequences: Vec<u64> = entries.values().map(&sequence).collect();
+    sequences.sort_unstable();
+    let keep_from = sequences[INSPECT_CLOSED_DOCUMENTS_CAP / 4];
+    entries.retain(|_, value| sequence(value) >= keep_from);
+}
 
 /// How many server-exit log lines `LspManager` keeps for inspection.
 const RECENT_EXIT_LOG_LINES: usize = 16;
@@ -1061,6 +1105,9 @@ impl LspManager {
             clients_generation: 0,
             inspect_closed_documents: HashMap::new(),
             inspect_close_sequence: 0,
+            late_close_replies: HashMap::new(),
+            close_answering_servers: HashSet::new(),
+            versioned_publish_servers: HashSet::new(),
             latest_push_for_pull_servers: HashMap::new(),
             latest_pull_for_rust: HashMap::new(),
             retry_clock: RetryClock::system(),
@@ -1965,7 +2012,7 @@ impl LspManager {
         config: &Config,
     ) -> Result<EnsureFileOpenResult, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
-        self.end_inspect_close_exception(&canonical_path);
+        self.end_inspect_close_exception_on_reopen(&canonical_path);
         let server_keys = self.ensure_server_for_file(&canonical_path, config);
         if server_keys.is_empty() {
             return Ok(EnsureFileOpenResult::default());
@@ -2187,7 +2234,7 @@ impl LspManager {
         if server_keys.is_empty() {
             return Ok(Vec::new());
         }
-        self.end_inspect_close_exception(&canonical_path);
+        self.end_inspect_close_exception_on_reopen(&canonical_path);
 
         let uri = uri_for_path(&canonical_path)?;
         let language_id = language_id_for_extension(
@@ -2726,6 +2773,11 @@ impl LspManager {
                 store.close(&canonical_path);
             }
             self.diagnostics.clear_for_server_file(key, &canonical_path);
+            // This close clears the file's diagnostics, so the server's empty
+            // reply to it is stored, even if it might be the reply to an
+            // earlier scoped inspect close.
+            self.late_close_replies
+                .remove(&(key.clone(), canonical_path.clone()));
         }
 
         match first_error {
@@ -2793,8 +2845,7 @@ impl LspManager {
                 .entry(key.clone())
                 .or_default()
                 .open(canonical_path.clone());
-            self.inspect_closed_documents
-                .remove(&(key.clone(), canonical_path.clone()));
+            self.reopen_inspect_closed_document(&key, &canonical_path);
             opened.push(key);
         }
         Ok(opened)
@@ -4943,6 +4994,10 @@ impl LspManager {
                         .retain(|(server, _), _| *server != key);
                     self.inspect_closed_documents
                         .retain(|(server, _), _| *server != key);
+                    self.late_close_replies
+                        .retain(|(server, _), _| *server != key);
+                    self.close_answering_servers.remove(&key);
+                    self.versioned_publish_servers.remove(&key);
                     None
                 }
             }
@@ -5032,6 +5087,18 @@ impl LspManager {
                 self.latest_push_for_pull_servers
                     .insert((key.clone(), file.clone()), stored.clone());
             }
+        }
+        if version.is_some() {
+            self.versioned_publish_servers.insert(key.clone());
+        }
+        if self.is_late_close_reply(&key, &file, version.is_some(), stored.is_empty()) {
+            slog_info!(
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-late-reply-to-inspect-close file={}",
+                key.kind.id_str(),
+                key.root.display(),
+                file.display()
+            );
+            return None;
         }
         if self.is_inspect_close_clearing(&key, &file, stored.is_empty()) {
             slog_info!(
@@ -5125,30 +5192,26 @@ impl LspManager {
         }
     }
 
-    /// True when this publish is the empty list a server sends to clear a
-    /// document that a scoped inspect opened only to read its diagnostics and
-    /// then closed. Such a publish describes the closed document, not the
-    /// file, and is ignored for as long as the exception lasts. A non-empty
-    /// publish is real news about the file: it is stored and ends the
-    /// exception, as does reopening or editing the file through AFT.
     /// Remember a document a scoped inspect closed (see
     /// `inspect_closed_documents`), forgetting the oldest past the cap.
     fn note_inspect_closed_document(&mut self, key: &ServerKey, canonical_path: &Path) {
         self.inspect_close_sequence = self.inspect_close_sequence.wrapping_add(1);
         self.inspect_closed_documents.insert(
             (key.clone(), canonical_path.to_path_buf()),
-            self.inspect_close_sequence,
+            InspectClosedDocument {
+                sequence: self.inspect_close_sequence,
+                answered: false,
+            },
         );
-        if self.inspect_closed_documents.len() > INSPECT_CLOSED_DOCUMENTS_CAP {
-            // Drop the oldest quarter at once so the scan runs rarely.
-            let mut sequences: Vec<u64> = self.inspect_closed_documents.values().copied().collect();
-            sequences.sort_unstable();
-            let keep_from = sequences[INSPECT_CLOSED_DOCUMENTS_CAP / 4];
-            self.inspect_closed_documents
-                .retain(|_, sequence| *sequence >= keep_from);
-        }
+        forget_oldest_past_cap(&mut self.inspect_closed_documents, |closed| closed.sequence);
     }
 
+    /// True when this publish is the empty list a server sends to clear a
+    /// document that a scoped inspect opened only to read its diagnostics and
+    /// then closed. Such a publish describes the closed document, not the
+    /// file, and is ignored for as long as the exception lasts. A non-empty
+    /// publish is real news about the file: it is stored and ends the
+    /// exception, as does reopening or editing the file through AFT.
     fn is_inspect_close_clearing(
         &mut self,
         key: &ServerKey,
@@ -5170,7 +5233,80 @@ impl LspManager {
             self.inspect_closed_documents.remove(&lookup);
             return false;
         }
+        if let Some(closed) = self.inspect_closed_documents.get_mut(&lookup) {
+            closed.answered = true;
+        }
+        self.close_answering_servers.insert(key.clone());
         true
+    }
+
+    /// True when this publish is the late reply to a scoped inspect's
+    /// `didClose` for a document AFT has since reopened (see
+    /// `late_close_replies`), and must not be stored. A versioned publish
+    /// describes the reopened document, so the reply is no longer expected:
+    /// the server sends it before anything about the reopened document. The
+    /// first unversioned publish is taken as the reply; only an empty one is
+    /// ignored, because a non-empty one is real news about the file, as it is
+    /// for a closed document.
+    fn is_late_close_reply(
+        &mut self,
+        key: &ServerKey,
+        file: &Path,
+        versioned: bool,
+        diagnostics_empty: bool,
+    ) -> bool {
+        if self.late_close_replies.is_empty()
+            || self
+                .late_close_replies
+                .remove(&(key.clone(), file.to_path_buf()))
+                .is_none()
+        {
+            return false;
+        }
+        if versioned {
+            return false;
+        }
+        self.close_answering_servers.insert(key.clone());
+        diagnostics_empty
+    }
+
+    /// AFT is opening or editing a document. A scoped inspect's close of it
+    /// that the server has not answered yet leaves a reply on its way that
+    /// must not be read as the reopened document's report (see
+    /// `late_close_replies`). The reply is only expected from a server that
+    /// answered a close before or that versions its reports; for any other
+    /// server, ignoring the next unversioned empty publish could ignore the
+    /// reopened file's real clean report.
+    fn reopen_inspect_closed_document(&mut self, key: &ServerKey, canonical_path: &Path) {
+        let lookup = (key.clone(), canonical_path.to_path_buf());
+        let Some(closed) = self.inspect_closed_documents.remove(&lookup) else {
+            return;
+        };
+        let reply_is_recognizable = self.close_answering_servers.contains(key)
+            || self.versioned_publish_servers.contains(key);
+        if closed.answered || !reply_is_recognizable {
+            return;
+        }
+        self.inspect_close_sequence = self.inspect_close_sequence.wrapping_add(1);
+        self.late_close_replies
+            .insert(lookup, self.inspect_close_sequence);
+        forget_oldest_past_cap(&mut self.late_close_replies, |sequence| *sequence);
+    }
+
+    /// [`Self::end_inspect_close_exception`] for a document AFT is opening or
+    /// editing in every server that has it closed, keeping track of the
+    /// close replies still on their way.
+    fn end_inspect_close_exception_on_reopen(&mut self, canonical_path: &Path) {
+        let closed_keys = self
+            .inspect_closed_documents
+            .keys()
+            .filter(|(_, file)| file == canonical_path)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in closed_keys {
+            self.reopen_inspect_closed_document(&key, canonical_path);
+        }
+        self.end_inspect_close_exception(canonical_path);
     }
 
     /// Edits and opens through AFT make the file's publishes current again,
@@ -7960,6 +8096,50 @@ mod diagnostic_capacity_tests {
         assert!(manager.inspect_closed_documents.contains_key(&newest));
         let oldest = (key, PathBuf::from("/work/f0.ts"));
         assert!(!manager.inspect_closed_documents.contains_key(&oldest));
+    }
+
+    // After AFT reopens a document whose scoped-inspect close is unanswered,
+    // only the first unversioned publish is taken as the close reply, and only
+    // for a server whose reply can be told apart from a report.
+    #[test]
+    fn late_close_reply_is_ignored_once_and_only_when_recognizable() {
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: PathBuf::from("/work"),
+        };
+        let file = Path::new("/work/a.ts");
+
+        // A server never seen versioning reports or answering closes: its
+        // next empty publish may be the reopened file's clean report.
+        let mut unknown = LspManager::new();
+        unknown.note_inspect_closed_document(&key, file);
+        unknown.reopen_inspect_closed_document(&key, file);
+        assert!(!unknown.is_late_close_reply(&key, file, false, true));
+
+        let mut versioned = LspManager::new();
+        versioned.versioned_publish_servers.insert(key.clone());
+        versioned.note_inspect_closed_document(&key, file);
+        versioned.reopen_inspect_closed_document(&key, file);
+        assert!(versioned.is_late_close_reply(&key, file, false, true));
+        assert!(
+            !versioned.is_late_close_reply(&key, file, false, true),
+            "one close has one reply"
+        );
+        assert!(versioned.close_answering_servers.contains(&key));
+
+        // A versioned report means the reply is not coming any more.
+        versioned.note_inspect_closed_document(&key, file);
+        versioned.reopen_inspect_closed_document(&key, file);
+        assert!(!versioned.is_late_close_reply(&key, file, true, true));
+        assert!(!versioned.is_late_close_reply(&key, file, false, true));
+
+        // A close answered before the reopen leaves no reply on its way.
+        let mut answered = LspManager::new();
+        answered.close_answering_servers.insert(key.clone());
+        answered.note_inspect_closed_document(&key, file);
+        assert!(answered.is_inspect_close_clearing(&key, file, true));
+        answered.reopen_inspect_closed_document(&key, file);
+        assert!(!answered.is_late_close_reply(&key, file, false, true));
     }
 
     // configure clears cached spawn failures so a just-installed server retries
