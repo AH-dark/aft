@@ -31,7 +31,7 @@ import type { PluginContext } from "../packages/opencode-plugin/src/types.ts";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const FIXTURES_ROOT = join(REPO_ROOT, "crates/aft/tests/fixtures/subc_parity");
-const RAW_PROJECT_ROOT = "/tmp/aft-subc-parity/project";
+const RAW_PROJECT_ROOT = join(REPO_ROOT, "target", "subc-parity-capture", "project");
 let PROJECT_ROOT = RAW_PROJECT_ROOT;
 const PROJECT_ROOT_TOKEN = "<PROJECT_ROOT>";
 const HOME_ROOT = homedir();
@@ -365,7 +365,7 @@ function translateAftZoomToolCall(rawArgs: Record<string, unknown>): BridgeCall 
         : {}),
     };
   });
-  return { command: "zoom", params: { targets, ...(rawArgs.contextLines !== undefined ? { context_lines: rawArgs.contextLines } : {}), ...(rawArgs.callgraph === true ? { callgraph: true } : {}) } };
+  return { command: "zoom", params: { targets, ...(rawArgs.contextLines !== undefined ? { context_lines: rawArgs.contextLines } : {}), ...(rawArgs.callgraph === true ? { callgraph: true } : {}), ...(rawArgs.ref !== undefined ? { ref: rawArgs.ref } : {}) } };
 }
 
 function zoomMultiTargetResponses(
@@ -536,6 +536,7 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "outline_directory_json_mode", tool_name: "outline", agent_args: { target: "src" } },
   { name: "outline_directory_include_tests", tool_name: "outline", agent_args: { target: "src", includeTests: true } },
   { name: "zoom_batch_mixed_translate", tool_name: "zoom", agent_args: { batch: [{ target: "src/main.ts", symbols: ["run", "missing"] }, { target: "https://example.test/docs", symbols: "Overview" }], contextLines: 2, callgraph: true } },
+  { name: "zoom_batch_revision_translate", tool_name: "zoom", agent_args: { batch: [{ target: "src/main.ts", symbols: "run, missing" }], contextLines: 2, callgraph: true, ref: "HEAD~1" } },
   { name: "zoom_batch_empty_translate", tool_name: "zoom", agent_args: { batch: [] } },
   { name: "zoom_batch_conflict_translate", tool_name: "zoom", agent_args: { batch: [{ target: "a.ts", url: "b.ts", symbols: "run" }] } },
   { name: "zoom_url_translate", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features", contextLines: 2 } },
@@ -561,6 +562,18 @@ const BASH_OUTCOMES = [
 ] as const;
 
 const FORMAT_CASES: FormatCase[] = [
+  {
+    name: "safety_purge",
+    tool_name: "safety",
+    agent_args: { op: "purge", path: "secret.env" },
+    native_response_json: {
+      id: "1", success: true, path: `${PROJECT_ROOT}/secret.env`,
+      undo_stacks_removed: 1, undo_entries_removed: 3,
+      checkpoints_pruned: [{ name: "pre-edit", files_removed: 1 }],
+      checkpoints_dropped: ["only-secret"], complete: true, failures: [], irreversible: true,
+    },
+    server_text: `purged ${PROJECT_ROOT}/secret.env\nundo: removed 3 backup(s) of 1 file(s)\ncheckpoints pruned: pre-edit (1 file(s) removed)\ncheckpoints dropped: only-secret\nThis cannot be undone: the removed copies are gone and aft_safety undo or restore cannot bring them back.`,
+  },
   ...BASH_OUTCOMES.flatMap(([name, output]): FormatCase[] => [
     {
       name: `bash_unknown_${name}`,

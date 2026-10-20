@@ -128,12 +128,30 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     'Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
     (githubZoomDescription ? `\n\n${githubZoomDescription}` : "");
   const zoomArgs = {
-    batch: z.array(z.object({
-      target: z.string().describe("File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled"),
-      symbols: z.union([z.string(), z.array(z.string())]).describe("Symbol name for code or heading text for Markdown/HTML; a string or array of strings"),
-    })).min(1).describe("One or more lookups; entries may mix file paths and URLs"),
-    contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe("Lines of context before/after each symbol (default: 3)"),
-    callgraph: z.boolean().optional().describe("Include call-graph annotations for every entry (default: false)"),
+    batch: z
+      .array(
+        z.object({
+          target: z
+            .string()
+            .describe(
+              "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+            ),
+          symbols: z
+            .union([z.string(), z.array(z.string())])
+            .describe(
+              "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+            ),
+        }),
+      )
+      .min(1)
+      .describe("One or more lookups; entries may mix file paths and URLs"),
+    contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      "Lines of context before/after each symbol (default: 3)",
+    ),
+    callgraph: z
+      .boolean()
+      .optional()
+      .describe("Include call-graph annotations for every entry (default: false)"),
   };
   // `ref` exists only while `revision_reads` is on; the getters below read the
   // live config each time the host asks, so a reload is reflected.

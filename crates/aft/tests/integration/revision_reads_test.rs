@@ -358,6 +358,32 @@ fn revision_reads_off_refuses_ref_on_every_tool() {
 }
 
 #[test]
+fn revision_zoom_url_target_refuses_before_repository_resolution() {
+    let fixture = fixture();
+    let mut aft = configured(&fixture, true);
+    for batch in [
+        json!([{ "target": "https://example.invalid/docs", "symbols": "Overview" }]),
+        json!([
+            { "target": "src/lib.rs", "symbols": "version" },
+            { "target": "https://example.invalid/docs", "symbols": "Overview" },
+        ]),
+    ] {
+        let response = call(
+            &mut aft,
+            "zoom",
+            json!({ "batch": batch, "ref": "release" }),
+        );
+        assert_eq!(response["success"], false, "{response:?}");
+        assert_eq!(response["code"], "invalid_request", "{response:?}");
+        let message = response["message"].as_str().unwrap();
+        assert!(
+            message.contains("URL") && message.contains("revision"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
 fn revision_read_outside_the_project_root_is_refused_like_any_read() {
     let fixture = fixture();
     let mut aft = configured(&fixture, true);

@@ -7,6 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  classifyOccurrence,
   classifyOccurrenceDrift,
   legacyOccurrenceKey,
   scanLinesForOccurrences,
@@ -47,6 +48,13 @@ const BASE_LINES = [
 ];
 
 describe("content-keyed legacy-vocabulary allowlist", () => {
+  test("OpenCode header conversion is exempt without exempting arbitrary agent text", () => {
+    const path = "packages/opencode-plugin/src/tools/hoisted.ts";
+    const conversion = 'return description.replaceAll("`path`", "`filePath`").replaceAll(\'"path":\', \'"filePath":\');';
+    expect(classifyOccurrence(path, conversion).class).toBe("host-display-contract");
+    expect(classifyOccurrence(path, 'description: "Use filePath for every tool"').class).toBe("prohibited-agent-surface");
+    expect(classifyOccurrence("packages/opencode-plugin/src/tools/reading.ts", conversion).class).toBe("prohibited-agent-surface");
+  });
   test("inserting a line above both occurrences keeps the audit green", () => {
     const allowlisted = entriesForLines(PATH, BASE_LINES);
     expect(allowlisted).toHaveLength(2);

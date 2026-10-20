@@ -81,78 +81,46 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "path": {
-        "description": "Path to file (absolute or relative to project root)",
-        "type": "string"
-      },
-      "url": {
-        "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-        "type": "string"
-      },
-      "symbols": {
-        "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {
+      "batch": {
+        "description": "One or more lookups; entries may mix file paths and URLs",
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
               "type": "string"
-            }
-          }
-        ]
-      },
-      "targets": {
-        "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-        "anyOf": [
-          {
-            "type": "object",
-            "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "symbol": {
-                "description": "Symbol name in that file",
-                "type": "string"
-              }
             },
-            "required": [
-              "path",
-              "symbol"
-            ]
-          },
-          {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "path": {
-                  "description": "Path to file (absolute or relative to project root)",
+            "symbols": {
+              "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+              "anyOf": [
+                {
                   "type": "string"
                 },
-                "symbol": {
-                  "description": "Symbol name in that file",
-                  "type": "string"
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
                 }
-              },
-              "required": [
-                "path",
-                "symbol"
               ]
             }
-          }
-        ]
+          },
+          "required": [
+            "target",
+            "symbols"
+          ]
+        }
       },
       "contextLines": {
-        "description": "Lines of context before/after the symbol (default: 3)",
+        "description": "Lines of context before/after each symbol (default: 3)",
         "type": "integer",
         "minimum": 1,
         "maximum": 9007199254740991
       },
       "callgraph": {
-        "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+        "description": "Include call-graph annotations for every entry (default: false)",
         "type": "boolean"
       },
       "ref": {
@@ -160,6 +128,9 @@
         "type": "string"
       }
     },
-    "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.\n\nPass `ref` to read the file as it is at a git revision (branch, tag, SHA, HEAD~2); the reply's first line names the commit it resolved to. Every file of the call is read at that revision."
+    "required": [
+      "batch"
+    ],
+    "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.\n\nPass `ref` to read the file as it is at a git revision (branch, tag, SHA, HEAD~2); the reply's first line names the commit it resolved to. Every file of the call is read at that revision; URLs do not have revisions."
   }
 }

@@ -415,8 +415,10 @@ fn zoom_target_symbol_names(
         return github_zoom_selector(&target_req).map(|selector| vec![selector]);
     }
     if !memo.files.contains_key(file) {
-        memo.files
-            .insert(file.to_string(), resolve_zoom_file(req, ctx, file)?);
+        memo.files.insert(
+            file.to_string(),
+            resolve_zoom_file(req, ctx, file, memo.revision)?,
+        );
     }
     // A fetched URL's cache path carries its actual document language. Parsing
     // before resolution would split comma-bearing headings at extensionless URLs.
@@ -487,11 +489,23 @@ fn handle_zoom_targets(
                             }));
                         }
                     }
-                    Err(response) => entries.push(serde_json::json!({
-                        "targetLabel": target_label,
-                        "name": symbols.as_str().map(str::to_string).unwrap_or_else(|| symbols.to_string()),
-                        "response": serialize_zoom_target_response(req, response),
-                    })),
+                    Err(response) => {
+                        // A forbidden historical read refuses the call, rather
+                        // than being presented as a missing symbol in the batch.
+                        if revision.is_some()
+                            && matches!(
+                                response.data.get("code").and_then(|value| value.as_str()),
+                                Some("path_outside_root" | "denied_floor")
+                            )
+                        {
+                            return response;
+                        }
+                        entries.push(serde_json::json!({
+                            "targetLabel": target_label,
+                            "name": symbols.as_str().map(str::to_string).unwrap_or_else(|| symbols.to_string()),
+                            "response": serialize_zoom_target_response(req, response),
+                        }));
+                    }
                 }
             }
             Err(invalid) => {
@@ -553,6 +567,29 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some(reference) = crate::revision_read::requested_ref(req) else {
         return zoom_at(req, ctx, None);
     };
+    let has_url = ["file", "url"]
+        .into_iter()
+        .filter_map(|key| req.params.get(key).and_then(|value| value.as_str()))
+        .any(is_http_url)
+        || req
+            .params
+            .get("targets")
+            .and_then(|value| value.as_array())
+            .is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    target
+                        .get("file")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(is_http_url)
+                })
+            });
+    if has_url {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "zoom: 'ref' reads repository files; a URL has no git revision",
+        );
+    }
     // The revision is resolved once and every file of the call is read at it.
     let anchor = req
         .params

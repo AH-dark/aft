@@ -394,7 +394,9 @@ export const revisionRefArgSchema: ToolDefinition["args"] = {
 };
 
 export function createReadTool(ctx: PluginContext): ToolDefinition {
-  const baseDescription = v1FileParameterDescription(readDescription(resolveGithubConfig(ctx.config).read));
+  const baseDescription = v1FileParameterDescription(
+    readDescription(resolveGithubConfig(ctx.config).read),
+  );
   const baseArgs = {
     // OpenCode-only exception to the canonical `path` vocabulary: the
     // hoisted read/write/edit trio overrides OpenCode's built-in tools,

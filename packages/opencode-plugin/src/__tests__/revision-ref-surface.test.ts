@@ -119,6 +119,46 @@ describe("revision reads surface", () => {
     expect(argNames(read)).toContain("ref");
   });
 
+  test("zoom keeps a flat batch schema with one gated top-level revision", () => {
+    for (const enabled of [false, true]) {
+      const { ctx } = harness({ revision_reads: enabled });
+      const zoom = readingTools(ctx).aft_zoom;
+      const projected = projectV2Tool("aft_zoom", zoom, { directory: process.cwd() });
+      for (const input of [tool.schema.object(zoom.args), projected.input]) {
+        const schema = tool.schema.toJSONSchema(input, { io: "input" }) as {
+          properties: Record<string, { items?: { properties?: Record<string, unknown> } }>;
+          required?: string[];
+        };
+        expect(Object.keys(schema.properties).sort()).toEqual(
+          enabled
+            ? ["batch", "callgraph", "contextLines", "ref"]
+            : ["batch", "callgraph", "contextLines"],
+        );
+        expect(schema).not.toHaveProperty("anyOf");
+        expect(schema).not.toHaveProperty("oneOf");
+        expect(schema.required).toEqual(["batch"]);
+        expect(Object.keys(schema.properties.batch.items!.properties!).sort()).toEqual([
+          "symbols",
+          "target",
+        ]);
+      }
+    }
+  });
+
+  test("zoom refuses a URL with a revision before dispatch", async () => {
+    const { ctx, calls } = harness({ revision_reads: true });
+    await expect(
+      readingTools(ctx).aft_zoom.execute(
+        {
+          batch: [{ target: "https://example.invalid/docs", symbols: "Overview" }],
+          ref: "HEAD",
+        },
+        sdkContext(await project()),
+      ),
+    ).rejects.toThrow("a URL has no revision");
+    expect(calls).toHaveLength(0);
+  });
+
   test("the module catalog artifact advertises ref only in the enabled override", () => {
     const base = buildSubcToolSchemas();
     const enabled = buildSubcToolSchemas(false, true);

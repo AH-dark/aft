@@ -69,6 +69,43 @@ describe("Pi revision reads surface", () => {
     expect(refs).toEqual(["v1", undefined, "main", "HEAD~1"]);
   });
 
+  test("zoom keeps a flat batch schema with one gated top-level revision", () => {
+    for (const enabled of [false, true]) {
+      const zoom = registered({ revision_reads: enabled }).tools.get("aft_zoom")!;
+      const schema = zoom.parameters as {
+        properties: Record<string, { items?: { properties?: Record<string, unknown> } }>;
+        required?: string[];
+      };
+      expect(Object.keys(schema.properties).sort()).toEqual(
+        enabled
+          ? ["batch", "callgraph", "contextLines", "ref"]
+          : ["batch", "callgraph", "contextLines"],
+      );
+      expect(schema).not.toHaveProperty("anyOf");
+      expect(schema).not.toHaveProperty("oneOf");
+      expect(schema.required).toEqual(["batch"]);
+      expect(Object.keys(schema.properties.batch.items!.properties!).sort()).toEqual([
+        "symbols",
+        "target",
+      ]);
+    }
+  });
+
+  test("zoom refuses a URL with a revision before dispatch", async () => {
+    const { tools, calls } = registered({ revision_reads: true });
+    await expect(
+      executeTool(
+        tools.get("aft_zoom")!,
+        {
+          batch: [{ target: "https://example.invalid/docs", symbols: "Overview" }],
+          ref: "HEAD",
+        },
+        makeExtContext(process.cwd(), "revision-url"),
+      ),
+    ).rejects.toThrow("a URL has no revision");
+    expect(calls).toHaveLength(0);
+  });
+
   test("a ref sent while revision_reads is off still reaches the engine to be refused", async () => {
     const { tools, calls } = registered({});
     await executeTool(

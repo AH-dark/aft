@@ -1,0 +1,15 @@
+{
+  "agent_args": {
+    "batch": [
+      {
+        "symbols": "run, missing",
+        "target": "src/main.ts"
+      }
+    ],
+    "callgraph": true,
+    "contextLines": 2,
+    "ref": "HEAD~1"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "zoom"
+}
