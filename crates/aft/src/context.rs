@@ -1742,6 +1742,7 @@ pub(crate) fn watcher_counters_for_root(root: &Path) -> Arc<WatcherCounters> {
 #[derive(Debug)]
 enum DeletedRootCleanup {
     Pending(u64),
+    Inconclusive(u64),
     Complete(u64),
 }
 
@@ -5651,10 +5652,30 @@ impl AppContext {
         )
     }
 
-    /// Clean up a missing root without admitting ordinary work on that root.
-    /// Returns true when the drain should stop, including when the LSP
-    /// manager is busy and cleanup must be retried on a later drain call.
+    /// After confirming the project root is gone, this method drops its watcher
+    /// and shuts down its language-server clients.
+    /// Returns true when the drain should stop, including while a root check is
+    /// inconclusive or cleanup must be retried on a later drain call.
     pub(crate) fn try_cleanup_deleted_root(&self, expected_generation: u64) -> bool {
+        self.try_cleanup_deleted_root_with_probe_impl(expected_generation, |path| {
+            std::fs::metadata(path)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_cleanup_deleted_root_with_probe(
+        &self,
+        expected_generation: u64,
+        root_metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> bool {
+        self.try_cleanup_deleted_root_with_probe_impl(expected_generation, root_metadata)
+    }
+
+    fn try_cleanup_deleted_root_with_probe_impl(
+        &self,
+        expected_generation: u64,
+        root_metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> bool {
         self.subc_lifecycle
             .run_if_current(
                 self.configure_generation.as_ref(),
@@ -5667,9 +5688,33 @@ impl AppContext {
                         return false;
                     };
                     let mut cleanup = self.deleted_root_cleanup.lock();
-                    if root.is_dir() {
-                        *cleanup = None;
-                        return false;
+                    match root_metadata(&root) {
+                        Ok(metadata) if metadata.is_dir() => {
+                            *cleanup = None;
+                            return false;
+                        }
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) => {}
+                        Err(error) => {
+                            let already_logged = matches!(
+                                *cleanup,
+                                Some(DeletedRootCleanup::Inconclusive(generation))
+                                    if generation == expected_generation
+                            );
+                            if !already_logged {
+                                crate::slog_warn!(
+                                    "project root check inconclusive {}: {}; preserving watcher and language servers",
+                                    root.display(),
+                                    error
+                                );
+                            }
+                            *cleanup = Some(DeletedRootCleanup::Inconclusive(expected_generation));
+                            return true;
+                        }
                     }
                     if matches!(*cleanup, Some(DeletedRootCleanup::Complete(generation)) if generation == expected_generation) {
                         return true;
@@ -5793,7 +5838,11 @@ impl AppContext {
     /// never add one: use `try_lock` and treat contention as pending work.
     pub fn watcher_drain_has_work(&self) -> bool {
         let cleanup_pending = self.deleted_root_cleanup.try_lock().is_none_or(|cleanup| {
-            matches!(*cleanup, Some(DeletedRootCleanup::Pending(generation)) if generation == self.configure_generation())
+            matches!(
+                *cleanup,
+                Some(DeletedRootCleanup::Pending(generation) | DeletedRootCleanup::Inconclusive(generation))
+                    if generation == self.configure_generation()
+            )
         });
         let receiver_pending = self
             .watcher_rx

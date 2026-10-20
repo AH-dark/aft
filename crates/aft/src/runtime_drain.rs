@@ -8948,6 +8948,42 @@ mod idle_lsp_tests {
     }
 
     #[test]
+    fn deleted_root_inconclusive_check_preserves_runtime_until_root_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, _tx) = deleted_root_context(&root);
+        let pid = spawn_sleep_client(&ctx, root.clone());
+        let generation = ctx.configure_generation();
+
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for _ in 0..2 {
+                assert!(ctx.try_cleanup_deleted_root_with_probe(generation, |_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected root metadata failure",
+                    ))
+                }));
+            }
+        });
+
+        assert_eq!(ctx.lsp().server_count(), 1);
+        assert!(ctx.watcher_rx().lock().is_some());
+        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(ctx.watcher_drain_has_work());
+        let inconclusive_logs = logs
+            .iter()
+            .filter(|line| line.contains("project root check inconclusive"))
+            .collect::<Vec<_>>();
+        assert_eq!(inconclusive_logs.len(), 1, "{logs:?}");
+
+        let outcome = drain_watcher_events_bounded(&ctx, 1);
+        assert!(!outcome.has_more);
+        assert!(ctx.watcher_rx().lock().is_some());
+        assert_eq!(ctx.lsp().server_count(), 1);
+        assert!(crate::bash_background::process::is_process_alive(pid));
+    }
+
+    #[test]
     fn deleted_root_cleanup_defers_contended_watcher_receiver() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
