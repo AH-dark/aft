@@ -51,7 +51,14 @@ test("OpenCode 2 completion wake masks a printed GitHub credential", async () =>
     );
     await Effect.runPromise(tool.execute({}, { sessionID: "s", progress: () => Effect.void }));
     await consumer.bridgeOptions.onBashCompletion?.({ ...completion, session_id: "s" }, {
-      send: async () => ({ success: true }),
+      send: async (command: string) =>
+        command === "bash_drain_completions"
+          ? {
+              success: true,
+              bg_completions: [{ ...completion, session_id: "s" }],
+              pending_matches: [],
+            }
+          : { success: true, acked_task_ids: [completion.task_id] },
     } as never);
     expect(delivered).toHaveLength(1);
     expect(JSON.stringify(delivered)).toContain("<REDACTED_SECRET>");

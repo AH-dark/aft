@@ -59,6 +59,7 @@ interface WakeRoute {
     bridge: AftProjectTransport,
     acknowledge?: boolean,
   ): Promise<boolean | undefined>;
+  standaloneCompletion?(completion: BashCompletedPayload, bridge: AftProjectTransport): Promise<void>;
   patternMatch?(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<boolean>;
   /** Record a status-only long-running reminder in its session. */
   longRunning(reminder: BashLongRunningPayload): Promise<void>;
@@ -160,6 +161,11 @@ async function routeCompletion(
   const route = wakeRouteState().routes.get(completion.session_id);
   if (route) {
     try {
+      if (acknowledge && route.standaloneCompletion) {
+        await route.standaloneCompletion(completion, bridge);
+        forgetUnroutedCompletion(completion.session_id, completion.task_id);
+        return true;
+      }
       const admitted = (await route.completion(completion, bridge, acknowledge)) === true;
       // The held copy is an admission retry, not a second durable notification.
       // bg-notifications.ts tracks subc acknowledgement retries separately in
@@ -345,6 +351,7 @@ export function createV2RuntimeConsumer(
       admitted: boolean;
     }
   >();
+  const completing = new Map<string, Promise<void>>();
   const matching = new Map<string, Promise<void>>();
   const draining = new Map<string, Promise<void>>();
   let disposed = false;
@@ -375,30 +382,35 @@ export function createV2RuntimeConsumer(
           reason: match.reason,
           text: formatPatternMatchReminder([match]),
         };
-        // A late push can arrive after its ack, or after a newer sticky match
-        // replaced it. Durable pending state is the replay fence, not an
-        // ever-growing set of every offset this Location has delivered.
-        const current = await pending.bridge.send("bash_drain_completions", {
-          session_id: match.session_id,
-        });
-        if (current.success === false || !Array.isArray(current.pending_matches)) {
-          throw new Error("pattern replay validation failed");
-        }
-        if (
-          !current.pending_matches
-            .filter(isPatternMatchEntry)
-            .some(
-              (entry) =>
-                entry.session_id === match.session_id &&
-                entry.task_id === match.task_id &&
-                entry.watch_id === match.watch_id &&
-                entry.match_offset === match.match_offset &&
-                entry.reason === match.reason,
-            )
-        ) {
-          delivery.retirePatternMatch(wake);
-          pendingMatches.delete(key);
-          return;
+        // Rust reports a deleted task by sending a terminal notification, not
+        // by saving a pending match. There is no task row in which to persist it.
+        const erased = match.reason === "task_exit" && match.match_text === "watch target erased";
+        if (!erased) {
+          // A late push can arrive after its ack, or after a newer sticky match
+          // replaced it. Durable pending state is the replay fence, not an
+          // ever-growing set of every offset this Location has delivered.
+          const current = await pending.bridge.send("bash_drain_completions", {
+            session_id: match.session_id,
+          });
+          if (current.success === false || !Array.isArray(current.pending_matches)) {
+            throw new Error("pattern replay validation failed");
+          }
+          if (
+            !current.pending_matches
+              .filter(isPatternMatchEntry)
+              .some(
+                (entry) =>
+                  entry.session_id === match.session_id &&
+                  entry.task_id === match.task_id &&
+                  entry.watch_id === match.watch_id &&
+                  entry.match_offset === match.match_offset &&
+                  entry.reason === match.reason,
+              )
+          ) {
+            delivery.retirePatternMatch(wake);
+            pendingMatches.delete(key);
+            return;
+          }
         }
         if (!pending.admitted) {
           const text = wake.text;
@@ -610,6 +622,98 @@ export function createV2RuntimeConsumer(
         if (match.reason === "task_exit") forgetUnroutedCompletion(match.session_id, match.task_id);
       }
       return admitted;
+    },
+    standaloneCompletion: async (completion, bridge) => {
+      if (subcPool) {
+        await route.completion(completion, bridge);
+        return;
+      }
+      const key = JSON.stringify([completion.session_id, completion.task_id]);
+      const active = completing.get(key);
+      if (active) return active;
+      const deliver = async () => {
+        if (disposed) return;
+        if (await resolveIsSubagent(context, completion.session_id)) {
+          await awaitV2ExecutionSettlement(context, completion.session_id);
+        }
+        if (
+          (await resolveIsSubagent(context, completion.session_id)) &&
+          !v2WatchWakeAllowed(context, completion.session_id, completion.task_id)
+        ) {
+          holdBgCompletion(
+            completion.session_id,
+            completion,
+            v2SubagentStopped(context, completion.session_id),
+          );
+          forgetV2Watch(context, completion.session_id, completion.task_id);
+          return;
+        }
+        // Check the daemon's pending completions before admitting a wake: a
+        // queued duplicate may arrive after its ACK removed the in-memory key.
+        const current = await bridge.send("bash_drain_completions", {
+          session_id: completion.session_id,
+        });
+        if (current.success === false || !Array.isArray(current.bg_completions))
+          throw new Error("completion replay validation failed");
+        const wake = { sessionID: completion.session_id, taskIDs: [completion.task_id] };
+        if (
+          !current.bg_completions.some(
+            (entry) =>
+              isCompletionEntry(entry) &&
+              entry.session_id === completion.session_id &&
+              entry.task_id === completion.task_id,
+          )
+        ) {
+          delivery.retireCompletion(wake);
+          return;
+        }
+        const text = formatSystemReminder([completion]);
+        const admitted = await Effect.runPromise(
+          delivery.completion({
+            sessionID: completion.session_id,
+            taskIDs: [completion.task_id],
+            text,
+            metadata: {
+              source: "aft",
+              kind: "bash_completion",
+              task_ids: [completion.task_id],
+              status: completion.status,
+            },
+          }),
+        );
+        // An already admitted wake still needs another ACK attempt if its earlier ACK failed.
+        if (admitted) detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
+
+        const ack = await bridge.send("bash_ack_completions", {
+          session_id: completion.session_id,
+          task_ids: [completion.task_id],
+        });
+        if (
+          ack.success === false ||
+          !Array.isArray(ack.acked_task_ids) ||
+          !ack.acked_task_ids.includes(completion.task_id)
+        )
+          throw new Error("completion acknowledgement was not confirmed");
+        delivery.retireCompletion(wake);
+        for (const [key, pending] of pendingMatches) {
+          const match = pending.match;
+          if (match.session_id !== completion.session_id || match.task_id !== completion.task_id)
+            continue;
+          delivery.retirePatternMatch({
+            sessionID: match.session_id,
+            taskIDs: [match.task_id],
+            watchID: match.watch_id,
+            matchOffset: match.match_offset,
+            reason: match.reason,
+            text: "",
+          });
+          pendingMatches.delete(key);
+        }
+        forgetV2Watch(context, completion.session_id, completion.task_id);
+      };
+      const attempt = deliver().finally(() => completing.delete(key));
+      completing.set(key, attempt);
+      return attempt;
     },
     longRunning: (reminder) =>
       Effect.runPromise(

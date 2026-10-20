@@ -70,7 +70,23 @@ async function rig(parentID?: string) {
         return { success: true, watch_id: "watch-ready" };
       }
       if (command === "bash_drain_completions")
-        return { success: true, pending_matches: pending ? [pending] : [] };
+        return {
+          success: true,
+          pending_matches: pending ? [pending] : [],
+          bg_completions:
+            task.status === "completed"
+              ? [
+                  {
+                    session_id: "session-v2",
+                    task_id: task.id,
+                    status: "completed",
+                    command: "server",
+                    exit_code: 0,
+                    output_preview: "done",
+                  },
+                ]
+              : [],
+        };
       if (command === "bash_ack_completions") {
         if (ignoreAck) {
           ignoreAck = false;
@@ -82,7 +98,11 @@ async function rig(parentID?: string) {
         }
         if (pending?.once) watch = undefined;
         pending = undefined;
-        return { success: true, acked_matches: params.matches ?? [] };
+        return {
+          success: true,
+          acked_matches: params.matches ?? [],
+          acked_task_ids: params.task_ids ?? [],
+        };
       }
       return { success: true };
     },
@@ -497,6 +517,41 @@ test("V2 subagent pattern wakes require an eligible watch and respect deliberate
     await r.print("READY stopped");
     expect(r.synthetic).toHaveLength(1);
     expect(r.sends.filter((send) => send.command === "bash_ack_completions")).toHaveLength(acks);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 erased watch delivers its live-only failure notice without a durable match", async () => {
+  const r = await rig();
+  try {
+    await r.register();
+    const before = r.sends.length;
+    await r.consumer.bridgeOptions.onBashPatternMatch?.(
+      {
+        type: "bash_pattern_match",
+        session_id: "session-v2",
+        task_id: "bash-running",
+        watch_id: "watch-ready",
+        match_offset: 0,
+        match_text: "watch target erased",
+        context:
+          "watch target erased: the background task row was erased before the watch reached a normal terminal result",
+        once: true,
+        reason: "task_exit",
+      },
+      r.bridge as never,
+    );
+    expect(r.synthetic).toHaveLength(1);
+    expect(r.synthetic[0]?.text).toContain("watch target erased");
+    expect(r.sends.slice(before).filter((send) => send.command === "bash_ack_completions")).toEqual(
+      [
+        {
+          command: "bash_ack_completions",
+          params: { session_id: "session-v2", task_ids: ["bash-running"] },
+        },
+      ],
+    );
   } finally {
     await r.close();
   }
