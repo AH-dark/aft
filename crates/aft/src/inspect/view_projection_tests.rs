@@ -89,6 +89,8 @@ fn inspect_view_pending_publication_race_and_dispatch_are_root_local() {
 fn inspect_view_pending_refresh_keys_ignore_root_spelling() {
     let manager = InspectManager::new();
     let job_root = std::env::temp_dir().join("aft-view-key-checkout");
+    // Only Windows adds a second spelling, so the vector is mutated there alone.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut spellings = vec![job_root.join("nested").join("..")];
     #[cfg(windows)]
     spellings.push(PathBuf::from(format!(r"\\?\{}", job_root.display())));
