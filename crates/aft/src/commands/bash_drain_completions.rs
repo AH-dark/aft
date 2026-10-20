@@ -57,11 +57,12 @@ pub fn handle_ack(req: &RawRequest, ctx: &AppContext) -> Response {
             &pattern_match.watch_id,
             pattern_match.match_offset,
         ) {
-            Ok(Some(watch_removed)) => acked_matches.push(json!({
+            Ok(Some(result)) => acked_matches.push(json!({
                 "task_id": pattern_match.task_id,
                 "watch_id": pattern_match.watch_id,
                 "match_offset": pattern_match.match_offset,
-                "watch_removed": watch_removed,
+                "watch_removed": result.watch_removed,
+                "task_settled": result.task_settled,
             })),
             Ok(None) => {}
             Err(error) => return Response::error(&req.id, "pattern_ack_failed", error),

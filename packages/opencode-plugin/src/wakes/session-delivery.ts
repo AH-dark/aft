@@ -115,6 +115,10 @@ export class V2SessionDelivery {
     this.admittedWakes.delete(this.patternKey(input));
   }
 
+  retireCompletion(input: Pick<CompletionWake, "sessionID" | "taskIDs">): void {
+    for (const taskID of input.taskIDs) this.admittedWakes.delete(`${input.sessionID}\0${taskID}`);
+  }
+
   private admitWake(
     input: CompletionWake,
     keys: string[],
