@@ -14,7 +14,8 @@ use crate::protocol::{RawRequest, Response};
 /// Two kinds of copies are removed: undo backups (disk, `aft.db` rows and
 /// in-memory caches) and the matching files inside the session's named
 /// checkpoints. A checkpoint that still holds other files is rewritten
-/// without them; one left empty, or one that cannot be rewritten, is dropped.
+/// without them; one left empty is dropped. A rewrite failure keeps the
+/// checkpoint recoverable and is reported as an incomplete purge.
 /// Nothing belonging to another session is touched, and nothing here can be
 /// undone.
 ///

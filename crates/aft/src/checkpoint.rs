@@ -72,11 +72,10 @@ pub struct CheckpointPurge {
     /// Checkpoints rewritten without the purged files, with how many files
     /// each lost.
     pub pruned: Vec<(String, usize)>,
-    /// Checkpoints removed whole, because every file in them was purged or
-    /// because rewriting them without those files failed.
+    /// Checkpoints removed whole because every file in them was purged.
     pub dropped: Vec<String>,
-    /// Checkpoints that may still hold purged content because removing them
-    /// failed, with the error.
+    /// Checkpoints that may still hold purged content because rewriting or
+    /// removing them failed, with the error.
     pub failures: Vec<(String, String)>,
 }
 
@@ -844,9 +843,9 @@ impl CheckpointStore {
     ///
     /// A checkpoint that keeps other files is rewritten without the selected
     /// ones, and their blobs are deleted. A checkpoint left with no files is
-    /// dropped, and so is one whose rewrite fails: keeping the old copy would
-    /// keep the content the caller asked to remove. Other sessions'
-    /// checkpoints are never read.
+    /// dropped. A failed rewrite keeps the checkpoint recoverable and reports
+    /// an incomplete purge rather than deleting unrelated saved files. Other
+    /// sessions' checkpoints are never read.
     pub fn purge_paths(
         &mut self,
         session: &str,
@@ -871,6 +870,7 @@ impl CheckpointStore {
             else {
                 continue;
             };
+            let original = checkpoint.clone();
             let before = checkpoint.file_contents.len();
             checkpoint
                 .file_contents
@@ -884,9 +884,7 @@ impl CheckpointStore {
                 continue;
             }
 
-            let rewrite_error = if checkpoint.file_contents.is_empty() {
-                None
-            } else {
+            if !checkpoint.file_contents.is_empty() {
                 if let Some(dir) = self.durable_checkpoint_dir(session, &name) {
                     self.hydrated_checkpoints
                         .get_mut()
@@ -902,19 +900,25 @@ impl CheckpointStore {
                         report.pruned.push((name, removed));
                         continue;
                     }
-                    Err(error) => Some(error),
+                    Err(error) => {
+                        self.checkpoints
+                            .entry(session.to_string())
+                            .or_default()
+                            .insert(name.clone(), original);
+                        report.failures.push((name, error.to_string()));
+                        continue;
+                    }
                 }
-            };
-            if let Some(error) = &rewrite_error {
-                crate::slog_warn!(
-                    "checkpoint {} could not be rewritten during purge; dropping it: {}",
-                    name,
-                    error
-                );
             }
             match self.remove_checkpoint_from_disk_locked(session, &name) {
                 Ok(()) => report.dropped.push(name),
-                Err(error) => report.failures.push((name, error.to_string())),
+                Err(error) => {
+                    self.checkpoints
+                        .entry(session.to_string())
+                        .or_default()
+                        .insert(name.clone(), original);
+                    report.failures.push((name, error.to_string()));
+                }
             }
         }
         if self.checkpoints.get(session).is_some_and(HashMap::is_empty) {
@@ -1694,9 +1698,17 @@ fn checkpoint_file_bytes(file: &CheckpointFile) -> Cow<'_, [u8]> {
 #[cfg(test)]
 thread_local! {
     static CHECKPOINT_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CHECKPOINT_FAIL_METADATA_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if final_name == "meta.json" && CHECKPOINT_FAIL_METADATA_WRITE.with(|fail| fail.replace(false))
+    {
+        return Err(io::Error::other(
+            "injected checkpoint metadata write failure: disk full",
+        ));
+    }
     let final_path = dir.join(final_name);
     crate::durability::atomic_write(
         &final_path,
@@ -3703,6 +3715,40 @@ mod tests {
             .unwrap_or_default();
         contents.sort();
         contents
+    }
+
+    #[test]
+    fn purge_paths_preserves_checkpoint_on_rewrite_failure() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        let keep = project.path().join("keep.txt");
+        fs::write(&secret, "secret").unwrap();
+        fs::write(&keep, "keep").unwrap();
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "both", vec![secret.clone(), keep.clone()])
+            .unwrap();
+        let directory = store.durable_checkpoint_dir("s1", "both").unwrap();
+        let metadata = fs::read(directory.join("meta.json")).unwrap();
+        CHECKPOINT_FAIL_METADATA_WRITE.with(|fail| fail.set(true));
+        let report = store.purge_paths("s1", &|path| path == secret).unwrap();
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert_eq!(report.failures[0].0, "both");
+        assert!(report.failures[0]
+            .1
+            .contains("injected checkpoint metadata write failure"));
+        assert!(report.pruned.is_empty(), "{report:?}");
+        assert!(report.dropped.is_empty(), "{report:?}");
+        assert_eq!(fs::read(directory.join("meta.json")).unwrap(), metadata);
+        for mut recoverable in [store, fresh_checkpoint_store(storage.path())] {
+            assert_eq!(recoverable.list("s1").unwrap()[0].file_count, 2);
+            fs::write(&secret, "changed").unwrap();
+            fs::write(&keep, "changed").unwrap();
+            recoverable.restore("s1", "both").unwrap();
+            assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
+            assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+        }
     }
 
     #[test]
