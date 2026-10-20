@@ -2116,6 +2116,23 @@ fn handle_semantic_search_inner(
             external_source,
         );
     }
+    // A root bound while aft.db was busy has its index lanes off until its
+    // next bind; answer through the bounded grep fallback and say why.
+    if ctx.artifact_identity_provisional() {
+        return semantic_unavailable_grep_fallback_response(
+            req,
+            ctx,
+            &params,
+            &shape,
+            "unavailable",
+            crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string(),
+            "identity provisional",
+            false,
+            Vec::new(),
+            &project_root,
+            top_k,
+        );
+    }
     let semantic_status_snapshot = match try_read_with_budget(
         ctx.semantic_index_status(),
         INTERACTIVE_ARTIFACT_READ_BUDGET,

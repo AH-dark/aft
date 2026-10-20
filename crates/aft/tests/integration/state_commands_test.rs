@@ -478,6 +478,241 @@ fn locked_database_legacy_path_pin_binds_without_saving_then_honours_the_pin() {
     assert_eq!(saved[0]["identity"]["kind"], "path", "{saved:?}");
 }
 
+/// A git repository with one commit and one searchable file, optionally
+/// pinned to its path identity by an older standing-root row, with aft.db held
+/// by an exclusive transaction that also blocks readers.
+#[cfg(unix)]
+struct ProvisionalFixture {
+    _project: tempfile::TempDir,
+    storage: tempfile::TempDir,
+    root: std::path::PathBuf,
+    lock: rusqlite::Connection,
+}
+
+#[cfg(unix)]
+fn provisional_fixture(path_pin: bool) -> ProvisionalFixture {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    fs::write(
+        root.join("marker.rs"),
+        "fn provisional_identity_marker() {}\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        crate::test_helpers::apply_hermetic_git_env(command.current_dir(&root));
+        let output = command.args(args).output().expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "marker.rs"]);
+    git(&[
+        "-c",
+        "user.name=Identity Tests",
+        "-c",
+        "user.email=identity@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "initial",
+    ]);
+    {
+        let mut database = db(storage.path());
+        if path_pin {
+            let spelling = root.display().to_string();
+            aft::db::standing_roots::ensure_standing_root(
+                &mut database,
+                &aft::db::standing_roots::StandingRootRecord {
+                    literal_path: spelling.clone(),
+                    resolved_target: spelling,
+                    resolved_git_toplevel: None,
+                    scoped_relative_path: None,
+                },
+                &[aft::config::IndexKind::Search],
+            )
+            .unwrap();
+        }
+    }
+    let lock = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+    lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    ProvisionalFixture {
+        _project: project,
+        storage,
+        root,
+        lock,
+    }
+}
+
+/// Names of the entries directly under `storage/<folder>`.
+#[cfg(unix)]
+fn entry_names(storage: &Path, folder: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(storage.join(folder)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+const PROVISIONAL_REASON: &str =
+    "identity provisional: aft.db was busy at bind; indexes stay off until this folder's next bind";
+
+#[cfg(unix)]
+fn degraded_reasons(aft: &mut AftProcess) -> Vec<String> {
+    let status = aft.send(&json!({ "id": "status", "command": "status" }).to_string());
+    assert_eq!(status["success"], true, "{status}");
+    status["degraded_reasons"]
+        .as_array()
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(|reason| reason.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Nothing keyed by any artifact identity exists yet: no index family, owner
+/// manifest, retention binding, saved identity or legacy memo.
+#[cfg(unix)]
+fn assert_no_artifact_state(storage: &Path) {
+    for folder in [
+        "index",
+        "semantic",
+        "callgraph",
+        "views",
+        "artifact-owners",
+        "retention/roots",
+    ] {
+        assert_eq!(
+            entry_names(storage, folder),
+            Vec::<String>::new(),
+            "{folder} must stay empty while the identity is provisional"
+        );
+    }
+    assert_eq!(saved_root_identities(storage), Vec::<Value>::new());
+    assert!(!storage.join("cache-keys.json").exists());
+}
+
+/// After a finalizing bind, wait until exactly one artifact family is owned
+/// and built for the root, and return its saved identity kind.
+#[cfg(unix)]
+fn wait_for_single_built_family(storage: &Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let owners = entry_names(storage, "artifact-owners");
+        let built = entry_names(storage, "index");
+        if owners.len() == 1 && built.contains(&owners[0]) {
+            assert_eq!(built, owners, "one folder must build one index family");
+            let saved = saved_root_identities(storage);
+            assert_eq!(saved.len(), 1, "{saved:?}");
+            return saved[0]["identity"]["kind"].as_str().unwrap().to_string();
+        }
+        assert!(
+            owners.len() <= 1,
+            "one folder must own one artifact family: {owners:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no index was built after the finalizing bind: owners={owners:?} index={built:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn provisional_bind_then_finalize(path_pin: bool) -> String {
+    let fixture = provisional_fixture(path_pin);
+    let storage = fixture.storage.path();
+    let mut aft = configured_aft(&fixture.root, storage, "opencode");
+    assert!(
+        degraded_reasons(&mut aft).contains(&PROVISIONAL_REASON.to_string()),
+        "status must name the provisional identity"
+    );
+    let grep = aft.send(
+        &json!({
+            "id": "grep",
+            "command": "grep",
+            "pattern": "provisional_identity_marker",
+        })
+        .to_string(),
+    );
+    assert_eq!(grep["success"], true, "{grep}");
+    assert!(
+        grep.to_string().contains("marker.rs"),
+        "grep must answer through the unindexed fallback: {grep}"
+    );
+    assert_ne!(
+        grep["index_status"], "Ready",
+        "grep must not claim an index: {grep}"
+    );
+    assert_eq!(grep["fallback"], "filesystem", "{grep}");
+    assert_eq!(
+        grep["index"]["trigram"]["reason"], "identity_provisional",
+        "grep must disclose why its index is off: {grep}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_no_artifact_state(storage);
+
+    fixture.lock.execute_batch("ROLLBACK").unwrap();
+    drop(fixture.lock);
+    // The same bind again, from the same session: it must not take the
+    // equivalent-configure shortcut, so it reads the pin and finalizes.
+    configure(&mut aft, &fixture.root, storage, "opencode");
+    assert!(
+        !degraded_reasons(&mut aft).contains(&PROVISIONAL_REASON.to_string()),
+        "a finalizing bind clears the provisional reason"
+    );
+    let kind = wait_for_single_built_family(storage);
+    assert!(aft.shutdown().success());
+    kind
+}
+
+#[cfg(unix)]
+#[test]
+fn provisional_identity_with_a_path_pin_finalizes_to_the_path_key_at_the_next_bind() {
+    assert_eq!(provisional_bind_then_finalize(true), "path");
+}
+
+#[cfg(unix)]
+#[test]
+fn provisional_identity_without_a_pin_finalizes_to_the_git_key_at_the_next_bind() {
+    assert_eq!(provisional_bind_then_finalize(false), "git");
+}
+
+#[cfg(unix)]
+#[test]
+fn provisional_identity_search_answers_through_the_unindexed_fallback() {
+    let fixture = provisional_fixture(true);
+    let mut aft = configured_aft(&fixture.root, fixture.storage.path(), "opencode");
+    let search = aft.send(
+        &json!({
+            "id": "search",
+            "command": "semantic_search",
+            "query": "provisional_identity_marker",
+            "top_k": 5,
+        })
+        .to_string(),
+    );
+    assert_eq!(search["success"], true, "{search}");
+    assert!(
+        search.to_string().contains("marker.rs"),
+        "search must answer through the unindexed fallback: {search}"
+    );
+    assert!(
+        search.to_string().contains("identity provisional"),
+        "search must disclose why its indexes are off: {search}"
+    );
+    assert_no_artifact_state(fixture.storage.path());
+    drop(fixture.lock);
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn standalone_database_retry_does_not_block_read_only_requests() {
     use std::time::{Duration, Instant};

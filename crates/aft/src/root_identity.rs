@@ -81,14 +81,33 @@ fn read_record(root: &Path, storage: &Path) -> io::Result<Option<Record>> {
     Ok(Some(record))
 }
 
+/// An identity chosen for one bind.
+pub(crate) struct BoundIdentity {
+    pub(crate) identity: Identity,
+    /// The older aft.db pin could not be read, so this identity was not saved
+    /// and the root's next bind may choose a different one. Nothing may be
+    /// stored under its key until a bind that read the pin confirms it.
+    pub(crate) provisional: bool,
+}
+
+impl BoundIdentity {
+    fn settled(identity: Identity) -> Self {
+        Self {
+            identity,
+            provisional: false,
+        }
+    }
+}
+
 /// Serialize the first choice across processes and aliases. A corrupt record
 /// is an error, not permission to choose a replacement identity.
+#[cfg(test)]
 pub(crate) fn bind(
     root: &Path,
     storage: &Path,
     choose: impl FnOnce(LegacyPin, Option<&Identity>) -> io::Result<IdentityChoice>,
 ) -> io::Result<Identity> {
-    bind_with_recheck(root, storage, true, choose)
+    bind_with_recheck(root, storage, true, choose).map(|bound| bound.identity)
 }
 
 /// Real binds force verification; background passes may reuse an observed stamp.
@@ -97,11 +116,11 @@ pub(crate) fn bind_with_recheck(
     storage: &Path,
     force: bool,
     choose: impl FnOnce(LegacyPin, Option<&Identity>) -> io::Result<IdentityChoice>,
-) -> io::Result<Identity> {
+) -> io::Result<BoundIdentity> {
     let root = canonical_root(root);
     if let Some(record) = read_record(&root, storage)? {
         if reusable(&record, &root, force) {
-            return Ok(record.identity);
+            return Ok(BoundIdentity::settled(record.identity));
         }
     }
     let path = record_path(&root, storage);
@@ -121,7 +140,7 @@ pub(crate) fn bind_with_recheck(
     let previous = read_record(&root, storage)?;
     if let Some(record) = &previous {
         if reusable(record, &root, force) {
-            return Ok(record.identity.clone());
+            return Ok(BoundIdentity::settled(record.identity.clone()));
         }
     }
     // With Git available, resolve again under the record lock: a different
@@ -144,7 +163,10 @@ pub(crate) fn bind_with_recheck(
     if matches!(pins, LegacyPins::Unreadable) {
         // The chosen identity may contradict a pin that could not be read.
         // Use it for this bind only; the next bind reads the pin again.
-        return Ok(identity);
+        return Ok(BoundIdentity {
+            identity,
+            provisional: true,
+        });
     }
     if !choice.verified
         && previous
@@ -174,7 +196,7 @@ pub(crate) fn bind_with_recheck(
         .as_ref()
         .is_some_and(|record| record.identity == identity && record.probe_stamp == probe_stamp)
     {
-        return Ok(identity);
+        return Ok(BoundIdentity::settled(identity));
     }
     let bytes = serde_json::to_vec(&Record {
         version: 1,
@@ -189,7 +211,7 @@ pub(crate) fn bind_with_recheck(
         &bytes,
         crate::durability::AtomicWriteDurability::FileAndDirectory,
     )?;
-    Ok(identity)
+    Ok(BoundIdentity::settled(identity))
 }
 
 fn reusable(record: &Record, root: &Path, force: bool) -> bool {
@@ -234,9 +256,14 @@ pub(crate) fn select(
     root: &Path,
     storage: &Path,
     choose: impl FnOnce(LegacyPin) -> io::Result<IdentityChoice>,
-) -> io::Result<IdentityChoice> {
+) -> io::Result<BoundIdentity> {
     let canonical = canonical_root(root);
-    choose_with_pins(&legacy_pins(&canonical, storage), choose)
+    let pins = legacy_pins(&canonical, storage);
+    let choice = choose_with_pins(&pins, choose)?;
+    Ok(BoundIdentity {
+        identity: choice.identity,
+        provisional: matches!(pins, LegacyPins::Unreadable),
+    })
 }
 
 fn choose_with_pins(
@@ -283,7 +310,7 @@ fn legacy_pins(root: &Path, storage: &Path) -> LegacyPins {
                 .insert(root.to_path_buf())
             {
                 crate::slog_info!(
-                    "legacy pin unreadable (aft.db busy): root={} error={error}; using a temporary identity that is not saved, retrying on the next bind",
+                    "legacy pin unreadable (aft.db busy): identity provisional for root={}; indexes stay off until this folder's next bind; error={error}",
                     root.display()
                 );
             }

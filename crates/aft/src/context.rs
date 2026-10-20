@@ -6693,13 +6693,15 @@ impl AppContext {
         key
     }
 
+    /// `Ok(None)` means the root's identity is provisional for this bind; see
+    /// [`crate::search_index::artifact_cache_key_for_bind_profiled`].
     pub fn memoized_artifact_cache_key_for_configure(
         &self,
         raw_root: &Path,
         canonical_root: &Path,
         storage_root: &Path,
         git_common_dir: Option<&Path>,
-    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+    ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
         self.memoized_artifact_cache_key_for_configure_profiled(
             raw_root,
             canonical_root,
@@ -6716,7 +6718,7 @@ impl AppContext {
         storage_root: &Path,
         git_common_dir: Option<&Path>,
         timings: &mut crate::search_index::ArtifactCacheKeyTimings,
-    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+    ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
         {
             let waiting = Instant::now();
             let keys = self.artifact_cache_keys.lock();
@@ -6727,17 +6729,22 @@ impl AppContext {
                 .cloned()
             {
                 timings.context_cache_hit = true;
-                return Ok(key);
+                return Ok(Some(key));
             }
         }
 
-        let key = crate::search_index::artifact_cache_key_with_memo_profiled(
+        // A provisional key is never memoized, so the next bind resolves the
+        // identity again and can finalize it.
+        let Some(key) = crate::search_index::artifact_cache_key_for_bind_profiled(
             canonical_root,
             raw_root,
             storage_root,
             git_common_dir,
             timings,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
         let waiting = Instant::now();
@@ -6745,7 +6752,7 @@ impl AppContext {
         timings.context_memo_wait += waiting.elapsed();
         keys.insert(canonical_root.to_path_buf(), key.clone());
         keys.insert(raw_root.to_path_buf(), key.clone());
-        Ok(key)
+        Ok(Some(key))
     }
 
     #[cfg(test)]
@@ -8382,6 +8389,15 @@ impl AppContext {
             .lock()
             .iter()
             .any(|reason| reason == "root_too_broad")
+    }
+
+    /// The bound root's artifact identity was provisional at its last bind
+    /// (aft.db was busy), so its index lanes are off until the next bind.
+    pub(crate) fn artifact_identity_provisional(&self) -> bool {
+        self.degraded_reasons
+            .lock()
+            .iter()
+            .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_REASON)
     }
 
     pub fn cache_role(&self) -> &'static str {

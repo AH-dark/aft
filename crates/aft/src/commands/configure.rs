@@ -1744,7 +1744,11 @@ fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
 /// root configuration: the bind admits their reload and queues its start after
 /// acknowledgement, without requiring exclusive use beside existing readers.
 fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config) -> bool {
-    if ctx.subc_unbound_quiesced() || ctx.database_runtime_failed() {
+    // A provisional identity is finalized only by a full bind.
+    if ctx.subc_unbound_quiesced()
+        || ctx.database_runtime_failed()
+        || ctx.artifact_identity_provisional()
+    {
         return false;
     }
     if ctx.cached_worktree_bridge(canonical_root).is_none() {
@@ -3651,6 +3655,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         && !root_too_broad
         && (!parent_folder || crate::views::parent::held_by(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
+        && !ctx.artifact_identity_provisional()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
         && ctx.configure_warm_key_matches(&preflight_warm_key)
         && ctx.is_worktree_bridge() == is_worktree_bridge
@@ -3850,8 +3855,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    let mut identity_provisional = false;
     let project_key = match project_key_result {
-        Some(Ok(key)) => Some(key),
+        Some(Ok(Some(key))) => Some(key),
+        Some(Ok(None)) => {
+            identity_provisional = true;
+            None
+        }
         Some(Err(error)) => {
             return Response::error_with_data(
                 &req.id,
@@ -3866,14 +3876,29 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         None => None,
     };
+    if identity_provisional {
+        // aft.db was busy, so an older pin for this folder is unknown and its
+        // identity may still change. Serve tools without indexes for this
+        // bind: no artifact, ownership or retention record is written under a
+        // key the next bind may replace, and the next bind finalizes it.
+        degraded_reasons.push(crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string());
+        next_config.indexes.trigram = false;
+        next_config.indexes.semantic = false;
+        next_config.indexes.callgraph = false;
+        next_config.views.enabled = false;
+    }
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_step("retention_bind");
     let retention_started = Instant::now();
-    let retention_result = crate::storage_retention::record_bind(
-        &storage_root,
-        &canonical_cache_root,
-        project_key.as_deref().unwrap_or_default(),
-    );
+    let retention_result = if identity_provisional {
+        Ok(())
+    } else {
+        crate::storage_retention::record_bind(
+            &storage_root,
+            &canonical_cache_root,
+            project_key.as_deref().unwrap_or_default(),
+        )
+    };
     cache_key_profile.retention_bind = retention_started.elapsed();
     if let Err(error) = retention_result {
         return retention_binding_failure(&req.id, error);
@@ -3957,12 +3982,15 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let callgraph_writer_capability = root_cache_storage_ok
         && !is_worktree_bridge
         && !artifact_owner_read_only
-        && !root_too_broad;
+        && !root_too_broad
+        && !identity_provisional;
     // A parent folder, like HOME, runs no project-wide work over the folder
     // itself; its children are served from their own sessions' results.
-    let inspect_writer_capability = root_cache_storage_ok && !root_too_broad && !parent_folder;
+    let inspect_writer_capability =
+        root_cache_storage_ok && !root_too_broad && !parent_folder && !identity_provisional;
     let heavy_root_work_allowed = !root_too_broad
         && !parent_folder
+        && !identity_provisional
         && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
     // Commit seal: past this point the configure mutates AppContext and must
@@ -4086,7 +4114,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
-    if !root_too_broad {
+    if !root_too_broad && !identity_provisional {
         crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     }
     ctx.begin_configure_ack_step("warm_key");
@@ -20724,7 +20752,8 @@ mod tests {
                         None,
                         &mut profile.key,
                     )
-                    .unwrap();
+                    .unwrap()
+                    .expect("a free aft.db gives a settled identity");
                 assert_eq!(
                     profile.key.git_spawns,
                     usize::from(label == "cold_context" || sample == 0)

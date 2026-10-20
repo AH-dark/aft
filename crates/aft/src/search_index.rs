@@ -7033,6 +7033,33 @@ pub(crate) fn artifact_cache_key_with_memo_profiled(
     Ok(key)
 }
 
+/// The artifact key a session bind uses, or `None` while the root's identity
+/// is provisional (see [`resolve_root_identity_for_bind`]). A provisional key
+/// is not recorded anywhere, so the next bind derives the key again.
+pub(crate) fn artifact_cache_key_for_bind_profiled(
+    probe_root: &Path,
+    memo_root: &Path,
+    storage_root: &Path,
+    git_common_dir: Option<&Path>,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> Result<Option<String>, ArtifactCacheKeyProbeError> {
+    let bound = resolve_root_identity_for_bind(
+        probe_root,
+        memo_root,
+        storage_root,
+        git_common_dir,
+        timings,
+        true,
+        true,
+    )?;
+    if bound.provisional {
+        return Ok(None);
+    }
+    let key = bound.identity.key(probe_root, false);
+    record_derived_cache_key(memo_root, &key);
+    Ok(Some(key))
+}
+
 fn legacy_identity_memo(
     root: &Path,
     raw_key: &str,
@@ -7092,6 +7119,8 @@ pub(crate) fn resolve_root_identity(
 }
 
 /// `force` distinguishes a real bind from background standing reconciliation.
+/// A provisional identity is an error here: only a session bind may use one,
+/// and only through [`resolve_root_identity_for_bind`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_root_identity_with_recheck(
     probe_root: &Path,
@@ -7102,6 +7131,42 @@ pub(crate) fn resolve_root_identity_with_recheck(
     persist: bool,
     force: bool,
 ) -> Result<crate::root_identity::Identity, ArtifactCacheKeyProbeError> {
+    let bound = resolve_root_identity_for_bind(
+        probe_root,
+        memo_root,
+        storage_root,
+        git_common_dir,
+        timings,
+        persist,
+        force,
+    )?;
+    if bound.provisional {
+        return Err(ArtifactCacheKeyProbeError {
+            root: memo_root.to_path_buf(),
+            detail: PROVISIONAL_IDENTITY_REASON.to_string(),
+        });
+    }
+    Ok(bound.identity)
+}
+
+/// Why a root has no settled artifact identity yet. Shown as the root's
+/// degraded reason and as the detail of a refused identity lookup.
+pub(crate) const PROVISIONAL_IDENTITY_REASON: &str =
+    "identity provisional: aft.db was busy at bind; indexes stay off until this folder's next bind";
+
+/// Like [`resolve_root_identity_with_recheck`], but a busy aft.db yields a
+/// provisional identity instead of an error. The caller must not store any
+/// artifact, ownership or retention record under a provisional identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_root_identity_for_bind(
+    probe_root: &Path,
+    memo_root: &Path,
+    storage_root: &Path,
+    git_common_dir: Option<&Path>,
+    timings: &mut ArtifactCacheKeyTimings,
+    persist: bool,
+    force: bool,
+) -> Result<crate::root_identity::BoundIdentity, ArtifactCacheKeyProbeError> {
     let mut choose = |pin: crate::root_identity::LegacyPin,
                       saved: Option<&crate::root_identity::Identity>|
      -> std::io::Result<crate::root_identity::IdentityChoice> {
@@ -7209,17 +7274,15 @@ pub(crate) fn resolve_root_identity_with_recheck(
         }
     };
     let result = if persist {
-        if force {
-            crate::root_identity::bind(probe_root, storage_root, choose)
-        } else {
-            crate::root_identity::bind_with_recheck(probe_root, storage_root, false, choose)
-        }
+        crate::root_identity::bind_with_recheck(probe_root, storage_root, force, choose)
     } else {
         match crate::root_identity::read(probe_root, storage_root) {
-            Ok(Some(identity)) => Ok(identity),
+            Ok(Some(identity)) => Ok(crate::root_identity::BoundIdentity {
+                identity,
+                provisional: false,
+            }),
             Ok(None) => {
                 crate::root_identity::select(probe_root, storage_root, |pin| choose(pin, None))
-                    .map(|choice| choice.identity)
             }
             Err(error) => Err(error),
         }
