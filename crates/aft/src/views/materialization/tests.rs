@@ -1466,9 +1466,9 @@ const DIFFERENTIAL_CIRCLE: &str = "import { Shape } from './shapes';\n\
 const DIFFERENTIAL_GO_SPEAKER: &str =
     "package svc\n\ntype Speaker interface {\n\tSpeak()\n\tSit()\n}\n";
 
-/// A deterministic corpus of TypeScript, Rust, Go, Java and C# files that a
-/// seeded or scripted sequence of edits walks through. Each version is a full
-/// path-to-source map.
+/// A deterministic corpus of TypeScript and Rust files, optionally with Go,
+/// Java and C# packages, that a seeded or scripted sequence of edits walks
+/// through. Each version is a full path-to-source map.
 struct DifferentialCorpus {
     files: BTreeMap<String, String>,
     next_id: usize,
@@ -1534,6 +1534,19 @@ impl DifferentialCorpus {
             "src/board.rs".into(),
             "use crate::shapes::Tile;\npub fn board(t: &Tile) -> i32 { t.width() }\n".into(),
         );
+        Self {
+            files,
+            next_id: 100,
+            // Never zero, so the generator does not get stuck.
+            state: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+        }
+    }
+
+    /// Adds the Go, Java and C# packages that edits 14 and up change. Only
+    /// the walks choosing those edits carry them, which keeps the other
+    /// walks as fast as before.
+    fn with_directory_packages(mut self) -> Self {
+        let files = &mut self.files;
         // One Go package. `Dog` lacks `Sit`, so it does not yet satisfy
         // `Speaker`; `Loud` calls through an unknown receiver, whose name
         // matches depend on the interfaces of every Go file; `Pet` names a
@@ -1569,12 +1582,7 @@ impl DifferentialCorpus {
             "csharp/farm/Barn.cs".into(),
             "class Barn { void Open(Cow c) { c.Moo(); } }\n".into(),
         );
-        Self {
-            files,
-            next_id: 100,
-            // Never zero, so the generator does not get stuck.
-            state: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
-        }
+        self
     }
 
     fn next(&mut self, bound: usize) -> usize {
@@ -1896,6 +1904,9 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
         .collect::<Vec<_>>();
     for (seed, script) in scripts {
         let mut corpus = DifferentialCorpus::new(seed);
+        if script.is_some_and(|script| script.iter().any(|&choice| choice >= 14)) {
+            corpus = corpus.with_directory_packages();
+        }
         let mut versions = Vec::new();
         let mut steps = Vec::new();
         for step in 0..5 {
