@@ -306,9 +306,9 @@ fn read_gh(real_gh: &Path, args: &[String], deadline: Instant, cap: u64) -> Resu
     read_gh_after_spawn(real_gh, args, cap, || Ok(()), || deadline)
 }
 
-// The Windows process-tree test waits for PowerShell to publish the
-// grandchild PID before starting its timeout budget. Production callers keep
-// passing their existing absolute deadline through the closure.
+// The process-tree tests wait for the grandchild to be ready before starting
+// their timeout budget. Production callers keep passing their existing absolute
+// deadline through the closure.
 fn read_gh_after_spawn(
     real_gh: &Path,
     args: &[String],
@@ -529,54 +529,76 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timeout_kills_a_grandchild_process() {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+
         let directory = tempfile::tempdir().unwrap();
-        let pid_file = directory.path().join("grandchild.pid");
-        let script = "sleep 30 & echo $! > \"$1\"; wait";
+        let fifo_path = directory.path().join("grandchild-lifetime");
+        let fifo_name = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is a valid, NUL-terminated path in our private temp directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let mut lifetime = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)
+            .unwrap();
+        // Only the grandchild opens the FIFO for writing. Its PID acknowledges
+        // that it holds the write end, which exec keeps open throughout sleep.
+        let script = "sh -c 'echo $$; exec sleep 30' > \"$1\" & wait";
         let start = Instant::now();
-        let result = read_gh(
+        let mut pid = String::new();
+        let result = read_gh_after_spawn(
             Path::new("/bin/sh"),
             &[
                 "-c".into(),
                 script.into(),
                 "rename-guard-test".into(),
-                pid_file.to_string_lossy().into_owned(),
+                fifo_path.to_string_lossy().into_owned(),
             ],
-            // Long enough for a loaded runner to start the shell and record
-            // the grandchild's pid before the deadline kills the tree.
-            start + Duration::from_secs(3),
             1024,
+            || {
+                let setup_deadline = start + Duration::from_secs(3);
+                loop {
+                    let mut byte = [0];
+                    match lifetime.read(&mut byte) {
+                        Ok(1) if byte[0] == b'\n' => return Ok(()),
+                        Ok(1) => pid.push(char::from(byte[0])),
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            return Err(format!("could not read grandchild PID: {error}"))
+                        }
+                    }
+                    if Instant::now() >= setup_deadline {
+                        return Err("grandchild did not open its lifetime pipe".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+            || Instant::now() + Duration::from_secs(3),
         );
         assert!(result.unwrap_err().contains("deadline"));
         assert!(start.elapsed() < Duration::from_secs(15));
 
-        let pid: i32 = std::fs::read_to_string(pid_file)
-            .expect("the shell did not record the grandchild pid before the deadline")
-            .trim()
+        let pid: i32 = pid
             .parse()
-            .unwrap();
+            .expect("grandchild acknowledged its lifetime pipe");
+        // FIFO EOF observes closure of the grandchild's write end, even while it
+        // remains a zombie. This liveness observation is independent of reaping
+        // and PID reuse.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while process_is_alive(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !process_is_alive(pid),
-            "grandchild process {pid} survived timeout"
-        );
-    }
-
-    #[cfg(unix)]
-    fn process_is_alive(pid: i32) -> bool {
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            #[cfg(target_os = "linux")]
-            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                return stat
-                    .rsplit_once(')')
-                    .and_then(|(_, fields)| fields.trim_start().chars().next())
-                    != Some('Z');
+        loop {
+            match lifetime.read(&mut [0]) {
+                Ok(0) => break,
+                Ok(_) => panic!("unexpected data after grandchild PID"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("could not observe grandchild exit: {error}"),
             }
-            true
-        } else {
-            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            if Instant::now() >= deadline {
+                // The writer is still alive; clean it up before reporting the failure.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("grandchild process {pid} survived timeout (lifetime pipe still open)");
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
