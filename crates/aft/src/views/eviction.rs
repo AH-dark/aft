@@ -3051,12 +3051,34 @@ mod tests {
          41568 bytes",
     ];
 
+    /// The collect-all pass's file bytes after its sweep take one of two
+    /// values, 4120 bytes (one 4 KiB write-ahead-log frame) apart, from run
+    /// to run on unchanged main as well (2 of 30 runs there): the pass does
+    /// not always write the same number of pages. These are the golden lines
+    /// with the other value; a run must match one set or the other entirely.
+    const GOLDEN_ALTERNATE_LINES: &[(usize, &str)] = &[
+        (
+            15,
+            "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
+             deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
+             sweep_error=None before_file_bytes=544789 after_file_bytes=510361 \
+             after_complete=true over_hard=[] stopped_early=false",
+        ),
+        (17, "recorded family_usage file_bytes=510361"),
+    ];
+
     #[test]
     fn measurement_sweep_and_admission_values_match_the_recorded_golden() {
         let actual = golden_fixture_values();
         eprintln!("golden values: {actual:#?}");
         if cfg!(target_os = "linux") {
-            assert_eq!(actual, GOLDEN_VALUES);
+            let mut alternate = GOLDEN_VALUES.to_vec();
+            for (index, line) in GOLDEN_ALTERNATE_LINES {
+                alternate[*index] = line;
+            }
+            if actual != alternate {
+                assert_eq!(actual, GOLDEN_VALUES);
+            }
         }
     }
 
@@ -3079,24 +3101,19 @@ mod tests {
     /// plane stores, the same family failed to measure at all.
     #[test]
     fn an_unopenable_plane_store_is_measured_by_size_and_reported_by_the_sweep() {
-        let intact_storage = tempfile::tempdir().unwrap();
-        let broken_storage = tempfile::tempdir().unwrap();
-        let intact = two_view_family(intact_storage.path());
-        let broken = two_view_family(broken_storage.path());
-        let plane =
-            crate::blob_store::v2::plane_path(broken_storage.path(), FAMILY, FamilyPlane::Trigram)
-                .unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let broken = two_view_family(storage.path());
+        let plane = crate::blob_store::v2::plane_path(storage.path(), FAMILY, FamilyPlane::Trigram)
+            .unwrap();
+        let (expected, complete) = family_file_bytes(storage.path(), FAMILY, None).unwrap();
+        assert!(complete);
         // Same length, so the family's file bytes must not change.
         let length = fs::metadata(&plane).unwrap().len() as usize;
         fs::write(&plane, vec![b'x'; length]).unwrap();
 
-        let expected = measure(&intact, None).unwrap();
         let measured = measure(&broken, None).expect("measurement opens no plane store");
         assert!(measured.family_store.complete);
-        assert_eq!(
-            measured.family_store.file_bytes,
-            expected.family_store.file_bytes
-        );
+        assert_eq!(measured.family_store.file_bytes, expected);
 
         let report = enforce(&broken, EnforceOptions::default()).unwrap();
         assert!(report.evicted.is_empty());
