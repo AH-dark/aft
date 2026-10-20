@@ -46,9 +46,10 @@ use super::persistence::{
     allocate_task_layout, delete_resolved_task, delete_task_bundle,
     delete_task_bundle_with_legacy_harness_root, discover_task_ids, is_task_layout_not_found,
     open_task_artifact, quarantine_invalid_entry, quarantine_task_layout, read_exit_marker,
-    read_task_at, resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
-    unix_millis, update_task_at, validate_task_id, write_kill_marker_if_absent, write_task_at,
-    BgMode, ExitMarker, PersistedTask, TaskArtifact, TaskIoHandles, TaskPaths,
+    read_task_at, resolve_task_layout, resolve_uninitialized_task_layout, session_tasks_dir,
+    uninitialized_layout_is_recent, unix_millis, update_task_at, validate_task_id,
+    write_kill_marker_if_absent, write_task_at, BgMode, ExitMarker, PersistedTask, TaskArtifact,
+    TaskIoHandles, TaskPaths,
 };
 #[cfg(unix)]
 use super::process::terminate_pgid;
@@ -642,6 +643,24 @@ pub struct BgTaskHealthCounts {
     pub retired_undelivered_completions: u64,
     /// Scratch directories of finished commands still kept on disk.
     pub retained_scratch: RetainedScratchHealth,
+    pub project_replay_failures: Vec<ProjectReplayFailureHealth>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectReplayFailureReason {
+    SessionDirectoryPermissionDenied,
+    SessionDirectoryOpenFailed,
+    SessionDirectoryReadFailed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectReplayFailureHealth {
+    pub session_dir: PathBuf,
+    pub reason: ProjectReplayFailureReason,
+    pub error: String,
+    pub attempts: u32,
+    pub retry_after_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,6 +825,109 @@ pub enum WatchdogPassCause {
     Tick,
 }
 
+const PROJECT_REPLAY_SCAN_ENTRY_BUDGET: usize = 512;
+const PROJECT_REPLAY_SCAN_TIME_BUDGET: Duration = Duration::from_millis(25);
+const PROJECT_REPLAY_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const PROJECT_REPLAY_RETRY_MAX: Duration = Duration::from_secs(5);
+
+struct ProjectReplayFailure {
+    reason: ProjectReplayFailureReason,
+    error: String,
+    attempts: u32,
+    retry_at: Instant,
+}
+
+struct ProjectReplaySessionScan {
+    session_id: String,
+    session_dir: PathBuf,
+    entries: fs::ReadDir,
+    seen_task_ids: HashSet<String>,
+}
+
+struct ProjectReplayScanCursor {
+    storage_dir: PathBuf,
+    project_root: PathBuf,
+    sessions: VecDeque<String>,
+    known_sessions: HashSet<String>,
+    current: Option<ProjectReplaySessionScan>,
+    failures: HashMap<String, ProjectReplayFailure>,
+    #[cfg(test)]
+    total_examined: usize,
+}
+
+impl ProjectReplayScanCursor {
+    fn new(storage_dir: &Path, project_root: &Path) -> Self {
+        Self {
+            storage_dir: storage_dir.to_path_buf(),
+            project_root: canonicalized_path(project_root),
+            sessions: VecDeque::new(),
+            known_sessions: HashSet::new(),
+            current: None,
+            failures: HashMap::new(),
+            #[cfg(test)]
+            total_examined: 0,
+        }
+    }
+
+    fn enqueue_sessions(&mut self, sessions: impl IntoIterator<Item = String>) {
+        for session_id in sessions {
+            if self.known_sessions.insert(session_id.clone()) {
+                self.sessions.push_back(session_id);
+            }
+        }
+    }
+
+    fn park_session(
+        &mut self,
+        session_id: String,
+        reason: ProjectReplayFailureReason,
+        error: std::io::Error,
+    ) {
+        let failure = self.failures.entry(session_id.clone()).or_insert_with(|| {
+            crate::slog_warn!(
+                "failed to scan Bash task session {} during project replay; retry deferred: {error}",
+                session_tasks_dir(&self.storage_dir, &session_id).display()
+            );
+            ProjectReplayFailure {
+                reason,
+                error: error.to_string(),
+                attempts: 0,
+                retry_at: Instant::now(),
+            }
+        });
+        failure.attempts = failure.attempts.saturating_add(1);
+        failure.reason = reason;
+        failure.error = error.to_string();
+        let backoff = PROJECT_REPLAY_RETRY_INITIAL
+            .saturating_mul(1 << failure.attempts.saturating_sub(1).min(4))
+            .min(PROJECT_REPLAY_RETRY_MAX);
+        failure.retry_at = Instant::now() + backoff;
+    }
+
+    fn retry_at(&self) -> Option<Instant> {
+        if self.current.is_some() || !self.sessions.is_empty() {
+            return None;
+        }
+        self.failures.values().map(|failure| failure.retry_at).min()
+    }
+
+    fn retry_due_failures(&mut self) {
+        let now = Instant::now();
+        for (session_id, failure) in &self.failures {
+            if failure.retry_at <= now {
+                self.sessions.push_back(session_id.clone());
+            }
+        }
+    }
+}
+
+struct ProjectReplayDiskBatch {
+    tasks: Vec<PersistedTask>,
+    examined: usize,
+    incomplete_reason: Option<&'static str>,
+    retry_deferred: bool,
+}
+
 pub(crate) struct RegistryInner {
     #[cfg(unix)]
     db_hint_jobs:
@@ -875,6 +997,11 @@ pub(crate) struct RegistryInner {
     /// persisted GC so a sweep never judges a session that replay is in the
     /// middle of restoring.
     session_recovery: Mutex<HashMap<String, SessionRecovery>>,
+    /// Project replay retains its iterator between bounded maintenance passes
+    /// rather than restarting at the first session after every bind.
+    project_replay_scan: Mutex<Option<ProjectReplayScanCursor>>,
+    #[cfg(test)]
+    project_replay_scan_budget_for_test: Mutex<Option<(usize, Duration)>>,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
@@ -1329,6 +1456,9 @@ impl BgTaskRegistry {
                 snapshots_built: AtomicU64::new(0),
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
+                project_replay_scan: Mutex::new(None),
+                #[cfg(test)]
+                project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_writes_awaiting_pool: Mutex::new(HashSet::new()),
@@ -1577,6 +1707,40 @@ impl BgTaskRegistry {
         }
         if let Ok(mut slot) = self.inner.db_harness.write() {
             *slot = Some(segment);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_project_replay_scan_budget_for_test(
+        &self,
+        entries: usize,
+        duration: Duration,
+    ) {
+        *self
+            .inner
+            .project_replay_scan_budget_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entries, duration));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_replay_scan_total_examined_for_test(&self) -> Option<usize> {
+        self.inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|cursor| cursor.total_examined)
+    }
+
+    // Only the Unix unreadable-session replay test uses this; Windows cannot
+    // make a session directory unreadable the same way.
+    #[cfg(all(test, unix))]
+    pub(crate) fn expire_project_replay_backoff_for_test(&self) {
+        if let Some(cursor) = self.inner.project_replay_scan.lock().unwrap().as_mut() {
+            for failure in cursor.failures.values_mut() {
+                failure.retry_at = Instant::now();
+            }
         }
     }
 
@@ -4481,6 +4645,60 @@ impl BgTaskRegistry {
         self.replay_session_inner(storage_dir, session_id, Some(project_root))
     }
 
+    pub(crate) fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {
+        let project_root = canonicalized_path(project_root);
+        self.inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|cursor| {
+                cursor.storage_dir == storage_dir
+                    && cursor.project_root == project_root
+                    && (cursor.current.is_some()
+                        || !cursor.sessions.is_empty()
+                        || !cursor.failures.is_empty())
+            })
+    }
+
+    pub(crate) fn project_replay_retry_at(&self) -> Option<Instant> {
+        self.inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(ProjectReplayScanCursor::retry_at)
+    }
+
+    /// Continue only the saved disk walk. The configure tail schedules one
+    /// batch at a time, releasing recovery guards and locks between batches.
+    pub(crate) fn continue_project_replay(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: &Path,
+        retry_due_failures: bool,
+    ) -> Result<bool, String> {
+        if self.project_replay_pending(storage_dir, project_root) {
+            // Only a continuation resumed by a later maintenance tick may retry
+            // failed sessions. A long drain of healthy sessions must not reopen
+            // a failed session even if its backoff expires during that drain.
+            if retry_due_failures {
+                if let Some(cursor) = self
+                    .inner
+                    .project_replay_scan
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    cursor.retry_due_failures();
+                }
+            }
+            self.replay_session_batch(storage_dir, session_id, Some(project_root), true)?;
+        }
+        Ok(self.project_replay_pending(storage_dir, project_root))
+    }
+
     pub(crate) fn repair_legacy_root_tasks(&self, storage_root: &Path, harness: Harness) {
         let root_tasks = storage_root.join("bash-tasks");
         // Replayed tasks pin their artifact directories, including after exit.
@@ -4685,6 +4903,16 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
+        self.replay_session_batch(storage_dir, session_id, project_root, false)
+    }
+
+    fn replay_session_batch(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: Option<&Path>,
+        continuation: bool,
+    ) -> Result<(), String> {
         // Held for the whole call: from here on this session's task directory is
         // being rewritten, and the persisted GC below sweeps the same storage
         // root from another thread. Tasks belonging to other sessions are
@@ -4693,9 +4921,11 @@ impl BgTaskRegistry {
         // Standalone NDJSON: every session for a project replays through the same
         // bridge, so replay unions this session into live delivery routes.
         // Only subc route synchronization (subc/mod.rs:2120) replaces the whole set.
-        self.record_live_delivery_session(session_id);
-        self.retire_orphaned_watch_tombstones(session_id)?;
-        self.start_watchdog();
+        if !continuation {
+            self.record_live_delivery_session(session_id);
+            self.retire_orphaned_watch_tombstones(session_id)?;
+            self.start_watchdog();
+        }
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -4723,10 +4953,124 @@ impl BgTaskRegistry {
         // (see GitHub user report against v0.27.0). INFO-level logs only when
         // disk actually returned tasks (real migration signal); WARN when the
         // DB lookup itself errored.
-        let tasks = match self.replay_session_from_db(session_id, project_root) {
-            Some(Ok(tasks)) if !tasks.is_empty() => tasks,
+        let database_replay = if continuation {
+            None
+        } else {
+            self.replay_session_from_db(session_id, project_root)
+        };
+        let tasks = match database_replay {
+            _ if continuation => {
+                let batch = self.replay_session_from_disk_for_project(
+                    storage_dir,
+                    project_root.expect("project replay continuation requires a root"),
+                    std::iter::empty(),
+                    &HashSet::new(),
+                );
+                if !batch.retry_deferred || !batch.tasks.is_empty() {
+                    crate::slog_info!(
+                        "replay merged {} disk tasks; scan {}: {}, examined {}",
+                        batch.tasks.len(),
+                        if batch.incomplete_reason.is_some() {
+                            "incomplete"
+                        } else {
+                            "complete"
+                        },
+                        batch.incomplete_reason.unwrap_or("iterator exhausted"),
+                        batch.examined
+                    );
+                }
+                batch.tasks
+            }
+            Some(Ok(mut tasks)) if !tasks.is_empty() => {
+                // A task can be written to its disk bundle while this registry
+                // has no database pool. Preserve DB rows as authoritative for
+                // matching IDs, but add replayable disk records omitted by the
+                // query. Delivered terminal bundles are intentionally retired
+                // from DB replay and must not be resurrected from disk.
+                let mut seen = tasks
+                    .iter()
+                    .map(|task| (task.session_id.clone(), task.task_id.clone()))
+                    .collect::<HashSet<_>>();
+                let mut database_sessions = tasks
+                    .iter()
+                    .map(|task| task.session_id.clone())
+                    .collect::<BTreeSet<_>>();
+                database_sessions.remove(session_id);
+                let mut disk_sessions = VecDeque::from([session_id.to_string()]);
+                disk_sessions.extend(database_sessions);
+                let database_tasks = tasks
+                    .iter()
+                    .map(|task| (task.session_id.clone(), task.task_id.clone()))
+                    .collect::<HashSet<_>>();
+                let disk_batch = if let Some(project_root) = project_root {
+                    self.replay_session_from_disk_for_project(
+                        storage_dir,
+                        project_root,
+                        disk_sessions,
+                        &database_tasks,
+                    )
+                } else {
+                    let mut disk_tasks = Vec::new();
+                    for disk_session in disk_sessions {
+                        match self.replay_session_from_disk(storage_dir, &disk_session) {
+                            Ok(session_tasks) => disk_tasks.extend(session_tasks),
+                            Err(error) => crate::slog_warn!(
+                                "bash task replay disk merge failed for session {disk_session}; retaining DB results: {error}"
+                            ),
+                        }
+                    }
+                    ProjectReplayDiskBatch {
+                        tasks: disk_tasks,
+                        examined: 0,
+                        incomplete_reason: None,
+                        retry_deferred: false,
+                    }
+                };
+                let mut merged = 0usize;
+                for task in disk_batch.tasks {
+                    if task.is_terminal() && task.completion_delivered {
+                        continue;
+                    }
+                    let key = (task.session_id.clone(), task.task_id.clone());
+                    if seen.insert(key) {
+                        tasks.push(task);
+                        merged = merged.saturating_add(1);
+                    }
+                }
+                if let Some(reason) = disk_batch
+                    .incomplete_reason
+                    .filter(|_| !disk_batch.retry_deferred || merged > 0)
+                {
+                    crate::slog_info!(
+                        "replay merged {merged} disk tasks; scan incomplete: {reason}, examined {}",
+                        disk_batch.examined
+                    );
+                }
+                tasks
+            }
             Some(Ok(_)) => {
-                let disk_tasks = self.replay_session_from_disk(storage_dir, session_id)?;
+                let disk_tasks = match project_root {
+                    Some(project_root) => {
+                        let batch = self.replay_session_from_disk_for_project(
+                            storage_dir,
+                            project_root,
+                            [session_id.to_string()],
+                            &HashSet::new(),
+                        );
+                        if let Some(reason) = batch
+                            .incomplete_reason
+                            .filter(|_| !batch.retry_deferred || !batch.tasks.is_empty())
+                        {
+                            crate::slog_info!(
+                                "replay merged {} disk tasks; scan incomplete: {reason}, examined {}",
+                                batch.tasks.len(),
+                                batch.examined
+                            );
+                        }
+                        batch.tasks
+                    }
+                    None => self.replay_session_from_disk(storage_dir, session_id)?,
+                };
                 if !disk_tasks.is_empty() {
                     crate::slog_info!(
                         "bash task replay: 0 in DB for session {}, {} from disk fallback",
@@ -4742,11 +5086,53 @@ impl BgTaskRegistry {
                     session_id,
                     error
                 );
-                self.replay_session_from_disk(storage_dir, session_id)?
+                match project_root {
+                    Some(project_root) => {
+                        let batch = self.replay_session_from_disk_for_project(
+                            storage_dir,
+                            project_root,
+                            [session_id.to_string()],
+                            &HashSet::new(),
+                        );
+                        if let Some(reason) = batch
+                            .incomplete_reason
+                            .filter(|_| !batch.retry_deferred || !batch.tasks.is_empty())
+                        {
+                            crate::slog_info!(
+                                "replay merged {} disk tasks; scan incomplete: {reason}, examined {}",
+                                batch.tasks.len(),
+                                batch.examined
+                            );
+                        }
+                        batch.tasks
+                    }
+                    None => self.replay_session_from_disk(storage_dir, session_id)?,
+                }
             }
             None => {
                 // DB pool unconfigured — common in tests + before harness is set.
-                self.replay_session_from_disk(storage_dir, session_id)?
+                match project_root {
+                    Some(project_root) => {
+                        let batch = self.replay_session_from_disk_for_project(
+                            storage_dir,
+                            project_root,
+                            [session_id.to_string()],
+                            &HashSet::new(),
+                        );
+                        if let Some(reason) = batch
+                            .incomplete_reason
+                            .filter(|_| !batch.retry_deferred || !batch.tasks.is_empty())
+                        {
+                            crate::slog_info!(
+                                "replay merged {} disk tasks; scan incomplete: {reason}, examined {}",
+                                batch.tasks.len(),
+                                batch.examined
+                            );
+                        }
+                        batch.tasks
+                    }
+                    None => self.replay_session_from_disk(storage_dir, session_id)?,
+                }
             }
         };
 
@@ -5314,6 +5700,233 @@ impl BgTaskRegistry {
             }
         }
         Ok(tasks)
+    }
+
+    fn replay_session_from_disk_for_project(
+        &self,
+        storage_dir: &Path,
+        project_root: &Path,
+        sessions: impl IntoIterator<Item = String>,
+        database_tasks: &HashSet<(String, String)>,
+    ) -> ProjectReplayDiskBatch {
+        let project_root = canonicalized_path(project_root);
+        // Session directory names are hashed, and one session can contain tasks
+        // from several projects. DB rows identify project sessions before the
+        // walk; the current route session is included for disk-only task rows.
+        let (entry_budget, time_budget) = {
+            #[cfg(test)]
+            if let Some(limits) = *self
+                .inner
+                .project_replay_scan_budget_for_test
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                limits
+            } else {
+                (
+                    PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+                    PROJECT_REPLAY_SCAN_TIME_BUDGET,
+                )
+            }
+            #[cfg(not(test))]
+            {
+                (
+                    PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
+                    PROJECT_REPLAY_SCAN_TIME_BUDGET,
+                )
+            }
+        };
+        let entry_budget = entry_budget.max(1);
+        let mut scan_slot = self
+            .inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if scan_slot.as_ref().is_none_or(|cursor| {
+            cursor.storage_dir != storage_dir || cursor.project_root != project_root
+        }) {
+            *scan_slot = Some(ProjectReplayScanCursor::new(storage_dir, &project_root));
+        }
+        let cursor = scan_slot.as_mut().expect("project replay cursor installed");
+        cursor.enqueue_sessions(sessions);
+
+        let started = Instant::now();
+        let mut examined = 0usize;
+        let mut tasks = Vec::new();
+        let mut incomplete_reason = None;
+        loop {
+            if cursor.current.is_none() && cursor.sessions.is_empty() {
+                break;
+            }
+            if examined >= entry_budget {
+                incomplete_reason = Some("entry budget");
+                break;
+            }
+            if started.elapsed() >= time_budget {
+                incomplete_reason = Some("time budget");
+                break;
+            }
+
+            if cursor.current.is_none() {
+                let session_id = cursor.sessions.pop_front().expect("pending session");
+                examined = examined.saturating_add(1);
+                #[cfg(test)]
+                {
+                    cursor.total_examined = cursor.total_examined.saturating_add(1);
+                }
+                let session_dir = session_tasks_dir(storage_dir, &session_id);
+                match fs::read_dir(&session_dir) {
+                    Ok(entries) => {
+                        cursor.current = Some(ProjectReplaySessionScan {
+                            session_id,
+                            session_dir,
+                            entries,
+                            seen_task_ids: HashSet::new(),
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        cursor.known_sessions.remove(&session_id);
+                        cursor.failures.remove(&session_id);
+                    }
+                    Err(error) => {
+                        let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                            ProjectReplayFailureReason::SessionDirectoryPermissionDenied
+                        } else {
+                            ProjectReplayFailureReason::SessionDirectoryOpenFailed
+                        };
+                        cursor.park_session(session_id, reason, error);
+                    }
+                }
+                continue;
+            }
+
+            examined = examined.saturating_add(1);
+            #[cfg(test)]
+            {
+                cursor.total_examined = cursor.total_examined.saturating_add(1);
+            }
+            let next_entry = cursor
+                .current
+                .as_mut()
+                .expect("current project replay session")
+                .entries
+                .next();
+            let entry = match next_entry {
+                None => {
+                    let current = cursor
+                        .current
+                        .take()
+                        .expect("finished project replay session");
+                    cursor.failures.remove(&current.session_id);
+                    continue;
+                }
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    let current = cursor
+                        .current
+                        .take()
+                        .expect("failed project replay session");
+                    cursor.park_session(
+                        current.session_id,
+                        ProjectReplayFailureReason::SessionDirectoryReadFailed,
+                        error,
+                    );
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else {
+                let session_dir = &cursor
+                    .current
+                    .as_ref()
+                    .expect("current project replay session")
+                    .session_dir;
+                if let Err(error) = quarantine_invalid_entry(storage_dir, session_dir, &name) {
+                    crate::slog_warn!(
+                        "failed to quarantine invalid Bash task entry during project replay: {error}"
+                    );
+                }
+                continue;
+            };
+            let task_id = match text.split_once('.') {
+                Some((task_id, "json")) => task_id,
+                Some(_) => continue,
+                None => text,
+            };
+            if validate_task_id(task_id).is_err() {
+                if task_id.starts_with("bash-") {
+                    let session_dir = &cursor
+                        .current
+                        .as_ref()
+                        .expect("current project replay session")
+                        .session_dir;
+                    if let Err(error) = quarantine_invalid_entry(storage_dir, session_dir, &name) {
+                        crate::slog_warn!(
+                            "failed to quarantine invalid Bash task entry during project replay: {error}"
+                        );
+                    }
+                }
+                continue;
+            }
+            let (session_id, session_dir) = {
+                let current = cursor
+                    .current
+                    .as_mut()
+                    .expect("current project replay session");
+                if !current.seen_task_ids.insert(task_id.to_string()) {
+                    continue;
+                }
+                (current.session_id.clone(), current.session_dir.clone())
+            };
+            if database_tasks.contains(&(session_id.clone(), task_id.to_string()))
+                || self.task_for_session(task_id, &session_id).is_some()
+            {
+                continue;
+            }
+            let resolved = match resolve_uninitialized_task_layout(&session_dir, task_id) {
+                Ok(resolved) => resolved,
+                Err(_) => continue,
+            };
+            let metadata = match read_task_at(&resolved) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to read Bash task {task_id} during project replay: {error}"
+                    );
+                    continue;
+                }
+            };
+            if metadata.task_id != task_id
+                || metadata.session_id != session_id
+                || session_tasks_dir(storage_dir, &metadata.session_id) != session_dir
+            {
+                continue;
+            }
+            if metadata.is_terminal() && metadata.completion_delivered {
+                continue;
+            }
+            if metadata
+                .project_root
+                .as_deref()
+                .is_some_and(|root| canonicalized_path(root) == project_root)
+            {
+                tasks.push(metadata);
+            }
+        }
+
+        let retry_deferred = cursor.retry_at().is_some();
+        if retry_deferred {
+            incomplete_reason = Some("session directory retry deferred");
+        }
+        if cursor.current.is_none() && cursor.sessions.is_empty() && cursor.failures.is_empty() {
+            scan_slot.take();
+        }
+        ProjectReplayDiskBatch {
+            tasks,
+            examined,
+            incomplete_reason,
+            retry_deferred,
+        }
     }
 
     pub fn register_watch(
@@ -5919,12 +6532,26 @@ impl BgTaskRegistry {
         let mut task = self.task_for_session(task_id, session_id);
         if task.is_none() {
             if let Some(storage_dir) = storage_dir {
-                let _ = if let Some(project_root) = project_root {
-                    self.replay_session_for_project(storage_dir, session_id, project_root)
-                } else {
-                    self.replay_session(storage_dir, session_id)
-                };
+                // Project replay skips delivered bundles and may stop at its
+                // scan budget. An explicit status request can recover its one
+                // task, including artifact handles, without redelivering a notice.
+                let harness = self.db_harness_for_session(session_id);
+                let _ = self.recover_watch_task(
+                    storage_dir,
+                    session_id,
+                    task_id,
+                    project_root,
+                    harness.as_deref(),
+                );
                 task = self.task_for_session(task_id, session_id);
+                if task.is_none() {
+                    let _ = if let Some(project_root) = project_root {
+                        self.replay_session_for_project(storage_dir, session_id, project_root)
+                    } else {
+                        self.replay_session(storage_dir, session_id)
+                    };
+                    task = self.task_for_session(task_id, session_id);
+                }
             }
         }
         let Some(task) = task else {
@@ -7813,6 +8440,11 @@ impl BgTaskRegistry {
             }
             tasks.clear();
         }
+        self.inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.prune_session_harnesses();
     }
 
@@ -9988,7 +10620,32 @@ impl BgTaskRegistry {
             .map(|tasks| tasks.values().filter(|task| task.try_is_running()).count())?;
         let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
         let retained_scratch = self.try_retained_scratch_health()?;
+        let project_replay_failures = self
+            .inner
+            .project_replay_scan
+            .try_lock()
+            .ok()?
+            .as_ref()
+            .map(|cursor| {
+                let now = Instant::now();
+                let mut failures: Vec<_> = cursor
+                    .failures
+                    .iter()
+                    .map(|(session_id, failure)| ProjectReplayFailureHealth {
+                        session_dir: session_tasks_dir(&cursor.storage_dir, session_id),
+                        reason: failure.reason,
+                        error: failure.error.clone(),
+                        attempts: failure.attempts,
+                        retry_after_ms: failure.retry_at.saturating_duration_since(now).as_millis()
+                            as u64,
+                    })
+                    .collect();
+                failures.sort_by(|a, b| a.session_dir.cmp(&b.session_dir));
+                failures
+            })
+            .unwrap_or_default();
         Some(BgTaskHealthCounts {
+            project_replay_failures,
             retained_scratch,
             running,
             pending_completions,
@@ -13629,6 +14286,302 @@ mod tests {
             )
             .expect("owning project should replay its task");
         assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+    }
+
+    #[test]
+    fn replay_merges_disk_task_omitted_by_nonempty_db_result() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "partial-db-replay-session";
+        let db_task_id = "bash-1111111111111111";
+        let disk_task_id = "bash-2222222222222222";
+        let delivered_task_id = "bash-3333333333333333";
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+
+        write_running_project_task(storage.path(), project.path(), session, db_task_id);
+        write_running_project_task(storage.path(), project.path(), session, disk_task_id);
+        write_running_project_task(storage.path(), project.path(), session, delivered_task_id);
+        let delivered_paths = task_paths(storage.path(), session, delivered_task_id).unwrap();
+        let mut delivered = read_task(&delivered_paths.json).unwrap();
+        delivered.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        delivered.completion_delivered = true;
+        write_task(&delivered_paths.json, &delivered).unwrap();
+
+        let db_paths = task_paths(storage.path(), session, db_task_id).unwrap();
+        let db_metadata = read_task(&db_paths.json).unwrap();
+        let row = db_metadata.to_bash_task_row("opencode", &db_paths).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
+
+        registry.replay_session(storage.path(), session).unwrap();
+
+        assert!(
+            registry.task_for_session(disk_task_id, session).is_some(),
+            "a replayable disk task omitted from a nonempty DB result must be restored"
+        );
+        assert!(registry.task_for_session(db_task_id, session).is_some());
+        assert!(
+            registry
+                .task_for_session(delivered_task_id, session)
+                .is_none(),
+            "a delivered terminal bundle must not be resurrected after DB retirement"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_merges_disk_only_task_from_db_known_project_session() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let db_session = "project-replay-db-session";
+        let disk_session = db_session;
+        let bind_session = "project-replay-bind-session";
+        let db_task_id = "bash-4444444444444444";
+        let disk_task_id = "bash-5555555555555555";
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+
+        write_running_project_task(storage.path(), project.path(), db_session, db_task_id);
+        write_running_project_task(storage.path(), project.path(), disk_session, disk_task_id);
+        let db_paths = task_paths(storage.path(), db_session, db_task_id).unwrap();
+        let db_metadata = read_task(&db_paths.json).unwrap();
+        let row = db_metadata.to_bash_task_row("opencode", &db_paths).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
+
+        registry
+            .replay_session_for_project(storage.path(), bind_session, project.path())
+            .unwrap();
+
+        assert!(registry.task_for_session(db_task_id, db_session).is_some());
+        assert!(
+            registry
+                .task_for_session(disk_task_id, disk_session)
+                .is_some(),
+            "project replay must merge disk-only tasks from a session identified by its DB rows"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_keeps_delivered_terminal_readable_without_redelivering_it() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "delivered-project-task";
+        let task_id = "bash-6666666666666666";
+        let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task(&paths.json, &metadata).unwrap();
+
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(registry.task_for_session(task_id, session).is_none());
+        let snapshot = registry
+            .status_settled_owned(task_id, session, Some(project.path()), storage.path(), 1024)
+            .expect("explicit status can read the delivered bundle");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+        assert!(registry.task_for_session(task_id, session).is_some());
+        assert!(registry.drain_completions().is_empty());
+        registry.detach();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_replay_parks_failed_session_and_scans_remaining_sessions_in_same_batch() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        let blocked_session = "unreadable-project-session";
+        let healthy_session = "readable-project-session";
+        let healthy_task = "bash-000000000000beef";
+        write_running_project_task(
+            storage.path(),
+            project.path(),
+            blocked_session,
+            "bash-000000000000feed",
+        );
+        write_running_project_task(
+            storage.path(),
+            project.path(),
+            healthy_session,
+            healthy_task,
+        );
+        let blocked = session_tasks_dir(storage.path(), blocked_session);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0)).unwrap();
+        let batch = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [blocked_session.to_string(), healthy_session.to_string()],
+            &HashSet::new(),
+        );
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            batch
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [healthy_task],
+            "an unreadable first session must not stop the rest of the current batch"
+        );
+        assert!(batch.retry_deferred);
+        assert!(registry.project_replay_pending(storage.path(), project.path()));
+        assert!(registry.project_replay_retry_at().is_some());
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_scan_stops_at_budget_reports_and_resumes() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        registry.set_project_replay_scan_budget_for_test(8, Duration::from_secs(5));
+
+        let mut rows = Vec::new();
+        for session_index in 0..12 {
+            let session = format!("bounded-project-session-{session_index:02}");
+            for task_index in 0..8 {
+                let task_id = format!("bash-{:016x}", session_index * 8 + task_index);
+                write_running_project_task(storage.path(), project.path(), &session, &task_id);
+                if task_index == 0 {
+                    let paths = task_paths(storage.path(), &session, &task_id).unwrap();
+                    let metadata = read_task(&paths.json).unwrap();
+                    rows.push(metadata.to_bash_task_row("opencode", &paths).unwrap());
+                }
+            }
+        }
+        let conn = db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for row in rows {
+            crate::db::bash_tasks::upsert_bash_task(&tx, &row).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let (_, first_logs) = crate::logging::capture_log_lines(|| {
+            registry
+                .replay_session_for_project(
+                    storage.path(),
+                    "bounded-project-bind-session",
+                    project.path(),
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            Some(8),
+            "the first pass must stop exactly at its iterator budget"
+        );
+        assert!(
+            first_logs.iter().any(|line| {
+                line.contains("replay merged ")
+                    && line.contains("scan incomplete: entry budget, examined 8")
+            }),
+            "the incomplete scan must be reported: {first_logs:?}"
+        );
+
+        let (_, next_logs) = crate::logging::capture_log_lines(|| {
+            registry
+                .replay_session_for_project(
+                    storage.path(),
+                    "bounded-project-bind-session",
+                    project.path(),
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            Some(16),
+            "the following pass must continue from the saved iterator"
+        );
+        assert!(
+            next_logs.iter().any(|line| {
+                line.contains("replay merged ")
+                    && line.contains("scan incomplete: entry budget, examined 8")
+            }),
+            "the resumed scan must report its incomplete work: {next_logs:?}"
+        );
+
+        registry.set_project_replay_scan_budget_for_test(8, Duration::ZERO);
+        let (_, time_logs) = crate::logging::capture_log_lines(|| {
+            registry
+                .replay_session_for_project(
+                    storage.path(),
+                    "bounded-project-bind-session",
+                    project.path(),
+                )
+                .unwrap();
+        });
+        assert!(
+            time_logs.iter().any(|line| {
+                line.contains("replay merged ")
+                    && line.contains("scan incomplete: time budget, examined 0")
+            }),
+            "the elapsed-time limit must report its reason: {time_logs:?}"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    #[ignore = "manual replay bind-path benchmark: 5,000 tasks in 300 sessions"]
+    fn measure_project_replay_5000_tasks_300_sessions() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let mut rows = Vec::new();
+        let mut task_index = 0usize;
+
+        for session_index in 0..300 {
+            let session = format!("replay-benchmark-session-{session_index:03}");
+            let session_tasks = if session_index < 200 { 17 } else { 16 };
+            for task_in_session in 0..session_tasks {
+                let task_id = format!("bash-{task_index:016x}");
+                write_running_project_task(storage.path(), project.path(), &session, &task_id);
+                if task_in_session == 0 {
+                    let paths = task_paths(storage.path(), &session, &task_id).unwrap();
+                    let metadata = read_task(&paths.json).unwrap();
+                    rows.push(metadata.to_bash_task_row("opencode", &paths).unwrap());
+                }
+                task_index += 1;
+            }
+        }
+        assert_eq!(task_index, 5_000);
+
+        let conn = db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for row in rows {
+            crate::db::bash_tasks::upsert_bash_task(&tx, &row).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let started = Instant::now();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            registry.replay_session_for_project(
+                storage.path(),
+                "replay-benchmark-bind",
+                project.path(),
+            )
+        });
+        result.unwrap();
+        let elapsed = started.elapsed();
+        let recovered = registry.inner.tasks.lock().unwrap().len();
+        let examined = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap_or_default();
+        let incomplete = logs
+            .iter()
+            .find(|line| line.contains("replay merged ") && line.contains("scan incomplete"))
+            .cloned()
+            .unwrap_or_else(|| "complete".to_string());
+        println!(
+            "REPLAY_BENCHMARK sessions=300 task_dirs=5000 recovered={recovered} examined={examined} elapsed_ms={} scan={incomplete}",
+            elapsed.as_millis()
+        );
+        registry.detach();
     }
 
     #[cfg(unix)]

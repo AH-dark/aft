@@ -471,10 +471,6 @@ pub fn build_bash_outcome(
     else {
         return DispatchOutcome::Immediate(spawn_response);
     };
-    if spawn_response.data.get("status").and_then(Value::as_str) != Some("running") {
-        return DispatchOutcome::Immediate(spawn_response);
-    }
-
     let mode = spawn_response
         .data
         .get("mode")
@@ -482,7 +478,9 @@ pub fn build_bash_outcome(
         .unwrap_or("pipes");
     let is_pty = mode == "pty" || params.pty;
     if is_pty || params.background {
-        return DispatchOutcome::Immediate(background_launch_response(
+        // Spawn replies contain identity and state, not display text. Even an
+        // already-finished child needs the launch guidance for its task id.
+        let mut response = background_launch_response(
             &req.id,
             &task_id,
             is_pty,
@@ -494,7 +492,9 @@ pub fn build_bash_outcome(
                 req.session(),
                 worker_session,
             ),
-        ));
+        );
+        response.data["status"] = spawn_response.data["status"].clone();
+        return DispatchOutcome::Immediate(response);
     }
 
     let request_id = req.id.clone();
@@ -1278,6 +1278,51 @@ mod tests {
     use crate::bash_background::persistence::BgMode;
     use crate::bash_background::registry::BgTaskSnapshot;
     use crate::bash_background::BgTaskInfo;
+
+    #[cfg(unix)]
+    #[test]
+    fn quick_terminal_spawn_replies_are_complete() {
+        for (background, pty) in [(true, false), (false, true), (false, false)] {
+            let project = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config {
+                project_root: Some(project.path().into()),
+                storage_dir: Some(storage.path().into()),
+                ..crate::config::Config::default()
+            };
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": "quick-terminal",
+                "command": "bash",
+                "session_id": "quick-terminal-session",
+                "params": {"command": "printf 'quick-output\\n'; exit 7", "background": background, "pty": pty},
+            })).unwrap();
+            let spawn = crate::bash_background::completed_spawn_for_test(request.clone(), &ctx);
+            assert_eq!(spawn.data["status"], "failed");
+            let task_id = spawn.data["task_id"].as_str().unwrap().to_string();
+            let response = match build_bash_outcome(&request, &ctx, spawn) {
+                DispatchOutcome::Immediate(response) => response,
+                DispatchOutcome::Deferred(_) => panic!("completed task must answer immediately"),
+            };
+            let text = response.data["output"].as_str().unwrap_or_default();
+            assert_eq!(response.data["status"], "failed");
+            assert!(
+                text.contains(&task_id),
+                "reply must name its task: {response:?}"
+            );
+            if background || pty {
+                assert!(
+                    text.contains(&format_background_launch(&task_id, pty, false, false)),
+                    "launch must include task guidance: {text}"
+                );
+            } else {
+                assert!(text.contains("quick-output"), "{text}");
+                assert!(text.contains("[exit code: 7]"), "{text}");
+                assert_eq!(response.data["exit_code"], 7);
+            }
+        }
+    }
 
     #[test]
     fn foreground_scope_revocation_preserves_old_and_new_reason_text() {

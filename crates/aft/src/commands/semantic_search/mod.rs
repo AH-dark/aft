@@ -4065,37 +4065,7 @@ fn matching_line_from_source(
         })
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
-    let best = source
-        .lines()
-        .enumerate()
-        .filter_map(|(line_index, line)| {
-            let compact_line = line
-                .chars()
-                .filter(|character| character.is_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
-            let score = compact_tokens
-                .iter()
-                .map(|token| {
-                    if compact_line.contains(token) {
-                        token.len().saturating_mul(4)
-                    } else {
-                        token
-                            .as_bytes()
-                            .windows(3)
-                            .filter(|trigram| {
-                                compact_line
-                                    .as_bytes()
-                                    .windows(3)
-                                    .any(|candidate| candidate == *trigram)
-                            })
-                            .count()
-                    }
-                })
-                .sum::<usize>();
-            (score > 0).then_some((score, line_index, line))
-        })
-        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+    let best = best_content_line(&source, &compact_tokens);
     if let Some((_, line_index, line)) = best {
         // Start the shown part of a long line at the earliest query token it
         // contains, so the window covers the region that made the line match.
@@ -4113,6 +4083,62 @@ fn matching_line_from_source(
     }
 
     line_at_offset(&source, symbol_range?.start)
+}
+
+fn best_content_line<'a>(
+    source: &'a str,
+    compact_tokens: &[String],
+) -> Option<(usize, usize, &'a str)> {
+    if compact_tokens.is_empty() {
+        return None;
+    }
+
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let compact_line = line
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            let mut line_trigrams = None;
+            let score = compact_tokens
+                .iter()
+                .map(|token| {
+                    if compact_line.contains(token) {
+                        token.len().saturating_mul(4)
+                    } else {
+                        let line_trigrams = line_trigrams.get_or_insert_with(|| {
+                            compact_line
+                                .as_bytes()
+                                .windows(3)
+                                .inspect(|_| {
+                                    #[cfg(test)]
+                                    MATCHING_LINE_TRIGRAM_VISITS
+                                        .with(|count| count.set(count.get() + 1));
+                                })
+                                .map(|trigram| [trigram[0], trigram[1], trigram[2]])
+                                .collect::<std::collections::HashSet<_>>()
+                        });
+                        token
+                            .as_bytes()
+                            .windows(3)
+                            .filter(|trigram| {
+                                line_trigrams.contains(&[trigram[0], trigram[1], trigram[2]])
+                            })
+                            .count()
+                    }
+                })
+                .sum::<usize>();
+            (score > 0).then_some((score, line_index, line))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MATCHING_LINE_TRIGRAM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The line holding byte `offset` of `source`, as a 0-based line number and
@@ -11699,6 +11725,217 @@ mod tests {
 
         assert_eq!(matched.0, 1);
         assert_eq!(matched.1, "export function resolveTransformMode() {}");
+    }
+
+    fn reference_best_content_line<'a>(
+        source: &'a str,
+        compact_tokens: &[String],
+    ) -> Option<(usize, usize, &'a str)> {
+        source
+            .lines()
+            .enumerate()
+            .filter_map(|(line_index, line)| {
+                let compact_line = line
+                    .chars()
+                    .filter(|character| character.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                let score = compact_tokens
+                    .iter()
+                    .map(|token| {
+                        if compact_line.contains(token) {
+                            token.len().saturating_mul(4)
+                        } else {
+                            token
+                                .as_bytes()
+                                .windows(3)
+                                .filter(|trigram| {
+                                    compact_line
+                                        .as_bytes()
+                                        .windows(3)
+                                        .any(|candidate| candidate == *trigram)
+                                })
+                                .count()
+                        }
+                    })
+                    .sum::<usize>();
+                (score > 0).then_some((score, line_index, line))
+            })
+            .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+    }
+
+    #[test]
+    fn matching_line_trigram_set_is_differentially_byte_identical() {
+        let tie_tokens = vec!["abcxxx".to_string()];
+        let tied = best_content_line("abc\nabc", &tie_tokens).expect("positive tied scores");
+        assert_eq!(
+            (tied.0, tied.1),
+            (1, 0),
+            "the first equal-scoring line wins"
+        );
+        let repeated_trigram_tokens = vec!["aaaaaaaaab".to_string()];
+        let repeated_trigram_expected =
+            reference_best_content_line("aaaaaaaaa", &repeated_trigram_tokens);
+        assert_eq!(
+            repeated_trigram_expected.map(|(score, _, _)| score),
+            Some(7),
+            "duplicate query trigrams each contribute to the score"
+        );
+        assert_eq!(
+            best_content_line("aaaaaaaaa", &repeated_trigram_tokens).map(|(score, _, _)| score),
+            repeated_trigram_expected.map(|(score, _, _)| score)
+        );
+
+        let glyphs = ['a', 'b', 'c', 'x', 'é', 'ß', '中', '🙂', '_', ' '];
+        let mut random = 0x7a31_5d09_4c2e_8b17_u64;
+        let mut next = || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+
+        for case in 0..240 {
+            let line_count = (next() % 32) as usize;
+            let mut lines = Vec::with_capacity(line_count + 3);
+            for line_index in 0..line_count {
+                if line_index % 11 == 0 {
+                    lines.push(String::new());
+                }
+                let length = (next() % 160) as usize;
+                let line = (0..length)
+                    .map(|_| glyphs[(next() as usize) % glyphs.len()])
+                    .collect::<String>();
+                lines.push(line);
+            }
+            if case % 3 == 0 {
+                lines.push("a".repeat(5_000));
+            }
+            if case % 5 == 0 {
+                lines.push("abababababababab".to_string());
+            }
+            let source = lines.join("\n");
+
+            let mut compact_tokens = vec![
+                "aaaaaaaaaa".to_string(),
+                "aaaaaaaaab".to_string(),
+                "abababab".to_string(),
+                "éééé".to_string(),
+                "中中中".to_string(),
+            ];
+            let token_count = (next() % 9) as usize;
+            for _ in 0..token_count {
+                let length = 3 + (next() % 12) as usize;
+                compact_tokens.push(
+                    (0..length)
+                        .map(|_| glyphs[(next() as usize) % glyphs.len()])
+                        .collect(),
+                );
+            }
+            if case % 2 == 0 {
+                compact_tokens.push("abababab".to_string());
+            }
+
+            let expected = reference_best_content_line(&source, &compact_tokens)
+                .map(|(score, index, line)| (score, index, line.to_string()));
+            let actual = best_content_line(&source, &compact_tokens)
+                .map(|(score, index, line)| (score, index, line.to_string()));
+            assert_eq!(actual, expected, "differential case {case}");
+        }
+    }
+
+    #[test]
+    fn matching_line_scans_each_compact_line_once_for_all_tokens() {
+        // Every token misses the exact substring path, so all three need the
+        // same line's trigram membership. Count source visits, not elapsed time.
+        let source = "abcdefghij\nklmnopqrst";
+        let tokens = vec!["abcxxx".into(), "defxxx".into(), "klmxxx".into()];
+        MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(0));
+        assert_eq!(
+            best_content_line(source, &tokens),
+            Some((2, 0, "abcdefghij"))
+        );
+        assert_eq!(MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()), 16);
+
+        MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(0));
+        assert_eq!(
+            best_content_line("abcdefghij", &["abc".into()]).unwrap().0,
+            12
+        );
+        assert_eq!(MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark comparing source-line trigram scans with the indexed scorer"]
+    fn matching_line_trigram_scan_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let compact_tokens = [
+            "authentication",
+            "discovery",
+            "configuration",
+            "background",
+            "watchdog",
+            "scheduler",
+            "workspace",
+            "candidate",
+            "resolver",
+            "integration",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let source = (0..2_000)
+            .map(|line_index| {
+                if line_index % 25 == 0 {
+                    let prefix = format!("record_{line_index}_");
+                    format!("{prefix}{}", "x".repeat(5_000 - prefix.len()))
+                } else {
+                    format!(
+                        "The request handler keeps a stable summary for result {line_index} and updates the saved record."
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(source.lines().count(), 2_000);
+        assert!(source.lines().any(|line| line.len() == 5_000));
+        assert_eq!(
+            best_content_line(&source, &compact_tokens).map(|(score, index, line)| (
+                score,
+                index,
+                line.to_string()
+            )),
+            reference_best_content_line(&source, &compact_tokens).map(|(score, index, line)| (
+                score,
+                index,
+                line.to_string()
+            )),
+            "benchmark implementations must select the same line and score"
+        );
+
+        let iterations = 3;
+        let old_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(reference_best_content_line(
+                black_box(&source),
+                black_box(&compact_tokens),
+            ));
+        }
+        let old_elapsed = old_started.elapsed();
+
+        let new_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(best_content_line(
+                black_box(&source),
+                black_box(&compact_tokens),
+            ));
+        }
+        let new_elapsed = new_started.elapsed();
+        eprintln!(
+            "2,000 lines (80 x 5,000 chars), 10-token prose query, {iterations} iterations: old={old_elapsed:?}, new={new_elapsed:?}"
+        );
     }
 
     #[test]

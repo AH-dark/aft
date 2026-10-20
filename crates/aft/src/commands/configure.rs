@@ -6765,9 +6765,11 @@ impl ConfigureMaintenanceStage {
         }
     }
 
-    /// Stages a request's correctness depends on. They run to completion before
-    /// the first request after a configure is served: bash replay (a queued
-    /// `bash_drain_completions` must see the previous process's tasks), the
+    /// Initial work that runs before the first request after configure: bash
+    /// replay restores the DB tasks and one bounded disk batch, so an immediate
+    /// `bash_drain_completions` sees those results. Disk-only tasks beyond that
+    /// batch arrive through later maintenance and completion delivery rather
+    /// than delaying requests for a full disk scan. The prefix also prepares the
     /// project runtime (a queued `outline`/`glob` must see the rebuilt gitignore
     /// matcher), and the watcher start. The watcher only observes changes made
     /// after it subscribes, so a file written between the configure ack and the
@@ -6796,6 +6798,8 @@ struct ConfigureMaintenanceContinuation {
     callgraph_start_baseline: u64,
     semantic_waits_for_callgraph_start: bool,
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
+    replay_retry_at: Option<Instant>,
+    replay_error_logged: bool,
 }
 
 impl ConfigureMaintenanceContinuation {
@@ -6806,6 +6810,8 @@ impl ConfigureMaintenanceContinuation {
             callgraph_start_baseline: 0,
             semantic_waits_for_callgraph_start: false,
             view_load: None,
+            replay_retry_at: None,
+            replay_error_logged: false,
         }
     }
 }
@@ -6813,9 +6819,35 @@ impl ConfigureMaintenanceContinuation {
 #[derive(Debug, Default)]
 pub(crate) struct ConfigureMaintenanceState {
     jobs: VecDeque<ConfigureMaintenanceContinuation>,
+    // Freeze retry eligibility across one full drain, even if healthy sessions
+    // take longer to scan than a failed session's backoff.
+    replay_retry_cutoff: Option<Instant>,
 }
 
 impl ConfigureMaintenanceState {
+    pub(crate) fn has_ready_job(&self) -> bool {
+        let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
+        self.jobs.iter().any(|continuation| {
+            continuation
+                .replay_retry_at
+                .is_none_or(|deadline| deadline <= now)
+        })
+    }
+
+    fn select_ready_job(&mut self, ctx: &AppContext) -> bool {
+        let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
+        let Some(index) = self.jobs.iter().position(|continuation| {
+            ctx.subc_unbound_quiesced()
+                || continuation
+                    .replay_retry_at
+                    .is_none_or(|deadline| deadline <= now)
+        }) else {
+            return false;
+        };
+        self.jobs.rotate_left(index);
+        true
+    }
+
     fn absorb_enqueued(&mut self, ctx: &AppContext) {
         self.jobs.extend(
             ctx.drain_configure_maintenance()
@@ -6857,7 +6889,7 @@ pub(crate) fn standalone_configure_maintenance_pending(
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     state.absorb_enqueued(ctx);
-    !state.jobs.is_empty()
+    state.has_ready_job()
 }
 
 /// Finish request-critical configure work before standalone dispatch resumes.
@@ -6924,6 +6956,9 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     state.absorb_enqueued(ctx);
+    if !state.select_ready_job(ctx) {
+        return false;
+    }
     let Some(mut continuation) = state.jobs.pop_front() else {
         return false;
     };
@@ -6940,7 +6975,28 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
 
     let result = run_configure_maintenance_unit(ctx, &mut continuation);
     match result {
-        ConfigureMaintenanceUnitResult::Continue => state.jobs.push_front(continuation),
+        ConfigureMaintenanceUnitResult::Continue => {
+            // One root cursor needs only one delayed continuation. Later session
+            // binds can finish after replaying their own tasks, rather than
+            // accumulating duplicate retries for the same failed directory.
+            let redundant_retry = continuation.replay_retry_at.is_some()
+                && state.jobs.iter().any(|pending| {
+                    pending.replay_retry_at.is_some()
+                        && pending.job.harness_dir == continuation.job.harness_dir
+                        && pending.job.root_path == continuation.job.root_path
+                        && pending.job.generation >= continuation.job.generation
+                });
+            if !redundant_retry {
+                if continuation.replay_retry_at.is_some() {
+                    state.jobs.retain(|pending| {
+                        pending.replay_retry_at.is_none()
+                            || pending.job.harness_dir != continuation.job.harness_dir
+                            || pending.job.root_path != continuation.job.root_path
+                    });
+                }
+                state.jobs.push_front(continuation);
+            }
+        }
         ConfigureMaintenanceUnitResult::Complete => {}
         ConfigureMaintenanceUnitResult::CancelAll => {
             cancel_unbound_configure_jobs(
@@ -6953,7 +7009,7 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
         }
     }
 
-    !state.jobs.is_empty()
+    state.has_ready_job()
 }
 
 /// View store opens, manifest scans and legacy migration can take minutes on
@@ -6965,6 +7021,9 @@ pub(crate) fn drain_standalone_configure_unit(
 ) -> bool {
     state.absorb_enqueued(ctx);
     drop_superseded_parked_continuations(ctx, state);
+    if !state.select_ready_job(ctx) {
+        return false;
+    }
     let Some(continuation) = state.jobs.front_mut() else {
         return false;
     };
@@ -7033,14 +7092,22 @@ pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) ->
 fn drain_configure_tail(ctx: &AppContext, allow_step_aside: bool) -> bool {
     let mut state = ctx.take_parked_configure_tail().unwrap_or_default();
     drop_superseded_parked_continuations(ctx, &mut state);
+    state.replay_retry_cutoff = Some(Instant::now());
     while drain_deferred_configure_maintenance_unit(ctx, &mut state) {
         if allow_step_aside
             && crate::executor::current_actor_writer_waiting()
             && state.can_step_aside()
         {
+            state.replay_retry_cutoff = None;
             ctx.park_configure_tail(state);
             return true;
         }
+    }
+    if !state.jobs.is_empty() {
+        // Backoff is pending, not runnable work. Keep the cursor's continuation
+        // for a later scheduler tick instead of immediately re-enqueuing it.
+        state.replay_retry_cutoff = None;
+        ctx.park_configure_tail(state);
     }
     false
 }
@@ -7412,7 +7479,15 @@ fn run_configure_maintenance_unit_inner(
                     return ConfigureMaintenanceUnitResult::Complete;
                 }
                 replay_configure_session(ctx, job);
-                return ConfigureMaintenanceUnitResult::Complete;
+                if ctx
+                    .bash_background()
+                    .project_replay_pending(&job.harness_dir, &job.root_path)
+                {
+                    continuation.stage = ConfigureMaintenanceStage::Status;
+                } else {
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
+                return ConfigureMaintenanceUnitResult::Continue;
             }
 
             delay_configure_deferred_maintenance_for_test(&job.root_path);
@@ -7684,6 +7759,31 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::Status;
         }
         ConfigureMaintenanceStage::Status => {
+            // The cursor belongs to the root, not one configure generation.
+            // A newer tail also finishes a scan started by a superseded tail.
+            let retry_due_failures = continuation.replay_retry_at.take().is_some();
+            match ctx.bash_background().continue_project_replay(
+                &job.harness_dir,
+                &job.session_id,
+                &job.root_path,
+                retry_due_failures,
+            ) {
+                Ok(true) => {
+                    continuation.replay_error_logged = false;
+                    continuation.replay_retry_at = ctx.bash_background().project_replay_retry_at();
+                    ctx.signal_status_changed();
+                    return ConfigureMaintenanceUnitResult::Continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if !continuation.replay_error_logged {
+                        slog_warn!("failed to continue background bash replay: {error}");
+                        continuation.replay_error_logged = true;
+                    }
+                    continuation.replay_retry_at = Some(Instant::now() + Duration::from_secs(5));
+                    return ConfigureMaintenanceUnitResult::Continue;
+                }
+            }
             ctx.signal_status_changed();
             return ConfigureMaintenanceUnitResult::Complete;
         }
@@ -8396,6 +8496,391 @@ mod tests {
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         super::handle_configure(req, ctx)
+    }
+
+    fn bash_background_replay_fixture(
+        count: usize,
+        budget: Option<usize>,
+    ) -> (
+        tempfile::TempDir,
+        TestContext,
+        super::ConfigureMaintenanceState,
+        Vec<String>,
+    ) {
+        use crate::bash_background::persistence::{create_task_layout, write_task, PersistedTask};
+        #[cfg(unix)]
+        {
+            // Hundreds of recovered tasks retain pinned directory handles.
+            // Leave headroom for sibling tests, and never lower their limit.
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit.rlim_cur = limit.rlim_cur.max(8192.min(limit.rlim_max));
+            assert!(
+                limit.rlim_cur >= 4096,
+                "replay fixture needs descriptor headroom"
+            );
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        }
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = test_context();
+        let response = handle_configure_for_test(
+            &configure_request_with_session(
+                json!({
+                    "project_root": project.path(),
+                    "storage_dir": ctx._storage.path(),
+                    "harness": "opencode",
+                    "config": [user_tier(json!({
+                        "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                        "views": {"enabled": false}
+                    }))]
+                }),
+                "bounded-recovery",
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        if let Some(budget) = budget {
+            ctx.bash_background()
+                .set_project_replay_scan_budget_for_test(budget, Duration::from_secs(5));
+        }
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let task_ids: Vec<_> = (0..count).map(|i| format!("bash-{i:016x}")).collect();
+        for task_id in &task_ids {
+            let layout = create_task_layout(&storage, "bounded-recovery", task_id).unwrap();
+            let paths = &layout.paths;
+            let mut metadata = PersistedTask::starting(
+                task_id.clone(),
+                "bounded-recovery".into(),
+                "printf recovered".into(),
+                project.path().into(),
+                Some(project.path().into()),
+                Some(30000),
+                true,
+                true,
+            );
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&paths.json, &metadata).unwrap();
+            fs::write(&paths.stdout, "recovered\n").unwrap();
+            fs::write(&paths.stderr, "").unwrap();
+        }
+        let mut state = super::ConfigureMaintenanceState::default();
+        assert!(super::drain_standalone_configure_prefix(&ctx, &mut state));
+        // Reach the yieldable tail without manually replaying or querying task
+        // status: only scheduled maintenance may discover the remaining tasks.
+        for _ in 0..30 {
+            if state
+                .jobs
+                .front()
+                .is_some_and(|job| job.stage == ConfigureMaintenanceStage::Status)
+            {
+                return (project, ctx, state, task_ids);
+            }
+            assert!(super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+        }
+        panic!("configure did not reach its status stage");
+    }
+
+    #[test]
+    fn bash_background_project_replay_maintenance_recovers_all_disk_tasks() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(520, None);
+        let registry = ctx.bash_background();
+        assert!(
+            task_ids
+                .iter()
+                .filter(|id| registry.task_for_test(id).is_some())
+                .count()
+                < task_ids.len()
+        );
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for _ in 0..1000 {
+                if !super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {
+                    break;
+                }
+            }
+        });
+        assert!(state.jobs.is_empty(), "the recovery scan must complete");
+        assert_eq!(
+            task_ids
+                .iter()
+                .filter(|id| registry.task_for_test(id).is_some())
+                .count(),
+            task_ids.len(),
+            "maintenance must recover every disk-only task: {logs:?}"
+        );
+        let completions = registry.drain_completions();
+        assert_eq!(
+            completions.len(),
+            task_ids.len(),
+            "every recovered task needs a completion notice"
+        );
+        assert!(
+            logs.iter().any(|line| line.contains("scan complete")),
+            "completion progress must be reported: {logs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_background_project_replay_parks_unreadable_session_without_blocking_tail() {
+        use crate::bash_background::persistence::{create_task_layout, write_task, PersistedTask};
+        use std::os::unix::fs::PermissionsExt;
+
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (project, ctx, mut state, _) = bash_background_replay_fixture(0, Some(8));
+        let registry = ctx.bash_background();
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let write_disk_task = |session: &str, task_id: &str| {
+            let layout = create_task_layout(&storage, session, task_id).unwrap();
+            let mut task = PersistedTask::starting(
+                task_id.into(),
+                session.into(),
+                "printf recovered".into(),
+                project.path().into(),
+                Some(project.path().into()),
+                Some(30000),
+                true,
+                true,
+            );
+            task.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&layout.paths.json, &task).unwrap();
+            fs::write(&layout.paths.stdout, "recovered\n").unwrap();
+            fs::write(&layout.paths.stderr, "").unwrap();
+        };
+        let blocked_task = "bash-000000000000feed";
+        let healthy_task = "bash-000000000000beef";
+        write_disk_task("bounded-recovery", blocked_task);
+        write_disk_task("healthy-recovery", healthy_task);
+        let blocked =
+            crate::bash_background::persistence::session_tasks_dir(&storage, "bounded-recovery");
+        struct RestorePermissions(PathBuf);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let _restore = RestorePermissions(blocked.clone());
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            fs::read_dir(&blocked).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the reproduction requires an actually unreadable session directory"
+        );
+        state.jobs.front_mut().unwrap().stage = ConfigureMaintenanceStage::SessionReplay;
+        let (_, first_logs) = crate::logging::capture_log_lines(|| {
+            assert!(super::drain_standalone_configure_prefix(&ctx, &mut state));
+            while state.jobs.front().unwrap().stage != ConfigureMaintenanceStage::Status {
+                assert!(super::drain_deferred_configure_maintenance_unit(
+                    &ctx, &mut state
+                ));
+            }
+        });
+        ctx.park_configure_tail(state);
+        assert!(handle_configure_for_test(
+            &configure_request_with_session(
+                json!({
+                    "project_root": project.path(), "storage_dir": ctx._storage.path(), "harness": "opencode",
+                    "config": [user_tier(json!({
+                        "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                        "views": {"enabled": false}
+                    }))]
+                }),
+                "healthy-recovery",
+            ),
+            &ctx,
+        ).success);
+
+        let (finished_while_unreadable, logs) = std::thread::scope(|scope| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let ctx = &ctx;
+            let worker = scope.spawn(move || {
+                let (_, logs) = crate::logging::capture_log_lines(|| {
+                    super::drain_deferred_configure_maintenance(ctx);
+                });
+                done_tx.send(()).unwrap();
+                logs
+            });
+            let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            if !finished {
+                // Release a spinning tail before joining, so a regression fails
+                // without leaving an infinite worker running in the test suite.
+                fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            (finished, worker.join().unwrap())
+        });
+        assert!(finished_while_unreadable,
+            "configure tail held its worker on an unreadable session; later configure jobs cannot finish; failed scans logged {} times",
+            logs.iter().filter(|line| line.contains("failed to scan Bash task session")).count());
+        assert!(
+            fs::read_dir(&blocked).is_err(),
+            "the failure must remain persistent throughout the drain"
+        );
+        assert!(
+            registry.task_for_test(healthy_task).is_some(),
+            "the later configure must recover its disk task"
+        );
+        assert!(registry.task_for_test(blocked_task).is_none());
+        let root_health = serde_json::to_value(ctx.try_health_snapshot(project.path())).unwrap();
+        let health = &root_health["bash"];
+        assert_eq!(
+            health["project_replay_failures"][0]["session_dir"],
+            json!(blocked)
+        );
+        assert_eq!(
+            health["project_replay_failures"][0]["reason"],
+            "session_directory_permission_denied"
+        );
+        assert_eq!(health["project_replay_failures"][0]["attempts"], 1);
+        assert_eq!(
+            first_logs
+                .iter()
+                .chain(&logs)
+                .filter(|line| line.contains("failed to scan Bash task session"))
+                .count(),
+            1
+        );
+        let parked = ctx.take_parked_configure_tail().unwrap();
+        assert_eq!(
+            parked.jobs.len(),
+            1,
+            "later configure jobs must finish, not queue duplicate retries"
+        );
+        assert_eq!(
+            parked.jobs.front().unwrap().job.session_id,
+            "bounded-recovery"
+        );
+        ctx.park_configure_tail(parked);
+        assert!(
+            !ctx.configure_tail_has_work(),
+            "a future retry must not occupy a maintenance worker"
+        );
+        let examined = registry.project_replay_scan_total_examined_for_test();
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            examined,
+            "another drain before the deadline must not retry the failed scan"
+        );
+
+        let make_retry_due = || {
+            registry.expire_project_replay_backoff_for_test();
+            let mut parked = ctx.take_parked_configure_tail().unwrap();
+            for continuation in &mut parked.jobs {
+                continuation.replay_retry_at = Some(Instant::now());
+            }
+            ctx.park_configure_tail(parked);
+            assert!(
+                ctx.configure_tail_has_work(),
+                "the later tick must admit a due retry"
+            );
+        };
+        for attempt in 2..=6 {
+            make_retry_due();
+            let (_, retry_logs) = crate::logging::capture_log_lines(|| {
+                super::drain_deferred_configure_maintenance(&ctx);
+            });
+            let health = registry.try_health_counts().unwrap();
+            let failure = &health.project_replay_failures[0];
+            assert_eq!(failure.attempts, attempt, "each tick retries exactly once");
+            let expected_ms = (500u64 << (attempt - 1)).min(5000);
+            assert!(
+                failure.retry_after_ms > expected_ms - 250 && failure.retry_after_ms <= expected_ms,
+                "retry backoff must double up to five seconds: {failure:?}"
+            );
+            assert!(
+                !retry_logs
+                    .iter()
+                    .any(|line| line.contains("failed to scan Bash task session")),
+                "a persistent failure must log only once per streak: {retry_logs:?}"
+            );
+        }
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        make_retry_due();
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            registry.task_for_test(blocked_task).is_some(),
+            "a later tick must recover the repaired session"
+        );
+        assert!(registry
+            .try_health_counts()
+            .unwrap()
+            .project_replay_failures
+            .is_empty());
+        assert!(ctx.take_parked_configure_tail().is_none());
+    }
+
+    #[test]
+    fn bash_background_project_replay_retry_eligibility_is_frozen_for_each_drain() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, _) = bash_background_replay_fixture(0, None);
+        let now = Instant::now();
+        state.replay_retry_cutoff = Some(now - Duration::from_secs(10));
+        state.jobs.front_mut().unwrap().replay_retry_at = Some(now - Duration::from_secs(5));
+        assert!(
+            !state.has_ready_job(),
+            "a retry becoming due during a drain must wait for the next tick"
+        );
+        assert!(!state.select_ready_job(&ctx));
+        state.replay_retry_cutoff = None;
+        assert!(
+            state.has_ready_job(),
+            "the later maintenance probe must see the due retry"
+        );
+        assert!(state.select_ready_job(&ctx));
+    }
+
+    #[test]
+    fn bash_background_project_replay_maintenance_stops_on_unbind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(40, Some(8));
+        let registry = ctx.bash_background();
+        let before = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        assert!(
+            super::drain_deferred_configure_maintenance_unit(&ctx, &mut state),
+            "an incomplete scan must keep maintenance scheduled"
+        );
+        let after = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        assert!(
+            after > before,
+            "the continuation must actually scan before unbind"
+        );
+        assert!(task_ids
+            .iter()
+            .any(|id| registry.task_for_test(id).is_none()));
+        ctx.mark_subc_unbound();
+        assert!(!super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            Some(after),
+            "an unbound root must not scan another entry"
+        );
+        assert!(
+            state.jobs.is_empty(),
+            "unbound maintenance must be cancelled"
+        );
     }
 
     fn identical_bind_repairs_evicted_artifact_beside_reader(early_fast_path: bool) {

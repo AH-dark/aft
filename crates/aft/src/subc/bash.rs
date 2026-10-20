@@ -1421,19 +1421,6 @@ pub(super) fn submit_deferred_bash(
                             &mut repeat_for_spawn,
                         );
                     };
-                    if response.data.get("status").and_then(Value::as_str) != Some("running") {
-                        return finish_bash_spawn_immediate(
-                            response,
-                            ctx,
-                            &session_for_spawn,
-                            &format_context_for_spawn,
-                            &mut spawn_text_tx,
-                            &mut spawn_control_tx,
-                            true,
-                            &mut repeat_for_spawn,
-                        );
-                    }
-
                     let mode = response
                         .data
                         .get("mode")
@@ -1457,7 +1444,9 @@ pub(super) fn submit_deferred_bash(
                             corr,
                             unanswered_deadline,
                         );
-                        let response = bash_background_launch_response(
+                        // A terminal spawn reply still has no display text;
+                        // format the launch guidance before answering the host.
+                        let mut launch_response = bash_background_launch_response(
                             &request_id_for_spawn,
                             &task_id,
                             is_pty,
@@ -1472,8 +1461,9 @@ pub(super) fn submit_deferred_bash(
                                 worker_session,
                             ),
                         );
+                        launch_response.data["status"] = response.data["status"].clone();
                         return finish_bash_spawn_immediate(
-                            response,
+                            launch_response,
                             ctx,
                             &session_for_spawn,
                             &format_context_for_spawn,
@@ -3179,6 +3169,95 @@ mod grant_path_tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_terminal_spawn_replies_are_complete() {
+        for (background, pty, server_completion) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (true, false, true),
+        ] {
+            let (dir, root) = super::super::test_support::test_root("quick-terminal-subc");
+            let ctx = super::super::test_support::test_ctx();
+            ctx.update_config(|config| {
+                config.project_root = Some(dir.path().into());
+                config.storage_dir = Some(dir.path().join("storage"));
+                config.sandbox.profile.head = crate::config::SandboxMode::Off;
+            });
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), ctx);
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let (tx, mut rx) = mpsc::channel(8);
+            let (touch, _touch_rx) = mpsc::channel(8);
+            submit_deferred_bash(
+                &executor,
+                &tx,
+                &touch,
+                &metrics,
+                crate::bash_background::completed_spawn_for_test,
+                root.clone(),
+                root.as_path().into(),
+                "quick-terminal-session".into(),
+                "quick-terminal".into(),
+                RouteChannel {
+                    channel: 1,
+                    epoch: 1,
+                },
+                1,
+                Flags::new(false, Priority::Interactive, false),
+                PROTOCOL_VERSION,
+                json!({"command": "printf 'quick-output\\n'; exit 7", "background": background, "pty": pty}),
+                crate::subc_format::FormatContext::default(),
+                BashWaitCancel {
+                    run_scope: None,
+                    scope: None,
+                    late_results: false,
+                    ledger_carrier: None,
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                BindTrust::FirstParty,
+                crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                server_completion,
+                super::remote_policy::RemoteSource::None,
+                Instant::now(),
+            );
+            let done = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = done.response_for_test();
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["status"], "failed");
+            let task_id = response.data["task_id"].as_str().unwrap();
+            let text = done.text_for_test().unwrap();
+            assert!(text.contains(task_id), "reply must name its task: {text:?}");
+            if (background || pty) && !server_completion {
+                assert!(
+                    text.contains(
+                        &crate::commands::bash_orchestrate::format_background_launch(
+                            task_id, pty, false, false
+                        )
+                    ),
+                    "launch must include task guidance: {text}"
+                );
+            } else {
+                assert!(text.contains("quick-output"), "{text}");
+                assert!(text.contains("[exit code: 7]"), "{text}");
+                assert_eq!(response.data["exit_code"], 7);
+            }
+        }
+    }
 
     #[test]
     fn late_nonfatal_bash_error_after_handoff_logs_identity_without_another_reply() {
@@ -6407,6 +6486,58 @@ mod grant_path_tests {
             .as_str()
             .unwrap()
             .contains("committed-terminal"));
+    }
+
+    #[cfg(unix)]
+    fn terminal_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let mut response = running_bash_stub(req, ctx);
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(&task_id, DEADLINE_SESSION, 0)
+                .unwrap();
+            if snapshot.info.status.is_terminal() {
+                // Deliver a terminal launch observation deterministically, rather
+                // than racing the child against spawn-response construction.
+                response.data["status"] = serde_json::to_value(snapshot.info.status).unwrap();
+                return response;
+            }
+            assert!(Instant::now() < deadline, "task {task_id} did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_spawn_observation_keeps_foreground_output() {
+        let (_dir, root) = super::super::test_support::test_root("terminal-spawn-output");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut replies = deadline_test_call(
+            &executor,
+            &root,
+            terminal_bash_stub,
+            json!({"command": "printf terminal-spawn-output", "wait": true}),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert!(response.data["output"]
+            .as_str()
+            .expect("foreground reply includes output")
+            .contains("terminal-spawn-output"));
     }
 
     #[cfg(unix)]

@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "7 recovered fixes; semantic_search change is a scan-count optimization proven byte-identical (engine_unwired) Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
