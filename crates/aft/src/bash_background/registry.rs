@@ -3442,11 +3442,14 @@ impl BgTaskRegistry {
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
         } else {
+            super::enter_bash_startup_step(super::BashStartupStep::TaskDirectory);
             let task = allocate_task_layout(&storage_dir, &session_id)
                 .map_err(|error| format!("failed to create background task layout: {error}"))?;
             let root = project_root.as_deref().unwrap_or(&workdir);
+            super::enter_bash_startup_step(super::BashStartupStep::Environment);
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
+            super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
             let prepared = match crate::sandbox_spawn::prepare_task_payload(
                 &task,
                 command.as_bytes(),
@@ -3525,6 +3528,7 @@ impl BgTaskRegistry {
         let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
         metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
+        super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
             return Err(format!(
@@ -3830,11 +3834,14 @@ impl BgTaskRegistry {
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
         } else {
+            super::enter_bash_startup_step(super::BashStartupStep::TaskDirectory);
             let task = allocate_task_layout(&storage_dir, &session_id)
                 .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
             let root = project_root.as_deref().unwrap_or(&workdir);
+            super::enter_bash_startup_step(super::BashStartupStep::Environment);
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
+            super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
             let prepared = match crate::sandbox_spawn::prepare_task_payload(
                 &task,
                 command.as_bytes(),
@@ -3878,6 +3885,7 @@ impl BgTaskRegistry {
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
+        super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
             return Err(format!(
