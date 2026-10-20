@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -2272,6 +2272,8 @@ impl WatcherFilterThread {
 
             match raw_rx.recv_timeout(self.next_recv_timeout()) {
                 Ok(Ok(event)) => {
+                    #[cfg(feature = "test-timing-hooks")]
+                    hold_watcher_intake_for_test(&self.shutdown);
                     self.config.counters.note_raw_event();
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its
@@ -2542,6 +2544,8 @@ impl WatcherFilterThread {
             self.config
                 .counters
                 .note_unflushed_paths(std::iter::once(&path));
+            #[cfg(feature = "test-timing-hooks")]
+            note_watcher_intake_for_test(&path);
             let fresh = self.raw_paths.insert(path.clone());
             if content_only && (fresh || self.content_only_paths.contains(&path)) {
                 self.content_only_paths.insert(path);
@@ -2582,6 +2586,12 @@ impl WatcherFilterThread {
     }
 
     fn flush_pending_with_wait(&mut self, deadline: Instant, pause: impl FnMut()) -> bool {
+        #[cfg(feature = "test-timing-hooks")]
+        if !self.raw_paths.is_empty() {
+            // An idle tick has nothing to keep pending; holding it would stop
+            // the thread before it takes in the event the test is waiting for.
+            hold_watcher_flush_for_test(&self.shutdown);
+        }
         let flushed = self.flush_raw_paths_with_wait(deadline, pause);
         // Paths kept for another window (an ignore-rule change still being
         // acknowledged) remain unflushed; everything else has been handed to
@@ -2687,6 +2697,63 @@ impl WatcherFilterThread {
                 Err(SendTimeoutError::Disconnected(_)) => return false,
             }
         }
+    }
+}
+
+/// The gate file a test names in `AFT_TEST_WATCHER_INTAKE_GATE_FILE`, if any.
+#[cfg(feature = "test-timing-hooks")]
+fn watcher_intake_gate_for_test() -> Option<&'static Path> {
+    static GATE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GATE.get_or_init(|| std::env::var_os("AFT_TEST_WATCHER_INTAKE_GATE_FILE").map(PathBuf::from))
+        .as_deref()
+}
+
+/// Test seam: while the gate file exists, the watcher thread holds every raw
+/// event before taking it in, so a test can question the daemon at a moment
+/// when it cannot know about an edit yet. Removing the file releases the held
+/// events in order.
+#[cfg(feature = "test-timing-hooks")]
+fn hold_watcher_intake_for_test(shutdown: &AtomicBool) {
+    let Some(gate) = watcher_intake_gate_for_test() else {
+        return;
+    };
+    while gate.exists() && !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Test seam: while `<gate>.flush-hold` exists, the watcher thread keeps taken-in
+/// paths in its flush window instead of handing them on, so an edit it has
+/// received stays pending until the test has asked its question.
+#[cfg(feature = "test-timing-hooks")]
+fn hold_watcher_flush_for_test(shutdown: &AtomicBool) {
+    let Some(gate) = watcher_intake_gate_for_test() else {
+        return;
+    };
+    let mut hold = gate.as_os_str().to_owned();
+    hold.push(".flush-hold");
+    let hold = PathBuf::from(hold);
+    while hold.exists() && !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Test seam: append each path the watcher thread takes in to `<gate>.taken`,
+/// one per line, so a test can wait until the daemon has received an edit.
+#[cfg(feature = "test-timing-hooks")]
+fn note_watcher_intake_for_test(path: &Path) {
+    use std::io::Write;
+    let Some(gate) = watcher_intake_gate_for_test() else {
+        return;
+    };
+    let mut taken = gate.as_os_str().to_owned();
+    taken.push(".taken");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PathBuf::from(taken))
+    {
+        let _ = writeln!(file, "{}", path.display());
     }
 }
 

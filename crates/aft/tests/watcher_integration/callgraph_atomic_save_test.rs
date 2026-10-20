@@ -226,59 +226,118 @@ enum PendingWindow {
     MustBeObserved,
 }
 
+/// What the test has learned about whether the daemon has received the save's
+/// watcher events, and how many stale answers said they were incomplete.
+#[derive(Default)]
+struct SaveEvidence {
+    seen: bool,
+    stale_marked: usize,
+}
+
+impl SaveEvidence {
+    /// Check one answer against what was known when it was requested, then
+    /// learn from it. Call this before the next question is sent: evidence
+    /// that arrives later (the watcher can deliver the save between two
+    /// questions) says nothing about what the daemon knew for this answer.
+    fn judge(&mut self, response: &Value, fresh: bool, what: &str) {
+        if response["success"] != true || fresh {
+            return;
+        }
+        if self.seen || response["complete"] == false {
+            assert_stale_answer_is_marked(response, what);
+            self.stale_marked += 1;
+        }
+        self.seen = self.seen || response["complete"] == false;
+    }
+}
+
+/// One poll: the answers it got and whether both show the edited edge.
+struct PollRound {
+    tree: Value,
+    callers: Value,
+    fresh: bool,
+}
+
+/// Ask `call_tree` and then `callers` once, running `between` after the first
+/// question and before the second. Each answer is checked against what
+/// `evidence` held when that answer was requested.
+fn poll_round(
+    aft: &mut AftProcess,
+    file: &Path,
+    evidence: &mut SaveEvidence,
+    between: impl FnOnce(&mut AftProcess),
+) -> PollRound {
+    aft.send(r#"{"id":"atomic-save-ping","command":"ping"}"#);
+    evidence.seen = evidence.seen || index_sees_edit(aft);
+    let tree = call_tree(aft, file);
+    let tree_fresh = tree["success"] == true && child_names(&tree) == ["probe_beta"];
+    evidence.judge(&tree, tree_fresh, "call_tree");
+    between(aft);
+    let beta_callers = callers(aft, file, "probe_beta");
+    let callers_fresh =
+        beta_callers["success"] == true && caller_symbols(&beta_callers) == ["entry"];
+    evidence.judge(&beta_callers, callers_fresh, "callers");
+    PollRound {
+        tree,
+        callers: beta_callers,
+        fresh: tree_fresh && callers_fresh,
+    }
+}
+
+/// Poll until `call_tree` and `callers` both reflect the edited edge, starting
+/// from what `evidence` already holds.
+fn poll_until_fresh(
+    aft: &mut AftProcess,
+    file: &Path,
+    window: PendingWindow,
+    saved: Instant,
+    evidence: &mut SaveEvidence,
+) {
+    let deadline = saved + REFRESH_DEADLINE;
+    loop {
+        let round = poll_round(aft, file, evidence, |_| {});
+        if round.fresh {
+            eprintln!(
+                "atomic save reached the call graph after {} ms; {} stale answers were \
+                 marked incomplete on the way",
+                saved.elapsed().as_millis(),
+                evidence.stale_marked
+            );
+            assert!(
+                window == PendingWindow::MayBeUnobserved || evidence.stale_marked > 0,
+                "no answer served while the save was pending said it was incomplete"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the call graph never took the atomic save within {REFRESH_DEADLINE:?} \
+             (daemon saw it: {})\ncall_tree: {:#}\ncallers: {:#}",
+            evidence.seen,
+            round.tree,
+            round.callers
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait for the initial edge, then give the freshly bound watcher a moment to
+/// settle, as editors save well after a project is opened.
+fn prepare_for_save(aft: &mut AftProcess, file: &Path) {
+    wait_for_initial_edge(aft, file);
+    std::thread::sleep(Duration::from_millis(500));
+}
+
 /// Atomic-save `file` and poll until `call_tree` and `callers` both reflect
 /// the edited edge. Once the daemon has the save's watcher event (the trigram
 /// index answers with the edit, or an earlier answer was already marked
 /// pending), every answer that still shows the old edge must carry
 /// `complete: false`: the daemon cannot take back knowledge of a pending edit.
 fn assert_atomic_save_reaches_callgraph(aft: &mut AftProcess, file: &Path, window: PendingWindow) {
-    wait_for_initial_edge(aft, file);
-    // Give the freshly bound watcher a moment to settle, as editors save well
-    // after a project is opened.
-    std::thread::sleep(Duration::from_millis(500));
+    prepare_for_save(aft, file);
     atomic_save(file, BETA_SOURCE);
     let saved = Instant::now();
-    let deadline = saved + REFRESH_DEADLINE;
-    let mut event_seen = false;
-    let mut stale_marked = 0usize;
-    loop {
-        aft.send(r#"{"id":"atomic-save-ping","command":"ping"}"#);
-        event_seen = event_seen || index_sees_edit(aft);
-        let tree = call_tree(aft, file);
-        let beta_callers = callers(aft, file, "probe_beta");
-        let tree_fresh = tree["success"] == true && child_names(&tree) == ["probe_beta"];
-        let callers_fresh =
-            beta_callers["success"] == true && caller_symbols(&beta_callers) == ["entry"];
-        if tree_fresh && callers_fresh {
-            eprintln!(
-                "atomic save reached the call graph after {} ms; {stale_marked} stale \
-                 answers were marked incomplete on the way",
-                saved.elapsed().as_millis()
-            );
-            assert!(
-                window == PendingWindow::MayBeUnobserved || stale_marked > 0,
-                "no answer served while the save was pending said it was incomplete"
-            );
-            return;
-        }
-        event_seen = event_seen || tree["complete"] == false || beta_callers["complete"] == false;
-        if event_seen {
-            if tree["success"] == true && !tree_fresh {
-                assert_stale_answer_is_marked(&tree, "call_tree");
-                stale_marked += 1;
-            }
-            if beta_callers["success"] == true && !callers_fresh {
-                assert_stale_answer_is_marked(&beta_callers, "callers");
-                stale_marked += 1;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the call graph never took the atomic save within {REFRESH_DEADLINE:?} \
-             (daemon saw it: {event_seen})\ncall_tree: {tree:#}\ncallers: {beta_callers:#}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    poll_until_fresh(aft, file, window, saved, &mut SaveEvidence::default());
 }
 
 #[test]
@@ -294,6 +353,87 @@ fn atomic_save_reaches_callgraph_on_a_plain_checkout_with_views_off() {
         &mut aft,
         &root.join("src/probe.ts"),
         PendingWindow::MayBeUnobserved,
+    );
+    assert!(aft.shutdown().success());
+}
+
+/// The watcher can deliver a save between two questions of one poll. The
+/// first answer was given before the daemon knew about the edit, so serving
+/// the old edge as complete was honest; only answers requested after the
+/// daemon received the save must say they are incomplete. The watcher intake
+/// seam places the delivery exactly there instead of leaving it to timing.
+#[cfg(feature = "test-timing-hooks")]
+#[test]
+fn an_answer_given_before_the_watcher_took_the_save_is_not_judged_by_later_evidence() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("project");
+    init_repo(&root);
+    let gate = base.join("watcher-intake.gate");
+    let taken = base.join("watcher-intake.gate.taken");
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
+        "AFT_TEST_WATCHER_INTAKE_GATE_FILE",
+        gate.as_os_str(),
+    )]);
+    configure(&mut aft, &root, &base.join("storage"), false);
+    let file = root.join("src/probe.ts");
+    prepare_for_save(&mut aft, &file);
+
+    // Hold the watcher's intake across the save and the first question.
+    std::fs::write(&gate, b"held").unwrap();
+    // Hold its flush until both answers are in, so the daemon cannot refresh
+    // the call graph before `callers` is asked however long this test pauses.
+    let flush_hold = base.join("watcher-intake.gate.flush-hold");
+    std::fs::write(&flush_hold, b"held").unwrap();
+    atomic_save(&file, BETA_SOURCE);
+    let saved = Instant::now();
+    let mut evidence = SaveEvidence::default();
+    let round = poll_round(&mut aft, &file, &mut evidence, |_| {
+        // Release the save to the daemon and wait until its watcher thread
+        // has taken the source file in, before the second question.
+        std::fs::remove_file(&gate).unwrap();
+        let wanted = file.display().to_string();
+        let deadline = Instant::now() + REFRESH_DEADLINE;
+        while !std::fs::read_to_string(&taken)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == wanted)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the watcher never took in the released save"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    std::fs::remove_file(&flush_hold).unwrap();
+    // The round must really have straddled the delivery, or this test proves
+    // nothing: the first answer predates it, the second knows about it.
+    assert!(
+        round.tree["success"] == true
+            && child_names(&round.tree) == ["probe_alpha"]
+            && round.tree["complete"].is_null(),
+        "call_tree was asked while the watcher held the save, so it serves the old edge \
+         without knowing it is stale: {:#}",
+        round.tree
+    );
+    assert!(
+        round.callers["complete"] == false
+            && round.callers["gaps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|gap| gap["path"] == "src/probe.ts"),
+        "callers was asked after the watcher took the save, so it names the pending file: {:#}",
+        round.callers
+    );
+    poll_until_fresh(
+        &mut aft,
+        &file,
+        PendingWindow::MayBeUnobserved,
+        saved,
+        &mut evidence,
     );
     assert!(aft.shutdown().success());
 }
