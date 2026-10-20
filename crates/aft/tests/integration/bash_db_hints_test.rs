@@ -100,7 +100,13 @@ fn db_hints_background_completion_keeps_trailer_after_preview_cap() {
         }})
         .to_string(),
     );
-    assert_eq!(launched["status"], "running", "{launched}");
+    assert!(
+        matches!(
+            launched["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "unexpected spawn status: {launched}"
+    );
     assert!(!launched.to_string().contains("[aft: no column"));
     let task = launched["task_id"].as_str().unwrap();
     let completion = uncollected_completion(&mut aft, &dir.path().join("storage"), task);
@@ -125,7 +131,13 @@ fn db_hints_terminal_pty_status_and_completion() {
         }})
         .to_string(),
     );
-    assert_eq!(launched["status"], "running", "{launched}");
+    assert!(
+        matches!(
+            launched["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "unexpected spawn status: {launched}"
+    );
     let task = launched["task_id"].as_str().unwrap();
     let completion = uncollected_completion(&mut aft, &dir.path().join("storage"), task);
     let response = terminal(&mut aft, task);

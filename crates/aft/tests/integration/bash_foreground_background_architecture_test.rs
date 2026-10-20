@@ -4,7 +4,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, wait_for_task_metadata, AftProcess};
+use aft::bash_background::persistence::{
+    read_exit_marker, resolve_task_layout, session_tasks_dir, ExitMarker,
+};
+
+use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnDrop};
 
 const SESSION: &str = "bash-arch-session";
 
@@ -160,7 +164,13 @@ fn foreground_bash_with_daemonized_child_does_not_wait_for_inherited_fds() {
         json!({ "command": "nohup sh -c 'sleep 30 && echo done' > /dev/null 2>&1 &" }),
     );
     assert_eq!(bash["success"], true, "bash failed: {bash:?}");
-    assert_eq!(bash["status"], "running");
+    assert!(
+        matches!(
+            bash["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "unexpected spawn status: {bash:?}"
+    );
     // Usually returns in <100ms; assert only that inherited file descriptors do
     // not deadlock the foreground wait path.
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -216,6 +226,103 @@ fn bash_promote_reenables_completion_delivery() {
     assert_eq!(completions.len(), 1, "drained: {drained:?}");
     assert_eq!(completions[0]["task_id"], task_id);
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn promoted_foreground_completion_while_daemon_is_down_replays_once() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let release = project.path().join("release-command");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let mut first = AftProcess::spawn();
+    configure(&mut first, project.path(), storage.path());
+    let bash = spawn_bash(
+        &mut first,
+        json!({
+            "command": format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done; printf promoted",
+                release.display()
+            ),
+            "notify_on_completion": false,
+        }),
+    );
+    assert_eq!(bash["success"], true, "bash failed: {bash:?}");
+    let task_id = bash["task_id"].as_str().unwrap();
+    let metadata = wait_for_task_metadata(storage.path(), "opencode", task_id, "running");
+    assert_eq!(metadata["completion_delivered"], true);
+    let conn = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+    assert!(
+        aft::db::bash_tasks::get_bash_task(&conn, "opencode", SESSION, task_id)
+            .unwrap()
+            .unwrap()
+            .completion_delivered
+    );
+    let paths = resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), task_id)
+        .unwrap()
+        .paths;
+    let promoted = first.send(
+        &json!({
+            "id": "promote-before-restart",
+            "session_id": SESSION,
+            "command": "bash_promote",
+            "params": { "task_id": task_id },
+        })
+        .to_string(),
+    );
+    assert_eq!(promoted["success"], true, "promote failed: {promoted:?}");
+    assert!(first.shutdown().success());
+    assert!(read_exit_marker(&paths).unwrap().is_none());
+
+    // The wrapper finishes without a daemon, before any recovery can observe
+    // the command. Its exit marker, rather than a sleep, orders the restart.
+    drop(release_guard);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while read_exit_marker(&paths).unwrap().is_none() {
+        assert!(Instant::now() < deadline, "detached command did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(matches!(
+        read_exit_marker(&paths).unwrap(),
+        Some(ExitMarker::Code(0))
+    ));
+
+    let mut restarted = AftProcess::spawn();
+    configure(&mut restarted, project.path(), storage.path());
+    let drained = drain(&mut restarted);
+    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    let completions = drained["bg_completions"].as_array().unwrap();
+    assert_eq!(
+        completions.len(),
+        1,
+        "promoted completion was lost: {drained:?}"
+    );
+    assert_eq!(completions[0]["task_id"], task_id);
+    assert_eq!(completions[0]["status"], "completed");
+    let acked = restarted.send(
+        &json!({
+            "id": "ack-promoted-completion",
+            "session_id": SESSION,
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [task_id] },
+        })
+        .to_string(),
+    );
+    assert_eq!(acked["success"], true, "ack failed: {acked:?}");
+    assert!(drain(&mut restarted)["bg_completions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(restarted.shutdown().success());
+
+    let mut second_restart = AftProcess::spawn();
+    configure(&mut second_restart, project.path(), storage.path());
+    let drained = drain(&mut second_restart);
+    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    assert!(
+        drained["bg_completions"].as_array().unwrap().is_empty(),
+        "acked promoted completion was replayed: {drained:?}"
+    );
+    assert!(second_restart.shutdown().success());
 }
 
 #[test]

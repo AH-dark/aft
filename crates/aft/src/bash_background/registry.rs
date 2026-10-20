@@ -1185,6 +1185,8 @@ pub(crate) struct DbWriteOrder {
     /// the count while it holds `state`, then writes only if the count has
     /// not moved since (see [`BgTaskRegistry::persist_task_checkpoint`]).
     json_writes: Mutex<u64>,
+    #[cfg(test)]
+    before_fenced_change: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A task's aft.db row captured under its state lock, written after it.
@@ -1281,6 +1283,13 @@ fn with_task_db_fence<R>(session_id: &str, task_id: &str, change: impl FnOnce() 
     match DbWriteOrder::lookup(session_id, task_id) {
         Some(order) => {
             let _flush = order.flush_locked();
+            #[cfg(test)]
+            {
+                let hook = order.before_fenced_change.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             change()
         }
         None => change(),
@@ -4958,6 +4967,10 @@ impl BgTaskRegistry {
         } else {
             self.replay_session_from_db(session_id, project_root)
         };
+        // A failed task-list query means every later acknowledgement lookup on
+        // this pool would fail for the same reason. Remember that across the
+        // batch so disk recovery does not repeat the failing read per task.
+        let mut db_ack_lookup_unavailable = matches!(&database_replay, Some(Err(_)));
         let tasks = match database_replay {
             _ if continuation => {
                 let batch = self.replay_session_from_disk_for_project(
@@ -5082,7 +5095,7 @@ impl BgTaskRegistry {
             }
             Some(Err(error)) => {
                 crate::slog_warn!(
-                    "bash task replay DB lookup failed for session {}; falling back to disk: {}",
+                    "bash task replay DB lookup failed for session {}; falling back to disk without durable completion acknowledgements: {}",
                     session_id,
                     error
                 );
@@ -5332,7 +5345,13 @@ impl BgTaskRegistry {
                     continue;
                 }
             }
-            self.rehydrate_resolved_task(metadata, resolved.paths, session_id)?;
+            self.rehydrate_resolved_task_with_db_ack_state(
+                metadata,
+                resolved.paths,
+                session_id,
+                Self::persisted_task_process_is_alive,
+                &mut db_ack_lookup_unavailable,
+            )?;
         }
 
         // Every recovery write for this replay has landed; release the
@@ -5400,11 +5419,62 @@ impl BgTaskRegistry {
 
     fn rehydrate_resolved_task_with_process_probe(
         &self,
-        mut metadata: PersistedTask,
+        metadata: PersistedTask,
         paths: TaskPaths,
         session_id: &str,
         process_is_alive: impl FnOnce(&PersistedTask) -> bool,
     ) -> Result<(), String> {
+        let mut db_ack_lookup_unavailable = false;
+        self.rehydrate_resolved_task_with_db_ack_state(
+            metadata,
+            paths,
+            session_id,
+            process_is_alive,
+            &mut db_ack_lookup_unavailable,
+        )
+    }
+
+    fn rehydrate_resolved_task_with_db_ack_state(
+        &self,
+        mut metadata: PersistedTask,
+        paths: TaskPaths,
+        session_id: &str,
+        process_is_alive: impl FnOnce(&PersistedTask) -> bool,
+        db_ack_lookup_unavailable: &mut bool,
+    ) -> Result<(), String> {
+        // Disk fallback and remote checkpoints can replace the DB metadata.
+        // A foreign ack only changes the durable column, so reconcile it
+        // before any recovery write or completion enqueue uses the snapshot.
+        // If the database lookup fails, keep the acknowledgement state stored with
+        // the task on disk. This may enqueue the completion again, but it is safer
+        // than abandoning this task or the remaining tasks.
+        if !*db_ack_lookup_unavailable {
+            if let Some((harness, pool)) =
+                self.db_harness_and_pool_for_session(&metadata.session_id)
+            {
+                let lookup = match pool.lock() {
+                    Ok(conn) => crate::db::bash_tasks::get_bash_task(
+                        &conn,
+                        &harness,
+                        &metadata.session_id,
+                        &metadata.task_id,
+                    )
+                    .map_err(|error| error.to_string()),
+                    Err(_) => Err("db mutex poisoned".to_string()),
+                };
+                match lookup {
+                    Ok(Some(row)) => metadata.completion_delivered |= row.completion_delivered,
+                    Ok(None) => {}
+                    Err(error) => {
+                        *db_ack_lookup_unavailable = true;
+                        crate::slog_warn!(
+                            "bash task replay completion acknowledgement lookup failed for session {}; keeping disk task state and skipping remaining database reads in this batch: {error}",
+                            metadata.session_id
+                        );
+                    }
+                }
+            }
+        }
         #[cfg(unix)]
         if metadata.remote.is_some() && metadata.is_terminal() {
             remote::persist_terminal_artifacts(&paths, &mut metadata);
@@ -7498,17 +7568,34 @@ impl BgTaskRegistry {
                     .expect("promotion commit test controller");
             }
             let mut db = DeferredDbWrites::new(self, &task);
-            let mut state = task
-                .lock_state()
-                .map_err(|_| "background task lock poisoned".to_string())?;
-            let mut updated = state.metadata.clone();
-            updated.notify_on_completion = true;
-            updated.completion_delivered = false;
-            self.persist_task_locked(&task, &updated, &mut db)
-                .map_err(|e| format!("failed to promote background task: {e}"))?;
-            state.metadata = updated;
-            task.holds_background_slot.store(true, Ordering::SeqCst);
-            state.metadata.status.is_terminal()
+            with_task_db_fence(session_id, task_id, || {
+                // Foreground tasks start delivered because their reply carries
+                // the result. Promotion creates a new notification obligation;
+                // only this explicit transition may lower the durable bit.
+                if let Some((harness, pool)) = self.db_harness_and_pool_for_task(&task) {
+                    let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+                    conn.execute(
+                        "UPDATE bash_tasks SET completion_delivered = 0
+                         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+                        rusqlite::params![harness, session_id, task_id],
+                    )
+                    .map_err(|e| format!("failed to reset promoted task delivery: {e}"))?;
+                }
+                // SQLite is unlocked before taking task state. Keep the fence
+                // through persistence of the promoted state so an older
+                // foreground snapshot queued in the meantime cannot overwrite it.
+                let mut state = task
+                    .lock_state()
+                    .map_err(|_| "background task lock poisoned".to_string())?;
+                let mut updated = state.metadata.clone();
+                updated.notify_on_completion = true;
+                updated.completion_delivered = false;
+                self.persist_task_locked(&task, &updated, &mut db)
+                    .map_err(|e| format!("failed to promote background task: {e}"))?;
+                state.metadata = updated;
+                task.holds_background_slot.store(true, Ordering::SeqCst);
+                Ok::<_, String>(state.metadata.status.is_terminal())
+            })?
         };
         if terminal_after_promote {
             self.post_terminal_transition(&task, true)?;
@@ -8287,12 +8374,9 @@ impl BgTaskRegistry {
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
-        // The task may be held by another registry (this path runs when the
-        // ack reaches a root actor that does not own it) with a row snapshot
-        // still queued behind the aft.db mutex. Unfenced, that snapshot could
-        // land after this update and put `completion_delivered` back to 0,
-        // and replay trusts the row, so the completion would be delivered
-        // again after a restart.
+        // Drain already queued snapshots before applying the ack. The upsert
+        // also preserves a delivered column: the owner can capture more stale
+        // metadata while this fence holds the flush lock, or after it returns.
         with_task_db_fence(session_id, task_id, || {
             let Ok(conn) = pool.lock() else {
                 return;
@@ -13436,6 +13520,91 @@ mod tests {
         let metadata = read_task(&task.paths.json).unwrap();
         assert!(metadata.notify_on_completion);
         assert!(!metadata.completion_delivered);
+    }
+
+    #[test]
+    fn promotion_reopens_durable_foreground_delivery() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task = lifecycle_running_fixture(&registry, &storage);
+        task.lock_state().unwrap().metadata.completion_delivered = true;
+        registry.write_current_task_row(&task);
+        let row = || {
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task.task_id,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(row().completion_delivered);
+        registry.promote(&task.task_id, "session").unwrap();
+        assert!(row().status == "running");
+        assert!(
+            !row().completion_delivered,
+            "promotion left the task durably delivered"
+        );
+    }
+
+    #[test]
+    fn promotion_resets_delivery_after_pre_promotion_snapshots() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task = lifecycle_running_fixture(&registry, &storage);
+        let task_id = task.task_id.clone();
+        let delivered = || {
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task_id,
+            )
+            .unwrap()
+            .unwrap()
+            .completion_delivered
+        };
+        let mut before = DeferredDbWrites::new(&registry, &task);
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.completion_delivered = true;
+            registry
+                .persist_task_locked(&task, &state.metadata, &mut before)
+                .unwrap();
+        }
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *task.db_write_order.before_fenced_change.lock().unwrap() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv_timeout(CHILD_EXIT_LIVENESS_BOUND).unwrap();
+        }));
+        let promoting = {
+            let registry = registry.clone();
+            let task_id = task_id.clone();
+            std::thread::spawn(move || registry.promote(&task_id, "session"))
+        };
+        parked_rx.recv_timeout(CHILD_EXIT_LIVENESS_BOUND).unwrap();
+        assert!(delivered(), "the fence must drain the old delivered row");
+        // The promotion fence holds the flush lock, but has not updated task
+        // metadata. A deferred write can still queue the old foreground snapshot.
+        let mut during = DeferredDbWrites::new(&registry, &task);
+        {
+            let state = task.lock_state().unwrap();
+            registry
+                .persist_task_locked(&task, &state.metadata, &mut during)
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        assert!(promoting.join().unwrap().unwrap());
+        assert!(
+            !delivered(),
+            "promotion must reset the durable delivery bit"
+        );
+        drop(before);
+        drop(during);
+        assert!(!delivered(), "an old foreground snapshot undid promotion");
+        assert!(!task.lock_state().unwrap().metadata.completion_delivered);
     }
 
     #[test]
@@ -20986,30 +21155,17 @@ mod tests {
 
     /// An ack can reach a registry that does not hold the task (another
     /// project root's actor), which marks the aft.db row delivered directly.
-    /// A row snapshot the owning registry captured before the ack, carrying
-    /// `completion_delivered = false` and still queued behind the aft.db
-    /// mutex, must not land after that update: replay trusts the row, so the
-    /// completion would be delivered again after a restart.
+    /// A snapshot can be captured after the ack's fence drains the pending
+    /// row but before its SQL update. That snapshot must not undo the ack
+    /// when it flushes later, or restart replay will deliver a duplicate.
     #[cfg(unix)]
     #[test]
     fn queued_row_snapshot_cannot_undo_a_foreign_registry_ack() {
         let storage = tempfile::tempdir().unwrap();
         let (owner, db, _frames) = registry_with_db_and_frames(storage.path());
-        let task_id = owner
-            .spawn(
-                SpawnPlan::Unsandboxed,
-                QUICK_SUCCESS_COMMAND,
-                "session".to_string(),
-                storage.path().to_path_buf(),
-                HashMap::new(),
-                crate::bash_background::HardKill::After(Duration::from_secs(30)),
-                storage.path().to_path_buf(),
-                10,
-                true,
-                false,
-                Some(storage.path().to_path_buf()),
-            )
-            .unwrap();
+        let (task_id, task) =
+            insert_terminal_piped_task(&owner, &storage, "echo done", "done\n", "", false);
+        owner.write_current_task_row(&task);
         let row = |db: &Mutex<TrackedConnection>| {
             crate::db::bash_tasks::get_bash_task(
                 &db.lock().unwrap(),
@@ -21020,31 +21176,20 @@ mod tests {
             .unwrap()
             .expect("bash_tasks row")
         };
-        let terminal_by = Instant::now() + CHILD_EXIT_LIVENESS_BOUND;
-        while row(&db).status != "completed" {
-            assert!(
-                Instant::now() < terminal_by,
-                "task row never reached completed"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_eq!(row(&db).status, "completed");
         assert!(!row(&db).completion_delivered);
-        let task = owner.task_for_session(&task_id, "session").unwrap();
 
         // The foreign registry shares aft.db but does not hold the task.
         let foreign = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         foreign.set_harness(Harness::Opencode);
         foreign.set_db_pool(Arc::clone(&db));
 
-        let db_guard = db.lock().unwrap();
-        // The owner captures an undelivered snapshot; its flush is still to
-        // come (the guard is alive), as when it waits on the aft.db mutex.
-        let mut queued = DeferredDbWrites::new(&owner, &task);
-        {
-            let state = task.lock_state().unwrap();
-            assert!(!state.metadata.completion_delivered);
-            queued.capture(&state.metadata);
-        }
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *task.db_write_order.before_fenced_change.lock().unwrap() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv_timeout(CHILD_EXIT_LIVENESS_BOUND).unwrap();
+        }));
         let ack = {
             let foreign = foreign.clone();
             let task_id = task_id.clone();
@@ -21052,15 +21197,156 @@ mod tests {
                 foreign.ack_completions_for_session(Some("session"), &[task_id])
             })
         };
-        std::thread::sleep(Duration::from_millis(50));
-        drop(db_guard);
+        parked_rx.recv_timeout(CHILD_EXIT_LIVENESS_BOUND).unwrap();
+        // The fence holds the flush lock, not the task or JSON-write locks.
+        // A live owner can still persist and queue undelivered metadata here.
+        let mut queued = DeferredDbWrites::new(&owner, &task);
+        {
+            let state = task.lock_state().unwrap();
+            assert!(!state.metadata.completion_delivered);
+            owner
+                .persist_task_locked(&task, &state.metadata, &mut queued)
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
         assert_eq!(ack.join().unwrap(), vec![task_id.clone()]);
+        assert!(row(&db).completion_delivered, "ack was not durable");
         drop(queued);
 
         assert!(
             row(&db).completion_delivered,
             "a snapshot captured before the ack flipped the row back to undelivered"
         );
+        assert!(
+            PersistedTask::from(row(&db)).completion_delivered,
+            "row decoding lost the durable ack"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_replay_cannot_undo_a_foreign_registry_ack() {
+        for project_scoped in [false, true] {
+            for prefer_disk in [false, true] {
+                let storage = tempfile::tempdir().unwrap();
+                let (owner, db, _frames) = registry_with_db_and_frames(storage.path());
+                let (task_id, task) =
+                    insert_terminal_piped_task(&owner, &storage, "echo done", "done\n", "", false);
+                {
+                    let mut queued = DeferredDbWrites::new(&owner, &task);
+                    let mut state = task.lock_state().unwrap();
+                    state.metadata.local_fallback_started = prefer_disk;
+                    owner
+                        .persist_task_locked(&task, &state.metadata, &mut queued)
+                        .unwrap();
+                }
+                let foreign = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+                foreign.set_harness(Harness::Opencode);
+                foreign.set_db_pool(Arc::clone(&db));
+                assert_eq!(
+                    foreign.ack_completions_for_session(Some("session"), &[task_id.clone()]),
+                    vec![task_id.clone()]
+                );
+                assert!(!read_task(&task.paths.json).unwrap().completion_delivered);
+
+                let replay = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+                replay.set_harness(Harness::Opencode);
+                replay.set_db_pool(Arc::clone(&db));
+                // Keep this replay focused on recovery rather than the detached GC.
+                replay
+                    .inner
+                    .persisted_gc_started
+                    .store(true, Ordering::SeqCst);
+                if project_scoped {
+                    replay
+                        .replay_session_for_project(storage.path(), "session", storage.path())
+                        .unwrap();
+                } else {
+                    replay.replay_session(storage.path(), "session").unwrap();
+                }
+                assert!(
+                    replay.drain_completions().is_empty(),
+                    "durably acked task was replayed: project_scoped={project_scoped}, prefer_disk={prefer_disk}"
+                );
+                assert!(
+                    replay
+                        .task_for_session(&task_id, "session")
+                        .unwrap()
+                        .lock_state()
+                        .unwrap()
+                        .metadata
+                        .completion_delivered,
+                    "rehydration lost the durable ack"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_session_batch_restores_all_disk_tasks_when_aft_db_is_unreadable() {
+        let storage = tempfile::tempdir().unwrap();
+        let (owner, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_ids = (0..3)
+            .map(|index| {
+                insert_terminal_piped_task(
+                    &owner,
+                    &storage,
+                    &format!("echo task {index}"),
+                    &format!("task {index}\n"),
+                    "",
+                    false,
+                )
+                .0
+            })
+            .collect::<Vec<_>>();
+
+        // Make both the initial task-list query and the acknowledgement reads fail.
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TABLE bash_tasks")
+            .unwrap();
+
+        let replay = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        replay.set_harness(Harness::Opencode);
+        replay.set_db_pool(db);
+        replay
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            replay
+                .replay_session(storage.path(), "session")
+                .expect("unreadable database must not stop disk replay");
+        });
+
+        let fallback_warnings = logs
+            .iter()
+            .filter(|line| {
+                line.contains("falling back to disk without durable completion acknowledgements")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fallback_warnings.len(), 1, "{logs:?}");
+        assert!(fallback_warnings[0].contains("no such table: bash_tasks"));
+        assert!(
+            logs.iter()
+                .all(|line| !line.contains("completion acknowledgement lookup failed")),
+            "replay retried the unreadable database for each task: {logs:?}"
+        );
+
+        for task_id in task_ids {
+            assert!(
+                replay.task_for_session(&task_id, "session").is_some(),
+                "disk task was not restored: {task_id}"
+            );
+            assert!(
+                replay
+                    .pending_completions_for_session("session")
+                    .iter()
+                    .any(|completion| completion.task_id == task_id),
+                "pending completion was not queued: {task_id}"
+            );
+        }
     }
 
     /// A daemon restart replays every project root at once, and each root's

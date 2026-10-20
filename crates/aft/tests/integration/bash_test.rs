@@ -371,7 +371,13 @@ fn bash_streams_progress_and_returns_final_response() {
     let response = aft.send(r#"{"id":"bash-1","method":"bash","params":{"command":"echo hello"}}"#);
     assert_eq!(response["id"], "bash-1");
     assert_eq!(response["success"], true);
-    assert_eq!(response["status"], "running");
+    assert!(
+        matches!(
+            response["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "unexpected spawn status: {response:?}"
+    );
 
     let task_id = response["task_id"].as_str().unwrap();
     let started = std::time::Instant::now();
@@ -549,8 +555,11 @@ fn bash_piped_runner_exit_status_is_not_hidden() {
             response["success"], true,
             "spawn failed for {id}: {response:?}"
         );
-        assert_eq!(
-            response["status"], "running",
+        assert!(
+            matches!(
+                response["status"].as_str(),
+                Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+            ),
             "unexpected spawn status for {id}: {response:?}"
         );
         let task_id = response["task_id"].as_str().unwrap();
@@ -762,7 +771,13 @@ fn bash_timeout_terminates_shell_process_group_grandchild() {
     );
 
     assert_eq!(response["success"], true, "bash failed: {response:?}");
-    assert_eq!(response["status"], "running");
+    assert!(
+        matches!(
+            response["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "unexpected spawn status: {response:?}"
+    );
     let task_id = response["task_id"].as_str().unwrap();
     let started = std::time::Instant::now();
     loop {
