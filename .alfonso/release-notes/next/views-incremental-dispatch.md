@@ -1,0 +1,1 @@
+- Call graphs on views-enabled checkouts refresh within seconds after a small edit, instead of re-deriving every file's method calls on each save.

@@ -24,6 +24,10 @@
 //! - `AFT_UPDATE_BENCH_DISPATCH_COMPARE=1`: also cold-build the newer
 //!   revision with the method-call pass writing every site row by row, and
 //!   require the database to equal the one written by differences.
+//! - `AFT_UPDATE_BENCH_SYNC_CLONE=1`: also run each incremental case (first,
+//!   label suffix `-synced`) after flushing every pending write with sync(2).
+//! - `AFT_UPDATE_BENCH_TABLE_SIZES=1`: checkpoint the newer revision's cold
+//!   database and print each table's and index's size in the main file.
 //! - `AFT_UPDATE_BENCH_ONLY`: comma-separated case labels to run
 //!   (`switch-<first 12 hex of the target revision>` or `edit-<size>`).
 
@@ -310,10 +314,56 @@ fn bench_repository_incremental_update() {
     };
     let old_db = wanted("old").then(|| cold("old", &old));
     let new_db = wanted("new").then(|| cold("new", &new));
-    for (label, base, target) in &targets {
-        if only.as_ref().is_some_and(|only| !only.contains(label)) {
+    if let Some(path) = new_db
+        .as_ref()
+        .filter(|_| std::env::var_os("AFT_UPDATE_BENCH_TABLE_SIZES").is_some())
+    {
+        // Space each table and index takes in the main file once the cold
+        // build's WAL has been checkpointed into it.
+        let connection = Connection::open(path).unwrap();
+        connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        let total: i64 = connection
+            .query_row("SELECT SUM(pgsize) FROM dbstat", [], |row| row.get(0))
+            .unwrap();
+        let mut sizes = connection
+            .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC")
+            .unwrap();
+        for row in sizes
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+        {
+            let (name, bytes) = row.unwrap();
+            println!(
+                "update bench table_size name={name} bytes={bytes} share={:.4}",
+                bytes as f64 / total as f64
+            );
+        }
+        println!(
+            "update bench table_size total_bytes={total} file_bytes={} wal_bytes={}",
+            std::fs::metadata(path).unwrap().len(),
+            super::profile::wal_len(path)
+        );
+    }
+    let variants = if std::env::var_os("AFT_UPDATE_BENCH_SYNC_CLONE").is_some() {
+        // The flushed run goes first, in the position where the plain run
+        // would otherwise wait behind the cold builds' pending writeback.
+        vec![true, false]
+    } else {
+        vec![false]
+    };
+    for (case, base, target, synced) in targets.iter().flat_map(|(label, base, target)| {
+        variants
+            .iter()
+            .map(move |synced| (label, base, target, *synced))
+    }) {
+        if only.as_ref().is_some_and(|only| !only.contains(case)) {
             continue;
         }
+        let label = &format!("{case}{}", if synced { "-synced" } else { "" });
         let base_db = if std::ptr::eq(*base, &old) {
             old_db.as_ref().unwrap()
         } else {
@@ -322,11 +372,35 @@ fn bench_repository_incremental_update() {
         let size = manifest_diff_size(base, target);
         let db = out.path().join(format!("incremental-{label}.sqlite"));
         crate::views::generation::clone_derived(base_db, &db).unwrap();
+        if synced {
+            // Flush every pending write on the machine before timing, so the
+            // materialization's first durable commit does not also wait for
+            // writeback the preceding cold builds and clone left behind.
+            let started = Instant::now();
+            // SAFETY: sync(2) takes no arguments and cannot fail.
+            unsafe { libc::sync() };
+            println!(
+                "update bench system_sync label={label} ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let incremental_keeper = keeper(&db);
         let (cpu_before, _) = usage();
+        let epoch = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+        };
+        let window_start = epoch();
         let started = Instant::now();
         let (stats, timings) = materialize(&db, &blobs, target, Some(base)).unwrap();
         let wall = started.elapsed().as_secs_f64();
+        // Wall-clock bounds, to line the run up with system-call traces.
+        println!(
+            "update bench incremental_window label={label} start_epoch_s={window_start:.6} end_epoch_s={:.6}",
+            epoch()
+        );
         let (cpu_after, max_rss_kib) = usage();
         println!(
             "update bench incremental label={label} changed={} entries={} may_force_full_resolution={} product_path={} wall_s={wall:.3} cpu_s={:.3} max_rss_kib={max_rss_kib}",
@@ -342,6 +416,47 @@ fn bench_repository_incremental_update() {
         );
         println!("update bench stats label={label} {stats:?}");
         println!("update bench timings label={label} {timings:?}");
+        // Commit cost outside materialization: one small write committed on a
+        // connection configured like the materializer's, then the WAL frames
+        // a separate PASSIVE checkpoint finds and the time it takes.
+        {
+            let mut connection = Connection::open(&db).unwrap();
+            configure_materialization_connection(&connection).unwrap();
+            let wal = super::profile::wal_len(&db);
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k, v) VALUES('update_bench_probe', '1')",
+                    [],
+                )
+                .unwrap();
+            let started = Instant::now();
+            transaction.commit().unwrap();
+            println!(
+                "update bench probe_commit label={label} ms={:.3} wal_bytes_before={wal} wal_bytes_after={}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                super::profile::wal_len(&db)
+            );
+            // The probe row is not part of the materialized result that the
+            // parity check below compares with a cold build.
+            connection
+                .execute("DELETE FROM meta WHERE k='update_bench_probe'", [])
+                .unwrap();
+            let started = Instant::now();
+            let (busy, log, checkpointed) = connection
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap();
+            println!(
+                "update bench passive_checkpoint label={label} ms={:.3} busy={busy} log_frames={log} checkpointed_frames={checkpointed}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         drop(incremental_keeper);
         if parity {
             let expected = cold(&format!("target-{label}"), target);

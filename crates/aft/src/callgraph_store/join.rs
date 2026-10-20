@@ -1549,147 +1549,156 @@ fn manifest_payloads(
     Ok(loaded)
 }
 
-/// Bind receiver type paths using the same workspace, module and re-export
-/// rules as ordinary Rust paths. All evidence belongs to the immutable manifest.
-pub(crate) fn dispatch_type_targets(
-    manifest: &Manifest,
-    blobs: &impl ManifestBlobReader,
-    parses: &BTreeMap<String, &ParseBlob>,
-) -> Result<BTreeMap<(String, String), (String, String)>, ManifestJoinError> {
-    let mut stage = crate::views::materialization::profile::StageTimer::new("dispatch");
-    // Binding reads only the payloads of configuration files, so load each
-    // payload when it is first asked for rather than every payload up front.
-    let loaded = std::cell::RefCell::new(BTreeMap::<BlobKey, Arc<[u8]>>::new());
-    let read_error = std::cell::RefCell::new(None);
-    let reader = |key: &BlobKey| -> Option<Arc<[u8]>> {
-        if let Some(bytes) = loaded.borrow().get(key) {
-            return Some(bytes.clone());
+/// The receiver type names of one Rust file that method-call resolution may
+/// look up through ordinary Rust path binding: declared types and their bases,
+/// method owners and traits, field and return types, and each call site's
+/// receiver with any field or return-value wrapper removed.
+fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for ty in &parse.dispatch.types {
+        names.insert(ty.name.clone());
+        names.extend(ty.bases.iter().cloned());
+    }
+    for method in &parse.dispatch.methods {
+        names.insert(method.owner.clone());
+        names.extend(method.trait_name.iter().cloned());
+    }
+    names.extend(parse.dispatch.fields.iter().map(|f| f.ty.clone()));
+    names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
+    for site in &parse.dispatch.sites {
+        if let Some(receiver) = &site.receiver {
+            let mut name = receiver.as_str();
+            while let Some(expression) = name.strip_prefix("@field:") {
+                name = expression
+                    .rsplit_once('|')
+                    .map(|(base, _)| base)
+                    .unwrap_or(expression);
+            }
+            names.insert(name.strip_prefix("@return:").unwrap_or(name).to_string());
         }
-        let bytes: Arc<[u8]> = match blobs.read_callgraph_blob(key) {
-            Ok(Some(bytes)) => bytes.into(),
-            Ok(None) => {
-                read_error
-                    .borrow_mut()
-                    .get_or_insert(ManifestJoinError::MissingBlob(key.clone()));
-                return None;
-            }
-            Err(error) => {
-                read_error.borrow_mut().get_or_insert(error);
-                return None;
-            }
-        };
-        loaded.borrow_mut().insert(key.clone(), bytes.clone());
-        Some(bytes)
-    };
-    let facts = Rc::new(ManifestFacts {
-        manifest,
-        blobs: &reader,
-    });
-    let root = Path::new("/");
-    let paths = FactPaths {
-        root,
-        facts: facts.as_ref(),
-    };
-    let extracts = parses
-        .iter()
-        .map(|(file, parse)| Ok((file.clone(), parse.bind(file, &paths)?)))
-        .collect::<Result<HashMap<_, _>, ManifestJoinError>>()?;
-    stage.finish(
-        "type_targets.bind_all",
-        format_args!("files={}", extracts.len()),
-    );
-    let files = extracts
-        .iter()
-        .map(|(file, extract)| {
-            (
-                file.clone(),
-                super::DbFileIndex::from_extract(root, extract, &paths),
-            )
-        })
-        .collect();
-    let index = ManifestProjectIndex::from_parts(
-        root,
-        files,
-        extracts
-            .iter()
-            .map(|(file, extract)| (file.clone(), &extract.data))
-            .collect(),
-        super::WorkspaceCratePrefixCache::default(),
-        facts.clone(),
-    );
-    stage.finish("type_targets.file_indexes", format_args!(""));
+    }
+    names
+}
+
+/// Bind one Rust file's receiver type names with the same workspace, module and
+/// re-export rules as ordinary Rust paths. A name maps to its target file and
+/// symbol only when the target names a node of the index.
+fn resolve_dispatch_type_names<I: super::ResolverIndex>(
+    index: &I,
+    file: &str,
+    parse: &ParseBlob,
+    data: &FileCallData,
+) -> BTreeMap<String, (String, String)> {
     let mut targets = BTreeMap::new();
-    let mut queried = 0usize;
-    for (file, parse) in parses {
-        if parse.language != "rust" {
-            continue;
-        }
-        let mut names = BTreeSet::new();
-        for ty in &parse.dispatch.types {
-            names.insert(ty.name.clone());
-            names.extend(ty.bases.iter().cloned());
-        }
-        for method in &parse.dispatch.methods {
-            names.insert(method.owner.clone());
-            names.extend(method.trait_name.iter().cloned());
-        }
-        names.extend(parse.dispatch.fields.iter().map(|f| f.ty.clone()));
-        names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
-        for site in &parse.dispatch.sites {
-            if let Some(receiver) = &site.receiver {
-                let mut name = receiver.as_str();
-                while let Some(expression) = name.strip_prefix("@field:") {
-                    name = expression
-                        .rsplit_once('|')
-                        .map(|(base, _)| base)
-                        .unwrap_or(expression);
-                }
-                names.insert(name.strip_prefix("@return:").unwrap_or(name).to_string());
-            }
-        }
-        let data = &extracts[file].data;
-        for name in names {
-            queried += 1;
-            let short = name.rsplit("::").next().unwrap_or(&name);
-            let raw = super::RawRef {
-                ref_id: String::new(),
-                caller_node: None,
-                caller_symbol: None,
-                caller_file: file.clone(),
-                kind: "call".into(),
-                short_name: Some(short.into()),
-                full_ref: Some(name.clone()),
-                module_path: None,
-                import_kind: None,
-                local_name: None,
-                requested_name: None,
-                namespace_alias: None,
-                wildcard: false,
-                line: 0,
-                byte_start: 0,
-                byte_end: 0,
-                dependencies: BTreeSet::new(),
-            };
-            let resolved = super::resolve_rust_target(&index, file, &name, short, data, &raw);
-            if let Some((_, target_file, symbol)) = resolved {
-                if super::ResolverIndex::node_for_symbol(&index, &target_file, &symbol).is_some() {
-                    targets.insert((file.clone(), name), (target_file, symbol));
-                }
+    for name in dispatch_type_names(parse) {
+        let short = name.rsplit("::").next().unwrap_or(&name);
+        let raw = super::RawRef {
+            ref_id: String::new(),
+            caller_node: None,
+            caller_symbol: None,
+            caller_file: file.to_string(),
+            kind: "call".into(),
+            short_name: Some(short.into()),
+            full_ref: Some(name.clone()),
+            module_path: None,
+            import_kind: None,
+            local_name: None,
+            requested_name: None,
+            namespace_alias: None,
+            wildcard: false,
+            line: 0,
+            byte_start: 0,
+            byte_end: 0,
+            dependencies: BTreeSet::new(),
+        };
+        let resolved = super::resolve_rust_target(index, file, &name, short, data, &raw);
+        if let Some((_, target_file, symbol)) = resolved {
+            if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
+                targets.insert(name, (target_file, symbol));
             }
         }
     }
-    stage.finish(
-        "type_targets.resolve_names",
-        format_args!(
-            "names={queried} targets={} payloads_loaded={}",
-            targets.len(),
-            loaded.borrow().len()
-        ),
-    );
-    if let Some(error) = read_error.borrow_mut().take() {
-        return Err(error);
+    targets
+}
+
+/// What resolving one Rust file's receiver type names consulted: every
+/// resolver index answer it read, and every path whose presence it probed.
+/// While each recorded answer is unchanged and no probed path was added or
+/// removed, the file's receiver type targets are unchanged too, because the
+/// file's own parse blob is the only other input.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DispatchTypeTargetTrace {
+    queries: Vec<(ViewSurfaceQuery, String)>,
+    probes: BTreeSet<String>,
+}
+
+impl DispatchTypeTargetTrace {
+    /// Paths and index domains whose change can alter a recorded answer or
+    /// probe, so the owner knows which traces to check after a manifest diff.
+    pub(crate) fn dependencies(&self) -> BTreeSet<String> {
+        self.queries
+            .iter()
+            .flat_map(|(query, _)| query.dependencies())
+            .chain(self.probes.iter().cloned())
+            .collect()
     }
-    Ok(targets)
+
+    /// True when a path this resolution probed was added or removed.
+    pub(crate) fn probes_any(&self, paths: &BTreeSet<String>) -> bool {
+        !self.probes.is_disjoint(paths)
+    }
+
+    /// True when every recorded answer that depends on one of `changed` is
+    /// unchanged in `index`. An answer depending on nothing in `changed` reads
+    /// only index entries that are the same as when it was recorded. Traces
+    /// share queries (a crate's module parents, for one), so answers are kept
+    /// in `answers` for the next trace checked against the same index.
+    fn replays<'q>(
+        &'q self,
+        index: &impl super::ResolverIndex,
+        changed: &BTreeSet<String>,
+        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+    ) -> bool {
+        self.queries.iter().all(|(query, expected)| {
+            !query
+                .dependencies()
+                .iter()
+                .any(|dependency| changed.contains(dependency))
+                || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+        })
+    }
+}
+
+/// One Rust file's receiver type targets, keyed by the type name as written.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DispatchTypeTargets {
+    pub targets: BTreeMap<String, (String, String)>,
+    pub trace: DispatchTypeTargetTrace,
+}
+
+/// The previous generation's traces of the files whose trace depends on one of
+/// the given paths or index domains.
+pub(crate) type DispatchTypeTargetTraces<'p> =
+    &'p dyn Fn(
+        &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, DispatchTypeTargetTrace>, ManifestJoinError>;
+
+/// Which Rust files a join resolves receiver type targets for.
+pub(crate) enum DispatchTypeTargetPlan<'p> {
+    /// Every Rust file of the manifest, as a cold build does.
+    All,
+    /// Resolve every file of `recompute`. Other Rust files are checked only
+    /// when their previous trace depends on a path of `recompute`, on a path
+    /// of `membership_changed`, on a file whose index entry this join had to
+    /// rebuild, or on the crate-wide module domain. A checked file is resolved
+    /// again when its trace probed an added or removed path, or when one of
+    /// the index answers it recorded is different now. Every other file keeps
+    /// its previous targets.
+    Selected {
+        recompute: &'p BTreeSet<String>,
+        membership_changed: &'p BTreeSet<String>,
+        traces: DispatchTypeTargetTraces<'p>,
+    },
 }
 
 #[cfg(test)]
@@ -1773,6 +1782,11 @@ pub(crate) struct SelectedManifestJoin {
     pub rebuilt_surface_paths: BTreeSet<String>,
     pub decoded_caller_blobs: usize,
     pub resolved_bindings: usize,
+    /// Receiver type targets of the Rust files the join's
+    /// [`DispatchTypeTargetPlan`] resolved; other files keep their previous ones.
+    pub dispatch_type_targets: BTreeMap<String, DispatchTypeTargets>,
+    /// Parse blobs decoded only to resolve receiver type targets.
+    pub dispatch_type_target_decoded_blobs: usize,
 }
 
 /// Compact, deterministic snapshot of one file's resolver index. It deliberately
@@ -2127,7 +2141,7 @@ pub(crate) fn join_selected_manifest(
     selected: Option<&BTreeSet<String>>,
     cached: &BTreeMap<String, ViewBindingDependencies>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
-    join_manifest_with_surfaces(manifest, blobs, selected, cached, None)
+    join_manifest_with_surfaces(manifest, blobs, selected, cached, None, None)
 }
 
 /// Rebind only changed callers or callers that probed changed membership. Other
@@ -2141,6 +2155,7 @@ pub(crate) fn join_selected_manifest_reusing_surfaces(
     changed: &BTreeSet<String>,
     membership_changed: &BTreeSet<String>,
     fact_invalidated: &BTreeSet<String>,
+    dispatch_type_targets: Option<DispatchTypeTargetPlan<'_>>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
     join_manifest_with_surfaces(
         manifest,
@@ -2148,6 +2163,7 @@ pub(crate) fn join_selected_manifest_reusing_surfaces(
         selected,
         cached,
         Some((changed, membership_changed, fact_invalidated)),
+        dispatch_type_targets,
     )
 }
 
@@ -2157,6 +2173,7 @@ fn join_manifest_with_surfaces(
     selected: Option<&BTreeSet<String>>,
     cached: &BTreeMap<String, ViewBindingDependencies>,
     reuse: Option<(&BTreeSet<String>, &BTreeSet<String>, &BTreeSet<String>)>,
+    dispatch_type_target_plan: Option<DispatchTypeTargetPlan<'_>>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
     let mut profile = crate::views::materialization::profile::PhaseTimer::new("join");
     let loaded = std::cell::RefCell::new(BTreeMap::<BlobKey, Arc<[u8]>>::new());
@@ -2554,6 +2571,100 @@ fn join_manifest_with_surfaces(
             .collect();
     }
     profile.finish("dependency_union");
+    let mut dispatch_type_targets = BTreeMap::new();
+    let mut dispatch_type_target_decoded_blobs = 0;
+    if let Some(plan) = dispatch_type_target_plan {
+        let mut stage = crate::views::materialization::profile::StageTimer::new("join");
+        let (recompute, replayed) = match plan {
+            DispatchTypeTargetPlan::All => (None, 0),
+            DispatchTypeTargetPlan::Selected {
+                recompute,
+                membership_changed,
+                traces,
+            } => {
+                let mut seeds = recompute.clone();
+                seeds.extend(rebuilt_surface_paths.iter().cloned());
+                seeds.extend(membership_changed.iter().cloned());
+                seeds.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
+                let traces = traces(&seeds)?;
+                stage.finish(
+                    "dispatch_type_target_traces",
+                    format_args!("seeds={} traces={}", seeds.len(), traces.len()),
+                );
+                let mut files = recompute.clone();
+                let mut answers = BTreeMap::new();
+                for (file, trace) in &traces {
+                    if !files.contains(file)
+                        && (trace.probes_any(membership_changed)
+                            || !trace.replays(&index, &seeds, &mut answers))
+                    {
+                        files.insert(file.clone());
+                    }
+                }
+                (Some(files), traces.len())
+            }
+        };
+        for (path, entry) in manifest.entries() {
+            let ManifestEntry::Regular { planes, .. } = entry else {
+                continue;
+            };
+            let Some(key) = &planes.callgraph else {
+                continue;
+            };
+            let Ok(file) = std::str::from_utf8(path.as_bytes()) else {
+                continue;
+            };
+            if recompute
+                .as_ref()
+                .is_some_and(|files| !files.contains(file))
+            {
+                continue;
+            }
+            let decoded_blob = decode(key)?;
+            let CallgraphBlob::Parse(blob) = decoded_blob.as_ref() else {
+                continue;
+            };
+            if blob.language != "rust" {
+                continue;
+            }
+            // The caller data is the file's own parse; binding consults path
+            // facts only for reference dependencies, which are not wanted here.
+            let bound;
+            let data = if let Some(extract) = extracts.get(file) {
+                &extract.data
+            } else {
+                dispatch_type_target_decoded_blobs += 1;
+                bound = blob.bind(file, &paths)?;
+                &bound.data
+            };
+            facts.take();
+            facts.take_config();
+            let recording = ViewSurfaceIndex {
+                inner: &index,
+                queries: Default::default(),
+            };
+            let targets = resolve_dispatch_type_names(&recording, file, blob, data);
+            let probes = facts.take();
+            facts.take_config();
+            dispatch_type_targets.insert(
+                file.to_string(),
+                DispatchTypeTargets {
+                    targets,
+                    trace: DispatchTypeTargetTrace {
+                        queries: recording.take().into_iter().collect(),
+                        probes,
+                    },
+                },
+            );
+        }
+        stage.finish(
+            "dispatch_type_targets",
+            format_args!(
+                "replayed={replayed} resolved_files={} decoded={dispatch_type_target_decoded_blobs}",
+                dispatch_type_targets.len()
+            ),
+        );
+    }
     if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
         eprintln!("view_profile join.surfaces restored={restored_surfaces} rebuilt_changed={rebuilt_changed} rebuilt_facts={rebuilt_facts} rebuilt_membership={rebuilt_membership} rebuilt_missing={rebuilt_missing} selected={} resolved={} skipped={}", selected.map_or(bindings.len(), BTreeSet::len), resolved_callers.len(), bindings.keys().filter(|path| selected.is_none_or(|set| set.contains(*path)) && !resolved_callers.contains(*path)).count());
     }
@@ -2568,6 +2679,8 @@ fn join_manifest_with_surfaces(
         rebuilt_surface_paths,
         decoded_caller_blobs,
         resolved_bindings,
+        dispatch_type_targets,
+        dispatch_type_target_decoded_blobs,
     })
 }
 
@@ -2591,6 +2704,9 @@ enum ViewSurfaceQuery {
     Crate(String),
     CrateRoot(String),
     Inline(String, Vec<String>, String),
+    /// The `.go` files of the package a Go caller looks a symbol up in: its own
+    /// directory, or the directory of an imported module path.
+    GoPackage(String, Option<String>),
 }
 
 fn surface_value(value: &impl Serialize) -> String {
@@ -2616,6 +2732,11 @@ fn reexport_surface(value: &[super::ReexportIndex]) -> String {
 
 pub(crate) const VIEW_CONFIG_MEMBERSHIP_DOMAIN: &str = "\0view:config-membership";
 pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
+/// Recorded by every Go package file listing. A listing reads the directory,
+/// not the files in it, so a file added to the package is no recorded
+/// dependency of the callers that listed it; the owner rechecks this domain
+/// whenever a `.go` file is added or removed.
+pub(crate) const VIEW_GO_PACKAGE_DOMAIN: &str = "\0view:go-package-files";
 
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
@@ -2627,6 +2748,7 @@ impl ViewSurfaceQuery {
             Self::Parent(file) | Self::Inline(file, ..) => {
                 vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
             }
+            Self::GoPackage(..) => vec![VIEW_GO_PACKAGE_DOMAIN.into()],
             Self::Language(file)
             | Self::MacroUse(file)
             | Self::Module(file, _)
@@ -2660,6 +2782,9 @@ impl ViewSurfaceQuery {
             Self::Inline(file, segments, symbol) => {
                 surface_value(&index.inline_scoped_target(file, segments, symbol))
             }
+            Self::GoPackage(file, module) => {
+                surface_value(&index.go_package_files(file, module.as_deref()))
+            }
         }
     }
 }
@@ -2687,7 +2812,12 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
         value
     }
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
-        self.inner.go_package_files(caller_file, module)
+        let value = self.inner.go_package_files(caller_file, module);
+        self.record(
+            ViewSurfaceQuery::GoPackage(caller_file.into(), module.map(str::to_string)),
+            &value,
+        );
+        value
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         // resolve_ref reads only its own caller data; changed callers never reuse

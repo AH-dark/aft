@@ -16,6 +16,11 @@ pub(crate) struct WorkCounters {
     pub applicability_walks: AtomicU64,
     pub logical_aggregates: AtomicU64,
     pub own_generation_folds: AtomicU64,
+    pub dispatch_blobs_decoded: AtomicU64,
+    pub dispatch_files_resolved: AtomicU64,
+    pub dispatch_sites_resolved: AtomicU64,
+    pub dispatch_full_passes: AtomicU64,
+    pub dispatch_type_target_files: AtomicU64,
 }
 
 pub(crate) static WORK: WorkCounters = WorkCounters {
@@ -27,6 +32,11 @@ pub(crate) static WORK: WorkCounters = WorkCounters {
     applicability_walks: AtomicU64::new(0),
     logical_aggregates: AtomicU64::new(0),
     own_generation_folds: AtomicU64::new(0),
+    dispatch_blobs_decoded: AtomicU64::new(0),
+    dispatch_files_resolved: AtomicU64::new(0),
+    dispatch_sites_resolved: AtomicU64::new(0),
+    dispatch_full_passes: AtomicU64::new(0),
+    dispatch_type_target_files: AtomicU64::new(0),
 };
 
 /// Hash source bytes, counting repeated hashes as repeated work. Payload and
@@ -51,6 +61,11 @@ pub(crate) fn work_snapshot() -> serde_json::Value {
         "applicability_walks": WORK.applicability_walks.load(Ordering::Relaxed),
         "logical_aggregates": WORK.logical_aggregates.load(Ordering::Relaxed),
         "own_generation_folds": WORK.own_generation_folds.load(Ordering::Relaxed),
+        "dispatch_blobs_decoded": WORK.dispatch_blobs_decoded.load(Ordering::Relaxed),
+        "dispatch_files_resolved": WORK.dispatch_files_resolved.load(Ordering::Relaxed),
+        "dispatch_sites_resolved": WORK.dispatch_sites_resolved.load(Ordering::Relaxed),
+        "dispatch_full_passes": WORK.dispatch_full_passes.load(Ordering::Relaxed),
+        "dispatch_type_target_files": WORK.dispatch_type_target_files.load(Ordering::Relaxed),
     })
 }
 
