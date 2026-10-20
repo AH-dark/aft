@@ -10,7 +10,12 @@ import { projectV2Tool } from "../tools/definitions/v2.js";
 import type { PluginContext } from "../types.js";
 import { registerV2SessionLifecycle } from "../v2-session-lifecycle.js";
 import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
-import type { V2SessionSyntheticInput } from "../wakes/session-delivery.js";
+import {
+  MAX_ADMITTED_WAKES,
+  V2SessionDelivery,
+  type V2SessionSyntheticInput,
+  WakeDeliveryOverflow,
+} from "../wakes/session-delivery.js";
 
 afterEach(() => {
   __resetV2WakeRoutesForTests();
@@ -31,6 +36,7 @@ async function rig(parentID?: string) {
   let reverted = false;
   let failAdmission = false;
   let failAck = false;
+  let ignoreAck = false;
   const host = {
     location: { directory: process.cwd() },
     event: { subscribe: () => Stream.fromPubSub(bus) },
@@ -66,12 +72,17 @@ async function rig(parentID?: string) {
       if (command === "bash_drain_completions")
         return { success: true, pending_matches: pending ? [pending] : [] };
       if (command === "bash_ack_completions") {
+        if (ignoreAck) {
+          ignoreAck = false;
+          return { success: true, acked_task_ids: [] };
+        }
         if (failAck) {
           failAck = false;
           return { success: false, message: "ack unavailable" };
         }
         if (pending?.once) watch = undefined;
         pending = undefined;
+        return { success: true, acked_matches: params.matches ?? [] };
       }
       return { success: true };
     },
@@ -113,6 +124,9 @@ async function rig(parentID?: string) {
     },
     failAck: () => {
       failAck = true;
+    },
+    ignoreAck: () => {
+      ignoreAck = true;
     },
     async stop() {
       await Effect.runPromise(
@@ -175,12 +189,130 @@ test("V2 async bash_watch wakes on matching output before task completion", asyn
     expect(r.sends.filter((send) => send.command === "bash_ack_completions")).toEqual([
       {
         command: "bash_ack_completions",
-        params: { session_id: "session-v2", task_ids: ["bash-running"] },
+        params: {
+          session_id: "session-v2",
+          matches: [{ task_id: "bash-running", watch_id: "watch-ready", match_offset: 0 }],
+        },
       },
     ]);
   } finally {
     await r.close();
   }
+});
+
+test("V2 sticky watch retires 10000 admitted match keys and drops an acknowledged replay", async () => {
+  const r = await rig();
+  const deliveries = new Set<V2SessionDelivery>();
+  const original = V2SessionDelivery.prototype.patternMatch;
+  V2SessionDelivery.prototype.patternMatch = function (input) {
+    deliveries.add(this);
+    return original.call(this, input);
+  };
+  try {
+    await r.register(false);
+    for (let i = 0; i < 10000; i++) await r.print("READY");
+    expect(r.synthetic).toHaveLength(10000);
+    const delivery = [...deliveries][0] as unknown as { admittedWakes: Set<string> };
+    expect(delivery.admittedWakes.size).toBe(0);
+    await r.consumer.bridgeOptions.onBashPatternMatch?.(
+      {
+        type: "bash_pattern_match",
+        session_id: "session-v2",
+        task_id: "bash-running",
+        watch_id: "watch-ready",
+        match_offset: 0,
+        match_text: "READY",
+        context: "READY",
+        once: false,
+      },
+      r.bridge as never,
+    );
+    expect(r.synthetic).toHaveLength(10000);
+  } finally {
+    V2SessionDelivery.prototype.patternMatch = original;
+    await r.close();
+  }
+});
+
+test("V2 acknowledging one match leaves the other watch pending for the next delivery", async () => {
+  const r = await rig();
+  const first: BashPatternMatchFrame = {
+    type: "bash_pattern_match",
+    session_id: "session-v2",
+    task_id: "bash-running",
+    watch_id: "first",
+    match_offset: 10,
+    match_text: "READY",
+    context: "first",
+    once: true,
+  };
+  const second = { ...first, watch_id: "second", match_offset: 20, context: "second" };
+  const pending = [first, second];
+  const bridge = {
+    send: async (command: string, params: Record<string, unknown>) => {
+      if (command === "bash_drain_completions")
+        return { success: true, pending_matches: [...pending] };
+      if (command === "bash_ack_completions") {
+        const matches = params.matches as
+          | Array<{ watch_id: string; match_offset: number }>
+          | undefined;
+        for (let i = pending.length - 1; i >= 0; i--) {
+          if (
+            params.task_ids ||
+            matches?.some(
+              (m) =>
+                m.watch_id === pending[i]?.watch_id && m.match_offset === pending[i]?.match_offset,
+            )
+          )
+            pending.splice(i, 1);
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    },
+  };
+  try {
+    r.consumer.registerSession?.("session-v2");
+    await r.consumer.bridgeOptions.onBashPatternMatch?.(first, bridge as never);
+    expect(pending).toEqual([second]);
+    await r.consumer.bridgeOptions.onBashPatternMatch?.(second, bridge as never);
+    expect(pending).toEqual([]);
+    expect(r.synthetic.map((input) => input.text)).toEqual([
+      expect.stringContaining("first"),
+      expect.stringContaining("second"),
+    ]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 unretired wake overflow is typed and does not evict duplicate protection", async () => {
+  let admitted = 0;
+  const delivery = new V2SessionDelivery({
+    get: () => Effect.succeed({}),
+    prompt: () => Effect.void,
+    synthetic: () => Effect.sync(() => admitted++),
+  });
+  const wake = {
+    sessionID: "s",
+    taskIDs: ["task"],
+    watchID: "sticky",
+    matchOffset: 0,
+    text: "READY",
+  };
+  for (let i = 0; i < MAX_ADMITTED_WAKES; i++) {
+    expect(await Effect.runPromise(delivery.patternMatch({ ...wake, matchOffset: i }))).toBe(true);
+  }
+  const overflow = await Effect.runPromise(
+    delivery
+      .patternMatch({ ...wake, matchOffset: MAX_ADMITTED_WAKES })
+      .pipe(Effect.catch((error) => Effect.succeed(error))),
+  );
+  expect(overflow).toBeInstanceOf(WakeDeliveryOverflow);
+  expect(overflow).toMatchObject({ type: "wake_delivery_overflow" });
+  expect(await Effect.runPromise(delivery.patternMatch(wake))).toBe(false);
+  expect(admitted).toBe(MAX_ADMITTED_WAKES);
+  delivery.dispose();
 });
 
 test("V2 once matches remain pending until admission and acknowledgement succeed", async () => {
@@ -202,6 +334,23 @@ test("V2 once matches remain pending until admission and acknowledgement succeed
     expect(r.synthetic).toHaveLength(1);
     expect(r.pending()).toBeUndefined();
     expect(r.watching()).toBe(false);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 unconfirmed match acknowledgement retains admission until durable retirement", async () => {
+  const r = await rig();
+  try {
+    await r.register(false);
+    r.ignoreAck();
+    await r.print("READY");
+    expect(r.synthetic).toHaveLength(1);
+    expect(r.pending()).toBeDefined();
+    r.consumer.registerSession?.("session-v2");
+    await Bun.sleep(0);
+    expect(r.pending()).toBeUndefined();
+    expect(r.synthetic).toHaveLength(1);
   } finally {
     await r.close();
   }

@@ -509,6 +509,14 @@ export interface BashPatternMatchFrame {
   match_offset: number;
   context: string;
   once: boolean;
+  reason?: "pattern_match" | "task_exit";
+}
+
+/** Exact durable match identity accepted by bash_ack_completions.matches. */
+export interface BashPatternMatchAck {
+  task_id: string;
+  watch_id: string;
+  match_offset: number;
 }
 
 export interface StatusSnapshot {
