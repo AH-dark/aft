@@ -936,6 +936,7 @@ fn binary_version(path: &Path) -> Result<String, ProfileError> {
         .to_string())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn inspect_target(target: &Target, sample: &str) -> Result<TargetReport, ProfileError> {
     #[cfg(target_os = "linux")]
     let (_loaded_image, loaded_debug_id, disk_debug_id, inode_differs) = {
@@ -972,19 +973,6 @@ fn inspect_target(target: &Target, sample: &str) -> Result<TargetReport, Profile
             false,
         )
     };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let (loaded_image, loaded_debug_id, disk_debug_id, inode_differs): (
-        Option<PathBuf>,
-        String,
-        Option<String>,
-        bool,
-    ) = {
-        let _ = (target, sample);
-        return Err(ProfileError::runtime(
-            "aft profile unavailable: loaded image inspection is not implemented on this platform",
-        ));
-    };
-
     let debug_ids = select_debug_ids(&loaded_debug_id, disk_debug_id.as_deref(), inode_differs);
     #[cfg(target_os = "linux")]
     let (sha256, version) = {
@@ -1003,8 +991,6 @@ fn inspect_target(target: &Target, sample: &str) -> Result<TargetReport, Profile
         // could describe a different executable.
         ("unknown".to_string(), "unknown".to_string())
     };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let (sha256, version) = ("unknown".to_string(), "unknown".to_string());
     Ok(TargetReport {
         pid: target.pid,
         image: target.image.display().to_string(),
@@ -1014,6 +1000,13 @@ fn inspect_target(target: &Target, sample: &str) -> Result<TargetReport, Profile
         image_on_disk_differs: debug_ids.image_on_disk_differs,
         image_on_disk_debug_id: debug_ids.image_on_disk,
     })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inspect_target(_target: &Target, _sample: &str) -> Result<TargetReport, ProfileError> {
+    Err(ProfileError::runtime(
+        "aft profile unavailable: loaded image inspection is not implemented on this platform",
+    ))
 }
 
 #[cfg(target_os = "linux")]
