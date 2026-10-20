@@ -1,1 +1,1 @@
-Fixed delayed updates in views-enabled checkouts: a due view publication now wakes the watcher drain without waiting for unrelated maintenance. The one-second quiet window still coalesces bursts of edits into a single publication, and unchanged checkouts return to idle.
+- With index views on, a call graph reflects an edit within seconds. A finished update no longer waits up to five minutes for an unrelated maintenance timer before it is published.
