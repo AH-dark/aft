@@ -190,7 +190,13 @@ fn zoom_target_label_for_call(bare_name: &str, arguments: &Value) -> Option<Stri
         return None;
     }
     let obj = arguments.as_object()?;
-    obj.get("filePath")
+    obj.get("batch")
+        .and_then(Value::as_array)
+        .filter(|entries| entries.len() == 1)
+        .and_then(|entries| entries[0].get("target"))
+        .or_else(|| obj.get("target"))
+        .or_else(|| obj.get("path"))
+        .or_else(|| obj.get("filePath"))
         .or_else(|| obj.get("url"))
         .and_then(Value::as_str)
         .filter(|label| !label.is_empty())
@@ -2655,6 +2661,33 @@ fn format_zoom_call_ref(call: &Value) -> String {
 #[cfg(test)]
 mod zoom_other_calls_tests {
     use super::*;
+
+    #[test]
+    fn zoom_target_labels_accept_batch_and_quiet_aliases() {
+        for key in ["target", "path", "filePath", "url"] {
+            assert_eq!(
+                zoom_target_label_for_call(
+                    "zoom",
+                    &serde_json::json!({key: "https://example.test/docs"})
+                ),
+                Some("https://example.test/docs".to_string())
+            );
+        }
+        assert_eq!(
+            zoom_target_label_for_call(
+                "zoom",
+                &serde_json::json!({"batch": [{"target": "src/main.rs", "symbols": "main"}]})
+            ),
+            Some("src/main.rs".to_string())
+        );
+        assert_eq!(
+            zoom_target_label_for_call(
+                "zoom",
+                &serde_json::json!({"batch": [{"target": "a.rs"}, {"target": "b.rs"}]})
+            ),
+            None
+        );
+    }
 
     #[test]
     fn zoom_formats_other_calls_once_with_or_without_followable_calls() {

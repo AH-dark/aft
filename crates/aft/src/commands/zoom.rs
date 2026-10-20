@@ -250,7 +250,7 @@ fn resolve_zoom_file(
             "file_not_found",
             deterministic_zoom_refusal(
                 format!("file not found: {file}"),
-                "Set `file` to an existing path or use a reachable `url`.",
+                "Set `target` to an existing file path or a reachable HTTP/HTTPS URL.",
             ),
         ));
     }
@@ -263,7 +263,7 @@ fn resolve_zoom_file(
             "file_not_found",
             deterministic_zoom_refusal(
                 format!("cannot read {file}: {error}"),
-                "Choose a readable `file` path.",
+                "Choose a readable `target`.",
             ),
         )
     })?;
@@ -329,8 +329,13 @@ struct InvalidZoomTarget {
 fn zoom_target_fields(
     target: &serde_json::Value,
     index: usize,
-) -> Result<(&str, &str, &str), InvalidZoomTarget> {
+) -> Result<(&str, &serde_json::Value, &str), InvalidZoomTarget> {
     let obj = target.as_object();
+    let index = obj
+        .and_then(|obj| obj.get("batch_index"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(index);
     let field = |key: &str| {
         obj.and_then(|obj| obj.get(key))
             .and_then(|value| value.as_str())
@@ -341,25 +346,73 @@ fn zoom_target_fields(
         .and_then(|value| value.as_str())
         .filter(|label| !label.trim().is_empty());
     let file = field("file");
-    let symbol = field("symbol");
+    let symbols = obj.and_then(|obj| obj.get("symbols").or_else(|| obj.get("symbol")));
     let invalid = |message: String| InvalidZoomTarget {
         label: label.or(file).unwrap_or("(no path)").to_string(),
-        name: symbol.unwrap_or("").to_string(),
+        name: symbols
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         message,
     };
     let Some(file) = file else {
         return Err(invalid(deterministic_zoom_refusal(
-            format!("zoom: targets[{index}].file must be a non-empty string"),
+            format!("zoom: batch[{index}].target must be a non-empty string"),
             "Provide a file path for every target.",
         )));
     };
-    let Some(symbol) = symbol else {
+    let has_name =
+        |value: &serde_json::Value| value.as_str().is_some_and(|name| !name.trim().is_empty());
+    let Some(symbols) = symbols.filter(|value| {
+        has_name(value)
+            || value
+                .as_array()
+                .is_some_and(|values| values.iter().any(has_name))
+    }) else {
         return Err(invalid(deterministic_zoom_refusal(
-            format!("zoom: targets[{index}].symbol must be a non-empty string"),
+            format!("zoom: batch[{index}].symbols must be a non-empty string or an array of non-empty strings"),
             "Provide a symbol name for every target.",
         )));
     };
-    Ok((file, symbol, label.unwrap_or(file)))
+    Ok((file, symbols, label.unwrap_or(file)))
+}
+
+fn zoom_target_symbol_names(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+    symbols: &serde_json::Value,
+    memo: &mut ZoomTargetMemo,
+) -> Result<Vec<String>, Response> {
+    let target_req = RawRequest {
+        id: req.id.clone(),
+        command: req.command.clone(),
+        lsp_hints: req.lsp_hints.clone(),
+        session_id: req.session_id.clone(),
+        params: serde_json::json!({ "symbols": symbols }),
+    };
+    if is_github_read_target(file) {
+        return github_zoom_selector(&target_req).map(|selector| vec![selector]);
+    }
+    if !memo.files.contains_key(file) {
+        memo.files
+            .insert(file.to_string(), resolve_zoom_file(req, ctx, file)?);
+    }
+    // A fetched URL's cache path carries its actual document language. Parsing
+    // before resolution would split comma-bearing headings at extensionless URLs.
+    let (path, _) = &memo.files[file];
+    let names = parse_zoom_symbol_names(&target_req.params, detect_language(path))?;
+    if names.is_empty() {
+        return Err(Response::error(
+            &req.id,
+            "invalid_request",
+            deterministic_zoom_refusal(
+                "zoom: missing required batch entry 'symbols'",
+                "Provide `batch: [{ target, symbols }]` for the lookup.",
+            ),
+        ));
+    }
+    Ok(names)
 }
 
 fn handle_zoom_targets(
@@ -374,8 +427,8 @@ fn handle_zoom_targets(
             &req.id,
             "invalid_request",
             deterministic_zoom_refusal(
-                "zoom: 'targets' must be a non-empty array",
-                "Pass at least one `{ file, symbol }` target.",
+                "zoom: 'batch' must be a non-empty array",
+                "Pass a non-empty `batch` array of `{ target, symbols }` entries.",
             ),
         );
     }
@@ -389,22 +442,33 @@ fn handle_zoom_targets(
     let mut memo = ZoomTargetMemo::default();
     for (index, target) in targets.iter().enumerate() {
         match zoom_target_fields(target, index) {
-            Ok((file, symbol, target_label)) => {
+            Ok((file, symbols, target_label)) => {
                 any_usable = true;
-                let response = zoom_one_target_response(
-                    req,
-                    ctx,
-                    file,
-                    symbol,
-                    context_lines,
-                    include_callgraph,
-                    &mut memo,
-                );
-                entries.push(serde_json::json!({
-                    "targetLabel": target_label,
-                    "name": symbol,
-                    "response": serialize_zoom_target_response(req, response),
-                }));
+                match zoom_target_symbol_names(req, ctx, file, symbols, &mut memo) {
+                    Ok(names) => {
+                        for name in names {
+                            let response = zoom_one_target_response(
+                                req,
+                                ctx,
+                                file,
+                                &name,
+                                context_lines,
+                                include_callgraph,
+                                &mut memo,
+                            );
+                            entries.push(serde_json::json!({
+                                "targetLabel": target_label,
+                                "name": name,
+                                "response": serialize_zoom_target_response(req, response),
+                            }));
+                        }
+                    }
+                    Err(response) => entries.push(serde_json::json!({
+                        "targetLabel": target_label,
+                        "name": symbols.as_str().map(str::to_string).unwrap_or_else(|| symbols.to_string()),
+                        "response": serialize_zoom_target_response(req, response),
+                    })),
+                }
             }
             Err(invalid) => {
                 let response = Response::error(&req.id, "invalid_request", invalid.message.clone());
@@ -431,13 +495,9 @@ fn handle_zoom_targets(
     )
 }
 
-/// Expand a top-level `file` (or `url`) plus `symbol`/`symbols` that arrived
-/// next to `targets` into batch entries, one per symbol, split exactly as the
-/// single-file mode splits them. Some models fill every declared parameter on
-/// every call, so a real same-file request routinely arrives beside a
-/// placeholder `targets` entry; answering both beats refusing both. A file
-/// with no symbol still becomes one entry, which reports the missing symbol
-/// on its own line.
+/// Merge a top-level file lookup into the target batch without parsing it yet.
+/// The target handler normalizes the original string or array once, after URL
+/// resolution, so headings and explicit array entries keep their boundaries.
 fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value> {
     let label = req
         .params
@@ -445,20 +505,13 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
         .and_then(|value| value.as_str())
         .filter(|label| !label.trim().is_empty())
         .unwrap_or(file);
-    let names = if is_github_read_target(file) {
-        github_zoom_selector(req)
-            .map(|selector| vec![selector])
-            .unwrap_or_default()
-    } else {
-        parse_zoom_symbol_names(&req.params, detect_language(Path::new(file))).unwrap_or_default()
-    };
-    if names.is_empty() {
-        return vec![serde_json::json!({ "file": file, "symbol": "", "target_label": label })];
-    }
-    names
-        .into_iter()
-        .map(|name| serde_json::json!({ "file": file, "symbol": name, "target_label": label }))
-        .collect()
+    let symbols = req
+        .params
+        .get("symbols")
+        .or_else(|| req.params.get("symbol"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+    vec![serde_json::json!({ "file": file, "symbols": symbols, "target_label": label })]
 }
 
 /// Handle a `zoom` request.
@@ -490,8 +543,8 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 deterministic_zoom_refusal(
-                    "zoom: 'targets' must be a non-empty array",
-                    "Pass a non-empty `targets` array or use `file` with `symbol`.",
+                    "zoom: 'batch' must be a non-empty array",
+                    "Pass a non-empty `batch` array of `{ target, symbols }` entries.",
                 ),
             );
         };
@@ -521,8 +574,8 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 deterministic_zoom_refusal(
-                    "zoom: missing required param 'file'",
-                    "Provide `file` or `url` with the symbol to inspect.",
+                    "zoom: missing required batch entry 'target'",
+                    "Provide `batch: [{ target, symbols }]` to inspect.",
                 ),
             );
         }
@@ -677,7 +730,7 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 "invalid_request",
                 deterministic_zoom_refusal(
                     "zoom: provide both 'start_line' and 'end_line' for line-range mode",
-                    "Provide both 1-based line bounds or use `symbol` instead.",
+                    "Use `symbols` in a `batch` entry for a symbol lookup, or read the local file.",
                 ),
             );
         }
@@ -695,8 +748,8 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             "invalid_request",
             deterministic_zoom_refusal(
-                "zoom: missing required param 'symbol'",
-                "Provide `symbol`, `symbols`, or both `start_line` and `end_line`.",
+                "zoom: missing required batch entry 'symbols'",
+                "Provide `batch: [{ target, symbols }]` for the lookup.",
             ),
         );
     }
@@ -915,7 +968,7 @@ fn symbol_not_found_message(symbol_name: &str, all_symbols: &[Symbol], is_headin
         return deterministic_zoom_refusal(
             format!("{item_label} '{symbol_name}' not found"),
             &format!(
-                "This {container_label} has {symbol_count} {item_plural}; closest is {}. The requested {item_label} may be in another file, so change `file` or `symbol`.",
+                "This {container_label} has {symbol_count} {item_plural}; closest is {}. The requested {item_label} may be in another file, so change `target` or `symbols`.",
                 format_outline_symbol_labeled(closest, is_heading)
             ),
         );
@@ -923,7 +976,7 @@ fn symbol_not_found_message(symbol_name: &str, all_symbols: &[Symbol], is_headin
 
     deterministic_zoom_refusal(
         format!("{item_label} '{symbol_name}' not found"),
-        "Use line-range mode for a symbol-less file or choose a different `file` and `symbol`.",
+        "Read a symbol-less local file or choose a different `target` and `symbols` in the batch.",
     )
 }
 
@@ -1259,7 +1312,7 @@ fn zoom_one_symbol_inner(
             Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
             Err(_) => deterministic_zoom_refusal(
                 format!("symbol '{symbol_name}' not found"),
-                "List the file outline, then change `file` or `symbol`.",
+                "List the file outline, then change `target` or `symbols`.",
             ),
         };
         return Response::error(&req.id, "symbol_not_found", msg);
@@ -1561,7 +1614,7 @@ fn render_ambiguous_symbol_menu(
     suggestions: &[String],
 ) -> String {
     let mut lines = vec![format!(
-        "symbol '{symbol_name}' is ambiguous ({} candidates) and cannot choose a body. {} Pick one of these qualified names and pass the backticked name as `symbol`:",
+        "symbol '{symbol_name}' is ambiguous ({} candidates) and cannot choose a body. {} Pick one of these qualified names and pass the backticked name as `symbols`:",
         suggestions.len(),
         RETRY_UNCHANGED_ZOOM_MESSAGE,
     )];
@@ -3761,6 +3814,9 @@ def local():
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);
         assert_eq!(json["code"], "invalid_request");
+        let message = json["message"].as_str().unwrap();
+        assert!(message.contains("Provide `batch: [{ target, symbols }]`"));
+        assert!(!message.contains("`file`"));
     }
 
     #[test]
@@ -3830,6 +3886,7 @@ def local():
         assert!(message.contains("This file has"));
         assert!(message.contains("closest is `"));
         assert!(message.contains("may be in another file"));
+        assert!(message.contains("change `target` or `symbols`"));
     }
 
     #[test]
@@ -3857,7 +3914,8 @@ def local():
         let message = response["message"].as_str().unwrap();
         assert_eq!(response["code"], "file_not_found");
         assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
-        assert!(message.contains("Set `file` to an existing path"));
+        assert!(message.contains("Set `target` to an existing file path"));
+        assert!(!message.contains("`file`"));
     }
 
     #[test]
@@ -3873,7 +3931,7 @@ def local():
             content.contains(RETRY_UNCHANGED_ZOOM_MESSAGE),
             "expected ambiguous-name menu, got: {content}"
         );
-        assert!(content.contains("pass the backticked name as `symbol`"));
+        assert!(content.contains("pass the backticked name as `symbols`"));
     }
 
     #[test]

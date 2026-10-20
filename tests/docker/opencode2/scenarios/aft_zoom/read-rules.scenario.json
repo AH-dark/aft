@@ -23,9 +23,9 @@
             "id": "zoom-read-rule-batch",
             "name": "aft_zoom",
             "arguments": {
-              "targets": [
-                { "path": "secret.ts", "symbol": "hiddenSymbol" },
-                { "path": "public.ts", "symbol": "visibleSymbol" }
+              "batch": [
+                { "target": "secret.ts", "symbols": "hiddenSymbol" },
+                { "target": "public.ts", "symbols": "visibleSymbol" }
               ]
             },
             "non_mutating_evidence": { "reason": "zoom reads only authorized fixture symbols" }

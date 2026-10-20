@@ -215,10 +215,10 @@ for (const name of ["aft_outline", "aft_zoom"] as const) {
         expect(result.content).toBe(
           `allowed content\n\n${f.files[0]}: ${denial}\n${f.files[2]}: ${denial}`,
         );
-        expect(f.dispatched[0]?.targets).toEqual(
+        expect(f.dispatched[0]?.batch).toEqual(
           f.files
             .filter((_, index) => index !== 0 && index !== 2)
-            .map((path) => ({ filePath: path, symbol: "allowed" })),
+            .map((path) => ({ target: path, symbols: "allowed" })),
         );
       }
     } finally {

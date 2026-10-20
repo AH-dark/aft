@@ -393,7 +393,11 @@ export function projectV2Tool(
 
   return {
     name: hostName,
-    description: renameV2ToolReferences(definition.description),
+    description: renameV2ToolReferences(
+      ["read", "write", "edit"].includes(name)
+        ? definition.description.replaceAll("filePath", "path")
+        : definition.description,
+    ),
     input,
     options: {
       ...sharedOptions,

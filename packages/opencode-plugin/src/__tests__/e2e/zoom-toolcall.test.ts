@@ -130,7 +130,7 @@ export function runZoomToolcallSuite(
 
       expect(output).toContain("Incomplete zoom results: one or more symbols failed.");
       expect(output).toContain("sample.ts:15-17 [function funcA]");
-      expect(output).toContain('Symbol "missingSymbol" not found:');
+      expect(output).toContain('Symbol "missingSymbol" not found in sample.ts:');
     });
 
     test("url zoom returns server-rendered text through tool_call", async () => {
@@ -172,16 +172,13 @@ export function runZoomToolcallSuite(
       expect(output).not.toContain("visibleMethodBodyLine");
     });
 
-    test("single-symbol not-found errors still throw", async () => {
+    test("single-symbol not-found returns the lookup's guidance as text", async () => {
       const h = await harness();
-      const tools = readingTools(createPluginContext(h));
 
-      await expect(
-        tools.aft_zoom.execute(
-          { filePath: "sample.ts", symbols: "missingSymbol" },
-          createToolContext(h),
-        ),
-      ).rejects.toThrow("symbol 'missingSymbol' not found");
+      const output = await runZoom(h, { filePath: "sample.ts", symbols: "missingSymbol" });
+
+      expect(output).toContain('Symbol "missingSymbol" not found in sample.ts:');
+      expect(output).toContain("closest is `funcB`");
     });
 
     test("placeholder targets merge with a real path + symbols request", async () => {

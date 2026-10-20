@@ -843,7 +843,7 @@ fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
     let text = response["text"].as_str().unwrap_or_default();
     assert!(text.contains("function beta()"), "{text}");
     assert!(
-        text.contains("targets[1].symbol must be a non-empty string"),
+        text.contains("batch[1].symbols must be a non-empty string"),
         "{text}"
     );
 
@@ -905,4 +905,167 @@ fn search_invalid_pattern_refuses_with_invalid_pattern_code_on_both_paths() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn tool_call_zoom_batch_errors_keep_original_entry_index_after_symbol_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("lane.ts"),
+        "export function alpha() {}\nexport function beta() {}\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let response = placeholder_tool_call(
+        &mut aft,
+        "zoom-batch-index",
+        "zoom",
+        json!({ "batch": [
+        { "target": "lane.ts", "symbols": ["alpha", "beta"] },
+        { "target": "lane.ts", "symbols": [] }
+    ] }),
+    );
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("function alpha()") && text.contains("function beta()"),
+        "{response:#}"
+    );
+    assert!(
+        text.contains("batch[1].symbols must be a non-empty string"),
+        "{response:#}"
+    );
+    assert!(!text.contains("batch[2].symbols"), "{response:#}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_conflicting_http_locations_name_both_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let path = "https://example.test/path";
+    let url = "https://example.test/url";
+    for args in [
+        json!({ "path": path, "url": url, "symbols": "Heading" }),
+        json!({ "targets": [{ "path": path, "url": url, "symbol": "Heading" }] }),
+    ] {
+        let response = placeholder_tool_call(&mut aft, "zoom-conflict", "zoom", args);
+        assert_eq!(response["success"], false, "{response:#}");
+        assert_eq!(response["code"], "invalid_request", "{response:#}");
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(message.contains(path) && message.contains(url), "{message}");
+    }
+    assert!(aft.shutdown().success());
+}
+
+fn zoom_argument_shapes(target: &str, symbols: Value) -> Vec<Value> {
+    let mut shapes = vec![
+        json!({ "batch": [{ "target": target, "symbols": symbols }] }),
+        json!({ "targets": { "path": target, "symbol": symbols } }),
+        json!({ "targets": [{ "filePath": target, "symbols": symbols }] }),
+    ];
+    for key in ["target", "path", "filePath", "url"] {
+        shapes.push(json!({ key: target, "symbols": symbols }));
+    }
+    shapes
+}
+
+fn assert_zoom_lookup_names(response: &Value, expected: &[&str]) {
+    assert_eq!(response["success"], true, "{response:#}");
+    let entries = response["targets"].as_array().expect("zoom target results");
+    assert_eq!(entries.len(), expected.len(), "{response:#}");
+    for (entry, name) in entries.iter().zip(expected) {
+        assert_eq!(entry["name"], *name, "{response:#}");
+        assert_eq!(entry["response"]["success"], true, "{response:#}");
+    }
+}
+
+#[test]
+fn tool_call_zoom_code_comma_list_returns_both_symbols() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("code.ts"),
+        "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for args in zoom_argument_shapes("code.ts", json!("alpha, beta")) {
+        let response = placeholder_tool_call(&mut aft, "zoom-comma-list", "zoom", args);
+        assert_zoom_lookup_names(&response, &["alpha", "beta"]);
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_code_strings_clean_up_arrays_and_pasted_menu_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("code.ts"),
+        "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for (symbols, names) in [
+        (json!(r#"["alpha", "beta"]"#), vec!["alpha", "beta"]),
+        (
+            json!("- `alpha` — alpha(): number (lines 1-1)"),
+            vec!["alpha"],
+        ),
+    ] {
+        for args in zoom_argument_shapes("code.ts", symbols) {
+            let response = placeholder_tool_call(&mut aft, "zoom-cleanup", "zoom", args);
+            assert_zoom_lookup_names(&response, &names);
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_comma_headings_stay_single_lookups() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("guide.md"),
+        "# Alpha, beta\n\nBoth topics belong to one section.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("guide.html"),
+        "<h1>Alpha, beta</h1><p>Both topics belong to one section.</p>\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for file in ["guide.md", "guide.html"] {
+        for symbols in [json!("Alpha, beta"), json!(["Alpha, beta"])] {
+            for args in zoom_argument_shapes(file, symbols) {
+                let response = placeholder_tool_call(&mut aft, "zoom-comma-heading", "zoom", args);
+                assert_zoom_lookup_names(&response, &["Alpha, beta"]);
+            }
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_symbol_array_entries_are_not_comma_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("code.ts"), "export function alpha() {}\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for args in zoom_argument_shapes("code.ts", json!(["alpha, beta"])) {
+        let response = placeholder_tool_call(&mut aft, "zoom-array-entry", "zoom", args);
+        assert_eq!(response["success"], true, "{response:#}");
+        let entries = response["targets"].as_array().expect("zoom target results");
+        assert_eq!(entries.len(), 1, "{response:#}");
+        assert_eq!(entries[0]["name"], "alpha, beta", "{response:#}");
+        assert_eq!(entries[0]["response"]["success"], false, "{response:#}");
+        assert_eq!(
+            entries[0]["response"]["code"], "symbol_not_found",
+            "{response:#}"
+        );
+    }
+    assert!(aft.shutdown().success());
 }
