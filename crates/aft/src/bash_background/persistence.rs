@@ -806,6 +806,9 @@ impl From<BashTaskRow> for PersistedTask {
     fn from(row: BashTaskRow) -> Self {
         if let Ok(mut task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
             task.harness = Some(row.harness.clone());
+            // A foreign registry acknowledges the row without rewriting its
+            // metadata snapshot, so the durable column may be newer.
+            task.completion_delivered |= row.completion_delivered;
             return task;
         }
         let status = match row.status.as_str() {

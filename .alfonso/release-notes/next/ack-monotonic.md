@@ -1,0 +1,1 @@
+Prevent acknowledged background completions from becoming undelivered when a stale task snapshot is persisted by another registry. Restart recovery also honors durable acknowledgements when task metadata on disk predates the acknowledgement, avoiding duplicate completion wakes.
