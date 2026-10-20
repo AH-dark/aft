@@ -277,12 +277,23 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
 
         if (params.op === "purge" && params.path) {
           // Pi has no edit prompt; the purge path gets the same project-root
-          // check every other write in this plugin gets.
-          await assertExternalDirectoryPermission(
+          // check every other write in this plugin gets. A purge reaches every
+          // saved copy under the path, whether or not the path still exists,
+          // so, as for restore, each saved path the engine says it would
+          // remove is checked too before anything is removed.
+          const purgeTarget = await resolvePathArg(extCtx.cwd, params.path);
+          await assertExternalDirectoryPermission(extCtx, purgeTarget, { restrictToProjectRoot });
+          const preview = await callBridge(
+            bridge,
+            "safety_purge_paths",
+            { file: purgeTarget },
             extCtx,
-            await resolvePathArg(extCtx.cwd, params.path),
-            { restrictToProjectRoot },
           );
+          for (const file of new Set(responsePaths(preview))) {
+            await assertExternalDirectoryPermission(extCtx, file, {
+              restrictToProjectRoot,
+            });
+          }
         }
 
         const rawArgs: Record<string, unknown> = { op: params.op };

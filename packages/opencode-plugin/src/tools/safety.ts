@@ -185,20 +185,39 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           // Purging destroys copies of the path's content, so it asks the same
           // edit permission a write to the path would. A directory is asked
           // for as itself and as everything under it, so a rule like
-          // `secrets/*` also governs purging `secrets`.
+          // `secrets/*` also governs purging `secrets`. Whether the path still
+          // exists cannot decide the ask: a deleted directory's saved copies
+          // are still purged. So, as restore does, the engine first lists
+          // every saved path the purge would remove, and each one is asked
+          // for too; any denial refuses the purge before anything is removed.
           const absolutePath = resolveAbsolutePath(context, args.path as string);
           let isDirectory = false;
           try {
             isDirectory = fs.statSync(absolutePath).isDirectory();
           } catch {
-            // A deleted file still has backups worth purging; treat it as a file.
+            // A deleted path is asked for as itself plus its saved copies below.
           }
           const denial = await assertExternalDirectoryPermission(ctx, context, absolutePath, {
             kind: isDirectory ? "directory" : "file",
           });
           if (denial) return permissionDeniedResponse(denial);
+          // Sent as the purge itself sends it, so the engine resolves both alike.
+          const preview = await callBridge(ctx, context, "safety_purge_paths", {
+            file: expandTilde(args.path as string),
+          });
+          if (preview.success === false) {
+            throw new Error(bridgeErrorMessage(preview, "purge path preview failed"));
+          }
+          const previewPaths = Array.from(new Set(responsePaths(preview)));
+          for (const savedPath of previewPaths) {
+            const previewDenial = await assertExternalDirectoryPermission(ctx, context, savedPath);
+            if (previewDenial) return permissionDeniedResponse(previewDenial);
+          }
           const pattern = resolveRelativePatternFromAbsolute(context, absolutePath);
           const patterns = isDirectory ? [pattern, path.join(pattern, "*")] : [pattern];
+          for (const previewPattern of relativePatternsFromPaths(context, previewPaths)) {
+            if (!patterns.includes(previewPattern)) patterns.push(previewPattern);
+          }
           const permissionError = await askEditPermission(context, patterns, {
             filepath: absolutePath,
             operation: "purge",

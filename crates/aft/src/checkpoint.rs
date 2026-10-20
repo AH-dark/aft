@@ -765,6 +765,37 @@ impl CheckpointStore {
         Ok(paths)
     }
 
+    /// Every file this session's checkpoints hold, as `(checkpoint name,
+    /// absolute path)` pairs sorted by name then path, without changing any
+    /// checkpoint.
+    pub fn session_file_paths(
+        &mut self,
+        session: &str,
+    ) -> Result<Vec<(String, PathBuf)>, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
+        let mut paths = self
+            .checkpoints
+            .get(session)
+            .map(|checkpoints| {
+                checkpoints
+                    .values()
+                    .flat_map(|checkpoint| {
+                        checkpoint.file_contents.keys().map(|path| {
+                            (
+                                checkpoint.name.clone(),
+                                absolute_checkpoint_path(path.clone()),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        paths.sort();
+        Ok(paths)
+    }
+
     /// Delete a checkpoint from a session. Returns true when a checkpoint was removed.
     pub fn delete(&mut self, session: &str, name: &str) -> bool {
         let _mutation_lock = match self.acquire_mutation_lock() {

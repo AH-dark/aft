@@ -209,6 +209,7 @@ mod tests {
             "bash_ack_completions",
             "undo_preview",
             "checkpoint_paths",
+            "safety_purge_paths",
             "hashline_preflight",
             "inspect_tier2_run",
             "status",

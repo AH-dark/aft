@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { Effect } from "effect";
@@ -64,6 +65,38 @@ describe.skipIf(!binary.binaryPath)("aft_safety purge permissions", () => {
         }
       }, 60_000);
     }
+
+    test(`${host} purge of a deleted directory asks edit for each saved path under it`, async () => {
+      const h = await createHarness(binary);
+      harnesses.push(h);
+      const secret = h.path("secrets/x");
+      await mkdir(h.path("secrets"), { recursive: true });
+      await writeFile(secret, "token=0\n");
+      const write = await h.bridge.toolCall(sessionID, "write", {
+        path: secret,
+        content: "token=1\n",
+      });
+      expect(write.success).not.toBe(false);
+      const checkpoint = await h.bridge.toolCall(sessionID, "safety", {
+        op: "checkpoint",
+        name: "with-secret",
+        files: [secret],
+      });
+      expect(checkpoint.success).toBe(true);
+      // Once the directory is gone, nothing on disk says it held `x`.
+      await rm(h.path("secrets"), { recursive: true, force: true });
+
+      const { result, requests } = await executePurge(h, host, "deny", "secrets");
+
+      expect(result.toLowerCase()).toContain("denied");
+      const editPatterns = requests
+        .filter((request) => request.permission === "edit")
+        .flatMap((request) => request.patterns);
+      expect(editPatterns).toContain(path.join("secrets", "x"));
+      const list = await h.bridge.toolCall(sessionID, "safety", { op: "list" });
+      const names = (list.checkpoints as Array<{ name: string }>).map((entry) => entry.name);
+      expect(names).toEqual(["with-secret"]);
+    }, 60_000);
   }
 });
 
@@ -80,7 +113,12 @@ async function executePurge(
   if (host === "V1") {
     const ask: ToolContext["ask"] = async (input) => {
       requests.push({ permission: input.permission, patterns: [...input.patterns] });
-      if (effect === "deny" && input.permission === "edit") {
+      // Stands in for the rule `edit secrets/*`, which matches a path under
+      // `secrets` but not `secrets` itself.
+      const underSecrets = input.patterns.some((pattern) =>
+        pattern.startsWith(`secrets${path.sep}`),
+      );
+      if (effect === "deny" && input.permission === "edit" && underSecrets) {
         throw Object.assign(new Error(`denied by rule edit secrets/*: ${input.patterns[0]}`), {
           _tag: "DeniedError",
         });

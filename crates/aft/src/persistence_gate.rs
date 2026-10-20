@@ -24,7 +24,8 @@ pub(crate) fn classification(name: &str) -> Option<bool> {
         | "inline_symbol" | "ast_replace" | "batch" | "import" | "add_import" | "remove_import"
         | "organize_imports" | "lsp_rename" | "hashline" | "hashline_edit" | "safety" | "undo"
         | "undo_preview" | "edit_history" | "checkpoint" | "checkpoint_paths"
-        | "list_checkpoints" | "restore_checkpoint" | "safety_purge" | "snapshot" => Some(true),
+        | "list_checkpoints" | "restore_checkpoint" | "safety_purge" | "safety_purge_paths"
+        | "snapshot" => Some(true),
         "configure"
         | "ping"
         | "version"

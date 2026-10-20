@@ -414,3 +414,39 @@ fn revision_reads_work_from_a_linked_worktree_of_the_repository() {
     );
     assert!(ok_text(&head).starts_with(&header("HEAD", &fixture.feature)));
 }
+
+/// A directory that is a symlink today says nothing about the revision: the
+/// revision's own `src/old/file.rs` is read, not today's link target.
+#[cfg(unix)]
+#[test]
+fn revision_read_takes_repository_components_verbatim_through_a_parent_now_a_symlink() {
+    let fixture = fixture();
+    fs::create_dir_all(fixture.repo.join("src/old")).unwrap();
+    fs::create_dir_all(fixture.repo.join("src/new")).unwrap();
+    fs::write(
+        fixture.repo.join("src/old/file.rs"),
+        "pub fn old_file() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.repo.join("src/new/file.rs"),
+        "pub fn new_file() {}\n",
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", "src/old", "src/new"]);
+    git(&fixture.repo, &["commit", "--quiet", "-m", "old and new"]);
+    let split = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    fs::remove_dir_all(fixture.repo.join("src/old")).unwrap();
+    std::os::unix::fs::symlink("new", fixture.repo.join("src/old")).unwrap();
+
+    let mut aft = configured(&fixture, true);
+    for path in [
+        "src/old/file.rs".to_string(),
+        fixture.repo.join("src/old/file.rs").display().to_string(),
+    ] {
+        let resp = call(&mut aft, "read", json!({ "path": path, "ref": split }));
+        let text = ok_text(&resp);
+        assert!(text.contains("old_file"), "{path}: {text}");
+        assert!(!text.contains("new_file"), "{path}: {text}");
+    }
+}

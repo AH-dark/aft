@@ -40,10 +40,11 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 /// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
 ///   registry plumbing for the bg_events wake lane (drain = PureRead,
 ///   ack = Mutating in `command_lane`).
-/// - `undo_preview` / `checkpoint_paths`: read-only permission-preview reads
-///   over the session's own backup/checkpoint state — the plugin safety tool
-///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
-///   permission for. Without them, safety undo/restore fails over subc.
+/// - `undo_preview` / `checkpoint_paths` / `safety_purge_paths`: read-only
+///   permission-preview reads over the session's own backup/checkpoint state —
+///   the plugin safety tool calls them BEFORE `aft_safety undo`/`restore`/
+///   `purge` to know which paths to ask permission for. Without them, safety
+///   undo/restore/purge fails over subc.
 /// - `bash_kill` / `bash_write` / `bash_notify` / `bash_unnotify` /
 ///   `bash_wait_detach`: the rest of the background-bash consumer surface the
 ///   plugins invoke natively (kill a task, drive a PTY, register/remove a
@@ -75,6 +76,7 @@ pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_ack_completions"
             | "undo_preview"
             | "checkpoint_paths"
+            | "safety_purge_paths"
             | "bash_kill"
             | "bash_write"
             | "bash_notify"
@@ -126,6 +128,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "undo_preview"
         | "edit_history"
         | "checkpoint_paths"
+        | "safety_purge_paths"
         | "list_checkpoints"
         | "hashline_preflight"
         | "conflicts"
@@ -1092,6 +1095,7 @@ mod tests {
         // these, aft_safety undo/restore breaks over the subc transport.
         assert!(is_subc_native_plumbing_tool("undo_preview"));
         assert!(is_subc_native_plumbing_tool("checkpoint_paths"));
+        assert!(is_subc_native_plumbing_tool("safety_purge_paths"));
         // The rest of the plugins' background-bash consumer surface plus the
         // Tier-2 refresh trigger (each was shipped plugin-side without a gate
         // entry and silently rejected in prod; see subc_plumbing_drift_test).

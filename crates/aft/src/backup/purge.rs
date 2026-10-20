@@ -115,6 +115,99 @@ pub fn backup_key_for_path(path: &Path) -> PathBuf {
     canonicalize_key(path)
 }
 
+/// How a saved path relates to a [`PurgeTarget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedPathMatch {
+    /// The saved path is the purged path or lies under it.
+    Selected,
+    /// The saved path is somewhere else.
+    Unrelated,
+    /// The saved path's parent directory no longer exists, so whether it was
+    /// another spelling of the purged path cannot be told. It is kept, and
+    /// the purge must report it rather than claim it removed everything.
+    Unknown,
+}
+
+/// The path a purge removes saved copies of, resolved once so every saved
+/// path is compared by the location it names rather than by its spelling.
+///
+/// A location resolves every parent directory through symlinks but keeps the
+/// final component as written: a symlink is its own entry, distinct from the
+/// file it points at, so purging the link never purges its target's copies.
+#[derive(Debug, Clone)]
+pub struct PurgeTarget {
+    /// The path as the caller gave it.
+    given: PathBuf,
+    /// The path's location: parents resolved, final component kept.
+    location: PathBuf,
+    /// For an existing directory, its fully resolved form. Anything strictly
+    /// under it is under the purged directory, even when the directory was
+    /// named through a final symlink.
+    resolved_directory: Option<PathBuf>,
+    /// For an existing non-directory, its file name. A saved path with any
+    /// other final name can be neither the purged file nor under it.
+    existing_file_name: Option<std::ffi::OsString>,
+}
+
+impl PurgeTarget {
+    pub fn new(path: &Path) -> Self {
+        let location = canonicalize_key(path);
+        let is_directory = std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir());
+        let resolved_directory = is_directory
+            .then(|| std::fs::canonicalize(path).ok())
+            .flatten()
+            .map(|resolved| canonicalize_key(&resolved));
+        let existing_file_name = (!is_directory && std::fs::symlink_metadata(path).is_ok())
+            .then(|| path.file_name().map(std::ffi::OsStr::to_os_string))
+            .flatten();
+        Self {
+            given: path.to_path_buf(),
+            location,
+            resolved_directory,
+            existing_file_name,
+        }
+    }
+
+    /// How `saved` relates to this target. `recorded_resolved` is true for
+    /// undo-backup keys: stores record them with every parent already
+    /// resolved, so a parent that is gone now was a real directory then, and
+    /// the remaining components still identify the location. Checkpoint keys
+    /// keep the caller's spelling, so a missing parent there may have been a
+    /// symlink to anywhere.
+    pub fn classify(&self, saved: &Path, recorded_resolved: bool) -> SavedPathMatch {
+        if saved.starts_with(&self.given) || saved.starts_with(&self.location) {
+            return SavedPathMatch::Selected;
+        }
+        let parent_exists = saved
+            .parent()
+            .is_some_and(|parent| std::fs::canonicalize(parent).is_ok());
+        if !parent_exists && !recorded_resolved {
+            let other_name = self
+                .existing_file_name
+                .as_deref()
+                .is_some_and(|name| saved.file_name() != Some(name));
+            return if other_name {
+                SavedPathMatch::Unrelated
+            } else {
+                SavedPathMatch::Unknown
+            };
+        }
+        let saved_location = canonicalize_key(saved);
+        let under_directory = self.resolved_directory.as_ref().is_some_and(|directory| {
+            saved_location != *directory && saved_location.starts_with(directory)
+        });
+        if saved_location.starts_with(&self.location) || under_directory {
+            SavedPathMatch::Selected
+        } else {
+            SavedPathMatch::Unrelated
+        }
+    }
+
+    fn selects(&self, saved: &Path, recorded_resolved: bool) -> bool {
+        self.classify(saved, recorded_resolved) == SavedPathMatch::Selected
+    }
+}
+
 /// Totals for one side of a report: what matched, or what was removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeTotals {
@@ -231,7 +324,7 @@ pub fn purge_backups(
     live_stores: &[LiveStore<'_>],
 ) -> PurgeReport {
     let storage_dir = request.storage_dir.as_path();
-    let path_filter = request.path.as_deref().map(canonicalize_key);
+    let path_filter = request.path.as_deref().map(PurgeTarget::new);
     let mut report = PurgeReport {
         dry_run: request.dry_run,
         storage_dir: storage_dir.display().to_string(),
@@ -254,15 +347,7 @@ pub fn purge_backups(
             .unwrap_or_else(|| UNSCOPED_NAMESPACE.to_string());
         report.examined.namespaces.push(label.clone());
 
-        let mut working = BackupStore::new();
-        // The working store addresses this namespace explicitly; a route
-        // harness installed on the calling thread must not redirect it.
-        working.follow_request_harness = false;
-        working.set_storage_dir_inner(storage_dir.to_path_buf(), namespace.clone(), 0);
-        if let (Some(db), Some(segment)) = (db.as_ref(), namespace.as_ref()) {
-            working.set_db_pool(Arc::clone(db));
-            working.set_db_harness_segment(segment.clone());
-        }
+        let mut working = namespace_working_store(storage_dir, namespace.as_ref(), db.as_ref());
 
         let namespace_stores = stores
             .iter()
@@ -281,7 +366,7 @@ pub fn purge_backups(
             &working,
             &namespace_stores,
             request.session.as_deref(),
-            path_filter.as_deref(),
+            path_filter.as_ref(),
             &mut report.examined,
         );
 
@@ -485,12 +570,12 @@ fn purge_session_path_in_memory(
     session: &str,
     path: &Path,
 ) -> PurgeReport {
-    let filter = canonicalize_key(path);
+    let target = PurgeTarget::new(path);
     let mut guard = store.lock();
     let keys = guard
         .in_memory_stack_keys()
         .into_iter()
-        .filter(|(owner, key)| owner == session && key_matches(key, Some(&filter)))
+        .filter(|(owner, key)| owner == session && key_matches(key, Some(&target)))
         .collect::<Vec<_>>();
     let mut removed = TotalsBuilder::default();
     for (owner, key) in keys {
@@ -509,6 +594,76 @@ fn purge_session_path_in_memory(
         live_stores: 1,
         ..PurgeReport::default()
     }
+}
+
+/// The keys of one session's undo stacks at or under `path`: what
+/// [`purge_session_path`] would remove, found the same way and with the same
+/// database rules, without changing anything. Plugins ask permission for
+/// each of these before they run the purge.
+pub fn session_path_keys(
+    store: &parking_lot::Mutex<BackupStore>,
+    session: &str,
+    path: &Path,
+    resident_db: impl FnOnce(&Path) -> Option<Arc<Mutex<TrackedConnection>>>,
+) -> Vec<PathBuf> {
+    let (storage_dir, own_db) = {
+        let guard = store.lock();
+        (
+            guard.storage_dir.clone(),
+            guard.db_pool.read().ok().and_then(|slot| slot.clone()),
+        )
+    };
+    let target = PurgeTarget::new(path);
+    let Some(storage_dir) = storage_dir else {
+        return store
+            .lock()
+            .in_memory_stack_keys()
+            .into_iter()
+            .filter(|(owner, key)| owner == session && key_matches(key, Some(&target)))
+            .map(|(_, key)| key)
+            .collect();
+    };
+    let db = own_db.or_else(|| resident_db(&storage_dir.join("aft.db")));
+    let mut keys = BTreeSet::new();
+    let mut examined = PurgeExamined::default();
+    for namespace in namespaces(&storage_dir, db.as_ref(), None) {
+        let working = namespace_working_store(&storage_dir, namespace.as_ref(), db.as_ref());
+        let live_stores = [store]
+            .into_iter()
+            .filter(|store| {
+                store
+                    .lock()
+                    .uses_namespace(&storage_dir, namespace.as_deref())
+            })
+            .collect::<Vec<_>>();
+        let candidates = collect_candidates(
+            &working,
+            &live_stores,
+            Some(session),
+            Some(&target),
+            &mut examined,
+        );
+        keys.extend(candidates.into_iter().map(|(_, key)| key));
+    }
+    keys.into_iter().collect()
+}
+
+/// A store that reads and writes exactly one namespace of `storage_dir`.
+fn namespace_working_store(
+    storage_dir: &Path,
+    namespace: Option<&String>,
+    db: Option<&Arc<Mutex<TrackedConnection>>>,
+) -> BackupStore {
+    let mut working = BackupStore::new();
+    // The working store addresses this namespace explicitly; a route
+    // harness installed on the calling thread must not redirect it.
+    working.follow_request_harness = false;
+    working.set_storage_dir_inner(storage_dir.to_path_buf(), namespace.cloned(), 0);
+    if let (Some(db), Some(segment)) = (db, namespace) {
+        working.set_db_pool(Arc::clone(db));
+        working.set_db_harness_segment(segment.clone());
+    }
+    working
 }
 
 fn open_purge_db(
@@ -539,10 +694,11 @@ fn same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn key_matches(key: &Path, path_filter: Option<&Path>) -> bool {
-    // `Path::starts_with` compares whole components, so `/a/b` covers `/a/b`
-    // and `/a/b/c` but not `/a/bc`.
-    path_filter.is_none_or(|filter| key.starts_with(filter))
+fn key_matches(key: &Path, path_filter: Option<&PurgeTarget>) -> bool {
+    // Undo-backup keys are recorded with their parents resolved; see
+    // `PurgeTarget::classify`. `Path::starts_with` compares whole components,
+    // so `/a/b` covers `/a/b` and `/a/b/c` but not `/a/bc`.
+    path_filter.is_none_or(|target| target.selects(key, true))
 }
 
 fn note_skipped(examined: &mut PurgeExamined, what: String) {
@@ -595,7 +751,7 @@ fn collect_candidates(
     working: &BackupStore,
     live_stores: &[LiveStore<'_>],
     session_filter: Option<&str>,
-    path_filter: Option<&Path>,
+    path_filter: Option<&PurgeTarget>,
     examined: &mut PurgeExamined,
 ) -> BTreeSet<(String, PathBuf)> {
     let mut candidates = BTreeSet::new();

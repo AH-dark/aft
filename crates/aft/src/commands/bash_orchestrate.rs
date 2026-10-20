@@ -1223,16 +1223,45 @@ fn append_bash_reply_notices(
     if notices.is_empty() {
         return;
     }
-    let mut combined = output;
+    // The reply ends with the `[task <id>]` line and, when the output was cut,
+    // the `shown N of M lines (cap)` trailer, which must stay the last line.
+    // Notices go above both.
+    let trailer = response
+        .data
+        .get(crate::list_surfaces::bash::WIRE_KEY)
+        .and_then(|value| {
+            serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()
+        })
+        .map(|envelope| crate::list_surfaces::bash::envelope_trailer(&envelope));
+    let (body, tail) = split_reply_tail(&output, trailer.as_deref());
+    let mut combined = body.trim_end_matches('\n').to_string();
     for notice in notices {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(&notice);
+        push_line(&mut combined, &notice);
+    }
+    if !tail.is_empty() {
+        push_line(&mut combined, tail);
     }
     if let Some(data) = response.data.as_object_mut() {
         data.insert("output".to_string(), Value::String(combined));
     }
+}
+
+/// Split a bash reply into its body and the closing lines AFT adds after the
+/// command output: an optional `[task <id>]` line followed by the optional
+/// list-envelope `trailer`. The tail is returned with its own line breaks.
+fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
+    let mut tail_start = output.len();
+    if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
+        if output.ends_with(trailer) {
+            tail_start -= trailer.len();
+        }
+    }
+    let before = output[..tail_start].trim_end_matches('\n');
+    let last_line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    if is_foreground_task_line(&before[last_line_start..]) {
+        tail_start = last_line_start;
+    }
+    (&output[..tail_start], &output[tail_start..])
 }
 
 fn background_launch_response(
@@ -1849,6 +1878,50 @@ mod tests {
             );
             assert_eq!(actual, case.expected, "{}", case.name);
         }
+    }
+
+    /// The `shown N of M lines (cap)` trailer must stay the reply's last line,
+    /// and the `[task <id>]` line stays directly above it, so notices added
+    /// after the reply is built go above both.
+    #[test]
+    fn reply_notices_go_above_the_task_line_and_the_truncation_trailer() {
+        let mut task = snapshot("", false, None, BgTaskStatus::Completed, Some(0));
+        let envelope = crate::list_surfaces::bash::build_bash_output_envelope(2, 10)
+            .expect("two of ten lines is a cut");
+        let trailer = crate::list_surfaces::bash::envelope_trailer(&envelope);
+        task.output_preview = format!("line 1\nline 2\n{trailer}");
+        task.bash_output_list_envelope = Some(envelope);
+        let mut response = foreground_result_response("req", task);
+        let keys = ["API_KEY".to_string()];
+
+        append_bash_reply_notices(
+            &mut response,
+            Some("Same command as the previous call."),
+            Some(&keys),
+        );
+
+        let output = response.data["output"].as_str().expect("output text");
+        assert_eq!(
+            output,
+            format!(
+                "line 1\nline 2\nSame command as the previous call.\n\
+                 Configured bash.env keys applied (values not shown): API_KEY.\n\
+                 [task bash-test]\n{trailer}"
+            )
+        );
+    }
+
+    #[test]
+    fn reply_notices_go_above_the_task_line_without_a_trailer() {
+        let task = snapshot("done", false, None, BgTaskStatus::Completed, Some(0));
+        let mut response = foreground_result_response("req", task);
+
+        append_bash_reply_notices(&mut response, Some("Same command."), None);
+
+        assert_eq!(
+            response.data["output"].as_str(),
+            Some("done\nSame command.\n[task bash-test]")
+        );
     }
 
     #[test]

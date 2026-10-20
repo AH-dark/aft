@@ -1419,8 +1419,9 @@ describe("permission audit regressions", () => {
     expect(askCalls.map((call) => [call.permission, call.patterns])).toEqual([
       ["edit", ["secret.env"]],
     ]);
-    expect(calls.map((call) => call.command)).toEqual(["safety"]);
-    expect(calls[0]?.params).toMatchObject({ op: "purge", filePath: "secret.env" });
+    expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths", "safety"]);
+    expect(calls[0]?.params).toMatchObject({ file: "secret.env" });
+    expect(calls[1]?.params).toMatchObject({ op: "purge", filePath: "secret.env" });
   });
 
   test("aft_safety purge of a directory asks edit for it and everything under it", async () => {
@@ -1454,7 +1455,42 @@ describe("permission audit regressions", () => {
     )) as string;
 
     expect(parsePermissionDenied(raw).message).toBe("edit denied by policy");
-    expect(calls).toHaveLength(0);
+    expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths"]);
+  });
+
+  test("aft_safety purge of a deleted directory asks edit for every saved path under it", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    // `secrets` is gone from disk; only the engine knows what it held.
+    const savedSecret = path.join(project, "secrets", "x");
+    const askCalls: AskCall[] = [];
+    const denySecretsChildren = (async (input: AskCall) => {
+      askCalls.push(input);
+      // The rule `edit secrets/*` matches a path under `secrets`, never
+      // `secrets` itself.
+      if (
+        input.permission === "edit" &&
+        input.patterns.some((pattern) => pattern.startsWith(`secrets${path.sep}`))
+      ) {
+        throw new Error("denied by rule edit secrets/*");
+      }
+    }) as unknown as ToolContext["ask"];
+    const sdkCtx = createSdkContext(project, denySecretsChildren);
+    const { calls, tools } = createHarness(safetyTools, (command) =>
+      command === "safety_purge_paths"
+        ? { success: true, paths: [savedSecret] }
+        : { success: true },
+    );
+
+    const raw = (await tools.aft_safety.execute(
+      { op: "purge", filePath: "secrets" },
+      sdkCtx,
+    )) as string;
+
+    expect(parsePermissionDenied(raw).message).toBe("denied by rule edit secrets/*");
+    expect(
+      askCalls.filter((call) => call.permission === "edit").map((call) => call.patterns),
+    ).toEqual([["secrets", path.join("secrets", "x")]]);
+    expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths"]);
   });
 
   test("aft_safety purge without a path is refused before any ask", async () => {

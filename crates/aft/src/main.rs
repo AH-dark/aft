@@ -1392,6 +1392,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
         }
         "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
         "safety_purge" => aft::commands::safety_purge::handle_safety_purge(&req, ctx),
+        "safety_purge_paths" => aft::commands::safety_purge::handle_safety_purge_paths(&req, ctx),
         "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
         "hashline_preflight" => aft::commands::hashline::handle_preflight(&req, ctx),
         "hashline_edit" => aft::commands::hashline::handle_edit(&req, ctx),

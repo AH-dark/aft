@@ -2973,3 +2973,141 @@ fn purge_of_a_directory_then_of_the_project_root() {
     assert!(aft.shutdown().success());
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn purge_preview(aft: &mut AftProcess, session: &str, path: &str) -> Vec<String> {
+    let response = session_send(
+        aft,
+        session,
+        &format!("purge-paths-{session}-{path}"),
+        "safety_purge_paths",
+        serde_json::json!({ "file": path }),
+    );
+    assert_eq!(
+        response["success"], true,
+        "purge preview {path}: {response:?}"
+    );
+    let mut paths = response["paths"]
+        .as_array()
+        .unwrap_or_else(|| panic!("preview paths: {response:?}"))
+        .iter()
+        .map(|path| path.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+/// A checkpoint keeps the spelling a file was saved under. One saved through
+/// a symlinked directory is the same file as its real spelling, so purging
+/// the real path must remove it; one whose parent no longer exists cannot be
+/// told apart, so the purge keeps it and says it is incomplete.
+#[cfg(unix)]
+#[test]
+fn purge_matches_checkpoints_saved_through_a_symlinked_parent() {
+    let dir = temp_dir("purge_alias");
+    let real = dir.join("real");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("alias")).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("gone_alias")).unwrap();
+    let secret = real.join("secret.env");
+    fs::write(&secret, "token=0").unwrap();
+    // An unrelated file in a directory that is deleted later: a different
+    // name can never be the purged file, so it is not reported.
+    let other = dir.join("scratch/other.txt");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::write(&other, "other").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-purge-alias");
+    for (name, file) in [
+        ("aliased", dir.join("alias/secret.env")),
+        ("orphaned", dir.join("gone_alias/secret.env")),
+        ("unrelated", other.clone()),
+    ] {
+        let response = session_send(
+            &mut aft,
+            "s1",
+            &format!("cp-{name}"),
+            "checkpoint",
+            serde_json::json!({ "name": name, "files": [file] }),
+        );
+        assert_eq!(response["success"], true, "checkpoint {name}: {response:?}");
+    }
+    fs::remove_file(dir.join("gone_alias")).unwrap();
+    fs::remove_dir_all(dir.join("scratch")).unwrap();
+
+    let real_secret = secret.display().to_string();
+    assert_eq!(
+        purge_preview(&mut aft, "s1", &real_secret),
+        vec![dir.join("alias/secret.env").display().to_string()]
+    );
+    let purge = session_purge(&mut aft, "s1", &real_secret);
+    assert_eq!(purge["checkpoints_dropped"], serde_json::json!(["aliased"]));
+    assert_eq!(purge["complete"], false, "{purge:?}");
+    let failures = purge["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{purge:?}");
+    let target = failures[0]["target"].as_str().unwrap();
+    assert!(target.contains("orphaned"), "{target}");
+    assert!(target.contains("gone_alias/secret.env"), "{target}");
+    assert_eq!(
+        checkpoint_names(&mut aft, "s1"),
+        vec!["orphaned".to_string(), "unrelated".to_string()]
+    );
+
+    assert!(aft.shutdown().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A deleted directory is no longer on disk, but its saved copies are; the
+/// preview lists every one of them so the plugin can ask for each.
+#[test]
+fn purge_preview_lists_saved_copies_under_a_deleted_directory() {
+    let dir = temp_dir("purge_preview_deleted");
+    let secret = dir.join("secrets/x");
+    let nested = dir.join("secrets/deep/y");
+    let outside = dir.join("public.txt");
+    for file in [&secret, &nested, &outside] {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "v0").unwrap();
+    }
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-purge-preview-deleted");
+    session_snapshot(&mut aft, "s1", &secret, "v1");
+    session_snapshot(&mut aft, "s1", &outside, "v1");
+    session_snapshot(&mut aft, "s2", &nested, "v1");
+    let response = session_send(
+        &mut aft,
+        "s1",
+        "cp-deleted",
+        "checkpoint",
+        serde_json::json!({ "name": "deleted", "files": [&nested, &outside] }),
+    );
+    assert_eq!(response["success"], true, "checkpoint: {response:?}");
+    fs::remove_dir_all(dir.join("secrets")).unwrap();
+
+    let canonical_dir = fs::canonicalize(&dir).unwrap();
+    let preview = purge_preview(&mut aft, "s1", "secrets");
+    let expected_secret = [
+        secret.display().to_string(),
+        canonical_dir.join("secrets/x").display().to_string(),
+    ];
+    let expected_nested = [
+        nested.display().to_string(),
+        canonical_dir.join("secrets/deep/y").display().to_string(),
+    ];
+    assert!(
+        preview.iter().any(|path| expected_secret.contains(path)),
+        "{preview:?}"
+    );
+    assert!(
+        preview.iter().any(|path| expected_nested.contains(path)),
+        "{preview:?}"
+    );
+    assert!(
+        preview.iter().all(|path| !path.ends_with("public.txt")),
+        "{preview:?}"
+    );
+
+    assert!(aft.shutdown().success());
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -331,8 +331,11 @@ impl RevisionSession {
     }
 
     /// The path's location inside the repository, `/`-separated as git
-    /// spells tree paths. The final component is not followed: a symlink is
-    /// read as the entry the revision stores under that name.
+    /// spells tree paths. Only the spelling of the checkout root is resolved;
+    /// every component below it is taken as written. Today's symlinks say
+    /// nothing about the revision: a directory that is a link now may have
+    /// been a real directory then, and a final symlink is read as the entry
+    /// the revision stores under that name.
     fn repository_path(
         &self,
         req: &RawRequest,
@@ -361,14 +364,7 @@ impl RevisionSession {
                 ),
             )
         };
-        let (Some(parent), Some(name)) = (normalized.parent(), normalized.file_name()) else {
-            return Err(outside());
-        };
-        let parent = canonicalize_existing_prefix(parent);
-        let relative = parent.join(name);
-        let relative = relative
-            .strip_prefix(&self.toplevel)
-            .map_err(|_| outside())?;
+        let relative = repository_relative(&normalized, &self.toplevel).ok_or_else(outside)?;
         let mut parts = Vec::new();
         for component in relative.components() {
             match component {
@@ -474,26 +470,24 @@ fn existing_directory(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Resolve symlinks in the longest existing prefix of `path` and append the
-/// rest unchanged, so it compares with git's resolved repository root.
-fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
-    let mut missing = Vec::new();
-    let mut current = path;
-    loop {
-        if let Ok(resolved) = std::fs::canonicalize(current) {
-            return missing
-                .iter()
-                .rev()
-                .fold(resolved, |path: PathBuf, part| path.join(part));
-        }
-        match (current.parent(), current.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name.to_os_string());
-                current = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
+/// `path` relative to the checkout whose resolved root is `toplevel`, with
+/// the components below the root kept exactly as written. The root may be
+/// spelled differently from git's resolved form (a symlinked temp directory,
+/// say), so the shortest ancestor of `path` that resolves to `toplevel` is
+/// taken as the root. Searching from the shortest ancestor means a symlink
+/// inside the checkout is never resolved, even one pointing back at the root.
+/// `None` when no ancestor is the checkout root.
+fn repository_relative(path: &Path, toplevel: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(toplevel) {
+        return Some(relative.to_path_buf());
     }
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    ancestors
+        .into_iter()
+        .find(|ancestor| std::fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == toplevel))
+        .and_then(|root| path.strip_prefix(root).ok())
+        .map(Path::to_path_buf)
 }
 
 fn output_line(bytes: &[u8]) -> Option<&str> {
