@@ -86,7 +86,7 @@ fn read_record(root: &Path, storage: &Path) -> io::Result<Option<Record>> {
 pub(crate) fn bind(
     root: &Path,
     storage: &Path,
-    choose: impl FnOnce(bool, Option<&Identity>) -> io::Result<IdentityChoice>,
+    choose: impl FnOnce(LegacyPin, Option<&Identity>) -> io::Result<IdentityChoice>,
 ) -> io::Result<Identity> {
     bind_with_recheck(root, storage, true, choose)
 }
@@ -96,7 +96,7 @@ pub(crate) fn bind_with_recheck(
     root: &Path,
     storage: &Path,
     force: bool,
-    choose: impl FnOnce(bool, Option<&Identity>) -> io::Result<IdentityChoice>,
+    choose: impl FnOnce(LegacyPin, Option<&Identity>) -> io::Result<IdentityChoice>,
 ) -> io::Result<Identity> {
     let root = canonical_root(root);
     if let Some(record) = read_record(&root, storage)? {
@@ -129,11 +129,23 @@ pub(crate) fn bind_with_recheck(
     let before = crate::developer_tools::git_usable()
         .then(|| crate::search_index::repository_identity_stamp(&root))
         .flatten();
-    let choice = select(&root, storage, |pinned| {
-        choose(pinned, previous.as_ref().map(|record| &record.identity))
+    // A saved record already holds this root's identity, so the older aft.db
+    // pin is not consulted and a busy database cannot delay the bind.
+    let pins = if previous.is_some() {
+        LegacyPins::Known(Vec::new())
+    } else {
+        legacy_pins(&root, storage)
+    };
+    let choice = choose_with_pins(&pins, |pin| {
+        choose(pin, previous.as_ref().map(|record| &record.identity))
     })?;
     let identity = choice.identity;
     identity.validate(&root)?;
+    if matches!(pins, LegacyPins::Unreadable) {
+        // The chosen identity may contradict a pin that could not be read.
+        // Use it for this bind only; the next bind reads the pin again.
+        return Ok(identity);
+    }
     if !choice.verified
         && previous
             .as_ref()
@@ -189,35 +201,58 @@ fn reusable(record: &Record, root: &Path, force: bool) -> bool {
             }))
 }
 
+/// What older standing entries in aft.db say about a root's identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegacyPin {
+    /// No older standing entry pins this root to its path identity.
+    Unpinned,
+    /// An older standing entry pins this root to its path identity.
+    Path,
+    /// aft.db could not be read without waiting, so any pin is unknown. The
+    /// identity chosen now is temporary: nothing derived from it, including
+    /// legacy memo entries, may be saved.
+    Unreadable,
+}
+
+/// `(resolved_git_toplevel, scoped_relative_path)` of each older standing entry.
+type StandingPin = (Option<String>, Option<String>);
+
+enum LegacyPins {
+    Known(Vec<StandingPin>),
+    Unreadable,
+}
+
+/// Roots whose unreadable pin has already been logged, so a database that
+/// stays busy across many binds logs one line per root, not one per bind.
+static UNREADABLE_PIN_ROOTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Older standing entries already pin an identity even before this record
 /// format existed. Import path pins; refuse a repository downgrade or mismatch.
 pub(crate) fn select(
     root: &Path,
     storage: &Path,
-    choose: impl FnOnce(bool) -> io::Result<IdentityChoice>,
+    choose: impl FnOnce(LegacyPin) -> io::Result<IdentityChoice>,
 ) -> io::Result<IdentityChoice> {
     let canonical = canonical_root(root);
-    let root = canonical.as_path();
-    let database = storage.join("aft.db");
-    let mut pins = Vec::new();
-    if database.try_exists()? {
-        let connection = crate::db::open_readonly(&database).map_err(io::Error::other)?;
-        let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='standing_roots')", [], |row| row.get(0)).map_err(io::Error::other)?;
-        if exists {
-            let mut statement = connection.prepare("SELECT resolved_git_toplevel, scoped_relative_path FROM standing_roots WHERE resolved_target = ?1").map_err(io::Error::other)?;
-            pins = statement
-                .query_map([root.to_string_lossy().as_ref()], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                })
-                .map_err(io::Error::other)?
-                .collect::<Result<_, _>>()
-                .map_err(io::Error::other)?;
-        }
-    }
-    let choice = choose(pins.iter().any(|(toplevel, _)| toplevel.is_none()))?;
+    choose_with_pins(&legacy_pins(&canonical, storage), choose)
+}
+
+fn choose_with_pins(
+    pins: &LegacyPins,
+    choose: impl FnOnce(LegacyPin) -> io::Result<IdentityChoice>,
+) -> io::Result<IdentityChoice> {
+    let pins = match pins {
+        LegacyPins::Known(pins) => pins,
+        LegacyPins::Unreadable => return choose(LegacyPin::Unreadable),
+    };
+    let pin = if pins.iter().any(|(toplevel, _)| toplevel.is_none()) {
+        LegacyPin::Path
+    } else {
+        LegacyPin::Unpinned
+    };
+    let choice = choose(pin)?;
     let (toplevel, relative) = choice.identity.topology();
     let toplevel = toplevel.map(|path| path.to_string_lossy().into_owned());
     if pins
@@ -227,6 +262,61 @@ pub(crate) fn select(
         return Err(io::Error::other("the existing standing repository identity cannot be recovered; Git unavailability does not authorize a path identity"));
     }
     Ok(choice)
+}
+
+/// Read the older standing pins for `root` without waiting on aft.db. Another
+/// process may hold the database for a long time, and a bind must not fail or
+/// stall on it: a busy, locked or unopenable database reports `Unreadable`.
+fn legacy_pins(root: &Path, storage: &Path) -> LegacyPins {
+    match read_legacy_pins(root, storage) {
+        Ok(pins) => {
+            UNREADABLE_PIN_ROOTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(root);
+            LegacyPins::Known(pins)
+        }
+        Err(error) => {
+            if UNREADABLE_PIN_ROOTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(root.to_path_buf())
+            {
+                crate::slog_info!(
+                    "legacy pin unreadable (aft.db busy): root={} error={error}; using a temporary identity that is not saved, retrying on the next bind",
+                    root.display()
+                );
+            }
+            LegacyPins::Unreadable
+        }
+    }
+}
+
+fn read_legacy_pins(root: &Path, storage: &Path) -> io::Result<Vec<StandingPin>> {
+    let database = storage.join("aft.db");
+    if !database.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let connection = crate::db::open_readonly(&database).map_err(io::Error::other)?;
+    connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .map_err(io::Error::other)?;
+    let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='standing_roots')", [], |row| row.get(0)).map_err(io::Error::other)?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare("SELECT resolved_git_toplevel, scoped_relative_path FROM standing_roots WHERE resolved_target = ?1").map_err(io::Error::other)?;
+    let pins = statement
+        .query_map([root.to_string_lossy().as_ref()], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(io::Error::other)?
+        .collect::<Result<_, _>>()
+        .map_err(io::Error::other)?;
+    Ok(pins)
 }
 
 impl Identity {

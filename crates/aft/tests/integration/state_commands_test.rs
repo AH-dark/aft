@@ -393,6 +393,90 @@ fn deferred_database_open_busy_exhaustion_retries_without_rebind() {
     assert!(aft.shutdown().success());
 }
 
+/// Saved root identity records under `storage`, parsed.
+fn saved_root_identities(storage: &Path) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(storage.join("root-identities")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+        .collect()
+}
+
+// Unix only: the pin row must use the root spelling configure resolves, and
+// fs::canonicalize returns a verbatim path on Windows.
+#[cfg(unix)]
+#[test]
+fn locked_database_legacy_path_pin_binds_without_saving_then_honours_the_pin() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    // A repository with a commit: without the pin, a bind chooses its Git
+    // identity, so honouring the path pin is observable.
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        crate::test_helpers::apply_hermetic_git_env(command.current_dir(&root));
+        let output = command.args(args).output().expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&[
+        "-c",
+        "user.name=Identity Tests",
+        "-c",
+        "user.email=identity@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "initial",
+    ]);
+    {
+        let mut database = db(storage.path());
+        let spelling = root.display().to_string();
+        aft::db::standing_roots::ensure_standing_root(
+            &mut database,
+            &aft::db::standing_roots::StandingRootRecord {
+                literal_path: spelling.clone(),
+                resolved_target: spelling,
+                resolved_git_toplevel: None,
+                scoped_relative_path: None,
+            },
+            &[aft::config::IndexKind::Search],
+        )
+        .unwrap();
+    }
+    // Rollback-journal mode, so an exclusive transaction also blocks readers.
+    let lock = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+    lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+
+    let aft = configured_aft(&root, storage.path(), "opencode");
+    assert!(aft.shutdown().success());
+    assert_eq!(
+        saved_root_identities(storage.path()),
+        Vec::<Value>::new(),
+        "an identity chosen while the pin is unreadable must not be saved"
+    );
+    assert!(
+        !storage.path().join("cache-keys.json").exists(),
+        "nor may it record a repository memo that would conflict with the pin"
+    );
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+    let aft = configured_aft(&root, storage.path(), "opencode");
+    assert!(aft.shutdown().success());
+    let saved = saved_root_identities(storage.path());
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0]["identity"]["kind"], "path", "{saved:?}");
+}
+
 #[test]
 fn standalone_database_retry_does_not_block_read_only_requests() {
     use std::time::{Duration, Instant};

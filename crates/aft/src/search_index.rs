@@ -7102,10 +7102,14 @@ pub(crate) fn resolve_root_identity_with_recheck(
     persist: bool,
     force: bool,
 ) -> Result<crate::root_identity::Identity, ArtifactCacheKeyProbeError> {
-    let mut choose = |pinned_path: bool,
+    let mut choose = |pin: crate::root_identity::LegacyPin,
                       saved: Option<&crate::root_identity::Identity>|
      -> std::io::Result<crate::root_identity::IdentityChoice> {
-        use crate::root_identity::{Identity, IdentityChoice};
+        use crate::root_identity::{Identity, IdentityChoice, LegacyPin};
+        let pinned_path = pin == LegacyPin::Path;
+        // While an older pin cannot be read, the identity chosen here is only
+        // temporary, so neither refresh nor write the legacy memo from it.
+        let persist = persist && pin != LegacyPin::Unreadable;
         let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
         let canonical_key =
             artifact_cache_key_memo_root_key(&crate::root_identity::canonical_root(probe_root));
@@ -7213,10 +7217,10 @@ pub(crate) fn resolve_root_identity_with_recheck(
     } else {
         match crate::root_identity::read(probe_root, storage_root) {
             Ok(Some(identity)) => Ok(identity),
-            Ok(None) => crate::root_identity::select(probe_root, storage_root, |pinned| {
-                choose(pinned, None)
-            })
-            .map(|choice| choice.identity),
+            Ok(None) => {
+                crate::root_identity::select(probe_root, storage_root, |pin| choose(pin, None))
+                    .map(|choice| choice.identity)
+            }
             Err(error) => Err(error),
         }
     };
