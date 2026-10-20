@@ -1382,7 +1382,7 @@ const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
     }
 }
 
-fn configure_materialization_connection(connection: &Connection) -> Result<()> {
+pub(crate) fn configure_materialization_connection(connection: &Connection) -> Result<()> {
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     // Publication can expose the generation while its pages remain in the WAL,

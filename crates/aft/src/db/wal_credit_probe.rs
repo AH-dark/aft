@@ -65,6 +65,30 @@ fn written_bytes() -> &'static Mutex<BTreeMap<FileClass, u64>> {
     BYTES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn main_io() -> &'static Mutex<BTreeMap<usize, (u64, u64)>> {
+    static IO: OnceLock<Mutex<BTreeMap<usize, (u64, u64)>>> = OnceLock::new();
+    IO.get_or_init(Default::default)
+}
+
+pub(crate) fn main_io_counts(connection: &Connection) -> (u64, u64) {
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            std::ptr::from_mut(&mut file).cast(),
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK);
+    main_io()
+        .lock()
+        .unwrap()
+        .get(&(file as usize))
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Which file class each open `sqlite3_file` belongs to. A `sqlite3_file` is
 /// only ever handed out by `xOpen`, so re-registering on every open keeps this
 /// correct even when SQLite reuses an address for a later file.
@@ -125,6 +149,7 @@ unsafe extern "C" fn probe_open(
         .lock()
         .expect("probe file map poisoned")
         .insert(file as usize, FileClass::of(flags));
+    main_io().lock().unwrap().insert(file as usize, (0, 0));
 
     let platform_methods = unsafe { (*file).pMethods };
     if !platform_methods.is_null() {
@@ -136,6 +161,7 @@ unsafe extern "C" fn probe_open(
             .unwrap_or_else(|| {
                 let mut copy = unsafe { *platform_methods };
                 copy.xWrite = Some(probe_write);
+                copy.xSync = Some(probe_sync);
                 let copy: &'static ffi::sqlite3_io_methods = Box::leak(Box::new(copy));
                 let patched = std::ptr::from_ref(copy) as usize;
                 methods.insert(patched, platform_methods as usize);
@@ -170,6 +196,14 @@ unsafe extern "C" fn probe_write(
             .get(&(file as usize))
             .copied()
             .unwrap_or(FileClass::Other);
+        if class == FileClass::MainDb {
+            main_io()
+                .lock()
+                .unwrap()
+                .entry(file as usize)
+                .or_default()
+                .0 += 1;
+        }
         *written_bytes()
             .lock()
             .expect("probe byte map poisoned")
@@ -181,11 +215,27 @@ unsafe extern "C" fn probe_write(
     unsafe { write(file, buffer, amount, offset) }
 }
 
+unsafe extern "C" fn probe_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
+    if open_files().lock().unwrap().get(&(file as usize)) == Some(&FileClass::MainDb) {
+        main_io()
+            .lock()
+            .unwrap()
+            .entry(file as usize)
+            .or_default()
+            .1 += 1;
+    }
+    let patched = unsafe { (*file).pMethods };
+    let platform =
+        patched_methods().lock().unwrap()[&(patched as usize)] as *const ffi::sqlite3_io_methods;
+    let sync = unsafe { (*platform).xSync }.unwrap();
+    unsafe { sync(file, flags) }
+}
+
 fn take_written_bytes() -> BTreeMap<FileClass, u64> {
     std::mem::take(&mut *written_bytes().lock().expect("probe byte map poisoned"))
 }
 
-fn open_counted(path: &Path, flags: OpenFlags) -> Connection {
+pub(crate) fn open_counted(path: &Path, flags: OpenFlags) -> Connection {
     register_probe_vfs();
     Connection::open_with_flags_and_vfs(
         path,
