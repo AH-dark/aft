@@ -5991,7 +5991,7 @@ impl AppContext {
             || self
                 .parked_configure_tail
                 .try_lock()
-                .is_none_or(|tail| tail.is_some())
+                .is_none_or(|tail| tail.as_ref().is_some_and(|state| state.has_ready_job()))
             || !self.configure_warnings_rx.is_empty()
     }
 

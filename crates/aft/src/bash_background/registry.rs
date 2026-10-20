@@ -643,6 +643,24 @@ pub struct BgTaskHealthCounts {
     pub retired_undelivered_completions: u64,
     /// Scratch directories of finished commands still kept on disk.
     pub retained_scratch: RetainedScratchHealth,
+    pub project_replay_failures: Vec<ProjectReplayFailureHealth>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectReplayFailureReason {
+    SessionDirectoryPermissionDenied,
+    SessionDirectoryOpenFailed,
+    SessionDirectoryReadFailed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectReplayFailureHealth {
+    pub session_dir: PathBuf,
+    pub reason: ProjectReplayFailureReason,
+    pub error: String,
+    pub attempts: u32,
+    pub retry_after_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -809,6 +827,15 @@ pub enum WatchdogPassCause {
 
 const PROJECT_REPLAY_SCAN_ENTRY_BUDGET: usize = 512;
 const PROJECT_REPLAY_SCAN_TIME_BUDGET: Duration = Duration::from_millis(25);
+const PROJECT_REPLAY_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const PROJECT_REPLAY_RETRY_MAX: Duration = Duration::from_secs(5);
+
+struct ProjectReplayFailure {
+    reason: ProjectReplayFailureReason,
+    error: String,
+    attempts: u32,
+    retry_at: Instant,
+}
 
 struct ProjectReplaySessionScan {
     session_id: String,
@@ -823,6 +850,7 @@ struct ProjectReplayScanCursor {
     sessions: VecDeque<String>,
     known_sessions: HashSet<String>,
     current: Option<ProjectReplaySessionScan>,
+    failures: HashMap<String, ProjectReplayFailure>,
     #[cfg(test)]
     total_examined: usize,
 }
@@ -835,6 +863,7 @@ impl ProjectReplayScanCursor {
             sessions: VecDeque::new(),
             known_sessions: HashSet::new(),
             current: None,
+            failures: HashMap::new(),
             #[cfg(test)]
             total_examined: 0,
         }
@@ -847,12 +876,56 @@ impl ProjectReplayScanCursor {
             }
         }
     }
+
+    fn park_session(
+        &mut self,
+        session_id: String,
+        reason: ProjectReplayFailureReason,
+        error: std::io::Error,
+    ) {
+        let failure = self.failures.entry(session_id.clone()).or_insert_with(|| {
+            crate::slog_warn!(
+                "failed to scan Bash task session {} during project replay; retry deferred: {error}",
+                session_tasks_dir(&self.storage_dir, &session_id).display()
+            );
+            ProjectReplayFailure {
+                reason,
+                error: error.to_string(),
+                attempts: 0,
+                retry_at: Instant::now(),
+            }
+        });
+        failure.attempts = failure.attempts.saturating_add(1);
+        failure.reason = reason;
+        failure.error = error.to_string();
+        let backoff = PROJECT_REPLAY_RETRY_INITIAL
+            .saturating_mul(1 << failure.attempts.saturating_sub(1).min(4))
+            .min(PROJECT_REPLAY_RETRY_MAX);
+        failure.retry_at = Instant::now() + backoff;
+    }
+
+    fn retry_at(&self) -> Option<Instant> {
+        if self.current.is_some() || !self.sessions.is_empty() {
+            return None;
+        }
+        self.failures.values().map(|failure| failure.retry_at).min()
+    }
+
+    fn retry_due_failures(&mut self) {
+        let now = Instant::now();
+        for (session_id, failure) in &self.failures {
+            if failure.retry_at <= now {
+                self.sessions.push_back(session_id.clone());
+            }
+        }
+    }
 }
 
 struct ProjectReplayDiskBatch {
     tasks: Vec<PersistedTask>,
     examined: usize,
     incomplete_reason: Option<&'static str>,
+    retry_deferred: bool,
 }
 
 pub(crate) struct RegistryInner {
@@ -1656,6 +1729,15 @@ impl BgTaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|cursor| cursor.total_examined)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_project_replay_backoff_for_test(&self) {
+        if let Some(cursor) = self.inner.project_replay_scan.lock().unwrap().as_mut() {
+            for failure in cursor.failures.values_mut() {
+                failure.retry_at = Instant::now();
+            }
+        }
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
@@ -4555,8 +4637,19 @@ impl BgTaskRegistry {
             .is_some_and(|cursor| {
                 cursor.storage_dir == storage_dir
                     && cursor.project_root == project_root
-                    && (cursor.current.is_some() || !cursor.sessions.is_empty())
+                    && (cursor.current.is_some()
+                        || !cursor.sessions.is_empty()
+                        || !cursor.failures.is_empty())
             })
+    }
+
+    pub(crate) fn project_replay_retry_at(&self) -> Option<Instant> {
+        self.inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(ProjectReplayScanCursor::retry_at)
     }
 
     /// Continue only the saved disk walk. The configure tail schedules one
@@ -4566,8 +4659,23 @@ impl BgTaskRegistry {
         storage_dir: &Path,
         session_id: &str,
         project_root: &Path,
+        retry_due_failures: bool,
     ) -> Result<bool, String> {
         if self.project_replay_pending(storage_dir, project_root) {
+            // Only a continuation resumed by a later maintenance tick may retry
+            // failed sessions. A long drain of healthy sessions must not reopen
+            // a failed session even if its backoff expires during that drain.
+            if retry_due_failures {
+                if let Some(cursor) = self
+                    .inner
+                    .project_replay_scan
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    cursor.retry_due_failures();
+                }
+            }
             self.replay_session_batch(storage_dir, session_id, Some(project_root), true)?;
         }
         Ok(self.project_replay_pending(storage_dir, project_root))
@@ -4840,17 +4948,19 @@ impl BgTaskRegistry {
                     std::iter::empty(),
                     &HashSet::new(),
                 );
-                crate::slog_info!(
-                    "replay merged {} disk tasks; scan {}: {}, examined {}",
-                    batch.tasks.len(),
-                    if batch.incomplete_reason.is_some() {
-                        "incomplete"
-                    } else {
-                        "complete"
-                    },
-                    batch.incomplete_reason.unwrap_or("iterator exhausted"),
-                    batch.examined
-                );
+                if !batch.retry_deferred || !batch.tasks.is_empty() {
+                    crate::slog_info!(
+                        "replay merged {} disk tasks; scan {}: {}, examined {}",
+                        batch.tasks.len(),
+                        if batch.incomplete_reason.is_some() {
+                            "incomplete"
+                        } else {
+                            "complete"
+                        },
+                        batch.incomplete_reason.unwrap_or("iterator exhausted"),
+                        batch.examined
+                    );
+                }
                 batch.tasks
             }
             Some(Ok(mut tasks)) if !tasks.is_empty() => {
@@ -4895,6 +5005,7 @@ impl BgTaskRegistry {
                         tasks: disk_tasks,
                         examined: 0,
                         incomplete_reason: None,
+                        retry_deferred: false,
                     }
                 };
                 let mut merged = 0usize;
@@ -4908,7 +5019,10 @@ impl BgTaskRegistry {
                         merged = merged.saturating_add(1);
                     }
                 }
-                if let Some(reason) = disk_batch.incomplete_reason {
+                if let Some(reason) = disk_batch
+                    .incomplete_reason
+                    .filter(|_| !disk_batch.retry_deferred || merged > 0)
+                {
                     crate::slog_info!(
                         "replay merged {merged} disk tasks; scan incomplete: {reason}, examined {}",
                         disk_batch.examined
@@ -4925,7 +5039,10 @@ impl BgTaskRegistry {
                             [session_id.to_string()],
                             &HashSet::new(),
                         );
-                        if let Some(reason) = batch.incomplete_reason {
+                        if let Some(reason) = batch
+                            .incomplete_reason
+                            .filter(|_| !batch.retry_deferred || !batch.tasks.is_empty())
+                        {
                             crate::slog_info!(
                                 "replay merged {} disk tasks; scan incomplete: {reason}, examined {}",
                                 batch.tasks.len(),
@@ -4959,7 +5076,10 @@ impl BgTaskRegistry {
                             [session_id.to_string()],
                             &HashSet::new(),
                         );
-                        if let Some(reason) = batch.incomplete_reason {
+                        if let Some(reason) = batch
+                            .incomplete_reason
+                            .filter(|_| !batch.retry_deferred || !batch.tasks.is_empty())
+                        {
                             crate::slog_info!(
                                 "replay merged {} disk tasks; scan incomplete: {reason}, examined {}",
                                 batch.tasks.len(),
@@ -4981,7 +5101,10 @@ impl BgTaskRegistry {
                             [session_id.to_string()],
                             &HashSet::new(),
                         );
-                        if let Some(reason) = batch.incomplete_reason {
+                        if let Some(reason) = batch
+                            .incomplete_reason
+                            .filter(|_| !batch.retry_deferred || !batch.tasks.is_empty())
+                        {
                             crate::slog_info!(
                                 "replay merged {} disk tasks; scan incomplete: {reason}, examined {}",
                                 batch.tasks.len(),
@@ -5645,15 +5768,15 @@ impl BgTaskRegistry {
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         cursor.known_sessions.remove(&session_id);
+                        cursor.failures.remove(&session_id);
                     }
                     Err(error) => {
-                        crate::slog_warn!(
-                            "failed to open Bash task session {} during project replay: {error}",
-                            session_dir.display()
-                        );
-                        cursor.sessions.push_front(session_id);
-                        incomplete_reason = Some("session directory error");
-                        break;
+                        let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                            ProjectReplayFailureReason::SessionDirectoryPermissionDenied
+                        } else {
+                            ProjectReplayFailureReason::SessionDirectoryOpenFailed
+                        };
+                        cursor.park_session(session_id, reason, error);
                     }
                 }
                 continue;
@@ -5672,13 +5795,23 @@ impl BgTaskRegistry {
                 .next();
             let entry = match next_entry {
                 None => {
-                    cursor.current = None;
+                    let current = cursor
+                        .current
+                        .take()
+                        .expect("finished project replay session");
+                    cursor.failures.remove(&current.session_id);
                     continue;
                 }
                 Some(Ok(entry)) => entry,
                 Some(Err(error)) => {
-                    crate::slog_warn!(
-                        "failed to enumerate Bash task entry during project replay: {error}"
+                    let current = cursor
+                        .current
+                        .take()
+                        .expect("failed project replay session");
+                    cursor.park_session(
+                        current.session_id,
+                        ProjectReplayFailureReason::SessionDirectoryReadFailed,
+                        error,
                     );
                     continue;
                 }
@@ -5763,13 +5896,18 @@ impl BgTaskRegistry {
             }
         }
 
-        if cursor.current.is_none() && cursor.sessions.is_empty() {
+        let retry_deferred = cursor.retry_at().is_some();
+        if retry_deferred {
+            incomplete_reason = Some("session directory retry deferred");
+        }
+        if cursor.current.is_none() && cursor.sessions.is_empty() && cursor.failures.is_empty() {
             scan_slot.take();
         }
         ProjectReplayDiskBatch {
             tasks,
             examined,
             incomplete_reason,
+            retry_deferred,
         }
     }
 
@@ -10418,7 +10556,32 @@ impl BgTaskRegistry {
             .map(|tasks| tasks.values().filter(|task| task.try_is_running()).count())?;
         let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
         let retained_scratch = self.try_retained_scratch_health()?;
+        let project_replay_failures = self
+            .inner
+            .project_replay_scan
+            .try_lock()
+            .ok()?
+            .as_ref()
+            .map(|cursor| {
+                let now = Instant::now();
+                let mut failures: Vec<_> = cursor
+                    .failures
+                    .iter()
+                    .map(|(session_id, failure)| ProjectReplayFailureHealth {
+                        session_dir: session_tasks_dir(&cursor.storage_dir, session_id),
+                        reason: failure.reason,
+                        error: failure.error.clone(),
+                        attempts: failure.attempts,
+                        retry_after_ms: failure.retry_at.saturating_duration_since(now).as_millis()
+                            as u64,
+                    })
+                    .collect();
+                failures.sort_by(|a, b| a.session_dir.cmp(&b.session_dir));
+                failures
+            })
+            .unwrap_or_default();
         Some(BgTaskHealthCounts {
+            project_replay_failures,
             retained_scratch,
             running,
             pending_completions,
@@ -14155,6 +14318,52 @@ mod tests {
         assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
         assert!(registry.task_for_session(task_id, session).is_some());
         assert!(registry.drain_completions().is_empty());
+        registry.detach();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_replay_parks_failed_session_and_scans_remaining_sessions_in_same_batch() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        let blocked_session = "unreadable-project-session";
+        let healthy_session = "readable-project-session";
+        let healthy_task = "bash-000000000000beef";
+        write_running_project_task(
+            storage.path(),
+            project.path(),
+            blocked_session,
+            "bash-000000000000feed",
+        );
+        write_running_project_task(
+            storage.path(),
+            project.path(),
+            healthy_session,
+            healthy_task,
+        );
+        let blocked = session_tasks_dir(storage.path(), blocked_session);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0)).unwrap();
+        let batch = registry.replay_session_from_disk_for_project(
+            storage.path(),
+            project.path(),
+            [blocked_session.to_string(), healthy_session.to_string()],
+            &HashSet::new(),
+        );
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            batch
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [healthy_task],
+            "an unreadable first session must not stop the rest of the current batch"
+        );
+        assert!(batch.retry_deferred);
+        assert!(registry.project_replay_pending(storage.path(), project.path()));
+        assert!(registry.project_replay_retry_at().is_some());
         registry.detach();
     }
 
