@@ -112,6 +112,12 @@ pub enum CanaryAccess {
     Readable,
     /// No canary exists at this path.
     Missing,
+    /// The policy query itself failed (macOS `sandbox_check` returned an
+    /// error). Nothing is proven, so the shim treats this as "not jailed".
+    /// That keeps the fence because the worker launcher runs the same query
+    /// after applying the jail and refuses to start the shell on anything but
+    /// [`CanaryAccess::Denied`]: a running worker shell has a proven deny.
+    Unproven,
 }
 
 /// Probe one canary path from inside the current process's policy.
@@ -123,33 +129,68 @@ pub enum CanaryAccess {
 ///
 /// macOS: ask Seatbelt whether this process may read the file's data. The
 /// query opens nothing and, with SANDBOX_CHECK_NO_REPORT, logs no violation.
+/// `sandbox_check` also answers 1 ("denied") for a path that does not exist,
+/// so existence is checked first: a missing canary is never a deny.
 pub fn access(path: &Path) -> CanaryAccess {
+    probe(path).access
+}
+
+/// One probe's verdict plus the raw facts behind it, for diagnostics.
+struct Probe {
+    access: CanaryAccess,
+    detail: String,
+}
+
+fn probe(path: &Path) -> Probe {
     #[cfg(target_os = "linux")]
     {
-        linux_access(path)
+        linux_probe(path)
     }
     #[cfg(target_os = "macos")]
     {
-        macos_access(path)
+        macos_probe(path)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = path;
-        CanaryAccess::Missing
+        Probe {
+            access: CanaryAccess::Missing,
+            detail: format!("{}: no canary probe on this platform", path.display()),
+        }
     }
 }
 
+#[cfg(unix)]
+fn errno_of(error: &std::io::Error) -> i32 {
+    error.raw_os_error().unwrap_or(-1)
+}
+
 #[cfg(target_os = "linux")]
-fn linux_access(path: &Path) -> CanaryAccess {
-    match std::fs::metadata(path) {
-        Err(error) if error.raw_os_error() == Some(libc::EACCES) => CanaryAccess::Denied,
-        Err(_) => CanaryAccess::Missing,
-        Ok(metadata) if !metadata.is_file() => CanaryAccess::Missing,
+fn linux_probe(path: &Path) -> Probe {
+    let (access, detail) = match std::fs::metadata(path) {
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => (
+            CanaryAccess::Denied,
+            format!("stat errno={}", errno_of(&error)),
+        ),
+        Err(error) => (
+            CanaryAccess::Missing,
+            format!("stat errno={}", errno_of(&error)),
+        ),
+        Ok(metadata) if !metadata.is_file() => (CanaryAccess::Missing, "stat: not a file".into()),
         Ok(_) => match std::fs::File::open(path) {
-            Ok(_) => CanaryAccess::Readable,
-            Err(error) if error.raw_os_error() == Some(libc::EACCES) => CanaryAccess::Denied,
-            Err(_) => CanaryAccess::Missing,
+            Ok(_) => (CanaryAccess::Readable, "stat ok, open ok".into()),
+            Err(error) if error.raw_os_error() == Some(libc::EACCES) => (
+                CanaryAccess::Denied,
+                format!("stat ok, open errno={}", errno_of(&error)),
+            ),
+            Err(error) => (
+                CanaryAccess::Missing,
+                format!("stat ok, open errno={}", errno_of(&error)),
+            ),
         },
+    };
+    Probe {
+        access,
+        detail: format!("{}: {detail} -> {access:?}", path.display()),
     }
 }
 
@@ -169,38 +210,97 @@ mod seatbelt {
     pub const SANDBOX_FILTER_PATH: libc::c_int = 1;
 }
 
+/// Resolve the longest existing prefix of `path` and append the rest, since
+/// Seatbelt rules name resolved paths (for example /private/var for /var). The
+/// canary's own directory may deny metadata inside the jail, so the canary
+/// itself often cannot be resolved there.
 #[cfg(target_os = "macos")]
-fn macos_access(path: &Path) -> CanaryAccess {
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut prefix = path;
+    loop {
+        if let Ok(resolved) = prefix.canonicalize() {
+            return rest
+                .iter()
+                .rev()
+                .fold(resolved, |path, name| path.join(name));
+        }
+        match (prefix.parent(), prefix.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                prefix = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_probe(path: &Path) -> Probe {
     use std::os::unix::ffi::OsStrExt;
-    // Seatbelt matches the resolved path. The canary's own metadata may be
-    // denied, so resolve its parent directory and append the file name.
-    let resolved = path
-        .parent()
-        .and_then(|parent| parent.canonicalize().ok())
-        .zip(path.file_name())
-        .map(|(parent, name)| parent.join(name))
-        .unwrap_or_else(|| path.to_path_buf());
+    let resolved = resolve_existing_prefix(path);
+    let probe = |access: CanaryAccess, detail: String| Probe {
+        access,
+        detail: format!(
+            "{} (resolved {}): {detail} -> {access:?}",
+            path.display(),
+            resolved.display()
+        ),
+    };
+    // A worker cannot delete or rename the canary inside the jail, so only a
+    // canary that was never created reports ENOENT. Inside the jail its
+    // metadata is denied (EPERM), which still means it exists.
+    let metadata = std::fs::symlink_metadata(&resolved);
+    let stat = match &metadata {
+        Ok(metadata) if metadata.is_file() => "stat ok".to_string(),
+        Ok(_) => return probe(CanaryAccess::Missing, "stat: not a file".into()),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return probe(
+                CanaryAccess::Missing,
+                format!("stat errno={}", errno_of(error)),
+            )
+        }
+        Err(error) => format!("stat errno={}", errno_of(error)),
+    };
     let Ok(c_path) = std::ffi::CString::new(resolved.as_os_str().as_bytes()) else {
-        return CanaryAccess::Missing;
+        return probe(CanaryAccess::Missing, "path contains NUL".into());
     };
     // SAFETY: both strings are NUL-terminated and live across the call; the
-    // path filter takes exactly one const char* variadic argument.
-    let denied = unsafe {
-        seatbelt::sandbox_check(
+    // path filter takes exactly one const char* variadic argument. errno is
+    // cleared first so the value read afterwards belongs to this call.
+    let (result, errno) = unsafe {
+        *libc::__error() = 0;
+        let result = seatbelt::sandbox_check(
             libc::getpid(),
             c"file-read-data".as_ptr(),
             seatbelt::SANDBOX_FILTER_PATH | seatbelt::SANDBOX_CHECK_NO_REPORT,
             c_path.as_ptr(),
-        ) != 0
+        );
+        (result, *libc::__error())
     };
-    if denied {
-        return CanaryAccess::Denied;
+    let detail = format!("{stat}, sandbox_check={result} errno={errno}");
+    match result {
+        0 if metadata.is_ok() => probe(CanaryAccess::Readable, detail),
+        // Allowed by policy but its metadata is hidden: not readable here.
+        0 => probe(CanaryAccess::Unproven, detail),
+        1 => probe(CanaryAccess::Denied, detail),
+        _ => probe(CanaryAccess::Unproven, detail),
     }
-    if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-        CanaryAccess::Readable
-    } else {
-        CanaryAccess::Missing
+}
+
+/// One line per candidate canary describing what the probe saw, for test and
+/// support diagnostics. It never changes a decision.
+pub fn diagnostics() -> String {
+    let mut lines = Vec::new();
+    #[cfg(target_os = "linux")]
+    // SAFETY: PR_GET_NO_NEW_PRIVS takes no pointer arguments.
+    lines.push(format!("no_new_privs={}", unsafe {
+        libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+    }));
+    for home in candidate_homes() {
+        lines.push(probe(&path_for_home(&home)).detail);
     }
+    lines.join("; ")
 }
 
 /// Whether this process runs inside AFT's worker jail, judged only by kernel

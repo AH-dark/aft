@@ -391,13 +391,16 @@ fn sandboxed_head_shell_without_a_ticket_keeps_gh_passthrough() {
             "id": "sandboxed-head-gh",
             "method": "bash",
             "params": {
-                "command": "test -f \"$HOME/.local/share/cortexkit/aft/gh-shim-worker-jail/canary\" && echo CANARY_PRESENT; env -u AFT_GH_SHIM_TICKET gh version; echo EXIT=$?"
+                "command": "test -f \"$HOME/.local/share/cortexkit/aft/gh-shim-worker-jail/canary\" && echo CANARY_PRESENT; env -u AFT_GH_SHIM_TICKET AFT_GH_SHIM_CANARY_DIAGNOSTICS=1 gh version; echo EXIT=$?"
             }
         })
         .to_string(),
     );
     assert_eq!(response["success"], true, "bash spawn failed: {response:?}");
     let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+    // The shim prints its canary probe (resolved path, stat errno, and on macOS
+    // the raw sandbox_check return and errno) to stderr, which lands in the
+    // output preview shown by these assertions.
     let output = status["output_preview"].as_str().unwrap_or_default();
     assert!(output.contains("CANARY_PRESENT"), "{status:?}");
     assert!(!output.contains("gh_shim_worker_native_gh"), "{status:?}");

@@ -34,8 +34,20 @@ impl ShellSignals {
 /// make a jailed worker look like a head. Relaxed Linux grants all of `/` and
 /// cannot deny the canary; there the fence is reported as unenforced.
 pub(super) fn native_sandbox_active() -> bool {
-    crate::worker_jail_canary::inside_worker_jail()
+    let jailed = crate::worker_jail_canary::inside_worker_jail();
+    // Support aid: show what the canary probe saw. It never changes the
+    // decision, so a worker setting or clearing it gains nothing.
+    if std::env::var_os(CANARY_DIAGNOSTICS_ENV).is_some() {
+        eprintln!(
+            "gh-shim: worker-jail canary jailed={jailed}: {}",
+            crate::worker_jail_canary::diagnostics()
+        );
+    }
+    jailed
 }
+
+/// Set to any value to print the canary probe's raw results on stderr.
+pub(super) const CANARY_DIAGNOSTICS_ENV: &str = "AFT_GH_SHIM_CANARY_DIAGNOSTICS";
 
 pub(super) fn permission_with(
     relay: &RelayContext,

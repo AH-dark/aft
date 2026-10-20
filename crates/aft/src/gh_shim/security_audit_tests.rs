@@ -509,14 +509,17 @@ fn stripped_worker_probe_child() {
     });
     crate::worker_jail_canary::with_test_homes(vec![home], || {
         let signals = native_guard::ShellSignals::from_process();
+        // The probe's raw results (resolved canary path, stat errno, and on
+        // macOS the sandbox_check return and errno) explain a wrong verdict.
+        let diagnostics = crate::worker_jail_canary::diagnostics();
         if mode != "jail" {
-            assert!(!signals.sandboxed);
+            assert!(!signals.sandboxed, "{mode}: {diagnostics}");
             assert!(native_guard::permission_from_process().is_ok());
             // Passthrough replaces this process with the real gh, so it runs last.
             run(&args(&["version"]));
             unreachable!("native gh passthrough returned instead of exec");
         }
-        assert!(signals.sandboxed);
+        assert!(signals.sandboxed, "{mode}: {diagnostics}");
         let error = native_guard::permission_with(&RelayContext::from_process(), signals, |_| {
             panic!("no ticket")
         })
