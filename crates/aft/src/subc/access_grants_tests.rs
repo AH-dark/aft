@@ -1446,6 +1446,36 @@ fn grants_catalog_head_change_during_resolution_refuses_by_the_new_policy() {
     assert!(worker_grants(&head, &ctx).is_empty());
 }
 
+#[test]
+fn grants_revived_launch_rechecks_head_changes_after_unlocked_resolution() {
+    let (_dir, ctx, head, worker, outside, raw) = delegated_launch();
+    remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap();
+    let revived = at_epoch(&worker, 8);
+    let (hook, points) = change_once_at(
+        &ctx,
+        unlocked_hook::Point::Resolve,
+        revoke_head_grant(&head, &outside),
+    );
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    drop(hook);
+    let db = ctx.db().unwrap();
+    assert!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived))
+            .unwrap()
+            .is_empty(),
+        "the stale head snapshot must not install a revoked grant"
+    );
+    assert!(
+        points
+            .borrow()
+            .iter()
+            .filter(|point| **point == unlocked_hook::Point::Resolve)
+            .count()
+            >= 2,
+        "the changed policy must be resolved again"
+    );
+}
+
 /// The head stops holding the launch's directory after the launch read its
 /// stored parameters and before it materializes them. Nothing may be
 /// materialized against the stale snapshot; the new policy refuses.
