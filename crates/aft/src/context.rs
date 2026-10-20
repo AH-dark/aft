@@ -4097,6 +4097,7 @@ pub struct AppContext {
     parked_configure_tail:
         parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
+    readonly_artifact_cache_keys: parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), String>>,
     artifact_cache_key_derivations: AtomicU64,
     borrowed_index_cache: parking_lot::Mutex<BorrowedIndexCache>,
     /// Successful git worktree probes, keyed by canonical root and guarded by
@@ -4810,6 +4811,7 @@ impl AppContext {
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
+            readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
             borrowed_index_cache: parking_lot::Mutex::new(BorrowedIndexCache::default()),
             worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),
@@ -6693,6 +6695,23 @@ impl AppContext {
         key
     }
 
+    pub(crate) fn memoized_readonly_artifact_cache_key(
+        &self,
+        canonical_root: &Path,
+        storage: &Path,
+    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        let cache_key = (canonical_root.to_path_buf(), storage.to_path_buf());
+        let mut keys = self.readonly_artifact_cache_keys.lock();
+        if let Some(key) = keys.get(&cache_key) {
+            return Ok(key.clone());
+        }
+        let key = crate::search_index::artifact_cache_key_read_only(canonical_root, storage)?;
+        self.artifact_cache_key_derivations
+            .fetch_add(1, Ordering::SeqCst);
+        keys.insert(cache_key, key.clone());
+        Ok(key)
+    }
+
     /// `Ok(None)` means the root's identity is provisional for this bind; see
     /// [`crate::search_index::artifact_cache_key_for_bind_profiled`].
     pub fn memoized_artifact_cache_key_for_configure(
@@ -6802,7 +6821,15 @@ impl AppContext {
     ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>> {
         let canonical_root =
             std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let storage = crate::bash_background::storage_dir(storage_dir);
+        let project_key = match self.memoized_readonly_artifact_cache_key(&canonical_root, &storage)
+        {
+            Ok(key) => key,
+            Err(error) => {
+                crate::slog_warn!("borrowed search index unavailable: {}", error);
+                return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
+            }
+        };
         let Some(artifact) = crate::readonly_artifacts::search_index_artifact_generation_with_key(
             &project_key,
             storage_dir,
@@ -6889,7 +6916,15 @@ impl AppContext {
     ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>> {
         let canonical_root =
             std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let storage = crate::bash_background::storage_dir(storage_dir);
+        let project_key = match self.memoized_readonly_artifact_cache_key(&canonical_root, &storage)
+        {
+            Ok(key) => key,
+            Err(error) => {
+                crate::slog_warn!("borrowed semantic index unavailable: {}", error);
+                return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
+            }
+        };
         let Some(artifact) = crate::readonly_artifacts::semantic_index_artifact_generation_with_key(
             &project_key,
             storage_dir,
@@ -9071,9 +9106,14 @@ impl AppContext {
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
         if let Some(root) = self.callgraph_project_root() {
-            self.storage_dir()
+            let storage = self.storage_dir();
+            let key = self.cached_artifact_cache_key(&root).or_else(|| {
+                self.memoized_readonly_artifact_cache_key(&root, &storage)
+                    .ok()
+            });
+            storage
                 .join("callgraph")
-                .join(self.memoized_artifact_cache_key(&root))
+                .join(key.as_deref().unwrap_or("unconfigured"))
         } else {
             self.storage_dir().join("callgraph").join("unconfigured")
         }
@@ -9760,16 +9800,21 @@ impl AppContext {
         // A published generation written by a newer build (or a reader floor
         // above this build) is refused by name; no cold build is started to
         // replace it.
+        let project_key =
+            match self.memoized_readonly_artifact_cache_key(&project_root, &self.storage_dir()) {
+                Ok(key) => key,
+                Err(error) => {
+                    return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                        error.to_string(),
+                    ));
+                }
+            };
         if let Some(refusal) = crate::persisted_format::refusal_covering(
             crate::persisted_format::PersistedStore::CallgraphStore,
             &callgraph_dir,
         )
         .or_else(|| {
-            crate::callgraph_store::check_published_format(
-                &callgraph_dir,
-                &self.memoized_artifact_cache_key(&project_root),
-            )
-            .err()
+            crate::callgraph_store::check_published_format(&callgraph_dir, &project_key).err()
         }) {
             return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
                 refusal.to_string(),

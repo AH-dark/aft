@@ -2267,7 +2267,9 @@ impl SearchIndex {
             BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::Cancelled)
             | BorrowedIndexLoad::Invalid => "denied",
         };
-        let key = artifact_cache_key(current_canonical_root);
+        // Log the key of the artifact we opened. Adding Git to a folder can
+        // produce a different key than the one under which its index was saved.
+        let key = cache_dir.file_name().unwrap_or_default().to_string_lossy();
         let build_id = crate::logging::in_flight_build_id(
             crate::logging::IndexPlane::Search,
             current_canonical_root,
@@ -6986,6 +6988,24 @@ pub fn artifact_cache_key_with_memo(
         git_common_dir,
         &mut ArtifactCacheKeyTimings::default(),
     )
+}
+
+/// Resolve a reader's key from the same identity records as a session bind,
+/// without creating or refreshing identity metadata. A busy legacy database
+/// leaves the identity unresolved rather than publishing a provisional key.
+pub(crate) fn artifact_cache_key_read_only(
+    project_root: &Path,
+    storage_root: &Path,
+) -> Result<String, ArtifactCacheKeyProbeError> {
+    resolve_root_identity(
+        project_root,
+        project_root,
+        storage_root,
+        None,
+        &mut ArtifactCacheKeyTimings::default(),
+        false,
+    )
+    .map(|identity| identity.key(project_root, false))
 }
 
 /// Wall times overlap: memo_hold includes load, pruning and writes, while

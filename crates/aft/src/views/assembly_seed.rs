@@ -43,7 +43,11 @@ pub(super) fn sibling_checkout_seed(
     }
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     for (_, scope, root, view, generation) in candidates {
-        if crate::search_index::artifact_cache_key(&root) != request.family {
+        if crate::search_index::artifact_cache_key_read_only(&root, &request.storage)
+            .ok()
+            .as_deref()
+            != Some(request.family.as_str())
+        {
             continue;
         }
         let seed = (|| {

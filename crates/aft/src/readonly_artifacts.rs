@@ -7,7 +7,7 @@ use std::time::Duration;
 // for that project.
 use crate::cache_freshness::{artifact_generation, ArtifactGeneration};
 use crate::search_index::{
-    artifact_cache_key_with_memo, resolve_cache_dir, resolve_cache_dir_with_key, BorrowedIndexLoad,
+    artifact_cache_key_read_only, resolve_cache_dir_with_key, BorrowedIndexLoad,
     BorrowedIndexLoadStop, SearchIndex,
 };
 use crate::semantic_index::SemanticIndex;
@@ -412,18 +412,17 @@ pub(crate) fn open_search_index_cancellable(
 
 fn search_index_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Option<PathBuf> {
     match storage_dir {
-        Some(storage_dir) => {
-            match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
-                Ok(project_key) => {
-                    Some(resolve_cache_dir_with_key(&project_key, Some(storage_dir)))
-                }
-                Err(error) => {
-                    crate::slog_warn!("read-only search index unavailable: {}", error);
-                    None
-                }
+        Some(storage_dir) => match artifact_cache_key_read_only(project_root, storage_dir) {
+            Ok(project_key) => Some(resolve_cache_dir_with_key(&project_key, Some(storage_dir))),
+            Err(error) => {
+                crate::slog_warn!("read-only search index unavailable: {}", error);
+                None
             }
-        }
-        None => Some(resolve_cache_dir(project_root, None)),
+        },
+        None => search_index_cache_dir(
+            project_root,
+            Some(&crate::bash_background::storage_dir(None)),
+        ),
     }
 }
 
@@ -518,14 +517,13 @@ fn semantic_index_location(
     storage_dir: Option<&Path>,
 ) -> Option<(PathBuf, String)> {
     let storage_dir = storage_dir?;
-    let project_key =
-        match artifact_cache_key_with_memo(project_root, project_root, storage_dir, None) {
-            Ok(project_key) => project_key,
-            Err(error) => {
-                crate::slog_warn!("read-only semantic index unavailable: {}", error);
-                return None;
-            }
-        };
+    let project_key = match artifact_cache_key_read_only(project_root, storage_dir) {
+        Ok(project_key) => project_key,
+        Err(error) => {
+            crate::slog_warn!("read-only semantic index unavailable: {}", error);
+            return None;
+        }
+    };
     let data_path = storage_dir
         .join("semantic")
         .join(&project_key)
@@ -670,6 +668,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::search_index::{artifact_cache_key_with_memo, resolve_cache_dir};
 
     use std::collections::BTreeMap;
     use std::fs;
@@ -1029,6 +1028,123 @@ mod tests {
             | ReadOnlyArtifact::Stale(ReadOnlyStale { index, .. }) => index,
             other => panic!("expected borrowed search index, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn borrowed_readers_share_saved_path_identity_after_git_is_added() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn readonly_needle() {}\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let owner = borrowed_context(&root, storage.path());
+        let saved_key = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
+            .unwrap()
+            .expect("settled path identity");
+        build_search_artifact(&root, storage.path());
+        build_semantic_artifact(&root, storage.path());
+        let callgraph_dir = storage.path().join("callgraph").join(&saved_key);
+        crate::root_cache::configure_artifact_access(&root, &saved_key, false);
+        let graph =
+            crate::callgraph_store::CallGraphStore::open(callgraph_dir.clone(), root.clone())
+                .unwrap();
+        graph.cold_build(&[root.join("src/lib.rs")]).unwrap();
+        drop(graph);
+
+        init_git(&root);
+        commit_all(&root);
+        assert_ne!(artifact_cache_key(&root), saved_key);
+        // A saved identity must be enough even when the older pin database
+        // cannot be opened. Consulting it would refuse all these readers.
+        fs::create_dir(storage.path().join("aft.db")).unwrap();
+        let before = snapshot_dir(storage.path());
+        let session = tempfile::tempdir().unwrap();
+        let borrower = borrowed_context(session.path(), storage.path());
+        with_borrowed_search_load_limits_for_test(10_000, Duration::from_secs(5), || {
+            let index = cached_search_index(&borrower, &root, storage.path());
+            assert_eq!(
+                index
+                    .grep("readonly_needle", true, &[], &[], &root, 10)
+                    .matches
+                    .len(),
+                1
+            );
+        });
+        assert!(matches!(
+            borrower.open_borrowed_semantic_index(&root, Some(storage.path())),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        let opened = open_search_index_read_only(&root, Some(storage.path()));
+        assert!(
+            matches!(
+                opened,
+                ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
+            ),
+            "Git may change ignore rules, but must not hide the saved index: {opened:?}"
+        );
+        assert!(matches!(
+            open_semantic_index_read_only(&root, Some(storage.path())),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        assert!(
+            crate::callgraph_store::CallGraphStore::open_readonly(callgraph_dir, root.clone())
+                .unwrap()
+                .is_some()
+        );
+        let readonly_session = borrowed_context(&root, storage.path());
+        assert_eq!(
+            readonly_session.callgraph_store_dir(),
+            storage.path().join("callgraph").join(&saved_key)
+        );
+        assert!(
+            readonly_session.cached_artifact_cache_key(&root).is_none(),
+            "reader keys must not bypass configure's bind verification"
+        );
+        // Callgraph query pins are ephemeral reader metadata, not identities.
+        let after = snapshot_dir(storage.path());
+        for (path, snapshot) in &before {
+            assert_eq!(
+                after.get(path),
+                Some(snapshot),
+                "reader changed {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            Some(crate::root_identity::Identity::Path)
+        );
+    }
+
+    #[test]
+    fn readonly_identity_lookup_never_persists_and_refuses_a_busy_legacy_database() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let missing = storage.path().join("not-created");
+        assert!(artifact_cache_key_read_only(&root, &missing).is_ok());
+        assert!(!missing.exists());
+        let writer = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+        writer
+            .execute_batch("CREATE TABLE marker (v TEXT); BEGIN EXCLUSIVE;")
+            .unwrap();
+        let before = snapshot_dir(storage.path());
+        let started = std::time::Instant::now();
+        let ctx = borrowed_context(&root, storage.path());
+        let error = ctx
+            .memoized_readonly_artifact_cache_key(&root, storage.path())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("identity provisional"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(ctx.artifact_cache_key_derivation_count_for_test(), 0);
+        assert_eq!(snapshot_dir(storage.path()), before);
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[cfg(debug_assertions)]

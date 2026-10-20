@@ -4999,7 +4999,6 @@ fn schedule_artifact_loads_admitted(
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
     let canonical_cache_root = ctx.canonical_cache_root();
-    let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
     let config = ctx.config();
     let storage_dir = config.storage_dir.clone();
     let search_index_max_file_size = config.search_index_max_file_size;
@@ -5010,6 +5009,21 @@ fn schedule_artifact_loads_admitted(
         &config.index.roots,
     );
     drop(config);
+    let project_key = match ctx
+        .cached_artifact_cache_key(&canonical_cache_root)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            ctx.memoized_readonly_artifact_cache_key(
+                &canonical_cache_root,
+                &crate::bash_background::storage_dir(storage_dir.as_deref()),
+            )
+        }) {
+        Ok(key) => key,
+        Err(error) => {
+            crate::slog_warn!("saved artifact loads unavailable: {}", error);
+            return (None, None);
+        }
+    };
     // A root no session has open never starts a semantic build, a view fill
     // or a refresh; it takes the read-only arm below, which reads a saved
     // index if there is one.

@@ -5476,7 +5476,15 @@ impl CallGraphStore {
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
         crate::private_storage::tighten_keyed_dir(&callgraph_dir, "callgraph");
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        // Production stores live at storage/callgraph/key. Standalone stores
+        // use their own directory as storage for identity lookup.
+        let storage = callgraph_dir
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "callgraph"))
+            .and_then(Path::parent)
+            .unwrap_or(&callgraph_dir);
+        let project_key = crate::search_index::artifact_cache_key_read_only(&project_root, storage)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
         // A generation written by a newer build is refused by name rather than
         // reported as not built (which would send callers to a cold build) or
         // served from an older legacy partition.
