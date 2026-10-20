@@ -4967,6 +4967,10 @@ impl BgTaskRegistry {
         } else {
             self.replay_session_from_db(session_id, project_root)
         };
+        // A failed task-list query means every later acknowledgement lookup on
+        // this pool would fail for the same reason. Remember that across the
+        // batch so disk recovery does not repeat the failing read per task.
+        let mut db_ack_lookup_unavailable = matches!(&database_replay, Some(Err(_)));
         let tasks = match database_replay {
             _ if continuation => {
                 let batch = self.replay_session_from_disk_for_project(
@@ -5091,7 +5095,7 @@ impl BgTaskRegistry {
             }
             Some(Err(error)) => {
                 crate::slog_warn!(
-                    "bash task replay DB lookup failed for session {}; falling back to disk: {}",
+                    "bash task replay DB lookup failed for session {}; falling back to disk without durable completion acknowledgements: {}",
                     session_id,
                     error
                 );
@@ -5341,7 +5345,13 @@ impl BgTaskRegistry {
                     continue;
                 }
             }
-            self.rehydrate_resolved_task(metadata, resolved.paths, session_id)?;
+            self.rehydrate_resolved_task_with_db_ack_state(
+                metadata,
+                resolved.paths,
+                session_id,
+                Self::persisted_task_process_is_alive,
+                &mut db_ack_lookup_unavailable,
+            )?;
         }
 
         // Every recovery write for this replay has landed; release the
@@ -5409,25 +5419,60 @@ impl BgTaskRegistry {
 
     fn rehydrate_resolved_task_with_process_probe(
         &self,
-        mut metadata: PersistedTask,
+        metadata: PersistedTask,
         paths: TaskPaths,
         session_id: &str,
         process_is_alive: impl FnOnce(&PersistedTask) -> bool,
     ) -> Result<(), String> {
+        let mut db_ack_lookup_unavailable = false;
+        self.rehydrate_resolved_task_with_db_ack_state(
+            metadata,
+            paths,
+            session_id,
+            process_is_alive,
+            &mut db_ack_lookup_unavailable,
+        )
+    }
+
+    fn rehydrate_resolved_task_with_db_ack_state(
+        &self,
+        mut metadata: PersistedTask,
+        paths: TaskPaths,
+        session_id: &str,
+        process_is_alive: impl FnOnce(&PersistedTask) -> bool,
+        db_ack_lookup_unavailable: &mut bool,
+    ) -> Result<(), String> {
         // Disk fallback and remote checkpoints can replace the DB metadata.
         // A foreign ack only changes the durable column, so reconcile it
         // before any recovery write or completion enqueue uses the snapshot.
-        if let Some((harness, pool)) = self.db_harness_and_pool_for_session(&metadata.session_id) {
-            let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
-            if let Some(row) = crate::db::bash_tasks::get_bash_task(
-                &conn,
-                &harness,
-                &metadata.session_id,
-                &metadata.task_id,
-            )
-            .map_err(|error| error.to_string())?
+        // If the database lookup fails, keep the acknowledgement state stored with
+        // the task on disk. This may enqueue the completion again, but it is safer
+        // than abandoning this task or the remaining tasks.
+        if !*db_ack_lookup_unavailable {
+            if let Some((harness, pool)) =
+                self.db_harness_and_pool_for_session(&metadata.session_id)
             {
-                metadata.completion_delivered |= row.completion_delivered;
+                let lookup = match pool.lock() {
+                    Ok(conn) => crate::db::bash_tasks::get_bash_task(
+                        &conn,
+                        &harness,
+                        &metadata.session_id,
+                        &metadata.task_id,
+                    )
+                    .map_err(|error| error.to_string()),
+                    Err(_) => Err("db mutex poisoned".to_string()),
+                };
+                match lookup {
+                    Ok(Some(row)) => metadata.completion_delivered |= row.completion_delivered,
+                    Ok(None) => {}
+                    Err(error) => {
+                        *db_ack_lookup_unavailable = true;
+                        crate::slog_warn!(
+                            "bash task replay completion acknowledgement lookup failed for session {}; keeping disk task state and skipping remaining database reads in this batch: {error}",
+                            metadata.session_id
+                        );
+                    }
+                }
             }
         }
         #[cfg(unix)]
@@ -21234,6 +21279,73 @@ mod tests {
                     "rehydration lost the durable ack"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn replay_session_batch_restores_all_disk_tasks_when_aft_db_is_unreadable() {
+        let storage = tempfile::tempdir().unwrap();
+        let (owner, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_ids = (0..3)
+            .map(|index| {
+                insert_terminal_piped_task(
+                    &owner,
+                    &storage,
+                    &format!("echo task {index}"),
+                    &format!("task {index}\n"),
+                    "",
+                    false,
+                )
+                .0
+            })
+            .collect::<Vec<_>>();
+
+        // Make both the initial task-list query and the acknowledgement reads fail.
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TABLE bash_tasks")
+            .unwrap();
+
+        let replay = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        replay.set_harness(Harness::Opencode);
+        replay.set_db_pool(db);
+        replay
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            replay
+                .replay_session(storage.path(), "session")
+                .expect("unreadable database must not stop disk replay");
+        });
+
+        let fallback_warnings = logs
+            .iter()
+            .filter(|line| {
+                line.contains("falling back to disk without durable completion acknowledgements")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fallback_warnings.len(), 1, "{logs:?}");
+        assert!(fallback_warnings[0].contains("no such table: bash_tasks"));
+        assert!(
+            logs.iter()
+                .all(|line| !line.contains("completion acknowledgement lookup failed")),
+            "replay retried the unreadable database for each task: {logs:?}"
+        );
+
+        for task_id in task_ids {
+            assert!(
+                replay.task_for_session(&task_id, "session").is_some(),
+                "disk task was not restored: {task_id}"
+            );
+            assert!(
+                replay
+                    .pending_completions_for_session("session")
+                    .iter()
+                    .any(|completion| completion.task_id == task_id),
+                "pending completion was not queued: {task_id}"
+            );
         }
     }
 
