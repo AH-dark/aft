@@ -130,17 +130,19 @@ pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 /// Status reason of a task killed because its caller withdrew the call.
 pub const WITHDRAWN_REASON: &str = "withdrawn";
 pub const SCOPE_REVOKED_REASON: &str = "scope_revoked";
+pub(crate) const OWNER_PAUSED_REASON: &str = "paused_by_owner";
 /// Status reason of a task a codemode program started, killed because the
 /// daemon confirmed the program's run scope ended.
 pub const RUN_ENDED_REASON: &str = "run_ended";
 
-/// How a task killed at the end of its daemon scope is labelled to the agent:
-/// `run ended` for a codemode program's task, `scope revoked` otherwise.
+/// How an owner-directed stop is labelled to the agent: a run or scope end,
+/// or a pause that leaves the scope usable.
 /// `None` for any other status reason.
 pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     match reason {
         Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
         Some(RUN_ENDED_REASON) => Some("run ended"),
+        Some(OWNER_PAUSED_REASON) => Some("paused by owner"),
         _ => None,
     }
 }
@@ -806,6 +808,25 @@ impl Drop for SessionRecoveryGuard {
 #[derive(Clone)]
 pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ScopeKilledTask {
+    pub task_id: String,
+    pub session_id: String,
+    pub remote: Option<ScopeRemoteCancel>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ScopeRemoteCancel {
+    pub job_id: Option<String>,
+    pub cancel: String,
+}
+
+#[derive(Default)]
+pub(crate) struct ScopeKillReport {
+    pub killed: Vec<ScopeKilledTask>,
+    pub already_finished: usize,
 }
 
 #[path = "scratch_retention.rs"]
@@ -7690,12 +7711,11 @@ impl BgTaskRegistry {
         }
     }
 
-    /// One line for each task of `session_id` whose waiting call was
-    /// cancelled while the task kept running, naming the task (and its
-    /// build-server job for a remote task) and how to check or stop it. Each
-    /// task is named once: taking a notice clears the task's flag on disk. A
-    /// task that has finished since is not named, because its completion
-    /// notice reports it.
+    /// Name unannounced cancelled calls and owner-paused tasks once on the
+    /// session's next bash-family reply. Running tasks include how to check or
+    /// stop them; owner-paused tasks explain their expected terminal status.
+    /// Taking a notice clears its flag on disk. Other finished tasks are left
+    /// to their completion notices.
     pub(crate) fn take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
         let mut task_ids = match self.inner.cancelled_call_tasks.lock() {
             Ok(mut tasks) => match tasks.remove(session_id) {
@@ -7722,6 +7742,12 @@ impl BgTaskRegistry {
                 crate::slog_warn!(
                     "cancelled-call notice for task {task_id} was not cleared on disk: {error}"
                 );
+            }
+            if state.metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
+                && state.metadata.status == BgTaskStatus::Killed
+            {
+                lines.push(format!("task {task_id}: killed (paused by owner)"));
+                continue;
             }
             if state.metadata.status.is_terminal() {
                 continue;
@@ -9050,33 +9076,143 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
-        for task in self.running_tasks() {
+        if let Err(error) = self.stop_scope_tasks(scope, false, None) {
+            log::warn!("scope revocation kill failed: {error}");
+        }
+        // Finished commands of the ended scope keep no scratch for later reads.
+        self.release_scope_scratch(scope);
+    }
+
+    /// Stop this scope's current tasks without ending its authority to spawn.
+    pub(crate) fn pause_scope(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        remote: bool,
+    ) -> Result<ScopeKillReport, String> {
+        self.stop_scope_tasks(scope, true, Some(remote))
+    }
+
+    pub(crate) fn wait_owner_pause_cancel(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        deadline: Instant,
+    ) -> ScopeRemoteCancel {
+        let failed = |reason: &str| ScopeRemoteCancel {
+            job_id: None,
+            cancel: format!("failed: {reason}"),
+        };
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return failed("task not found");
+        };
+        let Ok(state) = task.lock_state() else {
+            return failed("task lock poisoned");
+        };
+        let Ok((state, _)) = task.kill_settled.wait_timeout_while(
+            state,
+            deadline.saturating_duration_since(Instant::now()),
+            |state| {
+                state
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.owner_pause_cancel.is_none())
+            },
+        ) else {
+            return failed("task lock poisoned");
+        };
+        let Some(remote) = state.metadata.remote.as_ref() else {
+            return failed("remote task no longer available");
+        };
+        ScopeRemoteCancel {
+            job_id: remote.job_id.map(|id| id.to_string()),
+            cancel: remote
+                .owner_pause_cancel
+                .clone()
+                .unwrap_or_else(|| "failed: did not settle within 10 seconds".into()),
+        }
+    }
+
+    fn stop_scope_tasks(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        paused: bool,
+        remote: Option<bool>,
+    ) -> Result<ScopeKillReport, String> {
+        let mut report = ScopeKillReport::default();
+        let mut errors = Vec::new();
+        for task in self.task_arcs() {
             let stamp = task
                 .lock_state()
                 .ok()
-                .and_then(|state| state.metadata.scope.clone())
+                .and_then(|state| {
+                    if remote.is_some_and(|remote| remote != state.metadata.remote.is_some()) {
+                        return None;
+                    }
+                    state.metadata.scope.clone()
+                })
                 .filter(|stamp| {
                     stamp.owner == scope.owner
                         && stamp.scope_ref == scope.scope_ref
                         && stamp.scope_epoch == scope.scope_epoch
                 });
             if let Some(stamp) = stamp {
+                if task.is_terminal() {
+                    report.already_finished += 1;
+                    continue;
+                }
                 // A run scope's tasks were started by a codemode program.
-                let killed = if stamp.attributes.run_id.is_some() {
+                let killed = if paused {
+                    self.kill_with_status_reason(
+                        &task.task_id,
+                        &task.session_id,
+                        BgTaskStatus::Killed,
+                        Some(OWNER_PAUSED_REASON.into()),
+                    )
+                } else if stamp.attributes.run_id.is_some() {
                     self.kill_for_run_end(&task.task_id, &task.session_id)
                 } else {
                     self.kill_for_scope_revocation(&task.task_id, &task.session_id)
                 };
-                if let Err(error) = killed {
-                    log::warn!(
-                        "scope revocation kill failed task={}: {error}",
-                        task.task_id
-                    );
+                match killed {
+                    Ok(snapshot) if snapshot.info.status == BgTaskStatus::Killed => {
+                        if paused {
+                            let mut db = DeferredDbWrites::new(self, &task);
+                            let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
+                            state.metadata.cancelled_call_unannounced = true;
+                            self.persist_task_locked(&task, &state.metadata, &mut db)
+                                .map_err(|e| e.to_string())?;
+                            drop(state);
+                            self.index_cancelled_call(&task.session_id, &task.task_id);
+                        }
+                        let remote = task.lock_state().ok().and_then(|state| {
+                            state
+                                .metadata
+                                .remote
+                                .as_ref()
+                                .map(|remote| ScopeRemoteCancel {
+                                    job_id: remote.job_id.map(|id| id.to_string()),
+                                    cancel: remote.owner_pause_cancel.clone().unwrap_or_else(
+                                        || "failed: cancellation outcome unavailable".into(),
+                                    ),
+                                })
+                        });
+                        report.killed.push(ScopeKilledTask {
+                            task_id: task.task_id.clone(),
+                            session_id: task.session_id.clone(),
+                            remote,
+                        });
+                    }
+                    Ok(_) => report.already_finished += 1,
+                    Err(error) => errors.push(format!("{}: {error}", task.task_id)),
                 }
             }
         }
-        // Finished commands of the ended scope keep no scratch for later reads.
-        self.release_scope_scratch(scope);
+        if errors.is_empty() {
+            Ok(report)
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
@@ -9531,6 +9667,10 @@ impl BgTaskRegistry {
                     self.persist_task_locked(&task, &state.metadata, &mut db)
                         .map_err(|e| e.to_string())?;
                 }
+            }
+            if reason.as_deref() == Some(OWNER_PAUSED_REASON) {
+                self.record_owner_pause_remote(&task)?;
+                return Ok(self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES));
             }
             return self.kill_remote_task(&task);
         }
@@ -13197,11 +13337,22 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
         .as_ref()
         .and_then(|remote| remote.output_incomplete.as_ref())
         .map(remote::RemoteOutputIncomplete::warning_line);
-    match (warning, metadata.execution_note.as_deref()) {
+    let note = match (warning, metadata.execution_note.as_deref()) {
         (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
         (Some(warning), _) => Some(warning),
         (None, Some(note)) => Some(note.to_owned()),
         (None, None) => None,
+    };
+    if metadata.status == BgTaskStatus::Killed
+        && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
+    {
+        let pause = "[killed (paused by owner); expected stop, not a command failure]";
+        Some(match note {
+            Some(note) => format!("{pause}\n{note}"),
+            None => pause.to_owned(),
+        })
+    } else {
+        note
     }
 }
 

@@ -1,0 +1,119 @@
+{
+  "success": {
+    "principal": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "request": {
+      "op": "bash.kill_scope",
+      "params": {
+        "scope": {
+          "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+          "ref": "worker-pause",
+          "scope_epoch": 1,
+          "kind": "worker",
+          "attributes": {},
+          "owner_authorized": true
+        }
+      }
+    },
+    "reply": {
+      "op": "bash.kill_scope",
+      "status": "ok",
+      "data": {
+        "killed": [{ "task_id": "TASK_ID", "session_id": "pause-session", "remote": null }],
+        "already_finished": 0,
+        "not_found": 0
+      }
+    }
+  },
+  "not_owner": {
+    "principal": { "kind": "reserved", "module_id": "prefrontal" },
+    "request": {
+      "op": "bash.kill_scope",
+      "params": {
+        "scope": {
+          "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+          "ref": "worker-pause",
+          "scope_epoch": 1,
+          "kind": "worker",
+          "attributes": {},
+          "owner_authorized": true
+        }
+      }
+    },
+    "reply": {
+      "op": "bash.kill_scope",
+      "status": "error",
+      "data": { "code": "kill_scope_not_owner", "message": "bash.kill_scope requires the scope's owner" }
+    }
+  },
+  "unaccepted": {
+    "principal": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "request": {
+      "op": "bash.kill_scope",
+      "params": {
+        "scope": {
+          "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+          "ref": "unaccepted-worker",
+          "scope_epoch": 1,
+          "kind": "worker",
+          "attributes": {},
+          "owner_authorized": true
+        }
+      }
+    },
+    "reply": {
+      "op": "bash.kill_scope",
+      "status": "ok",
+      "data": {
+        "killed": [{ "task_id": "TASK_ID", "session_id": "session", "remote": { "job_id": null, "cancel": "failed: did not settle within 10 seconds" } }],
+        "already_finished": 0,
+        "not_found": 0
+      }
+    }
+  },
+  "withdrawn_before_acceptance": {
+    "principal": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "request": {
+      "op": "bash.kill_scope",
+      "params": {
+        "scope": {
+          "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+          "ref": "withdrawn-worker",
+          "scope_epoch": 1,
+          "kind": "worker",
+          "attributes": {},
+          "owner_authorized": true
+        }
+      }
+    },
+    "reply": {
+      "op": "bash.kill_scope",
+      "status": "ok",
+      "data": {
+        "killed": [{ "task_id": "TASK_ID", "session_id": "session", "remote": { "job_id": null, "cancel": "sent" } }],
+        "already_finished": 0,
+        "not_found": 0
+      }
+    }
+  },
+  "nothing_running": {
+    "principal": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "request": {
+      "op": "bash.kill_scope",
+      "params": {
+        "scope": {
+          "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+          "ref": "empty-scope",
+          "scope_epoch": 1,
+          "kind": "worker",
+          "attributes": {},
+          "owner_authorized": true
+        }
+      }
+    },
+    "reply": {
+      "op": "bash.kill_scope",
+      "status": "ok",
+      "data": { "killed": [], "already_finished": 0, "not_found": 0 }
+    }
+  }
+}

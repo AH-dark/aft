@@ -719,6 +719,8 @@ pub(crate) struct RemoteTask {
     #[serde(default)]
     pub unknown_len: u64,
     pub cancel_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pause_cancel: Option<String>,
     pub terminal: Option<TerminalRecord>,
     #[serde(default)]
     pub fallback_digest: Option<String>,
@@ -1654,6 +1656,7 @@ impl BgTaskRegistry {
             stderr_len: 0,
             unknown_len: 0,
             cancel_requested: false,
+            owner_pause_cancel: None,
             terminal: None,
             fallback_digest: None,
             env_not_forwarded: None,
@@ -1809,6 +1812,10 @@ impl BgTaskRegistry {
                     .map_err(|e| e.to_string())
                     .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial)));
                 if let Err(error) = result {
+                    if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
+                        task.remote_launch_ready.store(true, Ordering::Release);
+                        return;
+                    }
                     let point = task
                         .state
                         .lock()
@@ -2009,7 +2016,9 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_requested)
             {
-                self.remote_terminal(&task, Verdict::Cancelled, None);
+                if !self.finish_owner_pause_cancel(&task, Ok(())) {
+                    self.remote_terminal(&task, Verdict::Cancelled, None);
+                }
                 return Ok(());
             }
             match client.run(&request).await {
@@ -2049,7 +2058,14 @@ impl BgTaskRegistry {
                 .is_some_and(|r| r.cancel_requested);
             if cancel && !cancelled {
                 if let Some(point) = stream.resume_point() {
-                    let _ = client.cancel_job(point.job_id).await;
+                    let result = client
+                        .cancel_job(point.job_id)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string());
+                    if self.finish_owner_pause_cancel(&task, result) {
+                        return Ok(());
+                    }
                     stream = self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                         .await?;
@@ -2058,11 +2074,15 @@ impl BgTaskRegistry {
                     // Before the runner accepts the submission, there is no job
                     // ID for exec.cancel or attach. Cancel the active call instead.
                     // The SDK closes its receiver, so this cannot prove the job stopped.
-                    client.cancel_submission(&stream).await.map_err(|error| {
+                    let result = client.cancel_submission(&stream).await.map_err(|error| {
                         format!(
                         "remote cancellation before acceptance failed; outcome unknown: {error}"
                     )
-                    })?;
+                    });
+                    if self.finish_owner_pause_cancel(&task, result.clone()) {
+                        return Ok(());
+                    }
+                    result?;
                     return Err("remote cancellation requested before acceptance; outcome unknown: no job ID to recover terminal proof".into());
                 }
             }
@@ -2464,7 +2484,14 @@ impl BgTaskRegistry {
             let attempt = recovery
                 .wait(point.job_id, async {
                     if cancel {
-                        let _ = client.cancel_job(point.job_id).await;
+                        let result = client
+                            .cancel_job(point.job_id)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        if self.finish_owner_pause_cancel(task, result) {
+                            return Err(exec::Error::Protocol("owner pause settled".into()));
+                        }
                     }
                     client.attach(point.clone()).await
                 })
@@ -2880,6 +2907,41 @@ impl BgTaskRegistry {
         }
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
+    }
+
+    pub(super) fn record_owner_pause_remote(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        self.record_remote_cancel(task)?;
+        self.remote_terminal(task, Verdict::Cancelled, None);
+        Ok(())
+    }
+
+    // A pause ends AFT's local task even if the runner cannot be reached. Store
+    // the remote cancellation result separately so the owner can see failures
+    // without reporting the expected local stop as a command failure.
+    fn finish_owner_pause_cancel(&self, task: &Arc<BgTask>, result: Result<(), String>) -> bool {
+        let terminal = {
+            let mut db = DeferredDbWrites::new(self, task);
+            let Ok(mut state) = task.state.lock() else {
+                return false;
+            };
+            if state.metadata.status_reason.as_deref() != Some(super::OWNER_PAUSED_REASON) {
+                return false;
+            }
+            let terminal = state.metadata.is_terminal();
+            if let Some(remote) = state.metadata.remote.as_mut() {
+                remote.owner_pause_cancel = Some(match result {
+                    Ok(()) => "sent".into(),
+                    Err(error) => format!("failed: {error}"),
+                });
+            }
+            let _ = self.persist_task_locked(task, &state.metadata, &mut db);
+            terminal
+        };
+        task.kill_settled.notify_all();
+        if !terminal {
+            self.remote_terminal(task, Verdict::Cancelled, None);
+        }
+        true
     }
 }
 
