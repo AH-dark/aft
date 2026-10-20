@@ -394,6 +394,7 @@ fn deferred_database_open_busy_exhaustion_retries_without_rebind() {
 }
 
 /// Saved root identity records under `storage`, parsed.
+#[cfg(unix)]
 fn saved_root_identities(storage: &Path) -> Vec<Value> {
     let Ok(entries) = fs::read_dir(storage.join("root-identities")) else {
         return Vec::new();
