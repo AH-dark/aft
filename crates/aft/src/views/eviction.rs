@@ -300,8 +300,9 @@ thread_local! {
     /// path such as admission walks nothing.
     static TREE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TREE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The byte budget of the last family sweep an enforcement pass on this
-    /// thread started, which its report does not carry.
+    /// The byte budget an enforcement pass on this thread gave the family
+    /// sweep it started most recently. The sweep's report does not record
+    /// its budget, so tests read it here.
     static LAST_SWEEP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -2908,8 +2909,9 @@ mod tests {
             .unwrap()
     }
 
-    /// An admission outcome without the sentence about the background pass,
-    /// which depends on whether another test's pass is running.
+    /// The admission outcome with the refusal's "eviction pass" clause
+    /// removed. That clause depends on whether another test's background
+    /// eviction pass happens to be running, so goldens cannot include it.
     fn admission(registry: &FamilyRegistry) -> String {
         match admit_new_view(registry) {
             Ok(()) => "admitted".to_string(),

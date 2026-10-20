@@ -294,8 +294,9 @@ pub(crate) enum SmallFamilyCheck {
     /// When a complete walk of the family's files is within the budget.
     FileWalk,
     /// When the given byte count is within the budget, as a sweep that
-    /// trusted a measurement taken before it started would decide. Tests
-    /// use it to show what such a sweep would miss.
+    /// relied on a family size measured before the sweep started would
+    /// decide. Tests use it to show the rows such a sweep would fail to
+    /// delete when the family grew in between.
     #[cfg(test)]
     Assumed(u64),
 }
