@@ -342,6 +342,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "edit.rs",
+        enclosing_item: "foreign_group",
+        location_or_primitive: "groups.truncate(count.max(0) as usize)",
+        reason: "test helper shrinking a getgroups buffer to the count the OS returned; group ids for a fixture, never an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "read_sized",
+        location_or_primitive: "buffer.truncate(read_size as usize)",
+        reason: "shrinks a byte buffer to the size the OS reported for an extended-attribute name list or value; raw metadata copied to the replacement file, never an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "edit.rs",
         enclosing_item: "REFORMATTED_EXCERPT_MAX_LINES, REFORMATTED_EXCERPT_MAX_BYTES, compute_reformatted_excerpt, excerpt_caps_bound_owned_line_construction",
         location_or_primitive: "REFORMATTED_EXCERPT_MAX_",
         reason: "bounds an inline post-format source excerpt, not a paginated list; oversized excerpts retain the existing extensive marker instead of returning partial source text",

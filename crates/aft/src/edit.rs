@@ -3481,7 +3481,19 @@ mod in_place_write_tests {
             .unwrap();
         assert!(restricted.status.success(), "{restricted:?}");
         let before = icacls(&path);
-        assert_eq!(acl_entries(&before, &path).len(), 1, "{before}");
+        // The strict file must differ from what a new file in this folder gets,
+        // or a temporary that inherited the folder's entries would pass too.
+        // Runners differ in which explicit entries a temp file keeps, so the
+        // test compares with a fresh sibling instead of counting entries.
+        let sibling = dir.path().join("fresh.txt");
+        std::fs::write(&sibling, "fresh\n").unwrap();
+        let inherited = icacls(&sibling);
+        assert_ne!(
+            acl_entries(&inherited, &sibling),
+            acl_entries(&before, &path),
+            "the restricted file must have a narrower DACL than the folder gives: {before}"
+        );
+        std::fs::remove_file(&sibling).unwrap();
         let mut seen = None;
         let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
             use std::io::Write;
