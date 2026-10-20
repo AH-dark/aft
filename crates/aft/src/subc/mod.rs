@@ -20403,6 +20403,14 @@ mod tests {
         }
     }
 
+    /// Caller deadline for a bash call that must run once the database opens.
+    /// It covers the open itself plus bash startup, which the product budgets at
+    /// 15 s; a loaded test host regularly needs more than a few seconds for
+    /// both. A bash call that never got the database would still be refused
+    /// with `database_initializing` when this expires, so the bound proves
+    /// nothing weaker than a short one.
+    const BASH_AFTER_OPEN_BUDGET: Duration = Duration::from_secs(15);
+
     fn database_wire_tool(
         executor: &Arc<Executor>,
         fixture: &ConfiguredRoot,
@@ -20414,7 +20422,10 @@ mod tests {
             fixture,
             name,
             wait_budget,
-            (Duration::from_millis(500), Duration::from_secs(3)),
+            (
+                Duration::from_millis(500),
+                Duration::from_secs(3).max(wait_budget),
+            ),
             |req, ctx| {
                 assert!(
                     ctx.database_runtime_refusal(&req.id, &req.command)
@@ -20580,7 +20591,11 @@ mod tests {
             );
         let started = Instant::now();
         let mut first = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
-        let deadline = started + Duration::from_secs(2);
+        // The database open stays gated until `release` is sent, so a bind that
+        // waited for it would never answer within any deadline. Polling up to the
+        // product's own bind deadline proves the ordering without failing a
+        // correct bind that a loaded host merely slowed down.
+        let deadline = started + ROUTE_BIND_DEADLINE;
         let first_response = loop {
             if let Ok(response) = first.try_recv() {
                 break Some(response);
@@ -20625,7 +20640,7 @@ mod tests {
         assert!(!fixture.storage.path().join("aft.db").exists());
         let mut second = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(2);
+        let deadline = started + ROUTE_BIND_DEADLINE;
         let second_response = loop {
             if let Ok(response) = second.try_recv() {
                 break Some(response);
@@ -20640,7 +20655,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             let _ = release.send(());
         });
-        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(3));
+        let bash = database_wire_tool(&executor, &fixture, "bash", BASH_AFTER_OPEN_BUDGET);
         release_thread.join().unwrap();
         assert_eq!(
             bash["success"], true,
@@ -21023,7 +21038,7 @@ mod tests {
         );
         // ...and a waiting bash call schedules the open itself instead of
         // waiting for the configure tail, so it runs rather than being refused.
-        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(3));
+        let bash = database_wire_tool(&executor, &fixture, "bash", BASH_AFTER_OPEN_BUDGET);
         assert_eq!(bash["success"], true, "{bash}");
         crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
         assert!(fixture
