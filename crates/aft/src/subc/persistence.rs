@@ -82,6 +82,7 @@ impl DatabaseWaits {
             return Err(decoded);
         }
         let permit = permit.unwrap();
+        let restore_started = Instant::now();
         let identity = identity.clone();
         let progress = Arc::new(StdMutex::new(identity.project_root.clone()));
         let worker_progress = progress.clone();
@@ -117,6 +118,7 @@ impl DatabaseWaits {
                     Err(error)
                 }
             });
+            decoded.phase_trace.note_launch_restore_wait(restore_started.elapsed());
             decoded
         });
         if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {

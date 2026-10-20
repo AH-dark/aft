@@ -101,17 +101,6 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-    // A shell's target paths are unknown before execution, and relaxed sandboxes
-    // may permit reads outside granted roots. Refuse while launch grants remain
-    // unrestored rather than reporting only a sandbox permission denial.
-    match ctx.unrestored_launch_grants(&req.id) {
-        Ok(grants) => {
-            if let Some(grant) = grants.first() {
-                return AppContext::unrestored_grant_refusal(&req.id, &grant.path);
-            }
-        }
-        Err(response) => return response,
-    }
     // The dedicated external route is defensive as well as convenient: callers
     // cannot accidentally execute Bash merely by omitting the selector.
     if req.command == "powershell" {

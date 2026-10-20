@@ -467,6 +467,7 @@ async fn grants_revived_launch_first_call_restores_without_catalog() {
     let (_dir, ctx, head, worker) = fixture();
     let worker = at_epoch(&worker, 1);
     let target = head.project_root.join("shared");
+    std::fs::create_dir_all(&target).unwrap();
     remote_policy::catalog(
         catalog_request(json!([{"path":target,"mode":"write"}])),
         &worker,
@@ -563,43 +564,11 @@ fn grants_revived_launch_failed_restore_refuses_and_retries() {
     );
 }
 
-#[test]
-fn grants_unrestored_launch_refuses_bash_before_spawn() {
-    let (_dir, ctx, head, worker) = default_fixture();
-    let target = head.project_root.join("shared");
-    remote_policy::catalog(
-        catalog_request(json!([{"path":target,"mode":"write"}])),
-        &worker,
-        &ctx,
-    )
-    .unwrap();
-    let revived = at_epoch(&worker, 8);
-    register(&revived, &ctx).unwrap();
-    let _scope = crate::access_policy::scope_guard(Some(scope_key(&revived)));
-    let _ask = crate::access_policy::ask_route_guard(Some(ask_route(&revived)));
-    let marker = worker.project_root.join("bash-ran");
-    let request = RawRequest {
-        id: "unrestored-shell".into(),
-        command: "bash".into(),
-        session_id: None,
-        lsp_hints: None,
-        params: json!({"command":format!("touch '{}'", marker.display())}),
-    };
-    let response = crate::commands::bash::handle(&request, &ctx);
-    assert!(!response.success);
-    assert_eq!(response.data["code"], "grants_unavailable");
-    assert_eq!(response.data["detail"]["path"], json!(target));
-    assert_eq!(response.data["detail"]["retryable"], true);
-    assert!(
-        !marker.exists(),
-        "unrestored launch grants must refuse before shell execution"
-    );
-}
-
 #[tokio::test]
 async fn grants_revived_launch_memo_skips_restore_database_on_second_call() {
     let (_dir, ctx, head, worker) = fixture();
     let worker = at_epoch(&worker, 1);
+    std::fs::create_dir_all(head.project_root.join("shared")).unwrap();
     remote_policy::catalog(
         catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
         &worker,
@@ -636,6 +605,7 @@ async fn grants_revived_launch_no_params_is_not_memoized() {
         "no params is not a definite materialization"
     );
     let target = head.project_root.join("late-launch");
+    std::fs::create_dir_all(&target).unwrap();
     remote_policy::catalog(
         catalog_request(json!([{"path":target,"mode":"read"}])),
         &worker,
@@ -691,6 +661,9 @@ fn grants_revived_launch_drops_and_logs_revoked_head_and_floor() {
     let held = head.project_root.join("held");
     let revoked = worker.project_root.join("revoked");
     let denied = head.project_root.join("denied");
+    for path in [&held, &revoked, &denied] {
+        std::fs::create_dir_all(path).unwrap();
+    }
     let grant = AccessGrant {
         path: policy_path(&revoked),
         kind: GrantKind::Subtree,

@@ -739,10 +739,12 @@ pub(super) fn restore_launch_before(
         let saved_head_key = head_key.clone();
         let storage = ctx.storage_dir();
         let resolution_progress = progress.clone();
+        let launch_state = ctx.launch_grant_state.clone();
+        let saved_key = key.clone();
         // Building the head policy also probes paths besides saved grants.
         // Isolate the whole unlocked phase so those probes share the deadline.
         let resolved = crate::bounded_io::run(&identity.project_root, None, move |_| {
-            crate::access_policy::with_bounded_policy_paths(resolution_progress, || -> Result<_, subc_protocol::ErrorBody> {
+            crate::access_policy::with_bounded_policy_paths(resolution_progress.clone(), || -> Result<_, subc_protocol::ErrorBody> {
                 let head = saved_head
                     .clone()
                     .map(|policy| policy.resolve(&storage));
@@ -752,6 +754,30 @@ pub(super) fn restore_launch_before(
                 let mut grants = Vec::new();
                 let mut dropped = Vec::new();
                 for entry in entries {
+                    let saved_grant = entry.get("path").and_then(Value::as_str)
+                        .map(PathBuf::from).filter(|path| path.is_absolute())
+                        .zip(match entry.get("mode").and_then(Value::as_str) {
+                            Some("read") => Some(AccessOperation::Read),
+                            Some("write") => Some(AccessOperation::Write),
+                            _ => None,
+                        })
+                        .map(|(path, operation)| AccessGrant { path, kind: GrantKind::Subtree, operation });
+                    if let Some(grant) = saved_grant {
+                        if launch_state.is_absent(&saved_key, &grant) {
+                            continue;
+                        }
+                        *resolution_progress.lock().unwrap_or_else(|e| e.into_inner()) = grant.path.clone();
+                        #[cfg(test)]
+                        launch_state.note_probe(&grant.path);
+                        match crate::bounded_io::metadata(&grant.path) {
+                            Ok(_) => {}
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
+                                launch_state.mark_absent(&saved_key, grant);
+                                continue;
+                            }
+                            Err(error) => return Err(restore_refusal(&grant.path, crate::bounded_io::timeout_code(&error), error)),
+                        }
+                    }
                     match validate(&json!([entry]), head.as_ref(), saved_head_key.as_ref()) {
                         Ok(valid) => {
                             for grant in valid {

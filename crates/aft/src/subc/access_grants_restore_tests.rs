@@ -34,6 +34,7 @@ struct WireRestore {
 impl WireRestore {
     async fn new() -> Self {
         let (dir, ctx, head, _) = default_fixture();
+        ctx.update_config(|config| config.experimental_bash_background = true);
         let worker = identity(&head.project_root, "worker", "worker", Some("head"));
         register(&worker, &ctx).unwrap();
         let target = policy_path(&dir.path().join("saved-launch"));
@@ -53,6 +54,7 @@ impl WireRestore {
         )
         .unwrap();
         let revived = at_epoch(&worker, 8);
+        register(&revived, &ctx).unwrap();
         let ctx = Arc::new(ctx);
         let executor = Arc::new(Executor::new());
         executor.register_actor(revived.root.clone(), ctx.clone());
@@ -208,6 +210,22 @@ impl WireRestore {
         self.send(FrameType::Goodbye, 0, 999, json!({})).await;
         self.module.take().unwrap().join().unwrap().unwrap();
     }
+
+    fn install_shell_launcher(&self) -> Box<dyn std::any::Any> {
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = self._dir.path().join("sandbox-profile-capture");
+        let profile = self.revived.project_root.join("last-profile.json");
+        // Capture the normally resolved profile, then execute a real command.
+        // Native sandbox enforcement belongs to the platform sandbox tests.
+        std::fs::write(&launcher, format!(
+            "#!/bin/sh\nshift\n[ \"$1\" = --profile-json ] || exit 91\nprintf '%s' \"$2\" > '{}'\nshift 2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n", profile.display()
+        )).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Box::new(crate::sandbox_spawn::install_sandbox_launcher_for_test(
+            &self.revived.project_root,
+            launcher,
+        ))
+    }
 }
 
 #[tokio::test]
@@ -265,12 +283,28 @@ async fn grants_stalled_restore_allows_independently_granted_read() {
 }
 
 #[tokio::test]
-async fn grants_stalled_restore_refuses_bash_with_unknown_paths() {
-    if !in_isolated_process("grants_stalled_restore_refuses_bash_with_unknown_paths") {
+async fn grants_stalled_restore_runs_bash_with_reduced_profile() {
+    if !in_isolated_process("grants_stalled_restore_runs_bash_with_reduced_profile") {
         return;
     }
     let mut wire = WireRestore::new().await;
+    let _launcher = wire.install_shell_launcher();
     let marker = wire.revived.project_root.join("bash-ran");
+    let independent = policy_path(&wire._dir.path().join("independent-write"));
+    std::fs::create_dir_all(&independent).unwrap();
+    {
+        let db = wire.ctx.db().unwrap();
+        store::insert(
+            &db.lock().unwrap(),
+            &scope_key(&wire.revived),
+            &AccessGrant {
+                path: independent.clone(),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Write,
+            },
+        )
+        .unwrap();
+    }
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
     wire.call_tool(
         100,
@@ -279,19 +313,142 @@ async fn grants_stalled_restore_refuses_bash_with_unknown_paths() {
     )
     .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
-    let reply = wire.reply(100, Duration::from_secs(3)).await.unwrap();
-    wire.assert_unrestored();
-    assert!(
-        !marker.exists(),
-        "bash must not spawn with unknown grant dependencies"
-    );
-    drop(stall);
+    let reply = wire.reply(100, Duration::from_secs(5)).await.unwrap();
+    assert!(!wire
+        .ctx
+        .launch_grants_materialized(&scope_key(&wire.revived)));
     let target = wire.target.clone();
+    let ran = marker.exists();
+    let profile = ran.then(|| {
+        serde_json::from_slice::<crate::sandbox_profile::SandboxProfile>(
+            &std::fs::read(wire.revived.project_root.join("last-profile.json")).unwrap(),
+        )
+        .unwrap()
+    });
+    drop(stall);
     wire.stop().await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["code"], "grants_unavailable", "{body}");
-    assert_eq!(body["detail"]["retryable"], true, "{body}");
-    assert_eq!(body["detail"]["path"], json!(target), "{body}");
+    assert!(ran, "checkout bash did not run: {body}");
+    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+    let notices = body["structuredContent"]["unrestored_grants"]
+        .as_array()
+        .expect("structured grant notice");
+    let grant = notices
+        .iter()
+        .find(|grant| grant["path"] == json!(target))
+        .unwrap();
+    assert_eq!(grant["mode"], "write");
+    assert_eq!(grant["retryable"], true);
+    let text = body["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("Unrestored launch grants:"), "{text}");
+    assert!(text.contains(&target.display().to_string()), "{text}");
+    assert!(text.contains("temporarily unavailable"), "{text}");
+    assert!(text.contains("permission error"), "{text}");
+    let profile = profile.unwrap();
+    assert!(!profile.writable_roots.contains(&target));
+    assert!(!profile.read_allow.contains(&target));
+    assert!(profile.writable_roots.contains(&independent), "{profile:?}");
+}
+
+#[tokio::test]
+async fn grants_deleted_target_is_not_reprobed_or_regranted() {
+    if !in_isolated_process("grants_deleted_target_is_not_reprobed_or_regranted") {
+        return;
+    }
+    let mut wire = WireRestore::new().await;
+    let _launcher = wire.install_shell_launcher();
+    let target = wire.target.clone();
+    std::fs::remove_dir_all(&target).unwrap();
+    let marker = wire.revived.project_root.join("bash-ran");
+    wire.call_tool(
+        100,
+        "bash",
+        json!({"command":format!("touch '{}'", marker.display())}),
+    )
+    .await;
+    let first = wire.reply(100, Duration::from_secs(5)).await.unwrap();
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    assert!(marker.exists(), "{first}");
+    assert_eq!(first["structuredContent"]["success"], true, "{first}");
+    let notices = first["structuredContent"]["unrestored_grants"]
+        .as_array()
+        .unwrap();
+    let missing = notices
+        .iter()
+        .find(|grant| grant["path"] == json!(target))
+        .unwrap();
+    assert_eq!(missing["mode"], "write");
+    assert_eq!(missing["retryable"], false, "{first}");
+    assert!(first["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("no longer exists"));
+    assert_eq!(wire.ctx.launch_grant_state.probe_count(&target), 1);
+
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("probe.txt"), "replacement object").unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    wire.call_tool(
+        102,
+        "bash",
+        json!({"command":format!("touch '{}'", marker.display())}),
+    )
+    .await;
+    let second = wire.reply(102, Duration::from_secs(5)).await.unwrap();
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert!(marker.exists(), "{second}");
+    assert_eq!(second["structuredContent"]["success"], true, "{second}");
+    assert!(
+        second["structuredContent"]["unrestored_grants"].is_null(),
+        "notice must appear once: {second}"
+    );
+    assert_eq!(
+        wire.ctx.launch_grant_state.probe_count(&target),
+        1,
+        "a terminally missing saved target must not be probed again"
+    );
+    wire.call(103).await;
+    let read = wire.reply(103, Duration::from_secs(3)).await.unwrap();
+    let read: Value = serde_json::from_slice(&read.body).unwrap();
+    assert_eq!(
+        read["structuredContent"]["code"], "grants_unavailable",
+        "{read}"
+    );
+    assert_eq!(
+        read["structuredContent"]["detail"]["retryable"], false,
+        "{read}"
+    );
+    wire.stop().await;
+}
+
+#[test]
+fn grants_saved_target_with_non_directory_parent_is_terminal() {
+    let (_dir, ctx, head, worker) = default_fixture();
+    let parent = head.project_root.join("grant-parent");
+    let target = parent.join("child");
+    std::fs::create_dir_all(&target).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&parent).unwrap();
+    std::fs::write(&parent, "not a directory").unwrap();
+    let revived = at_epoch(&worker, 8);
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    assert_eq!(ctx.launch_grant_state.probe_count(&target), 1);
+    let _scope = crate::access_policy::scope_guard(Some(scope_key(&revived)));
+    let _ask = crate::access_policy::ask_route_guard(Some(ask_route(&revived)));
+    let unavailable = ctx.unrestored_launch_grants("enotdir").unwrap();
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable[0].path, target);
+    assert!(!unavailable[0].retryable);
+    let db = ctx.db().unwrap();
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -359,6 +516,8 @@ fn grants_stalled_restore_worker_exits_before_path_recovers() {
     }
     let (_dir, ctx, head, worker) = default_fixture();
     let target = head.project_root.join("saved-launch");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(head.project_root.join("healthy-launch")).unwrap();
     remote_policy::catalog(
         catalog_request(json!([
             {"path":head.project_root.join("healthy-launch"),"mode":"read"},

@@ -1058,6 +1058,7 @@ pub(super) fn submit_deferred_bash(
     // relayed before the client's deadline. OpenCode and Pi extend their reply
     // deadlines for runon calls to allow input capture after task registration.
     let grant_scope = crate::access_policy::current_scope();
+    let ask_route = crate::access_policy::current_ask_route();
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
     let spawn_ctx = match executor.try_actor_context(&root) {
@@ -1094,6 +1095,41 @@ pub(super) fn submit_deferred_bash(
             return;
         }
     };
+    // Capture unavailable grants on the executor, where database reads belong,
+    // and annotate only the reply being delivered, not each foreground poll.
+    let notice_snapshot = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let snapshot_for_reply = notice_snapshot.clone();
+    let notice_state = spawn_ctx.launch_grant_state.clone();
+    let notice_key = match &ask_route {
+        crate::access_policy::AskRoute::Consent { launch, .. } => launch.clone(),
+        _ => None,
+    };
+    let annotated_completion_tx = notice_key.map(|key| {
+        let (tx, mut annotated_completion_rx) = mpsc::channel::<BashDeferredCompletion>(1);
+        let completion_forward = completion_tx.clone();
+        let completion_metrics = metrics.clone();
+        tokio::spawn(async move {
+            while let Some(mut done) = annotated_completion_rx.recv().await {
+                decrement_counted_channel(&completion_metrics.bash_deferred_queued);
+                if let Some(result) = done.result.as_mut() {
+                    let notices = notice_state.notices(&key, &snapshot_for_reply.lock());
+                    crate::context::launch_grants::annotate_shell_reply(
+                        &mut result.text,
+                        &mut result.response,
+                        &notices,
+                    );
+                }
+                let _ = send_counted_channel(
+                    &completion_forward,
+                    &completion_metrics.bash_deferred_queued,
+                    done,
+                )
+                .await;
+            }
+        });
+        tx
+    });
+    let completion_tx = annotated_completion_tx.as_ref().unwrap_or(completion_tx);
     let raw_args = arguments
         .get("params")
         .filter(|params| params.is_object())
@@ -1327,6 +1363,7 @@ pub(super) fn submit_deferred_bash(
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+                            let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                             crate::sandbox_spawn::with_worker_jail(worker_jail, || {
                             crate::bash_background::with_call_key(call_key, || {
                                 crate::bash_background::registry::with_ledger_spawn(
@@ -1347,7 +1384,12 @@ pub(super) fn submit_deferred_bash(
                                                               crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || {
                                                                   let run_dispatch = || {
                                                                       crate::bash_rewrite::with_rewrites_off(run_scoped, || {
-                                                                          crate::bash_background::with_call_requester(task_requester, || dispatch(raw_req, ctx))
+                                                                           crate::bash_background::with_call_requester(task_requester, || {
+                                                                               match ctx.unrestored_launch_grants(&raw_req.id) {
+                                                                                   Ok(grants) => { *notice_snapshot.lock() = grants; dispatch(raw_req, ctx) }
+                                                                                   Err(response) => response,
+                                                                               }
+                                                                           })
                                                                       })
                                                                   };
                                                                   #[cfg(not(test))]

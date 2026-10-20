@@ -47,6 +47,8 @@ pub(crate) use gitignore_state::apply_project_ignore_rules;
 
 #[path = "confinement.rs"]
 pub(crate) mod confinement;
+#[path = "launch_grants.rs"]
+pub(crate) mod launch_grants;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
@@ -3764,6 +3766,7 @@ pub struct AppContext {
     /// Confirmed launch materializations shared by this root's routes. Missing
     /// params and failed restores are not cached, so later calls can retry.
     launch_grants_materialized: parking_lot::Mutex<HashSet<crate::db::access_grants::ScopeKey>>,
+    pub(crate) launch_grant_state: Arc<launch_grants::LaunchGrantState>,
     #[cfg(test)]
     launch_restore_attempts: AtomicUsize,
     #[cfg(test)]
@@ -4578,6 +4581,7 @@ impl AppContext {
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             launch_grants_materialized: parking_lot::Mutex::new(HashSet::new()),
+            launch_grant_state: Arc::default(),
             #[cfg(test)]
             launch_restore_attempts: AtomicUsize::new(0),
             #[cfg(test)]
@@ -6838,12 +6842,14 @@ impl AppContext {
         self.app.set_db(conn);
         self.compression_aggregates.clear();
         self.launch_grants_materialized.lock().clear();
+        self.launch_grant_state.clear();
     }
 
     pub fn clear_db(&self) {
         self.app.clear_db();
         self.compression_aggregates.clear();
         self.launch_grants_materialized.lock().clear();
+        self.launch_grant_state.clear();
     }
 
     pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
@@ -13460,12 +13466,12 @@ impl AppContext {
         Ok(resolved)
     }
 
-    /// Read saved launch entries without resolving their paths or caching a
-    /// failure. These entries can explain a refusal but cannot authorize access.
+    /// Read saved launch inputs without filesystem probes and combine them with
+    /// confirmed-absence records. Neither source can authorize path access.
     pub(crate) fn unrestored_launch_grants(
         &self,
         req_id: &str,
-    ) -> Result<Vec<crate::access_policy::AccessGrant>, crate::protocol::Response> {
+    ) -> Result<Vec<launch_grants::UnrestoredGrant>, crate::protocol::Response> {
         let crate::access_policy::AskRoute::Consent {
             launch: Some(key), ..
         } = crate::access_policy::current_ask_route()
@@ -13486,19 +13492,26 @@ impl AppContext {
         let conn = db
             .lock()
             .map_err(|_| unavailable("grant database lock poisoned; retry".into()))?;
-        crate::db::access_grants::unrestored_launch(&conn, &key)
-            .map_err(|error| unavailable(format!("launch grants unavailable: {error}; retry")))
+        let pending = crate::db::access_grants::unrestored_launch(&conn, &key)
+            .map_err(|error| unavailable(format!("launch grants unavailable: {error}; retry")))?;
+        Ok(self.launch_grant_state.unavailable(&key, pending))
     }
 
-    pub(crate) fn unrestored_grant_refusal(req_id: &str, path: &Path) -> crate::protocol::Response {
+    pub(crate) fn unrestored_grant_refusal(
+        req_id: &str,
+        grant: &launch_grants::UnrestoredGrant,
+    ) -> crate::protocol::Response {
+        let path = &grant.path;
+        let status = if grant.retryable {
+            "is not restored; retry after the path recovers"
+        } else {
+            "no longer exists; this saved grant cannot be restored"
+        };
         crate::protocol::Response::error_with_data(
             req_id,
             "grants_unavailable",
-            format!(
-                "launch grant for {} is not restored; retry after the path recovers",
-                path.display()
-            ),
-            serde_json::json!({"detail":{"retryable":true,"path":path,"phase":"launch_grant_restore"}}),
+            format!("launch grant for {} {status}", path.display()),
+            serde_json::json!({"detail":{"retryable":grant.retryable,"path":path,"phase":"launch_grant_restore"}}),
         )
     }
 
@@ -13539,7 +13552,7 @@ impl AppContext {
             decision,
             AccessDecision::Allow | AccessDecision::Deny(AccessDenial::Floor)
         ) {
-            return Err(Self::unrestored_grant_refusal(req_id, &grant.path));
+            return Err(Self::unrestored_grant_refusal(req_id, grant));
         }
         Ok(())
     }
