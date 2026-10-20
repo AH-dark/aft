@@ -7325,6 +7325,9 @@ fn walk_applicable_area_uncached(
             reason: "project root is not a directory".to_string(),
         });
     }
+    crate::views::io::WORK
+        .applicability_walks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     delay_applicability_walk_for_test();
 
     let walk_roots = match scope_roots.filter(|roots| !roots.is_empty()) {

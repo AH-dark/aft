@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "corpora": {
+    "aft": {
+      "repository": "https://github.com/cortexkit/aft.git",
+      "commit": "05d40ac417db6137a4204521bd3c59853325e968"
+    },
+    "opencode": {
+      "repository": "https://github.com/anomalyco/opencode.git",
+      "commit": "f7d5a1cbc725665586dc69b312c11be1d3787f0b"
+    },
+    "kubernetes": {
+      "repository": "https://github.com/kubernetes/kubernetes.git",
+      "commit": "66452049f3d692768c39c797b21b793dce80314e"
+    }
+  },
+  "workload": {
+    "roots": [1, 5, 15],
+    "source_file": "views_perf_probe.rs",
+    "states": ["atomic_edit", "revert", "tool_write", "tool_revert", "branch_switch", "branch_return", "worktree_create", "worktree_remove"],
+    "g2_warmup_minutes": 5,
+    "g2_activity_minutes": 30,
+    "g2_quiet_minutes": 20,
+    "edit_cycle_seconds": 20,
+    "query_interval_seconds": 5,
+    "semantic_backend": "fastembed",
+    "semantic_model": "default resolved by the binary; record effective model in each result",
+    "witness": "probe_entry must call probe_alpha in base state and probe_beta in changed state; every state must be witnessed before another mutation"
+  }
+}

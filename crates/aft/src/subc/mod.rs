@@ -199,6 +199,9 @@ type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod access_grants;
 mod bash;
+// The grant tests run real shell commands, which need a POSIX shell.
+#[cfg(all(test, unix))]
+mod bash_grant_tests;
 #[cfg(test)]
 mod bash_selector_tests;
 mod consent;
@@ -6521,10 +6524,41 @@ fn route_bind_error_code_for_configure_response(response: &Response) -> &'static
         // a fresh bind can create or join a healthy actor, so do not classify
         // them as permanent config divergence.
         Some("actor_not_registered" | "actor_fatal") => "actor_not_ready",
+        // The retention binding record sits behind a storage-wide file lock
+        // that background sweeps also take. A bind that times out waiting for
+        // it is contention, not divergent configuration, so the client retries
+        // instead of treating the root as permanently refused.
+        Some("retention_binding_unavailable") => "actor_not_ready",
         _ => "config_divergence",
     }
 }
 
+#[cfg(test)]
+mod route_bind_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn retention_binding_lock_timeout_is_a_retryable_bind_refusal() {
+        let response = Response::error(
+            "bind",
+            "retention_binding_unavailable",
+            "cannot protect checkout cache binding: timed out acquiring filesystem lock",
+        );
+        assert_eq!(
+            route_bind_error_code_for_configure_response(&response),
+            "actor_not_ready"
+        );
+    }
+
+    #[test]
+    fn unknown_configure_refusals_stay_config_divergence() {
+        let response = Response::error("bind", "some_new_refusal", "x");
+        assert_eq!(
+            route_bind_error_code_for_configure_response(&response),
+            "config_divergence"
+        );
+    }
+}
 /// Open the root's database on the dedicated database-open thread now that the
 /// bind reply is out, instead of waiting for the root's configure tail. Tails
 /// are admitted a few at a time across all roots, so after a restart a root's

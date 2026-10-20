@@ -1295,9 +1295,14 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
     let watcher_pending = aft::response_finalize::watcher_query_pending(ctx, &req.command);
+    let callgraph_pending = aft::response_finalize::callgraph_query_pending(ctx, &req.command);
     let mut response = dispatch_command(req, ctx);
     aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
     aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
+    aft::response_finalize::attach_callgraph_pending_gaps(
+        &mut response,
+        callgraph_pending.as_ref(),
+    );
     // Every mutation this request made is on disk now; record what it left so
     // a later undo can tell AFT's own result from a change made outside AFT.
     ctx.backup().lock().record_post_mutation_states();
@@ -4163,6 +4168,116 @@ mod watcher_filter_tests {
         assert_eq!(
             tree.children[0].name, "newLeaf",
             "async callgraph refresh did not publish the changed edge"
+        );
+    }
+
+    /// An editor's atomic save (temporary file renamed over the original)
+    /// reaches the refresh worker like a write. While the worker has not
+    /// applied it, a call-graph answer still shows the old edge and must say
+    /// so with `complete: false` and a gap naming the file; once the refresh
+    /// lands, the new edge is served as a complete answer.
+    #[test]
+    fn pending_callgraph_refresh_marks_answers_incomplete_and_names_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let root = root.as_path();
+        let worker =
+            aft::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.to_path_buf());
+        let source = root.join("main.ts");
+        std::fs::write(
+            &source,
+            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(root.join("storage")),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_harness(Harness::Opencode);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx.set_cache_role(false, None);
+        aft::root_cache::configure_artifact_access(
+            root,
+            &aft::search_index::artifact_cache_key(root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+        let tx = install_watcher_rx(&ctx);
+        ctx.ensure_callgraph_store()
+            .unwrap()
+            .expect("store should build on demand");
+        let call_tree = || {
+            dispatch(
+                serde_json::from_value(serde_json::json!({
+                    "id": "pending-call-tree",
+                    "command": "call_tree",
+                    "file": source,
+                    "symbol": "entry",
+                    "depth": 1,
+                }))
+                .unwrap(),
+                &ctx,
+            )
+        };
+        let before = call_tree();
+        assert_eq!(before.data["children"][0]["name"], "oldLeaf");
+        assert!(before.data.get("complete").is_none(), "{:?}", before.data);
+
+        let temporary = root.join(".main.ts.swp");
+        std::fs::write(
+            &temporary,
+            "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        std::fs::rename(&temporary, &source).unwrap();
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.to_path_buf());
+        // A rename-over reports both the vanished temporary file and the
+        // replaced original.
+        tx.send(WatcherDispatchEvent::Paths(vec![temporary, source.clone()]))
+            .unwrap();
+        drain_watcher_events(&ctx);
+        held.recv_timeout(Duration::from_secs(60))
+            .expect("fixture worker never took the refresh");
+        let pending = call_tree();
+        release.send(()).unwrap();
+        assert_eq!(
+            pending.data["children"][0]["name"], "oldLeaf",
+            "the held worker must not publish early"
+        );
+        assert_eq!(
+            pending.data["complete"], false,
+            "a stale answer must not look complete: {:?}",
+            pending.data
+        );
+        assert!(
+            pending.data["gaps"].as_array().is_some_and(|gaps| gaps
+                .iter()
+                .any(|gap| gap["kind"] == "callgraph_pending" && gap["path"] == "main.ts")),
+            "the pending gap must name the saved file: {:?}",
+            pending.data
+        );
+
+        assert!(
+            worker.wait(Duration::from_secs(60)),
+            "fixture refresh worker hung"
+        );
+        let after = call_tree();
+        assert_eq!(after.data["children"][0]["name"], "newLeaf");
+        assert!(
+            after.data.get("complete").is_none(),
+            "a refreshed answer is complete: {:?}",
+            after.data
         );
     }
 

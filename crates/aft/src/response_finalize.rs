@@ -1203,6 +1203,144 @@ pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
     ) && ctx.watcher_query_has_pending_changes()
 }
 
+/// Commands answered from the call graph.
+fn is_callgraph_command(command: &str) -> bool {
+    matches!(
+        command,
+        "callgraph"
+            | "callers"
+            | "call_tree"
+            | "impact"
+            | "trace_to"
+            | "trace_to_symbol"
+            | "trace_data"
+    )
+}
+
+/// The call-graph changes still being applied when a call-graph command
+/// starts. Captured before execution for the same reason as
+/// [`watcher_query_pending`]: a refresh that lands while the answer is being
+/// computed does not make that answer current. `None` for other commands and
+/// when nothing is pending.
+pub fn callgraph_query_pending(
+    ctx: &AppContext,
+    command: &str,
+) -> Option<crate::context::CallgraphUnappliedChanges> {
+    if !is_callgraph_command(command) {
+        return None;
+    }
+    Some(ctx.callgraph_unapplied_changes()).filter(|changes| !changes.is_empty())
+}
+
+/// Above this many files of one kind, a call-graph answer reports how many
+/// files are pending in a single gap instead of one gap per file, so a branch
+/// switch that touches thousands of files does not bury the answer.
+const NAMED_PENDING_FILE_LIMIT: usize = 20;
+
+const VIEW_PENDING_REASON: &str = "callgraph changes not yet installed";
+const STORE_PENDING_REASON: &str = "file changes not yet applied to the call graph";
+
+/// Mark a successful call-graph answer as incomplete while edits it may not
+/// reflect are still being applied, naming the files. Views report through
+/// the same `view_pending` gap the per-checkout query wait uses.
+pub fn attach_callgraph_pending_gaps(
+    response: &mut Response,
+    pending: Option<&crate::context::CallgraphUnappliedChanges>,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if !response.success {
+        return;
+    }
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    data.insert("complete".into(), Value::Bool(false));
+    let mut added = Vec::new();
+    for (kind, reason, paths) in [
+        ("view_pending", VIEW_PENDING_REASON, &pending.view_paths),
+        (
+            "callgraph_pending",
+            STORE_PENDING_REASON,
+            &pending.store_paths,
+        ),
+    ] {
+        if paths.len() > NAMED_PENDING_FILE_LIMIT {
+            added.push(serde_json::json!({"kind": kind, "files": paths.len(), "reason": reason}));
+        } else {
+            added.extend(
+                paths
+                    .iter()
+                    .map(|path| serde_json::json!({"kind": kind, "path": path, "reason": reason})),
+            );
+        }
+    }
+    if pending.whole_checkout {
+        added.push(serde_json::json!({
+            "kind": "view_pending",
+            "reason": "checkout changes not yet installed in the call graph",
+        }));
+    }
+    let gaps = data
+        .entry("gaps")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(gaps) = gaps.as_array_mut() {
+        for gap in added {
+            if !gaps.contains(&gap) {
+                gaps.push(gap);
+            }
+        }
+    }
+}
+
+/// The line a rendered call-graph answer carries while edits are pending,
+/// built from the gaps [`attach_callgraph_pending_gaps`] and the per-checkout
+/// query wait attach.
+pub(crate) fn append_callgraph_pending_notice(text: &mut String, response: &Response) {
+    if let Some(notice) = callgraph_pending_notice(response) {
+        if !text.contains(&notice) {
+            append_trailing_line(text, &notice);
+        }
+    }
+}
+
+fn callgraph_pending_notice(response: &Response) -> Option<String> {
+    let gaps = response.data.get("gaps")?.as_array()?;
+    let mut named = Vec::new();
+    let mut counted = 0u64;
+    let mut whole_checkout = false;
+    for gap in gaps {
+        if !matches!(
+            gap.get("kind").and_then(Value::as_str),
+            Some("view_pending" | "callgraph_pending")
+        ) {
+            continue;
+        }
+        if let Some(path) = gap.get("path").and_then(Value::as_str) {
+            if !named.contains(&path) {
+                named.push(path);
+            }
+        } else if let Some(files) = gap.get("files").and_then(Value::as_u64) {
+            counted += files;
+        } else {
+            whole_checkout = true;
+        }
+    }
+    let subject = if whole_checkout {
+        "this checkout".to_string()
+    } else if counted > 0 || named.len() > 3 {
+        format!("{} files", counted + named.len() as u64)
+    } else if named.is_empty() {
+        return None;
+    } else {
+        named.join(", ")
+    };
+    Some(format!(
+        "Call graph update pending for {subject}: this answer may show calls from before those edits. Retry shortly for the updated graph."
+    ))
+}
+
 pub fn attach_watcher_query_gap(response: &mut Response, pending: bool) {
     if !pending || !response.success {
         return;
@@ -1341,5 +1479,89 @@ mod checkout_transport_tests {
         finalize_tool_response(&mut response, &mut text, &ctx, "session", "callers", false);
         assert_eq!(response.data["complete"], false);
         assert_eq!(response.data["gaps"][0]["path"], "unreflected.rs");
+    }
+}
+
+#[cfg(test)]
+mod callgraph_pending_tests {
+    use super::*;
+    use crate::context::CallgraphUnappliedChanges;
+
+    fn pending(view: &[&str], store: &[&str], whole_checkout: bool) -> CallgraphUnappliedChanges {
+        CallgraphUnappliedChanges {
+            store_paths: store.iter().map(|path| path.to_string()).collect(),
+            view_paths: view.iter().map(|path| path.to_string()).collect(),
+            whole_checkout,
+        }
+    }
+
+    fn rendered(response: &Response) -> String {
+        let mut text = String::from("tree");
+        append_callgraph_pending_notice(&mut text, response);
+        text
+    }
+
+    #[test]
+    fn pending_files_are_named_and_mark_the_answer_incomplete() {
+        let mut response = Response::success("cg", serde_json::json!({"children": []}));
+        attach_callgraph_pending_gaps(
+            &mut response,
+            Some(&pending(&["src/view.rs"], &["src/store.rs"], false)),
+        );
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(
+            response.data["gaps"],
+            serde_json::json!([
+                {"kind": "view_pending", "path": "src/view.rs", "reason": VIEW_PENDING_REASON},
+                {"kind": "callgraph_pending", "path": "src/store.rs", "reason": STORE_PENDING_REASON},
+            ])
+        );
+        assert!(rendered(&response).ends_with(
+            "Call graph update pending for src/view.rs, src/store.rs: this answer may show calls from before those edits. Retry shortly for the updated graph."
+        ));
+    }
+
+    #[test]
+    fn many_pending_files_are_counted_in_one_gap() {
+        let paths = (0..=NAMED_PENDING_FILE_LIMIT)
+            .map(|index| format!("src/file{index}.rs"))
+            .collect::<Vec<_>>();
+        let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut response = Response::success("cg", serde_json::json!({}));
+        attach_callgraph_pending_gaps(&mut response, Some(&pending(&paths, &[], false)));
+        assert_eq!(
+            response.data["gaps"],
+            serde_json::json!([{
+                "kind": "view_pending",
+                "files": NAMED_PENDING_FILE_LIMIT + 1,
+                "reason": VIEW_PENDING_REASON,
+            }])
+        );
+        assert!(rendered(&response).contains(&format!(
+            "pending for {} files:",
+            NAMED_PENDING_FILE_LIMIT + 1
+        )));
+    }
+
+    #[test]
+    fn a_whole_checkout_publication_is_reported_without_a_path() {
+        let mut response = Response::success("cg", serde_json::json!({}));
+        attach_callgraph_pending_gaps(&mut response, Some(&pending(&[], &[], true)));
+        assert_eq!(response.data["complete"], false);
+        assert!(response.data["gaps"][0].get("path").is_none());
+        assert!(rendered(&response).contains("pending for this checkout:"));
+    }
+
+    #[test]
+    fn nothing_pending_or_a_failed_answer_is_left_alone() {
+        let mut response = Response::success("cg", serde_json::json!({"children": []}));
+        attach_callgraph_pending_gaps(&mut response, None);
+        assert_eq!(response.data, serde_json::json!({"children": []}));
+        assert_eq!(rendered(&response), "tree");
+
+        let mut failed = Response::error("cg", "symbol_not_found", "missing");
+        let before = failed.data.clone();
+        attach_callgraph_pending_gaps(&mut failed, Some(&pending(&["a.rs"], &[], false)));
+        assert_eq!(failed.data, before);
     }
 }

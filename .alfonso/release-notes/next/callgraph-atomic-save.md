@@ -1,0 +1,1 @@
+- While an edit is still being applied to the call graph, `aft_callgraph` answers are marked `complete: false` and name the pending file, including on per-checkout views; previously a views-enabled checkout served the pre-edit edge for the whole republication as if it were complete.

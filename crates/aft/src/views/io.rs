@@ -1,7 +1,58 @@
-//! Process-wide Darwin I/O deltas, not per-root counters. Other roots and
-//! background work can contribute to every interval. Overlap counts flag
-//! concurrent publications but cannot rule out other concurrent I/O.
+//! Process-wide work counters and kernel I/O deltas, not per-root counters.
+//! Other roots and background work can contribute to every interval. Overlap
+//! counts flag publications but cannot rule out other concurrent I/O.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Lifetime totals for measured work sites, shared by every root in this process.
+/// Relaxed loads are intentionally not a transactional snapshot; difference them
+/// only within one daemon lifetime, never sum overlapping per-root intervals.
+pub(crate) struct WorkCounters {
+    pub source_hashes: AtomicU64,
+    pub source_hash_bytes: AtomicU64,
+    pub content_reads: AtomicU64,
+    pub content_read_bytes: AtomicU64,
+    pub full_walks: AtomicU64,
+    pub applicability_walks: AtomicU64,
+    pub logical_aggregates: AtomicU64,
+    pub own_generation_folds: AtomicU64,
+}
+
+pub(crate) static WORK: WorkCounters = WorkCounters {
+    source_hashes: AtomicU64::new(0),
+    source_hash_bytes: AtomicU64::new(0),
+    content_reads: AtomicU64::new(0),
+    content_read_bytes: AtomicU64::new(0),
+    full_walks: AtomicU64::new(0),
+    applicability_walks: AtomicU64::new(0),
+    logical_aggregates: AtomicU64::new(0),
+    own_generation_folds: AtomicU64::new(0),
+};
+
+/// Hash source bytes, counting repeated hashes as repeated work. Payload and
+/// embedding-text checksums are not source hashes and must not use this helper.
+pub(crate) fn source_hash(bytes: &[u8]) -> blake3::Hash {
+    WORK.source_hashes.fetch_add(1, Ordering::Relaxed);
+    WORK.source_hash_bytes
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    blake3::hash(bytes)
+}
+
+pub(crate) fn work_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "pid": std::process::id(),
+        "scope": "process_lifetime_instrumented_sites",
+        "source_hashes": WORK.source_hashes.load(Ordering::Relaxed),
+        "source_hash_bytes": WORK.source_hash_bytes.load(Ordering::Relaxed),
+        "content_reads": WORK.content_reads.load(Ordering::Relaxed),
+        "content_read_bytes": WORK.content_read_bytes.load(Ordering::Relaxed),
+        "full_walks": WORK.full_walks.load(Ordering::Relaxed),
+        "applicability_walks": WORK.applicability_walks.load(Ordering::Relaxed),
+        "logical_aggregates": WORK.logical_aggregates.load(Ordering::Relaxed),
+        "own_generation_folds": WORK.own_generation_folds.load(Ordering::Relaxed),
+    })
+}
 
 pub(crate) use crate::process_io::Bytes;
 #[derive(Default)]
@@ -207,6 +258,44 @@ impl Drop for Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn performance_work_counts_real_source_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("counter.rs");
+        std::fs::write(&path, b"fn counter() {}\n").unwrap();
+        let before = work_snapshot();
+        let bytes = crate::project_content::read(&path).unwrap();
+        assert_eq!(
+            crate::cache_freshness::hash_bytes(&bytes),
+            blake3::hash(&bytes)
+        );
+        let _ = crate::search_index::project_walk_builder(root.path())
+            .build()
+            .count();
+        let after = work_snapshot();
+        for field in ["source_hashes", "content_reads", "full_walks"] {
+            assert!(
+                after[field].as_u64().unwrap() > before[field].as_u64().unwrap(),
+                "{field}"
+            );
+        }
+        for field in ["source_hash_bytes", "content_read_bytes"] {
+            assert!(
+                after[field].as_u64().unwrap()
+                    >= before[field].as_u64().unwrap() + bytes.len() as u64,
+                "{field}"
+            );
+        }
+        for field in [
+            "applicability_walks",
+            "logical_aggregates",
+            "own_generation_folds",
+        ] {
+            assert!(after[field].is_u64(), "{field}");
+        }
+        assert_eq!(after["pid"], std::process::id());
+    }
+
     #[test]
     fn publication_byte_buckets_sum_to_process_delta() {
         let bytes = |n| Bytes {

@@ -1334,6 +1334,9 @@ pub(crate) struct WatcherCounters {
     last_rescan_cost_ms: AtomicU64,
     last_rescan_rss_delta_bytes: AtomicI64,
     last_rescan_rss_delta_known: AtomicBool,
+    /// Call-graph source files the watcher thread has received but is still
+    /// holding in its flush window, before they reach the dispatch channel.
+    unflushed_source_paths: Mutex<BTreeSet<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1375,6 +1378,38 @@ impl WatcherCounters {
             .fetch_add(count, Ordering::Relaxed);
         self.paths_dispatched_since_last_rescan
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record changed files the watcher thread holds in its flush window.
+    /// Only files the call graph indexes are kept: a call-graph answer is the
+    /// only reader, and other files cannot change one.
+    pub(crate) fn note_unflushed_paths<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        let mut unflushed = self
+            .unflushed_source_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unflushed.extend(
+            paths
+                .into_iter()
+                .filter(|path| crate::parser::detect_language(path).is_some())
+                .cloned(),
+        );
+    }
+
+    /// The flush window ended: its files are in the dispatch channel (or were
+    /// filtered out), where the watcher drain accounts for them.
+    pub(crate) fn clear_unflushed_paths(&self) {
+        self.unflushed_source_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    pub(crate) fn unflushed_paths(&self) -> BTreeSet<PathBuf> {
+        self.unflushed_source_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[cfg(target_os = "linux")]
@@ -1660,6 +1695,25 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) view_publication_paths: BTreeSet<PathBuf>,
     pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
+}
+
+/// File changes the call graph has not taken yet, as root-relative paths with
+/// `/` separators. See [`AppContext::callgraph_unapplied_changes`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallgraphUnappliedChanges {
+    /// Files whose changes the root's call-graph store has not applied.
+    pub store_paths: BTreeSet<String>,
+    /// Files whose changes the checkout's published view has not installed.
+    pub view_paths: BTreeSet<String>,
+    /// The view is republishing the whole checkout, so which files changed
+    /// is not known.
+    pub whole_checkout: bool,
+}
+
+impl CallgraphUnappliedChanges {
+    pub fn is_empty(&self) -> bool {
+        self.store_paths.is_empty() && self.view_paths.is_empty() && !self.whole_checkout
+    }
 }
 
 pub(crate) struct WatcherDrainGuard<'a>(&'a AtomicUsize);
@@ -5561,6 +5615,92 @@ impl AppContext {
     /// an empty slot alone does not prove that indexed answers are current.
     pub fn watcher_query_has_pending_changes(&self) -> bool {
         self.watcher_drains_in_flight.load(Ordering::Acquire) > 0 || self.watcher_drain_has_work()
+    }
+
+    /// File changes the watcher has delivered that the call graph serving this
+    /// root's answers has not taken yet. Source files the watcher thread still
+    /// holds in its flush window count for both kinds of graph. The legacy
+    /// store also counts paths queued, running, or parked in its refresh
+    /// worker and paths deferred until a writable store is ready. A
+    /// per-checkout view counts paths waiting out the publication quiet window
+    /// and paths carried by a publication that has not installed its
+    /// generation. Events in the dispatch channel or in a drain that has not
+    /// sorted them yet are not listed here; `watcher_query_has_pending_changes`
+    /// covers them without naming files.
+    pub fn callgraph_unapplied_changes(&self) -> CallgraphUnappliedChanges {
+        let mut changes = CallgraphUnappliedChanges::default();
+        if !self.config().indexes.callgraph {
+            return changes;
+        }
+        let roots: Vec<PathBuf> = [
+            self.callgraph_project_root(),
+            self.config().project_root.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let relative = |path: &Path| -> String {
+            let shown = roots
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            shown.to_string_lossy().replace('\\', "/")
+        };
+        let mut store_paths: BTreeSet<PathBuf> = self
+            .pending_callgraph_store_paths
+            .lock()
+            .iter()
+            .cloned()
+            .collect();
+        if let Some(project_root) = self.callgraph_project_root() {
+            store_paths.extend(crate::callgraph_store::callgraph_refresh_unapplied_paths(
+                &project_root,
+            ));
+        }
+        // Files still in the watcher thread's flush window are not yet in the
+        // dispatch channel, so nothing else reports them as changing.
+        let unflushed = self
+            .watcher_counters()
+            .unflushed_paths()
+            .into_iter()
+            .map(|path| relative(&path));
+        if self.config().views.enabled {
+            changes.view_paths.extend(unflushed);
+        } else {
+            changes.store_paths.extend(unflushed);
+        }
+        changes
+            .store_paths
+            .extend(store_paths.iter().map(|path| relative(path)));
+        if self.config().views.enabled {
+            // A view answers for every file the call graph indexes; edits to
+            // other files (an editor's temporary save file, for example) are
+            // published too but cannot change a call-graph answer.
+            if let Some(state) = self.watcher_drain_slice.lock().as_ref() {
+                if state.view_publication_due.is_some() && state.view_publication_paths.is_empty() {
+                    changes.whole_checkout = true;
+                }
+                changes.view_paths.extend(
+                    state
+                        .view_publication_paths
+                        .iter()
+                        .filter(|path| crate::parser::detect_language(path).is_some())
+                        .map(|path| relative(path)),
+                );
+            }
+            if let Some(paths) = crate::executor::view_publication::unpublished_paths_for(self) {
+                if paths.is_empty() {
+                    changes.whole_checkout = true;
+                }
+                changes.view_paths.extend(
+                    paths
+                        .iter()
+                        .map(|path| String::from_utf8_lossy(path).into_owned())
+                        .filter(|path| crate::parser::detect_language(Path::new(path)).is_some()),
+                );
+            }
+        }
+        changes
     }
 
     pub(crate) fn watcher_drain_guard(&self) -> WatcherDrainGuard<'_> {

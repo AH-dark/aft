@@ -85,7 +85,7 @@ pub enum FreshnessVerdict {
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> blake3::Hash {
-    blake3::hash(bytes)
+    crate::views::io::source_hash(bytes)
 }
 
 pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blake3::Hash>> {

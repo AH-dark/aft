@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Batch D: views measurement counters (health metrics), call-graph pending-edit disclosure, retryable bind on retention lock timeout, bash permission forgery regression tests, order-independent V2 permission tests. No ranking-fenced file changed. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

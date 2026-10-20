@@ -959,6 +959,9 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
         options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
     }
     let scratch_check = crate::task_temp_reads::check_path(path)?;
+    crate::views::io::WORK
+        .content_reads
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut file = options.open(path)?;
     crate::task_temp_reads::check_opened(path, scratch_check.as_ref(), &file)?;
     let metadata = file.metadata()?;
@@ -973,6 +976,9 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
         .try_reserve(usize::try_from(metadata.len()).map_err(io::Error::other)?)
         .map_err(io::Error::other)?;
     file.read_to_end(&mut bytes)?;
+    crate::views::io::WORK
+        .content_read_bytes
+        .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(bytes)
 }
 pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {

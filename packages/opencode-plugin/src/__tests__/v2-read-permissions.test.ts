@@ -183,7 +183,12 @@ test("zoom batch authorizes distinct files and keeps allowed lookups after a den
       { path: "allowed.ts", symbol: "allowed" },
     ],
   });
-  expect(calls.map((call) => call.resources)).toEqual([["allowed.ts"], ["secret-dir/file.ts"]]);
+  // Distinct files are authorized in parallel, so the order of the host's
+  // permission calls is not fixed; what matters is one call per file.
+  expect(calls.map((call) => call.resources).sort()).toEqual([
+    ["allowed.ts"],
+    ["secret-dir/file.ts"],
+  ]);
   expect(dispatched).toEqual([
     {
       targets: [
@@ -271,11 +276,20 @@ test("directory outline checks only rendered files and rechecks newly visible fi
       const result = await execute("aft_outline", { target: root, files });
       expect(result.content).toBe("allowed() newlyVisible()\n1 files left out by read rules.");
       expect(dispatched).toHaveLength(2);
-      expect(calls.filter((call) => call.action === "read").map((call) => call.resources)).toEqual([
-        [relative(process.cwd(), allowed)],
-        [relative(process.cwd(), secret)],
-        [relative(process.cwd(), newlyVisible)],
-      ]);
+      // The first round's files are authorized in parallel, so compare the set
+      // of checked files; the two dispatches above prove the second round.
+      expect(
+        calls
+          .filter((call) => call.action === "read")
+          .map((call) => call.resources)
+          .sort(),
+      ).toEqual(
+        [
+          [relative(process.cwd(), allowed)],
+          [relative(process.cwd(), secret)],
+          [relative(process.cwd(), newlyVisible)],
+        ].sort(),
+      );
     }
   } finally {
     await rm(root, { recursive: true, force: true });

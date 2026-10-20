@@ -3090,6 +3090,7 @@ fn build_health_report_with_indexing(
         "process_io".to_string(),
         crate::process_io::ProcessIoSnapshot::capture().to_value(),
     );
+    metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
     metrics.insert(
         "write_ledger_top_10m".to_string(),
         json!(crate::write_ledger::recent_top_writers()),

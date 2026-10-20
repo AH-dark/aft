@@ -12898,6 +12898,24 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
     let report = expect_health_check_report(&mut stream, 20).await;
     let metrics = report.metrics.clone().expect("health check metrics");
+    let work = metrics.get("views_work").expect("production work counters");
+    assert_eq!(work["pid"], std::process::id());
+    assert_eq!(work["schema"], 1);
+    for field in [
+        "source_hashes",
+        "source_hash_bytes",
+        "content_reads",
+        "content_read_bytes",
+        "full_walks",
+        "applicability_walks",
+        "logical_aggregates",
+        "own_generation_folds",
+    ] {
+        assert!(
+            work[field].is_u64(),
+            "missing production counter {field}: {work}"
+        );
+    }
     assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
     for (section, fields) in [
         (

@@ -25,6 +25,7 @@ mod helpers;
 
 #[path = "../integration/branch_switch_test.rs"]
 mod branch_switch_test;
+mod callgraph_atomic_save_test;
 mod callgraph_watcher_test;
 mod config_live_reload_test;
 mod configure_watcher_test;
