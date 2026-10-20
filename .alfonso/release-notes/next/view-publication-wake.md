@@ -1,0 +1,1 @@
+Fixed delayed updates in views-enabled checkouts: a due view publication now wakes the watcher drain without waiting for unrelated maintenance. The one-second quiet window still coalesces bursts of edits into a single publication, and unchanged checkouts return to idle.

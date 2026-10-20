@@ -16536,6 +16536,213 @@ mod tests {
         assert!(!deferred);
     }
 
+    async fn assert_quiet_view_publication_wake(edit_count: usize) {
+        use crate::context::ViewRuntimeSnapshot;
+        use crate::watcher_filter::WatcherDispatchEvent;
+        use std::collections::BTreeSet;
+
+        let (_dir, root) = test_root("maintenance-view-deadline");
+        let root_path = std::fs::canonicalize(root.as_path()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "Publication test"],
+            vec!["config", "user.email", "publication@example.invalid"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root_path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        for name in ["first.rs", "second.rs"] {
+            std::fs::write(root_path.join(name), "pub fn original() {}\n").unwrap();
+        }
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root_path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root_path.clone());
+            config.storage_dir = Some(storage.path().to_owned());
+            config.views.enabled = true;
+            config.indexes.trigram = false;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = true;
+        });
+        ctx.set_canonical_cache_root(root_path.clone());
+        let scope = crate::path_identity::project_scope_key(&root_path);
+        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
+        ctx.install_view_runtime(
+            ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: storage.path().to_owned(),
+                family: "maintenance-view-fixture".to_owned(),
+                scope,
+                view_dir: view.view_dir().to_owned(),
+                generation: None,
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::capture_git_head_metadata(&root_path, None).unwrap(),
+                pending_paths: BTreeSet::new(),
+                pending_inputs: Default::default(),
+            },
+            None,
+        );
+        let initial = ctx
+            .publish_view_paths(BTreeSet::new(), true)
+            .unwrap()
+            .generation;
+        runtime_drain::drain_build_completions(&ctx);
+        runtime_drain::drain_inspect_events(&ctx);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(8);
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let mut jobs = async || {
+            let (jobs, deferred) = due_maintenance_jobs(
+                &mut live_roots,
+                Some(&executor),
+                &BgSubsBySession::new(),
+                &BgWakePending::new(),
+                MAINTENANCE_SUBMIT_BUDGET,
+                &HashSet::new(),
+            );
+            assert!(!deferred);
+            for (job_root, kind) in &jobs {
+                assert_eq!((job_root, *kind), (&root, MaintenanceDrainKind::Watcher));
+                submit_maintenance_job(
+                    &executor,
+                    job_root.clone(),
+                    *kind,
+                    Vec::new(),
+                    &completion_tx,
+                    &metrics,
+                );
+                let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                    .await
+                    .expect("watcher maintenance must finish")
+                    .unwrap();
+                assert!(completion.response.success);
+                note_maintenance_completion(
+                    live_roots.get_mut(job_root).unwrap(),
+                    completion.requeue_kind,
+                    false,
+                    false,
+                );
+            }
+            jobs
+        };
+        assert!(jobs().await.is_empty());
+        let baseline = ctx.view_publication_attempts_for_test();
+        let mut changed = BTreeSet::new();
+        let mut previous_due = None;
+        let mut last_edit = Instant::now();
+        for edit in 0..edit_count {
+            let path = root_path.join(if edit % 2 == 0 {
+                "first.rs"
+            } else {
+                "second.rs"
+            });
+            last_edit = Instant::now();
+            std::fs::write(&path, format!("pub fn changed_{edit}() {{}}\n")).unwrap();
+            changed.insert(path.clone());
+            tx.send(WatcherDispatchEvent::Paths(vec![path])).unwrap();
+            assert_eq!(jobs().await.len(), 1);
+            let slice = ctx.watcher_drain_slice().lock();
+            let state = slice.as_ref().unwrap();
+            assert_eq!(state.view_publication_paths, changed);
+            let due = state.view_publication_due.unwrap();
+            assert!(due > last_edit);
+            if let Some(previous) = previous_due {
+                assert!(due > previous, "each batch extends the quiet window");
+            }
+            previous_due = Some(due);
+            drop(slice);
+            assert!(
+                ctx.view_publication_attempts_for_test() == baseline,
+                "the debounce must not publish early"
+            );
+            assert!(
+                jobs().await.is_empty(),
+                "a future deadline must not spin the dispatcher"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let due = previous_due.unwrap();
+        let deadline = last_edit + Duration::from_secs(2);
+        while ctx.view_publication_attempts_for_test() == baseline && Instant::now() < deadline {
+            assert!(
+                !ctx.tier2_refresh_dispatch_due(),
+                "no Tier-2 rescue wake is due"
+            );
+            jobs().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ctx.view_publication_attempts_for_test() - baseline,
+            1,
+            "view publication did not start within 2s of the edit without other maintenance due"
+        );
+        let started = Instant::now();
+        assert!(started >= due, "publication must respect the quiet window");
+        assert!(started <= due + Duration::from_secs(1));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx.view_runtime_snapshot().unwrap().generation == initial {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the started publication must install its generation");
+        runtime_drain::drain_build_completions(&ctx);
+        runtime_drain::drain_inspect_events(&ctx);
+        let slice = ctx.watcher_drain_slice().lock();
+        assert!(slice.as_ref().unwrap().view_publication_due.is_none());
+        assert!(slice.as_ref().unwrap().view_publication_paths.is_empty());
+        drop(slice);
+        for _ in 0..10 {
+            assert!(
+                jobs().await.is_empty(),
+                "an unchanged root must return to idle"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ctx.view_publication_attempts_for_test() - baseline,
+            1,
+            "a burst publishes exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_publication_quiet_root_wakes_without_other_maintenance() {
+        assert_quiet_view_publication_wake(1).await;
+    }
+
+    #[tokio::test]
+    async fn view_publication_burst_coalesces_and_returns_idle() {
+        assert_quiet_view_publication_wake(3).await;
+    }
+
     /// The maintenance probes run on the frame loop, which also answers
     /// health checks and routes requests. A probe that waits for its source's
     /// lock parks the whole module for as long as another thread holds it,
