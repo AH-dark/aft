@@ -626,16 +626,50 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
     Ok(usage)
 }
 
+/// Measures the family store by its files alone. It opens no plane store:
+/// admission, the hard limit and the recorded totals read only file bytes,
+/// and a logical payload total would cost one aggregate query per plane on
+/// every pass. Reports that want that total call [`family_payload_bytes`].
 fn measure_family_store(
     registry: &FamilyRegistry,
     deadline: Option<Instant>,
 ) -> RegistryResult<FamilyStoreUsage> {
-    let dir = family_dir(registry.storage(), registry.family())?;
-    let (file_bytes, complete) = tree_bytes(&dir, deadline)?;
+    let (file_bytes, complete) =
+        family_file_bytes(registry.storage(), registry.family(), deadline)?;
     Ok(FamilyStoreUsage {
         file_bytes,
         complete,
     })
+}
+
+/// Bytes of every file under `blobs/v2/<family>/`, each file once, and
+/// whether the walk reached the end before `deadline` and its bounds. It
+/// only lists directories and reads file sizes, so it opens no SQLite file.
+/// The family sweep uses the same walk to tell that a family is too small
+/// to be over its budget.
+pub(crate) fn family_file_bytes(
+    storage: &Path,
+    family: &str,
+    deadline: Option<Instant>,
+) -> RegistryResult<(u64, bool)> {
+    let dir = family_dir(storage, family)?;
+    Ok(tree_bytes(&dir, deadline)?)
+}
+
+/// `SUM(length(payload))` over every plane store of the family, for reports
+/// that show the logical size beside the file size. It opens each plane
+/// store and runs one aggregate query per plane, so enforcement, admission
+/// and measurement never call it.
+pub fn family_payload_bytes(registry: &FamilyRegistry) -> RegistryResult<u64> {
+    let mut payload_bytes = 0u64;
+    for plane in FamilyPlane::ALL {
+        if let Some(store) =
+            FamilyStoreReader::open_existing(registry.storage(), registry.family(), plane)?
+        {
+            payload_bytes = payload_bytes.saturating_add(store.usage()?.payload_bytes);
+        }
+    }
+    Ok(payload_bytes)
 }
 
 /// Divides the family store's keys among the views that rely on them. A key
@@ -885,7 +919,7 @@ pub fn enforce(
     if !past(deadline) {
         #[cfg(test)]
         LAST_SWEEP_BUDGET.with(|last| last.set(Some(policy.byte_budget)));
-        match family::sweep_family_bounded(registry, None, policy, walk_bounds(deadline), None) {
+        match family::sweep_family_remeasured(registry, None, policy, walk_bounds(deadline), None) {
             Ok(sweep) => {
                 report.stopped_early |= sweep.stopped_early;
                 report.sweep = Some(sweep);
@@ -2625,13 +2659,14 @@ mod tests {
         }
         eprintln!(
             "occupancy view_store_bytes={} ({:.6}% of the {} byte soft limit) family_store_file_bytes={} \
-             ({:.6}% of the {} byte soft limit) referenced_bytes={} shared_bytes={}",
+             ({:.6}% of the {} byte soft limit) payload_bytes={} referenced_bytes={} shared_bytes={}",
             usage.view_store_bytes,
             percent(usage.view_store_bytes, VIEW_STORE_SOFT_BYTES),
             VIEW_STORE_SOFT_BYTES,
             usage.family_store.file_bytes,
             percent(usage.family_store.file_bytes, FAMILY_STORE_SOFT_BYTES),
             FAMILY_STORE_SOFT_BYTES,
+            family_payload_bytes(&registry).unwrap(),
             keys.referenced_bytes,
             keys.shared_bytes
         );
@@ -2829,17 +2864,8 @@ mod tests {
 
     /// `SUM(length(payload))` over every plane of the family, the logical
     /// total the occupancy report prints next to the file bytes.
-    fn payload_total(registry: &FamilyRegistry, _usage: &DiskUsage) -> u64 {
-        let mut total = 0u64;
-        for plane in FamilyPlane::ALL {
-            if let Some(store) =
-                FamilyStoreReader::open_existing(registry.storage(), registry.family(), plane)
-                    .unwrap()
-            {
-                total += store.usage().unwrap().payload_bytes;
-            }
-        }
-        total
+    fn payload_total(registry: &FamilyRegistry) -> u64 {
+        family_payload_bytes(registry).unwrap()
     }
 
     /// The usage rows the last recorded measurement left in the registry,
@@ -2963,10 +2989,7 @@ mod tests {
             usage.held_view_bytes,
             usage.complete
         ));
-        values.push(format!(
-            "payload_total={}",
-            payload_total(&registry, &usage)
-        ));
+        values.push(format!("payload_total={}", payload_total(&registry)));
         values.push(format!("{:?}", account_keys(&registry, None).unwrap()));
         values.extend(recorded_rows(&registry));
         values.push(format!("admission default {}", admission(&registry)));
@@ -3037,6 +3060,209 @@ mod tests {
         }
     }
 
+    /// Builds a family of two idle views and returns its registry, so tests
+    /// can build identical copies of it in separate storage roots.
+    fn two_view_family(storage: &Path) -> FamilyRegistry {
+        let registry = FamilyRegistry::open(storage, FAMILY).unwrap();
+        for (seed, scope) in ["a", "b"].into_iter().enumerate() {
+            idle_view(&registry, scope, seed as u64, 16);
+            set_last_bind(&registry, scope, seed as u64 + 1);
+        }
+        wait_for_background_enforcement(&registry);
+        registry
+    }
+
+    /// Measurement reads file sizes only, so a plane store that is not a
+    /// SQLite file at all is measured like any other file. The family sweep,
+    /// which has to open the store, reports why it could not run, and the
+    /// enforcement pass still finishes. Before measurement stopped opening
+    /// plane stores, the same family failed to measure at all.
+    #[test]
+    fn an_unopenable_plane_store_is_measured_by_size_and_reported_by_the_sweep() {
+        let intact_storage = tempfile::tempdir().unwrap();
+        let broken_storage = tempfile::tempdir().unwrap();
+        let intact = two_view_family(intact_storage.path());
+        let broken = two_view_family(broken_storage.path());
+        let plane =
+            crate::blob_store::v2::plane_path(broken_storage.path(), FAMILY, FamilyPlane::Trigram)
+                .unwrap();
+        // Same length, so the family's file bytes must not change.
+        let length = fs::metadata(&plane).unwrap().len() as usize;
+        fs::write(&plane, vec![b'x'; length]).unwrap();
+
+        let expected = measure(&intact, None).unwrap();
+        let measured = measure(&broken, None).expect("measurement opens no plane store");
+        assert!(measured.family_store.complete);
+        assert_eq!(
+            measured.family_store.file_bytes,
+            expected.family_store.file_bytes
+        );
+
+        let report = enforce(&broken, EnforceOptions::default()).unwrap();
+        assert!(report.evicted.is_empty());
+        assert!(report.sweep.is_none());
+        let error = report
+            .sweep_error
+            .expect("the sweep could not open the store");
+        assert!(error.contains("not a database"), "{error}");
+        assert!(report.after.family_store.complete);
+    }
+
+    /// Runs one enforcement pass and counts the planes whose logical totals
+    /// its family sweep read.
+    fn enforce_counting_aggregates(registry: &FamilyRegistry) -> (EnforcementReport, usize) {
+        let before = crate::gc::family::delete_aggregates_on_this_thread();
+        let report = enforce(registry, EnforceOptions::default()).unwrap();
+        let after = crate::gc::family::delete_aggregates_on_this_thread();
+        (report, after - before)
+    }
+
+    fn plane_stores(storage: &Path) -> usize {
+        FamilyPlane::ALL
+            .into_iter()
+            .filter(|plane| {
+                crate::blob_store::v2::plane_path(storage, FAMILY, *plane)
+                    .unwrap()
+                    .is_file()
+            })
+            .count()
+    }
+
+    /// A pass below every limit sweeps without reading any plane's logical
+    /// totals: the family's files already fit in the payload budget. Every
+    /// pass that could find something to delete still reads them, once per
+    /// plane: file bytes over the payload budget but under the soft limit,
+    /// a walk of the family's files that could not finish, and a pass that
+    /// evicted a view and so collects every unreferenced row.
+    #[test]
+    fn a_below_limit_sweep_reads_no_logical_totals_and_every_other_pass_reads_them() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = two_view_family(storage.path());
+        let planes = plane_stores(storage.path());
+        assert_eq!(planes, 1);
+        LAST_SWEEP_BUDGET.with(|last| last.set(None));
+
+        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        assert!(report.evicted.is_empty() && report.before.complete);
+        assert_eq!(
+            LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
+            Some(FAMILY_PAYLOAD_BUDGET_BYTES)
+        );
+        assert_eq!(report.sweep.as_ref().unwrap().deleted_blobs, 0);
+        assert_eq!(aggregates, 0, "below-limit pass");
+        // Marking and the release of free pages still ran.
+        let sweep = report.sweep.as_ref().unwrap();
+        assert!(sweep.marked_keys > 0);
+        assert_eq!(sweep.space_reclaim.examined_stores, planes as u64);
+
+        // Over a payload budget of one byte, far under the soft limit.
+        registry.set_disk_budget(DiskBudget {
+            family_payload: 1,
+            ..DiskBudget::default()
+        });
+        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        assert!(report.evicted.is_empty());
+        assert!(report.before.family_store.file_bytes < FAMILY_STORE_SOFT_BYTES);
+        assert_eq!(LAST_SWEEP_BUDGET.with(|last| last.replace(None)), Some(1));
+        assert_eq!(aggregates, planes, "over the payload budget");
+
+        // A directory deeper than the walk goes leaves it incomplete.
+        registry.set_disk_budget(DiskBudget::default());
+        let deep = family_dir(storage.path(), FAMILY)
+            .unwrap()
+            .join("deeper/than/the-walk");
+        fs::create_dir_all(&deep).unwrap();
+        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        assert!(report.evicted.is_empty() && !report.before.family_store.complete);
+        assert_eq!(
+            LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
+            Some(FAMILY_PAYLOAD_BUDGET_BYTES)
+        );
+        assert_eq!(aggregates, planes, "incomplete walk");
+        fs::remove_dir_all(family_dir(storage.path(), FAMILY).unwrap().join("deeper")).unwrap();
+
+        registry.set_disk_budget(budget(0, u64::MAX));
+        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        assert_eq!(evicted(&report), ["a", "b"]);
+        assert_eq!(LAST_SWEEP_BUDGET.with(|last| last.replace(None)), Some(0));
+        assert!(report.sweep.as_ref().unwrap().deleted_blobs > 0);
+        assert_eq!(aggregates, planes, "collect-all pass");
+    }
+
+    /// Builds the two-view family, records its file bytes, then grows it with
+    /// rows no view references, put before any sweep raises its epoch.
+    fn grown_family(storage: &Path) -> (FamilyRegistry, u64) {
+        let registry = two_view_family(storage);
+        let (before_growth, complete) = family_file_bytes(storage, FAMILY, None).unwrap();
+        assert!(complete);
+        let access = crate::blob_store::v2::StoreWriteAccess::for_registered_view(storage, FAMILY);
+        let store =
+            crate::blob_store::v2::FamilyStore::open(&access, FamilyPlane::Trigram).unwrap();
+        for seed in 100..140 {
+            let bytes = text(seed, 8_000);
+            store
+                .put_or_touch(
+                    &trigram_key(&bytes),
+                    &TrigramPayload::extract(&bytes, &policy()).encode(),
+                )
+                .unwrap();
+        }
+        (registry, before_growth)
+    }
+
+    /// A family that grew past the sweep's budget after it was last measured
+    /// is swept exactly like the sweep that always reads logical totals,
+    /// because the skip decision measures the files again after marking. A
+    /// sweep that trusted the measurement taken before the growth would skip
+    /// and delete nothing.
+    #[test]
+    fn a_family_grown_past_the_budget_since_its_last_measurement_is_swept_in_full() {
+        let remeasured_storage = tempfile::tempdir().unwrap();
+        let aggregate_storage = tempfile::tempdir().unwrap();
+        let stale_storage = tempfile::tempdir().unwrap();
+        let (remeasured, byte_budget) = grown_family(remeasured_storage.path());
+        let (aggregate, _) = grown_family(aggregate_storage.path());
+        let (stale, stale_measurement) = grown_family(stale_storage.path());
+        let policy = FamilySweepPolicy { byte_budget };
+        let (grown, complete) = family_file_bytes(remeasured_storage.path(), FAMILY, None).unwrap();
+        assert!(complete && grown > byte_budget, "{grown} <= {byte_budget}");
+
+        let before = crate::gc::family::delete_aggregates_on_this_thread();
+        let swept = family::sweep_family_remeasured(
+            &remeasured,
+            None,
+            policy,
+            SweepBounds::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::gc::family::delete_aggregates_on_this_thread() - before,
+            plane_stores(remeasured_storage.path())
+        );
+        let reference =
+            family::sweep_family_bounded(&aggregate, None, policy, SweepBounds::default(), None)
+                .unwrap();
+        assert!(reference.deleted_blobs > 0, "{reference:?}");
+        assert_eq!(
+            (swept.deleted_blobs, swept.deleted_bytes),
+            (reference.deleted_blobs, reference.deleted_bytes)
+        );
+
+        let trusted = family::sweep_with(
+            &stale,
+            None,
+            FamilySweepPolicy {
+                byte_budget: stale_measurement,
+            },
+            SweepBounds::default(),
+            None,
+            family::SmallFamilyCheck::Assumed(stale_measurement),
+        )
+        .unwrap();
+        assert_eq!((trusted.deleted_blobs, trusted.deleted_bytes), (0, 0));
+    }
+
     /// Receipt for the views performance gate G2a subset: the process-wide
     /// `metrics.views_work.logical_aggregates` counter across below-limit
     /// enforcement passes, with their wall time (reported, not gated). Other
@@ -3094,9 +3320,8 @@ mod tests {
                 "passes": passes,
             })
         );
-        // On main since "reduce v2 blob reuse and disk-limit read costs",
-        // measurement opens no plane store and the sweep's page-capacity bound
-        // already rules out deletion for a family this small.
+        // Measurement opens no plane store, and the family sweep's walk of
+        // the family's files rules out deletion for a family this small.
         for pass in &passes {
             assert_eq!(
                 pass["logical_aggregates"],
