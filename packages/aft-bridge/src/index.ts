@@ -83,6 +83,8 @@ export {
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,
+  BashPatternMatchAck,
+  BashPatternMatchFrame,
   BridgeClock,
   BridgeOptions,
   BridgeRequestOptions,

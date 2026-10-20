@@ -2171,6 +2171,12 @@ export class SubcTransportPool implements AftTransportPool {
     }
     if (name === "bash_unnotify" && data.unregistered === true && typeof args.watch_id === "string")
       record.backgroundWatches.delete(args.watch_id);
+    if (name === "bash_ack_completions" && Array.isArray(data.acked_matches)) {
+      for (const match of data.acked_matches) {
+        if (isRecord(match) && match.watch_removed === true && typeof match.watch_id === "string")
+          record.backgroundWatches.delete(match.watch_id);
+      }
+    }
     if (name === "bash_ack_completions" && Array.isArray(data.acked_task_ids)) {
       // ACK also acknowledges mid-run pattern matches. It does not prove a
       // running/unknown task is terminal, so those must keep their carrier.

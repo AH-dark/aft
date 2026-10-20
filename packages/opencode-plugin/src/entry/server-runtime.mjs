@@ -94,7 +94,7 @@ async function bootLocation(context, location, dependencies) {
     context,
     config,
     () => liveConfig,
-    () => pool.getBridge(canonicalDirectory),
+    (root = directory) => pool.getBridge(root),
   );
   // Only a rejected configuration keeps AFT out of a project; there is no
   // config switch that turns it off.

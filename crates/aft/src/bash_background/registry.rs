@@ -3605,7 +3605,75 @@ impl BgTaskRegistry {
         (stdout, stderr, pty)
     }
 
-    /// Ack path for pattern watches: once-watches (and any terminal-task watches)
+    /// Acknowledge only the durable match admitted by the host. A stale offset
+    /// must not clear a newer sticky match, or a sibling watch on the same task.
+    pub fn ack_pattern_match_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        watch_id: &str,
+        match_offset: u64,
+    ) -> Result<Option<bool>, String> {
+        let terminal = self
+            .persisted_task_is_terminal(session_id, task_id)
+            .unwrap_or(false);
+        let (harness, pool) = self
+            .db_harness_and_pool_for_session(session_id)
+            .ok_or_else(|| "watch persistence unavailable".to_string())?;
+        let (removed, settled) = {
+            let conn = pool.lock().map_err(|error| error.to_string())?;
+            let Some(mut row) = crate::db::bash_watches::get_bash_pattern_watch(
+                &conn, &harness, session_id, task_id, watch_id,
+            )
+            .map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            if !row.pending_match
+                || row.match_offset.map(|offset| offset.max(0) as u64) != Some(match_offset)
+            {
+                return Ok(None);
+            }
+            let removed = row.once || terminal;
+            if removed {
+                crate::db::bash_watches::delete_bash_pattern_watch(
+                    &conn, &harness, session_id, task_id, watch_id,
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                row.pending_match = false;
+                row.match_text = None;
+                row.match_offset = None;
+                row.match_context = None;
+                crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
+                    .map_err(|error| error.to_string())?;
+            }
+            let settled = terminal
+                && !crate::db::bash_watches::list_bash_pattern_watches_for_task(
+                    &conn, &harness, session_id, task_id,
+                )
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|row| row.pending_match);
+            (removed, settled)
+        };
+        self.sync_memory_watches_from_persistence(task_id);
+        // Terminal watched tasks suppress their generic completion. Only after
+        // the last pending match is acknowledged is that completion settled.
+        if settled {
+            if let Some(task) = self.task_for_session(task_id, session_id) {
+                task.set_completion_delivered(true, self)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.mark_persisted_completion_delivered(session_id, task_id);
+            }
+            let _ = self.remove_pending_completion(task_id);
+            self.clear_task_watch_state(task_id);
+        }
+        Ok(Some(removed))
+    }
+
+    /// Task-wide ack: once-watches (and any terminal-task watches)
     /// are dropped after delivery is confirmed; sticky watches clear pending only.
     fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
@@ -21898,6 +21966,66 @@ mod tests {
         assert!(refusal
             .to_string()
             .starts_with(crate::persisted_format::CODE));
+    }
+
+    #[test]
+    fn per_match_ack_settles_terminal_completion_only_after_last_watch() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = "bash-0000000000000198";
+        install_delivered_terminal_with_pending_watch(&registry, &db, storage.path(), task_id);
+        let task = registry.task_for_session(task_id, "session").unwrap();
+        task.set_completion_delivered(false, &registry).unwrap();
+        {
+            let conn = db.lock().unwrap();
+            let mut sibling = crate::db::bash_watches::get_bash_pattern_watch(
+                &conn,
+                "opencode",
+                "session",
+                task_id,
+                "watch-00000001",
+            )
+            .unwrap()
+            .unwrap();
+            sibling.watch_id = "watch-00000002".into();
+            sibling.once = false;
+            crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &sibling).unwrap();
+        }
+        assert_eq!(
+            registry
+                .ack_pattern_match_for_session("foreign", task_id, "watch-00000001", 756_237)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            registry
+                .ack_pattern_match_for_session("session", task_id, "watch-00000001", 756_237)
+                .unwrap(),
+            Some(true)
+        );
+        assert!(!task.lock_state().unwrap().metadata.completion_delivered);
+        assert_eq!(
+            registry
+                .pending_pattern_matches_for_session("session")
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .ack_pattern_match_for_session("session", task_id, "watch-00000002", 756_237)
+                .unwrap(),
+            Some(true)
+        );
+        assert!(task.lock_state().unwrap().metadata.completion_delivered);
+        assert!(registry
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+        assert_eq!(
+            registry
+                .ack_pattern_match_for_session("session", task_id, "watch-00000002", 756_237)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
