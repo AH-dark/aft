@@ -3468,6 +3468,15 @@ mod in_place_write_tests {
     #[test]
     fn replacement_temporary_never_has_a_wider_dacl_than_the_file() {
         let dir = tempfile::tempdir().unwrap();
+        // Make the folder admit more users than the file will: Everyone may
+        // read anything created here. Runner temp folders differ in what new
+        // files get, so the test sets the wider entry itself.
+        let widened = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(R)"])
+            .output()
+            .unwrap();
+        assert!(widened.status.success(), "{widened:?}");
         let path = dir.path().join("strict.txt");
         std::fs::write(&path, "old\n").unwrap();
         let restricted = std::process::Command::new("icacls")
@@ -3481,10 +3490,9 @@ mod in_place_write_tests {
             .unwrap();
         assert!(restricted.status.success(), "{restricted:?}");
         let before = icacls(&path);
-        // The strict file must differ from what a new file in this folder gets,
-        // or a temporary that inherited the folder's entries would pass too.
-        // Runners differ in which explicit entries a temp file keeps, so the
-        // test compares with a fresh sibling instead of counting entries.
+        // The strict file must differ from what a new file in this folder gets
+        // (the folder's inheritable Everyone entry), or a temporary that
+        // inherited the folder's entries would pass too.
         let sibling = dir.path().join("fresh.txt");
         std::fs::write(&sibling, "fresh\n").unwrap();
         let inherited = icacls(&sibling);
