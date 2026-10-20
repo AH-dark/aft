@@ -112,11 +112,12 @@ pub enum CanaryAccess {
     Readable,
     /// No canary exists at this path.
     Missing,
-    /// The policy query itself failed (macOS `sandbox_check` returned an
-    /// error). Nothing is proven, so the shim treats this as "not jailed".
-    /// That keeps the fence because the worker launcher runs the same query
-    /// after applying the jail and refuses to start the shell on anything but
-    /// [`CanaryAccess::Denied`]: a running worker shell has a proven deny.
+    /// The probe could not establish a deny: `sandbox_check` failed, or it
+    /// allowed the read while the canary's metadata was unavailable. The shim
+    /// treats this as "not jailed". That keeps the fence because the worker
+    /// launcher runs the same probe after applying the jail and refuses to
+    /// start the shell on anything but [`CanaryAccess::Denied`]: a running
+    /// worker shell has a proven deny.
     Unproven,
 }
 
@@ -281,15 +282,17 @@ fn macos_probe(path: &Path) -> Probe {
     let detail = format!("{stat}, sandbox_check={result} errno={errno}");
     match result {
         0 if metadata.is_ok() => probe(CanaryAccess::Readable, detail),
-        // Allowed by policy but its metadata is hidden: not readable here.
+        // Policy allows the read, but the metadata check did not confirm the
+        // canary exists.
         0 => probe(CanaryAccess::Unproven, detail),
         1 => probe(CanaryAccess::Denied, detail),
         _ => probe(CanaryAccess::Unproven, detail),
     }
 }
 
-/// One line per candidate canary describing what the probe saw, for test and
-/// support diagnostics. It never changes a decision.
+/// What the probe saw for every candidate canary (and, on Linux, the
+/// no_new_privs value), joined on one line for test and support diagnostics.
+/// It never changes a decision.
 pub fn diagnostics() -> String {
     let mut lines = Vec::new();
     #[cfg(target_os = "linux")]
