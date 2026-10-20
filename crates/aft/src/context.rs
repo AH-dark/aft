@@ -6281,6 +6281,12 @@ impl AppContext {
                         || state
                             .ignore_refresh_due
                             .is_some_and(|due| Instant::now() >= due)
+                        // Publication runs in the watcher drain even after all
+                        // paths are applied. Wake at its quiet deadline, not on
+                        // every tick while the debounce is still pending.
+                        || state
+                            .view_publication_due
+                            .is_some_and(|due| Instant::now() >= due)
                 })
             })
     }
