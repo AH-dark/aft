@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -47,6 +47,8 @@ pub(crate) use gitignore_state::apply_project_ignore_rules;
 
 #[path = "confinement.rs"]
 pub(crate) mod confinement;
+#[path = "launch_grants.rs"]
+pub(crate) mod launch_grants;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
@@ -517,6 +519,82 @@ impl SubcLifecycleAdmission {
 
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_secs(5);
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL: Duration = Duration::from_millis(10);
+
+#[derive(Debug)]
+enum SearchIndexShutdownOutcome {
+    Flushed,
+    Skipped,
+    Failed(&'static str),
+}
+
+/// Completion messages received before the search-index shutdown deadline.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct SearchIndexShutdownReport {
+    pub completed: usize,
+    pub flushed: usize,
+    pub failed_roots: Vec<PathBuf>,
+    pub unfinished_roots: Vec<PathBuf>,
+}
+
+/// Wait for each root's synchronous write to finish, bounded by the caller's
+/// exit deadline. A deadline is not a completion event: unfinished workers
+/// retain their deltas, but process exit may interrupt them, so name each root
+/// whose cache was not saved instead of reporting an aggregate success.
+#[doc(hidden)]
+pub fn flush_search_indexes_before(
+    contexts: &[Arc<AppContext>],
+    deadline: Instant,
+) -> SearchIndexShutdownReport {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending = std::collections::BTreeMap::new();
+    for (id, ctx) in contexts.iter().enumerate() {
+        let root = ctx
+            .canonical_cache_root_opt()
+            .unwrap_or_else(|| ctx.config().project_root.clone().unwrap_or_default());
+        pending.insert(id, root);
+        let ctx = Arc::clone(ctx);
+        let tx = tx.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send((id, ctx.search_index_shutdown_outcome()));
+        });
+        #[cfg(test)]
+        crate::subc::record_exit_index_flush_worker(worker);
+        #[cfg(not(test))]
+        drop(worker);
+    }
+    drop(tx);
+    let mut report = SearchIndexShutdownReport::default();
+    while !pending.is_empty() {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((id, outcome)) => {
+                let root = pending.remove(&id).expect("pending search flush root");
+                report.completed += 1;
+                match outcome {
+                    SearchIndexShutdownOutcome::Flushed => report.flushed += 1,
+                    SearchIndexShutdownOutcome::Skipped => {}
+                    SearchIndexShutdownOutcome::Failed(reason) => {
+                        crate::slog_warn!(
+                            "search index: shutdown flush failed root={}: {}",
+                            root.display(),
+                            reason
+                        );
+                        report.failed_roots.push(root);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    for root in pending.into_values() {
+        crate::slog_warn!(
+            "search index: shutdown flush unfinished root={}: completion not received before exit deadline; delta may not be saved",
+            root.display()
+        );
+        report.unfinished_roots.push(root);
+    }
+    report
+}
 
 /// Numeric projection for consumers that still require the legacy status-bar
 /// shape. It is derived from [`StatusBarCountValues`], which preserves whether
@@ -2721,6 +2799,16 @@ struct PathRestrictionContext {
     path_for_resolution: PathBuf,
 }
 
+/// Marks explicit roots passed to search tools so their worker-only refusal
+/// for a filesystem-root search can be handled at the shared path gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerSearchTool {
+    Glob,
+    Grep,
+    AftSearch,
+    AstGrepSearch,
+}
+
 /// Per-context memo for the configured project root used by containment checks.
 ///
 /// `resolved_root` is the bare output from `fs::canonicalize`; it must not be
@@ -2751,6 +2839,50 @@ mod lexical_comparison_tests {
             );
         }
     }
+}
+
+fn relative_components_under_root(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    match components.next()? {
+        Component::Prefix(_) => match components.next()? {
+            Component::RootDir => {}
+            _ => return None,
+        },
+        Component::RootDir => {}
+        _ => return None,
+    }
+
+    let mut relative = PathBuf::new();
+    for component in components {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+fn checkout_counterpart(original: &Path, checkout: &Path) -> Option<PathBuf> {
+    let relative = relative_components_under_root(original)?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+
+    // Normalize before probing so a spelling such as /../secret never stats
+    // the unnormalized path supplied by the caller.
+    let normalized_original = normalize_path(original);
+    match std::fs::symlink_metadata(&normalized_original) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        _ => return None,
+    }
+
+    let checkout = std::fs::canonicalize(checkout).ok()?;
+    let candidate = normalize_path(&checkout.join(relative));
+    if !candidate.starts_with(&checkout) {
+        return None;
+    }
+
+    let canonical_candidate = std::fs::canonicalize(&candidate).ok()?;
+    canonical_candidate
+        .starts_with(&checkout)
+        .then_some(canonical_candidate)
 }
 
 fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
@@ -3646,6 +3778,12 @@ pub struct AppContext {
     /// root's exact `PathBuf` spelling, so reconfiguration never reuses a
     /// canonical root selected for another configured value.
     path_restriction_root_memo: parking_lot::Mutex<Option<PathRestrictionRootMemo>>,
+    /// Confirmed launch materializations shared by this root's routes. Missing
+    /// params and failed restores are not cached, so later calls can retry.
+    launch_grants_materialized: parking_lot::Mutex<HashSet<crate::db::access_grants::ScopeKey>>,
+    pub(crate) launch_grant_state: Arc<launch_grants::LaunchGrantState>,
+    #[cfg(test)]
+    launch_restore_attempts: AtomicUsize,
     #[cfg(test)]
     path_restriction_root_canonicalizations: AtomicUsize,
     force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
@@ -4457,6 +4595,10 @@ impl AppContext {
             config_live: crate::config_live::ConfigLiveState::default(),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
+            launch_grants_materialized: parking_lot::Mutex::new(HashSet::new()),
+            launch_grant_state: Arc::default(),
+            #[cfg(test)]
+            launch_restore_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
             force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
@@ -6727,15 +6869,40 @@ impl AppContext {
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         self.app.set_db(conn);
         self.compression_aggregates.clear();
+        self.launch_grants_materialized.lock().clear();
+        self.launch_grant_state.clear();
     }
 
     pub fn clear_db(&self) {
         self.app.clear_db();
         self.compression_aggregates.clear();
+        self.launch_grants_materialized.lock().clear();
+        self.launch_grant_state.clear();
     }
 
     pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.app.db()
+    }
+
+    pub(crate) fn launch_grants_materialized(
+        &self,
+        scope: &crate::db::access_grants::ScopeKey,
+    ) -> bool {
+        self.launch_grants_materialized.lock().contains(scope)
+    }
+
+    pub(crate) fn memoize_launch_grants(&self, scope: crate::db::access_grants::ScopeKey) {
+        self.launch_grants_materialized.lock().insert(scope);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_launch_restore_attempt(&self) {
+        self.launch_restore_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_restore_attempts(&self) -> usize {
+        self.launch_restore_attempts.load(Ordering::Relaxed)
     }
 
     /// Mark persistence as initializing for a configure that just committed,
@@ -10523,8 +10690,16 @@ impl AppContext {
     /// and never write the shared artifact.
     #[doc(hidden)]
     pub fn flush_search_index_on_graceful_shutdown(&self) -> bool {
+        matches!(
+            self.search_index_shutdown_outcome(),
+            SearchIndexShutdownOutcome::Flushed
+        )
+    }
+
+    fn search_index_shutdown_outcome(&self) -> SearchIndexShutdownOutcome {
+        use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
         if self.shared_artifacts_read_only() {
-            return false;
+            return Skipped;
         }
 
         self.drain_search_index_events_for_graceful_shutdown();
@@ -10534,18 +10709,8 @@ impl AppContext {
         }
 
         if self.search_index_build_in_progress() {
-            return false;
+            return Failed("search index rebuild did not settle");
         }
-
-        let Some(canonical_root) = self.canonical_cache_root_opt() else {
-            return false;
-        };
-        let config = self.config();
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
-        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
-            &project_key,
-            config.storage_dir.as_deref(),
-        );
 
         {
             let search_index = self
@@ -10553,12 +10718,25 @@ impl AppContext {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(index) = search_index.as_ref() else {
-                return false;
+                return Skipped;
             };
-            if !index.ready || !index.has_pending_disk_changes() {
-                return false;
+            if !index.ready {
+                return Failed("search index is not ready");
+            }
+            if !index.has_pending_disk_changes() {
+                return Skipped;
             }
         }
+
+        let Some(canonical_root) = self.canonical_cache_root_opt() else {
+            return Failed("canonical cache root is unavailable");
+        };
+        let config = self.config();
+        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+            &project_key,
+            config.storage_dir.as_deref(),
+        );
 
         let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(
             &cache_dir,
@@ -10570,7 +10748,7 @@ impl AppContext {
                     "search index: skipped shutdown flush because cache lock was unavailable: {}",
                     error
                 );
-                return false;
+                return Failed("cache lock unavailable");
             }
         };
 
@@ -10579,14 +10757,21 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(index) = search_index.as_mut() else {
-            return false;
+            return Skipped;
         };
-        if !index.ready || !index.has_pending_disk_changes() {
-            return false;
+        if !index.ready {
+            return Failed("search index is not ready");
+        }
+        if !index.has_pending_disk_changes() {
+            return Skipped;
         }
 
         let git_head = index.stored_git_head().map(str::to_owned);
-        index.write_to_disk(&cache_dir, git_head.as_deref())
+        if index.write_to_disk(&cache_dir, git_head.as_deref()) {
+            Flushed
+        } else {
+            Failed("disk cache write failed")
+        }
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
@@ -13127,7 +13312,7 @@ impl AppContext {
         // Mutating tools validate here, so a helper that is merely slow to be
         // scheduled must not refuse the user's change (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
-        self.validate_path_with_artifact_session(req_id, path, None)
+        self.validate_path_with_artifact_session(req_id, path, None, None)
     }
 
     /// Validate a write location without following its final path component.
@@ -13144,13 +13329,19 @@ impl AppContext {
         // Only mutations validate write locations (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
         reject_github_address(req_id, path)?;
+        self.check_unrestored_path(
+            req_id,
+            &crate::inspect::job::normalize_path(&self.resolve_relative_path(path)),
+            None,
+            true,
+        )?;
         let Some(PathRestrictionContext {
             raw_root,
             resolved_root,
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
-            self.check_path_access(req_id, path, path, None, true)?;
+            self.check_path_access(req_id, path, path, None, None, true)?;
             return Ok(path.to_path_buf());
         };
         let normalized = normalize_path(&path_for_resolution);
@@ -13178,7 +13369,7 @@ impl AppContext {
         })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
-        self.check_path_access(req_id, path, &resolved, None, true)?;
+        self.check_path_access(req_id, path, &resolved, None, None, true)?;
         Ok(resolved)
     }
 
@@ -13194,7 +13385,7 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id));
+        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id), None);
         if crate::context::confinement::for_request(req_id) {
             // Canonical targets and symlink destinations are private outside the
             // fence. Always report the caller's spelling, including on failure.
@@ -13204,14 +13395,31 @@ impl AppContext {
         }
     }
 
+    pub(crate) fn validate_search_path(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+        search_tool: WorkerSearchTool,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_path_with_artifact_session(req_id, path, Some(session_id), Some(search_tool))
+    }
+
     fn validate_path_with_artifact_session(
         &self,
         req_id: &str,
         path: &Path,
         artifact_session_id: Option<&str>,
+        search_tool: Option<WorkerSearchTool>,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
+        self.check_unrestored_path(
+            req_id,
+            &crate::inspect::job::normalize_path(&self.resolve_relative_path(path)),
+            artifact_session_id,
+            false,
+        )?;
         let Some(PathRestrictionContext {
             raw_root,
             resolved_root,
@@ -13228,12 +13436,19 @@ impl AppContext {
                     let resolved = crate::bounded_io::canonicalize(path).map_err(|error| {
                         crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
                     })?;
-                    self.check_path_access(req_id, path, &resolved, artifact_session_id, false)?;
+                    self.check_path_access(
+                        req_id,
+                        path,
+                        &resolved,
+                        artifact_session_id,
+                        search_tool,
+                        false,
+                    )?;
                     return Ok(resolved);
                 }
             }
             // Root restriction is disabled, so retain ordinary callers' spelling.
-            self.check_path_access(req_id, path, path, artifact_session_id, false)?;
+            self.check_path_access(req_id, path, path, artifact_session_id, search_tool, false)?;
             return Ok(path.to_path_buf());
         };
 
@@ -13272,8 +13487,106 @@ impl AppContext {
             resolve(req_id, &path_for_resolution, &resolved_root, &raw_root)?
         };
 
-        self.check_path_access(req_id, path, &resolved, artifact_session_id, false)?;
+        self.check_path_access(
+            req_id,
+            path,
+            &resolved,
+            artifact_session_id,
+            search_tool,
+            false,
+        )?;
         Ok(resolved)
+    }
+
+    /// Read saved launch inputs without filesystem probes and combine them with
+    /// confirmed-absence records. Neither source can authorize path access.
+    pub(crate) fn unrestored_launch_grants(
+        &self,
+        req_id: &str,
+    ) -> Result<Vec<launch_grants::UnrestoredGrant>, crate::protocol::Response> {
+        let crate::access_policy::AskRoute::Consent {
+            launch: Some(key), ..
+        } = crate::access_policy::current_ask_route()
+        else {
+            return Ok(Vec::new());
+        };
+        let unavailable = |message: String| {
+            crate::protocol::Response::error_with_data(
+                req_id,
+                "grants_unavailable",
+                message,
+                serde_json::json!({"detail":{"retryable":true,"phase":"launch_grant_restore","path":key.project_root}}),
+            )
+        };
+        let db = self
+            .db()
+            .ok_or_else(|| unavailable("scope persistence unavailable; retry".into()))?;
+        let conn = db
+            .lock()
+            .map_err(|_| unavailable("grant database lock poisoned; retry".into()))?;
+        let pending = crate::db::access_grants::unrestored_launch(&conn, &key)
+            .map_err(|error| unavailable(format!("launch grants unavailable: {error}; retry")))?;
+        Ok(self.launch_grant_state.unavailable(&key, pending))
+    }
+
+    pub(crate) fn unrestored_grant_refusal(
+        req_id: &str,
+        grant: &launch_grants::UnrestoredGrant,
+    ) -> crate::protocol::Response {
+        let path = &grant.path;
+        let status = if grant.retryable {
+            "is not restored; retry after the path recovers"
+        } else {
+            "no longer exists; this saved grant cannot be restored"
+        };
+        crate::protocol::Response::error_with_data(
+            req_id,
+            "grants_unavailable",
+            format!("launch grant for {} {status}", path.display()),
+            serde_json::json!({"detail":{"retryable":grant.retryable,"path":path,"phase":"launch_grant_restore"}}),
+        )
+    }
+
+    fn check_unrestored_path(
+        &self,
+        req_id: &str,
+        path: &Path,
+        artifact_session: Option<&str>,
+        preserve_final: bool,
+    ) -> Result<(), crate::protocol::Response> {
+        use crate::access_policy::{AccessDecision, AccessDenial, AccessOperation};
+        let operation = if artifact_session.is_some() {
+            AccessOperation::Read
+        } else {
+            AccessOperation::Write
+        };
+        let pending = self.unrestored_launch_grants(req_id)?;
+        let Some(grant) = pending.iter().find(|grant| grant.covers(operation, path)) else {
+            return Ok(());
+        };
+        let owned_artifact = artifact_session.is_some_and(|session| {
+            self.bash_background
+                .is_session_owned_artifact_path(session, path)
+                || self
+                    .bash_background
+                    .is_session_owned_scratch_path(session, path)
+                || self.bash_background.is_readable_task_path(session, path)
+        });
+        let policy = self.access_policy(req_id)?;
+        let decision = if preserve_final {
+            policy.decide_tree_write(path)
+        } else {
+            policy.decide(operation, path, owned_artifact)
+        };
+        // This check grants nothing. Canonical resolution and the usual policy
+        // still follow, including floors, symlink checks and owned-artifact rules.
+        if !matches!(
+            decision,
+            AccessDecision::Allow | AccessDecision::Deny(AccessDenial::Floor)
+        ) {
+            return Err(Self::unrestored_grant_refusal(req_id, grant));
+        }
+        Ok(())
     }
 
     /// Use the effective configuration snapshot selected for the current tool route.
@@ -13358,6 +13671,69 @@ impl AppContext {
         }
     }
 
+    fn checkout_root_for_message(&self) -> Option<PathBuf> {
+        let root = self
+            .config()
+            .project_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())?;
+        Some(root)
+    }
+
+    fn current_call_is_worker(&self) -> bool {
+        let Some(scope) = crate::access_policy::current_scope() else {
+            return false;
+        };
+        let Some(db) = self.db() else {
+            return false;
+        };
+        let Ok(conn) = db.lock() else {
+            return false;
+        };
+        crate::db::access_grants::is_worker(&conn, &scope).unwrap_or(false)
+    }
+
+    fn worker_root_search_refusal(
+        &self,
+        req_id: &str,
+        original: &Path,
+        search_tool: Option<WorkerSearchTool>,
+    ) -> Option<crate::protocol::Response> {
+        search_tool?;
+        if !relative_components_under_root(&normalize_path(original))
+            .is_some_and(|relative| relative.as_os_str().is_empty())
+            || !self.current_call_is_worker()
+            || !matches!(
+                crate::access_policy::current_ask_route(),
+                crate::access_policy::AskRoute::Consent { .. }
+            )
+        {
+            return None;
+        }
+        let checkout = self.checkout_root_for_message()?;
+        Some(crate::protocol::Response::error(
+            req_id,
+            "worker_root_search",
+            format!("use your checkout instead: {}", checkout.display()),
+        ))
+    }
+
+    fn checkout_path_suggestion(&self, original: &Path) -> Option<PathBuf> {
+        if !original.has_root() || !self.current_call_is_worker() {
+            return None;
+        }
+        let checkout = self.checkout_root_for_message()?;
+        if crate::bounded_io::current().is_some() {
+            crate::bounded_io::run(original, None, move |path| {
+                Ok(checkout_counterpart(&path, &checkout))
+            })
+            .ok()
+            .flatten()
+        } else {
+            checkout_counterpart(original, &checkout)
+        }
+    }
+
     /// Resolve an `ask` decision for the call on this thread. A lowered route
     /// treats the ask as allow. A consent route allows only what an
     /// `allow_once` answer approved for this dispatch; anything else refuses
@@ -13392,10 +13768,21 @@ impl AppContext {
                     }),
                 ));
             }
-            AskRoute::Consent { once } => once,
+            AskRoute::Consent { once, .. } => once,
         };
         if once.iter().any(|grant| grant.covers(operation, identity)) {
             return Ok(());
+        }
+        if let Some(suggestion) = self.checkout_path_suggestion(original) {
+            return Err(crate::protocol::Response::error(
+                req_id,
+                "path_not_found_did_you_mean",
+                format!(
+                    "path not found: {}; did you mean {}?",
+                    original.display(),
+                    crate::inspect::job::normalize_path(&suggestion).display()
+                ),
+            ));
         }
         // A directory is asked for as a subtree so one answer covers what the
         // tool reads beneath it. The probe stays on the bounded helper when
@@ -13434,9 +13821,13 @@ impl AppContext {
         original: &Path,
         resolved: &Path,
         artifact_session: Option<&str>,
+        search_tool: Option<WorkerSearchTool>,
         preserve_final: bool,
     ) -> Result<(), crate::protocol::Response> {
         use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
+        if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
+            return Err(response);
+        }
         let operation = if artifact_session.is_some() {
             AccessOperation::Read
         } else {
@@ -13492,6 +13883,7 @@ impl AppContext {
                     .bash_background
                     .is_readable_task_path(session, &identity)
         });
+        self.check_unrestored_path(req_id, &identity, artifact_session, preserve_final)?;
         let policy = self.access_policy(req_id)?;
         let decision = if preserve_final {
             policy.decide_tree_write(&identity)

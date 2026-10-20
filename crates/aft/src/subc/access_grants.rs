@@ -294,7 +294,10 @@ pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRo
         return crate::access_policy::AskRoute::Unavailable;
     }
     if identity.scope.as_ref().is_some_and(alfonso) {
-        crate::access_policy::AskRoute::Consent { once: Vec::new() }
+        crate::access_policy::AskRoute::Consent {
+            once: Vec::new(),
+            launch: launch_key(identity, "worker"),
+        }
     } else {
         crate::access_policy::AskRoute::Lowered
     }
@@ -522,7 +525,13 @@ pub(super) fn resolve_unlocked<S: PartialEq, R, T, E>(
     }
 }
 
-fn param_refused(index: usize, path: Value, reason: &str) -> subc_protocol::ErrorBody {
+fn param_refused(
+    index: usize,
+    path: Value,
+    reason: &str,
+    head: Option<&ScopeKey>,
+) -> subc_protocol::ErrorBody {
+    log::info!("allow_paths refused: index={index} reason={reason} path={path} head={head:?}");
     let mut error = refusal(
         "plan_param_refused",
         format!("allow_paths[{index}]: {reason}"),
@@ -536,21 +545,23 @@ fn param_refused(index: usize, path: Value, reason: &str) -> subc_protocol::Erro
 pub(super) fn validate(
     raw: &Value,
     head: Option<&AccessPolicy>,
+    head_key: Option<&ScopeKey>,
 ) -> Result<Vec<AccessGrant>, subc_protocol::ErrorBody> {
     let list = raw
         .as_array()
-        .ok_or_else(|| param_refused(0, Value::Null, "malformed"))?;
+        .ok_or_else(|| param_refused(0, Value::Null, "malformed", head_key))?;
     if list.len() > 64 {
         return Err(param_refused(
             64,
             list[64].get("path").cloned().unwrap_or(Value::Null),
             "malformed",
+            head_key,
         ));
     }
     let mut grants: Vec<AccessGrant> = Vec::new();
     for (index, entry) in list.iter().enumerate() {
         let path_value = entry.get("path").cloned().unwrap_or(Value::Null);
-        let malformed = || param_refused(index, path_value.clone(), "malformed");
+        let malformed = || param_refused(index, path_value.clone(), "malformed", head_key);
         let object = entry.as_object().ok_or_else(malformed)?;
         let path = object
             .get("path")
@@ -574,7 +585,7 @@ pub(super) fn validate(
             return Err(malformed());
         }
         if !Path::new(path).is_absolute() {
-            return Err(param_refused(index, path_value, "not_absolute"));
+            return Err(param_refused(index, path_value, "not_absolute", head_key));
         }
         let grant = AccessGrant {
             path: policy_path(Path::new(path)),
@@ -582,10 +593,15 @@ pub(super) fn validate(
             operation: mode,
         };
         let Some(head) = head else {
-            return Err(param_refused(index, path_value, "head_not_held"));
+            return Err(param_refused(
+                index,
+                path_value,
+                "head_policy_unknown",
+                head_key,
+            ));
         };
         if let Some(floor) = head.capability_floor(mode, GrantKind::Subtree, &grant.path) {
-            let mut error = param_refused(index, path_value, "denied_floor");
+            let mut error = param_refused(index, path_value, "denied_floor", head_key);
             error.message.push_str(&format!(
                 " ({}: {})",
                 floor.rule.description(),
@@ -598,44 +614,174 @@ pub(super) fn validate(
             return Err(error);
         }
         if head.head_policy(&grant) != HeadPolicy::Allow {
-            return Err(param_refused(index, path_value, "head_not_held"));
+            return Err(param_refused(index, path_value, "head_not_held", head_key));
         }
-        if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
-            if mode == AccessOperation::Write {
-                prior.operation = mode;
-            }
-        } else {
-            grants.push(grant);
-        }
+        merge_grant(&mut grants, grant);
     }
     Ok(grants)
 }
 
-pub(super) fn catalog(
-    raw: Option<&Value>,
+fn merge_grant(grants: &mut Vec<AccessGrant>, grant: AccessGrant) {
+    if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
+        if grant.operation == AccessOperation::Write {
+            prior.operation = grant.operation;
+        }
+    } else {
+        grants.push(grant);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum LaunchTarget {
+    Existing {},
+    Future { parent: PathBuf },
+}
+
+fn missing_target(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+fn save_launch_target(path: &Path) -> std::io::Result<LaunchTarget> {
+    match crate::bounded_io::metadata(path) {
+        Ok(_) => Ok(LaunchTarget::Existing {}),
+        Err(error) if missing_target(&error) => {
+            // Preserve the ancestor used to resolve a future destination. Its
+            // disappearance must not silently move the grant to a higher root.
+            let mut parent = path.parent();
+            while let Some(candidate) = parent {
+                match crate::bounded_io::metadata(candidate) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        return Ok(LaunchTarget::Future {
+                            parent: candidate.into(),
+                        })
+                    }
+                    Ok(_) => return Err(std::io::ErrorKind::NotADirectory.into()),
+                    Err(error) if missing_target(&error) => parent = candidate.parent(),
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn launch_inputs(saved: &Value) -> Value {
+    let mut inputs = saved.clone();
+    if let Some(entries) = inputs.as_array_mut() {
+        for entry in entries {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("target");
+            }
+        }
+    }
+    inputs
+}
+
+fn restorable_launch_target(
+    entry: &Value,
+    grant: &AccessGrant,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    let target = entry
+        .get("target")
+        .map(|target| serde_json::from_value::<LaunchTarget>(target.clone()))
+        .transpose()
+        .map_err(|error| restore_refusal(&grant.path, "invalid_launch_target", error))?;
+    // Grants name canonical paths, not inodes: an atomic save replaces the
+    // object without changing the path authority delegated by the head.
+    match (crate::bounded_io::metadata(&grant.path), target) {
+        (Ok(_), _) => Ok(true),
+        (Err(error), Some(LaunchTarget::Existing { .. })) if missing_target(&error) => Ok(false),
+        (Err(error), Some(LaunchTarget::Future { parent })) if missing_target(&error) => {
+            let metadata = crate::bounded_io::metadata(&parent).map_err(|error| {
+                restore_refusal(&grant.path, crate::bounded_io::timeout_code(&error), error)
+            })?;
+            if !metadata.is_dir() {
+                return Err(restore_refusal(
+                    &grant.path,
+                    "not_a_directory",
+                    "launch parent is no longer a directory",
+                ));
+            }
+            Ok(true)
+        }
+        // Legacy rows do not establish that the target ever existed. An absent
+        // target is therefore retryable rather than permanently discarded.
+        (Err(error), _) => Err(restore_refusal(
+            &grant.path,
+            crate::bounded_io::timeout_code(&error),
+            error,
+        )),
+    }
+}
+
+/// Revived workers do not fetch another catalog. Validate only saved launch
+/// entries against current head authority, dropping invalid siblings. Filesystem
+/// probes run unlocked; the install transaction rechecks all stored inputs.
+#[cfg(test)]
+pub(super) fn restore_launch(
     identity: &RouteIdentity,
     ctx: &AppContext,
     preset: &str,
-) -> Result<(), subc_protocol::ErrorBody> {
-    if identity
-        .scope
-        .as_ref()
-        .is_some_and(|stamp| !stamp.owner_authorized)
-    {
-        if let Some(raw) = raw {
-            validate(raw, None)?;
-        }
-        return Ok(());
-    }
-    if raw.is_none() && launch_key(identity, preset).is_none() {
-        return Ok(());
-    }
-    let Some(db) = ctx.db() else {
-        if let Some(raw) = raw {
-            validate(raw, None)?;
-        }
-        return Ok(());
+) -> Result<store::LaunchRestore, subc_protocol::ErrorBody> {
+    restore_launch_before(
+        identity,
+        ctx,
+        preset,
+        Instant::now() + persistence::WAIT_BUDGET,
+        Arc::new(StdMutex::new(identity.project_root.clone())),
+    )
+}
+
+pub(super) fn restore_refusal(
+    path: &Path,
+    reason: &str,
+    message: impl std::fmt::Display,
+) -> subc_protocol::ErrorBody {
+    refusal(
+        "grants_unavailable",
+        format!(
+            "launch grant restoration for {}: {message}; retry after the path recovers",
+            path.display()
+        ),
+    )
+    .with_detail(
+        json!({"retryable":true,"path":path,"reason":reason,"phase":"launch_grant_restore"}),
+    )
+}
+
+pub(super) fn restore_launch_before(
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+    preset: &str,
+    deadline: Instant,
+    progress: Arc<StdMutex<PathBuf>>,
+) -> Result<store::LaunchRestore, subc_protocol::ErrorBody> {
+    let _budget = crate::bounded_io::enter(Some(
+        crate::bounded_io::Budget::after(deadline.saturating_duration_since(Instant::now()))
+            .capped(deadline),
+    ));
+    let expired = || {
+        (Instant::now() >= deadline).then(|| {
+            restore_refusal(
+                &progress.lock().unwrap_or_else(|e| e.into_inner()),
+                "deadline_exceeded",
+                "admission deadline exceeded",
+            )
+        })
     };
+    let Some(key) = launch_key(identity, preset) else {
+        return Ok(store::LaunchRestore::NoParams);
+    };
+    #[cfg(test)]
+    ctx.note_launch_restore_attempt();
+    let db = ctx
+        .db()
+        .ok_or_else(|| refusal("grants_unavailable", "scope persistence unavailable"))?;
     let lock = || {
         db.lock()
             .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))
@@ -644,7 +790,184 @@ pub(super) fn catalog(
     let read_head = |conn: &rusqlite::Connection| {
         head_key
             .as_ref()
-            .map(|key| policy_snapshot(conn, key))
+            .map(|key| {
+                store::head_policy_scope(conn, key)?
+                    .map(|resolved| policy_snapshot(conn, &resolved))
+                    .transpose()
+                    .map(Option::flatten)
+            })
+            .transpose()
+            .map(Option::flatten)
+    };
+    let unavailable = |e: rusqlite::Error| refusal("grants_unavailable", e.to_string());
+    {
+        let conn = lock()?;
+        register_on(&conn, identity, ctx)?;
+    }
+    loop {
+        if let Some(error) = expired() {
+            return Err(error);
+        }
+        let (snapshot, raw) = {
+            let conn = lock()?;
+            (
+                read_head(&conn).map_err(unavailable)?,
+                store::preview_launch(&conn, &key).map_err(unavailable)?,
+            )
+        };
+        let Some(raw) = raw else {
+            return Ok(store::LaunchRestore::NoParams);
+        };
+        #[cfg(test)]
+        if snapshot.is_some() {
+            unlocked_hook::run(unlocked_hook::Point::Resolve);
+        }
+        let saved_head = snapshot.clone();
+        let saved_launch = raw.clone();
+        let saved_head_key = head_key.clone();
+        let storage = ctx.storage_dir();
+        let resolution_progress = progress.clone();
+        let launch_state = ctx.launch_grant_state.clone();
+        let saved_key = key.clone();
+        // Building the head policy also probes paths besides saved grants.
+        // Isolate the whole unlocked phase so those probes share the deadline.
+        let resolved = crate::bounded_io::run(&identity.project_root, None, move |_| {
+            crate::access_policy::with_bounded_policy_paths(resolution_progress.clone(), || -> Result<_, subc_protocol::ErrorBody> {
+                let head = saved_head
+                    .clone()
+                    .map(|policy| policy.resolve(&storage));
+                let entries = saved_launch
+                    .as_array()
+                    .ok_or_else(|| unavailable(rusqlite::Error::InvalidQuery))?;
+                let mut grants = Vec::new();
+                let mut dropped = Vec::new();
+                for entry in entries {
+                    let saved_grant = entry.get("path").and_then(Value::as_str)
+                        .map(PathBuf::from).filter(|path| path.is_absolute())
+                        .zip(match entry.get("mode").and_then(Value::as_str) {
+                            Some("read") => Some(AccessOperation::Read),
+                            Some("write") => Some(AccessOperation::Write),
+                            _ => None,
+                        })
+                        .map(|(path, operation)| AccessGrant { path, kind: GrantKind::Subtree, operation });
+                    if let Some(grant) = saved_grant {
+                        if launch_state.is_absent(&saved_key, &grant) {
+                            continue;
+                        }
+                        *resolution_progress.lock().unwrap_or_else(|e| e.into_inner()) = grant.path.clone();
+                        #[cfg(test)]
+                        launch_state.note_probe(&grant.path);
+                        if !restorable_launch_target(entry, &grant)? {
+                            launch_state.mark_absent(&saved_key, grant);
+                            continue;
+                        }
+                    }
+                    match validate(&launch_inputs(&json!([entry])), head.as_ref(), saved_head_key.as_ref()) {
+                        Ok(valid) => {
+                            for grant in valid {
+                                // Launch paths are saved canonically. A symlink retarget
+                                // must not turn the same spelling into new authority.
+                                // Legacy noncanonical inputs fail closed on revival.
+                                if entry.get("path").and_then(Value::as_str).map(Path::new)
+                                    != Some(grant.path.as_path())
+                                {
+                                    dropped.push(format!("launch allow_paths dropped: path={} mode={} reason=\"launch_path_changed\"",
+                                        entry["path"], entry["mode"]));
+                                } else {
+                                    merge_grant(&mut grants, grant);
+                                }
+                            }
+                        }
+                        Err(error) => dropped.push(format!(
+                            "launch allow_paths dropped: path={} mode={} reason={}",
+                            entry.get("path").unwrap_or(&Value::Null),
+                            entry.get("mode").unwrap_or(&Value::Null),
+                            error
+                                .detail
+                                .as_ref()
+                                .and_then(|d| d.get("reason"))
+                                .unwrap_or(&Value::Null),
+                        )),
+                    }
+                }
+                Ok((grants, dropped))
+            })
+        }).map_err(|error| restore_refusal(&progress.lock().unwrap_or_else(|e| e.into_inner()), crate::bounded_io::timeout_code(&error), error))?;
+        let (grants, dropped) = resolved?;
+        let conn = lock()?;
+        if let Some(error) = expired() {
+            return Err(error);
+        }
+        let mut changed = false;
+        let mut timed_out = None;
+        let restored = store::restore_launch(&conn, &key, |conn, current_raw| {
+            if *current_raw != raw || read_head(conn)? != snapshot {
+                changed = true;
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            // A database wait or repeated snapshot changes cannot let an
+            // expired admission install grants after its caller was refused.
+            if let Some(error) = expired() {
+                timed_out = Some(error);
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(grants)
+        });
+        if let Some(error) = timed_out {
+            return Err(error);
+        }
+        if changed {
+            continue;
+        }
+        let restored = restored.map_err(unavailable)?;
+        if restored == store::LaunchRestore::Materialized {
+            for message in dropped {
+                crate::slog_warn!("{message}");
+            }
+        }
+        return Ok(restored);
+    }
+}
+
+pub(super) fn catalog(
+    raw: Option<&Value>,
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+    preset: &str,
+) -> Result<(), subc_protocol::ErrorBody> {
+    let head_key = head_scope(identity);
+    if identity
+        .scope
+        .as_ref()
+        .is_some_and(|stamp| !stamp.owner_authorized)
+    {
+        if let Some(raw) = raw {
+            validate(raw, None, head_key.as_ref())?;
+        }
+        return Ok(());
+    }
+    if raw.is_none() && launch_key(identity, preset).is_none() {
+        return Ok(());
+    }
+    let Some(db) = ctx.db() else {
+        if let Some(raw) = raw {
+            validate(raw, None, head_key.as_ref())?;
+        }
+        return Ok(());
+    };
+    let lock = || {
+        db.lock()
+            .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))
+    };
+    let read_head = |conn: &rusqlite::Connection| {
+        head_key
+            .as_ref()
+            .map(|key| {
+                store::head_policy_scope(conn, key)?
+                    .map(|resolved| policy_snapshot(conn, &resolved))
+                    .transpose()
+                    .map(Option::flatten)
+            })
             .transpose()
             .map(Option::flatten)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))
@@ -668,7 +991,7 @@ pub(super) fn catalog(
     loop {
         let head = snapshot.clone().map(|policy| policy.resolve(&storage));
         if let Some(raw) = raw {
-            validate(raw, head.as_ref())?;
+            validate(raw, head.as_ref(), head_key.as_ref())?;
         }
         let Some(key) = launch.as_ref() else {
             return Ok(());
@@ -683,10 +1006,47 @@ pub(super) fn catalog(
             launch_params(&conn, key)?
         };
         let empty = json!([]);
-        let chosen = stored.as_ref().or(raw).unwrap_or(&empty);
+        let stored_inputs = stored.as_ref().map(launch_inputs);
+        let chosen = stored_inputs.as_ref().or(raw).unwrap_or(&empty);
         #[cfg(test)]
         unlocked_hook::run(unlocked_hook::Point::LaunchValidation);
-        let grants = validate(chosen, head.as_ref())?;
+        let mut grants = validate(chosen, head.as_ref(), head_key.as_ref())?;
+        if let Some(stored) = &stored {
+            let mut restorable = Vec::new();
+            for grant in grants {
+                let entry = stored.as_array().unwrap().iter().find(|entry| {
+                    entry.get("path").and_then(Value::as_str).map(Path::new)
+                        == Some(grant.path.as_path())
+                });
+                // Catalog refetches validate current head authority above and
+                // apply launch-time existence rules to the saved canonical path.
+                if let Some(entry) = entry {
+                    if !ctx.launch_grant_state.is_absent(key, &grant) {
+                        if restorable_launch_target(entry, &grant)? {
+                            restorable.push(grant);
+                        } else {
+                            ctx.launch_grant_state.mark_absent(key, grant);
+                        }
+                    }
+                }
+            }
+            grants = restorable;
+        }
+        // Save the validated canonical authority and its launch-time target
+        // before taking the database lock, since metadata probes can block.
+        let saved = if let Some(stored) = &stored {
+            stored.clone()
+        } else {
+            Value::Array(grants.iter().map(|grant| {
+            let target = save_launch_target(&grant.path)
+                .map_err(|error| restore_refusal(&grant.path, crate::bounded_io::timeout_code(&error), error))?;
+            Ok(json!({
+                "path": grant.path,
+                "mode": if grant.operation == AccessOperation::Write { "write" } else { "read" },
+                "target": target,
+            }))
+        }).collect::<Result<_, subc_protocol::ErrorBody>>()?)
+        };
         let conn = lock()?;
         let current = read_head(&conn)?;
         if current != snapshot {
@@ -698,7 +1058,7 @@ pub(super) fn catalog(
         if launch_params(&conn, key)? != stored {
             continue;
         }
-        store::materialize(&conn, key, chosen, &grants)
+        store::materialize(&conn, key, &saved, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
         return Ok(());
     }

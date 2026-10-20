@@ -1,6 +1,10 @@
 use super::*;
 use crate::access_policy::{AccessDecision, AccessDenial};
 
+#[cfg(unix)]
+#[path = "access_grants_restore_tests.rs"]
+mod slow_restore;
+
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
     let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
@@ -69,6 +73,753 @@ fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }
 
+fn worker_at_parent_epoch(worker: &RouteIdentity, parent: &str, epoch: u64) -> RouteIdentity {
+    let mut data = copied_identity(worker);
+    let parent_stamp = data.scope.as_mut().unwrap().parent.as_mut().unwrap();
+    parent_stamp.scope_ref = parent.into();
+    parent_stamp.scope_epoch = epoch;
+    RouteIdentity(Arc::new(data))
+}
+
+#[test]
+fn grants_head_policy_survives_an_unregistered_parent_epoch() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = worker_at_parent_epoch(&worker, "head", 12);
+    remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        operation(json!({}), "grants.list", &worker, &ctx).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn grants_head_policy_never_crosses_identity_future_or_end_boundaries() {
+    let (_dir, ctx, head, worker) = fixture();
+    let different = worker_at_parent_epoch(&worker, "different-head", 12);
+    let future = worker_at_parent_epoch(&worker, "head", 6);
+    let mut other_owner = copied_identity(&worker_at_parent_epoch(&worker, "head", 12));
+    other_owner
+        .scope
+        .as_mut()
+        .unwrap()
+        .parent
+        .as_mut()
+        .unwrap()
+        .owner =
+        serde_json::from_value(json!({"kind":"reserved","module_id":"another-owner"})).unwrap();
+    for caller in [different, future, RouteIdentity(Arc::new(other_owner))] {
+        let error = remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+            &caller,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+    }
+    let mut ended = scope_key(&head);
+    ended.epoch = 10;
+    store::end_scope_grants(&ctx.db().unwrap().lock().unwrap(), &ended).unwrap();
+    for epoch in [10, 12] {
+        let caller = worker_at_parent_epoch(&worker, "head", epoch);
+        let error = remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+            &caller,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+    }
+}
+
+#[test]
+fn grants_head_policy_tombstone_returns_no_scope_and_refuses_surviving_authority() {
+    let (dir, ctx, head, worker) = fixture();
+    let latest = at_epoch(&head, 10);
+    register(&latest, &ctx).unwrap();
+    let older_target = policy_path(&dir.path().join("older-head-grant"));
+    let ended_target = policy_path(&dir.path().join("ended-head-grant"));
+    let db = ctx.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        store::set_mode(
+            &conn,
+            &scope_key(&latest),
+            crate::access_policy::ApprovalMode::Ask,
+        )
+        .unwrap();
+        for (identity, path) in [(&head, &older_target), (&latest, &ended_target)] {
+            store::insert(
+                &conn,
+                &scope_key(identity),
+                &AccessGrant {
+                    path: path.clone(),
+                    kind: GrantKind::Subtree,
+                    operation: AccessOperation::Read,
+                },
+            )
+            .unwrap();
+            let policy = policy_for_scope(&conn, &scope_key(identity), &ctx)
+                .unwrap()
+                .unwrap();
+            validate(&json!([{"path":path,"mode":"read"}]), Some(&policy), None).unwrap();
+        }
+        // Leave configuration and stale grants in place deliberately. Ordinary
+        // scope-end cleanup also deletes grants; authorization must not depend
+        // on that deletion to reject an ended policy.
+        let key = scope_key(&latest);
+        assert_eq!(
+            conn.execute(
+                "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+            )
+            .unwrap(),
+            1
+        );
+        assert!(store::scope_config(&conn, &key).unwrap().is_none());
+        assert!(policy_snapshot(&conn, &key).unwrap().is_none());
+        let retained_config: String = conn
+            .query_row(
+                "SELECT config FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained_config: crate::config::Config =
+            serde_json::from_str(&retained_config).unwrap();
+        assert_eq!(
+            retained_config.project_root,
+            Some(head.project_root.clone())
+        );
+        for identity in [&head, &latest] {
+            let key = scope_key(identity);
+            let retained_grants: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                    rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained_grants, 1);
+        }
+    }
+    for epoch in [10, 12] {
+        let caller = worker_at_parent_epoch(&worker, "head", epoch);
+        for path in [&older_target, &ended_target, &head.project_root] {
+            let error = remote_policy::catalog(
+                catalog_request(json!([{"path":path,"mode":"read"}])),
+                &caller,
+                &ctx,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "plan_param_refused");
+            assert_eq!(error.message, "allow_paths[0]: head_policy_unknown");
+            assert_eq!(
+                error.detail,
+                Some(json!({
+                    "param":"allow_paths", "index":0, "path":path, "reason":"head_policy_unknown"
+                }))
+            );
+            assert!(store::list(&db.lock().unwrap(), &scope_key(&caller))
+                .unwrap()
+                .is_empty());
+        }
+        let mut parent = scope_key(&latest);
+        parent.epoch = epoch;
+        assert_eq!(
+            store::head_policy_scope(&db.lock().unwrap(), &parent).unwrap(),
+            None,
+            "a tombstone must resolve to no policy scope, not an ended key"
+        );
+    }
+}
+
+#[test]
+fn grants_head_policy_rechecks_revocation_at_source_epoch() {
+    let (_dir, ctx, head, worker) = fixture();
+    let caller = worker_at_parent_epoch(&worker, "head", 12);
+    let target = worker.project_root.join("shared");
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &caller,
+        &ctx,
+    )
+    .unwrap();
+    operation(json!({"path":target}), "grants.revoke", &head, &ctx).unwrap();
+    let error = remote_policy::catalog(json!({"preset":"worker"}), &caller, &ctx).unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
+}
+
+#[test]
+fn grants_head_policy_uses_latest_observed_restrictions() {
+    let (_dir, ctx, head, worker) = fixture();
+    let target = worker.project_root.join("shared");
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    let newer = at_epoch(&head, 10);
+    register(&newer, &ctx).unwrap();
+    store::set_mode(
+        &db.lock().unwrap(),
+        &scope_key(&newer),
+        crate::access_policy::ApprovalMode::Ask,
+    )
+    .unwrap();
+    let caller = worker_at_parent_epoch(&worker, "head", 12);
+    let error = remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &caller,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
+}
+
+fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
+    RouteIdentityData {
+        root: identity.root.clone(),
+        project_root: identity.project_root.clone(),
+        harness: identity.harness.clone(),
+        session: identity.session.clone(),
+        role: identity.role,
+        trust: identity.trust,
+        spawn_principal: identity.spawn_principal.clone(),
+        consumer_elicitation_capable: identity.consumer_elicitation_capable,
+        disabled_tools: identity.disabled_tools.clone(),
+        scope: identity.scope.clone(),
+        call_mode: identity.call_mode.clone(),
+        run_scope: OnceLock::new(),
+        made_tool_call: AtomicBool::new(false),
+        run_owner: None,
+    }
+}
+
+fn at_epoch(identity: &RouteIdentity, epoch: u64) -> RouteIdentity {
+    let mut data = copied_identity(identity);
+    data.scope.as_mut().unwrap().scope_epoch = epoch;
+    RouteIdentity(Arc::new(data))
+}
+
+#[cfg(unix)]
+#[test]
+fn grants_revived_launch_symlink_changes_never_widen_authority() {
+    let (_dir, ctx, head, worker) = fixture();
+    let original = head.project_root.join("original");
+    let other = head.project_root.join("other");
+    let alias = head.project_root.join("alias");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    std::os::unix::fs::symlink(&original, &alias).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":alias,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&other, &alias).unwrap();
+    let revived = at_epoch(&worker, 8);
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    let db = ctx.db().unwrap();
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: original.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    std::fs::remove_dir(&original).unwrap();
+    std::os::unix::fs::symlink(&other, &original).unwrap();
+    let changed = at_epoch(&worker, 9);
+    restore_launch(&changed, &ctx, "worker").unwrap();
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&changed))
+        .unwrap()
+        .is_empty());
+}
+
+async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) {
+    let body = first_read_response(ctx, identity, preset).await;
+    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+}
+
+async fn first_read_response(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) -> Value {
+    first_read_path_response(ctx, identity, preset, None).await
+}
+
+async fn first_read_path_response(
+    ctx: Arc<AppContext>,
+    identity: RouteIdentity,
+    preset: &str,
+    target: Option<PathBuf>,
+) -> Value {
+    ctx.update_config(|config| config.project_root = Some(identity.project_root.clone()));
+    let target = target.unwrap_or_else(|| identity.project_root.join("first-call.txt"));
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "first call").unwrap();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(identity.root.clone(), ctx.clone());
+    let confinement = remote_policy::CarriedConfinement::read(&ctx, &identity);
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        7,
+        serde_json::to_vec(&json!({
+            "op":"tool.call", "name":"read", "preset":preset,
+            "arguments":{"filePath":target}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let decoded = DecodedFrame {
+        parsed_body: Default::default(),
+        confinement: None,
+        launch_restore: None,
+        frame,
+        phase_trace: PhaseTrace::new(Instant::now()),
+    };
+    let mut waits = persistence::DatabaseWaits::default();
+    let decoded = match waits.restore_launch(decoded, &routes, &executor) {
+        Ok(()) => waits.next().await,
+        Err(decoded) => decoded,
+    };
+    let frame = decoded.frame;
+    let (writer, mut replies) = mpsc::channel(8);
+    let (bash_tx, _bash_rx) = mpsc::channel(8);
+    let (touch_tx, _touch_rx) = mpsc::channel(8);
+    let (entries, _deferred_rx) = mpsc::unbounded_channel();
+    handle_tool_call(
+        &writer,
+        &frame,
+        None,
+        Some(confinement),
+        PhaseTrace::new(Instant::now()),
+        &routes,
+        &HashMap::new(),
+        &ReclaimedRoutes::default(),
+        &mut HashMap::new(),
+        &executor,
+        &Arc::default(),
+        &Arc::new(PendingDeferredSetups::default()),
+        &Arc::new(Notify::new()),
+        &PersistentCancelSignal::new(),
+        &bash_tx,
+        &touch_tx,
+        &Arc::new(DispatchPathMetrics::new()),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut 1,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        |request, ctx| crate::commands::read::handle_read(&request, ctx),
+        &DeferredResponseSender {
+            entries,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        },
+        false,
+        1024 * 1024,
+        &drain::ModuleDrainWindow::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .expect("first read must terminate")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
+    body
+}
+
+#[tokio::test]
+async fn grants_revived_launch_first_call_restores_without_catalog() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let target = head.project_root.join("shared");
+    std::fs::create_dir_all(&target).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    let conn = ctx.db().unwrap();
+    let conn = conn.lock().unwrap();
+    let expected = vec![AccessGrant {
+        path: policy_path(&target),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    }];
+    assert_eq!(store::list(&conn, &scope_key(&revived)).unwrap(), expected);
+    assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap(), expected);
+    let markers: i64 = conn
+        .query_row("SELECT COUNT(*) FROM access_materialized", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(markers, 2, "old-epoch history must remain intact");
+}
+
+#[test]
+fn grants_future_targets_restore_only_while_launch_parent_exists() {
+    let (_dir, ctx, head, worker) = fixture();
+    let parent = head.project_root.join("existing-parent");
+    std::fs::create_dir(&parent).unwrap();
+    let future = parent.join("future").join("nested");
+    let created = parent.join("created-later");
+    remote_policy::catalog(
+        catalog_request(json!([
+            {"path":future,"mode":"write"},
+            {"path":created,"mode":"write"}
+        ])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    std::fs::remove_dir(&parent).unwrap();
+    let revived = at_epoch(&worker, 8);
+    let refused = restore_launch(&revived, &ctx, "worker").unwrap_err();
+    assert_eq!(refused.detail.unwrap()["retryable"], true);
+    std::fs::create_dir_all(&created).unwrap();
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    let db = ctx.db().unwrap();
+    let restored = store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap();
+    assert_eq!(restored.len(), 2);
+    for target in [&future, &created] {
+        assert!(restored
+            .iter()
+            .any(|grant| &grant.path == target && grant.operation == AccessOperation::Write));
+    }
+    assert!(!future.exists());
+}
+
+#[test]
+fn grants_revived_launch_failed_restore_refuses_and_retries() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let target = head.project_root.join("shared");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    let db = ctx.db().unwrap();
+    db.lock().unwrap().execute_batch("CREATE TRIGGER fail_restore BEFORE INSERT ON access_grants WHEN NEW.epoch='2' BEGIN SELECT RAISE(ABORT,'injected restore failure'); END;").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        let body = runtime.block_on(first_read_path_response(
+            ctx.clone(),
+            revived.clone(),
+            "worker",
+            Some(target.join("first-call.txt")),
+        ));
+        let refused = &body["structuredContent"];
+        assert_eq!(refused["code"], "grants_unavailable", "{body}");
+        assert_eq!(refused["detail"]["retryable"], true, "{body}");
+        assert_eq!(refused["detail"]["path"], json!(target), "{body}");
+    });
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("launch_grant_restore_failed:")
+                && line.contains(&format!("owner={}", scope_key(&revived).owner))
+                && line.contains("scope_ref=worker epoch=2 code=grants_unavailable")
+                && line.contains("injected restore failure")),
+        "{lines:?}"
+    );
+    assert_eq!(ctx.launch_restore_attempts(), 1);
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
+    crate::access_policy::with_scope(Some(scope_key(&revived)), || {
+        assert_ne!(
+            ctx.access_policy("read")
+                .unwrap()
+                .decide(AccessOperation::Read, &target, false),
+            AccessDecision::Allow
+        );
+    });
+    db.lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_restore;")
+        .unwrap();
+    runtime.block_on(first_read(ctx.clone(), revived.clone(), "worker"));
+    assert_eq!(
+        ctx.launch_restore_attempts(),
+        2,
+        "failed restores must retry"
+    );
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn grants_revived_launch_memo_skips_restore_database_on_second_call() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    std::fs::create_dir_all(head.project_root.join("shared")).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let ctx = Arc::new(ctx);
+    for epoch in [1, 2] {
+        let identity = at_epoch(&worker, epoch);
+        first_read(ctx.clone(), identity.clone(), "worker").await;
+        assert_eq!(ctx.launch_restore_attempts(), epoch as usize);
+        // Separately constructed routes for the same scope reuse the cached
+        // launch result instead of repeating its database check.
+        first_read(ctx.clone(), at_epoch(&worker, epoch), "worker").await;
+        assert_eq!(
+            ctx.launch_restore_attempts(),
+            epoch as usize,
+            "second call must not enter the restore database path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grants_revived_launch_no_params_is_not_memoized() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    assert_eq!(
+        ctx.launch_restore_attempts(),
+        2,
+        "no params is not a definite materialization"
+    );
+    let target = head.project_root.join("late-launch");
+    std::fs::create_dir_all(&target).unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    assert_eq!(ctx.launch_restore_attempts(), 3);
+    let db = ctx.db().unwrap();
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    first_read(ctx.clone(), revived, "worker").await;
+    assert_eq!(ctx.launch_restore_attempts(), 3);
+}
+
+#[tokio::test]
+async fn grants_revived_launch_does_not_copy_ask_earned_grants() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    remote_policy::catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap();
+    let earned = AccessGrant {
+        path: policy_path(&head.project_root.join("consented")),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    {
+        let db = ctx.db().unwrap();
+        // Consent installs standing grants, not launch parameters.
+        store::insert(&db.lock().unwrap(), &scope_key(&worker), &earned).unwrap();
+    }
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert!(store::list(&conn, &scope_key(&revived)).unwrap().is_empty());
+    assert_eq!(
+        store::list(&conn, &scope_key(&worker)).unwrap(),
+        vec![earned]
+    );
+}
+
+#[test]
+fn grants_revived_launch_drops_and_logs_revoked_head_and_floor() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let held = head.project_root.join("held");
+    let revoked = worker.project_root.join("revoked");
+    let denied = head.project_root.join("denied");
+    for path in [&held, &revoked, &denied] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let grant = AccessGrant {
+        path: policy_path(&revoked),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    {
+        let db = ctx.db().unwrap();
+        store::insert(&db.lock().unwrap(), &scope_key(&head), &grant).unwrap();
+    }
+    let raw = json!([
+        {"path":held,"mode":"write"},
+        {"path":revoked,"mode":"read"},
+        {"path":denied,"mode":"read"}
+    ]);
+    remote_policy::catalog(catalog_request(raw.clone()), &worker, &ctx).unwrap();
+    operation(json!({"path":revoked}), "grants.revoke", &head, &ctx).unwrap();
+    ctx.update_config(|config| config.sandbox.read_deny.push(denied.clone()));
+    register(&head, &ctx).unwrap();
+    let revived = at_epoch(&worker, 2);
+    let (result, lines) =
+        crate::logging::capture_log_lines(|| restore_launch(&revived, &ctx, "worker"));
+    result.unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for (path, reason) in [(&revoked, "head_not_held"), (&denied, "denied_floor")] {
+        assert!(
+            lines.iter().any(|line| {
+                line.contains(&format!("path={}", json!(path)))
+                    && line.contains("mode=\"read\"")
+                    && line.contains(&format!("reason=\"{reason}\""))
+            }),
+            "missing named drop for {path:?}: {lines:?}"
+        );
+    }
+    let db = ctx.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            store::list(&conn, &scope_key(&revived)).unwrap(),
+            vec![AccessGrant {
+                path: policy_path(&held),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Write,
+            }]
+        );
+        assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap().len(), 3);
+        let mut saved = store::launch_params(&conn, &launch_key(&revived, "worker").unwrap())
+            .unwrap()
+            .unwrap();
+        for entry in saved.as_array_mut().unwrap() {
+            assert_eq!(entry["target"]["state"], "existing");
+            assert!(entry.as_object_mut().unwrap().remove("target").is_some());
+        }
+        assert_eq!(saved, raw);
+        store::revoke(&conn, &scope_key(&revived), &policy_path(&held)).unwrap();
+    }
+    let (result, lines) =
+        crate::logging::capture_log_lines(|| restore_launch(&revived, &ctx, "worker"));
+    result.unwrap();
+    assert!(
+        lines.is_empty(),
+        "repeat call must not revalidate: {lines:?}"
+    );
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn grants_revived_launch_isolates_ref_owner_session_and_preset() {
+    for dimension in [
+        "ref",
+        "owner",
+        "session",
+        "preset",
+        "principal",
+        "harness",
+        "root",
+    ] {
+        let (dir, ctx, head, worker) = fixture();
+        let worker = at_epoch(&worker, 1);
+        remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
+            &worker,
+            &ctx,
+        )
+        .unwrap();
+        let mut data = copied_identity(&at_epoch(&worker, 2));
+        let mut preset = "worker";
+        match dimension {
+            "ref" => data.scope.as_mut().unwrap().scope_ref = "other".into(),
+            "owner" => {
+                data.scope.as_mut().unwrap().owner =
+                    serde_json::from_value(json!({"kind":"direct"})).unwrap()
+            }
+            "session" => data.session = "other".into(),
+            "preset" => preset = "head",
+            "principal" => {
+                if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                {
+                    *principal_id = Some("reserved:other".into());
+                }
+            }
+            "harness" => data.harness = "other".into(),
+            _ => {
+                data.project_root = dir.path().join("other-root");
+                std::fs::create_dir(&data.project_root).unwrap();
+                data.root = ProjectRootId::from_path(&data.project_root).unwrap();
+            }
+        }
+        let other = RouteIdentity(Arc::new(data));
+        let ctx = Arc::new(ctx);
+        first_read(ctx.clone(), other.clone(), preset).await;
+        let db = ctx.db().unwrap();
+        assert!(
+            store::list(&db.lock().unwrap(), &scope_key(&other))
+                .unwrap()
+                .is_empty(),
+            "{dimension}"
+        );
+    }
+}
+
 #[test]
 fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
     let dir = tempfile::tempdir().unwrap();
@@ -95,7 +846,12 @@ fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
             "credential path",
         ),
     ] {
-        let error = validate(&json!([{"path":target,"mode":"write"}]), Some(&policy)).unwrap_err();
+        let error = validate(
+            &json!([{"path":target,"mode":"write"}]),
+            Some(&policy),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "plan_param_refused");
         assert_eq!(
             error.detail,
@@ -216,7 +972,10 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
         .is_none());
     }
     assert_eq!(
-        validate(&json!({}), None).unwrap_err().detail.unwrap()["reason"],
+        validate(&json!({}), None, None)
+            .unwrap_err()
+            .detail
+            .unwrap()["reason"],
         "malformed"
     );
     let oversized = Value::Array(
@@ -225,7 +984,10 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
             .collect(),
     );
     assert_eq!(
-        validate(&oversized, None).unwrap_err().detail.unwrap()["index"],
+        validate(&oversized, None, None)
+            .unwrap_err()
+            .detail
+            .unwrap()["index"],
         64
     );
 }
@@ -791,7 +1553,7 @@ fn delegated_launch() -> (
         let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
             .unwrap()
             .unwrap();
-        validate(&raw, Some(&policy)).unwrap();
+        validate(&raw, Some(&policy), None).unwrap();
     }
     (dir, ctx, head, worker, outside, raw)
 }
@@ -868,6 +1630,36 @@ fn grants_catalog_head_change_during_resolution_refuses_by_the_new_policy() {
         "stored launch parameters were read after a stale validation: {points:?}"
     );
     assert!(worker_grants(&head, &ctx).is_empty());
+}
+
+#[test]
+fn grants_revived_launch_rechecks_head_changes_after_unlocked_resolution() {
+    let (_dir, ctx, head, worker, outside, raw) = delegated_launch();
+    remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap();
+    let revived = at_epoch(&worker, 8);
+    let (hook, points) = change_once_at(
+        &ctx,
+        unlocked_hook::Point::Resolve,
+        revoke_head_grant(&head, &outside),
+    );
+    restore_launch(&revived, &ctx, "worker").unwrap();
+    drop(hook);
+    let db = ctx.db().unwrap();
+    assert!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived))
+            .unwrap()
+            .is_empty(),
+        "the stale head snapshot must not install a revoked grant"
+    );
+    assert!(
+        points
+            .borrow()
+            .iter()
+            .filter(|point| **point == unlocked_hook::Point::Resolve)
+            .count()
+            >= 2,
+        "the changed policy must be resolved again"
+    );
 }
 
 /// The head stops holding the launch's directory after the launch read its

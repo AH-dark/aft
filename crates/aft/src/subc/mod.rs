@@ -444,6 +444,9 @@ struct DecodedFrame {
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
     confinement: Option<remote_policy::CarriedConfinement>,
+    /// Result of restoring launch grants for this frame; retain it so later
+    /// admission waits do not repeat restoration.
+    launch_restore: Option<Result<(), subc_protocol::ErrorBody>>,
 }
 
 impl DecodedFrame {
@@ -4187,6 +4190,11 @@ fn flush_actor_indexes_on_graceful_shutdown(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
+    tests::record_exit_index_flush_worker(worker);
+}
+
 fn flush_actor_indexes_on_graceful_shutdown_with(
     actor_contexts: &[Arc<AppContext>],
     drained_at: Instant,
@@ -4203,32 +4211,11 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     // Index deltas can be rebuilt after a restart. Give the independent roots
     // one short shared window to persist them, without extending the outage
     // when a rebuild or a cache lock holds one root for several seconds.
-    let (tx, rx) = std::sync::mpsc::channel();
-    for actor_ctx in actor_contexts {
-        let ctx = Arc::clone(actor_ctx);
-        let tx = tx.clone();
-        let _worker = std::thread::spawn(move || {
-            let _ = tx.send(ctx.flush_search_index_on_graceful_shutdown());
-        });
-        #[cfg(test)]
-        tests::record_exit_index_flush_worker(_worker);
-    }
-    drop(tx);
     let started = Instant::now();
     let flush_deadline = crate::callgraph_store::exit_index_flush_deadline(drained_at);
     let deadline =
         (started + crate::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline);
-    let mut completed = 0;
-    let mut flushed = 0;
-    while completed < actor_contexts.len() {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(saved) => {
-                completed += 1;
-                flushed += usize::from(saved);
-            }
-            Err(_) => break,
-        }
-    }
+    let report = crate::context::flush_search_indexes_before(actor_contexts, deadline);
     // Refreshes are reconstructible, so exit waits for them only until the
     // flush deadline and otherwise leaves them to the next start.
     let refreshed =
@@ -4236,8 +4223,8 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     let line = format!(
         "subc exit phase=index_flush roots={} completed={} flushed={} callgraph={} elapsed_ms={}",
         actor_contexts.len(),
-        completed,
-        flushed,
+        report.completed,
+        report.flushed,
         refreshed.as_str(),
         started.elapsed().as_millis()
     );
@@ -5201,7 +5188,7 @@ where
                 if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
                     dispatch_path_metrics.tool_received_decoded(&frame);
                 }
-                let DecodedFrame { frame, phase_trace, parsed_body, confinement } = frame;
+                let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore } = frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -5263,7 +5250,7 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
-                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement};
+                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
                                 Ok(()) => continue,
@@ -5340,7 +5327,7 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement };
+                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore };
                         // A codemode program's tool call runs with its head agent's
                         // access: every step below sees the head-derived identity.
                         let codemode_routes;
@@ -5391,6 +5378,15 @@ where
                         } else {
                             decoded
                         };
+                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                            match database_waits.restore_launch(decoded, routes_for_call, &executor) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else { decoded };
+                        // Unrestored grants do not block unrelated tools or shells.
+                        // Path checks refuse grant-dependent access; shells disclose
+                        // the missing grants and use only currently effective authority.
                         let decoded = if !ledger_waited && !management_routes.contains(&route) {
                             match ledger_edge.defer(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {
                                 Ok(()) => continue,
@@ -6391,6 +6387,7 @@ where
                     let decoded = DecodedFrame {
                         parsed_body: Default::default(),
                         confinement: None,
+                        launch_restore: None,
                         frame,
                         phase_trace: PhaseTrace::new(received_at),
                     };
@@ -8642,10 +8639,17 @@ async fn handle_tool_call(
         Ok(envelope) => envelope,
         Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
     };
-    let reply_budget = crate::commands::blocking_wait::ReplyBudget::from_envelope(
+    let mut reply_budget = crate::commands::blocking_wait::ReplyBudget::from_envelope(
         phase_trace.received_at(),
         &envelope,
     );
+    if envelope
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| matches!(name, "bash" | "powershell"))
+    {
+        reply_budget = reply_budget.after_launch_restore(phase_trace.launch_restore_wait());
+    }
     if flow_read::intercept(&identity, &envelope) {
         return flow_read::dispatch(
             tx,
@@ -13569,6 +13573,76 @@ mod tests {
     }
 
     #[test]
+    fn graceful_shutdown_reports_failed_search_flush_root() {
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let (root_dir, _) = test_root("failed-shutdown-flush");
+        let (ctx, root, cache_dir) = actor_ctx_with_dirty_search_index(
+            root_dir.path(),
+            storage.path(),
+            "source.txt",
+            "old token\n",
+            "new token\n",
+        );
+        // Make replacement fail without depending on Windows sharing flags or
+        // an antivirus scanner holding a particular file open.
+        std::fs::rename(cache_dir.join("cache.bin"), cache_dir.join("old-cache.bin"))
+            .expect("move old cache");
+        std::fs::create_dir(cache_dir.join("cache.bin")).expect("block cache replacement");
+        let (report, logs) = crate::logging::capture_log_lines(|| {
+            crate::context::flush_search_indexes_before(
+                &[Arc::clone(&ctx)],
+                Instant::now() + Duration::from_secs(30),
+            )
+        });
+        assert_eq!(report.completed, 1, "{report:?}");
+        assert_eq!(report.flushed, 0, "{report:?}");
+        assert_eq!(report.failed_roots, vec![root.clone()]);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("shutdown flush failed root=")
+                    && line.contains(&root.display().to_string())
+                    && line.contains("disk cache write failed")),
+            "{logs:?}"
+        );
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .has_pending_disk_changes());
+    }
+
+    #[test]
+    fn graceful_shutdown_reports_unfinished_search_flush_root() {
+        let (root_dir, _) = test_root("unfinished-shutdown-flush");
+        let root = std::fs::canonicalize(root_dir.path()).expect("canonical root");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.clone());
+        // Keep the worker from finishing until the coordinator has classified
+        // the root. An already expired deadline makes this independent of load.
+        let held = ctx.search_index().write().unwrap();
+        let (report, logs) = crate::logging::capture_log_lines(|| {
+            crate::context::flush_search_indexes_before(&[Arc::clone(&ctx)], Instant::now())
+        });
+        drop(held);
+        assert_eq!(report.completed, 0, "{report:?}");
+        assert_eq!(report.unfinished_roots, vec![root.clone()]);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("shutdown flush unfinished root=")
+                    && line.contains(&root.display().to_string())),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
     fn graceful_shutdown_flushes_every_actor_search_index() {
         let storage = tempfile::tempdir().expect("storage tempdir");
         let (root1_dir, root1) = test_root("shutdown-flush-root-1");
@@ -13592,7 +13666,14 @@ mod tests {
         assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
         assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
 
-        flush_actor_indexes_on_graceful_shutdown(&executor.actor_contexts(), Instant::now());
+        // Wait for the workers' completion messages, not the transport's short
+        // best-effort exit window, before reopening their cache files.
+        let report = crate::context::flush_search_indexes_before(
+            &executor.actor_contexts(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(report.completed, 2, "{report:?}");
+        assert_eq!(report.flushed, 2, "{report:?}");
 
         // Shutdown deliberately stops waiting after its shared flush budget.
         // Join the actual workers before checking persistence: this tests that
@@ -18640,7 +18721,7 @@ mod tests {
             )
             .unwrap();
             let mut waits = persistence::DatabaseWaits::default();
-            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
             let decoded = match waits.defer(decoded, &routes, executor) {
                 Ok(()) => waits.next().await,
                 Err(decoded) => decoded,
@@ -19237,7 +19318,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut waits = persistence::DatabaseWaits::default();
-            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
                 serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()), };
             assert!(waits.defer(frame, &routes, &executor).is_ok());
@@ -19875,6 +19956,7 @@ mod admission_mechanism_tests {
         let mut decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

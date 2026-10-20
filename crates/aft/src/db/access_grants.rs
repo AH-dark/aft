@@ -148,7 +148,7 @@ pub fn mode(
     Err(rusqlite::Error::InvalidQuery)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeKey {
     pub owner: String,
     pub scope_ref: String,
@@ -197,6 +197,33 @@ pub fn scope_config(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Optio
     let json: Option<String> = conn.query_row("SELECT config FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0",
         params![key.owner,key.scope_ref,key.epoch.to_string()], |r| r.get(0)).optional()?;
     json.map(|json| decode(&json)).transpose()
+}
+
+/// Resolve a head's last observed policy at or before its attested epoch.
+/// Select tombstones too: an ended epoch must block an older live policy.
+/// Read grants from the selected row instead of copying them, so revocation
+/// remains effective on the next check.
+pub fn head_policy_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<ScopeKey>> {
+    // Match remote-exec's unsigned decimal ordering without a signed SQL cast.
+    let row: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT epoch,ended FROM access_scopes WHERE owner=?1 AND scope_ref=?2
+             AND (length(epoch)<length(?3) OR (length(epoch)=length(?3) AND epoch<=?3))
+             ORDER BY length(epoch) DESC,epoch DESC LIMIT 1",
+            params![key.owner, key.scope_ref, key.epoch.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((epoch, ended)) = row else {
+        return Ok(None);
+    };
+    if ended {
+        return Ok(None);
+    }
+    Ok(Some(ScopeKey {
+        epoch: epoch.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+        ..key.clone()
+    }))
 }
 
 pub fn resolve_scope(
@@ -368,21 +395,148 @@ pub fn materialize(
     }
     tx.execute("INSERT OR IGNORE INTO access_launch_params(project_root,harness,session,principal,owner,scope_ref,epoch,preset,params) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![key.project_root,key.harness,key.session,key.principal,key.owner,key.scope_ref,key.epoch.to_string(),key.preset,raw.to_string()])?;
+    materialize_on(&tx, &scope, grants)?;
+    tx.commit()
+}
+
+fn materialize_on(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &ScopeKey,
+    grants: &[AccessGrant],
+) -> rusqlite::Result<()> {
     let first = tx.execute(
         "INSERT OR IGNORE INTO access_materialized(owner,scope_ref,epoch) VALUES (?1,?2,?3)",
         params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
     )? == 1;
     if first {
         for grant in grants {
-            insert(&tx, &scope, grant)?;
+            insert(tx, scope, grant)?;
         }
     }
-    tx.commit()
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchRestore {
+    Materialized,
+    AlreadyMaterialized,
+    NoParams,
+}
+
+/// Read the launch inputs without committing a carry-forward row. Validation
+/// can then probe paths without holding the database lock; installation checks
+/// the inputs again in its own immediate transaction.
+pub fn preview_launch(
+    conn: &Connection,
+    key: &PolicyKey,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    let tx = conn.unchecked_transaction()?;
+    let row = super::remote_exec::catalog_params(
+        &tx,
+        key,
+        super::remote_exec::CatalogParams::AccessLaunch,
+    )?;
+    row.map(|(_, json)| decode(&json)).transpose()
+}
+
+/// Saved capabilities that have not been installed in this epoch. Reading them
+/// must not probe the filesystem: an unavailable mount is precisely why callers
+/// need this refusal-only description. Restoration alone validates and installs.
+pub fn unrestored_launch(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Vec<AccessGrant>> {
+    let scope = ScopeKey::from_policy(key);
+    let materialized: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM access_materialized WHERE owner=?1 AND scope_ref=?2 AND epoch=?3)",
+        params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
+        |r| r.get(0),
+    )?;
+    if materialized {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = preview_launch(conn, key)? else {
+        return Ok(Vec::new());
+    };
+    raw.as_array()
+        .ok_or(rusqlite::Error::InvalidQuery)?
+        .iter()
+        .map(|entry| {
+            let path = entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            let operation = match entry.get("mode").and_then(serde_json::Value::as_str) {
+                Some("read") => AccessOperation::Read,
+                Some("write") => AccessOperation::Write,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(AccessGrant {
+                path,
+                kind: GrantKind::Subtree,
+                operation,
+            })
+        })
+        .collect()
+}
+
+/// A call can restore only persisted launch inputs, never standing consent grants.
+/// The immediate transaction serializes the marker check, params carry-forward,
+/// current-head validation and grant installation, even across database handles.
+pub fn restore_launch(
+    conn: &Connection,
+    key: &PolicyKey,
+    validate: impl FnOnce(&Connection, &serde_json::Value) -> rusqlite::Result<Vec<AccessGrant>>,
+) -> rusqlite::Result<LaunchRestore> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let scope = ScopeKey::from_policy(key);
+    let materialized: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM access_materialized WHERE owner=?1 AND scope_ref=?2 AND epoch=?3)",
+        params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
+        |r| r.get(0),
+    )?;
+    if materialized {
+        return Ok(LaunchRestore::AlreadyMaterialized);
+    }
+    let Some((_, json)) = super::remote_exec::catalog_params(
+        &tx,
+        key,
+        super::remote_exec::CatalogParams::AccessLaunch,
+    )?
+    else {
+        // A call before the initial catalog must not freeze an empty launch.
+        return Ok(LaunchRestore::NoParams);
+    };
+    if scope_config(&tx, &scope)?.is_none() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let grants = validate(&tx, &decode(&json)?)?;
+    materialize_on(&tx, &scope, &grants)?;
+    tx.commit()?;
+    Ok(LaunchRestore::Materialized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grants_head_policy_orders_unsigned_epochs_without_signed_casts() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let config = Config::default();
+        for epoch in [7, 10, u64::MAX - 1] {
+            register_scope(&conn, &scope("head", epoch), None, &config).unwrap();
+        }
+        for (epoch, expected) in [
+            (6, None),
+            (7, Some(7)),
+            (12, Some(10)),
+            (u64::MAX, Some(u64::MAX - 1)),
+        ] {
+            let resolved = head_policy_scope(&conn, &scope("head", epoch)).unwrap();
+            assert_eq!(resolved.map(|key| key.epoch), expected);
+        }
+    }
     fn scope(name: &str, epoch: u64) -> ScopeKey {
         ScopeKey {
             owner: "owner".into(),
@@ -467,6 +621,187 @@ mod tests {
         conn.execute_batch("DROP TRIGGER fail_install;").unwrap();
         materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
         assert_eq!(list(&conn, &scope).unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn grants_revived_launch_concurrent_first_calls_materialize_once() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let first = scope("worker", 1);
+        let second = scope("worker", 2);
+        let bind = policy(&first, dir.path());
+        let revived = policy(&second, dir.path());
+        let grant = AccessGrant {
+            path: crate::access_policy::policy_path(&dir.path().join("outside")),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        };
+        let conn = crate::db::open(&path).unwrap();
+        for key in [&first, &second] {
+            register_scope(&conn, key, None, &Config::default()).unwrap();
+        }
+        let raw = serde_json::json!([{"path":grant.path,"mode":"write"}]);
+        materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE installs(n INTEGER); INSERT INTO installs VALUES(0);
+            CREATE TRIGGER count_install BEFORE INSERT ON access_grants WHEN NEW.epoch='2'
+            BEGIN UPDATE installs SET n=n+1; END;",
+        )
+        .unwrap();
+        let handles = [
+            crate::db::open(&path).unwrap(),
+            crate::db::open(&path).unwrap(),
+        ];
+        let barrier = Arc::new(Barrier::new(2));
+        let validations = Arc::new(AtomicUsize::new(0));
+        let installed: Vec<LaunchRestore> = std::thread::scope(|threads| {
+            let jobs: Vec<_> = handles
+                .into_iter()
+                .map(|conn| {
+                    let barrier = barrier.clone();
+                    let validations = validations.clone();
+                    let revived = &revived;
+                    let grant = &grant;
+                    let raw = &raw;
+                    threads.spawn(move || {
+                        barrier.wait();
+                        restore_launch(&conn, revived, |_, params| {
+                            assert_eq!(params, raw, "only stored launch inputs may be validated");
+                            validations.fetch_add(1, Ordering::SeqCst);
+                            Ok(vec![grant.clone()])
+                        })
+                        .unwrap()
+                    })
+                })
+                .collect();
+            jobs.into_iter().map(|job| job.join().unwrap()).collect()
+        });
+        assert_eq!(
+            installed
+                .iter()
+                .filter(|result| **result == LaunchRestore::Materialized)
+                .count(),
+            1
+        );
+        assert_eq!(
+            installed
+                .iter()
+                .filter(|result| **result == LaunchRestore::AlreadyMaterialized)
+                .count(),
+            1
+        );
+        assert_eq!(validations.load(Ordering::SeqCst), 1);
+        let installs: i64 = conn
+            .query_row("SELECT n FROM installs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            installs, 1,
+            "upserts must not hide duplicate materializations"
+        );
+        assert_eq!(list(&conn, &second).unwrap(), vec![grant.clone()]);
+        assert_eq!(list(&conn, &first).unwrap(), vec![grant]);
+        let markers: i64 = conn
+            .query_row("SELECT COUNT(*) FROM access_materialized", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(markers, 2);
+    }
+
+    #[test]
+    fn grants_revived_launch_failed_install_rolls_back_carry_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let first = scope("worker", 1);
+        let second = scope("worker", 2);
+        for key in [&first, &second] {
+            register_scope(&conn, key, None, &Config::default()).unwrap();
+        }
+        let grant = AccessGrant {
+            // Grants use canonical policy identities, including temp-directory aliases.
+            path: crate::access_policy::policy_path(
+                &dir.path().join("nested").join("..").join("outside"),
+            ),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        let raw = serde_json::json!([{"path":grant.path,"mode":"read"}]);
+        materialize(&conn, &policy(&first, dir.path()), &raw, &[grant.clone()]).unwrap();
+        let revived = policy(&second, dir.path());
+        conn.execute_batch("CREATE TRIGGER fail_install BEFORE INSERT ON access_grants BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert!(restore_launch(&conn, &revived, |_, _| Ok(vec![grant.clone()])).is_err());
+        for table in [
+            "access_launch_params",
+            "access_materialized",
+            "access_grants",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE epoch='2'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "failed restore must roll back {table}");
+        }
+        conn.execute_batch("DROP TRIGGER fail_install;").unwrap();
+        assert_eq!(
+            restore_launch(&conn, &revived, |_, _| Ok(vec![grant.clone()])).unwrap(),
+            LaunchRestore::Materialized
+        );
+        assert_eq!(list(&conn, &second).unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn grants_revived_launch_restoration_isolates_full_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let first = scope("worker", 1);
+        register_scope(&conn, &first, None, &Config::default()).unwrap();
+        materialize(
+            &conn,
+            &policy(&first, dir.path()),
+            &serde_json::json!([]),
+            &[],
+        )
+        .unwrap();
+        for dimension in [
+            "ref",
+            "owner",
+            "session",
+            "preset",
+            "principal",
+            "harness",
+            "root",
+        ] {
+            let mut key = policy(&scope("worker", 2), dir.path());
+            match dimension {
+                "ref" => key.scope_ref = "other".into(),
+                "owner" => key.owner = "other".into(),
+                "session" => key.session = "other".into(),
+                "preset" => key.preset = "head".into(),
+                "principal" => key.principal = "other".into(),
+                "harness" => key.harness = "other".into(),
+                _ => key.project_root = dir.path().join("other").display().to_string(),
+            }
+            register_scope(
+                &conn,
+                &ScopeKey::from_policy(&key),
+                None,
+                &Config::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                restore_launch(&conn, &key, |_, _| panic!(
+                    "crossed {dimension} identity boundary"
+                ))
+                .unwrap(),
+                LaunchRestore::NoParams
+            );
+        }
     }
 
     #[test]

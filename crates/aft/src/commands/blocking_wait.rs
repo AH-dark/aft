@@ -77,6 +77,15 @@ impl ReplyBudget {
     pub(crate) fn cap(&self, deadline: Instant) -> Instant {
         deadline.min(self.deadline)
     }
+
+    /// Refund restoration time only to the internal startup allowance. The
+    /// caller's absolute reply deadline, including delivery margin, stays fixed.
+    pub(crate) fn after_launch_restore(self, elapsed: Duration) -> Self {
+        Self {
+            received_at: self.received_at + elapsed,
+            deadline: self.deadline,
+        }
+    }
 }
 
 impl From<Instant> for ReplyBudget {
@@ -100,6 +109,24 @@ pub(crate) fn clamp_worker_wait_ms(configured: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_restore_wait_refunds_startup_but_not_caller_deadline() {
+        let receipt = Instant::now() - Duration::from_secs(20);
+        let budget = ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(2)));
+        assert!(budget.deadline < Instant::now());
+        let shifted = budget.after_launch_restore(Duration::from_secs(20));
+        assert!(shifted.deadline < Instant::now());
+        assert_eq!(
+            shifted.received_at - budget.received_at,
+            Duration::from_secs(20)
+        );
+        assert_eq!(shifted.deadline, budget.deadline);
+        assert_eq!(
+            budget.after_launch_restore(Duration::ZERO).deadline,
+            budget.deadline
+        );
+    }
 
     #[test]
     fn default_worker_wait_keeps_full_thirty_minutes() {

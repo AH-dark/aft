@@ -613,7 +613,10 @@ where
                 holder: claimed,
             } => {
                 holder = Some((ask, claimed));
-                let running = rerun(AskRoute::Consent { once });
+                let running = rerun(AskRoute::Consent {
+                    once,
+                    launch: super::access_grants::launch_key(&call.identity, "worker"),
+                });
                 tokio::pin!(running);
                 let (response, text) = loop {
                     tokio::select! {

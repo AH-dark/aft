@@ -19,6 +19,7 @@ pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
 #[derive(Debug)]
 pub struct PhaseTrace {
     frame_decoded: Instant,
+    launch_restore_wait: std::time::Duration,
     executor_submitted: Option<Instant>,
     job_admitted: Option<Instant>,
     translate_done: Option<Instant>,
@@ -94,9 +95,18 @@ impl PhaseTrace {
         self.frame_decoded
     }
 
+    pub(crate) fn launch_restore_wait(&self) -> std::time::Duration {
+        self.launch_restore_wait
+    }
+
+    pub(crate) fn note_launch_restore_wait(&mut self, elapsed: std::time::Duration) {
+        self.launch_restore_wait = elapsed;
+    }
+
     pub fn new(frame_decoded: Instant) -> Self {
         Self {
             frame_decoded,
+            launch_restore_wait: std::time::Duration::ZERO,
             executor_submitted: None,
             job_admitted: None,
             translate_done: None,
@@ -795,6 +805,7 @@ mod tests {
         let t0 = Instant::now();
         let trace = PhaseTrace {
             frame_decoded: t0,
+            launch_restore_wait: Duration::ZERO,
             executor_submitted: Some(t0 + Duration::from_millis(1)),
             job_admitted: Some(t0 + Duration::from_millis(3)),
             translate_done: Some(t0 + Duration::from_millis(6)),

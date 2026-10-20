@@ -1,0 +1,1 @@
+Graceful shutdown names each project whose search-index flush failed or did not finish before the exit deadline, instead of treating an incomplete flush as a successful completion. The shutdown deadline is unchanged.
