@@ -339,6 +339,7 @@ fn write_patched_file(
     description: &str,
     backed_paths: &mut HashSet<PathBuf>,
     created_in_call: bool,
+    write_warnings: &mut Vec<String>,
 ) -> Result<PatchedFile, String> {
     let existed = path.exists();
     let original = if existed {
@@ -381,6 +382,9 @@ fn write_patched_file(
         }
     };
 
+    // Warnings from both the write and a syntax rollback reach the reply even
+    // when the hunk fails, so a recovery copy or lost mode is never hidden.
+    write_warnings.append(&mut write_result.write_warnings);
     if write_result.rolled_back {
         if snapshot_taken {
             discard_latest_backup(ctx, req, op_id, path);
@@ -648,6 +652,7 @@ fn apply_add(
     contents: &str,
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
+    write_warnings: &mut Vec<String>,
 ) -> Result<AppliedHunkResult, String> {
     if resolved.source.abs.exists() {
         return Err(
@@ -666,6 +671,7 @@ fn apply_add(
         "apply_patch: file created by add hunk",
         backed_paths,
         true,
+        write_warnings,
     )?;
     Ok(AppliedHunkResult {
         index: 0,
@@ -721,6 +727,7 @@ fn apply_update(
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
     target_created_in_call: bool,
+    write_warnings: &mut Vec<String>,
 ) -> Result<AppliedHunkResult, String> {
     let original = fs::read_to_string(&resolved.source.abs)
         .map_err(|error| format!("failed to read file: {error}"))?;
@@ -737,6 +744,7 @@ fn apply_update(
             op_id,
             backed_paths,
             target_created_in_call,
+            write_warnings,
         )
     } else {
         let written = write_patched_file(
@@ -748,6 +756,7 @@ fn apply_update(
             "apply_patch: pre-update backup",
             backed_paths,
             target_created_in_call,
+            write_warnings,
         )?;
         Ok(AppliedHunkResult {
             index: 0,
@@ -772,6 +781,7 @@ fn apply_move_update(
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
     dest_created_in_call: bool,
+    write_warnings: &mut Vec<String>,
 ) -> Result<AppliedHunkResult, String> {
     let dest_existed = dest.abs.exists();
     let dest_snapshot = if dest_existed {
@@ -792,6 +802,7 @@ fn apply_move_update(
         "apply_patch: move destination backup",
         backed_paths,
         dest_created_in_call,
+        write_warnings,
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -944,7 +955,8 @@ mod audit_regressions {
                 "destination after".into(),
                 "failed-move",
                 &mut backed,
-                false
+                false,
+                &mut Vec::new()
             )
             .is_err());
             if existed {
@@ -1087,6 +1099,8 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     let mut output_lines = Vec::new();
     let mut failures = Vec::new();
     let mut applied = Vec::new();
+    // Warnings from every file write, including writes of hunks that failed.
+    let mut write_warnings: Vec<String> = Vec::new();
     // Files this patch created that still exist, each mapped to the index of
     // the reply line that created it. A later hunk that deletes or moves the
     // file away removes it; the syntax check reads the final content after
@@ -1104,6 +1118,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     contents,
                     &op_id,
                     &mut backed_paths,
+                    &mut write_warnings,
                 ) {
                     Ok(mut result) => {
                         result.index = index;
@@ -1148,6 +1163,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     &op_id,
                     &mut backed_paths,
                     target_created_in_call,
+                    &mut write_warnings,
                 ) {
                     Ok(mut result) => {
                         result.index = index;
@@ -1222,18 +1238,22 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     let output = output_lines.join("\n");
 
     if applied.is_empty() && !failures.is_empty() {
+        let mut data = json!({
+            "output": output,
+            "complete": false,
+            "all_failed": true,
+            "partial": false,
+            "failures": failures,
+            "metadata": { "diff": "", "files": [] },
+        });
+        if !write_warnings.is_empty() {
+            data["warnings"] = json!(write_warnings);
+        }
         return Response::error_with_data(
             req.id.clone(),
             "apply_patch_failed",
             output.clone(),
-            json!({
-                "output": output,
-                "complete": false,
-                "all_failed": true,
-                "partial": false,
-                "failures": failures,
-                "metadata": { "diff": "", "files": [] },
-            }),
+            data,
         );
     }
 
@@ -1253,6 +1273,9 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         "failures": failures,
         "metadata": { "diff": diff, "files": files },
     });
+    if !write_warnings.is_empty() {
+        result["warnings"] = json!(write_warnings);
+    }
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, None);
     Response::success(&req.id, result)
 }
@@ -1451,4 +1474,127 @@ pub fn handle_apply_patch(req: &RawRequest, ctx: &AppContext) -> Response {
         affected_abs.iter().map(|path| std::path::Path::new(path)),
     );
     apply_patch(req, ctx, &resolved)
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn ambiguous_update_reports_refusal_and_preserves_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let original = "\u{feff}head\r\n  target\r\nother\r\n\ttarget\r\n";
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n-\u{feff}head\n+\u{feff}changed\n@@\n-target\n+replacement\n*** End Patch", path.display());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "match-guard".into(),
+            command: "apply_patch".into(),
+            params: serde_json::json!({"patch_text": patch, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+        assert_eq!(response["code"], "apply_patch_failed", "{response}");
+        assert!(response["failures"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Ambiguous non-exact match"));
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn malformed_later_update_is_rejected_before_any_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let original = b"\xef\xbb\xbfhead\r\nlast";
+        let binary = b"\xffuntouched\r\n";
+        std::fs::write(&first, original).unwrap();
+        std::fs::write(&second, binary).unwrap();
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n-\u{feff}head\n+\u{feff}changed\n*** Update File: {}\n@@\ngarbage\n*** End Patch", first.display(), second.display());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "parse-guard".into(),
+            command: "apply_patch".into(),
+            params: serde_json::json!({"patch_text": patch, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+        assert_eq!(response["code"], "invalid_request", "{response}");
+        assert!(response["message"].as_str().unwrap().contains("line 8"));
+        assert_eq!(std::fs::read(first).unwrap(), original);
+        assert_eq!(std::fs::read(second).unwrap(), binary);
+    }
+}
+
+/// Write warnings must reach the reply even when a hunk fails, so a rolled
+/// back write cannot hide a recovery copy or a mode it failed to restore.
+#[cfg(all(test, unix))]
+mod write_warning_tests {
+    use super::*;
+
+    #[test]
+    fn rolled_back_hunk_reports_its_write_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ts");
+        let original = "export const value = 1;\n";
+        std::fs::write(&path, original).unwrap();
+        // A second name keeps the write in place, where the mode is checked.
+        std::fs::hard_link(&path, dir.path().join("b.ts")).unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-export const value = 1;\n+export const value = {{;\n*** End Patch",
+            path.display()
+        );
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "rollback-warnings".into(),
+            command: "apply_patch".into(),
+            params: serde_json::json!({"patch_text": patch, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        edit::FORCE_MODE_RESTORE_FAILURE.with(|forced| forced.set(true));
+        let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+        edit::FORCE_MODE_RESTORE_FAILURE.with(|forced| forced.set(false));
+        assert_eq!(response["code"], "apply_patch_failed", "{response}");
+        assert!(
+            response["failures"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid syntax"),
+            "{response}"
+        );
+        let warnings = response["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().starts_with("mode_not_restored: ")),
+            "{response}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 }

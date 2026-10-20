@@ -452,6 +452,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             rolled_back: false,
             lsp_outcome,
             final_text: None,
+            write_warnings: Vec::new(),
             reformatted_excerpt: final_content.as_deref().and_then(|content| {
                 edit::compute_reformatted_excerpt(
                     &format!("{before_content}{append_content}"),

@@ -53,6 +53,8 @@ pub struct SequenceMatch {
 
 /// Convert smart quotes, dash variants, ellipsis, and NBSP to their ASCII forms; mirrors `patch-parser.ts:207-214`.
 pub fn normalize_unicode(input: &str) -> String {
+    #[cfg(test)]
+    NORMALIZED_LINE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     let mut normalized = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
@@ -71,6 +73,8 @@ pub fn normalize_unicode(input: &str) -> String {
 
 /// Replace a leading run of tabs and spaces with the same number of plain spaces; mirrors `patch-parser.ts:227-229`.
 pub fn normalize_indent(input: &str) -> String {
+    #[cfg(test)]
+    NORMALIZED_LINE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     let mut leading_chars = 0;
     let mut leading_bytes = 0;
 
@@ -94,6 +98,8 @@ pub fn normalize_indent(input: &str) -> String {
 
 /// Collapse every Unicode whitespace run to one space and trim the ends; mirrors `patch-parser.ts:233-235`.
 pub fn normalize_reflow_whitespace(input: &str) -> String {
+    #[cfg(test)]
+    REFLOW_WINDOW_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     let mut collapsed = String::with_capacity(input.len());
     let mut in_whitespace = false;
 
@@ -114,6 +120,8 @@ pub fn normalize_reflow_whitespace(input: &str) -> String {
 
 /// Remove every Unicode whitespace character; mirrors `patch-parser.ts:237-239`.
 pub fn strip_reflow_whitespace(input: &str) -> String {
+    #[cfg(test)]
+    REFLOW_WINDOW_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     input.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
@@ -168,57 +176,105 @@ fn normalized_sequence_match(
     pattern: &[&str],
     start_index: usize,
     eof: bool,
-    normalize: impl Fn(&str) -> String,
+    compare: impl Fn(&str, &str) -> bool,
 ) -> Option<usize> {
     if pattern.is_empty() || pattern.len() > lines.len() {
         return None;
     }
-    let wanted: Vec<String> = pattern.iter().map(|line| normalize(line)).collect();
     if eof {
         let start = lines.len() - pattern.len();
         return (start >= start_index
             && lines[start..]
                 .iter()
-                .zip(&wanted)
-                .all(|(line, expected)| normalize(line) == *expected))
+                .zip(pattern)
+                .all(|(line, expected)| compare(line, expected)))
         .then_some(start);
     }
-    let mut prefix = vec![0; wanted.len()];
-    for i in 1..wanted.len() {
+    let mut prefix = vec![0; pattern.len()];
+    for i in 1..pattern.len() {
         let mut matched = prefix[i - 1];
-        while matched > 0 && wanted[i] != wanted[matched] {
+        loop {
+            if compare(pattern[i], pattern[matched]) {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
             matched = prefix[matched - 1];
-        }
-        if wanted[i] == wanted[matched] {
-            matched += 1;
         }
         prefix[i] = matched;
     }
     let mut matched = 0;
     for (i, line) in lines.iter().enumerate().skip(start_index) {
-        let current = normalize(line);
-        while matched > 0 && current != wanted[matched] {
+        loop {
+            if compare(line, pattern[matched]) {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
             matched = prefix[matched - 1];
         }
-        if current == wanted[matched] {
-            matched += 1;
-        }
-        if matched == wanted.len() {
-            return Some(i + 1 - wanted.len());
+        if matched == pattern.len() {
+            return Some(i + 1 - pattern.len());
         }
     }
     None
+}
+
+fn unicode_characters(input: &str) -> impl Iterator<Item = char> + '_ {
+    input.chars().flat_map(|ch| {
+        let mapped = match ch {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' => '-',
+            '\u{00A0}' => ' ',
+            _ => ch,
+        };
+        if ch == '\u{2026}' {
+            [Some('.'), Some('.'), Some('.')]
+        } else {
+            [Some(mapped), None, None]
+        }
+        .into_iter()
+        .flatten()
+    })
+}
+
+fn collapsed_whitespace(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    let mut started = false;
+    let mut space = false;
+    chars.flat_map(move |ch| {
+        let emitted = if ch.is_whitespace() {
+            space = started;
+            [None, None]
+        } else {
+            let emitted = if space {
+                [Some(' '), Some(ch)]
+            } else {
+                [Some(ch), None]
+            };
+            space = false;
+            started = true;
+            emitted
+        };
+        emitted.into_iter().flatten()
+    })
 }
 
 fn non_whitespace_unit_count(input: &str) -> usize {
     // TypeScript uses UTF-16 code units for `.length`; Rust has no direct equivalent on `str`.
     // The length check only bounds candidate windows before exact string equality, so counting
     // Unicode scalar values keeps non-ASCII text from being over-weighted by UTF-8 byte length.
-    strip_reflow_whitespace(input).chars().count()
+    input.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
 #[cfg(test)]
 thread_local! {
+    static NORMALIZED_LINE_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_WINDOW_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -266,12 +322,18 @@ pub fn find_reflow_match(
                 continue;
             }
 
-            let window_text = lines[start..end].join("\n");
-            let window_non_whitespace = strip_reflow_whitespace(&window_text);
-            if window_non_whitespace != needle_non_whitespace {
+            let window_chars = || {
+                lines[start..end]
+                    .iter()
+                    .flat_map(|line| line.chars().chain(std::iter::once('\n')))
+            };
+            if !window_chars()
+                .filter(|ch| !ch.is_whitespace())
+                .eq(needle_non_whitespace.chars())
+            {
                 continue;
             }
-            if normalize_reflow_whitespace(&window_text) != normalized_needle {
+            if !collapsed_whitespace(window_chars()).eq(normalized_needle.chars()) {
                 continue;
             }
 
@@ -284,82 +346,93 @@ pub fn find_reflow_match(
     first_match
 }
 
-/// Run the first-hit-wins Exact/Rstrip/Trim/Indent/Unicode/Reflow ladder; mirrors `patch-parser.ts:353-399`.
+/// Keep exact first-hit matching, but refuse ambiguous non-exact fallbacks.
 pub fn seek_sequence_tiered(
     lines: &[&str],
     pattern: &[&str],
     start_index: usize,
     eof: bool,
 ) -> Option<SequenceMatch> {
+    seek_sequence_tiered_checked(lines, pattern, start_index, eof)
+        .ok()
+        .flatten()
+}
+
+fn unique_match(
+    first: Option<usize>,
+    next: impl FnOnce(usize) -> Option<usize>,
+) -> Result<Option<usize>, &'static str> {
+    if let Some(first) = first {
+        if next(first + 1).is_some() {
+            return Err("Ambiguous non-exact match");
+        }
+    }
+    Ok(first)
+}
+
+pub(crate) fn seek_sequence_tiered_checked(
+    lines: &[&str],
+    pattern: &[&str],
+    start_index: usize,
+    eof: bool,
+) -> Result<Option<SequenceMatch>, &'static str> {
     if pattern.is_empty() {
-        return None;
+        return Ok(None);
     }
-
+    let matched = |found, tier| {
+        Some(SequenceMatch {
+            found,
+            tier,
+            line_count: pattern.len(),
+        })
+    };
     if let Some(found) = try_match(lines, pattern, start_index, |a, b| a == b, eof) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Exact,
-            line_count: pattern.len(),
-        });
+        return Ok(matched(found, MatchTier::Exact));
     }
-
-    if let Some(found) = try_match(
-        lines,
-        pattern,
-        start_index,
-        |a, b| a.trim_end() == b.trim_end(),
-        eof,
-    ) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Rstrip,
-            line_count: pattern.len(),
-        });
+    for (tier, compare) in [
+        (
+            MatchTier::Rstrip,
+            (|a: &str, b: &str| a.trim_end() == b.trim_end()) as fn(&str, &str) -> bool,
+        ),
+        (
+            MatchTier::Trim,
+            (|a: &str, b: &str| a.trim() == b.trim()) as fn(&str, &str) -> bool,
+        ),
+    ] {
+        let found = unique_match(
+            try_match(lines, pattern, start_index, compare, eof),
+            |next| try_match(lines, pattern, next, compare, eof),
+        )?;
+        if let Some(found) = found {
+            return Ok(matched(found, tier));
+        }
     }
-
-    if let Some(found) = try_match(
-        lines,
-        pattern,
-        start_index,
-        |a, b| a.trim() == b.trim(),
-        eof,
-    ) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Trim,
-            line_count: pattern.len(),
-        });
+    let indent = |a: &str, b: &str| a.trim() == b.trim();
+    let found = unique_match(
+        normalized_sequence_match(lines, pattern, start_index, eof, indent),
+        |next| normalized_sequence_match(lines, pattern, next, eof, indent),
+    )?;
+    if let Some(found) = found {
+        return Ok(matched(found, MatchTier::Indent));
     }
-
-    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |line| {
-        normalize_indent(line).trim_end().to_string()
-    }) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Indent,
-            line_count: pattern.len(),
-        });
+    let unicode = |a: &str, b: &str| unicode_characters(a.trim()).eq(unicode_characters(b.trim()));
+    let found = unique_match(
+        normalized_sequence_match(lines, pattern, start_index, eof, unicode),
+        |next| normalized_sequence_match(lines, pattern, next, eof, unicode),
+    )?;
+    if let Some(found) = found {
+        return Ok(matched(found, MatchTier::Unicode));
     }
-
-    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |line| {
-        normalize_unicode(line.trim())
-    }) {
-        return Some(SequenceMatch {
-            found,
-            tier: MatchTier::Unicode,
-            line_count: pattern.len(),
-        });
-    }
-
     if eof {
-        return None;
+        return Ok(None);
     }
-
-    find_reflow_match(lines, pattern, start_index).map(|(found, line_count)| SequenceMatch {
-        found,
-        tier: MatchTier::Reflow,
-        line_count,
-    })
+    Ok(
+        find_reflow_match(lines, pattern, start_index).map(|(found, line_count)| SequenceMatch {
+            found,
+            tier: MatchTier::Reflow,
+            line_count,
+        }),
+    )
 }
 
 fn add_sampled_candidates(
@@ -669,12 +742,12 @@ mod tests {
         let mut pattern = vec!["same"; 60];
         pattern[59] = "missing";
         let calls = Cell::new(0);
-        let found = super::normalized_sequence_match(&lines, &pattern, 0, false, |line| {
+        let found = super::normalized_sequence_match(&lines, &pattern, 0, false, |a, b| {
             calls.set(calls.get() + 1);
-            line.to_string()
+            a == b
         });
         assert_eq!(found, None);
-        assert!(calls.get() <= lines.len() + pattern.len());
+        assert!(calls.get() <= 2 * (lines.len() + pattern.len()));
         let baseline_calls = Cell::new(0);
         assert_eq!(
             found,
@@ -689,7 +762,7 @@ mod tests {
                 false
             )
         );
-        assert!(baseline_calls.get() > calls.get() * 40);
+        assert!(baseline_calls.get() > calls.get() * 20);
         eprintln!(
             "repeated-prefix comparisons: baseline {}, indexed {}",
             baseline_calls.get(),
@@ -698,7 +771,7 @@ mod tests {
         let mut found_lines = lines.clone();
         found_lines[4_999] = "missing";
         assert_eq!(
-            super::normalized_sequence_match(&found_lines, &pattern, 0, false, str::to_string),
+            super::normalized_sequence_match(&found_lines, &pattern, 0, false, |a, b| a == b),
             Some(4_940)
         );
         assert_eq!(
@@ -990,6 +1063,78 @@ mod tests {
                 synthetic_file.len(),
             ),
             NearestMissSearch::SkippedLargeFile
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn fallback_matching_does_not_allocate_normalized_file_lines() {
+        NORMALIZED_LINE_ALLOCATIONS.with(|count| count.set(0));
+        let result = seek_sequence_tiered(&["one – two"], &["one - two"], 0, false).unwrap();
+        assert_eq!(result.tier, MatchTier::Unicode);
+        assert_eq!(NORMALIZED_LINE_ALLOCATIONS.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn reflow_matching_does_not_allocate_candidate_windows() {
+        REFLOW_WINDOW_ALLOCATIONS.with(|count| count.set(0));
+        assert_eq!(
+            find_reflow_match(&["x", "a", "b", "y", "a  b"], &["a b"], 0),
+            None
+        );
+        assert_eq!(
+            find_reflow_match(&["x", "a", "b"], &["a b"], 0),
+            Some((1, 2))
+        );
+        // Only the needle is normalized (once collapsed, once stripped) per
+        // search; file lines and candidate windows are compared in place.
+        assert_eq!(REFLOW_WINDOW_ALLOCATIONS.with(|count| count.get()), 4);
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn non_exact_matches_must_be_unique_in_the_eligible_range() {
+        for (lines, pattern) in [
+            (vec!["target ", "other", "target\t"], vec!["target"]),
+            (vec!["  target", "other", "\ttarget"], vec!["target"]),
+            (vec!["‘target’", "other", "’target’"], vec!["'target'"]),
+        ] {
+            assert!(
+                seek_sequence_tiered(&lines, &pattern, 0, false).is_none(),
+                "{lines:?}"
+            );
+            let selected = seek_sequence_tiered(&lines, &pattern, 2, false).unwrap();
+            assert_eq!(selected.found, 2);
+            assert_eq!(
+                seek_sequence_tiered(&lines, &pattern, 0, true)
+                    .unwrap()
+                    .found,
+                2
+            );
+        }
+        assert!(
+            seek_sequence_tiered(
+                &["say( ‘a’ )", "say( ’a’ )", "say(", " 'a' ", ")"],
+                &["say( 'a' )"],
+                0,
+                false
+            )
+            .is_none(),
+            "an ambiguous stronger fallback must not fall through to reflow"
+        );
+        assert_eq!(
+            seek_sequence_tiered(&["target", "target"], &["target"], 0, false)
+                .unwrap()
+                .found,
+            0
         );
     }
 }

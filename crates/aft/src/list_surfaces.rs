@@ -335,6 +335,30 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded deduplication bookkeeping, not a result list; evicting an idle session only repeats its next bar and never suppresses a changed value",
     },
     ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "drop, notify_full_validation_start",
+        location_or_primitive: "FULL_VALIDATION_START_HOOK Option::take",
+        reason: "consumes or clears a test-only callback; Option::take removes one optional value, not entries from an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "foreign_group",
+        location_or_primitive: "groups.truncate(count.max(0) as usize)",
+        reason: "test helper shrinking a getgroups buffer to the count the OS returned; group ids for a fixture, never an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "read_sized",
+        location_or_primitive: "buffer.truncate(read_size as usize)",
+        reason: "shrinks a byte buffer to the size the OS reported for an extended-attribute name list or value; raw metadata copied to the replacement file, never an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "edit.rs",
+        enclosing_item: "REFORMATTED_EXCERPT_MAX_LINES, REFORMATTED_EXCERPT_MAX_BYTES, compute_reformatted_excerpt, excerpt_caps_bound_owned_line_construction",
+        location_or_primitive: "REFORMATTED_EXCERPT_MAX_",
+        reason: "bounds an inline post-format source excerpt, not a paginated list; oversized excerpts retain the existing extensive marker instead of returning partial source text",
+    },
+    ExclusionEntry {
         file: "subc_format.rs",
         enclosing_item: "format_ast_search_capture",
         location_or_primitive: "AST_CAPTURE_INLINE_CHAR_LIMIT .chars().take()",

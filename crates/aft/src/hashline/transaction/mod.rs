@@ -7,8 +7,8 @@
 //! observation, register commit gating, and `op_id` emission.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::backup::{new_op_id, BackupStore};
@@ -562,7 +562,7 @@ fn execute_step(
 
 fn execute_mutate(
     step_index: usize,
-    file: PlannedFile,
+    mut file: PlannedFile,
     op_id: &str,
     journaled: &mut bool,
     ctx: &mut ExecuteContext<'_>,
@@ -674,7 +674,11 @@ fn execute_mutate(
         }]);
     }
 
-    if let Err(error) = durable_write(&file.canonical_path, &file.final_bytes) {
+    let written = durable_write(&file.canonical_path, &file.final_bytes);
+    if let Ok(write_warnings) = written.as_ref() {
+        file.warnings.extend(write_warnings.iter().cloned());
+    }
+    if let Err(error) = written {
         let classification = if error.to_string().contains("durability") {
             FileClassification::FailedDurability
         } else {
@@ -771,7 +775,7 @@ fn execute_mutate(
 
 fn execute_mv(
     step_index: usize,
-    mv: PlannedMv,
+    mut mv: PlannedMv,
     op_id: &str,
     journaled: &mut bool,
     ctx: &mut ExecuteContext<'_>,
@@ -890,9 +894,12 @@ fn execute_mv(
     }
 
     // Destination durability precedes source unlink.
-    if let Err(error) = ensure_parent_dirs(&mv.dest_canonical)
-        .and_then(|_| durable_write(&mv.dest_canonical, &mv.final_bytes))
-    {
+    let written = ensure_parent_dirs(&mv.dest_canonical)
+        .and_then(|_| durable_write(&mv.dest_canonical, &mv.final_bytes));
+    if let Ok(write_warnings) = written.as_ref() {
+        mv.warnings.extend(write_warnings.iter().cloned());
+    }
+    if let Err(error) = written {
         let classification = if error.to_string().contains("durability") {
             FileClassification::FailedDurability
         } else {
@@ -1088,42 +1095,13 @@ fn ensure_parent_dirs(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write bytes via temp + fsync + rename so a crash cannot leave a torn target.
-fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Write bytes through the shared source writer: a synced replacement when
+/// that keeps the file's access metadata, otherwise an in-place rewrite backed
+/// by a recovery copy, so a failed write leaves the original bytes. Returns
+/// the writer's warnings for the file's outcome.
+fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<Vec<String>> {
     ensure_parent_dirs(path)?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let temp_name = {
-        let mut name = std::ffi::OsString::from(".aft-hashline-");
-        name.push(file_name);
-        name.push(".tmp");
-        name
-    };
-    let temp_path = parent.join(temp_name);
-
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-            .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
-        fs::rename(&temp_path, path)?;
-        // Best-effort directory durability after the rename.
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    write_result
+    crate::edit::atomic_write_source(path, bytes).map(|outcome| outcome.warnings)
 }
 
 // ── Outcome helpers ──────────────────────────────────────────────────────────
@@ -2289,5 +2267,88 @@ mod tests {
         // Backup is taken before baseline recheck, so op_id must be present.
         assert!(envelope.op_id.is_some());
         assert_eq!(fs::read(&a).unwrap(), b"changed\n");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod audit11_regressions {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_write_preserves_mode_and_does_not_touch_shared_temp_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script");
+        fs::write(&path, b"old\r\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+        let unrelated = dir.path().join(".aft-hashline-script.tmp");
+        fs::write(&unrelated, b"unrelated").unwrap();
+        let updated = b"\xef\xbb\xbfnew\r\n\xfflast";
+        durable_write(&path, updated).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), updated);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn durable_write_keeps_hard_links_joined() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script");
+        let other_name = dir.path().join("linked");
+        fs::write(&path, b"old\n").unwrap();
+        fs::hard_link(&path, &other_name).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        durable_write(&path, b"new\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(fs::read(&other_name).unwrap(), b"new\n");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&path).unwrap().nlink(), 2);
+    }
+}
+
+/// Hashline writes on every platform: a single-link file is replaced with the
+/// new bytes, and a hard-linked file is rewritten so every name sees them.
+#[cfg(test)]
+mod portable_durable_write_tests {
+    use super::*;
+
+    fn leftover_sidecars(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".aft-source-"))
+            .collect()
+    }
+
+    #[test]
+    fn durable_write_replaces_a_single_link_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        fs::write(&path, b"old\r\n").unwrap();
+        let warnings = durable_write(&path, b"\xef\xbb\xbfnew\r\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfnew\r\n");
+        assert_eq!(leftover_sidecars(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn durable_write_rewrites_every_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        fs::write(&path, b"old\n").unwrap();
+        fs::hard_link(&path, &other_name).unwrap();
+        let warnings = durable_write(&path, b"new\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(fs::read(&other_name).unwrap(), b"new\n");
+        assert_eq!(leftover_sidecars(dir.path()), Vec::<String>::new());
     }
 }

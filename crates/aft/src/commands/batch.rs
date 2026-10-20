@@ -9,7 +9,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::context::AppContext;
-use crate::edit::{self, line_col_to_byte};
+use crate::edit;
 use crate::protocol::{RawRequest, Response};
 
 /// A validated edit ready to apply, carrying byte offsets into the original content.
@@ -85,8 +85,9 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     // Phase 1: Validate all edits and resolve to byte offsets
     let mut resolved: Vec<ResolvedEdit> = Vec::with_capacity(edits.len());
 
+    let line_offsets = edit::LineOffsets::new(&source);
     for (i, edit_val) in edits.iter().enumerate() {
-        match resolve_edit(&source, edit_val, i, &req.id) {
+        match resolve_edit_with_offsets(&source, &line_offsets, edit_val, i, &req.id) {
             Ok(item_edits) => resolved.extend(item_edits),
             Err(resp) => return resp,
         }
@@ -366,8 +367,22 @@ mod contract_tests {
     }
 }
 
+/// Test convenience for resolving one edit without a shared line-offset table.
+#[cfg(test)]
 fn resolve_edit(
     source: &str,
+    edit_val: &serde_json::Value,
+    index: usize,
+    req_id: &str,
+) -> Result<Vec<ResolvedEdit>, Response> {
+    let line_offsets = edit::LineOffsets::new(source);
+    resolve_edit_with_offsets(source, &line_offsets, edit_val, index, req_id)
+}
+
+/// Resolve one edit, reusing line starts computed once for the whole batch.
+fn resolve_edit_with_offsets(
+    source: &str,
+    line_offsets: &edit::LineOffsets,
     edit_val: &serde_json::Value,
     index: usize,
     req_id: &str,
@@ -627,8 +642,7 @@ fn resolve_edit(
                 )
             })?;
 
-        let lines: Vec<&str> = source.lines().collect();
-        let total_lines = lines.len();
+        let total_lines = line_offsets.line_count();
 
         // Allow line_start == total_lines for appending at end of file
         if line_start > total_lines {
@@ -685,7 +699,7 @@ fn resolve_edit(
                     == Some(0)
                 && line_start > line_end)
         {
-            let byte_pos = line_col_to_byte(source, line_start as u32, 0);
+            let byte_pos = line_offsets.offset(line_start);
             let mut replacement_str = content.to_string();
             if !replacement_str.ends_with('\n') {
                 replacement_str.push('\n');
@@ -706,9 +720,9 @@ fn resolve_edit(
         };
 
         // Convert line range to byte offsets
-        let byte_start = line_col_to_byte(source, line_start as u32, 0);
+        let byte_start = line_offsets.offset(line_start);
         // line_end is inclusive: end byte is at the end of line_end (including its newline if present)
-        let byte_end = line_col_to_byte(source, line_end.saturating_add(1) as u32, 0);
+        let byte_end = line_offsets.offset(line_end.saturating_add(1));
 
         // Empty content = delete lines entirely (no trailing newline added)
         // Non-empty content = if the replaced range had a trailing newline, auto-append
@@ -1135,5 +1149,39 @@ mod a03_measurements {
             );
             eprintln!("A03 diff reversed={reversed} elapsed={elapsed:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn batch_reuses_one_line_offset_scan() {
+        let source = "\u{feff}first\r\n\u{e9}\r\nthree\rfour\r\ntail";
+        edit::LINE_OFFSET_BYTES_SCANNED.with(|count| count.set(0));
+        let offsets = edit::LineOffsets::new(source);
+        let edit = serde_json::json!({"line_start": 2, "line_end": 2, "content": "new"});
+        for _ in 0..100 {
+            let resolved = resolve_edit_with_offsets(source, &offsets, &edit, 0, "test").unwrap();
+            assert_eq!((resolved[0].byte_start, resolved[0].byte_end), (10, 14));
+            let content =
+                edit::replace_byte_range(source, 10, 14, &resolved[0].replacement).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("file.txt");
+            let config = crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            };
+            edit::write_format_validate(&path, &content, &config, &serde_json::json!({})).unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                "\u{feff}first\r\nnew\nthree\rfour\r\ntail".as_bytes()
+            );
+        }
+        assert_eq!(
+            edit::LINE_OFFSET_BYTES_SCANNED.with(|count| count.get()),
+            source.len()
+        );
     }
 }

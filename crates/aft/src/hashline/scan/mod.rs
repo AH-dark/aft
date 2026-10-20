@@ -593,8 +593,8 @@ impl ForwardScanner {
             first_seen,
             last_seen,
         };
-        let records = self
-            .retained_lines
+        let retained_lines = std::mem::take(&mut self.retained_lines);
+        let records = retained_lines
             .iter()
             .map(|(&line_number, retained)| (line_number, retained.record.clone()))
             .collect();
@@ -609,7 +609,7 @@ impl ForwardScanner {
             tag,
             normalized_bytes,
             records,
-            retained_lines: self.retained_lines.clone(),
+            retained_lines,
             coverage: coverage.clone(),
             boundary,
             total_lines: self.scanned_line_count,
@@ -617,6 +617,9 @@ impl ForwardScanner {
             provenance: self.request.provenance.clone(),
             capture_provenance: capture_provenance.clone(),
         };
+        // A finished scanner never consumes its buffers again. Release the raw
+        // copy before retaining the API's published snapshot and returned value.
+        self.raw_bytes = Vec::new();
         self.published = Some(snapshot.clone());
         Ok(ScanResult {
             snapshot: Some(snapshot),
@@ -1156,5 +1159,24 @@ mod tests {
             deferred, 64,
             "the deferred corpus rows must remain explicitly classified"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn finalization_releases_scanner_owned_content() {
+        let mut scanner = ForwardScanner::new(ScanRequest::whole_file());
+        scanner.push(b"\xef\xbb\xbffirst\r\n\xfflast").unwrap();
+        let result = scanner.finish().unwrap();
+        assert_eq!(result.snapshot.as_ref(), scanner.published_snapshot());
+        let snapshot = result.snapshot.unwrap();
+        assert_eq!(snapshot.records[&1].content, b"\xef\xbb\xbffirst");
+        assert_eq!(snapshot.records[&2].content, b"\xfflast");
+        assert!(scanner.raw_bytes.is_empty());
+        assert_eq!(scanner.raw_bytes.capacity(), 0);
+        assert!(scanner.retained_lines.is_empty());
     }
 }
