@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Issue #645 watcher recovery: search_index.rs only gains build cancellation; completed builds keep membership, order, file IDs and ranking. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
