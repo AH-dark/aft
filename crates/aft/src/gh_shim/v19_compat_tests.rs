@@ -2,7 +2,7 @@ use super::*;
 
 include!("../../tests/fixtures/gh_shim/status_normalization.rs");
 
-const MAIN: &str = "5433db405d8f8af6a26111e75d826c191fd9ca8a";
+const MAIN: &str = "bdbf17caf5d0dae171399937876d454e0974b55a";
 
 #[test]
 fn audit_v19_classifier_matches_pinned_main_corpus() {
