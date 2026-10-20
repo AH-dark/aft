@@ -1731,3 +1731,50 @@ fn url_with_query_resolves_ts_extension() {
         cache_content_path_for_url(storage.path(), &url, ".ts")
     );
 }
+
+#[test]
+fn translated_zoom_extensionless_urls_preserve_comma_headings() {
+    for (content_type, body) in [
+        (
+            "text/markdown",
+            "# Alpha, beta\n\nFirst section.\n\n# Gamma, delta\n\nSecond section.\n",
+        ),
+        (
+            "text/html",
+            "<h1>Alpha, beta</h1><p>First section.</p><h1>Gamma, delta</h1><p>Second section.</p>",
+        ),
+    ] {
+        let project = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        let server = spawn_mock_server(1, move |_path, stream| {
+            write_response(stream, "200 OK", content_type, body.as_bytes());
+        });
+        let url = server.url("/guide");
+        let mut aft = configure_with_storage(project.path(), storage.path());
+        for (symbols, names) in [
+            (json!("Alpha, beta"), vec!["Alpha, beta"]),
+            (
+                json!(["Alpha, beta", "Gamma, delta"]),
+                vec!["Alpha, beta", "Gamma, delta"],
+            ),
+            (
+                json!(r#"["Alpha, beta", "Gamma, delta"]"#),
+                vec!["Alpha, beta", "Gamma, delta"],
+            ),
+        ] {
+            let response = translated_zoom(
+                &mut aft,
+                project.path(),
+                json!({ "batch": [{ "target": url, "symbols": symbols }] }),
+            );
+            assert_eq!(response["success"], true, "{response:#}");
+            let entries = response["targets"].as_array().expect("zoom target results");
+            assert_eq!(entries.len(), names.len(), "{response:#}");
+            for (entry, name) in entries.iter().zip(names) {
+                assert_eq!(entry["name"], name, "{response:#}");
+                assert_eq!(entry["response"]["success"], true, "{response:#}");
+            }
+        }
+        assert!(aft.shutdown().success());
+    }
+}

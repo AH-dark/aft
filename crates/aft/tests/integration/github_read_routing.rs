@@ -618,3 +618,81 @@ fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
         response.data
     );
 }
+
+#[test]
+fn github_zoom_batch_ordinals_fetch_each_discussion_once() {
+    let temp = tempfile::tempdir().expect("create counted discussion fixture");
+    let bin = temp.path().join("bin");
+    let calls = temp.path().join("gh-calls");
+    fs::create_dir_all(&bin).unwrap();
+    link_cached_executable(
+        &bin.join("gh"),
+        br#"#!/bin/sh
+printf '%s\n' "$1:$2" >> "$AFT_TEST_GH_CALL_LOG"
+case "$1:$2" in
+  issue:view|pr:view)
+    printf '%s\n' '{"number":410,"title":"Counted discussion","state":"OPEN","body":"Fixture body","url":"https://github.com/owner/repo/issues/410","comments":[{"author":{"login":"first"},"body":"First selected comment","createdAt":"2026-09-03T05:10:00Z"},{"author":{"login":"second"},"body":"Second selected comment","createdAt":"2026-09-03T05:20:00Z"}],"files":[],"reviews":[]}'
+    ;;
+  api:graphql)
+    printf '%s\n' '{"data":{"repository":{"nameWithOwner":"owner/repo","pullRequest":{"number":410,"title":"Counted discussion","state":"OPEN","body":"Fixture body","comments":[],"files":[],"reviews":[]}}}}'
+    ;;
+  api:repos/*)
+    printf '%s\n' '[[]]'
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .expect("cache counted gh fixture");
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&original_path)))
+            .unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_GH_CALL_LOG", calls.as_os_str()),
+    ]);
+    configure_gh_read_enabled(&mut aft, temp.path());
+    for target in ["issue://410", "pr://owner/repo/410"] {
+        for arguments in [
+            json!({ "batch": [{ "target": target, "symbols": ["1", "2"] }] }),
+            json!({ "path": target, "symbols": ["1", "2"] }),
+            json!({ "targets": [{ "path": target, "symbols": ["1", "2"] }] }),
+        ] {
+            // Each discussion fetch starts with one structured view request;
+            // count that request rather than its additional timeline/review calls.
+            let view_count = || {
+                fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| matches!(*line, "issue:view" | "pr:view"))
+                    .count()
+            };
+            let before = view_count();
+            let response = aft.send(
+                &json!({ "id": "counted-zoom", "command": "tool_call", "session_id": "github-zoom-fetch-count", "name": "zoom", "arguments": arguments })
+                    .to_string(),
+            );
+            assert_eq!(response["success"], true, "{response:#}");
+            let entries = response["targets"].as_array().expect("zoom targets");
+            for entry in entries {
+                assert_eq!(entry["response"]["success"], true, "{response:#}");
+            }
+            let text = response["text"].as_str().unwrap_or_default();
+            assert!(text.contains("First selected comment"), "{response:#}");
+            assert!(text.contains("Second selected comment"), "{response:#}");
+            assert_eq!(
+                view_count() - before,
+                1,
+                "one fetch per GitHub batch entry: {response:#}"
+            );
+            assert_eq!(
+                entries.len(),
+                1,
+                "one combined selector per entry: {response:#}"
+            );
+            assert_eq!(entries[0]["name"], "1,2", "{response:#}");
+        }
+    }
+    assert!(aft.shutdown().success());
+}

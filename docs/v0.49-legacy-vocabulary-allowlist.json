@@ -2609,6 +2609,28 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 966,
+      "column": 32,
+      "token": "filePath",
+      "text": "json!({ \"targets\": [{ \"filePath\": target, \"symbols\": symbols }] }),",
+      "location": "line 966, column 32",
+      "ordinal": 1,
+      "class": "compatibility-fixture",
+      "reason": "The regression test verifies that quiet legacy location aliases retain language-aware symbol parsing."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 968,
+      "column": 36,
+      "token": "filePath",
+      "text": "for key in [\"target\", \"path\", \"filePath\", \"url\"] {",
+      "location": "line 968, column 36",
+      "ordinal": 1,
+      "class": "compatibility-fixture",
+      "reason": "The regression test verifies that quiet legacy location aliases retain language-aware symbol parsing."
+    },
+    {
       "path": "crates/aft/tests/integration/tool_call_parity_test.rs",
       "line": 376,
       "column": 29,

@@ -958,3 +958,114 @@ fn tool_call_zoom_conflicting_http_locations_name_both_values() {
     }
     assert!(aft.shutdown().success());
 }
+
+fn zoom_argument_shapes(target: &str, symbols: Value) -> Vec<Value> {
+    let mut shapes = vec![
+        json!({ "batch": [{ "target": target, "symbols": symbols }] }),
+        json!({ "targets": { "path": target, "symbol": symbols } }),
+        json!({ "targets": [{ "filePath": target, "symbols": symbols }] }),
+    ];
+    for key in ["target", "path", "filePath", "url"] {
+        shapes.push(json!({ key: target, "symbols": symbols }));
+    }
+    shapes
+}
+
+fn assert_zoom_lookup_names(response: &Value, expected: &[&str]) {
+    assert_eq!(response["success"], true, "{response:#}");
+    let entries = response["targets"].as_array().expect("zoom target results");
+    assert_eq!(entries.len(), expected.len(), "{response:#}");
+    for (entry, name) in entries.iter().zip(expected) {
+        assert_eq!(entry["name"], *name, "{response:#}");
+        assert_eq!(entry["response"]["success"], true, "{response:#}");
+    }
+}
+
+#[test]
+fn tool_call_zoom_code_comma_list_returns_both_symbols() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("code.ts"),
+        "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for args in zoom_argument_shapes("code.ts", json!("alpha, beta")) {
+        let response = placeholder_tool_call(&mut aft, "zoom-comma-list", "zoom", args);
+        assert_zoom_lookup_names(&response, &["alpha", "beta"]);
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_code_strings_clean_up_arrays_and_pasted_menu_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("code.ts"),
+        "export function alpha() { return 1; }\nexport function beta() { return 2; }\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for (symbols, names) in [
+        (json!(r#"["alpha", "beta"]"#), vec!["alpha", "beta"]),
+        (
+            json!("- `alpha` — alpha(): number (lines 1-1)"),
+            vec!["alpha"],
+        ),
+    ] {
+        for args in zoom_argument_shapes("code.ts", symbols) {
+            let response = placeholder_tool_call(&mut aft, "zoom-cleanup", "zoom", args);
+            assert_zoom_lookup_names(&response, &names);
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_comma_headings_stay_single_lookups() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("guide.md"),
+        "# Alpha, beta\n\nBoth topics belong to one section.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("guide.html"),
+        "<h1>Alpha, beta</h1><p>Both topics belong to one section.</p>\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for file in ["guide.md", "guide.html"] {
+        for symbols in [json!("Alpha, beta"), json!(["Alpha, beta"])] {
+            for args in zoom_argument_shapes(file, symbols) {
+                let response = placeholder_tool_call(&mut aft, "zoom-comma-heading", "zoom", args);
+                assert_zoom_lookup_names(&response, &["Alpha, beta"]);
+            }
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_symbol_array_entries_are_not_comma_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("code.ts"), "export function alpha() {}\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for args in zoom_argument_shapes("code.ts", json!(["alpha, beta"])) {
+        let response = placeholder_tool_call(&mut aft, "zoom-array-entry", "zoom", args);
+        assert_eq!(response["success"], true, "{response:#}");
+        let entries = response["targets"].as_array().expect("zoom target results");
+        assert_eq!(entries.len(), 1, "{response:#}");
+        assert_eq!(entries[0]["name"], "alpha, beta", "{response:#}");
+        assert_eq!(entries[0]["response"]["success"], false, "{response:#}");
+        assert_eq!(
+            entries[0]["response"]["code"], "symbol_not_found",
+            "{response:#}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}

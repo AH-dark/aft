@@ -2688,43 +2688,40 @@ fn translate_zoom_targets(
             .get("target")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let names: Vec<&str> = match entry.get("symbols") {
-            Some(Value::String(name)) => vec![name],
-            Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
-            None | Some(Value::Null) => vec![""],
+        let (symbol_key, symbols) = match entry.get("symbols") {
+            Some(value @ Value::String(_)) => ("symbol", value.clone()),
+            Some(value @ Value::Array(_)) => ("symbols", value.clone()),
+            None | Some(Value::Null) => ("symbol", Value::String(String::new())),
             _ => {
                 return Err(invalid_request(format!(
                     "'batch[{index}].symbols' must be a string or array of strings"
                 )))
             }
         };
-        for name in if names.is_empty() { vec![""] } else { names } {
-            let mut translated = Map::new();
-            if target.is_empty() {
-                translated.insert("file".to_string(), Value::String(String::new()));
-            } else {
-                insert_zoom_location(&mut translated, project_root, target);
-            }
-            if target.trim().is_empty() || name.trim().is_empty() {
-                // A symbols array expands into one native lookup per name. For a
-                // blank target or name, carry the batch entry's index so the
-                // handler reports its position rather than a flattened lookup index.
-                translated.insert("batch_index".to_string(), Value::Number(index.into()));
-            }
-            translated.insert("symbol".to_string(), Value::String(name.to_string()));
-            translated.insert(
-                "target_label".to_string(),
-                Value::String(
-                    if target.is_empty() {
-                        "(no target)"
-                    } else {
-                        target
-                    }
-                    .to_string(),
-                ),
-            );
-            out.push(Value::Object(translated));
+        let mut translated = Map::new();
+        if target.is_empty() {
+            translated.insert("file".to_string(), Value::String(String::new()));
+        } else {
+            insert_zoom_location(&mut translated, project_root, target);
         }
+        if target.trim().is_empty() || !zoom_field_present(Some(&symbols)) {
+            translated.insert("batch_index".to_string(), Value::Number(index.into()));
+        }
+        // Keep arrays grouped until the handler knows the resolved language.
+        // GitHub ordinals must also stay together to share one discussion fetch.
+        translated.insert(symbol_key.to_string(), symbols);
+        translated.insert(
+            "target_label".to_string(),
+            Value::String(
+                if target.is_empty() {
+                    "(no target)"
+                } else {
+                    target
+                }
+                .to_string(),
+            ),
+        );
+        out.push(Value::Object(translated));
     }
     Ok(out)
 }
@@ -4980,7 +4977,7 @@ mod placeholder_argument_tests {
                 "{targets}"
             );
             assert_eq!(translated.args["targets"][0]["file"], abs("src/a.ts"));
-            assert_eq!(translated.args["targets"][0]["symbol"], "foo");
+            assert_eq!(translated.args["targets"][0]["symbols"], json!(["foo"]));
         }
 
         let error = zoom(json!({ "targets": [{ "path": "", "symbol": "" }] }))
@@ -5003,8 +5000,7 @@ mod placeholder_argument_tests {
         assert_eq!(
             translated.args["targets"],
             json!([
-                { "file": abs("src/a.ts"), "symbol": "foo", "target_label": "src/a.ts" },
-                { "file": abs("src/a.ts"), "symbol": "bar", "target_label": "src/a.ts" },
+                { "file": abs("src/a.ts"), "symbols": ["foo", "bar"], "target_label": "src/a.ts" },
                 { "file": abs("x"), "symbol": "x", "target_label": "x" }
             ])
         );
@@ -5111,8 +5107,7 @@ mod zoom_batch_contract_tests {
         assert_eq!(
             translated.args["targets"],
             json!([
-                { "file": file, "symbol": "client", "target_label": "http_client.rs" },
-                { "file": file, "symbol": "connect", "target_label": "http_client.rs" },
+                { "file": file, "symbols": ["client", "connect"], "target_label": "http_client.rs" },
                 { "file": "https://example.test/docs", "symbol": "Overview", "target_label": "https://example.test/docs" }
             ])
         );

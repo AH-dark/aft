@@ -351,11 +351,18 @@ function successForTranslate(command: string, params: Record<string, unknown>): 
 
 function translateAftZoomToolCall(rawArgs: Record<string, unknown>): BridgeCall {
   const batch = rawArgs.batch as Array<{ target?: string; symbols?: string | string[] }>;
-  const targets = batch.flatMap((entry, index) => {
+  const targets = batch.map((entry, index) => {
     const target = entry.target ?? "";
-    const names = Array.isArray(entry.symbols) ? entry.symbols : [entry.symbols ?? ""];
+    const symbols = entry.symbols ?? "";
     const remote = /^(https?:\/\/|issue:\/\/|pr:\/\/)/.test(target);
-    return (names.length ? names : [""]).map((symbol) => ({ file: target ? (remote ? target : resolveProjectPath(target)) : "", symbol, target_label: target || "(no target)", ...(!target.trim() || !symbol.trim() ? { batch_index: index } : {}) }));
+    return {
+      file: target ? (remote ? target : resolveProjectPath(target)) : "",
+      ...(Array.isArray(symbols) ? { symbols } : { symbol: symbols }),
+      target_label: target || "(no target)",
+      ...(!target.trim() || (typeof symbols === "string" ? !symbols.trim() : !symbols.length)
+        ? { batch_index: index }
+        : {}),
+    };
   });
   return { command: "zoom", params: { targets, ...(rawArgs.contextLines !== undefined ? { context_lines: rawArgs.contextLines } : {}), ...(rawArgs.callgraph === true ? { callgraph: true } : {}) } };
 }
