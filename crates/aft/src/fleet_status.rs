@@ -143,10 +143,16 @@ struct FleetStatusInner {
     route_live: AtomicBool,
     state: parking_lot::Mutex<ClientState>,
     next_revision: AtomicU64,
-    /// The holder route the dial stopped reopening, if any. The health report
-    /// lists it (see [`stopped_routes_snapshot`]).
-    stopped_route: parking_lot::Mutex<Option<StoppedRoute>>,
+    /// The holder routes the dial stopped reopening, oldest first and bounded by
+    /// [`MAX_STOPPED_ROUTES`]. The health report lists them (see
+    /// [`stopped_routes_snapshot`]).
+    stopped_routes: parking_lot::Mutex<Vec<StoppedRoute>>,
 }
+
+/// How many refused session routes one dial remembers. Each refused session is
+/// kept so another session's publish cannot make the dial forget it and open
+/// the refused route again; the bound keeps a long-lived daemon's memory flat.
+const MAX_STOPPED_ROUTES: usize = 64;
 
 impl FleetStatusInner {
     fn new(wire_tx: Option<mpsc::Sender<StatusWireRequest>>, route_live: bool) -> Self {
@@ -155,7 +161,7 @@ impl FleetStatusInner {
             route_live: AtomicBool::new(route_live),
             state: parking_lot::Mutex::new(ClientState::default()),
             next_revision: AtomicU64::new(1),
-            stopped_route: parking_lot::Mutex::new(None),
+            stopped_routes: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -209,12 +215,13 @@ pub(crate) fn stopped_routes_snapshot() -> Value {
         clients
             .iter()
             .filter_map(Weak::upgrade)
-            .filter_map(|client| {
+            .flat_map(|client| {
                 client
-                    .stopped_route
+                    .stopped_routes
                     .lock()
-                    .as_ref()
+                    .iter()
                     .map(StoppedRoute::to_value)
+                    .collect::<Vec<_>>()
             })
             .collect(),
     )
@@ -283,12 +290,26 @@ impl FleetStatusClient {
 
     /// The holder route this client's dial stopped reopening, if any.
     #[cfg(test)]
+    /// The most recently stopped route.
     pub(crate) fn stopped_route(&self) -> Option<StoppedRoute> {
-        self.inner.stopped_route.lock().clone()
+        self.inner.stopped_routes.lock().last().cloned()
     }
 
-    fn set_stopped_route(&self, stopped: Option<StoppedRoute>) {
-        *self.inner.stopped_route.lock() = stopped;
+    #[cfg(test)]
+    fn stopped_routes(&self) -> Vec<StoppedRoute> {
+        self.inner.stopped_routes.lock().clone()
+    }
+
+    fn record_stopped_route(&self, stopped: StoppedRoute) {
+        let mut routes = self.inner.stopped_routes.lock();
+        routes.retain(|route| {
+            (&route.session, &route.harness, &route.project_root)
+                != (&stopped.session, &stopped.harness, &stopped.project_root)
+        });
+        if routes.len() >= MAX_STOPPED_ROUTES {
+            routes.remove(0);
+        }
+        routes.push(stopped);
     }
 
     pub(crate) fn set_route_live(&self, route_live: bool) {
@@ -636,12 +657,16 @@ async fn run_connected_status_dial<C: StatusConsumer>(
     // itself, because the daemon's close push can arrive after the dial has
     // already let the route go, and is replaced only by the next open.
     let mut last_route_channel: Option<u16> = None;
-    // Set when the holder refused to open the route for `route_identity` with a
-    // terminal code. The dial then never opens it again for that identity; a
-    // publish from another session, project or harness replaces the identity
-    // and gets its own single attempt. A daemon reconnect does not clear it:
-    // the holder, not the connection, made the decision.
-    let mut refused_identity: Option<FleetRouteIdentity> = None;
+    // Every identity the holder refused to open the route for with a terminal
+    // code, oldest first. The dial never opens a route for a listed identity
+    // again; a publish from an unlisted session, project or harness gets its
+    // own single attempt. Keeping the whole list (not only the last refusal)
+    // matters because all sessions share this dial: alternating publishes from
+    // two refused sessions must not take turns reopening each other's route.
+    // A daemon reconnect does not clear it: the holder, not the connection,
+    // made the decision.
+    let mut refused_identities: std::collections::VecDeque<FleetRouteIdentity> =
+        std::collections::VecDeque::new();
 
     let mut route: Option<C::Route> = None;
     let mut route_events = None;
@@ -651,7 +676,10 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         if tokio::time::Instant::now() >= next_discovery_at {
             match consumer.catalog_list().await {
                 Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
-                    if route.is_none() && reopen_forbidden.is_none() && refused_identity.is_none() {
+                    if route.is_none()
+                        && reopen_forbidden.is_none()
+                        && !refused_identities.contains(&route_identity)
+                    {
                         // `BindIdentity::new` leaves the registered project id
                         // unset: the dial has no resolved id to send.
                         let identity = BindIdentity::new(
@@ -690,7 +718,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                                     route_identity.harness,
                                     route_identity.project_root,
                                 );
-                                client.set_stopped_route(Some(StoppedRoute {
+                                client.record_stopped_route(StoppedRoute {
                                     target: STATUS_HOLDER_MODULE.to_string(),
                                     session: route_identity.session.clone(),
                                     harness: route_identity.harness.clone(),
@@ -698,8 +726,11 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                                     code,
                                     message,
                                     stopped_at_unix_ms: unix_now_ms(),
-                                }));
-                                refused_identity = Some(route_identity.clone());
+                                });
+                                if refused_identities.len() >= MAX_STOPPED_ROUTES {
+                                    refused_identities.pop_front();
+                                }
+                                refused_identities.push_back(route_identity.clone());
                                 client.set_route_live(false);
                             }
                             Err(RouteOpenFailure::Transient(error)) => {
@@ -749,15 +780,14 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         if let Some(request) = pending_request.take() {
             if route.is_none() {
                 let requested = FleetRouteIdentity::from(&request);
-                if refused_identity
-                    .as_ref()
-                    .is_some_and(|refused| *refused != requested)
+                if requested != route_identity
+                    && refused_identities.contains(&route_identity)
+                    && !refused_identities.contains(&requested)
                 {
                     // The refusal was about the identity the route was opened
                     // under, not about every session: open once for this one.
+                    // The earlier refusal stays listed and stays in force.
                     route_identity = requested;
-                    refused_identity = None;
-                    client.set_stopped_route(None);
                     discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
                     next_discovery_at = tokio::time::Instant::now();
                     pending_request = Some(request);
@@ -1451,6 +1481,27 @@ mod tests {
             client.stopped_route().map(|stopped| stopped.session),
             Some(other.to_owned())
         );
+        // All sessions share this dial. Alternating publishes from the two
+        // refused sessions must not make it forget one refusal and reopen
+        // that session's route.
+        for _ in 0..3 {
+            client.publish(Path::new("/tmp/project"), "opencode", session, "local");
+            advance_in_steps(Duration::from_secs(5)).await;
+            client.publish(Path::new("/tmp/other-project"), "opencode", other, "local");
+            advance_in_steps(Duration::from_secs(5)).await;
+        }
+        advance_in_steps(Duration::from_secs(600)).await;
+        assert_eq!(
+            attempts.lock().len(),
+            2,
+            "alternating refused sessions reopened a refused route"
+        );
+        let stopped: Vec<_> = client
+            .stopped_routes()
+            .into_iter()
+            .map(|stopped| stopped.session)
+            .collect();
+        assert_eq!(stopped, vec![session.to_owned(), other.to_owned()]);
         task.abort();
     }
 
