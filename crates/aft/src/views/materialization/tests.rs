@@ -234,6 +234,14 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             decoded_caller_blobs: 3,
             full_resolution: false,
             unattributed_callers: 0,
+            // The changed target and added file; the caller is re-resolved
+            // because its references were relinked.
+            dispatch_decoded_blobs: 2,
+            dispatch_resolved_files: 3,
+            dispatch_resolved_sites: 0,
+            dispatch_type_target_files: 0,
+            dispatch_type_target_decoded_blobs: 0,
+            dispatch_full: false,
         }
     );
     assert_eq!(stats.graph_rows_written(), 13);
@@ -1346,6 +1354,7 @@ fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_calle
         &changed,
         &BTreeSet::new(),
         &BTreeSet::new(),
+        None,
     )
     .unwrap();
     assert_eq!(joined.rebuilt_surface_entries, 1);
@@ -1449,6 +1458,9 @@ fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
     }));
 }
 
+const DIFFERENTIAL_CIRCLE: &str = "import { Shape } from './shapes';\n\
+     export class Circle implements Shape { area() { return 3; } }\n";
+
 /// A deterministic mixed TypeScript and Rust corpus that a seeded sequence of
 /// edits walks through. Each version is a full path-to-source map.
 struct DifferentialCorpus {
@@ -1483,9 +1495,39 @@ impl DifferentialCorpus {
         );
         files.insert(
             "src/lib.rs".into(),
-            "mod util;\npub use util::helper;\npub fn entry() { helper(); }\n".into(),
+            "mod shapes;\nmod board;\nmod util;\npub use util::helper;\npub fn entry() { helper(); }\n".into(),
         );
         files.insert("src/util.rs".into(), "pub fn helper() {}\n".into());
+        // Method calls on interface, class and unknown receivers, and on Rust
+        // inherent and trait methods, so every step also moves method-call rows.
+        files.insert(
+            "shapes.ts".into(),
+            "export interface Shape { area(): number; }\n\
+             export class Square implements Shape { area() { return 4; } }\n"
+                .into(),
+        );
+        files.insert("circle.ts".into(), DIFFERENTIAL_CIRCLE.into());
+        files.insert(
+            "draw.ts".into(),
+            "import { Shape, Square } from './shapes';\n\
+             export function draw(s: Shape) { return s.area(); }\n\
+             export function drawSquare(q: Square) { return q.area(); }\n\
+             export function drawAny(x) { return x.area(); }\n"
+                .into(),
+        );
+        files.insert(
+            "src/shapes.rs".into(),
+            "pub trait Area { fn area(&self) -> i32; }\n\
+             pub struct Tile;\n\
+             impl Tile { pub fn width(&self) -> i32 { 1 } }\n\
+             impl Area for Tile { fn area(&self) -> i32 { 1 } }\n\
+             pub fn measure(t: &Tile) -> i32 { t.width() + t.area() }\n"
+                .into(),
+        );
+        files.insert(
+            "src/board.rs".into(),
+            "use crate::shapes::Tile;\npub fn board(t: &Tile) -> i32 { t.width() }\n".into(),
+        );
         Self {
             files,
             next_id: 100,
@@ -1515,7 +1557,7 @@ impl DifferentialCorpus {
         let id = self.next_id;
         self.next_id += 1;
         let modules = self.typescript_modules();
-        match self.next(7) {
+        match self.next(13) {
             0 => {
                 // Insert a symbol before the others, renumbering every ordinal
                 // after it, so incoming references must be relinked.
@@ -1577,6 +1619,70 @@ impl DifferentialCorpus {
                 ));
                 format!("add rust module {module}")
             }
+            6 => {
+                // A new implementation of an interface method that other
+                // files call through interface and unknown receivers.
+                let path = if self.files.contains_key("circle.ts") && self.next(2) == 0 {
+                    "circle.ts"
+                } else {
+                    "shapes.ts"
+                };
+                self.files.get_mut(path).unwrap().push_str(&format!(
+                    "export class Extra{id} implements Shape {{ area() {{ return {id}; }} }}\n"
+                ));
+                format!("add implementing class to {path}")
+            }
+            7 => {
+                self.files.insert(
+                    format!("impl_{id}.ts"),
+                    format!(
+                        "import {{ Shape }} from './shapes';\n\
+                         export class Impl{id} implements Shape {{ area() {{ return {id}; }} }}\n"
+                    ),
+                );
+                format!("add implementing file impl_{id}.ts")
+            }
+            8 => {
+                // Renumbers every later method-call site of the caller.
+                let draw = self.files.get_mut("draw.ts").unwrap();
+                draw.insert_str(
+                    0,
+                    &format!("export function more{id}(s: Shape) {{ return s.area(); }}\n"),
+                );
+                "insert method call at the start of draw.ts".into()
+            }
+            9 => {
+                self.files
+                    .get_mut("src/shapes.rs")
+                    .unwrap()
+                    .push_str(&format!(
+                        "impl Tile {{ pub fn extra_{id}(&self) -> i32 {{ {id} }} }}\n"
+                    ));
+                self.files
+                    .get_mut("src/board.rs")
+                    .unwrap()
+                    .push_str(&format!(
+                        "pub fn use_{id}(t: &Tile) -> i32 {{ t.extra_{id}() }}\n"
+                    ));
+                format!("add rust method extra_{id} and its caller")
+            }
+            10 => {
+                let board = self.files.get_mut("src/board.rs").unwrap();
+                board.insert_str(
+                    0,
+                    &format!("pub fn first_{id}(t: &crate::shapes::Tile) -> i32 {{ t.width() }}\n"),
+                );
+                "insert rust method call at the start of board.rs".into()
+            }
+            11 => {
+                if self.files.remove("circle.ts").is_some() {
+                    "remove circle.ts".into()
+                } else {
+                    self.files
+                        .insert("circle.ts".into(), DIFFERENTIAL_CIRCLE.into());
+                    "restore circle.ts".into()
+                }
+            }
             _ => {
                 // Rename a target: callers that imported the old name stop
                 // resolving and must be relinked as unresolved.
@@ -1626,6 +1732,24 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
                 snapshot(&path)
             })
             .collect::<Vec<_>>();
+        for (table, what) in [
+            ("view_dispatch_sites", "method-call sites"),
+            ("view_unknown_live", "unknown-receiver targets"),
+            ("view_dispatch_dependencies", "method-call dependencies"),
+        ] {
+            assert!(
+                !cold[0][table].is_empty(),
+                "{context}: the corpus has {what}"
+            );
+        }
+        for provenance in ["exact", "dispatch", "name_match"] {
+            assert!(
+                cold[0]["edges"]
+                    .iter()
+                    .any(|row| row.contains(&format!("\"TEXT {provenance}\""))),
+                "{context}: the corpus has {provenance} method-call edges"
+            );
+        }
         let check = |from: usize, to: usize, label: &str| {
             let path = f
                 .dir
@@ -1635,6 +1759,9 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
             let stats = apply_manifest_diff(&path, &versions[from], &versions[to], &f.blobs)
                 .unwrap_or_else(|error| panic!("{context} {from}->{to}: {error}"));
             assert!(!stats.full_resolution, "{context} {from}->{to}: {stats:?}");
+            // The method-call pass must take its incremental path, or the
+            // comparison would not exercise carrying rows over.
+            assert!(!stats.dispatch_full, "{context} {from}->{to}: {stats:?}");
             let differences = parity::snapshot_differences(&cold[to], &snapshot(&path));
             assert!(
                 differences.is_empty(),
@@ -1852,4 +1979,88 @@ fn colliding_relink_legacy_generation_is_rebuilt_even_without_manifest_changes()
         "older potentially incorrect rows must not take the no-op path"
     );
     assert_snapshot_parity(&before, &snapshot(&copy));
+}
+
+/// Twelve TypeScript files whose method calls name a different method each,
+/// so one file's resolutions read no other file's facts.
+fn independent_dispatch_files(edited: Option<&str>) -> Vec<(String, String)> {
+    (0..12)
+        .map(|index| {
+            let mut source = format!(
+                "export class C{index} {{ run{index}() {{ return {index}; }} }}\n\
+                 export function typed{index}(c: C{index}) {{ return c.run{index}(); }}\n\
+                 export function call{index}(x) {{ return x.run{index}(); }}\n"
+            );
+            if index == 3 {
+                if let Some(edit) = edited {
+                    source.insert_str(0, edit);
+                }
+            }
+            (format!("f{index}.ts"), source)
+        })
+        .collect()
+}
+
+/// A one-file edit decodes one blob and resolves only the method-call sites
+/// whose recorded inputs it changed; every other file's rows are carried
+/// over. Resolving every file instead produces the same database, and the
+/// counters tell the two apart.
+#[test]
+fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let version = |edited: Option<&str>| {
+        let files = independent_dispatch_files(edited);
+        manifest(
+            &conn,
+            &files
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let base = version(None);
+    let cases = [
+        // Moves every site of f3 without changing what any file declares.
+        (
+            "body edit",
+            version(Some("export function first() { return 0; }\n")),
+            1,
+        ),
+        // Declares a method named run5, which f5's calls resolve to.
+        (
+            "new method",
+            version(Some("export class Extra { run5() { return 5; } }\n")),
+            2,
+        ),
+    ];
+    let base_db = f.dir.path().join("independent-base.sqlite");
+    materialize_manifest_view_database(&base_db, &f.blobs, &base).unwrap();
+    for (label, next, resolved_files) in &cases {
+        let cold = f
+            .dir
+            .path()
+            .join(format!("independent-cold-{label}.sqlite"));
+        materialize_manifest_view_database(&cold, &f.blobs, next).unwrap();
+        for every_file in [false, true] {
+            let db = f
+                .dir
+                .path()
+                .join(format!("independent-{label}-{every_file}.sqlite"));
+            std::fs::copy(&base_db, &db).unwrap();
+            dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(every_file));
+            let stats = apply_manifest_diff(&db, &base, next, &f.blobs);
+            dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(false));
+            let stats = stats.unwrap();
+            assert_snapshot_parity(&snapshot(&cold), &snapshot(&db));
+            assert!(!stats.dispatch_full, "{label}: {stats:?}");
+            assert_eq!(stats.dispatch_decoded_blobs, 1, "{label}: {stats:?}");
+            assert_eq!(
+                stats.dispatch_resolved_files,
+                if every_file { 12 } else { *resolved_files },
+                "{label} every_file={every_file}: {stats:?}"
+            );
+            assert!(stats.dispatch_resolved_sites > 0, "{label}: {stats:?}");
+        }
+    }
 }

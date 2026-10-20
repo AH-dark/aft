@@ -46,6 +46,18 @@ pub struct MaterializeStats {
     pub decoded_caller_blobs: usize,
     pub full_resolution: bool,
     pub unattributed_callers: usize,
+    /// Parse blobs the method-call pass decoded.
+    pub dispatch_decoded_blobs: usize,
+    /// Files whose method-call sites were resolved and rows reconciled.
+    pub dispatch_resolved_files: usize,
+    /// Method-call sites resolved.
+    pub dispatch_resolved_sites: usize,
+    /// Rust files whose receiver type targets were resolved.
+    pub dispatch_type_target_files: usize,
+    /// Parse blobs decoded only to resolve receiver type targets.
+    pub dispatch_type_target_decoded_blobs: usize,
+    /// The method-call pass resolved every file, as a cold build does.
+    pub dispatch_full: bool,
 }
 
 impl MaterializeStats {
@@ -612,6 +624,31 @@ fn materialize_reading(
     {
         membership_changed.insert(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN.into());
     }
+    // The method-call pass reuses the base generation's per-file inputs only
+    // when the ordinary graph is resolved selectively too and no resolver
+    // configuration changed; otherwise it resolves every file again.
+    let dispatch_reuse = base.is_some()
+        && selected.is_some()
+        && dispatch::reusable(&transaction)?
+        && !changed_strings
+            .iter()
+            .chain(&membership_changed)
+            .any(|path| join::view_resolution_config(path.as_bytes()))
+        && !membership_changed.contains(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN);
+    let type_target_traces = |seeds: &BTreeSet<String>| {
+        dispatch::type_target_traces(&transaction, seeds).map_err(|error| {
+            join::ManifestJoinError::Parse(format!("dispatch type target traces: {error}"))
+        })
+    };
+    let type_target_plan = if dispatch_reuse {
+        join::DispatchTypeTargetPlan::Selected {
+            recompute: &changed_strings,
+            membership_changed: &membership_changed,
+            traces: &type_target_traces,
+        }
+    } else {
+        join::DispatchTypeTargetPlan::All
+    };
     let selected_join_probe = PhaseProbe::start(&transaction);
     let joined = join::join_selected_manifest_reusing_surfaces(
         manifest,
@@ -621,6 +658,7 @@ fn materialize_reading(
         &changed_strings,
         &membership_changed,
         &fact_invalidated,
+        Some(type_target_plan),
     )
     .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     profile.record(
@@ -1097,15 +1135,29 @@ fn materialize_reading(
         .iter()
         .map(|edge| edge.ref_id.clone())
         .collect::<HashSet<_>>();
-    dispatch::emit(
+    let rewritten_ref_files = pending_refs
+        .iter()
+        .map(|row| row.caller_file.clone())
+        .collect::<BTreeSet<_>>();
+    let dispatch_work = dispatch::emit(
         &transaction,
         manifest,
         reader,
         &dispatch::EmitScope {
             changed_paths: changed.as_ref(),
             ordinary_edge_refs: &ordinary_edge_refs,
+            rewritten_ref_files: &rewritten_ref_files,
+            type_targets: &joined.dispatch_type_targets,
+            reuse: dispatch_reuse,
         },
     )?;
+    stats.dispatch_decoded_blobs = dispatch_work.decoded_blobs;
+    stats.dispatch_resolved_files = dispatch_work.resolved_files;
+    stats.dispatch_resolved_sites = dispatch_work.resolved_sites;
+    stats.dispatch_type_target_files = joined.dispatch_type_targets.len();
+    stats.dispatch_type_target_decoded_blobs = joined.dispatch_type_target_decoded_blobs;
+    stats.dispatch_full = dispatch_work.full;
+    profile.finish("dispatch");
     set_meta_ready(&transaction, true)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",

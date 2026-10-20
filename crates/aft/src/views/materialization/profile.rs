@@ -17,6 +17,9 @@ pub(crate) struct PhaseTimings {
     pub(crate) selected_join_ms: u128,
     pub(crate) write_bindings_ms: u128,
     pub(crate) emit_refs_edges_ms: u128,
+    /// The method-call pass, which runs after ordinary emission in the same
+    /// transaction.
+    pub(crate) dispatch_ms: u128,
     pub(crate) commit_ms: u128,
     pub(crate) cleanup_memory_ms: u128,
     pub(crate) cleanup_connections_ms: u128,
@@ -259,6 +262,7 @@ impl PhaseTimer {
                 (_, "selected_join") => timings.selected_join_ms = elapsed_ms,
                 (_, "write_bindings") => timings.write_bindings_ms = elapsed_ms,
                 (_, "emit_refs_edges") => timings.emit_refs_edges_ms = elapsed_ms,
+                (_, "dispatch") => timings.dispatch_ms = elapsed_ms,
                 (_, "commit") => timings.commit_ms = elapsed_ms,
                 (_, "cleanup_memory") => timings.cleanup_memory_ms = elapsed_ms,
                 (_, "cleanup_connections") => timings.cleanup_connections_ms = elapsed_ms,

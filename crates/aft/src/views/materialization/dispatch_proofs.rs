@@ -461,6 +461,9 @@ fn emit_without_caller_node(
         &dispatch::EmitScope {
             changed_paths: Some(&changed),
             ordinary_edge_refs: &HashSet::new(),
+            rewritten_ref_files: &BTreeSet::new(),
+            type_targets: &BTreeMap::new(),
+            reuse: false,
         },
     );
     dispatch::WRITE_ROW_BY_ROW.with(|cell| cell.set(false));
@@ -581,6 +584,9 @@ fn ordinary_edge_on_a_method_call_site_ref_is_deleted() {
             &dispatch::EmitScope {
                 changed_paths: Some(&changed),
                 ordinary_edge_refs: &planted,
+                rewritten_ref_files: &BTreeSet::new(),
+                type_targets: &BTreeMap::new(),
+                reuse: false,
             },
         );
         dispatch::WRITE_ROW_BY_ROW.with(|cell| cell.set(false));
