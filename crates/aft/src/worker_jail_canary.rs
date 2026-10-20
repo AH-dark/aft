@@ -346,16 +346,29 @@ pub fn diagnostics() -> String {
 /// Whether this process runs inside AFT's worker jail, judged only by kernel
 /// state and the account's password-database home.
 ///
-/// Linux also requires `no_new_privs`, which every AFT jail sets: without it a
-/// denied canary is only a mode change outside any jail.
+/// Linux excludes a process only when `no_new_privs` is explicitly zero. A
+/// seccomp filter can hide that query, but cannot remove the canary's deny.
 pub fn inside_worker_jail() -> bool {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: PR_GET_NO_NEW_PRIVS takes no pointer arguments.
-        if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
-            return false;
-        }
+        inside_worker_jail_with_no_new_privs(unsafe {
+            libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+        })
     }
+    #[cfg(not(target_os = "linux"))]
+    denied_candidate()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inside_worker_jail_with_no_new_privs(result: i32) -> bool {
+    if result == 0 {
+        return false;
+    }
+    denied_candidate()
+}
+
+fn denied_candidate() -> bool {
     candidate_homes()
         .iter()
         .any(|home| access(&path_for_home(home)) == CanaryAccess::Denied)

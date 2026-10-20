@@ -401,6 +401,19 @@ fn audit_env_i_and_unset_ticket_keep_kernel_worker_fence() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn audit_linux_prctl_error_still_checks_denied_worker_canary() {
+    let _lock = crate::test_env::process_env_lock();
+    let (output, _) = run_probe_child("jail-prctl-error", true);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A sandbox AFT did not create (a container's no_new_privs, a CI job sandbox,
 /// another tool's Seatbelt profile) is not a worker jail: gh passes through.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -494,7 +507,7 @@ fn stripped_worker_probe_child() {
     let _guard = crate::test_env::gh_shim_state_guard();
     std::env::set_var("PATH", &cwd);
     #[cfg(target_os = "linux")]
-    if mode == "jail" {
+    if mode.starts_with("jail") {
         confine_like_the_worker_jail(&canary_dir);
     }
     #[cfg(target_os = "macos")]
@@ -508,11 +521,19 @@ fn stripped_worker_probe_child() {
             .to_string()
     });
     crate::worker_jail_canary::with_test_homes(vec![home], || {
+        #[cfg(target_os = "linux")]
+        if mode == "jail-prctl-error" {
+            assert!(
+                crate::worker_jail_canary::inside_worker_jail_with_no_new_privs(-1),
+                "prctl error hid a denied canary"
+            );
+            assert!(!crate::worker_jail_canary::inside_worker_jail_with_no_new_privs(0));
+        }
         let signals = native_guard::ShellSignals::from_process();
         // The probe's raw results (resolved canary path, stat errno, and on
         // macOS the sandbox_check return and errno) explain a wrong verdict.
         let diagnostics = crate::worker_jail_canary::diagnostics();
-        if mode != "jail" {
+        if !mode.starts_with("jail") {
             assert!(!signals.sandboxed, "{mode}: {diagnostics}");
             assert!(native_guard::permission_from_process().is_ok());
             // Passthrough replaces this process with the real gh, so it runs last.
