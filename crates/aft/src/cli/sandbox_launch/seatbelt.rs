@@ -571,6 +571,72 @@ mod tests {
     }
 
     #[test]
+    fn worker_profiles_preserve_keychain_canary_and_gh_config_denies_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let canary_dir = home.join(aft::worker_jail_canary::CANARY_DIR_FROM_HOME);
+        let canary = canary_dir.join(aft::worker_jail_canary::CANARY_FILE);
+        let gh_config = home.join(".config/gh");
+        let mut profile = SandboxProfile::build(
+            vec![home.to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            home.to_path_buf(),
+        )
+        .unwrap();
+        profile.worker_jail = true;
+        profile.keychain_deny = vec![home.join("Library/Keychains"), "/Library/Keychains".into()];
+        profile.read_deny = vec![canary_dir.clone(), gh_config.clone()];
+        profile.write_deny = profile.read_deny.clone();
+        profile.worker_gh_fence = Some(aft::sandbox_profile::WorkerGhFence::Canary {
+            paths: vec![canary.clone()],
+        });
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            for service in ["com.apple.SecurityServer", "com.apple.securityd.xpc"] {
+                assert!(source.contains(&format!("(deny mach-lookup (global-name \"{service}\"))")));
+            }
+            assert!(!source.contains("com.apple.trustd"));
+            let metadata = format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                escape_path(&canary).unwrap()
+            );
+            let metadata_index = source.find(&metadata).expect("canary must remain visible");
+            for path in [&canary_dir, &gh_config] {
+                let filter = if mode == aft::config::SandboxMode::Strict {
+                    format!("(subpath \"{}\")", escape_path(path).unwrap())
+                } else {
+                    relaxed_filter(path, false).unwrap()
+                };
+                for operation in ["file-read*", "file-write*"] {
+                    let deny = format!("(deny {operation} {filter})");
+                    assert!(source
+                        .find(&deny)
+                        .is_some_and(|index| index < metadata_index));
+                }
+            }
+            for path in &profile.keychain_deny {
+                let deny = format!(
+                    "(deny file-read* file-write* {})",
+                    relaxed_filter(path, false).unwrap()
+                );
+                assert!(source
+                    .find(&deny)
+                    .is_some_and(|index| index > metadata_index));
+            }
+            assert!(!source.contains("(allow file-read-data"));
+        }
+    }
+
+    #[test]
     fn relaxed_regex_literal_escapes_dot_once() {
         assert_eq!(
             relaxed_filter(Path::new("/tmp/a.b"), false).unwrap(),
@@ -667,6 +733,8 @@ mod tests {
         let mut profile = SandboxProfile {
             v: 1,
             mode: aft::config::SandboxMode::Strict,
+            worker_jail: false,
+            keychain_deny: Vec::new(),
             deny_prefixes: Vec::new(),
             data_policy: Default::default(),
             writable_roots: vec![Path::new("/work").to_path_buf()],

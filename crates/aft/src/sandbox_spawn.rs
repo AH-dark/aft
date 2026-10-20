@@ -10237,6 +10237,8 @@ mod worker_gh_fence_tests {
         SandboxProfile {
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
+            worker_jail: true,
+            keychain_deny: Vec::new(),
             deny_prefixes: Vec::new(),
             data_policy: Default::default(),
             writable_roots: vec![PathBuf::from("/home/alice/work")],
