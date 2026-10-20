@@ -13,9 +13,34 @@ use crate::error::AftError;
 use crate::format;
 use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser};
 
-/// Write a source file through an exclusively created sibling, preserving its
-/// permissions. No target bytes change until the completed file is renamed.
-pub(crate) fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// How [`atomic_write_source`] stored the new bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceWriteMode {
+    /// A synced sibling file replaced the target by rename, or created it.
+    Replaced,
+    /// The existing file was truncated, rewritten and synced in place, because
+    /// a replacement file could not keep its hard links, owner, group, mode,
+    /// ACLs or extended attributes exactly.
+    InPlace,
+}
+
+/// Write a source file so that a failed write leaves the original bytes
+/// untouched whenever that is possible without changing who can read or reach
+/// the file.
+///
+/// Replacing by rename gives the path a new inode, which keeps nothing of the
+/// old file's links, owner, group, ACLs or extended attributes unless they are
+/// copied. The rename is used only when the replacement matches the original:
+/// a regular file with a single link, owned by the current user, whose owner,
+/// group, mode and extended attributes were copied and read back equal. On
+/// Linux the extended attributes include the POSIX ACL. On macOS the ACL is
+/// copied by the system's `fcopyfile` and is not read back separately. Any
+/// other existing file, and any existing file on Windows or another Unix, is
+/// rewritten in place and synced, as editors do when a backup-and-rename would
+/// alter the file, so access is never silently widened.
+/// Every source write path, including syntax rollback and hashline
+/// transactions, goes through this one decision.
+pub(crate) fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<SourceWriteMode> {
     atomic_write_source_with(path, bytes, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
@@ -26,7 +51,7 @@ fn atomic_write_source_with(
     path: &Path,
     bytes: &[u8],
     writer: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
-) -> std::io::Result<()> {
+) -> std::io::Result<SourceWriteMode> {
     use std::fs::{self, OpenOptions};
     use std::io;
     // Follow an existing symlink just as an in-place write would, rather than
@@ -37,15 +62,18 @@ fn atomic_write_source_with(
         Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
         Err(error) => return Err(error),
     };
-    let permissions = match fs::metadata(&destination) {
-        Ok(metadata) => Some(metadata.permissions()),
+    let original = match fs::metadata(&destination) {
+        Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    if permissions.is_some() {
+    if let Some(metadata) = original.as_ref() {
         // Preserve the existing file's write-access checks even when its parent
         // directory would permit replacing a read-only file by rename.
         OpenOptions::new().write(true).open(&destination)?;
+        if !source_replacement::may_keep_access(metadata) {
+            return write_source_in_place(&destination, bytes, writer);
+        }
     }
     let parent = destination
         .parent()
@@ -58,11 +86,19 @@ fn atomic_write_source_with(
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    if let Some(permissions) = permissions.as_ref() {
+    if let Some(metadata) = original.as_ref() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(permissions.mode() & 0o777);
+        options.mode(metadata.permissions().mode() & 0o777);
     }
-    let file = options.open(&temporary)?;
+    let file = match options.open(&temporary) {
+        Ok(file) => file,
+        // A writable file in a directory that refuses new entries can still be
+        // rewritten in place, as it could before replacement writes existed.
+        Err(error) if original.is_some() && error.kind() == io::ErrorKind::PermissionDenied => {
+            return write_source_in_place(&destination, bytes, writer);
+        }
+        Err(error) => return Err(error),
+    };
     struct RemoveTemporary {
         path: std::path::PathBuf,
         file: Option<fs::File>,
@@ -78,9 +114,18 @@ fn atomic_write_source_with(
         file: Some(file),
     };
     let file = cleanup.file.as_mut().expect("temporary file is open");
+    if let Some(metadata) = original.as_ref() {
+        // Copy and verify access metadata before any content is written, so a
+        // replacement that cannot match the original costs nothing to abandon.
+        if !source_replacement::copy_access(&destination, file, metadata) {
+            drop(cleanup);
+            return write_source_in_place(&destination, bytes, writer);
+        }
+    }
     writer(file, bytes)?;
-    if let Some(permissions) = permissions {
-        file.set_permissions(permissions)?;
+    if let Some(metadata) = original.as_ref() {
+        // Writing can clear set-id bits; restore the exact original mode.
+        file.set_permissions(metadata.permissions())?;
     }
     file.sync_all()
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
@@ -91,7 +136,267 @@ fn atomic_write_source_with(
     if let Ok(directory) = fs::File::open(parent) {
         let _ = directory.sync_all();
     }
-    Ok(())
+    Ok(SourceWriteMode::Replaced)
+}
+
+/// Rewrite an existing file through its own inode, keeping every link, owner,
+/// ACL and extended attribute, then sync it so the torn-write window ends as
+/// soon as the full content is written.
+fn write_source_in_place(
+    destination: &Path,
+    bytes: &[u8],
+    writer: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<SourceWriteMode> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)?;
+    writer(&mut file, bytes)?;
+    file.sync_all()
+        .map_err(|error| std::io::Error::new(error.kind(), format!("durability: {error}")))?;
+    Ok(SourceWriteMode::InPlace)
+}
+
+/// Decides whether a renamed replacement can carry an existing file's access
+/// metadata, and copies that metadata onto the replacement.
+mod source_replacement {
+    use std::fs::{File, Metadata};
+    use std::path::Path;
+
+    /// Cheap checks that rule out a replacement before a temporary exists: a
+    /// rename would split a hard link, and only the owner can give a new file
+    /// the original's owner.
+    #[cfg(unix)]
+    pub(super) fn may_keep_access(metadata: &Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == euid
+    }
+
+    /// Windows replacements take the directory's inherited ACL instead of the
+    /// file's own, and there is no cheap way to prove they match, so existing
+    /// files are always rewritten in place.
+    #[cfg(not(unix))]
+    pub(super) fn may_keep_access(_metadata: &Metadata) -> bool {
+        false
+    }
+
+    /// Give `replacement` the original's group, mode and extended attributes,
+    /// then read them back. Returns false when any of them cannot be matched.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn copy_access(destination: &Path, replacement: &File, original: &Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(source) = File::open(destination) else {
+            return false;
+        };
+        // The original may have changed since it was first inspected; decide
+        // on the open handle so the copied metadata belongs to one file.
+        let Ok(current) = source.metadata() else {
+            return false;
+        };
+        if current.dev() != original.dev() || current.ino() != original.ino() {
+            return false;
+        }
+        let Ok(created) = replacement.metadata() else {
+            return false;
+        };
+        if created.gid() != original.gid()
+            && std::os::unix::fs::fchown(replacement, None, Some(original.gid())).is_err()
+        {
+            return false;
+        }
+        if replacement.set_permissions(original.permissions()).is_err() {
+            return false;
+        }
+        let Ok(wanted) = xattrs::snapshot(&source) else {
+            return false;
+        };
+        if xattrs::copy_platform_security(&source, replacement).is_err()
+            || xattrs::replace_all(replacement, &wanted).is_err()
+        {
+            return false;
+        }
+        let Ok(copied) = replacement.metadata() else {
+            return false;
+        };
+        copied.uid() == original.uid()
+            && copied.gid() == original.gid()
+            && copied.mode() == original.mode()
+            && xattrs::snapshot(replacement).is_ok_and(|actual| actual == wanted)
+    }
+
+    /// Other platforms offer no checked way to copy ACLs, so a replacement
+    /// could widen access; their existing files are rewritten in place.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn copy_access(
+        _destination: &Path,
+        _replacement: &File,
+        _original: &Metadata,
+    ) -> bool {
+        false
+    }
+
+    /// Extended attributes read and written through open file descriptors.
+    /// On Linux this includes `system.posix_acl_access`, the stored POSIX ACL.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) mod xattrs {
+        use std::collections::BTreeMap;
+        use std::ffi::{CStr, CString};
+        use std::fs::File;
+        use std::io;
+        use std::os::fd::AsRawFd;
+
+        pub(crate) type Snapshot = BTreeMap<CString, Vec<u8>>;
+
+        /// Sizes can grow between the length query and the read; retry a few
+        /// times rather than looping forever on a file that keeps changing.
+        const SIZE_RETRIES: usize = 8;
+
+        fn unsupported(error: &io::Error) -> bool {
+            error.raw_os_error() == Some(libc::ENOTSUP)
+                || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+        }
+
+        #[cfg(target_os = "linux")]
+        unsafe fn list_raw(fd: i32, buffer: *mut libc::c_char, size: usize) -> isize {
+            libc::flistxattr(fd, buffer, size)
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn list_raw(fd: i32, buffer: *mut libc::c_char, size: usize) -> isize {
+            libc::flistxattr(fd, buffer, size, 0)
+        }
+        #[cfg(target_os = "linux")]
+        unsafe fn get_raw(fd: i32, name: &CStr, value: *mut libc::c_void, size: usize) -> isize {
+            libc::fgetxattr(fd, name.as_ptr(), value, size)
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn get_raw(fd: i32, name: &CStr, value: *mut libc::c_void, size: usize) -> isize {
+            libc::fgetxattr(fd, name.as_ptr(), value, size, 0, 0)
+        }
+        #[cfg(target_os = "linux")]
+        unsafe fn set_raw(fd: i32, name: &CStr, value: &[u8]) -> i32 {
+            libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0)
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn set_raw(fd: i32, name: &CStr, value: &[u8]) -> i32 {
+            libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0)
+        }
+        #[cfg(target_os = "linux")]
+        unsafe fn remove_raw(fd: i32, name: &CStr) -> i32 {
+            libc::fremovexattr(fd, name.as_ptr())
+        }
+        #[cfg(target_os = "macos")]
+        unsafe fn remove_raw(fd: i32, name: &CStr) -> i32 {
+            libc::fremovexattr(fd, name.as_ptr(), 0)
+        }
+
+        /// Read a variable-length attribute buffer with the usual
+        /// query-size-then-read protocol.
+        fn read_sized(mut read: impl FnMut(*mut u8, usize) -> isize) -> io::Result<Vec<u8>> {
+            for _ in 0..SIZE_RETRIES {
+                let size = read(std::ptr::null_mut(), 0);
+                if size < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut buffer = vec![0u8; size as usize];
+                if buffer.is_empty() {
+                    return Ok(buffer);
+                }
+                let read_size = read(buffer.as_mut_ptr(), buffer.len());
+                if read_size >= 0 {
+                    buffer.truncate(read_size as usize);
+                    return Ok(buffer);
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ERANGE) {
+                    return Err(error);
+                }
+            }
+            Err(io::Error::other("extended attributes kept changing size"))
+        }
+
+        /// Every extended attribute visible to this process, by name. A file
+        /// system without extended attributes has an empty snapshot.
+        pub(crate) fn snapshot(file: &File) -> io::Result<Snapshot> {
+            let fd = file.as_raw_fd();
+            // SAFETY: the buffer pointer and size describe a live allocation
+            // (or are null and zero for the size query).
+            let names =
+                match read_sized(|buffer, size| unsafe { list_raw(fd, buffer.cast(), size) }) {
+                    Ok(names) => names,
+                    Err(error) if unsupported(&error) => return Ok(Snapshot::new()),
+                    Err(error) => return Err(error),
+                };
+            let mut snapshot = Snapshot::new();
+            for name in names
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+            {
+                let name = CString::new(name).map_err(io::Error::other)?;
+                // SAFETY: as above; `name` is a NUL-terminated C string.
+                let value =
+                    read_sized(|buffer, size| unsafe { get_raw(fd, &name, buffer.cast(), size) })?;
+                snapshot.insert(name, value);
+            }
+            Ok(snapshot)
+        }
+
+        /// Make `file`'s extended attributes exactly `wanted`, removing any it
+        /// received on creation (for example an ACL inherited from the parent
+        /// directory's default ACL).
+        pub(crate) fn replace_all(file: &File, wanted: &Snapshot) -> io::Result<()> {
+            let fd = file.as_raw_fd();
+            for name in snapshot(file)?
+                .keys()
+                .filter(|name| !wanted.contains_key(*name))
+            {
+                // SAFETY: `name` is a NUL-terminated C string.
+                if unsafe { remove_raw(fd, name) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            for (name, value) in wanted {
+                // SAFETY: `name` is a NUL-terminated C string and `value` a
+                // live byte slice.
+                if unsafe { set_raw(fd, name, value) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        /// macOS ACLs are not extended attributes; copy them (and the
+        /// attributes) with the system's own metadata copier.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn copy_platform_security(source: &File, replacement: &File) -> io::Result<()> {
+            // SAFETY: both descriptors are open for the duration of the call
+            // and a null state is documented as allowed.
+            let result = unsafe {
+                libc::fcopyfile(
+                    source.as_raw_fd(),
+                    replacement.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        /// Linux stores POSIX ACLs as extended attributes, which
+        /// [`replace_all`] already copies.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn copy_platform_security(
+            _source: &File,
+            _replacement: &File,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }
 
 /// Convert 0-indexed line/col to a byte offset within `source`.
@@ -1928,5 +2233,192 @@ mod audit11_regressions {
         assert!(result.rolled_back);
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
         assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
+    }
+}
+
+/// Source writes must never change who can read or reach a file: ACLs,
+/// extended attributes, hard links, owner and group survive every edit.
+#[cfg(all(test, unix))]
+mod source_write_access_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn plain_config() -> Config {
+        Config {
+            format_on_edit: false,
+            ..Default::default()
+        }
+    }
+
+    /// A POSIX ACL in the kernel's extended-attribute encoding: owner rw-,
+    /// one named user r--, owning group ---, mask r--, other ---.
+    #[cfg(target_os = "linux")]
+    fn restrictive_acl(named_user: u32) -> Vec<u8> {
+        const UNDEFINED_ID: u32 = u32::MAX;
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 6u16, UNDEFINED_ID),
+            (0x02, 4, named_user),
+            (0x04, 0, UNDEFINED_ID),
+            (0x10, 4, UNDEFINED_ID),
+            (0x20, 0, UNDEFINED_ID),
+        ] {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        blob
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn edit_keeps_posix_acl_and_does_not_widen_group_access() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let name = CString::new("system.posix_acl_access").unwrap();
+        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated strings and a live byte slice.
+        let blob = restrictive_acl(unsafe { libc::geteuid() } + 1);
+        let set = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            set,
+            0,
+            "the test file system must support POSIX ACLs: {}",
+            std::io::Error::last_os_error()
+        );
+        let acl_of = |path: &Path| {
+            let file = std::fs::File::open(path).unwrap();
+            source_replacement::xattrs::snapshot(&file)
+                .unwrap()
+                .get(name.as_c_str())
+                .cloned()
+        };
+        let before = acl_of(&path).expect("ACL stored");
+
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(acl_of(&path).as_ref(), Some(&before));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        // The copied ACL lets the atomic replacement proceed.
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            atomic_write_source(&path, b"third\n").unwrap(),
+            SourceWriteMode::Replaced
+        );
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(acl_of(&path).as_ref(), Some(&before));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn edit_keeps_macos_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "user:nobody deny read"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let acl_of = |path: &Path| {
+            let output = std::process::Command::new("/bin/ls")
+                .arg("-le")
+                .arg(path)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .skip(1)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let before = acl_of(&path);
+        assert!(
+            before.iter().any(|line| line.contains("nobody deny read")),
+            "{before:?}"
+        );
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(acl_of(&path), before);
+    }
+
+    #[test]
+    fn edit_keeps_hard_links_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let other_name = dir.path().join("b.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::hard_link(&path, &other_name).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"new\n");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&other_name).unwrap().nlink(), 2);
+    }
+
+    /// A group other than the one new files get: any group as root, otherwise
+    /// a supplementary group of the current user.
+    fn foreign_group() -> Option<u32> {
+        // SAFETY: these calls have no preconditions; the buffer is sized by
+        // the first getgroups call.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if euid == 0 {
+            return Some(egid + 4242);
+        }
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0; count.max(0) as usize];
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(count.max(0) as usize);
+        groups.into_iter().find(|group| *group != egid)
+    }
+
+    #[test]
+    fn edit_keeps_a_foreign_group_and_owner() {
+        let Some(group) = foreign_group() else {
+            // Without root or a supplementary group no file can be given a
+            // foreign group, so there is nothing to observe on this host.
+            eprintln!("skipped: the test user has no root access or supplementary group");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.gid(), group);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+
+        // As root, a file owned by another user must keep that owner too.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&path, Some(4242), None).unwrap();
+            assert_eq!(
+                atomic_write_source(&path, b"third\n").unwrap(),
+                SourceWriteMode::InPlace
+            );
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (4242, group));
+            assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        }
     }
 }

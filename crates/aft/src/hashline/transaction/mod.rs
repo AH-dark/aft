@@ -1091,7 +1091,7 @@ fn ensure_parent_dirs(path: &Path) -> io::Result<()> {
 /// Write bytes via temp + fsync + rename so a crash cannot leave a torn target.
 fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ensure_parent_dirs(path)?;
-    crate::edit::atomic_write_source(path, bytes)
+    crate::edit::atomic_write_source(path, bytes).map(|_| ())
 }
 
 // ── Outcome helpers ──────────────────────────────────────────────────────────
@@ -2283,5 +2283,21 @@ mod audit11_regressions {
         );
         assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn durable_write_keeps_hard_links_joined() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script");
+        let other_name = dir.path().join("linked");
+        fs::write(&path, b"old\n").unwrap();
+        fs::hard_link(&path, &other_name).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        durable_write(&path, b"new\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(fs::read(&other_name).unwrap(), b"new\n");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&path).unwrap().nlink(), 2);
     }
 }
