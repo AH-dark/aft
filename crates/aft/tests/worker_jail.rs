@@ -571,6 +571,10 @@ impl Jail {
     }
 
     async fn submit_tool(&mut self, name: &str, arguments: Value) -> u64 {
+        self.submit_tool_on_channel(1, name, arguments).await
+    }
+
+    async fn submit_tool_on_channel(&mut self, channel: u16, name: &str, arguments: Value) -> u64 {
         let corr = self.next_corr;
         self.next_corr += 1;
         let body = json!({
@@ -583,7 +587,7 @@ impl Jail {
             &Frame::build(
                 FrameType::Request,
                 flags(),
-                1,
+                channel,
                 1,
                 corr,
                 serde_json::to_vec(&body).unwrap(),
@@ -596,11 +600,17 @@ impl Jail {
     }
 
     async fn tool_reply(&mut self, name: &str, arguments: Value) -> Value {
+        self.tool_reply_on_channel(1, name, arguments).await
+    }
+
+    async fn tool_reply_on_channel(&mut self, channel: u16, name: &str, arguments: Value) -> Value {
         for _ in 0..200 {
-            let corr = self.submit_tool(name, arguments.clone()).await;
+            let corr = self
+                .submit_tool_on_channel(channel, name, arguments.clone())
+                .await;
             let frame = loop {
                 let frame = next_frame(&mut self.stream).await;
-                if frame.header.channel == 1 && frame.header.corr == corr {
+                if frame.header.channel == channel && frame.header.corr == corr {
                     break frame;
                 }
             };
@@ -2363,3 +2373,7 @@ async fn worker_jail_cannot_write_saved_task_output() {
         "saved-output\n"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[path = "helpers/worker_keychain.rs"]
+mod keychain;
