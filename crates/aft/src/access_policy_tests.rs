@@ -1334,6 +1334,84 @@ fn scratch_read_allocator_path_uses_the_task_record() {
         .is_session_owned_scratch_path("foreign-session", &file));
 }
 
+/// A finished command's scratch is kept for a while after it exits. A file the
+/// command wrote to its `$TMPDIR` is therefore readable by the same session's
+/// read tools in the next step, with no permission ask. Another session still
+/// asks, and a write still goes through the normal policy.
+#[cfg(unix)]
+#[test]
+fn scratch_read_right_after_command_exit_reads_kept_scratch_without_ask() {
+    let (_directory, ctx, _scratch, _scope) = scratch_read_context();
+    let task = ctx
+        .bash_background()
+        .task_for_test("bash-0123456789abcdef")
+        .unwrap();
+    let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
+    let written = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("printf 'fn kept_scratch() {}\\n' > \"$TMPDIR/kept.rs\"")
+        .env("TMPDIR", &scratch)
+        .status()
+        .unwrap();
+    assert!(written.success());
+    // The same terminal cleanup a real command exit runs: it keeps the
+    // scratch and its recorded path instead of deleting them.
+    assert!(ctx
+        .bash_background()
+        .cleanup_terminal_task_temp(&task)
+        .unwrap());
+    let file = scratch.join("kept.rs");
+    assert!(file.is_file(), "command exit deleted the scratch");
+    let run = |session: &str, command: &str| {
+        let params = match command {
+            "read" | "outline" => json!({"file": file}),
+            "grep" => json!({"path": scratch, "pattern": "kept_scratch"}),
+            _ => json!({"path": scratch, "pattern": "*.rs"}),
+        };
+        let mut req = request(command, params);
+        req.session_id = Some(session.into());
+        match command {
+            "read" => crate::commands::read::handle_read(&req, &ctx),
+            "outline" => crate::commands::outline::handle_outline(&req, &ctx),
+            "grep" => crate::commands::grep::handle_grep(&req, &ctx),
+            _ => crate::commands::glob::handle_glob(&req, &ctx),
+        }
+    };
+    for command in ["read", "outline", "grep", "glob"] {
+        let own = run("policy-session", command);
+        assert!(own.success, "{command} after exit: {:?}", own.data);
+        assert!(
+            own.data.to_string().contains("kept"),
+            "{command}: {:?}",
+            own.data
+        );
+        let foreign = run("foreign-session", command);
+        assert_eq!(
+            foreign.data["code"], "access_ask_required",
+            "{command}: {:?}",
+            foreign.data
+        );
+    }
+    let write = crate::commands::write::handle_write(
+        &request(
+            "write",
+            json!({"file": file, "content": "fn rewritten() {}\n"}),
+        ),
+        &ctx,
+    );
+    assert_eq!(
+        write.data["code"], "access_ask_required",
+        "write into kept scratch: {:?}",
+        write.data
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "fn kept_scratch() {}\n"
+    );
+    let _ = crate::sandbox_spawn::cleanup_task_temp_dir(&scratch);
+}
+
 /// The worker flow seen in production: one shell call writes into its own
 /// `$TMPDIR` (the task's allocated scratch), and a later read or outline names
 /// that file. While the task still records its scratch the read succeeds; once
@@ -1378,11 +1456,12 @@ fn scratch_read_after_command_exit_is_not_found_without_ask() {
     }
 
     // The registry's own terminal cleanup deletes the scratch and clears the
-    // recorded path, exactly as it does when a real command exits.
+    // recorded path, exactly as it does once the retention time after a real
+    // command's exit has passed (the clock is moved past it here).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ctx
         .bash_background()
-        .cleanup_terminal_task_temp(&task)
+        .cleanup_terminal_task_temp_at(&task, u64::MAX)
         .unwrap()
     {
         assert!(

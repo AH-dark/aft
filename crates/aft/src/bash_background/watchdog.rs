@@ -200,6 +200,7 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                                         .filter_map(|registry| registry.upgrade())
                                     {
                                         let registry = BgTaskRegistry { inner };
+                                        registry.sweep_retained_scratch();
                                         registry.cleanup_finished(FINISHED_RETENTION);
                                         registry.request_recurring_persisted_gc();
                                     }

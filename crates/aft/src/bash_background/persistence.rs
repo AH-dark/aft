@@ -612,6 +612,15 @@ pub struct PersistedTask {
     pub sandbox_native: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_temp_dir: Option<PathBuf>,
+    /// When the finished command's scratch directory (`sandbox_temp_dir`)
+    /// may be deleted, in Unix milliseconds. Scratch is kept for a while after
+    /// the command exits so the same session can still read files it wrote
+    /// there. Stored in the record so a restarted daemon deletes it on time
+    /// instead of either forgetting it or deleting it early. Absent on running
+    /// tasks and on records written before AFT kept scratch after exit; those
+    /// derive the time from `finished_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_temp_delete_at: Option<u64>,
     pub status_reason: Option<String>,
     /// Capture did not finish cleanly; independent of the command's exit status.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -712,6 +721,7 @@ impl PersistedTask {
             scanner_report: Vec::new(),
             sandbox_native: false,
             sandbox_temp_dir: None,
+            sandbox_temp_delete_at: None,
             status_reason: None,
             output_incomplete: false,
             call_key,
@@ -844,6 +854,7 @@ impl From<BashTaskRow> for PersistedTask {
             scanner_report: Vec::new(),
             sandbox_native: false,
             sandbox_temp_dir: None,
+            sandbox_temp_delete_at: None,
             status_reason: None,
             output_incomplete: false,
             call_key: None,
