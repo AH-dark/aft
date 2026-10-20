@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +46,10 @@ def resolve_git_descriptor(descriptor: dict, changed: list[str], base: str, head
             print(note, file=sys.stderr)
 
 
-def member_pr(repository: str, head: str) -> dict:
+PR_LOOKUP_BACKOFF_SECONDS = (5, 10, 15, 30)
+
+
+def lookup_member_prs(repository: str, head: str) -> list[dict]:
     result = subprocess.run(
         ["gh", "api", "--paginate", "--slurp",
          f"repos/{repository}/commits/{head}/pulls?per_page=100"],
@@ -54,14 +58,64 @@ def member_pr(repository: str, head: str) -> dict:
     if result.returncode:
         raise InputFault(f"queue_pr_lookup_failed:{head}:{result.stderr.strip()}")
     pages = json.loads(result.stdout)
-    matches = [
-        pr for page in pages for pr in page
-        if pr["head"]["sha"] == head and pr["base"]["ref"] == "main"
+    return [pr for page in pages for pr in page]
+
+
+def lookup_queue_ref_pr(repository: str, number: int) -> dict:
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repository}/pulls/{number}"],
+        text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        raise InputFault(f"queue_pr_lookup_failed:{number}:{result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def is_member_pr(pr: dict, repository: str, head: str) -> bool:
+    return (
+        pr["head"]["sha"] == head
+        and pr["base"]["ref"] == "main"
         and pr["base"]["repo"]["full_name"] == repository
-    ]
-    if len(matches) != 1:
-        raise InputFault(f"ambiguous_queue_member:{head}:matches={len(matches)}")
-    return matches[0]
+    )
+
+
+def member_pr(
+    repository: str,
+    head: str,
+    *,
+    queue_ref_pr_number: int | None = None,
+    lookup=lookup_member_prs,
+    queue_ref_lookup=lookup_queue_ref_pr,
+    sleep=time.sleep,
+) -> dict:
+    for attempt in range(1, len(PR_LOOKUP_BACKOFF_SECONDS) + 2):
+        matches = [
+            pr for pr in lookup(repository, head)
+            if is_member_pr(pr, repository, head)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise InputFault(
+                f"ambiguous_queue_member:{head}:matches={len(matches)}:attempts={attempt}"
+            )
+        if attempt <= len(PR_LOOKUP_BACKOFF_SECONDS):
+            sleep(PR_LOOKUP_BACKOFF_SECONDS[attempt - 1])
+
+    if queue_ref_pr_number is not None:
+        pr = queue_ref_lookup(repository, queue_ref_pr_number)
+        # The queue ref names only its final PR; its API record is safe to use
+        # only when the PR still points at this merge's exact second-parent SHA.
+        if (
+            pr is not None
+            and pr.get("number") == queue_ref_pr_number
+            and is_member_pr(pr, repository, head)
+        ):
+            return pr
+
+    raise InputFault(
+        f"ambiguous_queue_member:{head}:matches=0:attempts={len(PR_LOOKUP_BACKOFF_SECONDS) + 1}"
+    )
 
 
 def member_descriptor(head: str, branch: str, group_head: str) -> tuple[str, dict]:
@@ -102,12 +156,14 @@ def queue_members(base: str, head: str, head_ref: str | None, repository: str) -
             raise InputFault(f"unknown_queue_ref:{head_ref}")
     members = []
     previous = base
-    for commit in git("rev-list", "--first-parent", "--reverse", f"{base}..{head}").splitlines():
+    commits = git("rev-list", "--first-parent", "--reverse", f"{base}..{head}").splitlines()
+    for index, commit in enumerate(commits):
         parents = git("show", "-s", "--format=%P", commit).split()
         # Only two-parent merges bind the synthetic commit to an exact PR head.
         if len(parents) != 2 or parents[0] != previous:
             raise InputFault(f"unsupported_queue_topology:{commit}")
-        pr = member_pr(repository, parents[1])
+        queue_ref_pr_number = int(tail[1]) if tail is not None and index == len(commits) - 1 else None
+        pr = member_pr(repository, parents[1], queue_ref_pr_number=queue_ref_pr_number)
         if any(member["number"] == pr["number"] for member in members):
             raise InputFault(f"duplicate_queue_member:{pr['number']}")
         members.append({"number": pr["number"], "branch": pr["head"]["ref"], "head": parents[1]})
