@@ -25,7 +25,7 @@ const PTY_SETUP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// A PTY child (and, during setup, the PTY master) that setup still owns. If
 /// setup fails before handing the child to its waiter thread, dropping this
-/// kills and reaps the child.
+/// attempts to kill and reap the child within a deadline, logging reap failures.
 struct SpawnedPtyChild {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
