@@ -1,1 +1,1 @@
-Bound managed Git hook resolver output capture even when a subprocess retains stdout, preventing a stalled descendant from hanging commits.
+- A managed git hook no longer hangs a commit when a helper process it starts keeps running.
