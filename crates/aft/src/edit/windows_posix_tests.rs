@@ -199,7 +199,7 @@ fn windows_posix_metadata_matches_replace_file() {
             132000000020000000,
         );
         drop(original);
-        // Compare the guarded policy to the real legacy API, including its
+        // Compare the guarded policy with ReplaceFileW, including its
         // merging of attributes absent from the replacement.
         assert_ne!(
             unsafe { SetFileAttributesW(wide(&path).as_ptr(), attributes,) },
@@ -321,6 +321,7 @@ fn windows_posix_1000_edit_benchmark() {
         let started = std::time::Instant::now();
         let mut errors = 0;
         let mut in_place = 0;
+        FALLBACK_COUNTS.with(|counts| counts.borrow_mut().clear());
         with_fault(fault, || {
             for _ in 0..1000 {
                 if atomic_write_source(&path, &bytes).is_err() {
@@ -334,6 +335,12 @@ fn windows_posix_1000_edit_benchmark() {
         stop.store(true, Ordering::Release);
         let (reads, missing, sharing) = reader.join().unwrap();
         println!("{method:?}: edits=1000 bytes={} elapsed_ms={} reads={reads} not_found={missing} sharing_violations={sharing} write_errors={errors} in_place={in_place}", bytes.len(), started.elapsed().as_millis());
+        FALLBACK_COUNTS.with(|counts| {
+            let counts = counts.borrow();
+            let count = |reason: &str| counts.get(reason).copied().unwrap_or(0);
+            let unsupported: usize = counts.iter().filter(|(reason, _)| reason.starts_with("rename unsupported:")).map(|(_, count)| count).sum();
+            println!("{method:?}: fallback_attributes_differ={} fallback_owner_sid_differs={} fallback_path_unrepresentable={} fallback_unsupported_filesystem={unsupported} fallback_reasons={counts:?}", count("file attributes differ"), count("owner SIDs differ"), count("rename namespace is unsupported"));
+        });
         if method == Method::PosixRename {
             assert_eq!(LAST_METHOD.get(), Some(method));
             assert!(reads > 0);

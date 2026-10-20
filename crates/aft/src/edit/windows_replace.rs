@@ -287,6 +287,7 @@ thread_local! {
     static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
     static LAST_METHOD: std::cell::Cell<Option<Method>> = const { std::cell::Cell::new(None) };
     static LAST_REASON: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static FALLBACK_COUNTS: std::cell::RefCell<std::collections::BTreeMap<String, usize>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 fn record(method: Method, reason: &str) {
@@ -295,6 +296,11 @@ fn record(method: Method, reason: &str) {
     LAST_METHOD.set(Some(method));
     #[cfg(test)]
     LAST_REASON.with(|last| last.replace(reason.to_owned()));
+    #[cfg(test)]
+    if method == Method::ReplaceFile {
+        FALLBACK_COUNTS
+            .with(|counts| *counts.borrow_mut().entry(reason.to_owned()).or_default() += 1);
+    }
 }
 
 fn eligible(
