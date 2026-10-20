@@ -1,0 +1,1 @@
+- Edits and syntax rollbacks now replace files atomically and keep their permissions, `apply_patch` rejects malformed patches and ambiguous inexact matches before writing anything, and symbol diffs track each overload separately.
