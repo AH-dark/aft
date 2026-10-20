@@ -168,8 +168,11 @@ acquire_box_gate
 
 # Keep every phase's output in a durable location. The default is deliberately
 # outside /tmp because macOS cleanup can remove a still-running gate's only
-# failure record.
-gate_log_dir="${AFT_GATE_LOG_DIR:-$HOME/.local/share/cortexkit/aft/gate-logs}"
+# failure record. It is also outside CortexKit's data and state folders: phase
+# commands write straight into this file, so it is every test's inherited
+# stdout, and the native sandbox refuses a test whose stdout lies under a
+# folder its floor denies.
+gate_log_dir="${AFT_GATE_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/aft-gate-logs}"
 gate_log="${AFT_GATE_LOG:-$gate_log_dir/gate-$(date -u '+%Y%m%dT%H%M%SZ')-$$.log}"
 mkdir -p "$(dirname "$gate_log")"
 if [[ "${AFT_GATE_LOG_INHERITED:-}" == "1" ]]; then
