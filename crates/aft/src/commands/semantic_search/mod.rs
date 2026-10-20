@@ -2116,16 +2116,16 @@ fn handle_semantic_search_inner(
             external_source,
         );
     }
-    // A root bound while aft.db was busy has its index lanes off until its
-    // next bind; answer through the bounded grep fallback and say why.
-    if ctx.artifact_identity_provisional() {
+    // An unsettled artifact identity keeps indexes off until the next bind;
+    // answer through the bounded grep fallback and disclose the bind failure.
+    if let Some(reason) = ctx.artifact_identity_provisional_reason() {
         return semantic_unavailable_grep_fallback_response(
             req,
             ctx,
             &params,
             &shape,
             "unavailable",
-            crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string(),
+            reason,
             "identity provisional",
             false,
             Vec::new(),

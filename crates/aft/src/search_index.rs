@@ -6937,9 +6937,16 @@ pub(crate) fn current_git_head(root: &Path) -> Option<String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum ArtifactCacheKeyFailure {
+    IdentityUnavailable,
+    GitUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactCacheKeyProbeError {
     root: PathBuf,
     detail: String,
+    failure: ArtifactCacheKeyFailure,
 }
 
 impl ArtifactCacheKeyProbeError {
@@ -6949,6 +6956,27 @@ impl ArtifactCacheKeyProbeError {
 
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    pub(crate) fn provisional_git_reason(&self) -> Option<String> {
+        if self.failure != ArtifactCacheKeyFailure::GitUnavailable {
+            return None;
+        }
+        let mut reason = format!(
+            "{GIT_IDENTITY_UNAVAILABLE_REASON}: {}; indexes and views stay off until this folder's next bind",
+            self.detail
+        );
+        if self.detail.contains("dubious ownership") {
+            let repository = crate::root_identity::nearest_git_marker(&self.root)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| self.root.clone());
+            reason.push_str(&format!(
+                "; if you trust this repository, run git config --global --add safe.directory '{}'",
+                repository.to_string_lossy().replace('\'', "'\\''")
+            ));
+        }
+        Some(reason)
     }
 }
 
@@ -7183,6 +7211,7 @@ pub(crate) fn resolve_root_identity_with_recheck(
         return Err(ArtifactCacheKeyProbeError {
             root: memo_root.to_path_buf(),
             detail: PROVISIONAL_IDENTITY_REASON.to_string(),
+            failure: ArtifactCacheKeyFailure::IdentityUnavailable,
         });
     }
     Ok(bound.identity)
@@ -7192,6 +7221,8 @@ pub(crate) fn resolve_root_identity_with_recheck(
 /// degraded reason and as the detail of a refused identity lookup.
 pub(crate) const PROVISIONAL_IDENTITY_REASON: &str =
     "identity provisional: aft.db was busy at bind; indexes stay off until this folder's next bind";
+pub(crate) const GIT_IDENTITY_UNAVAILABLE_REASON: &str =
+    "identity provisional: git_identity_unavailable";
 
 /// Like [`resolve_root_identity_with_recheck`], but a busy aft.db yields a
 /// provisional identity instead of an error. The caller must not store any
@@ -7206,6 +7237,7 @@ pub(crate) fn resolve_root_identity_for_bind(
     persist: bool,
     force: bool,
 ) -> Result<crate::root_identity::BoundIdentity, ArtifactCacheKeyProbeError> {
+    let mut git_unavailable = false;
     let mut choose = |pin: crate::root_identity::LegacyPin,
                       saved: Option<&crate::root_identity::Identity>|
      -> std::io::Result<crate::root_identity::IdentityChoice> {
@@ -7306,7 +7338,10 @@ pub(crate) fn resolve_root_identity_for_bind(
                 Identity::git(probe_root, memo.unwrap().git_root_commit)
                     .map(IdentityChoice::retained)
             }
-            RootCommitResolution::Failed(detail) => Err(std::io::Error::other(detail)),
+            RootCommitResolution::Failed(detail) => {
+                git_unavailable = true;
+                Err(std::io::Error::other(detail))
+            }
             RootCommitResolution::Cancelled => {
                 Err(std::io::Error::other("artifact cache key probe cancelled"))
             }
@@ -7328,7 +7363,16 @@ pub(crate) fn resolve_root_identity_for_bind(
     };
     result.map_err(|error| ArtifactCacheKeyProbeError {
         root: memo_root.to_path_buf(),
-        detail: format!("{error}; an existing identity was not replaced. Restore unreadable identity metadata or perform an explicit identity migration. {}", if crate::developer_tools::git_usable() { "" } else { crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON }),
+        failure: if git_unavailable {
+            ArtifactCacheKeyFailure::GitUnavailable
+        } else {
+            ArtifactCacheKeyFailure::IdentityUnavailable
+        },
+        detail: if git_unavailable {
+            error.to_string()
+        } else {
+            format!("{error}; an existing identity was not replaced. Restore unreadable identity metadata or perform an explicit identity migration. {}", if crate::developer_tools::git_usable() { "" } else { crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON })
+        },
     })
 }
 
@@ -7970,14 +8014,17 @@ pub(crate) fn canonical_git_root_commit_identity(
         RootCommitResolution::NotARepo => Err(ArtifactCacheKeyProbeError {
             root: project_root.to_path_buf(),
             detail: "not a git repository".to_string(),
+            failure: ArtifactCacheKeyFailure::IdentityUnavailable,
         }),
         RootCommitResolution::Failed(detail) => Err(ArtifactCacheKeyProbeError {
             root: project_root.to_path_buf(),
             detail,
+            failure: ArtifactCacheKeyFailure::GitUnavailable,
         }),
         RootCommitResolution::Cancelled => Err(ArtifactCacheKeyProbeError {
             root: project_root.to_path_buf(),
             detail: "artifact cache key probe cancelled".to_string(),
+            failure: ArtifactCacheKeyFailure::IdentityUnavailable,
         }),
     }
 }
@@ -10062,16 +10109,19 @@ mod tests {
                     GitMarkerState::Present => Err(ArtifactCacheKeyProbeError {
                         root: memo_root.to_path_buf(),
                         detail,
+                        failure: ArtifactCacheKeyFailure::GitUnavailable,
                     }),
                     GitMarkerState::Unknown(marker_detail) => Err(ArtifactCacheKeyProbeError {
                         root: memo_root.to_path_buf(),
                         detail: format!("{detail}; {marker_detail}"),
+                        failure: ArtifactCacheKeyFailure::GitUnavailable,
                     }),
                 }
             }
             RootCommitResolution::Cancelled => Err(ArtifactCacheKeyProbeError {
                 root: memo_root.to_path_buf(),
                 detail: "artifact cache key probe cancelled".to_string(),
+                failure: ArtifactCacheKeyFailure::IdentityUnavailable,
             }),
         }
     }

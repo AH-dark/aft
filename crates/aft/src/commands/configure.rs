@@ -3867,28 +3867,34 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(Ok(Some(key))) => Some(key),
         Some(Ok(None)) => {
             identity_provisional = true;
+            degraded_reasons.push(crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string());
             None
         }
         Some(Err(error)) => {
-            return Response::error_with_data(
-                &req.id,
-                "cache_key_probe_failed",
-                error.to_string(),
-                json!({
-                    "retryable": true,
-                    "root": error.root().display().to_string(),
-                    "detail": error.detail(),
-                }),
-            );
+            if let Some(reason) = error.provisional_git_reason() {
+                identity_provisional = true;
+                degraded_reasons.push(reason);
+                None
+            } else {
+                return Response::error_with_data(
+                    &req.id,
+                    "cache_key_probe_failed",
+                    error.to_string(),
+                    json!({
+                        "retryable": true,
+                        "root": error.root().display().to_string(),
+                        "detail": error.detail(),
+                    }),
+                );
+            }
         }
         None => None,
     };
     if identity_provisional {
-        // aft.db was busy, so an older pin for this folder is unknown and its
-        // identity may still change. Serve tools without indexes for this
-        // bind: no artifact, ownership or retention record is written under a
-        // key the next bind may replace, and the next bind finalizes it.
-        degraded_reasons.push(crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string());
+        // An unreadable legacy identity pin in aft.db or a failed Git probe
+        // leaves the identity unsettled. Serve tools that do not need indexes,
+        // but write no artifacts, ownership or retention records under a key
+        // the next bind may replace. Retry identity at that bind.
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
@@ -11162,6 +11168,36 @@ mod tests {
     }
 
     #[test]
+    fn build_key_memo_does_not_bypass_first_configure_identity_bind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let build_key = ctx.memoized_artifact_cache_key(&root);
+        assert_eq!(
+            ctx.cached_artifact_cache_key(&root),
+            Some(build_key.clone())
+        );
+        assert_eq!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            None
+        );
+
+        init_git_fixture(&root);
+        let bound_key = ctx
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(bound_key, build_key);
+        assert_eq!(ctx.cached_artifact_cache_key(&root), Some(bound_key));
+        assert!(matches!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            Some(crate::root_identity::Identity::Git { .. })
+        ));
+    }
+
+    #[test]
     fn configure_view_keeps_saved_path_key_when_git_is_added_before_maintenance() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let project = tempfile::tempdir().unwrap();
@@ -13749,7 +13785,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_configure_rejects_git_like_root_when_cache_key_probe_fails_without_memo() {
+    fn handle_configure_keeps_unreadable_git_unindexed_without_saving_a_path_identity() {
         let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
@@ -13758,7 +13794,7 @@ mod tests {
         let canonical_root = std::fs::canonicalize(&root).expect("canonical root");
         let _override =
             crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
-                vec![root.clone(), canonical_root],
+                vec![root.clone(), canonical_root.clone()],
                 "spawn failed: Too many open files (os error 24)",
             );
         let ctx = test_context();
@@ -13774,11 +13810,19 @@ mod tests {
         let response = handle_configure_for_test(&req, &ctx);
 
         assert!(
-            !response.success,
-            "configure must reject ambiguous git identity"
+            response.success,
+            "direct tools must remain usable: {response:?}"
         );
-        assert_eq!(response.data["code"], "cache_key_probe_failed");
-        assert_eq!(response.data["retryable"], true);
+        assert!(ctx.artifact_identity_provisional());
+        assert!(!ctx.config().indexes.trigram);
+        assert!(!ctx.config().indexes.semantic);
+        assert!(!ctx.config().indexes.callgraph);
+        assert!(!ctx.config().views.enabled);
+        let reason = ctx.artifact_identity_provisional_reason().unwrap();
+        assert!(reason.contains("git_identity_unavailable"), "{reason}");
+        assert!(reason.contains("Too many open files"), "{reason}");
+        assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
+        assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
         let path_key = crate::search_index::artifact_path_identity_key_for_test(&root);
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());

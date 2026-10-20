@@ -4103,6 +4103,9 @@ pub struct AppContext {
     parked_configure_tail:
         parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
+    /// Only successful configure binds may populate this memo. Build-derived
+    /// keys remain observable by status but cannot skip identity verification.
+    configure_artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     readonly_artifact_cache_keys:
         parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), ReadonlyArtifactCacheKey>>,
     artifact_cache_key_derivations: AtomicU64,
@@ -4818,6 +4821,7 @@ impl AppContext {
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
+            configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
             borrowed_index_cache: parking_lot::Mutex::new(BorrowedIndexCache::default()),
@@ -6691,16 +6695,16 @@ impl AppContext {
     }
 
     pub fn memoized_artifact_cache_key(&self, canonical_root: &Path) -> String {
-        let keys = self.artifact_cache_keys.lock();
+        let mut keys = self.artifact_cache_keys.lock();
         if let Some(key) = keys.get(canonical_root).cloned() {
             return key;
         }
         let key = crate::search_index::artifact_cache_key_for_build(canonical_root);
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
-        // Configure memoizes the key only after verifying the saved identity.
-        // Do not cache a build-derived key: a later configure must still perform
-        // that verification rather than treating a build's Git probe as final.
+        // Status reports the artifact key used by builds without probing Git.
+        // Configure uses a separate memo so it still verifies the root identity.
+        keys.insert(canonical_root.to_path_buf(), key.clone());
         key
     }
 
@@ -6780,7 +6784,7 @@ impl AppContext {
     ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
         {
             let waiting = Instant::now();
-            let keys = self.artifact_cache_keys.lock();
+            let keys = self.configure_artifact_cache_keys.lock();
             timings.context_memo_wait += waiting.elapsed();
             if let Some(key) = keys
                 .get(canonical_root)
@@ -6807,6 +6811,9 @@ impl AppContext {
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
         let waiting = Instant::now();
+        let mut verified = self.configure_artifact_cache_keys.lock();
+        verified.insert(canonical_root.to_path_buf(), key.clone());
+        verified.insert(raw_root.to_path_buf(), key.clone());
         let mut keys = self.artifact_cache_keys.lock();
         timings.context_memo_wait += waiting.elapsed();
         keys.insert(canonical_root.to_path_buf(), key.clone());
@@ -8467,12 +8474,21 @@ impl AppContext {
     }
 
     /// The bound root's artifact identity was provisional at its last bind
-    /// (aft.db was busy), so its index lanes are off until the next bind.
+    /// (aft.db was busy or Git was unreadable), so its index lanes are off
+    /// until the next bind.
     pub(crate) fn artifact_identity_provisional(&self) -> bool {
+        self.artifact_identity_provisional_reason().is_some()
+    }
+
+    pub(crate) fn artifact_identity_provisional_reason(&self) -> Option<String> {
         self.degraded_reasons
             .lock()
             .iter()
-            .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_REASON)
+            .find(|reason| {
+                reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_REASON
+                    || reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON)
+            })
+            .cloned()
     }
 
     pub fn cache_role(&self) -> &'static str {

@@ -599,6 +599,118 @@ fn assert_no_artifact_state(storage: &Path) {
     assert!(!storage.join("cache-keys.json").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    let source = root.join("marker.rs");
+    fs::write(&source, "pub fn unreadable_git_marker() {}\n").unwrap();
+    let real_git = which::which("git").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "marker.rs"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    ] {
+        let mut command = std::process::Command::new(&real_git);
+        crate::test_helpers::apply_hermetic_git_env(&mut command);
+        assert!(command
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let blocked = tools.path().join("blocked");
+    fs::write(&blocked, "").unwrap();
+    // A switchable Git stand-in reproduces an ownership refusal without
+    // requiring the test runner to change the checkout's owner.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" != '--version' ] && [ -f '{}' ]; then\n  echo 'fatal: detected dubious ownership in repository' >&2\n  exit 128\nfi\nexec '{}' \"$@\"\n",
+        blocked.display(), real_git.display()
+    );
+    super::helpers::link_cached_executable(&tools.path().join("git"), script.as_bytes()).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(tools.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let bind = json!({
+        "id": "cfg", "command": "configure", "harness": "opencode",
+        "project_root": root, "storage_dir": storage.path(),
+        "config": super::helpers::user_config(json!({
+            "indexes": {"trigram": true, "semantic": true, "callgraph": true},
+            "views": {"enabled": true}
+        }))
+    });
+    let response = aft.send(&bind.to_string());
+    assert_eq!(
+        response["success"], true,
+        "unreadable Git must not prevent binding: {response}"
+    );
+    let reasons = degraded_reasons(&mut aft).join("; ");
+    assert!(reasons.contains("git_identity_unavailable"), "{reasons}");
+    assert!(reasons.contains("dubious ownership"), "{reasons}");
+    assert!(
+        reasons.contains("git config --global --add safe.directory"),
+        "{reasons}"
+    );
+    assert!(reasons.contains(&root.display().to_string()), "{reasons}");
+    for request in [
+        json!({"id": "read", "command": "read", "file": source}),
+        json!({"id": "outline", "command": "outline", "file": source}),
+        json!({"id": "zoom", "command": "zoom", "file": source, "symbols": "unreadable_git_marker"}),
+        json!({"id": "edit", "command": "tool_call", "name": "edit", "arguments": {"path": source, "edits": [{"oldString": "pub fn", "newString": "// edited\npub fn"}]}}),
+        json!({"id": "bash", "command": "bash", "params": {"command": "printf unreadable_git_marker"}}),
+    ] {
+        let response = aft.send(&request.to_string());
+        assert_eq!(response["success"], true, "{request}: {response}");
+    }
+    assert!(fs::read_to_string(&source)
+        .unwrap()
+        .starts_with("// edited\n"));
+    let grep = aft.send(
+        &json!({"id": "grep", "command": "grep", "pattern": "unreadable_git_marker"}).to_string(),
+    );
+    assert_eq!(grep["success"], true, "{grep}");
+    assert_eq!(grep["fallback"], "filesystem", "{grep}");
+    assert_eq!(
+        grep["index"]["trigram"]["reason"], "identity_provisional",
+        "{grep}"
+    );
+    let search = aft.send(
+        &json!({"id": "search", "command": "semantic_search", "query": "unreadable_git_marker", "top_k": 5}).to_string(),
+    );
+    assert_eq!(search["success"], true, "{search}");
+    assert!(
+        search.to_string().contains("git_identity_unavailable"),
+        "{search}"
+    );
+    assert!(search.to_string().contains("dubious ownership"), "{search}");
+    assert_no_artifact_state(storage.path());
+
+    fs::remove_file(blocked).unwrap();
+    let response = aft.send(&bind.to_string());
+    assert_eq!(response["success"], true, "{response}");
+    assert!(!degraded_reasons(&mut aft)
+        .join("; ")
+        .contains("git_identity_unavailable"));
+    assert_eq!(wait_for_single_built_family(storage.path()), "git");
+    assert!(aft.shutdown().success());
+}
+
 /// After a finalizing bind, wait until exactly one artifact family is owned
 /// and built for the root, and return its saved identity kind.
 #[cfg(unix)]
