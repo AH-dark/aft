@@ -1,1 +1,0 @@
-- Tool calls no longer fail spuriously while the database opens or is briefly busy; saved session confinement remains enforced.

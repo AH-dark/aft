@@ -1,1 +1,0 @@
-- A second AFT process saving a large symbol cache on a slow disk no longer loses its write after 2 seconds, and the wait no longer delays file-change updates.

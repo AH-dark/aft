@@ -1,1 +1,0 @@
-- Approving a worker's folder-wide read now covers the whole folder every time; it could fall back to the single file when approved some time after the ask.

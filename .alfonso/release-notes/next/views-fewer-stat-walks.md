@@ -1,1 +1,0 @@
-- Background view disk-limit checks reuse byte counts for immutable generation artifacts instead of statting unchanged files on every pass; mutable SQLite files and protection markers are still measured each pass, with a full reconciliation every six hours.

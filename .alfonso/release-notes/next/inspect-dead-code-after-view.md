@@ -1,1 +1,0 @@
-- On checkouts using index views, dead-code results refresh after the view publishes, and incomplete results name up to five files that could not be parsed.

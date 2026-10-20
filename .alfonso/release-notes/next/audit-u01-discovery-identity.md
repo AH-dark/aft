@@ -1,1 +1,0 @@
-- - Tool discovery retries a failed PATH lookup on the next start instead of caching the failure, Windows project paths keep one identity, and config edits through a symlink update the linked file.

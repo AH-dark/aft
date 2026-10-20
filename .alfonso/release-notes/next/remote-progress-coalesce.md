@@ -1,1 +1,0 @@
-- Long remote (`runon`) commands now save their output progress at most every 5 seconds instead of every second, with fewer disk syncs per save, so several streaming remote builds no longer cause steady background disk activity in the daemon. Status checks are no longer blocked while that progress is being saved.

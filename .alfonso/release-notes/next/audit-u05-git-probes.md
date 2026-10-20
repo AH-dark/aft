@@ -1,1 +1,0 @@
-- Git repository detection no longer mistakes damaged repository metadata or a killed git process for "not a repository", and path comparisons keep leading .. components instead of dropping them.

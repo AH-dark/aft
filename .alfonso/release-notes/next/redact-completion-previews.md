@@ -1,1 +1,0 @@
-- Background completion previews now mask common credentials and secret environment values before reaching OpenCode or Pi.

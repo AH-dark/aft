@@ -1,1 +1,0 @@
-- gh repo rename under the operator bypass now refuses when the repository publishes reusable workflows or actions that other repositories reference; GH_SHIM_RENAME_PUBLISHED=allow overrides it and the audit line records what was published.

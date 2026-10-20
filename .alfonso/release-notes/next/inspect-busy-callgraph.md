@@ -1,1 +1,0 @@
-- aft_inspect: when the call graph store is momentarily busy, dead code and unused exports report pending (call graph building) instead of unavailable, as aft_zoom and aft_callgraph do.

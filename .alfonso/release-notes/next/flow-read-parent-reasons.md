@@ -1,1 +1,0 @@
-- Flow-read parent refusals now explain missing scopes, routes and epoch mismatches, daemon availability, and parent liveness without changing the error code.

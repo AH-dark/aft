@@ -1,1 +1,0 @@
-- Reusing indexed content and checking disk limits now avoid unnecessary database reads and writes, reducing background work across linked checkouts.

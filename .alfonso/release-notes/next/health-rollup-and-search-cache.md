@@ -1,1 +1,0 @@
-- Health checks cost less on busy daemons, and AFT's own edits to files outside a project no longer stop that project's search index from saving to disk (it was rebuilt in full on every start).

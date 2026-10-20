@@ -1,1 +1,0 @@
-- Daemon CPU on macOS: formatters, checkers and git probes no longer fork the daemon (they start through posix_spawn), and the per-edit git root-commit probe is reused until the repository's git files change; forking a large multi-threaded daemon took every malloc lock and stalled allocation process-wide.

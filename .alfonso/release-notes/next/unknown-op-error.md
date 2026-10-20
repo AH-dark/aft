@@ -1,1 +1,0 @@
-- Tool-provider routes now answer an operation AFT does not serve with an error naming it, instead of an empty success reply.
