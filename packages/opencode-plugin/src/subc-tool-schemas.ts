@@ -119,6 +119,12 @@ function consumerOnly(property: Record<string, unknown>): Record<string, unknown
   return { ...property, [CONSUMER_ONLY_MARKER]: true };
 }
 
+function canonicalFileDescription(def: ToolDefinition): ToolDefinition {
+  // Only OpenCode V1 records file headers under filePath. The catalog serves
+  // canonical path arguments, so its examples must use the same spelling.
+  return { ...def, description: def.description.replaceAll("filePath", "path") };
+}
+
 function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
   const wrapped = z.object(def.args);
   const jsonSchema = z.toJSONSchema(wrapped, { io: "input" }) as Record<string, unknown>;
@@ -231,9 +237,9 @@ export function buildSubcToolSchemas(
     status: { ...STATUS_SCHEMA, description: STATUS_DESCRIPTION },
     bash: bashSchema,
     powershell: powershellSchema,
-    read: argsToJsonSchema(read),
-    write: argsToJsonSchema(write),
-    edit: argsToJsonSchema(edit),
+    read: argsToJsonSchema(canonicalFileDescription(read)),
+    write: argsToJsonSchema(canonicalFileDescription(write)),
+    edit: argsToJsonSchema(canonicalFileDescription(edit)),
     apply_patch: argsToJsonSchema(applyPatch),
     grep: argsToJsonSchema(grepTool),
     glob: argsToJsonSchema(globTool),

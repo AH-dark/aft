@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e921e8ebb77a40efd52a5ff6b090e12486962f22d229dc8f284e118c3fbc0713",
-      "catalog_digest": "e921e8ebb77a40efd52a5ff6b090e12486962f22d229dc8f284e118c3fbc0713",
+      "generation": "18212684cab0c41ea9a0bb8e521e34898aa440aa5e5fd2c6b293f3cdb6c381b9",
+      "catalog_digest": "18212684cab0c41ea9a0bb8e521e34898aa440aa5e5fd2c6b293f3cdb6c381b9",
       "tools": [
         {
           "name": "status",
@@ -181,7 +181,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -471,7 +471,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -481,86 +481,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -1217,8 +1188,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "629bddbe4358113fbb99ee880aaf4e6a770b5fd4b59bfb5c08991bf2125f2b93",
-      "catalog_digest": "629bddbe4358113fbb99ee880aaf4e6a770b5fd4b59bfb5c08991bf2125f2b93",
+      "generation": "4e6458b1cb4defe49dfd8e4a9aa40a03aaa1473cbc1d70b726e652b5bae9970e",
+      "catalog_digest": "4e6458b1cb4defe49dfd8e4a9aa40a03aaa1473cbc1d70b726e652b5bae9970e",
       "tools": [
         {
           "name": "status",
@@ -1382,7 +1353,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1672,7 +1643,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -1682,86 +1653,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -2420,8 +2362,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "073a7b146e578748dfff516f4ed9d329292662dfac995e45c72e05f71b8fbc21",
-      "catalog_digest": "073a7b146e578748dfff516f4ed9d329292662dfac995e45c72e05f71b8fbc21",
+      "generation": "4a6acff379b834166b075cedbe890be62a67bf2dbd2f89db60ea5b956aa23a33",
+      "catalog_digest": "4a6acff379b834166b075cedbe890be62a67bf2dbd2f89db60ea5b956aa23a33",
       "tools": [
         {
           "name": "status",
@@ -2505,7 +2447,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2795,7 +2737,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2805,86 +2747,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -3542,8 +3455,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "51163f1be2c24371444620c30a359762b5c9ecef2c18146a8b559f9872dfc4c7",
-      "catalog_digest": "51163f1be2c24371444620c30a359762b5c9ecef2c18146a8b559f9872dfc4c7",
+      "generation": "a797f5e52547874462ae0e9f29f3d8fe0acc261fe32097701891c5b3111c3afb",
+      "catalog_digest": "a797f5e52547874462ae0e9f29f3d8fe0acc261fe32097701891c5b3111c3afb",
       "tools": [
         {
           "name": "status",
@@ -3707,7 +3620,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3952,7 +3865,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -3962,86 +3875,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -4699,8 +4583,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1c81c6d7aeb13d7538e819f7aa013f06356588f90c0d8fb2f9a12c5016cce50a",
-      "catalog_digest": "1c81c6d7aeb13d7538e819f7aa013f06356588f90c0d8fb2f9a12c5016cce50a",
+      "generation": "f47e1868398ce80a6d0d0335668b63c4336b4ae488fa58fd4e1678f74e462d9d",
+      "catalog_digest": "f47e1868398ce80a6d0d0335668b63c4336b4ae488fa58fd4e1678f74e462d9d",
       "tools": [
         {
           "name": "status",
@@ -4864,7 +4748,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5106,7 +4990,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5116,86 +5000,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -5854,8 +5709,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "dd6f8ba841e5fe74bcda36162725d687d31def2f95e81f2498d57eafd22a0c2f",
-      "catalog_digest": "dd6f8ba841e5fe74bcda36162725d687d31def2f95e81f2498d57eafd22a0c2f",
+      "generation": "f4ea8a005efa967d06ba6fff8680f1bc3f569519ec6d91079f576c4e144df9ca",
+      "catalog_digest": "f4ea8a005efa967d06ba6fff8680f1bc3f569519ec6d91079f576c4e144df9ca",
       "tools": [
         {
           "name": "status",
@@ -6019,7 +5874,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -6264,7 +6119,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -6274,86 +6129,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -6952,8 +6778,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "61dbb4ca1de10c96686502e2f518fecd664888892ea592cce0378b0b7376a54e",
-      "catalog_digest": "61dbb4ca1de10c96686502e2f518fecd664888892ea592cce0378b0b7376a54e",
+      "generation": "5a55648f8440aa35b22c49535087a5c0adaaad9b847178a86c985fdd6572945d",
+      "catalog_digest": "5a55648f8440aa35b22c49535087a5c0adaaad9b847178a86c985fdd6572945d",
       "tools": [
         {
           "name": "status",
@@ -7117,7 +6943,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -7359,7 +7185,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -7369,86 +7195,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -8047,8 +7844,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ec728f849d547cf638ef60232c1c7124053f4cdc5407884182c7b3edaf97974d",
-      "catalog_digest": "ec728f849d547cf638ef60232c1c7124053f4cdc5407884182c7b3edaf97974d",
+      "generation": "a667653576f643a7decb75c2ca4cac1b9c6430bf875027be82ba9599c1b8012b",
+      "catalog_digest": "a667653576f643a7decb75c2ca4cac1b9c6430bf875027be82ba9599c1b8012b",
       "tools": [
         {
           "name": "status",
@@ -8212,7 +8009,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -9110,8 +8907,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0e765a4e4c001d3f8b84c5162bb0894772a72a09eb0ddf061fa7d81c282e4260",
-      "catalog_digest": "0e765a4e4c001d3f8b84c5162bb0894772a72a09eb0ddf061fa7d81c282e4260",
+      "generation": "e48fa405bc987949ac749b8ea59ffadaf5b389185031608c63fdd7bdbf5ce0e8",
+      "catalog_digest": "e48fa405bc987949ac749b8ea59ffadaf5b389185031608c63fdd7bdbf5ce0e8",
       "tools": [
         {
           "name": "status",
@@ -9275,7 +9072,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -10167,8 +9964,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fcbbf6d85cc7443bd43be4cdcd53b247ae65f28066e194f04333d4420ef4797a",
-      "catalog_digest": "fcbbf6d85cc7443bd43be4cdcd53b247ae65f28066e194f04333d4420ef4797a",
+      "generation": "5dfb8720fa62ef35950ae3a8aecf6ddebf9ffa0228d62a4392b3bec6d79f2d89",
+      "catalog_digest": "5dfb8720fa62ef35950ae3a8aecf6ddebf9ffa0228d62a4392b3bec6d79f2d89",
       "tools": [
         {
           "name": "status",
@@ -10405,7 +10202,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -10695,7 +10492,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -10705,86 +10502,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -11442,8 +11210,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8e9fb75b9dfc60b77529b830a8cda00f92a227fc0e7e680c96afe6e0cb55983f",
-      "catalog_digest": "8e9fb75b9dfc60b77529b830a8cda00f92a227fc0e7e680c96afe6e0cb55983f",
+      "generation": "17383f5cc5b9c9e60da869d4f3db5182bbd42d76ed45c52cc837b0ff6a1fbb2b",
+      "catalog_digest": "17383f5cc5b9c9e60da869d4f3db5182bbd42d76ed45c52cc837b0ff6a1fbb2b",
       "tools": [
         {
           "name": "status",
@@ -11680,7 +11448,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -11970,7 +11738,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -11980,86 +11748,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -12719,8 +12458,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bd61c6a9669d5caab98c2a46af3eca07d0257074080462522a7c59243a00ad5d",
-      "catalog_digest": "bd61c6a9669d5caab98c2a46af3eca07d0257074080462522a7c59243a00ad5d",
+      "generation": "48fd67083ecb0570623f719da20153af4cb8fb55d00d5998a388bd3c6d3c5c1e",
+      "catalog_digest": "48fd67083ecb0570623f719da20153af4cb8fb55d00d5998a388bd3c6d3c5c1e",
       "tools": [
         {
           "name": "status",
@@ -12877,7 +12616,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -13167,7 +12906,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -13177,86 +12916,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -13915,8 +13625,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "aefdbae2421e7ec52b11b6504f2102587794d9f1f32c7a897e2d601623f0fa9e",
-      "catalog_digest": "aefdbae2421e7ec52b11b6504f2102587794d9f1f32c7a897e2d601623f0fa9e",
+      "generation": "4cd8335aed6be57c1cc4227962e9d61519640bfbfff4d31b37b6bf35ddbd762f",
+      "catalog_digest": "4cd8335aed6be57c1cc4227962e9d61519640bfbfff4d31b37b6bf35ddbd762f",
       "tools": [
         {
           "name": "status",
@@ -14153,7 +13863,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -14398,7 +14108,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -14408,86 +14118,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -15146,8 +14827,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d15cb9f91c95592d5bcd5541829c0c05387c46bfaefb29470900b5a318ace6be",
-      "catalog_digest": "d15cb9f91c95592d5bcd5541829c0c05387c46bfaefb29470900b5a318ace6be",
+      "generation": "f92b6a08faea570a6ed4104b0ecfb363e04423d9eb521baaf6f759bf0882e6b7",
+      "catalog_digest": "f92b6a08faea570a6ed4104b0ecfb363e04423d9eb521baaf6f759bf0882e6b7",
       "tools": [
         {
           "name": "status",
@@ -15384,7 +15065,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -15626,7 +15307,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -15636,86 +15317,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -16375,8 +16027,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ec77e4ff7e3d8961a7548d6ec98305efc92d70c66f8aad405418efe4ee15aa1e",
-      "catalog_digest": "ec77e4ff7e3d8961a7548d6ec98305efc92d70c66f8aad405418efe4ee15aa1e",
+      "generation": "8a41693ff8e1b07b1c0127cf4f663a809d3400190c4be6bcc195c455f9c18880",
+      "catalog_digest": "8a41693ff8e1b07b1c0127cf4f663a809d3400190c4be6bcc195c455f9c18880",
       "tools": [
         {
           "name": "status",
@@ -16613,7 +16265,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -16858,7 +16510,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -16868,86 +16520,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -17547,8 +17170,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "89cf68b49e394f0f045625383ef0811103e3a1d0d82ee3f38aebaf296fc4ac64",
-      "catalog_digest": "89cf68b49e394f0f045625383ef0811103e3a1d0d82ee3f38aebaf296fc4ac64",
+      "generation": "508461248bf7d5803d44138b1a3e2869d7a45f2883b6ad1f9b91973fe65c0a87",
+      "catalog_digest": "508461248bf7d5803d44138b1a3e2869d7a45f2883b6ad1f9b91973fe65c0a87",
       "tools": [
         {
           "name": "status",
@@ -17785,7 +17408,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -18027,7 +17650,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -18037,86 +17660,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -18716,8 +18310,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "0437f293eda6f0b1fad3784bd9f09c0fcf49c1dba9744a85f5cfbc5b73aac975",
-      "catalog_digest": "0437f293eda6f0b1fad3784bd9f09c0fcf49c1dba9744a85f5cfbc5b73aac975",
+      "generation": "c5744a7da6224d5985968e72135bf1e25b09d4fcfd8e649f1e7986c4c69e4cf4",
+      "catalog_digest": "c5744a7da6224d5985968e72135bf1e25b09d4fcfd8e649f1e7986c4c69e4cf4",
       "tools": [
         {
           "name": "status",
@@ -18954,7 +18548,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -19853,8 +19447,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6a74ed308fb30e46de0f841a16c0b3f34419d6d3f4e3becbe64775293e888b4f",
-      "catalog_digest": "6a74ed308fb30e46de0f841a16c0b3f34419d6d3f4e3becbe64775293e888b4f",
+      "generation": "12903af2e5d2c57c60f8dacdc9599480fcbf2a9d47a0e35d290b7b5b548b3393",
+      "catalog_digest": "12903af2e5d2c57c60f8dacdc9599480fcbf2a9d47a0e35d290b7b5b548b3393",
       "tools": [
         {
           "name": "status",
@@ -20091,7 +19685,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",

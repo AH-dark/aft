@@ -175,12 +175,12 @@ test("read permissions use native slash-separated resources and omit empty metad
 test("zoom batch authorizes distinct files and keeps allowed lookups after a denial", async () => {
   const { execute, calls, dispatched } = readers();
   const result = await execute("aft_zoom", {
-    path: "allowed.ts",
-    symbols: "allowed",
-    targets: [
-      { path: "./allowed.ts", symbol: "other" },
-      { path: "secret-dir/file.ts", symbol: "secret" },
-      { path: "allowed.ts", symbol: "allowed" },
+    batch: [
+      { target: "allowed.ts", symbols: "allowed" },
+      { target: "./allowed.ts", symbols: "other" },
+      { target: "secret-dir/file.ts", symbols: ["secret", "otherSecret"] },
+      { target: "allowed.ts", symbols: "allowed" },
+      { target: "https://example.test/docs", symbols: "Overview" },
     ],
   });
   // Distinct files are authorized in parallel, so the order of the host's
@@ -191,12 +191,12 @@ test("zoom batch authorizes distinct files and keeps allowed lookups after a den
   ]);
   expect(dispatched).toEqual([
     {
-      targets: [
-        { filePath: "./allowed.ts", symbol: "other" },
-        { filePath: "allowed.ts", symbol: "allowed" },
+      batch: [
+        { target: "allowed.ts", symbols: "allowed" },
+        { target: "./allowed.ts", symbols: "other" },
+        { target: "allowed.ts", symbols: "allowed" },
+        { target: "https://example.test/docs", symbols: "Overview" },
       ],
-      filePath: "allowed.ts",
-      symbols: "allowed",
     },
   ]);
   expect(String(result.content)).toContain("export function allowed()");
