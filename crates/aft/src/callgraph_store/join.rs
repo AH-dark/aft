@@ -1648,16 +1648,23 @@ impl DispatchTypeTargetTrace {
         !self.probes.is_disjoint(paths)
     }
 
-    /// True when every recorded answer is unchanged in `index`. Traces share
-    /// many queries (a crate's module parents, for one), so answers are kept
+    /// True when every recorded answer that depends on one of `changed` is
+    /// unchanged in `index`. An answer depending on nothing in `changed` reads
+    /// only index entries that are the same as when it was recorded. Traces
+    /// share queries (a crate's module parents, for one), so answers are kept
     /// in `answers` for the next trace checked against the same index.
     fn replays<'q>(
         &'q self,
         index: &impl super::ResolverIndex,
+        changed: &BTreeSet<String>,
         answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
     ) -> bool {
         self.queries.iter().all(|(query, expected)| {
-            *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+            !query
+                .dependencies()
+                .iter()
+                .any(|dependency| changed.contains(dependency))
+                || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
         })
     }
 }
@@ -2580,12 +2587,16 @@ fn join_manifest_with_surfaces(
                 seeds.extend(membership_changed.iter().cloned());
                 seeds.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
                 let traces = traces(&seeds)?;
+                stage.finish(
+                    "dispatch_type_target_traces",
+                    format_args!("seeds={} traces={}", seeds.len(), traces.len()),
+                );
                 let mut files = recompute.clone();
                 let mut answers = BTreeMap::new();
                 for (file, trace) in &traces {
                     if !files.contains(file)
                         && (trace.probes_any(membership_changed)
-                            || !trace.replays(&index, &mut answers))
+                            || !trace.replays(&index, &seeds, &mut answers))
                     {
                         files.insert(file.clone());
                     }
