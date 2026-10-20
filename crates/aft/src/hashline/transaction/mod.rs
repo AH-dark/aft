@@ -1095,10 +1095,9 @@ fn ensure_parent_dirs(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write bytes through the shared source writer: a synced replacement when
-/// that keeps the file's access metadata, otherwise an in-place rewrite backed
-/// by a recovery copy, so a failed write leaves the original bytes. Returns
-/// the writer's warnings for the file's outcome.
+/// Use the shared source writer's replacement-or-in-place decision so hashline
+/// writes have the same access checks, temporary-file protection and recovery
+/// handling as ordinary edits. Return its per-file warnings.
 fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<Vec<String>> {
     ensure_parent_dirs(path)?;
     crate::edit::atomic_write_source(path, bytes).map(|outcome| outcome.warnings)
