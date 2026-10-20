@@ -2377,3 +2377,57 @@ async fn worker_jail_cannot_write_saved_task_output() {
 #[cfg(target_os = "macos")]
 #[path = "helpers/worker_keychain.rs"]
 mod keychain;
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn worker_jail_session_dbus_socket_is_reachable_and_reported_unenforced() {
+    if !native_available() {
+        return;
+    }
+    for profile in ["strict", "relaxed"] {
+        let mut listener = None;
+        let mut socket = PathBuf::new();
+        let mut jail = Jail::start_with_layout_and_env(
+            None,
+            None,
+            true,
+            profile,
+            false,
+            false,
+            |base, command| {
+                let runtime = base.join("runtime");
+                std::fs::create_dir(&runtime).unwrap();
+                socket = runtime.join("bus");
+                listener = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+                command.env("XDG_RUNTIME_DIR", &runtime).env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", socket.display()),
+                );
+            },
+        )
+        .await;
+        let python = format!("import socket; s=socket.socket(socket.AF_UNIX); s.connect({:?}); s.sendall(b'worker-session-bus-probe')", socket.to_str().unwrap());
+        let reply = jail.bash(&format!(
+            "test -z \"${{DBUS_SESSION_BUS_ADDRESS+x}}\" && echo ENV_STRIPPED_$((1+1)); python3 -B -c {} && echo BUS_REACHABLE_$((1+1))",
+            quote(Path::new(&python)),
+        )).await;
+        assert!(reply.contains("ENV_STRIPPED_2"), "{profile}: {reply}");
+        assert!(reply.contains("BUS_REACHABLE_2"), "{profile}: {reply}");
+        assert!(
+            reply.contains("unenforced=[session_dbus_keyring,")
+                || reply.contains("unenforced=[session_dbus_keyring]"),
+            "missing named unenforced capability: {reply}"
+        );
+        // A real AF_UNIX connect and payload, not merely an environment check,
+        // demonstrate data exchange at the configured session-bus socket path.
+        let listener = listener.take().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = [0; 24];
+        std::io::Read::read_exact(&mut connection, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"worker-session-bus-probe");
+    }
+}

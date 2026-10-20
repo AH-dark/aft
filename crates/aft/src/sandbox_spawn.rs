@@ -5097,10 +5097,13 @@ fn sandboxed_child_environment(
         // dynamic-loader or shell/interpreter startup hook here would execute
         // code OUTSIDE confinement, so those keys are dropped even though they
         // arrived through the (otherwise honored) request environment.
+        // Workers also drop session-bus discovery; Linux still reports that
+        // direct connections to a known bus path are not isolated by Landlock.
         if is_preexec_hijack_env_key(key.as_str())
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
+            || (worker_jail_active() && key == "DBUS_SESSION_BUS_ADDRESS")
         {
             continue;
         }
@@ -5516,6 +5519,26 @@ pub(crate) mod environment_tests {
             serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
         assert!(decoded.worker_jail);
         assert_eq!(decoded.keychain_deny, profile.keychain_deny);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_session_bus_address_is_stripped_without_changing_heads() {
+        let request = HashMap::from([(
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            "unix:path=/run/user/1000/bus".to_string(),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let head = with_worker_jail(false, || sandboxed_child_environment(&request, dir.path()));
+        assert_eq!(
+            head.get(OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
+            Some(&OsString::from("unix:path=/run/user/1000/bus"))
+        );
+        let worker = with_worker_jail(true, || sandboxed_child_environment(&request, dir.path()));
+        assert!(!worker.contains_key(OsStr::new("DBUS_SESSION_BUS_ADDRESS")));
+        assert!(!sandbox_base_environment_key(OsStr::new(
+            "DBUS_SESSION_BUS_ADDRESS"
+        )));
     }
 
     const REENTRY: &str = "AFT_TEST_RELAXED_ENV_REENTRY";
