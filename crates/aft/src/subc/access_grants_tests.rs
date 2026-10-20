@@ -136,6 +136,108 @@ fn grants_head_policy_never_crosses_identity_future_or_end_boundaries() {
 }
 
 #[test]
+fn grants_head_policy_tombstone_returns_no_scope_and_refuses_surviving_authority() {
+    let (dir, ctx, head, worker) = fixture();
+    let latest = at_epoch(&head, 10);
+    register(&latest, &ctx).unwrap();
+    let older_target = policy_path(&dir.path().join("older-head-grant"));
+    let ended_target = policy_path(&dir.path().join("ended-head-grant"));
+    let db = ctx.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        store::set_mode(
+            &conn,
+            &scope_key(&latest),
+            crate::access_policy::ApprovalMode::Ask,
+        )
+        .unwrap();
+        for (identity, path) in [(&head, &older_target), (&latest, &ended_target)] {
+            store::insert(
+                &conn,
+                &scope_key(identity),
+                &AccessGrant {
+                    path: path.clone(),
+                    kind: GrantKind::Subtree,
+                    operation: AccessOperation::Read,
+                },
+            )
+            .unwrap();
+            let policy = policy_for_scope(&conn, &scope_key(identity), &ctx)
+                .unwrap()
+                .unwrap();
+            validate(&json!([{"path":path,"mode":"read"}]), Some(&policy), None).unwrap();
+        }
+        // Leave configuration and stale grants in place deliberately. Ordinary
+        // scope-end cleanup also deletes grants; authorization must not depend
+        // on that deletion to reject an ended policy.
+        let key = scope_key(&latest);
+        assert_eq!(
+            conn.execute(
+                "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+            )
+            .unwrap(),
+            1
+        );
+        assert!(store::scope_config(&conn, &key).unwrap().is_none());
+        assert!(policy_snapshot(&conn, &key).unwrap().is_none());
+        let retained_config: String = conn
+            .query_row(
+                "SELECT config FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained_config: crate::config::Config =
+            serde_json::from_str(&retained_config).unwrap();
+        assert_eq!(
+            retained_config.project_root,
+            Some(head.project_root.clone())
+        );
+        for identity in [&head, &latest] {
+            let key = scope_key(identity);
+            let retained_grants: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                    rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained_grants, 1);
+        }
+    }
+    for epoch in [10, 12] {
+        let caller = worker_at_parent_epoch(&worker, "head", epoch);
+        for path in [&older_target, &ended_target, &head.project_root] {
+            let error = remote_policy::catalog(
+                catalog_request(json!([{"path":path,"mode":"read"}])),
+                &caller,
+                &ctx,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "plan_param_refused");
+            assert_eq!(error.message, "allow_paths[0]: head_policy_unknown");
+            assert_eq!(
+                error.detail,
+                Some(json!({
+                    "param":"allow_paths", "index":0, "path":path, "reason":"head_policy_unknown"
+                }))
+            );
+            assert!(store::list(&db.lock().unwrap(), &scope_key(&caller))
+                .unwrap()
+                .is_empty());
+        }
+        let mut parent = scope_key(&latest);
+        parent.epoch = epoch;
+        assert_eq!(
+            store::head_policy_scope(&db.lock().unwrap(), &parent).unwrap(),
+            None,
+            "a tombstone must resolve to no policy scope, not an ended key"
+        );
+    }
+}
+
+#[test]
 fn grants_head_policy_rechecks_revocation_at_source_epoch() {
     let (_dir, ctx, head, worker) = fixture();
     let caller = worker_at_parent_epoch(&worker, "head", 12);
