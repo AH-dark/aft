@@ -1,1 +1,1 @@
-Make zoom batch-only with mixed file/URL targets, retain quiet runtime aliases, and align host file headers (#410).
+`aft_zoom` takes its lookups as `batch: [{ target, symbols }]`, mixing files and URLs in one call; an `https://` target is fetched as a URL instead of read as a path (#410). Older argument spellings still work.

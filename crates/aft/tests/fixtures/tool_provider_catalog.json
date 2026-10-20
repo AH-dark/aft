@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "18212684cab0c41ea9a0bb8e521e34898aa440aa5e5fd2c6b293f3cdb6c381b9",
-      "catalog_digest": "18212684cab0c41ea9a0bb8e521e34898aa440aa5e5fd2c6b293f3cdb6c381b9",
+      "generation": "dfd6fc108d653fb00c153cc50cd221df81b5ce6128d7e6b22e3fe453f6483798",
+      "catalog_digest": "dfd6fc108d653fb00c153cc50cd221df81b5ce6128d7e6b22e3fe453f6483798",
       "tools": [
         {
           "name": "status",
@@ -481,7 +481,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1188,8 +1188,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4e6458b1cb4defe49dfd8e4a9aa40a03aaa1473cbc1d70b726e652b5bae9970e",
-      "catalog_digest": "4e6458b1cb4defe49dfd8e4a9aa40a03aaa1473cbc1d70b726e652b5bae9970e",
+      "generation": "d520a6f473522b342d671c2f5741f4fca3830d7bcddeb5aedfcbe2f273a070c1",
+      "catalog_digest": "d520a6f473522b342d671c2f5741f4fca3830d7bcddeb5aedfcbe2f273a070c1",
       "tools": [
         {
           "name": "status",
@@ -1653,7 +1653,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2362,8 +2362,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4a6acff379b834166b075cedbe890be62a67bf2dbd2f89db60ea5b956aa23a33",
-      "catalog_digest": "4a6acff379b834166b075cedbe890be62a67bf2dbd2f89db60ea5b956aa23a33",
+      "generation": "9383e009382593b8b2044b8a3fdeb4cbfb08b52af051fc4d83da97d1c9020635",
+      "catalog_digest": "9383e009382593b8b2044b8a3fdeb4cbfb08b52af051fc4d83da97d1c9020635",
       "tools": [
         {
           "name": "status",
@@ -2747,7 +2747,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3455,8 +3455,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a797f5e52547874462ae0e9f29f3d8fe0acc261fe32097701891c5b3111c3afb",
-      "catalog_digest": "a797f5e52547874462ae0e9f29f3d8fe0acc261fe32097701891c5b3111c3afb",
+      "generation": "63f234ad5c407151745e7a84d3fa978fb21f04c4e1e8a76dfc5162836016e741",
+      "catalog_digest": "63f234ad5c407151745e7a84d3fa978fb21f04c4e1e8a76dfc5162836016e741",
       "tools": [
         {
           "name": "status",
@@ -3875,7 +3875,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4583,8 +4583,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f47e1868398ce80a6d0d0335668b63c4336b4ae488fa58fd4e1678f74e462d9d",
-      "catalog_digest": "f47e1868398ce80a6d0d0335668b63c4336b4ae488fa58fd4e1678f74e462d9d",
+      "generation": "ac1964122e47bfe42cf7e5f40c11a6d577a3b4912062a136c1ac000122eb016f",
+      "catalog_digest": "ac1964122e47bfe42cf7e5f40c11a6d577a3b4912062a136c1ac000122eb016f",
       "tools": [
         {
           "name": "status",
@@ -5000,7 +5000,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5709,8 +5709,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f4ea8a005efa967d06ba6fff8680f1bc3f569519ec6d91079f576c4e144df9ca",
-      "catalog_digest": "f4ea8a005efa967d06ba6fff8680f1bc3f569519ec6d91079f576c4e144df9ca",
+      "generation": "6063574f6e37ecb572dadf76cc2a6d8d4958577ba97bed3a841faf0bc73d5c41",
+      "catalog_digest": "6063574f6e37ecb572dadf76cc2a6d8d4958577ba97bed3a841faf0bc73d5c41",
       "tools": [
         {
           "name": "status",
@@ -6129,7 +6129,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -6778,8 +6778,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5a55648f8440aa35b22c49535087a5c0adaaad9b847178a86c985fdd6572945d",
-      "catalog_digest": "5a55648f8440aa35b22c49535087a5c0adaaad9b847178a86c985fdd6572945d",
+      "generation": "cdf390c4d6c56eb7463125c5c2ee0f1e5e2173af02877fd0d791c2f17eb847e1",
+      "catalog_digest": "cdf390c4d6c56eb7463125c5c2ee0f1e5e2173af02877fd0d791c2f17eb847e1",
       "tools": [
         {
           "name": "status",
@@ -7195,7 +7195,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -9964,8 +9964,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5dfb8720fa62ef35950ae3a8aecf6ddebf9ffa0228d62a4392b3bec6d79f2d89",
-      "catalog_digest": "5dfb8720fa62ef35950ae3a8aecf6ddebf9ffa0228d62a4392b3bec6d79f2d89",
+      "generation": "d14409c98ba9a81f8db0cd0f28dabe96a8e4d89266875bc5b93e851cb7b9fdfe",
+      "catalog_digest": "d14409c98ba9a81f8db0cd0f28dabe96a8e4d89266875bc5b93e851cb7b9fdfe",
       "tools": [
         {
           "name": "status",
@@ -10502,7 +10502,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -11210,8 +11210,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "17383f5cc5b9c9e60da869d4f3db5182bbd42d76ed45c52cc837b0ff6a1fbb2b",
-      "catalog_digest": "17383f5cc5b9c9e60da869d4f3db5182bbd42d76ed45c52cc837b0ff6a1fbb2b",
+      "generation": "7087dea25a2bf8b9e64473677b174c38f6dbab6dea37540d0d1f1e563d5dd436",
+      "catalog_digest": "7087dea25a2bf8b9e64473677b174c38f6dbab6dea37540d0d1f1e563d5dd436",
       "tools": [
         {
           "name": "status",
@@ -11748,7 +11748,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -12458,8 +12458,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "48fd67083ecb0570623f719da20153af4cb8fb55d00d5998a388bd3c6d3c5c1e",
-      "catalog_digest": "48fd67083ecb0570623f719da20153af4cb8fb55d00d5998a388bd3c6d3c5c1e",
+      "generation": "c1af78fd76b8015a4e3e4d15d99420a144fcefbef97160981184e16ec70ee32d",
+      "catalog_digest": "c1af78fd76b8015a4e3e4d15d99420a144fcefbef97160981184e16ec70ee32d",
       "tools": [
         {
           "name": "status",
@@ -12916,7 +12916,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -13625,8 +13625,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4cd8335aed6be57c1cc4227962e9d61519640bfbfff4d31b37b6bf35ddbd762f",
-      "catalog_digest": "4cd8335aed6be57c1cc4227962e9d61519640bfbfff4d31b37b6bf35ddbd762f",
+      "generation": "81336379ea82d827703b385e1c13361c6e7b3450e7d635598cac3693ea1e597e",
+      "catalog_digest": "81336379ea82d827703b385e1c13361c6e7b3450e7d635598cac3693ea1e597e",
       "tools": [
         {
           "name": "status",
@@ -14118,7 +14118,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -14827,8 +14827,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f92b6a08faea570a6ed4104b0ecfb363e04423d9eb521baaf6f759bf0882e6b7",
-      "catalog_digest": "f92b6a08faea570a6ed4104b0ecfb363e04423d9eb521baaf6f759bf0882e6b7",
+      "generation": "17e75ddacbc5006c8e060cbac18ac14d44de53453652ae61b3436f3cb8494b9d",
+      "catalog_digest": "17e75ddacbc5006c8e060cbac18ac14d44de53453652ae61b3436f3cb8494b9d",
       "tools": [
         {
           "name": "status",
@@ -15317,7 +15317,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -16027,8 +16027,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8a41693ff8e1b07b1c0127cf4f663a809d3400190c4be6bcc195c455f9c18880",
-      "catalog_digest": "8a41693ff8e1b07b1c0127cf4f663a809d3400190c4be6bcc195c455f9c18880",
+      "generation": "40994d26e51cf202c9abbadefd30027bb2028ad33ca5f988f0a08608a11e258f",
+      "catalog_digest": "40994d26e51cf202c9abbadefd30027bb2028ad33ca5f988f0a08608a11e258f",
       "tools": [
         {
           "name": "status",
@@ -16520,7 +16520,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -17170,8 +17170,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "508461248bf7d5803d44138b1a3e2869d7a45f2883b6ad1f9b91973fe65c0a87",
-      "catalog_digest": "508461248bf7d5803d44138b1a3e2869d7a45f2883b6ad1f9b91973fe65c0a87",
+      "generation": "45f2a04e0b1edbce73120bee65aa83f057f9ad9938585f29ff884a800650c370",
+      "catalog_digest": "45f2a04e0b1edbce73120bee65aa83f057f9ad9938585f29ff884a800650c370",
       "tools": [
         {
           "name": "status",
@@ -17660,7 +17660,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",

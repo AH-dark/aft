@@ -466,7 +466,7 @@ export function registerReadingTools(
         name: "aft_zoom",
         label: "zoom",
         description:
-          'Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
+          'Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
           (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
         parameters: ZoomParams,
         async execute(

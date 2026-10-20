@@ -560,6 +560,9 @@ test("zoom advertises only a required non-empty batch and shared options", () =>
     items: { required: ["target", "symbols"] },
   });
   expect(schema.anyOf ?? schema.oneOf ?? schema.allOf).toBeUndefined();
+  expect(tools.get("aft_zoom")!.description).toContain(
+    "Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch.",
+  );
 });
 
 test("zoom canonical batch mixes files and URLs and preserves symbol arrays", async () => {

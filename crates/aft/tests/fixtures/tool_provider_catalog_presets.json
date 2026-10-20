@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "c6cc7083db1cd1ed0ccd825ce6304b8ec98d851acfc5cc24fdbde88204291367",
-      "catalog_digest": "c6cc7083db1cd1ed0ccd825ce6304b8ec98d851acfc5cc24fdbde88204291367",
+      "generation": "30d8eca67150b41ce7a75dd1e72322b5b0dfff04099cf1fb572d8902386421c0",
+      "catalog_digest": "30d8eca67150b41ce7a75dd1e72322b5b0dfff04099cf1fb572d8902386421c0",
       "tools": [
         {
           "name": "status",
@@ -475,7 +475,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1235,8 +1235,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "fdbf4fcf236084cd1a38f86a908d7b72511836fc4857e061719de76c229a2d33",
-      "catalog_digest": "fdbf4fcf236084cd1a38f86a908d7b72511836fc4857e061719de76c229a2d33",
+      "generation": "8b3b410dcea2edee96afb241c737480b9fd493cfe31e22e3c02ca42a778176a0",
+      "catalog_digest": "8b3b410dcea2edee96afb241c737480b9fd493cfe31e22e3c02ca42a778176a0",
       "tools": [
         {
           "name": "status",
@@ -1773,7 +1773,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2534,8 +2534,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "011dbe6df9720d479627c158c45060f97b2df0a04added26953e88556a2f1456",
-      "catalog_digest": "011dbe6df9720d479627c158c45060f97b2df0a04added26953e88556a2f1456",
+      "generation": "b4a130d75aac2b7ba18505fdfbee43732d616c47b6e7b8992e734a4242434be3",
+      "catalog_digest": "b4a130d75aac2b7ba18505fdfbee43732d616c47b6e7b8992e734a4242434be3",
       "tools": [
         {
           "name": "read",
@@ -2764,7 +2764,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2979,8 +2979,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "011dbe6df9720d479627c158c45060f97b2df0a04added26953e88556a2f1456",
-      "catalog_digest": "011dbe6df9720d479627c158c45060f97b2df0a04added26953e88556a2f1456",
+      "generation": "b4a130d75aac2b7ba18505fdfbee43732d616c47b6e7b8992e734a4242434be3",
+      "catalog_digest": "b4a130d75aac2b7ba18505fdfbee43732d616c47b6e7b8992e734a4242434be3",
       "tools": [
         {
           "name": "read",
@@ -3209,7 +3209,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3425,8 +3425,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "b6437d14571679fc7c95e9f7d75a7b0fbedf946474293168a79d6603c33cd228",
-      "catalog_digest": "b6437d14571679fc7c95e9f7d75a7b0fbedf946474293168a79d6603c33cd228",
+      "generation": "5a0321b6e08e4ad35b2ca1a475e5ee06932a9fe301e0695966f2cc704e709429",
+      "catalog_digest": "5a0321b6e08e4ad35b2ca1a475e5ee06932a9fe301e0695966f2cc704e709429",
       "tools": [
         {
           "name": "status",
@@ -3894,7 +3894,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4655,8 +4655,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "bd5759d9af3908c044c4efed18b6cc7fcca1ba2e271631812c6450d07e525a1f",
-      "catalog_digest": "bd5759d9af3908c044c4efed18b6cc7fcca1ba2e271631812c6450d07e525a1f",
+      "generation": "5bf76df8f118be65462cf4632c91a0982c2322a581346eb3bd2d4c17a214ca5d",
+      "catalog_digest": "5bf76df8f118be65462cf4632c91a0982c2322a581346eb3bd2d4c17a214ca5d",
       "tools": [
         {
           "name": "status",
@@ -5197,7 +5197,7 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",

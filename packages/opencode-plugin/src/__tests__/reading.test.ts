@@ -639,7 +639,9 @@ test("zoom advertises only a required non-empty batch and shared options", () =>
   expect(Object.keys(definition.args).sort()).toEqual(["batch", "callgraph", "contextLines"]);
   expect(definition.args.batch.safeParse([]).success).toBe(false);
   expect(definition.args.batch.safeParse([{ target: "a.ts", symbols: "main" }]).success).toBe(true);
-  expect(definition.description).toContain("batch: [{ target, symbols }]");
+  expect(definition.description).toContain(
+    "Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch.",
+  );
   expect(definition.description).not.toContain("{ path, symbols }");
   expect(definition.description).not.toContain("{ url, symbols }");
 });
