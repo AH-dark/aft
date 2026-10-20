@@ -450,3 +450,68 @@ fn revision_read_takes_repository_components_verbatim_through_a_parent_now_a_sym
         assert!(!text.contains("new_file"), "{path}: {text}");
     }
 }
+
+/// The project-root check follows today's symlinks, but a revision read
+/// takes the path's components verbatim. With the root restricted to
+/// `public/` and `private` now a link to `public`, `private/file.txt` passes
+/// the root check yet names the commit's own `private/file.txt`, outside the
+/// root, so it must be refused.
+#[cfg(unix)]
+#[test]
+fn revision_read_through_a_symlink_into_the_root_cannot_reach_a_path_outside_it() {
+    let fixture = fixture();
+    let public = fixture.repo.join("public");
+    let private = fixture.repo.join("private");
+    fs::create_dir_all(&public).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    fs::write(public.join("file.txt"), "public words\n").unwrap();
+    fs::write(private.join("file.txt"), "private words\n").unwrap();
+    git(&fixture.repo, &["add", "public", "private"]);
+    git(
+        &fixture.repo,
+        &["commit", "--quiet", "-m", "public and private"],
+    );
+    let split = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    fs::remove_dir_all(&private).unwrap();
+    std::os::unix::fs::symlink("public", &private).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let resp = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": public,
+            "storage_dir": fixture.storage,
+            "config": [user_config_tier(json!({
+                "revision_reads": true,
+                "restrict_to_project_root": true,
+            }))],
+        })
+        .to_string(),
+    );
+    assert_eq!(resp["success"], true, "configure failed: {resp:?}");
+
+    for path in [
+        private.join("file.txt").display().to_string(),
+        "../private/file.txt".to_string(),
+    ] {
+        let resp = call(&mut aft, "read", json!({ "path": path, "ref": split }));
+        assert_eq!(resp["success"], false, "{path}: {resp:?}");
+        assert_eq!(resp["code"], "path_outside_root", "{path}: {resp:?}");
+        assert!(
+            !resp.to_string().contains("private words"),
+            "{path}: {resp:?}"
+        );
+    }
+
+    for path in [
+        "file.txt".to_string(),
+        public.join("file.txt").display().to_string(),
+    ] {
+        let resp = call(&mut aft, "read", json!({ "path": path, "ref": split }));
+        let text = ok_text(&resp);
+        assert!(text.contains("public words"), "{path}: {text}");
+        assert!(text.starts_with(&header(&split, &split)), "{path}: {text}");
+    }
+}

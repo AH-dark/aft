@@ -3111,3 +3111,56 @@ fn purge_preview_lists_saved_copies_under_a_deleted_directory() {
     assert!(aft.shutdown().success());
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Undo-backup keys are recorded with every parent resolved, so they are
+/// compared as stored. A backup of `old/file.txt` taken while `old` was a real
+/// directory stays that file's backup after `old` is replaced by a link to
+/// `new`: purging `new` neither lists nor removes it.
+#[cfg(unix)]
+#[test]
+fn purge_keeps_an_undo_backup_whose_parent_is_now_a_symlink_to_the_purged_directory() {
+    let dir = temp_dir("purge_relinked_parent");
+    let old = dir.join("old");
+    let new = dir.join("new");
+    fs::create_dir_all(&old).unwrap();
+    fs::create_dir_all(&new).unwrap();
+    let old_file = old.join("file.txt");
+    let new_file = new.join("file.txt");
+    fs::write(&old_file, "old-0").unwrap();
+    fs::write(&new_file, "new-0").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-purge-relinked-parent");
+    session_snapshot(&mut aft, "s1", &old_file, "old-1");
+    session_snapshot(&mut aft, "s1", &new_file, "new-1");
+
+    fs::remove_dir_all(&old).unwrap();
+    std::os::unix::fs::symlink(&new, &old).unwrap();
+
+    let new_path = new.display().to_string();
+    let preview = purge_preview(&mut aft, "s1", &new_path);
+    assert!(
+        preview.iter().all(|path| !path.contains("/old/")),
+        "the old backup must not be listed: {preview:?}"
+    );
+    assert!(
+        preview.iter().any(|path| path.ends_with("/new/file.txt")),
+        "the purged directory's own backup is listed: {preview:?}"
+    );
+    let purge = session_purge(&mut aft, "s1", &new_path);
+    assert_eq!(purge["undo_stacks_removed"], 1, "{purge:?}");
+
+    // With `old` a real directory again, its backup is still there to undo.
+    fs::remove_file(&old).unwrap();
+    fs::create_dir_all(&old).unwrap();
+    fs::write(&old_file, "old-1").unwrap();
+    assert_eq!(session_undo_code(&mut aft, "s1", &old_file), "ok");
+    assert_eq!(fs::read_to_string(&old_file).unwrap(), "old-0");
+    assert_eq!(
+        session_undo_code(&mut aft, "s1", &new_file),
+        "no_undo_history"
+    );
+
+    assert!(aft.shutdown().success());
+    let _ = fs::remove_dir_all(&dir);
+}

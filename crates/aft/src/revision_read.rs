@@ -388,6 +388,16 @@ impl RevisionSession {
                 ),
             ));
         }
+        // The caller already checked the path against the project root, but
+        // that check follows today's symlinks. The git tree lookup that uses
+        // these components does not: a path through a link that points into
+        // the root today names whatever the commit stored under the link's
+        // own name, which can lie outside the root. So the verbatim location
+        // is checked against the root too.
+        let location = parts
+            .iter()
+            .fold(self.toplevel.clone(), |path, part| path.join(part));
+        ctx.check_location_lexically_in_root(&req.id, requested, &location)?;
         Ok(parts.join("/"))
     }
 

@@ -13547,6 +13547,39 @@ impl AppContext {
         self.validate_path_with_artifact_session(req_id, path, Some(session_id), Some(search_tool))
     }
 
+    /// Refuse `location` unless it lies under the resolved project root,
+    /// compared lexically component by component without following any
+    /// symlink. For locations that are not looked up on today's disk, such as
+    /// a file inside an older git commit: the commit may hold a real
+    /// directory where a symlink into the root stands today, so a check that
+    /// follows today's symlinks would admit it. `location` must begin with a
+    /// fully resolved directory (as `fs::canonicalize` returns it), such as
+    /// the repository's resolved root, so it compares with the resolved
+    /// project root. `path` is the caller's spelling, used in the refusal. A
+    /// no-op when reads are not restricted to the project root for this
+    /// request.
+    pub(crate) fn check_location_lexically_in_root(
+        &self,
+        req_id: &str,
+        path: &Path,
+        location: &Path,
+    ) -> Result<(), crate::protocol::Response> {
+        let Some(PathRestrictionContext { resolved_root, .. }) =
+            self.path_restriction_context(req_id, path)?
+        else {
+            return Ok(());
+        };
+        if normalize_path(location).starts_with(&resolved_root) {
+            return Ok(());
+        }
+        if crate::context::confinement::for_request(req_id) {
+            // As in `validate_read_path`: confined requests never learn the
+            // resolved root, only their own spelling.
+            return Err(crate::context::confinement::refusal(req_id, path));
+        }
+        Err(path_error_response(req_id, path, &resolved_root))
+    }
+
     fn validate_path_with_artifact_session(
         &self,
         req_id: &str,

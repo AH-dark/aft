@@ -170,10 +170,16 @@ impl PurgeTarget {
 
     /// How `saved` relates to this target. `recorded_resolved` is true for
     /// undo-backup keys: stores record them with every parent already
-    /// resolved, so a parent that is gone now was a real directory then, and
-    /// the remaining components still identify the location. Checkpoint keys
-    /// keep the caller's spelling, so a missing parent there may have been a
-    /// symlink to anywhere.
+    /// resolved, so the key already is the location it was saved at and is
+    /// compared as stored. Resolving it again would follow symlinks created
+    /// since: a backup of `/repo/old/file.txt`, where `old` was later
+    /// replaced by a link to `/repo/new`, would otherwise be taken for
+    /// `/repo/new/file.txt` and purged with it. A parent that is gone now was
+    /// a real directory then, so such a key still names its location.
+    /// Checkpoint keys keep the caller's spelling. When their parent exists,
+    /// they are resolved here before comparing; when it is missing, the
+    /// result is `Unknown` (or `Unrelated` for a different file name),
+    /// because that parent may have been a symlink to anywhere.
     pub fn classify(&self, saved: &Path, recorded_resolved: bool) -> SavedPathMatch {
         if saved.starts_with(&self.given) || saved.starts_with(&self.location) {
             return SavedPathMatch::Selected;
@@ -192,7 +198,11 @@ impl PurgeTarget {
                 SavedPathMatch::Unknown
             };
         }
-        let saved_location = canonicalize_key(saved);
+        let saved_location = if recorded_resolved {
+            saved.to_path_buf()
+        } else {
+            canonicalize_key(saved)
+        };
         let under_directory = self.resolved_directory.as_ref().is_some_and(|directory| {
             saved_location != *directory && saved_location.starts_with(directory)
         });
