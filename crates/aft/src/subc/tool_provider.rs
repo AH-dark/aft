@@ -4301,8 +4301,12 @@ mod route_tests {
                 if keyed {
                     body["call_key"] = json!("no-elicitation");
                 }
+                // With `opening`, the database never finishes opening, so a
+                // refusal that waited for it would hang past any bound. The
+                // generous bound only absorbs actor startup on a loaded
+                // Windows runner, where one second was not enough.
                 let reply = tokio::time::timeout(
-                    Duration::from_secs(1),
+                    Duration::from_secs(15),
                     exchange_with_actor(
                         body,
                         identity,
