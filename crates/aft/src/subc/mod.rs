@@ -3633,7 +3633,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashSet<RouteChannel>,
+    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -4874,7 +4874,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
-    let mut management_routes: HashSet<RouteChannel> = HashSet::new();
+    let mut management_routes: HashMap<RouteChannel, Option<Principal>> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
@@ -5393,7 +5393,7 @@ where
                                 Err(decoded) => decoded,
                             }
                         } else { decoded };
-                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded, routes_for_call) {
+                        let decoded = if !database_waited && !management_routes.contains_key(&route) && !tool_provider::keyed_route_frame(&decoded, routes_for_call) {
                             match database_waits.defer(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5405,7 +5405,7 @@ where
                         // a blocking thread, never here; the call comes back carrying
                         // it, then passes the ledger and admission. Calls the ledger
                         // hands back already went through this step.
-                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                        let decoded = if !ledger_waited && !management_routes.contains_key(&route) {
                             match database_waits.read_confinement(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5413,7 +5413,7 @@ where
                         } else {
                             decoded
                         };
-                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                        let decoded = if !ledger_waited && !management_routes.contains_key(&route) {
                             match database_waits.restore_launch(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5422,7 +5422,7 @@ where
                         // Unrestored grants do not block unrelated tools or shells.
                         // Path checks refuse grant-dependent access; shells disclose
                         // the missing grants and use only currently effective authority.
-                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                        let decoded = if !ledger_waited && !management_routes.contains_key(&route) {
                             match ledger_edge.defer(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5465,7 +5465,7 @@ where
                             }
                             continue;
                         }
-                        let result = if management_routes.contains(&route)
+                        let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
                             // Management routes are bound only for first-party
@@ -5480,7 +5480,7 @@ where
                                 gh_relay_route_scopes(&routes),
                             );
                             Ok(())
-                        } else if management_routes.contains(&route) {
+                        } else if management_routes.contains_key(&route) {
                             handle_management_request(
                                 &writer_tx,
                                 &frame,
@@ -5490,6 +5490,7 @@ where
                                 &root_channels,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
+                                management_routes.get(&route).and_then(Option::as_ref),
                             )
                             .await
                         } else {
@@ -7056,7 +7057,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashSet<RouteChannel>,
+    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -7206,7 +7207,7 @@ async fn handle_control_request(
                 }
 
                 installed_route_epochs.insert(route_channel, epoch);
-                management_routes.insert(route_id);
+                management_routes.insert(route_id, principal);
                 return send_route_bind_ack(
                     tx,
                     frame.header.ver,
@@ -7555,6 +7556,7 @@ async fn handle_management_request(
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
+    principal: Option<&Principal>,
 ) -> Result<(), SubcError> {
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
     let operation = decoded
@@ -7575,6 +7577,15 @@ async fn handle_management_request(
     };
 
     let result = match operation {
+        crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|v| v.get("params"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            spawn_bash_kill_scope(tx, frame, executor, metrics, principal.cloned(), params);
+            return Ok(());
+        }
         crate::backup::purge::BACKUPS_PURGE_OPERATION => {
             let params = decoded
                 .as_ref()
@@ -7940,6 +7951,55 @@ fn spawn_gh_relay(
             send_reliable_writer_frame(&tx, &metrics, response, "gh shim relay response").await
         {
             log::warn!("gh_shim relay: could not queue the reply: {error}");
+        }
+    });
+}
+
+fn spawn_bash_kill_scope(
+    tx: &WriterSender,
+    frame: &Frame,
+    executor: &Arc<Executor>,
+    metrics: &Arc<DispatchPathMetrics>,
+    principal: Option<Principal>,
+    params: Value,
+) {
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let executor = Arc::clone(executor);
+    let metrics = Arc::clone(metrics);
+    // Signal grace periods and remote cancellation must not hold the frame loop.
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let result = tokio::task::spawn_blocking(move || {
+            let registries = executor
+                .actor_contexts()
+                .iter()
+                .map(|ctx| ctx.bash_background().clone())
+                .collect::<Vec<_>>();
+            crate::commands::bash_kill_scope::handle_bash_kill_scope(
+                params,
+                principal.as_ref(),
+                &registries,
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Response::error(
+                "management-bash-kill-scope",
+                "internal_error",
+                error.to_string(),
+            )
+        });
+        if let Err(error) = send_management_response(
+            &tx,
+            &frame,
+            crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION,
+            result,
+            &metrics,
+        )
+        .await
+        {
+            log::warn!("bash.kill_scope: could not queue the reply: {error}");
         }
     });
 }
@@ -13587,7 +13647,7 @@ mod tests {
                 &mut pending_binds,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
-                &mut HashSet::new(),
+                &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),

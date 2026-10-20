@@ -528,10 +528,16 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 sub_supervises: true,
             },
             // subc-protocol defines management operations as a name plus a
-            // Query/Mutate kind. These queries carry their own optional root
-            // input and do not scope the route itself.
+            // Query/Mutate kind. Each operation carries its target in its request;
+            // the management route itself is not bound to that target.
             ProviderRole::ManagementSurface {
                 operations: vec![
+                    ManagementOperation {
+                        name: crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION
+                            .to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
                     ManagementOperation {
                         name: crate::commands::health_digest::HEALTH_DIGEST_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
@@ -838,6 +844,10 @@ mod tests {
                 .map(|operation| (operation.name.as_str(), &operation.kind))
                 .collect::<Vec<_>>(),
             vec![
+                (
+                    crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
                 (
                     crate::commands::health_digest::HEALTH_DIGEST_OPERATION,
                     &ManagementOperationKind::Query,

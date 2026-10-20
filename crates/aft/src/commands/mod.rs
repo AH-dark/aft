@@ -8,6 +8,7 @@ pub mod bash_abort_inflight;
 pub mod bash_artifact_owned;
 pub mod bash_drain_completions;
 pub mod bash_kill;
+pub(crate) mod bash_kill_scope;
 pub mod bash_notify;
 pub mod bash_orchestrate;
 pub mod bash_owned_tasks;

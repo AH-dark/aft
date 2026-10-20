@@ -196,9 +196,9 @@ fn acknowledge_terminal_bash_reply(
     }
 }
 
-/// A bash-family reply tells the session, once, about each task whose waiting
-/// call was cancelled while the command kept running: the caller saw only the
-/// cancellation, with no task ID to check or stop.
+/// A bash-family reply names tasks the session has not heard about: commands
+/// still running after their waiting call was cancelled, and commands stopped
+/// by an owner pause. The registry supplies the appropriate status for each.
 fn append_cancelled_call_notices(
     text: &mut String,
     ctx: &AppContext,
