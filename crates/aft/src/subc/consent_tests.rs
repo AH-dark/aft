@@ -3794,6 +3794,14 @@ async fn consent_worker_searches_of_filesystem_root_refuse_without_asking() {
 async fn consent_stamped_head_search_of_filesystem_root_keeps_todays_behavior() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
+    // The general fixture explicitly selects ask mode. This case checks the
+    // full-access head's exemption from worker-only search guidance.
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &f.head,
+        &f.ctx,
+    )
+    .unwrap();
 
     let reply = f
         .checkout_tool(
