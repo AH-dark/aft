@@ -1,0 +1,1 @@
+- New Swift files now report syntax as unknown with a reason when compiler confirmation times out or is unavailable, instead of incorrectly reporting a definite syntax error; confirmed valid and invalid compiler verdicts are unchanged.

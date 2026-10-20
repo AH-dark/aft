@@ -76,39 +76,42 @@ pub(super) fn confirm_if_needed(
 /// Confirm a tree-sitter error in a Swift file that the current call created.
 ///
 /// There is no original to compare against, so the compiler's verdict on the
-/// new content decides directly. When `swiftc` is unavailable or fails, the
-/// tree-sitter verdict stands.
-pub(super) fn confirm_created(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
+/// new content decides directly. An unfinished confirmation is unknown, not
+/// evidence that the new file contains a syntax error.
+pub(super) fn confirm_created(
+    path: &Path,
+    source: &str,
+    is_valid: Option<bool>,
+) -> Result<Option<bool>, &'static str> {
     if path.extension().and_then(|ext| ext.to_str()) != Some("swift") || is_valid != Some(false) {
-        return is_valid;
+        return Ok(is_valid);
     }
-    confirm_with_compiler(path, source, is_valid)
+    compiler_verdict(path, source).map(Some)
 }
 
 fn confirm_with_compiler(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
+    // Existing files keep the conservative rollback policy when confirmation
+    // cannot finish; newly created files have no original content to protect.
+    compiler_verdict(path, source).map(Some).unwrap_or(is_valid)
+}
+
+fn compiler_verdict(path: &Path, source: &str) -> Result<bool, &'static str> {
     let outcome = parse(source);
+    log::debug!(
+        "Swift syntax confirmation for {}: {outcome:?}",
+        path.display()
+    );
     match outcome {
-        ParseOutcome::Exited(Some(0)) => {
-            log::debug!(
-                "swiftc confirmed syntax after tree-sitter errors: {}",
-                path.display()
-            );
-            Some(true)
-        }
+        ParseOutcome::Exited(Some(0)) => Ok(true),
+        ParseOutcome::Exited(Some(1)) => Ok(false),
+        ParseOutcome::TimedOut => Err("swiftc_timeout"),
+        ParseOutcome::Missing => Err("swiftc_not_installed"),
         ParseOutcome::Unavailable(reason) => {
-            log::debug!(
-                "Swift syntax confirmation unavailable for {}: {reason}",
-                path.display()
-            );
-            is_valid
+            log::debug!("Swift syntax confirmation unavailable: {reason}");
+            Err("swiftc_unavailable")
         }
-        other => {
-            log::debug!(
-                "Swift syntax confirmation failed for {}: {other:?}",
-                path.display()
-            );
-            is_valid
-        }
+        ParseOutcome::Exited(None) => Err("swiftc_terminated"),
+        ParseOutcome::Exited(Some(_)) => Err("swiftc_failed"),
     }
 }
 
@@ -177,7 +180,7 @@ fn parse(source: &str) -> ParseOutcome {
         Ok(path) => path,
         Err(reason) => {
             log::debug!("Swift syntax confirmation lookup failed: {reason}");
-            return ParseOutcome::Missing;
+            return ParseOutcome::Unavailable(reason.clone());
         }
     };
     let mut command = Command::new(path);
@@ -457,7 +460,7 @@ mod tests {
         for (outcome, valid, line) in [
             (ParseOutcome::Exited(Some(0)), Some(true), None),
             (ParseOutcome::Exited(Some(1)), Some(false), Some(1)),
-            (ParseOutcome::Missing, Some(false), Some(1)),
+            (ParseOutcome::Missing, None, None),
         ] {
             let calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let count = calls.clone();
@@ -490,6 +493,162 @@ mod tests {
             );
             assert_eq!(calls.get(), 1);
         }
+    }
+
+    fn created_write_response(source: &str, runner: Runner) -> serde_json::Value {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("new.swift");
+        assert_eq!(validate_syntax_str(source, &path), Some(false));
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                format_on_edit: false,
+                ..Config::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "created-swift", "command": "write", "file": path, "content": source
+        }))
+        .unwrap();
+        let response = with_runner(runner, || {
+            crate::commands::write::handle_write(&request, &ctx)
+        });
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["created"], true);
+        assert_eq!(response.data["rolled_back"], false);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        if response.data.get("syntax_skipped_reason").is_some() {
+            let text = crate::subc_format::format_response("write", &response, false);
+            assert!(text.contains("Syntax check: unknown"), "{text}");
+            assert!(!text.contains("new file does not parse"), "{text}");
+        }
+        response.data
+    }
+
+    #[test]
+    fn swift_parser_created_timeout_is_unknown() {
+        let response = created_write_response(TUPLE, Box::new(|_| ParseOutcome::TimedOut));
+        assert!(response.get("syntax_valid").is_none(), "{response:?}");
+        assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+        assert_eq!(response["syntax_skipped_reason"], "swiftc_timeout");
+        assert!(
+            response["warnings"].to_string().contains("unknown"),
+            "{response:?}"
+        );
+    }
+
+    #[test]
+    fn swift_parser_created_unavailable_is_unknown() {
+        for (outcome, reason) in [
+            (ParseOutcome::Missing, "swiftc_not_installed"),
+            (
+                ParseOutcome::Unavailable("permission denied".into()),
+                "swiftc_unavailable",
+            ),
+            (ParseOutcome::Exited(None), "swiftc_terminated"),
+            (ParseOutcome::Exited(Some(2)), "swiftc_failed"),
+        ] {
+            let mut outcome = Some(outcome);
+            let response = created_write_response(
+                TUPLE,
+                Box::new(move |_| outcome.take().expect("one compiler confirmation")),
+            );
+            assert!(response.get("syntax_valid").is_none(), "{response:?}");
+            assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+            assert_eq!(response["syntax_skipped_reason"], reason);
+        }
+    }
+
+    #[test]
+    fn swift_parser_created_answer_is_definite() {
+        for (source, status, valid) in [(TUPLE, 0, true), (BROKEN, 1, false)] {
+            let response = created_write_response(
+                source,
+                Box::new(move |actual| {
+                    assert_eq!(actual, source);
+                    ParseOutcome::Exited(Some(status))
+                }),
+            );
+            assert_eq!(response["syntax_valid"], valid, "{response:?}");
+            assert!(
+                response.get("syntax_skipped_reason").is_none(),
+                "{response:?}"
+            );
+            if valid {
+                assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+            } else {
+                assert_eq!(response["syntax_error_line"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn swift_parser_created_append_and_patch_report_unknown() {
+        for command in ["edit_match", "apply_patch"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("new.swift");
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                Config {
+                    format_on_edit: false,
+                    ..Config::default()
+                },
+            );
+            let params = if command == "edit_match" {
+                serde_json::json!({ "id": "append", "command": command, "file": path, "op": "append", "appendContent": TUPLE })
+            } else {
+                serde_json::json!({ "id": "patch", "command": command, "patch_text": format!("*** Begin Patch\n*** Add File: {}\n+{}*** End Patch\n", path.display(), TUPLE) })
+            };
+            let request = serde_json::from_value(params).unwrap();
+            let response = with_runner(Box::new(|_| ParseOutcome::TimedOut), || {
+                if command == "edit_match" {
+                    crate::commands::edit_match::handle_edit_match(&request, &ctx)
+                } else {
+                    crate::commands::apply_patch::handle_apply_patch(&request, &ctx)
+                }
+            });
+            assert!(response.success, "{response:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), TUPLE);
+            let data = if command == "edit_match" {
+                &response.data
+            } else {
+                assert!(response.data["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Syntax check: unknown"));
+                &response.data["metadata"]["files"][0]
+            };
+            assert!(
+                data.get("syntax_valid")
+                    .is_none_or(serde_json::Value::is_null),
+                "{data:?}"
+            );
+            assert!(data.get("syntax_error_line").is_none(), "{data:?}");
+            assert_eq!(data["syntax_skipped_reason"], "swiftc_timeout");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swift_parser_created_slow_checker_is_unknown() {
+        let response = created_write_response(
+            TUPLE,
+            Box::new(|source| {
+                assert_eq!(source, TUPLE);
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", "exec sleep 30"]);
+                let outcome = parse_outcome(run_command(
+                    command,
+                    source,
+                    Instant::now() + Duration::from_millis(50),
+                ));
+                assert!(matches!(outcome, ParseOutcome::TimedOut), "{outcome:?}");
+                outcome
+            }),
+        );
+        assert!(response.get("syntax_valid").is_none(), "{response:?}");
+        assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+        assert_eq!(response["syntax_skipped_reason"], "swiftc_timeout");
     }
 
     #[test]
@@ -647,6 +806,20 @@ mod tests {
             assert!(second.rolled_back);
             assert_eq!(second.syntax_valid, Some(false));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+        }) else {
+            eprintln!("skipping native Swift parser test: swiftc is unavailable");
+            return;
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_parser_native_created_file_is_valid() {
+        let Some(()) = with_native_swiftc(|| {
+            let check = crate::edit::check_created_file_syntax(Path::new("new.swift"), TUPLE);
+            assert_eq!(check.valid, Some(true), "{check:?}");
+            assert_eq!(check.first_error_line, None);
+            assert_eq!(check.skipped_reason, None);
         }) else {
             eprintln!("skipping native Swift parser test: swiftc is unavailable");
             return;

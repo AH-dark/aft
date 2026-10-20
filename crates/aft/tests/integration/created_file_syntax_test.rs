@@ -223,10 +223,10 @@ fn apply_patch_places_notice_under_the_broken_created_file_only() {
 }
 
 /// tree-sitter-swift rejects a parenthesized tuple metatype that `swiftc`
-/// accepts. A new Swift file is confirmed with the compiler before it counts
-/// as broken, so this file gets no syntax line.
+/// accepts. Compiler confirmation may time out on a loaded runner; an
+/// unfinished confirmation must be unknown rather than a definite syntax error.
 #[test]
-fn swift_new_file_swiftc_accepts_has_no_syntax_line() {
+fn swift_new_file_does_not_report_unconfirmed_syntax_error() {
     if !cfg!(target_os = "macos") {
         eprintln!("skipping: the swiftc confirmation test runs only on macOS, where swiftc ships with the Xcode toolchain");
         return;
@@ -253,9 +253,19 @@ fn swift_new_file_swiftc_accepts_has_no_syntax_line() {
     );
 
     assert_eq!(resp["created"], true, "{resp:?}");
-    assert_eq!(resp["syntax_valid"], true, "{resp:?}");
+    if resp.get("syntax_valid").is_some() {
+        assert_eq!(resp["syntax_valid"], true, "{resp:?}");
+        assert!(resp.get("syntax_skipped_reason").is_none(), "{resp:?}");
+    } else {
+        assert!(resp["syntax_skipped_reason"].is_string(), "{resp:?}");
+        assert!(text(&resp).contains("Syntax check: unknown"), "{resp:?}");
+    }
     assert!(resp.get("syntax_error_line").is_none(), "{resp:?}");
-    assert!(!text(&resp).contains("Syntax check"), "{}", text(&resp));
+    assert!(
+        !text(&resp).contains("new file does not parse"),
+        "{}",
+        text(&resp)
+    );
     assert!(aft.shutdown().success());
 }
 
