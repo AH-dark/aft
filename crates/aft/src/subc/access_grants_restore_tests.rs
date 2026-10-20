@@ -151,7 +151,7 @@ impl WireRestore {
             41,
             corr,
             json!({
-                "name":"read", "preset":"worker", "arguments":{"filePath":"probe.txt"},
+                "name":"read", "preset":"worker", "arguments":{"path":"probe.txt"},
                 "deadline_ms":crate::bash_background::persistence::unix_millis() + 700,
             }),
         )
