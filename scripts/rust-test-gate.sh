@@ -171,8 +171,10 @@ acquire_box_gate
 # failure record. It is also outside CortexKit's data and state folders: phase
 # commands write straight into this file, so it is every test's inherited
 # stdout, and the native sandbox refuses a test whose stdout lies under a
-# folder its floor denies.
-gate_log_dir="${AFT_GATE_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/aft-gate-logs}"
+# folder its floor denies. It is based on HOME, not XDG_STATE_HOME, because
+# the gate points XDG_STATE_HOME into its own per-gate home under target/,
+# which a run can replace while the gate is still writing its log.
+gate_log_dir="${AFT_GATE_LOG_DIR:-$HOME/.local/state/aft-gate-logs}"
 gate_log="${AFT_GATE_LOG:-$gate_log_dir/gate-$(date -u '+%Y%m%dT%H%M%SZ')-$$.log}"
 mkdir -p "$(dirname "$gate_log")"
 if [[ "${AFT_GATE_LOG_INHERITED:-}" == "1" ]]; then

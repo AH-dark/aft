@@ -64,7 +64,7 @@ fi
 # file with AFT_GATE_LOG or a directory with AFT_GATE_LOG_DIR. The default
 # matches rust-test-gate.sh: outside CortexKit's data and state folders, which
 # the native sandbox floor denies.
-gate_log_dir="${AFT_GATE_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/aft-gate-logs}"
+gate_log_dir="${AFT_GATE_LOG_DIR:-$HOME/.local/state/aft-gate-logs}"
 gate_log="${AFT_GATE_LOG:-$gate_log_dir/gated-push-$(date -u '+%Y%m%dT%H%M%SZ')-$$.log}"
 mkdir -p "$(dirname "$gate_log")"
 : > "$gate_log"
