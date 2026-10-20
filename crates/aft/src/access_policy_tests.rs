@@ -1333,3 +1333,130 @@ fn scratch_read_allocator_path_uses_the_task_record() {
         .bash_background()
         .is_session_owned_scratch_path("foreign-session", &file));
 }
+
+/// The worker flow seen in production: one shell call writes into its own
+/// `$TMPDIR` (the task's allocated scratch), and a later read or outline names
+/// that file. While the task still records its scratch the read succeeds; once
+/// cleanup has removed the scratch after the command exited, the same read
+/// answers not-found instead of raising a permission ask. Foreign sessions,
+/// writes and a recreated root that links elsewhere keep asking.
+#[cfg(unix)]
+#[test]
+fn scratch_read_after_command_exit_is_not_found_without_ask() {
+    let (directory, ctx, _scratch, _scope) = scratch_read_context();
+    let task = ctx
+        .bash_background()
+        .task_for_test("bash-0123456789abcdef")
+        .unwrap();
+    let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
+    let written = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("printf 'fn worker_scratch() {}\\n' > \"$TMPDIR/ict.rs\"")
+        .env("TMPDIR", &scratch)
+        .status()
+        .unwrap();
+    assert!(written.success());
+    let file = scratch.join("ict.rs");
+    let read = |session: &str, command: &str| {
+        let params = json!({"file": file});
+        let mut req = request(command, params);
+        req.session_id = Some(session.into());
+        match command {
+            "read" => crate::commands::read::handle_read(&req, &ctx),
+            _ => crate::commands::outline::handle_outline(&req, &ctx),
+        }
+    };
+    for command in ["read", "outline"] {
+        let live = read("policy-session", command);
+        assert!(live.success, "{command} while live: {:?}", live.data);
+        assert!(
+            live.data.to_string().contains("worker_scratch"),
+            "{command}: {:?}",
+            live.data
+        );
+    }
+
+    // The registry's own terminal cleanup deletes the scratch and clears the
+    // recorded path, exactly as it does when a real command exits.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ctx
+        .bash_background()
+        .cleanup_terminal_task_temp(&task)
+        .unwrap()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scratch cleanup did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!scratch.exists(), "cleanup must remove the scratch");
+    assert!(task
+        .lock_state()
+        .unwrap()
+        .metadata
+        .sandbox_temp_dir
+        .is_none());
+
+    for command in ["read", "outline"] {
+        let gone = read("policy-session", command);
+        assert!(!gone.success, "{command}: {:?}", gone.data);
+        assert_eq!(gone.data["code"], "not_found", "{command}: {:?}", gone.data);
+        assert!(
+            gone.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("task scratch is removed when its command exits"),
+            "{command}: {:?}",
+            gone.data
+        );
+        let foreign = read("foreign-session", command);
+        assert_eq!(
+            foreign.data["code"], "access_ask_required",
+            "{command}: {:?}",
+            foreign.data
+        );
+    }
+    // Workers often spell the scratch through the /tmp alias on macOS.
+    #[cfg(target_os = "macos")]
+    {
+        let alias = Path::new("/tmp").join(file.strip_prefix("/private/tmp").unwrap());
+        let response =
+            crate::commands::read::handle_read(&request("read", json!({"file": alias})), &ctx);
+        assert_eq!(response.data["code"], "not_found", "{:?}", response.data);
+    }
+    for (session, expected) in [("policy-session", true), ("foreign-session", false)] {
+        let mut req = request("bash_artifact_owned", json!({"path": file}));
+        req.session_id = Some(session.into());
+        let response = crate::commands::bash_artifact_owned::handle(&req, &ctx);
+        assert_eq!(response.data["owned"], expected, "{:?}", response.data);
+    }
+    let write = crate::commands::write::handle_write(
+        &request(
+            "write",
+            json!({"file": file, "content": "fn rewritten() {}\n"}),
+        ),
+        &ctx,
+    );
+    assert_eq!(
+        write.data["code"], "access_ask_required",
+        "{:?}",
+        write.data
+    );
+    assert!(!file.exists());
+
+    // A root name recreated as a link to another folder is not the removed
+    // scratch: the read resolves outside it and asks as before.
+    let outside = directory.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("ict.rs"), "fn outside_secret() {}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, &scratch).unwrap();
+    let linked = read("policy-session", "read");
+    let _ = std::fs::remove_file(&scratch);
+    assert_eq!(
+        linked.data["code"], "access_ask_required",
+        "{:?}",
+        linked.data
+    );
+}

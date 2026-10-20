@@ -362,6 +362,57 @@ impl BgTaskRegistry {
         })
     }
 
+    /// A task's scratch directory is deleted when its command exits, so a
+    /// session that wrote a file there in one shell call and reads it in a
+    /// later tool call names a path that is gone. Recognize a missing path
+    /// under a scratch root that one of this session's tasks records now or
+    /// recorded before cleanup, so the read can fail as not-found rather than
+    /// ask for permission to read nothing. `identity` is the policy identity:
+    /// absolute, with existing ancestors canonicalized and `..` removed.
+    pub(crate) fn is_session_missing_scratch_path(&self, session: &str, identity: &Path) -> bool {
+        if !identity.is_absolute()
+            || identity.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            || !crate::task_temp_reads::is_scratch(identity)
+            || !matches!(fs::symlink_metadata(identity), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return false;
+        }
+        let root_missing = |root: &Path| matches!(fs::symlink_metadata(root), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+        self.task_arcs().iter().any(|task| {
+            if task.session_id != session {
+                return false;
+            }
+            let Ok(state) = task.lock_state() else {
+                return false;
+            };
+            let under = |root: &Path| {
+                crate::sandbox_spawn::is_managed_task_temp_dir(root) && identity.starts_with(root)
+            };
+            // The recorded root may still exist (a missing file inside a live
+            // scratch) as long as it has not been replaced by a link. A root
+            // remembered only after cleanup must itself be gone: if the same
+            // name exists again, it belongs to some other task.
+            let live = state
+                .metadata
+                .sandbox_temp_dir
+                .as_deref()
+                .is_some_and(|root| {
+                    under(root)
+                        && (root_missing(root)
+                            || fs::canonicalize(root).is_ok_and(|current| current == root))
+                });
+            live || state
+                .removed_temp_dir
+                .as_deref()
+                .is_some_and(|root| under(root) && root_missing(root))
+        })
+    }
+
     fn head_reads_record(&self, record: &TaskReadRecord) -> bool {
         let Some(caller) = crate::access_policy::current_scope() else {
             return false;

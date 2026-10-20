@@ -1184,6 +1184,11 @@ pub(crate) struct BgTaskState {
     /// The path stays in persisted metadata until this worker result succeeds,
     /// so a crash or a full queue leaves enough information for the stale sweep.
     temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
+    /// The scratch directory this task used, kept in memory after cleanup has
+    /// deleted it and cleared `metadata.sandbox_temp_dir`. A later read of a
+    /// path inside it by the same session can then fail as not-found instead
+    /// of asking for permission to read a file that no longer exists.
+    pub(crate) removed_temp_dir: Option<PathBuf>,
     pub(crate) runtime: TaskRuntime,
     /// Pinned task-io directory and original O_EXCL output handles retained for
     /// the process lifetime. Daemon writes never reopen child-writable names.
@@ -3507,6 +3512,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -3850,6 +3856,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
                 io_handles: Some(io_handles),
@@ -4098,6 +4105,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -7932,7 +7940,7 @@ impl BgTaskRegistry {
             state.temp_cleanup = super::temp_cleanup::schedule(path, task.db_write_order.clone());
             return Ok(false);
         }
-        state.metadata.sandbox_temp_dir = None;
+        state.removed_temp_dir = state.metadata.sandbox_temp_dir.take();
         // A crash before this write is harmless: deletion is idempotent, and
         // replay can retry from the old record without touching another task.
         task.terminal_persist_dirty.store(true, Ordering::SeqCst);
@@ -8099,6 +8107,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: if mode == BgMode::Pty {
                     TaskRuntime::Pty(None)
