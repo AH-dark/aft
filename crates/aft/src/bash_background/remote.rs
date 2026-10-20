@@ -67,6 +67,47 @@ fn retry_waited_ms(remote: &RemoteTask) -> Option<u64> {
     remote.retry.as_ref()?.waited_ms
 }
 
+/// The refusal text for a remote job. When the runner refused it for waiting
+/// behind this session's own earlier job in the same workspace, say so and
+/// name that job and its task instead of quoting the runner's queue report.
+fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTask) -> String {
+    match &remote.workspace_holder {
+        Some(holder) if reason == "queue_wait_exceeded" => format!(
+            "runon refused: your earlier job {} in this workspace is still running (task {}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {} to end (bash_status shows it), then retry",
+            holder.job_id, holder.task_id, holder.task_id
+        ),
+        _ => retry_refusal_message(reason, detail, retry_waited_ms(remote)),
+    }
+}
+
+/// The job IDs a `queue_wait_exceeded` refusal detail names as running, when
+/// the refused job was waiting on its workspace owner. ck-motor reports
+/// `waiting_on=workspace owner; ...; holders=[job=<id> workspace=<key> ...; ...]; ...`;
+/// the detail is quoted text, so anything else yields no IDs.
+#[cfg(unix)]
+fn workspace_owner_holders(detail: &str) -> Vec<Uuid> {
+    let Some(rest) = detail.strip_prefix("waiting_on=workspace owner;") else {
+        return Vec::new();
+    };
+    let Some(start) = rest.find("holders=[") else {
+        return Vec::new();
+    };
+    let holders = &rest[start + "holders=[".len()..];
+    let holders = holders.split(']').next().unwrap_or_default();
+    holders
+        .split(';')
+        .filter_map(|entry| {
+            entry
+                .trim()
+                .strip_prefix("job=")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
 /// Derive the error from persisted remote proof, never from command output.
 /// Keeping it in snapshots lets foreground and restarted/background readers
 /// report the same named refusal without changing older task records.
@@ -91,16 +132,38 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
     let reason = serde_json::to_value(reason).ok()?;
     Some(super::RemoteRefusal {
         code: "remote_unavailable",
-        message: retry_refusal_message(
-            reason.as_str()?,
-            refusal_detail.as_deref(),
-            retry_waited_ms(remote),
-        ),
+        message: remote_refusal_message(reason.as_str()?, refusal_detail.as_deref(), remote),
     })
 }
 
+/// How long AFT keeps re-attaching after a job's own limits have passed, and
+/// after the last record it received from the job. It covers the runner's
+/// terminal delivery, ck-motor restarts and clock differences between machines.
 #[cfg(unix)]
-const REMOTE_REATTACH_BUDGET: Duration = Duration::from_secs(5 * 60);
+const REMOTE_REATTACH_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// ck-motor's default queue wait limit, used for a request that sets no
+/// `queue_wait_limit_s` (AFT never sets one).
+/// Time a job waits only behind its own workspace's earlier job is not counted
+/// against it, so this bounds the ordinary case, not every wait.
+#[cfg(unix)]
+const RUNNER_QUEUE_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// The first pause before re-attaching after a lost stream; each failed attempt
+/// without progress doubles it, up to [`REATTACH_BACKOFF_MAX`].
+#[cfg(unix)]
+const REATTACH_BACKOFF_FIRST: Duration = Duration::from_millis(100);
+
+#[cfg(unix)]
+const REATTACH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The pause before re-attach attempt `attempt` (0-based) since the last progress.
+#[cfg(unix)]
+fn reattach_backoff(attempt: u32) -> Duration {
+    REATTACH_BACKOFF_FIRST
+        .saturating_mul(1_u32 << attempt.min(16))
+        .min(REATTACH_BACKOFF_MAX)
+}
 
 #[cfg(unix)]
 const DRAINING_RETRY_BUDGET_MS: u64 = 10 * 60 * 1000;
@@ -187,8 +250,16 @@ fn remote_execution_note(remote: &RemoteTask) -> String {
 
 /// Only an offline remote job is safe to repeat without checking outside effects.
 /// Local fallback has its own warnings and never uses this advice.
+///
+/// The runner has no operation an agent can call to fetch a job AFT stopped
+/// following, so the advice names the job and what to do instead: wait for it
+/// to end by its own run timeout, then rerun.
 #[cfg(unix)]
-fn remote_unknown_outcome(job_id: Option<Uuid>, granted_network: bool) -> String {
+fn remote_unknown_outcome(
+    job_id: Option<Uuid>,
+    granted_network: bool,
+    run_timeout_ms: Option<u64>,
+) -> String {
     let mut text = "remote outcome unknown".to_owned();
     if let Some(job_id) = job_id {
         text.push_str(&format!(" (job {job_id})"));
@@ -201,8 +272,12 @@ fn remote_unknown_outcome(job_id: Option<Uuid>, granted_network: bool) -> String
         );
     }
     if let Some(job_id) = job_id {
+        let limit = run_timeout_ms.map_or_else(
+            || "until it ends".to_owned(),
+            |ms| format!("for up to its run timeout of {}", retry_duration(ms)),
+        );
         text.push_str(&format!(
-            "; check exec.status {job_id} first if you need its result"
+            "; job {job_id} may still be running on {RUNNER_ID} and holding this workspace {limit}, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end, then rerun"
         ));
     }
     text
@@ -220,37 +295,87 @@ fn local_os_name() -> &'static str {
     }
 }
 
-/// Bound consecutive empty recovery attempts, not silence on an open stream.
-/// Accepted jobs can disappear with a wiped runner state; AFT must not resubmit them.
+/// Bounds how long AFT keeps re-attaching to an accepted job whose stream it
+/// lost. Silence on an open stream is never bounded; only recovery attempts
+/// that bring no record are. While the job may still be queued or running on
+/// the runner, AFT keeps trying: it stops only once the job's own limits (the
+/// runner's queue wait limit plus the command's run timeout, counted from when
+/// AFT submitted it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
+/// after recovery began. Accepted jobs can disappear with a wiped runner state;
+/// AFT must not resubmit them.
 #[cfg(unix)]
 struct ReattachBudget {
-    limit: Duration,
+    grace: Duration,
+    /// When the job's own limits have passed; `None` when it has no run timeout.
+    job_end: Option<tokio::time::Instant>,
+    /// Human-readable summary of those limits, for the give-up message.
+    limit_note: String,
     deadline: Option<tokio::time::Instant>,
+    /// Failed recovery attempts since the last record; selects the next pause.
+    attempts: u32,
     #[cfg(test)]
     clock: Option<Arc<tests::ReattachClock>>,
+    #[cfg(test)]
+    clock_job_end: Option<Duration>,
     #[cfg(test)]
     clock_deadline: Option<Duration>,
 }
 
 #[cfg(unix)]
 impl ReattachBudget {
-    fn new(_root: &Path) -> Self {
+    fn new(_root: &Path, metadata: &PersistedTask) -> Self {
+        let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
+        let run_timeout = metadata.timeout_ms.map(Duration::from_millis);
+        let until_job_end = run_timeout.map(|timeout| {
+            let job_end_ms = metadata
+                .started_at
+                .saturating_add(duration_ms(queue_wait))
+                .saturating_add(duration_ms(timeout));
+            Duration::from_millis(job_end_ms.saturating_sub(unix_millis()))
+        });
+        let grace = REMOTE_REATTACH_GRACE;
+        // A shortened test budget stands for the whole allowance: the job's
+        // limits are treated as already passed.
         #[cfg(test)]
-        let limit = tests::take_reattach_budget(_root).unwrap_or(REMOTE_REATTACH_BUDGET);
-        #[cfg(not(test))]
-        let limit = REMOTE_REATTACH_BUDGET;
+        let (grace, until_job_end) = match tests::take_reattach_budget(_root) {
+            Some(budget) => (budget, until_job_end.map(|_| Duration::ZERO)),
+            None => (grace, until_job_end),
+        };
+        let limit_note = match run_timeout {
+            Some(timeout) => format!(
+                "ck-motor's queue wait limit of {} and its run timeout of {} have passed since AFT submitted it, plus {} of grace",
+                retry_duration(duration_ms(queue_wait)),
+                retry_duration(duration_ms(timeout)),
+                retry_duration(duration_ms(grace)),
+            ),
+            None => format!(
+                "it has no run timeout, so AFT waited {}",
+                retry_duration(duration_ms(grace))
+            ),
+        };
+        #[cfg(test)]
+        let clock = tests::reattach_clock(_root);
         Self {
-            limit,
+            grace,
+            job_end: until_job_end.map(|until| tokio::time::Instant::now() + until),
+            limit_note,
             deadline: None,
+            attempts: 0,
             #[cfg(test)]
-            clock: tests::reattach_clock(_root),
+            clock_job_end: clock
+                .as_ref()
+                .and_then(|clock| until_job_end.map(|until| clock.now() + until)),
+            #[cfg(test)]
+            clock,
             #[cfg(test)]
             clock_deadline: None,
         }
     }
 
+    /// A record arrived: the job is alive, so recovery starts over.
     fn reset(&mut self) {
         self.deadline = None;
+        self.attempts = 0;
         #[cfg(test)]
         if let Some(clock) = &self.clock {
             self.clock_deadline = None;
@@ -258,8 +383,11 @@ impl ReattachBudget {
         }
     }
 
-    fn expired(job_id: Uuid) -> String {
-        format!("remote outcome unknown: job {job_id} could not be re-attached for 5 minutes; command not rerun")
+    fn expired(&self, job_id: Uuid) -> String {
+        format!(
+            "remote outcome unknown: job {job_id} could not be re-attached before its own time limit passed ({}); command not rerun",
+            self.limit_note
+        )
     }
 
     fn check(&self, job_id: Uuid) -> Result<(), String> {
@@ -269,7 +397,7 @@ impl ReattachBudget {
                 .clock_deadline
                 .is_some_and(|deadline| clock.now() >= deadline)
             {
-                Err(Self::expired(job_id))
+                Err(self.expired(job_id))
             } else {
                 Ok(())
             };
@@ -278,9 +406,19 @@ impl ReattachBudget {
             .deadline
             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
         {
-            return Err(Self::expired(job_id));
+            return Err(self.expired(job_id));
         }
         Ok(())
+    }
+
+    /// The deadline is fixed when recovery begins: the later of the job's own
+    /// end and now, plus the grace period.
+    fn deadline(&mut self) -> tokio::time::Instant {
+        let (job_end, grace) = (self.job_end, self.grace);
+        *self.deadline.get_or_insert_with(|| {
+            let now = tokio::time::Instant::now();
+            job_end.map_or(now, |end| end.max(now)) + grace
+        })
     }
 
     async fn wait<T>(
@@ -290,24 +428,46 @@ impl ReattachBudget {
     ) -> Result<T, String> {
         self.check(job_id)?;
         #[cfg(test)]
-        if let Some(clock) = &self.clock {
-            let deadline = *self
-                .clock_deadline
-                .get_or_insert_with(|| clock.now() + self.limit);
+        if let Some(clock) = self.clock.clone() {
+            let (job_end, grace) = (self.clock_job_end, self.grace);
+            let deadline = *self.clock_deadline.get_or_insert_with(|| {
+                let now = clock.now();
+                job_end.map_or(now, |end| end.max(now)) + grace
+            });
             clock.waits.send_modify(|waits| *waits += 1);
             let mut ticks = clock.ticks.subscribe();
             return tokio::select! {
                 value = attempt => Ok(value),
-                _ = ticks.wait_for(|now| *now >= deadline) => Err(Self::expired(job_id)),
+                _ = ticks.wait_for(|now| *now >= deadline) => Err(self.expired(job_id)),
             };
         }
-        let deadline = *self
-            .deadline
-            .get_or_insert_with(|| tokio::time::Instant::now() + self.limit);
+        let deadline = self.deadline();
         tokio::time::timeout_at(deadline, attempt)
             .await
-            .map_err(|_| Self::expired(job_id))
+            .map_err(|_| self.expired(job_id))
     }
+
+    /// Pause before the next recovery attempt, backing off while attempts keep
+    /// failing. Fails once the deadline passes.
+    async fn pause(&mut self, job_id: Uuid) -> Result<(), String> {
+        let delay = reattach_backoff(self.attempts);
+        self.attempts = self.attempts.saturating_add(1);
+        #[cfg(test)]
+        if self.clock.is_some() {
+            // Paused-clock tests drive only the deadline; keep real pauses short
+            // so a test can observe many attempts. `reattach_backoff` has its own test.
+            let _ = delay;
+            return self
+                .wait(job_id, tokio::time::sleep(Duration::from_millis(5)))
+                .await;
+        }
+        self.wait(job_id, tokio::time::sleep(delay)).await
+    }
+}
+
+#[cfg(unix)]
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -429,6 +589,18 @@ pub(crate) struct RemoteTask {
     pub output_received: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_incomplete: Option<RemoteOutputIncomplete>,
+    /// Set when the runner refused this job with `queue_wait_exceeded` while it
+    /// waited behind an earlier job of this same session in the same workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_holder: Option<WorkspaceHolder>,
+}
+
+/// This session's earlier remote job that still held the workspace when the
+/// runner refused a later job in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspaceHolder {
+    pub job_id: Uuid,
+    pub task_id: String,
 }
 
 /// Where a remote job is, as far as its own stream has shown. Used to tell a
@@ -1342,6 +1514,7 @@ impl BgTaskRegistry {
             output_received: false,
             retry: None,
             output_incomplete: None,
+            workspace_holder: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -1543,7 +1716,14 @@ impl BgTaskRegistry {
             .clone()
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
-        let mut recovery = ReattachBudget::new(&root);
+        let mut recovery = ReattachBudget::new(
+            &root,
+            &task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata,
+        );
         let mut retry_request = None;
         if let Some(record) = remote.terminal.as_ref() {
             let verdict = exec::grade(record);
@@ -1618,9 +1798,7 @@ impl BgTaskRegistry {
                     }
                     if let Some(point) = remote.point().filter(|_| remote.connection_file.is_some())
                     {
-                        recovery
-                            .wait(point.job_id, tokio::time::sleep(Duration::from_secs(1)))
-                            .await?;
+                        recovery.pause(point.job_id).await?;
                         continue;
                     }
                     return Err(format!("remote outcome unknown; attach required: {error}"));
@@ -1799,9 +1977,7 @@ impl BgTaskRegistry {
                     }
                     // A known accepted job is recovered only by attach. Never
                     // convert a lost stream into another run or local fallback.
-                    recovery
-                        .wait(point.job_id, tokio::time::sleep(Duration::from_millis(100)))
-                        .await?;
+                    recovery.pause(point.job_id).await?;
                     stream = self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                         .await?;
@@ -1944,41 +2120,48 @@ impl BgTaskRegistry {
         recovery: &mut ReattachBudget,
     ) -> Result<exec::RemoteStream, String> {
         point.attach_request().map_err(|e| e.to_string())?;
-        recovery
-            .wait(point.job_id, async {
-                loop {
-                    let cancel = task
-                        .state
-                        .lock()
-                        .map_err(|_| "task lock poisoned")?
-                        .metadata
-                        .remote
-                        .as_ref()
-                        .is_some_and(|r| r.cancel_requested);
+        loop {
+            let cancel = task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.cancel_requested);
+            let attempt = recovery
+                .wait(point.job_id, async {
                     if cancel {
                         let _ = client.cancel_job(point.job_id).await;
                     }
-                    if let Ok(stream) = client.attach(point.clone()).await {
-                        return Ok(stream);
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Some(path) = &remote.connection_file {
-                        if let Ok(reconnected) = ExecRemoteClient::connect(
+                    client.attach(point.clone()).await
+                })
+                .await?;
+            if let Ok(stream) = attempt {
+                return Ok(stream);
+            }
+            // The route may have closed with the runner (a ck-motor restart).
+            // Back off, then reconnect and attach again; never resubmit.
+            recovery.pause(point.job_id).await?;
+            if let Some(path) = &remote.connection_file {
+                let reconnected = recovery
+                    .wait(
+                        point.job_id,
+                        ExecRemoteClient::connect(
                             path,
                             subc_protocol::BindIdentity::new(
                                 root.display().to_string(),
                                 remote.harness.clone(),
                                 remote.session.clone(),
                             ),
-                        )
-                        .await
-                        {
-                            *client = reconnected;
-                        }
-                    }
+                        ),
+                    )
+                    .await?;
+                if let Ok(reconnected) = reconnected {
+                    *client = reconnected;
                 }
-            })
-            .await?
+            }
+        }
     }
 
     fn remote_fallback(
@@ -2166,25 +2349,57 @@ impl BgTaskRegistry {
         reason: &str,
         refusal_detail: Option<&str>,
     ) -> Result<(), String> {
+        let holder = if reason == "queue_wait_exceeded" {
+            refusal_detail.and_then(|detail| self.own_workspace_holder(task, detail))
+        } else {
+            None
+        };
+        let message = {
+            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            let remote = state
+                .metadata
+                .remote
+                .as_mut()
+                .ok_or("remote record absent")?;
+            // Saved with the terminal below, so restarted readers render the same text.
+            remote.workspace_holder = holder;
+            remote_refusal_message(reason, refusal_detail, remote)
+        };
         self.remote_terminal(
             task,
             Verdict::RunLocally {
                 reason: RefusalReason::Unknown(reason.into()),
                 refusal_detail: refusal_detail.map(str::to_owned),
             },
-            Some({
-                let remote = task
-                    .state
-                    .lock()
-                    .map_err(|_| "task lock poisoned")?
-                    .metadata
-                    .remote
-                    .clone()
-                    .unwrap();
-                retry_refusal_message(reason, refusal_detail, retry_waited_ms(&remote))
-            }),
+            Some(message),
         );
         Ok(())
+    }
+
+    /// This session's earlier remote task whose job the refusal detail names as
+    /// running in the same checkout as `task`, if there is one.
+    fn own_workspace_holder(&self, task: &Arc<BgTask>, detail: &str) -> Option<WorkspaceHolder> {
+        let holders = workspace_owner_holders(detail);
+        if holders.is_empty() {
+            return None;
+        }
+        let workspace =
+            |metadata: &PersistedTask| worktree_root_containing(&metadata.workdir).ok().flatten();
+        let own_workspace = workspace(&task.state.lock().ok()?.metadata)?;
+        let tasks: Vec<_> = self.inner.tasks.lock().ok()?.values().cloned().collect();
+        tasks.into_iter().find_map(|other| {
+            if other.task_id == task.task_id || other.session_id != task.session_id {
+                return None;
+            }
+            let state = other.state.lock().ok()?;
+            let job_id = state.metadata.remote.as_ref()?.job_id?;
+            (holders.contains(&job_id) && workspace(&state.metadata)? == own_workspace).then(|| {
+                WorkspaceHolder {
+                    job_id,
+                    task_id: other.task_id.clone(),
+                }
+            })
+        })
     }
 
     fn refuse_remote_before_dispatch(&self, task: &Arc<BgTask>, error: &str) -> Result<(), String> {
@@ -2241,7 +2456,11 @@ impl BgTaskRegistry {
                             .get_or_insert_with(|| remote_note.clone())
                             .push_str(&format!("\n{detail}"));
                     }
-                    reason = Some(remote_unknown_outcome(job_id, network_risk));
+                    reason = Some(remote_unknown_outcome(
+                        job_id,
+                        network_risk,
+                        state.metadata.timeout_ms,
+                    ));
                 } else if reason.is_none() {
                     reason = Some("remote outcome_unknown; never rerun".into());
                 }

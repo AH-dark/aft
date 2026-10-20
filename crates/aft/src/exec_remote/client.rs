@@ -121,9 +121,9 @@ impl ExecRemoteClient {
             .unsubscribe()
             .map_err(Error::Transport)?;
         let point = stream.resume_point().ok_or_else(|| {
-            stream
-                .consumer
-                .recovery("cancel sent before job ID was received; query exec.status")
+            stream.consumer.recovery(
+                "cancel sent before the job ID was received; the job cannot be re-attached",
+            )
         })?;
         self.attach(point).await
     }

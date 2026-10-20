@@ -344,9 +344,7 @@ impl StreamConsumer {
     }
     pub fn finish(&self) -> Result<Verdict, super::Error> {
         self.terminal.clone().ok_or_else(|| {
-            self.recovery(
-                "stream ended without a known terminal; query exec.status and exec.attach",
-            )
+            self.recovery("stream ended without a known terminal record; re-attach to the job")
         })
     }
 }
