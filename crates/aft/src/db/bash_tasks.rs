@@ -98,7 +98,9 @@ pub struct BashTaskRow {
 
 pub fn upsert_bash_task(conn: &Connection, row: &BashTaskRow) -> rusqlite::Result<()> {
     // Acknowledgement can arrive through a different registry or connection
-    // while this snapshot is queued. Once delivered, a task cannot be unacked.
+    // while this snapshot is queued. Snapshots cannot undo it. Only promotion
+    // may reset completion_delivered to false under the task DB fence, creating
+    // a new completion notification.
     conn.execute(
         "INSERT INTO bash_tasks (
             harness, session_id, task_id, project_key, command, cwd, status,

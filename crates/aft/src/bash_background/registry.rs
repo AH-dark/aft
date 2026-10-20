@@ -7523,17 +7523,34 @@ impl BgTaskRegistry {
                     .expect("promotion commit test controller");
             }
             let mut db = DeferredDbWrites::new(self, &task);
-            let mut state = task
-                .lock_state()
-                .map_err(|_| "background task lock poisoned".to_string())?;
-            let mut updated = state.metadata.clone();
-            updated.notify_on_completion = true;
-            updated.completion_delivered = false;
-            self.persist_task_locked(&task, &updated, &mut db)
-                .map_err(|e| format!("failed to promote background task: {e}"))?;
-            state.metadata = updated;
-            task.holds_background_slot.store(true, Ordering::SeqCst);
-            state.metadata.status.is_terminal()
+            with_task_db_fence(session_id, task_id, || {
+                // Foreground tasks start delivered because their reply carries
+                // the result. Promotion creates a new notification obligation;
+                // only this explicit transition may lower the durable bit.
+                if let Some((harness, pool)) = self.db_harness_and_pool_for_task(&task) {
+                    let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+                    conn.execute(
+                        "UPDATE bash_tasks SET completion_delivered = 0
+                         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+                        rusqlite::params![harness, session_id, task_id],
+                    )
+                    .map_err(|e| format!("failed to reset promoted task delivery: {e}"))?;
+                }
+                // SQLite is unlocked before taking task state. Keep the fence
+                // through persistence of the promoted state so an older
+                // foreground snapshot queued in the meantime cannot overwrite it.
+                let mut state = task
+                    .lock_state()
+                    .map_err(|_| "background task lock poisoned".to_string())?;
+                let mut updated = state.metadata.clone();
+                updated.notify_on_completion = true;
+                updated.completion_delivered = false;
+                self.persist_task_locked(&task, &updated, &mut db)
+                    .map_err(|e| format!("failed to promote background task: {e}"))?;
+                state.metadata = updated;
+                task.holds_background_slot.store(true, Ordering::SeqCst);
+                Ok::<_, String>(state.metadata.status.is_terminal())
+            })?
         };
         if terminal_after_promote {
             self.post_terminal_transition(&task, true)?;
@@ -13458,6 +13475,91 @@ mod tests {
         let metadata = read_task(&task.paths.json).unwrap();
         assert!(metadata.notify_on_completion);
         assert!(!metadata.completion_delivered);
+    }
+
+    #[test]
+    fn promotion_reopens_durable_foreground_delivery() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task = lifecycle_running_fixture(&registry, &storage);
+        task.lock_state().unwrap().metadata.completion_delivered = true;
+        registry.write_current_task_row(&task);
+        let row = || {
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task.task_id,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(row().completion_delivered);
+        registry.promote(&task.task_id, "session").unwrap();
+        assert!(row().status == "running");
+        assert!(
+            !row().completion_delivered,
+            "promotion left the task durably delivered"
+        );
+    }
+
+    #[test]
+    fn promotion_resets_delivery_after_pre_promotion_snapshots() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task = lifecycle_running_fixture(&registry, &storage);
+        let task_id = task.task_id.clone();
+        let delivered = || {
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task_id,
+            )
+            .unwrap()
+            .unwrap()
+            .completion_delivered
+        };
+        let mut before = DeferredDbWrites::new(&registry, &task);
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.completion_delivered = true;
+            registry
+                .persist_task_locked(&task, &state.metadata, &mut before)
+                .unwrap();
+        }
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *task.db_write_order.before_fenced_change.lock().unwrap() = Some(Box::new(move || {
+            parked_tx.send(()).unwrap();
+            release_rx.recv_timeout(CHILD_EXIT_LIVENESS_BOUND).unwrap();
+        }));
+        let promoting = {
+            let registry = registry.clone();
+            let task_id = task_id.clone();
+            std::thread::spawn(move || registry.promote(&task_id, "session"))
+        };
+        parked_rx.recv_timeout(CHILD_EXIT_LIVENESS_BOUND).unwrap();
+        assert!(delivered(), "the fence must drain the old delivered row");
+        // The promotion fence holds the flush lock, but has not updated task
+        // metadata. A deferred write can still queue the old foreground snapshot.
+        let mut during = DeferredDbWrites::new(&registry, &task);
+        {
+            let state = task.lock_state().unwrap();
+            registry
+                .persist_task_locked(&task, &state.metadata, &mut during)
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        assert!(promoting.join().unwrap().unwrap());
+        assert!(
+            !delivered(),
+            "promotion must reset the durable delivery bit"
+        );
+        drop(before);
+        drop(during);
+        assert!(!delivered(), "an old foreground snapshot undid promotion");
+        assert!(!task.lock_state().unwrap().metadata.completion_delivered);
     }
 
     #[test]
