@@ -1738,6 +1738,70 @@ mod tests {
         assert_eq!(filtered.changed, expected);
     }
 
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn issue645_fsevents_nested_git_churn_never_reaches_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for name in ["service-a", "service-b"] {
+            let repo = root.join(name);
+            std::fs::create_dir(&repo).unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let matcher = Arc::new(RwLock::new(None));
+        let plan =
+            derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT)).unwrap();
+        let exclusions = watcher_exclusion_paths(&plan.selected);
+        for excluded in [true, false] {
+            let (tx, rx) = mpsc::channel();
+            let paths = if excluded {
+                exclusions.clone()
+            } else {
+                Vec::new()
+            };
+            let stream = FsEventsStream::start(
+                &root,
+                &paths,
+                tx,
+                fs::kFSEventStreamEventIdSinceNow,
+                Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(100));
+            let _ = rx.try_iter().count();
+            for name in ["service-a", "service-b"] {
+                let git = root.join(name).join(".git");
+                for index in 0..64 {
+                    std::fs::write(git.join(format!("churn-{index}")), "churn").unwrap();
+                }
+            }
+            let source = root.join("service-a/source.rs");
+            std::fs::write(&source, "fn visible() {}\n").unwrap();
+            thread::sleep(Duration::from_millis(500));
+            let events = rx.try_iter().map(Result::unwrap).collect::<Vec<_>>();
+            let git_events = events
+                .iter()
+                .flat_map(|event| &event.paths)
+                .filter(|path| path.components().any(|part| part.as_os_str() == ".git"))
+                .count();
+            assert!(
+                events.iter().any(|event| event.paths.contains(&source)),
+                "source-event control missing: {events:?}"
+            );
+            if excluded {
+                assert_eq!(git_events, 0, "metadata reached FSEvents: {events:?}");
+            } else {
+                assert!(git_events > 0, "unexcluded control saw no metadata churn");
+            }
+            drop(stream);
+        }
+    }
+
     /// The install burst that drove a fleet worktree into repeated watcher
     /// overflow, measured live: a `bun install` into
     /// `packages/plugin/node_modules` must deliver nothing, and the control

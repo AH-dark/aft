@@ -1,0 +1,1 @@
+- Reduce watcher overload in folders containing multiple repositories by excluding nested Git metadata, honoring local build manifests, coalescing cancellable refreshes, and moving overflow ignore scans off the tool dispatch thread (issue #645).

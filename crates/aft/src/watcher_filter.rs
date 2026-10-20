@@ -1221,11 +1221,7 @@ thread_local! {
     pub(crate) static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Is this a directory the exclusion walk must never enter or seed by itself?
-///
-/// A repository's own `.git` is seeded deliberately as slot zero; every other
-/// `.git` (submodule, nested checkout) is a large tree with nothing indexable
-/// in it, so the walk stops at the name rather than reading `objects/`.
+/// Git metadata is an exclusion boundary, never a tree to enumerate.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
     path.file_name() == Some(std::ffi::OsStr::new(".git"))
@@ -1514,14 +1510,25 @@ fn derive_exclusion_plan_cancellable(
     /// root, or `None` when the name is not an enabled ecosystem name or sits
     /// below the enumeration bound.
     fn nested_ecosystem_priority(root: &Path, path: &Path, depth: usize) -> Option<usize> {
+        let name = path.file_name()?.to_str()?;
+        if name == ".git" {
+            return Some(0);
+        }
         if depth > WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH {
             return None;
         }
-        let name = path.file_name()?.to_str()?;
-        if name == ".git" {
-            return None;
+        let mut owner = path.parent()?;
+        loop {
+            if let Some(priority) = ecosystem_exclusion_priority(owner, name) {
+                return Some(priority);
+            }
+            // Workspace-level manifests govern descendants too, but a nested
+            // checkout must not inherit an unrelated session root's ecosystem.
+            if owner == root || owner.join(".git").exists() {
+                return None;
+            }
+            owner = owner.parent()?;
         }
-        ecosystem_exclusion_priority(root, name)
     }
 
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -1587,6 +1594,25 @@ fn derive_exclusion_plan_cancellable(
                 continue;
             }
             if exclusion_walk_skips_git_directory(&path) {
+                let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+                let observed_count = observed.get(&relative).copied().unwrap_or_default();
+                admit(
+                    &mut candidates,
+                    Candidate {
+                        path,
+                        relative,
+                        source: if observed_count > 0 {
+                            WatcherExclusionSource::Observed
+                        } else {
+                            WatcherExclusionSource::Ecosystem
+                        },
+                        exists: true,
+                        ecosystem_priority: 0,
+                        observed_count,
+                        size_signal: 0,
+                        gitignore_order: GitignoreOrder::default(),
+                    },
+                );
                 continue;
             }
             let child_depth = depth + 1;
@@ -1837,8 +1863,8 @@ fn derive_exclusion_plan_cancellable(
         .map(|index| candidates[index].relative.clone())
         .collect::<BTreeSet<_>>();
 
-    // The repository's own `.git` keeps slot zero whatever else is known. Every
-    // other `.git` is skipped by the walk, so the relative path names it alone.
+    // Preserve the bound repository's metadata slot; nested repositories compete
+    // for the remaining slots without ever enumerating their metadata trees.
     let is_root_git = |candidate: &Candidate| candidate.relative == Path::new(".git");
     // After an overflow the recorded event volume decides. Ranking a measured
     // directory behind every unobserved ecosystem copy would let a monorepo's
@@ -1963,19 +1989,11 @@ fn derive_exclusion_plan_cancellable(
                 WatcherExclusionSource::Observed | WatcherExclusionSource::External
             )
         {
-            // With inherited coverage the watch walk never descends into an
-            // excluded directory, and it skips every ignored directory anyway,
-            // so a deeper copy of an already selected name buys nothing and a
-            // shallower one is the copy worth naming. On an exact-path backend
-            // the same entry is the bug this rule used to cause: the root copy
-            // covers nothing, so the nested copy doing the writing never gets
-            // a slot.
-            let candidate_depth = candidate.relative.components().count();
-            let nested_copy = selected.iter().any(|selected| {
-                let selected_relative = selected.path.strip_prefix(&root).unwrap_or(&selected.path);
-                selected.path.file_name() == candidate.path.file_name()
-                    && selected_relative.components().count() < candidate_depth
-            });
+            // Only an ancestor exclusion covers this subtree. Equal directory
+            // names in different repositories never cover one another.
+            let nested_copy = selected
+                .iter()
+                .any(|selected| candidate.path.starts_with(&selected.path));
             if nested_copy {
                 // A covered representative needs no slot of its own, so its
                 // reservation is released for whatever ranks next.
@@ -2235,6 +2253,7 @@ struct WatcherFilterThread {
     /// Events the dispatch channel had no room for, oldest first. Changed
     /// paths are merged into one event while they wait; see `hold_event`.
     backlog: VecDeque<WatcherDispatchEvent>,
+    overflow_burst: Option<(RescanReason, u64, Instant, Instant, bool)>,
     #[cfg(test)]
     delay_before_rescan_for_test: Duration,
 }
@@ -2270,13 +2289,26 @@ impl WatcherFilterThread {
             recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
             backlog: VecDeque::new(),
+            overflow_burst: None,
             #[cfg(test)]
             delay_before_rescan_for_test: Duration::ZERO,
         }
     }
 
     fn run(&mut self, raw_rx: mpsc::Receiver<notify::Result<notify::Event>>) {
+        self.run_until_stopped(raw_rx);
+        self.flush_overflow_summary();
+    }
+
+    fn run_until_stopped(&mut self, raw_rx: mpsc::Receiver<notify::Result<notify::Event>>) {
         loop {
+            if self
+                .overflow_burst
+                .as_ref()
+                .is_some_and(|burst| burst.3.elapsed() >= Duration::from_secs(1))
+            {
+                self.flush_overflow_summary();
+            }
             if self.shutdown.load(Ordering::SeqCst) {
                 self.flush_pending();
                 return;
@@ -2311,6 +2343,9 @@ impl WatcherFilterThread {
                         }
 
                         let reason = RescanReason::from_event_info(event.info());
+                        self.config.counters.note_overflow_ignore_relevance(
+                            self.overflow_paths_may_change_ignore(&event.paths),
+                        );
                         let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
                         self.content_only_paths.clear();
@@ -2366,6 +2401,35 @@ impl WatcherFilterThread {
 
     fn project_root_was_deleted(&self) -> bool {
         !self.config.project_root.exists()
+    }
+
+    fn overflow_paths_may_change_ignore(&self, paths: &[PathBuf]) -> bool {
+        if paths.is_empty() {
+            return true;
+        }
+        let metadata = WatcherBatchMetadata::resolve(&self.config);
+        paths.iter().any(|path| {
+            if metadata.can_change_corpus_ignore(&self.config, path) {
+                return true;
+            }
+            if let Ok(relative) = path.strip_prefix(&self.config.project_root) {
+                let mut components = relative.components();
+                while let Some(component) = components.next() {
+                    if component.as_os_str() == ".git" {
+                        // Objects, refs and linked-worktree bookkeeping cannot
+                        // change corpus membership; info/exclude can.
+                        return components
+                            .next()
+                            .is_none_or(|next| next.as_os_str() == "info");
+                    }
+                }
+                if watcher_path_is_high_churn_infra(relative) {
+                    return false;
+                }
+            }
+            // A directory-level loss can hide an ignore file anywhere below it.
+            !path.is_file()
+        })
     }
 
     fn record_recent_paths(&mut self, paths: &[PathBuf]) {
@@ -2427,7 +2491,6 @@ impl WatcherFilterThread {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let root_git = self.config.project_root.join(".git");
         let mut counts = BTreeMap::<String, u64>::new();
         for (path, _) in &self.recent_paths {
             let mut absolute = self.config.project_root.clone();
@@ -2450,7 +2513,7 @@ impl WatcherFilterThread {
                 if is_leaf && !absolute.is_dir() {
                     break;
                 }
-                if absolute == root_git
+                if absolute.file_name() == Some(std::ffi::OsStr::new(".git"))
                     || watcher_directory_is_ignored(matcher.as_deref(), &absolute)
                 {
                     // Recorded with `/` on every platform: the prefix is a
@@ -2480,12 +2543,28 @@ impl WatcherFilterThread {
         prefixes
     }
 
-    fn log_overflow(&self, reason: RescanReason) -> bool {
+    fn log_overflow(&mut self, reason: RescanReason) -> bool {
         let prefixes = self.overflow_prefixes();
         self.config
             .counters
             .set_observed_exclusion_prefixes(self.observed_exclusion_prefixes());
-        let during_rescan = self.config.counters.note_overflow(reason, prefixes.clone());
+        let during_rescan = self.config.counters.note_overflow(reason, prefixes);
+        let now = Instant::now();
+        let burst = self
+            .overflow_burst
+            .get_or_insert((reason, 0, now, now, false));
+        burst.1 += 1;
+        burst.3 = now;
+        burst.4 |= during_rescan;
+        during_rescan
+    }
+
+    fn flush_overflow_summary(&mut self) {
+        let Some((reason, count, first, last, during_rescan)) = self.overflow_burst.take() else {
+            return;
+        };
+        let window_ms = last.saturating_duration_since(first).as_millis();
+        let prefixes = self.overflow_prefixes();
         let backend = self.config.counters.backend_exclusions();
         let render_paths = |paths: &[PathBuf]| {
             paths
@@ -2523,7 +2602,7 @@ impl WatcherFilterThread {
             .map(|depth| depth.to_string())
             .unwrap_or_else(|| "unavailable".to_string());
         let line = format!(
-            "watcher overflow: reason={} root={} exclusions=[{}] candidates_dropped=[{}] matcher_generation={} top_prefixes=[{}] ring_span_ms={} queue_depth={} rescan_in_progress={}",
+            "watcher overflow: reason={} root={} exclusions=[{}] candidates_dropped=[{}] matcher_generation={} top_prefixes=[{}] ring_span_ms={} queue_depth={} rescan_in_progress={} count={} window_ms={}",
             reason.as_str(),
             self.config.project_root.display(),
             exclusions,
@@ -2532,10 +2611,11 @@ impl WatcherFilterThread {
             prefixes,
             span_ms,
             queue_depth,
-            during_rescan
+            during_rescan,
+            count,
+            window_ms
         );
         emit_watcher_overflow_log(line);
-        during_rescan
     }
 
     #[cfg(test)]
@@ -2594,7 +2674,16 @@ impl WatcherFilterThread {
     }
 
     fn next_recv_timeout(&self) -> Duration {
-        let mut timeout = ROOT_DELETED_CHECK_INTERVAL;
+        // Wake in time to flush a pending overflow summary, and sooner while
+        // dispatch-backlogged events are waiting for room.
+        let mut timeout =
+            self.overflow_burst
+                .as_ref()
+                .map_or(ROOT_DELETED_CHECK_INTERVAL, |burst| {
+                    (burst.3 + Duration::from_secs(1))
+                        .saturating_duration_since(Instant::now())
+                        .min(ROOT_DELETED_CHECK_INTERVAL)
+                });
         if !self.backlog.is_empty() {
             timeout = timeout.min(DISPATCH_BACKLOG_RETRY_INTERVAL);
         }
@@ -2993,6 +3082,138 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue645_nested_git_and_local_manifests_get_kernel_exclusions() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for repo in ["service-a", "group/service-b"] {
+            let repo = root.join(repo);
+            std::fs::create_dir_all(repo.join(".git/worktrees/linked")).unwrap();
+            std::fs::create_dir_all(repo.join("node_modules")).unwrap();
+            std::fs::write(repo.join("package.json"), "{}").unwrap();
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        builder.add_line(None, "node_modules/").unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let plan = derive_exclusion_plan(&root, &matcher, None, WatcherExclusionCoverage::Subtree);
+        for repo in ["service-a", "group/service-b"] {
+            for name in [".git", "node_modules"] {
+                let path = root.join(repo).join(name);
+                let candidate = plan
+                    .selected
+                    .iter()
+                    .find(|entry| entry.path == path)
+                    .unwrap_or_else(|| panic!("missing kernel exclusion: {}", path.display()));
+                assert_eq!(candidate.source, WatcherExclusionSource::Ecosystem);
+            }
+        }
+    }
+
+    #[test]
+    fn issue645_ecosystem_gates_use_the_containing_repository() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for name in ["node_modules", "target", ".venv"] {
+            std::fs::create_dir_all(root.join("repo").join(name)).unwrap();
+        }
+        for manifest in ["package.json", "Cargo.toml", "pyproject.toml"] {
+            std::fs::write(root.join("repo").join(manifest), "").unwrap();
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        for name in ["node_modules/", "target/", ".venv/"] {
+            builder.add_line(None, name).unwrap();
+        }
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let plan = derive_exclusion_plan(&root, &matcher, None, WatcherExclusionCoverage::Subtree);
+        for name in ["node_modules", "target", ".venv"] {
+            let path = root.join("repo").join(name);
+            let candidate = plan
+                .selected
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap();
+            assert_eq!(
+                candidate.source,
+                WatcherExclusionSource::Ecosystem,
+                "{} needs its local manifest",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn issue645_overflow_burst_logs_one_summary() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (tx, _rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.clone(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        for _ in 0..12 {
+            raw_tx
+                .send(Ok(notify::Event::new(notify::EventKind::Other)
+                    .set_flag(notify::event::Flag::Rescan)))
+                .unwrap();
+        }
+        drop(raw_tx);
+        filter.run(raw_rx);
+        let lines = take_watcher_overflow_logs_for_test()
+            .into_iter()
+            .filter(|line| line.contains(&format!("root={}", root.display())))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "one summary per overflow burst: {lines:?}");
+        assert!(lines[0].contains("count=12"), "{}", lines[0]);
+        assert!(lines[0].contains("window_ms="), "{}", lines[0]);
+    }
+
+    #[test]
+    fn issue645_overflow_ignore_evidence_is_conservative() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (tx, _) = watcher_dispatch_channel();
+        let filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.clone(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        std::fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
+        for path in [
+            "source.rs",
+            "a/.git/objects/pack",
+            "b/.git/worktrees/linked/HEAD",
+            "a/.git/refs/heads/main",
+        ] {
+            assert!(
+                !filter.overflow_paths_may_change_ignore(&[root.join(path)]),
+                "{path}"
+            );
+        }
+        for path in [
+            ".gitignore",
+            "a/.aftignore",
+            "a/.git/info/exclude",
+            "a/.git",
+            "a/src",
+        ] {
+            assert!(
+                filter.overflow_paths_may_change_ignore(&[root.join(path)]),
+                "{path}"
+            );
+        }
+        assert!(filter.overflow_paths_may_change_ignore(&[]));
+    }
+
     #[test]
     fn content_only_batches_preserve_kind_and_topology_dominates_coalescing() {
         use super::*;
@@ -4947,7 +5168,7 @@ mod tests {
     }
 
     #[test]
-    fn same_name_copies_keep_their_own_slot_only_on_exact_path_backends() {
+    fn same_name_copies_in_distinct_subtrees_need_their_own_slots() {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
         std::fs::write(root.path().join(".gitignore"), "node_modules\n").unwrap();
@@ -4986,11 +5207,11 @@ mod tests {
                 .chain(nested.iter().cloned())
                 .collect::<Vec<_>>()
         );
-        // Where an exclusion is inherited, the walk that adds watches stops at
-        // the root copy, so naming the copies below it would waste slots.
+        // These are siblings, not descendants of the root node_modules. Even
+        // a subtree backend must exclude each one independently.
         assert_eq!(
             watcher_exclusion_paths(&subtree.selected),
-            vec![canonical_root.join("node_modules")]
+            watcher_exclusion_paths(&exact_path.selected)
         );
     }
 

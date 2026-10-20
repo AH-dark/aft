@@ -1414,6 +1414,60 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn issue645_inotify_nested_git_churn_never_reaches_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for name in ["service-a", "service-b"] {
+            let repo = root.join(name);
+            std::fs::create_dir(&repo).unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        assert_eq!(
+            watcher.watched_directory_count(),
+            3,
+            "metadata trees must have no inotify watches"
+        );
+        for name in ["service-a", "service-b"] {
+            let churn = root.join(name).join(".git/worktrees/linked");
+            std::fs::create_dir_all(&churn).unwrap();
+            for index in 0..64 {
+                std::fs::write(churn.join(format!("entry-{index}")), "churn").unwrap();
+            }
+            std::fs::remove_dir_all(churn).unwrap();
+        }
+        let source = root.join("service-a/source.rs");
+        std::fs::write(&source, "fn visible() {}\n").unwrap();
+        let mut saw_source = false;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while let Ok(event) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            let event = event.unwrap();
+            assert!(
+                !event
+                    .paths
+                    .iter()
+                    .any(|path| path.components().any(|part| part.as_os_str() == ".git")),
+                "git churn reached drain: {event:?}"
+            );
+            saw_source |= event.paths.contains(&source);
+        }
+        assert!(saw_source, "positive source-event control must reach drain");
+    }
+
+    #[test]
     fn inotify_walk_does_not_watch_ignored_subtrees() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("target/nested")).unwrap();
