@@ -156,6 +156,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         .chain(&profile.deny_prefixes)
         .chain(&profile.read_deny)
         .chain(&profile.data_policy.deny)
+        .chain(&profile.keychain_deny)
         .flat_map(|path| path.ancestors().skip(1))
         .collect::<std::collections::BTreeSet<_>>();
     for ancestor in ancestors {
@@ -531,6 +532,18 @@ mod tests {
                     "missing final keychain file deny: {source}"
                 );
                 assert!(source.find(&deny).unwrap() > source.rfind("(allow ").unwrap());
+                if mode == aft::config::SandboxMode::Relaxed {
+                    for ancestor in path.ancestors().skip(1) {
+                        let unlink_deny = format!(
+                            "(deny file-write-unlink (literal \"{}\"))",
+                            escape_path(ancestor).unwrap()
+                        );
+                        assert!(
+                            source.contains(&unlink_deny),
+                            "keychain ancestor can be renamed: {source}"
+                        );
+                    }
+                }
             }
         }
     }
