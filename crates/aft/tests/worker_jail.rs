@@ -1035,7 +1035,10 @@ async fn off_worker_keeps_private_temp_and_governance_without_os_confinement() {
     assert!(reply.contains("OFF_2"), "{reply}");
     assert!(reply.contains("off-secret-readable"), "{reply}");
     assert!(reply.contains("/tmp/aft-w/"), "{reply}");
-    assert!(!reply.contains("unenforced=["), "{reply}");
+    assert!(
+        reply.contains("profile=off unenforced=[operator gh fence: unenforced"),
+        "{reply}"
+    );
     assert_eq!(
         std::fs::read_to_string(jail.base.join("sibling/off-write")).unwrap(),
         "off"

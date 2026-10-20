@@ -159,8 +159,9 @@ pub enum WorkerGhFence {
     /// The jail denies reads and writes of every canary file, including the
     /// account-home anchor. The launcher verifies each deny before execution.
     Canary { paths: Vec<PathBuf> },
-    /// The backend grants all of `/` (relaxed Linux), so no deny is enforced,
-    /// including the canary deny. The launcher reports the fence as unenforced.
+    /// This Unix worker profile has no canary deny (off or relaxed Linux). The
+    /// launcher reports the missing fence; Windows reports its lack of a native
+    /// backend separately through spawn diagnostics.
     Unenforced,
 }
 

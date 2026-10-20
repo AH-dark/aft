@@ -12531,14 +12531,16 @@ fn write_unenforced_sandbox_warning(
     handles: &TaskIoHandles,
     artifact: TaskArtifact,
 ) -> Result<(), String> {
-    if !matches!(plan, SpawnPlan::RelaxedUnenforced) {
-        return Ok(());
-    }
+    let warning = match plan {
+        SpawnPlan::RelaxedUnenforced => "sandbox: profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced] (Windows has no native sandbox backend; command runs with full user rights)\n",
+        SpawnPlan::Unsandboxed if crate::sandbox_spawn::worker_jail_active() => "sandbox: profile=off unenforced=[operator gh fence: unenforced (no OS sandbox)]\n",
+        _ => return Ok(()),
+    };
     // Write before the child starts, using the same capture handle offset so
     // both pipes and PTYs retain the warning alongside the command's output.
     handles
         .clone_file(artifact)
-        .and_then(|mut file| file.write_all(b"sandbox: profile=relaxed unenforced=[all filesystem read/write denies] (Windows has no native sandbox backend; command runs with full user rights)\n"))
+        .and_then(|mut file| file.write_all(warning.as_bytes()))
         .map_err(|error| format!("failed to report unenforced sandbox denies: {error}"))
 }
 
@@ -13076,7 +13078,7 @@ mod tests {
                 .unwrap();
             let output = std::fs::read_to_string(path).unwrap();
             assert!(
-                output.contains("profile=relaxed unenforced=[all filesystem read/write denies]"),
+                output.contains("profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"),
                 "{output}"
             );
             assert!(
@@ -13084,6 +13086,31 @@ mod tests {
                 "{output}"
             );
             assert!(output.ends_with("child-output\n"), "{output}");
+        }
+    }
+
+    #[test]
+    fn off_worker_gh_warning_survives_pipe_and_pty_capture() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, artifact) in [
+            (BgMode::Pipes, TaskArtifact::Stderr),
+            (BgMode::Pty, TaskArtifact::Pty),
+        ] {
+            let task = allocate_task_layout(root.path(), "off-worker-warning").unwrap();
+            let handles = TaskIoHandles::create(&task, mode.clone(), false).unwrap();
+            crate::sandbox_spawn::with_worker_jail(true, || {
+                write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact)
+                    .unwrap()
+            });
+            let path = match mode {
+                BgMode::Pipes => &task.paths.stderr,
+                BgMode::Pty => &task.paths.pty,
+            };
+            let output = std::fs::read_to_string(path).unwrap();
+            assert!(
+                output.contains("profile=off unenforced=[operator gh fence: unenforced"),
+                "{output}"
+            );
         }
     }
     use std::collections::HashMap;

@@ -1597,6 +1597,10 @@ fn build_native_profile(
         return match result {
             Ok(mut profile) => {
                 profile.mode = SandboxMode::Off;
+                if worker_jail_active() {
+                    profile.worker_gh_fence =
+                        Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
+                }
                 Ok(profile)
             }
             Err(error) => {

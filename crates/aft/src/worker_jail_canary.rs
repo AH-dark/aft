@@ -18,6 +18,12 @@
 //!
 //! Head shells (the operator's own agent) never deny the canary; their profiles
 //! grant reading it, so a sandboxed head keeps v19 passthrough.
+//!
+//! The fence applies only to strict Linux/macOS and relaxed macOS workers.
+//! Off workers, relaxed Linux and Windows have no proven canary fence; their
+//! ticket/environment checks alone do not survive a worker clearing its env.
+//! A canary gates this shim, not a directly executed upstream gh or credential
+//! services such as the macOS keychain. Those need independent confinement.
 
 use std::path::{Path, PathBuf};
 

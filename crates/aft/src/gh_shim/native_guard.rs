@@ -31,8 +31,9 @@ impl ShellSignals {
 /// the account's default AFT storage (see `crate::worker_jail_canary`). The
 /// deny is enforced by Landlock or Seatbelt, inherited across exec and
 /// irremovable, so clearing the environment or unsetting the ticket cannot
-/// make a jailed worker look like a head. Relaxed Linux grants all of `/` and
-/// cannot deny the canary; there the fence is reported as unenforced.
+/// make a fenced worker look like a head. Off workers, relaxed Linux and Windows
+/// have no proven canary fence and report it as unenforced. This gates the shim,
+/// not direct upstream execution or credential-service access.
 pub(super) fn native_sandbox_active() -> bool {
     let jailed = crate::worker_jail_canary::inside_worker_jail();
     // Support aid: show what the canary probe saw. It never changes the

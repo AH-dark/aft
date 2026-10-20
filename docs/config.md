@@ -583,6 +583,12 @@ These are the defaults. Stamped Alfonso workers use `worker`; heads, unstamped r
 
 Sandboxed commands receive `/private/tmp/aft-w/<hex>` on macOS (`/tmp/aft-w/<hex>` on Linux) through `TMPDIR`, `TMP` and `TEMP`. The AFT-managed `gh` shim (the command wrapper that routes GitHub operations through AFT's permission checks) stays first on the command PATH, Git co-author hooks still run, and child environments do not inherit daemon credentials.
 
+**Worker `gh` fence:** strict Linux/macOS and relaxed macOS worker shells deny a canary under the account home returned by the password database, and under the daemon's `HOME` when its canonical path differs. Launch refuses if the password-database account home cannot be resolved or its canary cannot be prepared, a grant overlaps a canary, or any canary remains readable after sandbox application. Head shells retain read access to both canaries. macOS permits only marker/ancestor metadata for the probe, not data reads or writes.
+
+**No proven fence on `off`, relaxed Linux, or Windows.** These modes report `operator gh fence: unenforced` in their unenforced list. Their ticket and worker environment markers still refuse native `gh` while present, but clearing the environment can remove that protection. Do not treat these modes as an environment-proof worker boundary. An outer sandbox alone does not identify a worker. If it also denies the same canary file, the shim may mistake that denial for AFT's worker-jail fence.
+
+The canary governs dispatch through the shim only. Running the upstream `gh` binary directly bypasses the shim. Credential files, environment tokens, keychain services, and requests to launch commands through host services (for example, launchd or systemd) require independent sandbox policies. Denying keychain files alone does not prove that login-keychain service queries are blocked.
+
 **macOS setuid limitation:** Seatbelt refuses to execute setuid tools, including `/bin/ps` and `top`, even with an allow-default profile. `pgrep` and `pkill` work in sandboxed shells. Select `off` when a command genuinely needs `ps`; AFT does not add an unsandboxed-exec exception or copy platform binaries to evade this restriction.
 
 ### Relaxed deny list (macOS)
@@ -614,7 +620,7 @@ Linux `strict` retains the existing Landlock allowlist and requires ABI V3 or ne
 - Project reads may be split around nested denies using children present at launch. Newly created root-level files may remain unreadable until the next command recomputes grants. Shared `/tmp` and sensitive runtime trees are not granted by strict.
 - `/proc` is readable for tooling. With Yama `ptrace_scope=0`, another same-UID process can expose environment or memory; missing/unreadable Yama configuration produces a conservative exposure warning.
 
-Windows has no OS sandbox backend. `relaxed` runs with full user rights and reports `profile=relaxed unenforced=[all filesystem read/write denies]` in captured output, including PTY output. Like Linux relaxed, it is **not** a secret or write boundary. `strict` refuses execution with `sandbox_unavailable`: `sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux`. Untrusted and MCP routes are forced strict and therefore refuse. `off` runs without an OS sandbox or an unenforced-denies warning.
+Windows has no OS sandbox backend. `relaxed` runs with full user rights and reports `profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced]` in captured output, including PTY output. Like Linux relaxed, it is **not** a secret or write boundary. `strict` refuses execution with `sandbox_unavailable`: `sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux`. Untrusted and MCP routes are forced strict and therefore refuse. `off` runs without an OS sandbox; worker commands report the unenforced `gh` fence, while head commands remain quiet.
 
 ### Retired `sandbox.enabled`
 

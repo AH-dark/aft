@@ -328,6 +328,7 @@ fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
 #[cfg(target_os = "macos")]
 fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     if profile.mode == aft::config::SandboxMode::Off {
+        emit_off_worker_gh_warning(profile);
         return Ok(());
     }
     seatbelt::apply(profile).map_err(|error| {
@@ -352,6 +353,7 @@ fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), SandboxLaunchE
 #[cfg(target_os = "linux")]
 fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     if profile.mode == aft::config::SandboxMode::Off {
+        emit_off_worker_gh_warning(profile);
         return Ok(());
     }
     let applied = landlock_backend::apply(profile).map_err(|error| {
@@ -359,6 +361,13 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     })?;
     emit_linux_warning(profile, applied);
     verify_worker_gh_fence(profile)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn emit_off_worker_gh_warning(profile: &SandboxProfile) {
+    if profile.worker_gh_fence == Some(aft::sandbox_profile::WorkerGhFence::Unenforced) {
+        eprintln!("sandbox-launch: profile=off unenforced=[operator gh fence: unenforced (no OS sandbox)]");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -516,7 +525,7 @@ fn print_support() -> Result<(), SandboxLaunchError> {
         "platform": "windows",
         "supported": false,
         "backend": null,
-        "unenforced": ["sccache_server_unblockable_without_native_sandbox"]
+        "unenforced": ["sccache_server_unblockable_without_native_sandbox", "operator_gh_fence_unenforced"]
     }))
 }
 
