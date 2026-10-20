@@ -127,10 +127,16 @@ fn sweep_planes_bounded(
     cancelled: &dyn Fn() -> bool,
     planes: &[BlobPlane],
 ) -> Result<SweepReport, SweepError> {
+    // V1 has no reference-epoch handoff, so sweep.lock must exclude pin admission
+    // throughout marking, including pins from older binaries. A pending bind
+    // cancels maintenance instead of waiting behind the whole mark pass.
+    let cancelled_for_bind =
+        || cancelled() || crate::storage_retention::bind_pending(request.storage);
     let control = SweepControl {
         deadline: Instant::now() + Duration::from_secs(5),
-        cancelled,
+        cancelled: &cancelled_for_bind,
     };
+    control.check()?;
     let _barrier = crate::storage_retention::barrier(request.storage)?;
     let mut report = SweepReport::default();
     let mut references = request.references.retained_keys.clone();
@@ -496,6 +502,31 @@ mod storage_retention_tests {
         assert_eq!(report.deleted_blobs, 2);
         assert_eq!(report.deleted_bytes, 8);
         assert_eq!(report.retained_bytes, 4);
+    }
+
+    #[test]
+    fn storage_retention_blob_gc_yields_to_waiting_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        let _pending = crate::fs_lock::try_acquire(
+            &temp.path().join("retention/bind-pending.lock"),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let error = sweep(SweepRequest {
+            storage: temp.path(),
+            family: "family",
+            view_dir: &temp.path().join("view"),
+            byte_budget: 1024,
+            now_ms: BLOB_AGE_FLOOR_MS + 1,
+            references: SweepReferences::default(),
+        })
+        .unwrap_err();
+        assert!(matches!(error, SweepError::Io(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "GC I/O error: blob sweep cancelled or deadline reached"
+        );
     }
 
     #[test]
