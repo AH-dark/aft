@@ -1863,7 +1863,7 @@ fn build_native_profile(
 
 /// Check the final worker-jail profile against its gh-shim canary before the
 /// launch: the canary directory must be denied for reads and writes, and no
-/// read or write grant may cover it or one of its ancestors. A grant over an
+/// read or write grant may overlap it, including the canary file. A grant over an
 /// ancestor would let a worker read the canary (Landlock grants are whole
 /// subtrees) or rename a directory above it. Any such profile is refused.
 #[cfg(unix)]
@@ -1901,7 +1901,7 @@ fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
         if let Some(grant) = read_grants
             .map(PathBuf::as_path)
             .chain(write_grants.iter().map(PathBuf::as_path))
-            .find(|grant| covers(grant))
+            .find(|grant| dir.starts_with(grant) || grant.starts_with(dir))
         {
             return Err(format!(
             "worker jail grant {} covers its gh-shim canary {}; refusing to start an unfenced worker shell",
@@ -10208,5 +10208,32 @@ mod worker_gh_fence_tests {
         assert!(verify_worker_gh_fence(&profile).is_err());
         profile.write_deny.push(other);
         assert!(verify_worker_gh_fence(&profile).is_ok());
+    }
+
+    #[test]
+    fn file_directory_and_ancestor_grants_refuse_worker_gh_fence() {
+        let dir = Path::new(CANARY);
+        for grant in [
+            dir.join("canary"),
+            dir.to_path_buf(),
+            dir.parent().unwrap().into(),
+        ] {
+            for kind in 0..6 {
+                let mut profile = fenced_profile(dir);
+                match kind {
+                    0 => profile.read_allow.push(grant.clone()),
+                    1 => profile.data_policy.read_allow.push(grant.clone()),
+                    2 => profile.writable_roots.push(grant.clone()),
+                    3 => profile.writable_files.push(grant.clone()),
+                    4 => profile.data_policy.write_allow.push(grant.clone()),
+                    _ => profile.data_policy.session_task_read_dir = Some(grant.clone()),
+                }
+                assert!(
+                    verify_worker_gh_fence(&profile).is_err(),
+                    "grant {kind}: {}",
+                    grant.display()
+                );
+            }
+        }
     }
 }
