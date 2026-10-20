@@ -163,8 +163,10 @@ async fn worker_jail_keychain_build_and_tls_compatibility() {
         assert!(reply.contains("1 passed"), "{profile}: {reply}");
         assert!(reply.contains("LINKED_BINARY_OK"), "{profile}: {reply}");
         assert!(reply.contains("TEST_2"), "{profile}: {reply}");
+        // Fetch into an independent repository: the linked main repository's
+        // shallow metadata is intentionally read-only to workers.
         let reply = jail.bash(
-            "git -c credential.helper= fetch --depth=1 https://github.com/octocat/Hello-World.git HEAD && echo FETCH_$((1+1))",
+                "fetch_repo=$(mktemp -d \"$TMPDIR/https-fetch.XXXXXX\") && git init -q \"$fetch_repo\" && git -C \"$fetch_repo\" -c credential.helper= fetch --depth=1 https://github.com/octocat/Hello-World.git HEAD && echo FETCH_$((1+1))",
         ).await;
         assert!(reply.contains("FETCH_2"), "{profile}: {reply}");
         let reply = jail
