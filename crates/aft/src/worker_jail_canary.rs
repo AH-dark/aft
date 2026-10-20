@@ -103,6 +103,43 @@ pub fn prepare(home: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot canonicalize worker-jail canary: {error}"))
 }
 
+/// Fence the password-database home even when the daemon uses a different HOME.
+/// Head shells retain read access to both canaries; a failed repair is non-fatal
+/// for heads so a missing canary cannot block an operator shell.
+#[cfg(unix)]
+pub fn prepare_homes(daemon_home: &Path, fenced: bool) -> Result<Vec<PathBuf>, String> {
+    prepare_homes_with_account(
+        daemon_home,
+        crate::production_storage::account_home(),
+        fenced,
+    )
+}
+
+#[cfg(unix)]
+fn prepare_homes_with_account(
+    daemon_home: &Path,
+    account: std::io::Result<PathBuf>,
+    fenced: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let mut homes = match account {
+        Ok(home) => vec![home],
+        Err(error) if fenced => {
+            return Err(format!("cannot resolve worker-jail account home: {error}"))
+        }
+        Err(_) => Vec::new(),
+    };
+    homes.push(daemon_home.to_path_buf());
+    let mut dirs = Vec::new();
+    for home in homes {
+        match prepare(&home) {
+            Ok(dir) if !dirs.contains(&dir) => dirs.push(dir),
+            Err(error) if fenced => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(dirs)
+}
+
 /// What the current process may do with one canary path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanaryAccess {
@@ -402,6 +439,47 @@ mod tests {
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn distinct_account_and_daemon_homes_are_prepared_for_workers_and_heads() {
+        let account = tempfile::tempdir().unwrap();
+        let daemon = tempfile::tempdir().unwrap();
+        for fenced in [true, false] {
+            let dirs = prepare_homes_with_account(daemon.path(), Ok(account.path().into()), fenced)
+                .unwrap();
+            assert_eq!(
+                dirs,
+                vec![
+                    dir_for_home(account.path()).canonicalize().unwrap(),
+                    dir_for_home(daemon.path()).canonicalize().unwrap()
+                ]
+            );
+        }
+        let dirs =
+            prepare_homes_with_account(account.path(), Ok(account.path().into()), true).unwrap();
+        assert_eq!(dirs.len(), 1);
+    }
+
+    #[test]
+    fn missing_account_home_refuses_fenced_workers_but_not_heads() {
+        let daemon = tempfile::tempdir().unwrap();
+        assert!(prepare_homes_with_account(
+            daemon.path(),
+            Err(std::io::Error::other("no passwd entry")),
+            true
+        )
+        .is_err());
+        assert_eq!(
+            prepare_homes_with_account(
+                daemon.path(),
+                Err(std::io::Error::other("no passwd entry")),
+                false
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[test]

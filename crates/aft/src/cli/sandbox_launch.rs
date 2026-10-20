@@ -340,9 +340,11 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 /// shim could not tell the worker from a head and the shell must not start.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
-    if let Some(aft::sandbox_profile::WorkerGhFence::Canary { path }) = &profile.worker_gh_fence {
-        aft::worker_jail_canary::verify_denied_after_apply(path)
-            .map_err(SandboxLaunchError::unavailable)?;
+    if let Some(aft::sandbox_profile::WorkerGhFence::Canary { paths }) = &profile.worker_gh_fence {
+        for path in paths {
+            aft::worker_jail_canary::verify_denied_after_apply(path)
+                .map_err(SandboxLaunchError::unavailable)?;
+        }
     }
     Ok(())
 }

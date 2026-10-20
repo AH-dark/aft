@@ -1214,6 +1214,20 @@ async fn worker_jail_fences_operator_gh_and_its_canary_resists_tampering() {
     assert!(!dir.join("new").exists());
 }
 
+/// The daemon's temporary HOME is not the account home that a cleared shim uses.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_account_home_anchor_survives_replaced_or_missing_home() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let reply = jail.bash("env -i PATH=\"$PATH\" gh version; echo NO_HOME_EXIT=$?; env -i HOME=/nonexistent PATH=\"$PATH\" gh version; echo WRONG_HOME_EXIT=$?").await;
+    assert!(reply.contains("NO_HOME_EXIT=86"), "{reply}");
+    assert!(reply.contains("WRONG_HOME_EXIT=86"), "{reply}");
+    assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
+}
+
 /// The canary sits in the account's default storage, so a configured storage
 /// root elsewhere still leaves it denied and the fence in place.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

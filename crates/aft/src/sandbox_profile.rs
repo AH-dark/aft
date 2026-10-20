@@ -156,9 +156,9 @@ pub struct SandboxProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerGhFence {
-    /// The jail denies reads and writes of this canary file. The launcher
-    /// refuses to start the shell unless the applied jail denies it.
-    Canary { path: PathBuf },
+    /// The jail denies reads and writes of every canary file, including the
+    /// account-home anchor. The launcher verifies each deny before execution.
+    Canary { paths: Vec<PathBuf> },
     /// The backend grants all of `/` (relaxed Linux), so no deny is enforced,
     /// including the canary deny. The launcher reports the fence as unenforced.
     Unenforced,
@@ -281,14 +281,26 @@ impl SandboxProfile {
             worker_gh_fence: match self.worker_gh_fence {
                 // The canary must exist when the jail is applied; a missing one
                 // refuses the launch here rather than starting unfenced.
-                Some(WorkerGhFence::Canary { path }) => Some(WorkerGhFence::Canary {
-                    path: path.canonicalize().map_err(|error| {
-                        SandboxProfileError::new(format!(
-                            "worker-jail canary {} is unavailable: {error}",
-                            path.display()
-                        ))
-                    })?,
-                }),
+                Some(WorkerGhFence::Canary { paths }) => {
+                    if paths.is_empty() {
+                        return Err(SandboxProfileError::new(
+                            "worker-jail canary paths are empty",
+                        ));
+                    }
+                    Some(WorkerGhFence::Canary {
+                        paths: paths
+                            .into_iter()
+                            .map(|path| {
+                                path.canonicalize().map_err(|error| {
+                                    SandboxProfileError::new(format!(
+                                        "worker-jail canary {} is unavailable: {error}",
+                                        path.display()
+                                    ))
+                                })
+                            })
+                            .collect::<Result<_, _>>()?,
+                    })
+                }
                 other => other,
             },
         })
