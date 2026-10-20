@@ -39,8 +39,8 @@ use crate::lsp::typescript_project::{
     unservable_typescript_reason, ProjectTypeScript, NATIVE_SERVER_INFO_NAME,
 };
 use crate::lsp::LspError;
-use crate::slog_error;
 use crate::slog_info;
+use crate::{slog_error, slog_warn};
 
 #[cfg(test)]
 #[path = "applicability_walk_tests.rs"]
@@ -4490,7 +4490,7 @@ impl LspManager {
                         Ok(()) => outcome.graceful += 1,
                         Err(err) => {
                             outcome.forced += 1;
-                            slog_error!("error shutting down {:?}: {}", key, err);
+                            Self::log_shutdown_error(&key, &err);
                         }
                     }
                 }
@@ -4571,12 +4571,24 @@ impl LspManager {
             .spawn(move || {
                 for (key, mut client) in clients {
                     if let Err(err) = client.shutdown_for_idle_reap() {
-                        slog_error!("error shutting down {:?}: {}", key, err);
+                        Self::log_shutdown_error(&key, &err);
                     }
                 }
             });
         if let Err(err) = spawn_result {
             slog_error!("failed to spawn idle LSP reap thread: {err}");
+        }
+    }
+
+    fn log_shutdown_error(key: &ServerKey, error: &LspError) {
+        match error {
+            LspError::Timeout(message)
+                if message.contains("; did not exit within ")
+                    && message.ends_with("; killed and reaped") =>
+            {
+                slog_warn!("LSP server shutdown {:?}: {}", key, message);
+            }
+            _ => slog_error!("error shutting down {:?}: {}", key, error),
         }
     }
 
@@ -9350,6 +9362,115 @@ mod rust_initialization_options_tests {
         assert_eq!(
             initialization_options_for_spawn(&def, source, root, &config).unwrap(),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_reap_shutdown_log_tests {
+    #[cfg(unix)]
+    use super::{LspChildRegistry, LspClient};
+    use super::{LspManager, ServerKey, ServerKind};
+    use crate::lsp::LspError;
+    #[cfg(unix)]
+    use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[test]
+    fn routine_log_level_reaped_shutdown_timeout_is_warn_only() {
+        let key = ServerKey {
+            kind: ServerKind::Biome,
+            root: PathBuf::from("/worker-checkout"),
+        };
+        let reaped_timeout = LspError::Timeout(
+            "timed out waiting for Biome to exit; did not exit within 5000ms; killed and reaped"
+                .to_string(),
+        );
+        let request_timeout = LspError::Timeout("shutdown request timed out".to_string());
+
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            LspManager::log_shutdown_error(&key, &reaped_timeout);
+            LspManager::log_shutdown_error(&key, &request_timeout);
+        });
+
+        assert_eq!(lines.len(), 2, "captured shutdown errors: {lines:?}");
+        assert!(lines[0].starts_with("WARN "), "{}", lines[0]);
+        assert!(lines[0].contains("did not exit within 5000ms; killed and reaped"));
+        assert!(lines[0].contains("/worker-checkout"), "{}", lines[0]);
+        assert!(lines[1].starts_with("ERROR "), "{}", lines[1]);
+        assert!(
+            lines[1].contains("shutdown request timed out"),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routine_log_level_uses_real_killed_and_reaped_shutdown_timeout() {
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let registry = LspChildRegistry::new();
+        let temp = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            raise SystemExit(0)
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    request = json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+    if request.get("method") == "shutdown":
+        body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": None}).encode()
+        sys.stdout.buffer.write(("Content-Length: %d\r\n\r\n" % len(body)).encode() + body)
+        sys.stdout.buffer.flush()
+"#;
+        let client = LspClient::spawn(
+            ServerKind::Biome,
+            temp.path().to_path_buf(),
+            Path::new("python3"),
+            &["-u".into(), "-c".into(), script.into()],
+            &HashMap::new(),
+            event_tx,
+            registry.clone(),
+        )
+        .expect("spawn shutdown stand-in");
+        let pid = client.child_pid();
+        let key = ServerKey {
+            kind: ServerKind::Biome,
+            root: temp.path().to_path_buf(),
+        };
+        assert!(registry.pids().contains(&pid));
+
+        let (outcome, lines) = crate::logging::capture_log_lines(|| {
+            LspManager::shutdown_all_clients(
+                vec![(key, client)],
+                registry.clone(),
+                Duration::from_secs(7),
+                false,
+            )
+        });
+
+        assert_eq!(outcome.forced, 1);
+        assert_eq!(outcome.unreaped, 0);
+        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!registry.pids().contains(&pid));
+        assert_eq!(lines.len(), 2, "captured shutdown errors: {lines:?}");
+        assert!(lines[0].starts_with("WARN "), "{}", lines[0]);
+        assert!(lines[0].contains("did not exit within 5000ms; killed and reaped"));
+        assert!(lines[0].contains(&temp.path().display().to_string()));
+        assert!(
+            lines[1].starts_with("INFO lsp shutdown_all:"),
+            "{}",
+            lines[1]
         );
     }
 }
