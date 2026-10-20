@@ -15349,6 +15349,12 @@ mod tests {
         );
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
+        // Windows cannot delete the project while it is a child's cwd. The fake
+        // moves outside it before initialization, without changing its LSP root.
+        ctx.lsp().set_extra_env(
+            "AFT_FAKE_LSP_CWD",
+            &root.as_path().parent().unwrap().to_string_lossy(),
+        );
         assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let pids = ctx.lsp_child_registry().pids();

@@ -46,9 +46,11 @@ fn resident_chunk_shortcut_matches_store_and_full_rebuild() {
                 .unwrap(),
         );
         let run = arena.get(&key).unwrap();
+        // Chunk text includes the platform-native relative path, so use the same
+        // path representation as a normal index build.
         let chunk = crate::semantic_index::chunk_view_file(
             root.path(),
-            Path::new("src/large.rs"),
+            &Path::new("src").join("large.rs"),
             edited.as_bytes(),
             plane.producer.caps,
         )
@@ -80,9 +82,10 @@ fn legacy_file_vectors_never_seed_chunk_shortcuts() {
     let plane = new_plane(storage.path(), "model-a");
     let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
     let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+    // Seed the same native-path chunk identities that a full build would persist.
     let chunks = crate::semantic_index::chunk_view_file(
         root.path(),
-        Path::new("src/large.rs"),
+        &Path::new("src").join("large.rs"),
         source.as_bytes(),
         plane.producer.caps,
     )

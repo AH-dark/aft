@@ -4386,25 +4386,37 @@ mod tests {
         let (_absent_dir, absent_root) = test_root("health-stale-absent");
         let absent_ctx = test_ctx();
         install_resident_stale_callgraph(&absent_ctx, &absent_root, "absent.ts", true);
-        assert!(executor.register_actor(absent_root.clone(), absent_ctx));
+        assert!(executor.register_actor(absent_root.clone(), absent_ctx.clone()));
         let (_existing_dir, existing_root) = test_root("health-stale-existing");
         let existing_ctx = test_ctx();
         install_resident_stale_callgraph(&existing_ctx, &existing_root, "existing.ts", false);
-        assert!(executor.register_actor(existing_root.clone(), existing_ctx));
+        assert!(executor.register_actor(existing_root.clone(), existing_ctx.clone()));
 
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &App::default_shared(),
-        );
-        let metrics = report.metrics.expect("health metrics");
+        // Make response-budget pressure deterministic instead of depending on
+        // process-wide telemetry contributed by concurrently running tests.
+        for ctx in [&absent_ctx, &existing_ctx] {
+            *ctx.semantic_index_status().write().unwrap() =
+                crate::context::SemanticIndexStatus::Building {
+                    stage: "x".repeat(HEALTH_METRICS_BUDGET_BYTES),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                };
+        }
+
+        // Assert the rollup's per-root census before building the byte-budgeted
+        // report; the oversized stages above intentionally make it omit details.
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        cache.refresh_for_test(&executor, &app);
+        let (rollup, _) = cache.snapshot();
+        let metrics = &rollup.metrics;
         let roots = metrics["roots"].as_array().expect("per-root health rows");
         let row_for = |root: &ProjectRootId| {
             roots
                 .iter()
                 .find(|row| row["project_root"] == root.as_path().display().to_string())
-                .expect("root health row")
+                .unwrap_or_else(|| panic!("root health row: {metrics}"))
         };
         let absent = row_for(&absent_root);
         assert_eq!(absent["resident_callgraph_stale_backend_rows"], 1);
@@ -4420,6 +4432,18 @@ mod tests {
             existing["resident_callgraph_unreadable_stale_backend_rows"],
             0
         );
+
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let bounded = report.metrics.expect("bounded health metrics");
+        assert_eq!(bounded["root_count"], 2);
+        assert_eq!(bounded["root_details_omitted"], 2);
+        assert!(bounded["roots"].as_array().unwrap().is_empty());
     }
 
     #[cfg(unix)]

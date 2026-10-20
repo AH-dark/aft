@@ -482,6 +482,11 @@ pub(crate) fn main() -> io::Result<()> {
         println!("aft fake rust-analyzer 1");
         return Ok(());
     }
+    // Change cwd before handling initialize, so its response confirms that
+    // deletion tests can remove the workspace even on Windows.
+    if let Some(cwd) = std::env::var_os("AFT_FAKE_LSP_CWD") {
+        std::env::set_current_dir(cwd)?;
+    }
     // AFT_FAKE_LSP_IGNORE_SIGTERM=1: keep running through SIGTERM, like a
     // server with its own handler that is busy or wedged, so only a kill that
     // cannot be ignored stops it.
