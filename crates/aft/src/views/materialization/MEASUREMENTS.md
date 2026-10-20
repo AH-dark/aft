@@ -917,3 +917,42 @@ Append the four-row latency/CPU table and evaluate the rule separately for each
 row, retaining host-load/phase contention and any publication defects. The
 before report to compare is `target/branch-drill-baseline/out/branch-drill.md`;
 its data table and caveats are also preserved above if target artifacts are swept.
+
+## Incremental method-call dispatch (debug, Linux 8 vCPU runner)
+
+`update_bench` on this repository (`AFT_UPDATE_BENCH_OLD=HEAD~N`, `EDITS=1`,
+`ONLY=edit-1`, `PARITY=1`, `AFT_VIEW_PROFILE=1`): one edited file
+(`crates/aft/tests/list_envelope_core/trailer_grammar_test.rs`) in a 5,408-entry
+manifest. Before is `origin/main` 88c06d5ef; after is this change.
+
+| incremental phase, ms | before | after (quiet run) | after (loaded run) |
+| --- | ---: | ---: | ---: |
+| load bindings/select | 494 | 458 | 1,026 |
+| selected join (ordinary surface replay) | 2,757 (2,020) | 3,748 (1,665) | 5,975 (2,991) |
+| ↳ receiver type targets in the join | — | 1,462 | 1,129 (traces 728) |
+| write bindings + ref/edge emission | 166 | 129 | 187 |
+| method-call pass | 120,714 | 165 | 332 |
+| ↳ decode every blob | 19,360 | 0.4 (1 blob) | 0.7 (1 blob) |
+| ↳ receiver type targets (bind every file) | 86,991 | moved into the join | — |
+| ↳ signature | 1,237 | in load (118) | in load (215) |
+| ↳ resolve sites | 8,668 (312,636 sites) | 2.5 (24 sites) | 5.2 (24 sites) |
+| ↳ write differences | 4,443 | 5.8 | 14.5 |
+| SQLite commit and metadata | ~78 | 1,336 | 1,077 |
+| **wall** | **125.4 s** | **6.1 s** | **9.1 s** |
+
+The method-call pass now keeps each file's resolver facts, sites and
+dependency keys in `view_dispatch_files` and `view_dispatch_dependencies`,
+decodes only changed blobs, and re-resolves only files whose recorded keys name
+a changed input. Rust receiver type targets are resolved inside the selected
+join (which already holds the index), replaying recorded index answers for
+unchanged files. Cold builds drop from 269.8 s to 173.8–209.3 s because the
+second bind of every Rust file is gone; the cold derived database grows from
+1.064 GB to 1.206 GB of WAL. Every after run compared the incremental database
+with a cold build of the same manifest: `update bench parity label=edit-1
+equal=true`.
+
+The 3-second target is not met: the ordinary join's surface replay (948
+callers, 312,039 queries, selected through the crate-wide Rust module domain)
+and the type-target trace load (868 traces through the same domain) remain,
+and the SQLite commit of 157 pages took about 1 s in both after runs against
+~78 ms before; that commit cost is not yet explained.
