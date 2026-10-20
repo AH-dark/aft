@@ -444,6 +444,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saved_identity_never_reads_the_legacy_database_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        crate::developer_tools::with_git_usable_for_test(true, || {
+            let first = bind_with_recheck(root.path(), storage.path(), true, |_, _| {
+                Identity::git(root.path(), "a".repeat(40)).map(IdentityChoice::verified)
+            })
+            .unwrap();
+            assert!(!first.provisional);
+            // An aft.db that cannot be opened at all: any attempt to read the
+            // older pin from it would make this bind provisional.
+            std::fs::create_dir(storage.path().join("aft.db")).unwrap();
+            // A forced bind of a repository identity re-verifies under the
+            // record lock, the path that previously consulted the pin.
+            let again = bind_with_recheck(root.path(), storage.path(), true, |pin, saved| {
+                assert_eq!(pin, LegacyPin::Unpinned);
+                assert!(saved.is_some());
+                Identity::git(root.path(), "a".repeat(40)).map(IdentityChoice::verified)
+            })
+            .unwrap();
+            assert!(
+                !again.provisional,
+                "a root with a saved identity must not read aft.db"
+            );
+            assert_eq!(again.identity, first.identity);
+        });
+    }
+
+    #[test]
     fn retained_choice_cannot_replace_a_saved_identity() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
