@@ -53,6 +53,13 @@ fn opening_next_queued_refresh_does_not_autocheckpoint_the_previous_batch() {
     let (_temp, store, source) = fixture();
     let root = store.project_root.clone();
     let dir = store.publication_dir.clone();
+    let ordinary_threshold_pages = 16;
+    let page_size: u64 = store
+        .conn
+        .lock()
+        .unwrap()
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .unwrap();
     // Keep a SQLite reader connection open without pinning a read transaction:
     // a checkpoint could backfill every page if opening the writer ran one.
     let keeper = Connection::open(store.sqlite_path()).unwrap();
@@ -67,17 +74,15 @@ fn opening_next_queued_refresh_does_not_autocheckpoint_the_previous_batch() {
     drop(store);
     let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
     set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
-    REFRESH_WORKER_TEST_SEAMS
-        .get()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .get_mut(&root)
-        .unwrap()
-        .wal_policy = Some(Arc::clone(&policy));
+    {
+        let mut seams = REFRESH_WORKER_TEST_SEAMS.get().unwrap().lock().unwrap();
+        let seam = seams.get_mut(&root).unwrap();
+        seam.wal_policy = Some(Arc::clone(&policy));
+        seam.ordinary_wal_autocheckpoint_pages = Some(ordinary_threshold_pages);
+    }
     let (first_held, first_release) = install_callgraph_refresh_worker_test_gate(root.clone());
     let pending = Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
-    let text: String = (0..65000)
+    let text: String = (0..400)
         .map(|n| format!("export function leaf_{n}() {{ return {n}; }}\n"))
         .collect();
     fs::write(&source, text).unwrap();
@@ -97,12 +102,12 @@ fn opening_next_queued_refresh_does_not_autocheckpoint_the_previous_batch() {
         crate::write_ledger::register(crate::write_ledger::Domain::CallgraphCheckpoint, root_id);
     let before = checkpoint_credit.physical_total_for_test();
     first_release.send(()).unwrap();
-    second_held.recv_timeout(Duration::from_secs(300)).unwrap();
+    second_held.recv_timeout(Duration::from_secs(30)).unwrap();
     {
         let policy = policy.lock().unwrap();
         assert!(
-            policy.observed_bytes > 4000 * 4096,
-            "the previous committed batch must exceed the ordinary autocheckpoint threshold"
+            policy.observed_bytes > 32 + ordinary_threshold_pages as u64 * (page_size + 24),
+            "the previous committed batch must exceed the test's ordinary autocheckpoint threshold"
         );
         assert_eq!(
             policy.events,
@@ -278,10 +283,16 @@ fn s2_refresh_commit_has_zero_main_file_writes_and_syncs() {
     configure_connection(&slot).unwrap();
     let before = main_io_counts(&slot);
     drop(slot);
-    let source_text: String = (0..65000)
-        .map(|n| format!("export function leaf_{n}() {{ return {n}; }}\n"))
-        .collect();
-    fs::write(&source, source_text).unwrap();
+    set_callgraph_refresh_worker_test_seam(store.project_root.clone(), Duration::ZERO, false);
+    REFRESH_WORKER_TEST_SEAMS
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .get_mut(&store.project_root)
+        .unwrap()
+        .refresh_wal_payload_bytes = 20 * 1024 * 1024;
+    fs::write(&source, "export function after() { return 2; }\n").unwrap();
     store.refresh_files(&[source]).unwrap();
     let conn = store.conn.lock().unwrap();
     assert!(
@@ -298,6 +309,7 @@ fn s2_refresh_commit_has_zero_main_file_writes_and_syncs() {
         before,
         "BEGIN through return of COMMIT must not write or sync the main database"
     );
+    clear_callgraph_refresh_worker_test_seam(&store.project_root);
 }
 
 #[test]
