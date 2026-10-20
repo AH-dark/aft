@@ -19704,10 +19704,14 @@ mod tests {
             .unwrap()
             .write_all(b"READY")
             .unwrap();
+        // On Windows the long-running command prints to the same stdout file,
+        // so the watch can start past offset zero. Measure the tick from
+        // wherever the cursor stood before it.
+        let before = registry.watch_stream_cursors(&noisy).0;
         registry.scan_task_watch_output(&noisy_task);
         let first = registry.watch_stream_cursors(&noisy).0;
         assert_eq!(
-            first,
+            first - before,
             1024 * 1024,
             "one running tick must not consume the whole burst"
         );
