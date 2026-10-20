@@ -19,6 +19,7 @@ struct GlobDiscovery {
     files: Vec<PathBuf>,
     indexed_mtimes: HashMap<PathBuf, SystemTime>,
     walk_truncated: bool,
+    walk_time_limit_reached: bool,
     source: &'static str,
     entries_visited: usize,
     walk_time: Duration,
@@ -127,6 +128,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let (
         mut files,
         walk_truncated,
+        walk_time_limit_reached,
         source,
         entries_visited,
         walk_time,
@@ -138,6 +140,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         parent_gaps = answer.gaps;
         (
             answer.files,
+            false,
             false,
             "index",
             answer.entries_visited,
@@ -163,6 +166,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         (
             discovery.files,
             discovery.walk_truncated,
+            discovery.walk_time_limit_reached,
             discovery.source,
             discovery.entries_visited,
             discovery.walk_time,
@@ -190,6 +194,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             })
             .collect();
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
+        let walk_time_limit_reached = discoveries.iter().any(|d| d.walk_time_limit_reached);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
         let walk_time = discoveries.iter().map(|d| d.walk_time).sum();
         let scope_has_files = discoveries.iter().any(|d| d.scope_has_files);
@@ -212,6 +217,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         (
             files,
             walk_truncated,
+            walk_time_limit_reached,
             source,
             entries_visited,
             walk_time,
@@ -258,6 +264,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     });
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
+    }
+    if walk_time_limit_reached {
+        body["walk_entries_examined"] = serde_json::json!(entries_visited);
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Fallback directory walk reached its time limit after examining {entries_visited} entries; results may be incomplete. Narrow with a smaller path or a more specific pattern.)",
+            body["text"].as_str().unwrap_or_default(),
+        ));
     }
     if !scope_has_files {
         let counts = {
@@ -313,15 +326,23 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let rendered_count =
         crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());
 
-    let envelope = crate::list_surfaces::glob::build_glob_envelope(
+    let envelope = crate::list_surfaces::glob::build_glob_envelope_with_time_limit(
         rendered_count,
         total,
         result_truncated,
         walk_truncated,
+        walk_time_limit_reached,
         skipped_foreign_mounts,
     );
 
     if let Some(env) = envelope {
+        if walk_time_limit_reached {
+            body["text"] =
+                serde_json::Value::String(crate::subc_format::append_glob_envelope_trailer(
+                    body["text"].as_str().unwrap_or_default(),
+                    &env,
+                ));
+        }
         body["files_list_envelope"] = serde_json::to_value(&env).unwrap_or_default();
     } else {
         if walk_truncated {
@@ -387,6 +408,7 @@ fn glob_root(
             files,
             indexed_mtimes: HashMap::new(),
             walk_truncated: false,
+            walk_time_limit_reached: false,
             source: "task-output",
             entries_visited,
             walk_time: Duration::ZERO,
@@ -427,6 +449,7 @@ fn glob_root(
             files,
             indexed_mtimes,
             walk_truncated: false,
+            walk_time_limit_reached: false,
             source: "index",
             walk_time: Duration::ZERO,
             scope_has_files,
@@ -465,6 +488,7 @@ fn glob_root(
                         files: outcome.files,
                         indexed_mtimes: HashMap::new(),
                         walk_truncated: outcome.walk_truncated,
+                        walk_time_limit_reached: false,
                         source: "fallback",
                         entries_visited: outcome.entries_visited,
                         walk_time,
@@ -539,6 +563,7 @@ fn fallback_glob(
         files: outcome.files,
         indexed_mtimes: HashMap::new(),
         walk_truncated: outcome.walk_truncated,
+        walk_time_limit_reached: outcome.walk_time_limit_reached,
         source: "fallback",
         entries_visited: outcome.entries_visited,
         walk_time,
@@ -736,6 +761,119 @@ mod tests {
                 .files
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn indexed_glob_is_unchanged_by_a_zero_fallback_walk_budget() {
+        let (_dir, ctx, project, _) = exact_file_glob_fixture();
+        let index = crate::search_index::SearchIndex::build(&project);
+        assert!(index.is_ready());
+        *ctx.search_index().write().unwrap() = Some(index);
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "glob-indexed-budget",
+            "command": "glob",
+            "pattern": "*.ts",
+        }))
+        .unwrap();
+
+        let response =
+            crate::grep_executor::with_fallback_walk_budget_for_test(Duration::ZERO, || {
+                handle_glob(&request, &ctx)
+            });
+        let body = serde_json::to_value(response).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(body["complete"], true, "{body}");
+        assert_eq!(body["fallback"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["files"].as_array().unwrap().len(), 2, "{body}");
+        assert!(
+            !body["text"].as_str().unwrap().contains("time limit"),
+            "{body}"
+        );
+        assert!(body["walk_entries_examined"].is_null(), "{body}");
+    }
+
+    #[test]
+    fn fallback_glob_returns_matches_when_its_walk_budget_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(project.join("a.rs"), "a").unwrap();
+        std::fs::write(project.join("b.rs"), "b").unwrap();
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project.clone()),
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "glob-time-limit",
+            "command": "glob",
+            "pattern": "*.rs",
+        }))
+        .unwrap();
+
+        let response = crate::grep_executor::with_fallback_walk_budget_for_test(
+            Duration::from_millis(100),
+            || {
+                crate::grep_executor::with_fallback_walk_entry_delay_for_test(
+                    Duration::from_millis(250),
+                    || handle_glob(&request, &ctx),
+                )
+            },
+        );
+        let body = serde_json::to_value(&response).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        assert_eq!(body["files"].as_array().unwrap().len(), 1, "{body}");
+        assert!(
+            body["walk_entries_examined"].as_u64().unwrap() > 0,
+            "{body}"
+        );
+        assert_eq!(body["files_list_envelope"]["reason"], "time_limit");
+        let trailer = "shown 1 of ≥1 files (time limit) · narrow: path";
+        assert!(
+            body["text"].as_str().unwrap().ends_with(trailer),
+            "{}",
+            body["text"]
+        );
+        let examined = body["walk_entries_examined"].as_u64().unwrap();
+        assert!(examined > 0, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("after examining {examined} entries")),
+            "{}",
+            body["text"]
+        );
+        let rendered = crate::subc_format::format_response("glob", &response, false);
+        assert!(rendered.ends_with(trailer), "{rendered}");
+        assert_eq!(rendered.matches(trailer).count(), 1, "{rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_glob_keeps_read_blocked_for_a_stalled_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(project.join("a.rs"), "a").unwrap();
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(1))
+            .with_access_budget(Duration::from_millis(300));
+
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let stalled_helper = crate::bounded_io::stall_running_helper(&project);
+            let discovery = fallback_glob(&project, &project, "*.rs", false);
+            assert!(discovery.files.is_empty());
+            assert!(!discovery.walk_time_limit_reached);
+            let response = crate::bounded_io::finish_response(crate::protocol::Response::success(
+                "glob-stalled-helper",
+                serde_json::json!({}),
+            ));
+            drop(stalled_helper);
+            response
+        });
+
+        assert_eq!(response.data["code"], "read_blocked", "{response:?}");
     }
 
     #[test]

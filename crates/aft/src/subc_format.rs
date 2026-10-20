@@ -1692,22 +1692,33 @@ fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
 }
 
 // Mirrors packages/opencode-plugin/src/tools/search.ts formatGrepOutput.
+pub(crate) fn append_glob_envelope_trailer(
+    text: &str,
+    envelope: &crate::list_envelope::ListEnvelope,
+) -> String {
+    const GLOB_TRUNCATED_MESSAGE: &str =
+        "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)";
+    let clean = text
+        .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
+        .replace(GLOB_TRUNCATED_MESSAGE, "");
+    let Some(trailer) = render_envelope_trailer(envelope) else {
+        return clean;
+    };
+    let suffix = format!("\n\n{trailer}");
+    if clean.ends_with(&suffix) {
+        clean
+    } else {
+        format!("{clean}{suffix}")
+    }
+}
+
 fn format_glob_response(data: &Value) -> String {
     let base = data["text"].as_str().unwrap_or_default();
     let envelope = data
         .get("files_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
     if let Some(env) = envelope {
-        const GLOB_TRUNCATED_MESSAGE: &str =
-            "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)";
-        let clean = base
-            .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
-            .replace(GLOB_TRUNCATED_MESSAGE, "");
-        if let Some(trailer) = render_envelope_trailer(&env) {
-            format!("{clean}\n\n{trailer}")
-        } else {
-            clean
-        }
+        append_glob_envelope_trailer(base, &env)
     } else {
         base.to_string()
     }

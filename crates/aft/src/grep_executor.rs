@@ -27,6 +27,8 @@ pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
 #[cfg(test)]
 thread_local! {
     static WALK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_FALLBACK_WALK_FILES) };
+    static WALK_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::from_secs(10)) };
+    static WALK_ENTRY_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 fn fallback_walk_limit() -> usize {
@@ -53,11 +55,66 @@ pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
 }
 /// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
 pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
+const FALLBACK_WALK_RETURN_MARGIN: Duration = Duration::from_millis(100);
+
+fn fallback_walk_budget() -> Duration {
+    #[cfg(test)]
+    {
+        return WALK_BUDGET.with(std::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        FALLBACK_WALK_BUDGET
+    }
+}
+
+fn fallback_walk_entry_delay() -> Duration {
+    #[cfg(test)]
+    {
+        return WALK_ENTRY_DELAY.with(std::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        Duration::ZERO
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_fallback_walk_budget_for_test<R>(
+    budget: Duration,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_BUDGET.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_BUDGET.with(|current| current.replace(budget)));
+    run()
+}
+
+#[cfg(test)]
+pub(crate) fn with_fallback_walk_entry_delay_for_test<R>(
+    delay: Duration,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_ENTRY_DELAY.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_ENTRY_DELAY.with(|current| current.replace(delay)));
+    run()
+}
 
 #[derive(Clone, Debug)]
 pub struct FallbackWalkOutcome {
     pub files: Vec<PathBuf>,
     pub walk_truncated: bool,
+    /// True only when the iterator stopped because its walk deadline expired.
+    pub walk_time_limit_reached: bool,
     /// Foreign filesystem mounts skipped before a recursive fallback could open them.
     pub skipped_foreign_mounts: usize,
     pub entries_visited: usize,
@@ -1207,7 +1264,7 @@ pub(crate) fn bounded_fallback_walk_files(
         search_root,
         filters,
         fallback_walk_limit(),
-        FALLBACK_WALK_BUDGET,
+        fallback_walk_budget(),
     )
 }
 
@@ -1222,13 +1279,11 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
         search_root,
         filters,
         fallback_walk_limit(),
-        FALLBACK_WALK_BUDGET,
+        fallback_walk_budget(),
         ignored_target,
     )
 }
 
-/// Enumerate source paths before documentation and data, with no file-count cap.
-/// Check the deadline on each directory entry, including entries rejected as files.
 pub(crate) fn source_first_fallback_walk_files(
     root: &Path,
     deadline: Instant,
@@ -1237,11 +1292,17 @@ pub(crate) fn source_first_fallback_walk_files(
     let mut entries_visited = 0;
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let mut walk_truncated = false;
+    let mut walk_time_limit_reached = false;
     'phases: for source_phase in [true, false] {
         let builder = fallback_project_walk_builder(root, Arc::clone(&skipped_foreign_mounts));
         for entry in builder.build() {
             entries_visited += 1;
-            if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+            if Instant::now() >= deadline {
+                walk_truncated = true;
+                walk_time_limit_reached = true;
+                break 'phases;
+            }
+            if crate::executor::current_job_cancelled() {
                 walk_truncated = true;
                 break 'phases;
             }
@@ -1256,6 +1317,7 @@ pub(crate) fn source_first_fallback_walk_files(
     FallbackWalkOutcome {
         files,
         walk_truncated,
+        walk_time_limit_reached,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
     }
@@ -1298,23 +1360,27 @@ fn bounded_fallback_walk_files_with_limits_target(
 ) -> FallbackWalkOutcome {
     let filter_root = filter_root.to_path_buf();
     let filters = filters.clone();
-    crate::bounded_io::run(
+    let entry_delay = fallback_walk_entry_delay();
+    let deadline = crate::bounded_io::deadline_before_io_timeout(
         search_root,
-        Some(Instant::now() + budget),
-        move |search_root| {
-            Ok(walk_files_unbounded(
-                &filter_root,
-                &search_root,
-                &filters,
-                max_files,
-                budget,
-                ignored_target,
-            ))
-        },
-    )
+        budget,
+        FALLBACK_WALK_RETURN_MARGIN,
+    );
+    crate::bounded_io::run(search_root, None, move |search_root| {
+        Ok(walk_files_unbounded(
+            &filter_root,
+            &search_root,
+            &filters,
+            max_files,
+            deadline,
+            ignored_target,
+            entry_delay,
+        ))
+    })
     .unwrap_or_else(|_| FallbackWalkOutcome {
         files: Vec::new(),
         walk_truncated: true,
+        walk_time_limit_reached: false,
         skipped_foreign_mounts: 0,
         entries_visited: 0,
     })
@@ -1325,8 +1391,9 @@ fn walk_files_unbounded(
     search_root: &Path,
     filters: &PathFilters,
     max_files: usize,
-    budget: Duration,
+    deadline: Instant,
     ignored_target: bool,
+    entry_delay: Duration,
 ) -> FallbackWalkOutcome {
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     // Built before the file test below, which would stat the starting path.
@@ -1338,6 +1405,7 @@ fn walk_files_unbounded(
         return FallbackWalkOutcome {
             files: Vec::new(),
             walk_truncated: false,
+            walk_time_limit_reached: false,
             skipped_foreign_mounts: 0,
             entries_visited: 0,
         };
@@ -1347,18 +1415,31 @@ fn walk_files_unbounded(
     } else {
         filter_root
     };
-    let started = Instant::now();
     let mut files = Vec::new();
     let mut walk_truncated = false;
+    let mut walk_time_limit_reached = false;
     let mut entries_visited = 0usize;
-    let walker = builder.build();
+    let mut walker = builder.build();
 
-    for entry in walker.filter_map(|entry| entry.ok()) {
+    loop {
+        // Stop between entries so a progressing walk can return before the
+        // bounded I/O helper deadline. A blocked `next` still times out there.
+        if Instant::now() >= deadline {
+            walk_truncated = true;
+            walk_time_limit_reached = true;
+            break;
+        }
+        let Some(entry) = walker.next() else {
+            break;
+        };
         entries_visited += 1;
-        if started.elapsed() >= budget || entries_visited > max_files.saturating_mul(8).max(1024) {
+        if entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
             break;
         }
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry
             .file_type()
             .map_or(false, |file_type| file_type.is_file())
@@ -1367,11 +1448,13 @@ fn walk_files_unbounded(
         }
         let path = entry.into_path();
         if filters.matches(filter_root, &path) {
-            files.push(path);
-            if files.len() > max_files {
+            if files.len() >= max_files {
                 walk_truncated = true;
-                files.truncate(max_files);
                 break;
+            }
+            files.push(path);
+            if !entry_delay.is_zero() {
+                std::thread::sleep(entry_delay);
             }
         }
     }
@@ -1380,6 +1463,7 @@ fn walk_files_unbounded(
     FallbackWalkOutcome {
         files,
         walk_truncated,
+        walk_time_limit_reached,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
     }

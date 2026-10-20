@@ -18,7 +18,7 @@ use aft::list_envelope::{derive_wire_key, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::bash::{
     append_envelope_trailer, build_bash_output_envelope, produce_bash_reply_data,
 };
-use aft::list_surfaces::glob::build_glob_envelope;
+use aft::list_surfaces::glob::{build_glob_envelope, build_glob_envelope_with_time_limit};
 use aft::list_surfaces::grep::build_grep_envelope_from_parts;
 use aft::list_surfaces::inspect::build_inspect_envelope;
 use aft::list_surfaces::outline::build_outline_files_envelope;
@@ -152,6 +152,20 @@ const WALK_CAP: &[ReasonSpec] = &[
         kind: ReasonKind::Selecting,
     },
 ];
+const GLOB_REASONS: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::TimeLimit,
+        kind: ReasonKind::Bounding,
+    },
+    ReasonSpec {
+        reason: Reason::Walk,
+        kind: ReasonKind::Bounding,
+    },
+    ReasonSpec {
+        reason: Reason::Cap,
+        kind: ReasonKind::Selecting,
+    },
+];
 const WALK_BUDGET: &[ReasonSpec] = &[
     ReasonSpec {
         reason: Reason::Walk,
@@ -226,7 +240,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         list_id: "payload.files",
         unit: Unit::Files,
         narrow: &["path"],
-        reasons: WALK_CAP,
+        reasons: GLOB_REASONS,
     },
     SurfaceSpec {
         command: "outline",
@@ -332,15 +346,22 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
                 build_grep_envelope_from_parts(100, 1204, 100, true, false, 0)
             }
         }
-        ("glob", "") => {
-            if has(Reason::Walk) && has(Reason::Cap) {
-                build_glob_envelope(5, 105, true, true, 0)
-            } else if has(Reason::Walk) {
-                build_glob_envelope(12, 12, false, true, 0)
-            } else {
-                build_glob_envelope(5, 21, false, false, 0)
-            }
+        ("glob", "") if has(Reason::TimeLimit) => {
+            let total = if has(Reason::Cap) { 2 } else { 1 };
+            build_glob_envelope_with_time_limit(
+                1,
+                total,
+                has(Reason::Cap),
+                true,
+                true,
+                usize::from(has(Reason::Walk)),
+            )
         }
+        ("glob", "") if has(Reason::Walk) && has(Reason::Cap) => {
+            build_glob_envelope(5, 105, true, true, 0)
+        }
+        ("glob", "") if has(Reason::Walk) => build_glob_envelope(12, 12, false, true, 0),
+        ("glob", "") => build_glob_envelope(5, 21, false, false, 0),
         ("outline", "files") => build_outline_files_envelope(
             412,
             if has(Reason::Budget) { 1568 } else { 0 },
@@ -389,13 +410,13 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
                 Total::AtLeast(1204)
             }
         }
-        ("glob", "") => {
-            if has(Reason::Walk) {
-                Total::AtLeast(if has(Reason::Cap) { 105 } else { 12 })
-            } else {
-                Total::Exact(21)
-            }
+        ("glob", "") if has(Reason::TimeLimit) => {
+            Total::AtLeast(if has(Reason::Cap) { 2 } else { 1 })
         }
+        ("glob", "") if has(Reason::Walk) => {
+            Total::AtLeast(if has(Reason::Cap) { 105 } else { 12 })
+        }
+        ("glob", "") => Total::Exact(21),
         ("outline", "files") => {
             if has(Reason::Walk) {
                 Total::AtLeast(if has(Reason::Budget) { 1980 } else { 412 })
@@ -776,6 +797,7 @@ pub fn capped_fixtures() -> Vec<FixtureRecord> {
         "walk_and_cap",
         "skipped_foreign_mounts_r25",
         "walk_truncated",
+        "time_limit_partial",
         "display_files_per_dir_r24",
         "display_directories_r24",
     ] {

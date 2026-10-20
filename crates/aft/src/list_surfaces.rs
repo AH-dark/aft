@@ -200,6 +200,11 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         narrow: &["path"],
         reasons: &[
             ReasonEntry {
+                reason: Reason::TimeLimit,
+                kind: ReasonKind::Bounding,
+                predicate_name: "walk_time_limit_reached, walk_files_unbounded, bounded_fallback_walk_files_with_limits_target",
+            },
+            ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
                 predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, walk_truncated, skipped_foreign_mounts",
