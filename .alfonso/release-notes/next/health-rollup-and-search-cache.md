@@ -1,5 +1,1 @@
-# Lighter health rollups on busy daemons; search caches save again
-
-The health rollup no longer re-walks a root's trigram and semantic indexes because a read added a file to its symbol cache. Each index's memory walk is now reused while that index's own shape is unchanged, so a read re-walks only the symbol cache and an edit only the trigram index. A root's `memory_measured_age_ms` is the age of the oldest walk in use. Thread names are classified at most once every 30 seconds instead of on every rollup; the thread total is still counted on every pass, and the new `threads.classified_age_ms` reports the age of `threads.by_class`.
-
-AFT's own writes to files outside a root (another checkout, a temporary directory) no longer enter that root's search index. Before, one such entry made every later disk-cache save fail with "refusing to cache path outside project root", so the index was rebuilt in full on each start. The symbol cache likewise saves the files under its root and keeps files parsed elsewhere in memory only, instead of refusing to save at all.
+- Health checks cost less on busy daemons, and AFT's own edits to files outside a project no longer stop that project's search index from saving to disk (it was rebuilt in full on every start).
