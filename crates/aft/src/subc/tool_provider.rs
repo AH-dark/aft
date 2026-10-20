@@ -1071,6 +1071,84 @@ fn custody_request(
 struct CustodyReply {
     body: Vec<u8>,
     withdrawn_key: Option<crate::db::call_ledger::Key>,
+    /// A withdrawn running call whose task this root's registry does not
+    /// hold. `body` is its answer, not stored yet: the kill must run on the
+    /// root that owns the task before the answer is stored and sent.
+    kill_elsewhere: Option<WithdrawKill>,
+}
+
+/// The kill a withdraw still owes, and the answer to store once it lands.
+struct WithdrawKill {
+    key: crate::db::call_ledger::Key,
+    task: String,
+    body: Vec<u8>,
+}
+
+/// The refusal for a withdraw whose running call could not be stopped. No
+/// answer was stored, so retrying the withdraw tries the kill again.
+fn withdraw_kill_failed(task: &str, error: &str) -> ErrorBody {
+    ErrorBody::new(
+        "withdraw_incomplete",
+        format!(
+            "the withdrawn call's task {task} could not be stopped: {error}; retry tool.withdraw"
+        ),
+    )
+    .with_detail(json!({"retryable": true, "task_id": task}))
+}
+
+/// Store a withdraw's answer once its kill landed (or was not needed), and
+/// return the answer every later withdraw will get.
+fn freeze_withdraw_answer(
+    ctx: &crate::context::AppContext,
+    kill: &WithdrawKill,
+) -> Result<Vec<u8>, ErrorBody> {
+    let unavailable = |message: String| {
+        ErrorBody::new("database_unavailable", message).with_detail(json!({"retryable": false}))
+    };
+    let db = ctx
+        .db()
+        .ok_or_else(|| unavailable("call ledger is unavailable".into()))?;
+    let conn = db
+        .lock()
+        .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
+    crate::db::call_ledger::freeze_withdraw_answer(&conn, &kill.key, &kill.body)
+        .map_err(|error| unavailable(error.to_string()))
+}
+
+/// Stop a withdrawn running call's task through `ctx`'s task registry (each
+/// project root has its own), then store the withdraw's answer. When that
+/// registry does not hold the task, the answer is stored only if the task's
+/// record shows it has already stopped; otherwise nothing is stored and the
+/// withdraw is refused as retryable.
+fn kill_withdrawn_call(
+    ctx: &crate::context::AppContext,
+    kill: &WithdrawKill,
+) -> Result<Vec<u8>, ErrorBody> {
+    if ctx.bash_background().holds_task(&kill.task) {
+        // The ledger lock must not be held here: killing persists the task's
+        // terminal state through the same `aft.db` connection.
+        if let Err(error) = ctx.bash_background().kill_withdrawn(&kill.task) {
+            log::warn!("withdrawn call task {} was not killed: {error}", kill.task);
+            return Err(withdraw_kill_failed(&kill.task, &error));
+        }
+        return freeze_withdraw_answer(ctx, kill);
+    }
+    let stopped = ctx.db().is_some_and(|db| {
+        db.lock().ok().is_some_and(|conn| {
+            crate::db::bash_tasks::bash_task_stopped(&conn, &kill.task).unwrap_or(false)
+        })
+    });
+    if stopped {
+        return freeze_withdraw_answer(ctx, kill);
+    }
+    log::warn!(
+        "withdrawn call task {} was not killed: no bound project root holds it",
+        kill.task
+    );
+    Err(withdraw_kill_failed(
+        &kill.task,
+        "no bound project root holds the task",
+    ))
 }
 
 /// Runs a custody request against the route root's ledger, on the actor's
@@ -1123,6 +1201,7 @@ fn run_custody(
                     body: serde_json::to_vec(&WithdrawAnswer::UnknownCall.encode())
                         .expect("withdraw answers are JSON"),
                     withdrawn_key: None,
+                    kill_elsewhere: None,
                 }),
                 Withdrawal::NotPermitted => Err(CallerProblem::NotPermitted.error()),
                 Withdrawal::Answer {
@@ -1130,17 +1209,29 @@ fn run_custody(
                     kill_task,
                     held_withdrawn,
                 } => {
-                    // The ledger lock was dropped when `found` was computed:
-                    // killing persists the task's terminal state through the
-                    // same `aft.db` connection, and would deadlock on it.
-                    if let Some(task) = kill_task {
-                        if let Err(error) = ctx.bash_background().kill_withdrawn(&task) {
-                            log::warn!("withdrawn call task {task} was not killed: {error}");
-                        }
+                    let withdrawn_key = held_withdrawn.then_some(key.clone());
+                    let Some(task) = kill_task else {
+                        return Ok(CustodyReply {
+                            body,
+                            withdrawn_key,
+                            kill_elsewhere: None,
+                        });
+                    };
+                    let kill = WithdrawKill { key, task, body };
+                    // A codemode program's shell calls run on its head's root,
+                    // which may differ from the root its own route is bound
+                    // to; their tasks are then in the head root's registry.
+                    if !ctx.bash_background().holds_task(&kill.task) {
+                        return Ok(CustodyReply {
+                            body: Vec::new(),
+                            withdrawn_key,
+                            kill_elsewhere: Some(kill),
+                        });
                     }
                     Ok(CustodyReply {
-                        body,
-                        withdrawn_key: held_withdrawn.then_some(key),
+                        body: kill_withdrawn_call(ctx, &kill)?,
+                        withdrawn_key,
+                        kill_elsewhere: None,
                     })
                 }
             }
@@ -1162,6 +1253,7 @@ fn run_custody(
             .map(|body| CustodyReply {
                 body,
                 withdrawn_key: None,
+                kill_elsewhere: None,
             })
         }
         Custody::Ack(request) => {
@@ -1173,9 +1265,45 @@ fn run_custody(
                 .map(|_| CustodyReply {
                     body: b"{}".to_vec(),
                     withdrawn_key: None,
+                    kill_elsewhere: None,
                 })
         }
     }
+}
+
+/// Runs a withdraw's owed kill on the project root whose registry holds the
+/// task, then stores and returns the answer. When no bound root holds it, the
+/// custody root checks the task's record instead (see [`kill_withdrawn_call`]).
+async fn kill_on_owning_root(
+    executor: &std::sync::Arc<crate::executor::Executor>,
+    custody_root: crate::path_identity::ProjectRootId,
+    kill: WithdrawKill,
+    op: &str,
+) -> Result<Vec<u8>, ErrorBody> {
+    use super::*;
+    let root = executor
+        .actor_entries()
+        .into_iter()
+        .find(|(_, ctx)| ctx.bash_background().holds_task(&kill.task))
+        .map_or(custody_root, |(root, _)| root);
+    let request_id = format!("{op}-kill-{}", kill.task);
+    let (result_tx, result_rx) = oneshot::channel();
+    let rx = executor.submit_async(
+        root,
+        Lane::Mutating,
+        request_id.clone(),
+        Box::new(move |ctx| {
+            let _ = result_tx.send(kill_withdrawn_call(ctx, &kill));
+            Response::success(request_id, json!({}))
+        }),
+    );
+    let response = await_executor_response(rx, op.to_owned()).await;
+    result_rx.await.unwrap_or_else(|_| {
+        Err(
+            ErrorBody::new("executor_failure", format!("{op} kill did not complete"))
+                .with_detail(response.data),
+        )
+    })
 }
 
 impl LedgerEdge {
@@ -1682,6 +1810,8 @@ impl LedgerEdge {
         );
         let edge = self.clone();
         let op = op.to_owned();
+        let executor = executor.clone();
+        let custody_root = identity.root.clone();
         tokio::spawn(async move {
             let response = await_executor_response(rx, op.clone()).await;
             let result = result_rx.await.unwrap_or_else(|_| {
@@ -1690,6 +1820,20 @@ impl LedgerEdge {
                         .with_detail(response.data),
                 )
             });
+            let result = match result {
+                Ok(CustodyReply {
+                    kill_elsewhere: Some(kill),
+                    withdrawn_key,
+                    ..
+                }) => kill_on_owning_root(&executor, custody_root, kill, &op)
+                    .await
+                    .map(|body| CustodyReply {
+                        body,
+                        withdrawn_key,
+                        kill_elsewhere: None,
+                    }),
+                other => other,
+            };
             match result {
                 Ok(reply) => {
                     if let Some(key) = reply.withdrawn_key {
@@ -5358,6 +5502,68 @@ mod ledger_terminal_tests {
     use super::*;
     use crate::db::call_ledger::Key;
     use crate::subc::{control_flags, route_key, Frame, FrameType, PersistentCancelSignal};
+
+    /// A withdraw whose running call could not be stopped stores no answer
+    /// and is refused as retryable, so a retry tries again. Once the task's
+    /// record shows it stopped, the answer is stored and returned.
+    #[test]
+    fn withdraw_without_a_landed_kill_stores_no_answer_and_is_retryable() {
+        use crate::db::call_ledger::{self as ledger, State};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::subc::test_support::test_ctx();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(db.clone());
+        let key = Key {
+            carrier: "carrier".into(),
+            call_key: "running".into(),
+        };
+        let task = "bash-0123456789abcdef";
+        {
+            let conn = db.lock().unwrap();
+            ledger::admit(&conn, &key, "digest", None, State::DispatchStarted).unwrap();
+            ledger::link_task(&conn, &key, task).unwrap();
+            conn.execute(
+                "INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,metadata) VALUES('h','s',?1,'elsewhere','sleep','cwd','running',1,'{}')",
+                [task],
+            )
+            .unwrap();
+        }
+        let Ok(ledger::Withdrawal::Answer {
+            body,
+            kill_task: Some(kill_task),
+            ..
+        }) = ledger::withdraw(&db.lock().unwrap(), &key, None, 100, usize::MAX)
+        else {
+            panic!("a running linked call must name its task to kill");
+        };
+        let kill = WithdrawKill {
+            key: key.clone(),
+            task: kill_task,
+            body,
+        };
+        assert!(!ctx.bash_background().holds_task(task));
+        let refused = kill_withdrawn_call(&ctx, &kill).expect_err("no registry holds the task");
+        assert_eq!(refused.code, "withdraw_incomplete");
+        assert_eq!(refused.detail.as_ref().unwrap()["retryable"], true);
+        let row = ledger::get(&db.lock().unwrap(), &key).unwrap().unwrap();
+        assert!(
+            row.withdraw_answer.is_none(),
+            "an unstopped call has no stored answer"
+        );
+
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE bash_tasks SET status='killed' WHERE task_id=?1",
+                [task],
+            )
+            .unwrap();
+        assert_eq!(kill_withdrawn_call(&ctx, &kill).unwrap(), kill.body);
+        let row = ledger::get(&db.lock().unwrap(), &key).unwrap().unwrap();
+        assert_eq!(row.withdraw_answer.as_deref(), Some(kill.body.as_slice()));
+    }
 
     #[tokio::test]
     async fn daemon_edge_permission_hold_keeps_plan_arguments_owned() {

@@ -9681,6 +9681,14 @@ impl BgTaskRegistry {
             .and_then(|tasks| tasks.get(task_id).cloned())
     }
 
+    /// Whether this registry holds the task. Each project root has its own
+    /// registry, and a codemode program's shell calls run on its head's root,
+    /// so a withdraw arriving on the program's own root uses this to find the
+    /// registry that can kill the task.
+    pub(crate) fn holds_task(&self, task_id: &str) -> bool {
+        self.task(task_id).is_some()
+    }
+
     /// Check tracked work without recovering task records or reading output.
     /// A terminal shell can leave descendants alive, so refresh a surviving or
     /// unknown process-group sample before treating the whole task as finished.

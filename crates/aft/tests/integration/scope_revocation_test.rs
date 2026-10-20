@@ -1953,3 +1953,171 @@ fn codemode_call_runs_with_head_principal_and_run_route_finds_its_ledger_row() {
         configured_dispatch,
     );
 }
+
+/// Wait until the route's `aft.db` is open: the bind acknowledgement comes
+/// before the asynchronous database open, and ledger operations refuse with
+/// `database_initializing` until then.
+async fn wait_for_ledger(stream: &mut tokio::net::TcpStream, channel: u16, first_corr: u64) {
+    let until = Instant::now() + Duration::from_secs(15);
+    let mut corr = first_corr;
+    loop {
+        provider_op(
+            stream,
+            channel,
+            corr,
+            json!({"name": "late_results", "arguments": {}}),
+        )
+        .await;
+        let ready = read_frame_timeout(stream, "ledger readiness").await;
+        if ready.header.ty == FrameType::Response {
+            return;
+        }
+        assert_eq!(
+            reply_json(&ready)["code"],
+            "database_initializing",
+            "{}",
+            String::from_utf8_lossy(&ready.body)
+        );
+        assert!(Instant::now() < until, "aft.db never opened");
+        corr += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A codemode run bound to another root than its head runs its shell calls on
+/// the head's root, so their tasks live in the head root's registry. A
+/// `tool.withdraw` on the run route must still stop such a call: the kill goes
+/// to the registry that owns the task, not to the run route's own root.
+#[cfg(unix)]
+#[test]
+fn codemode_withdraw_kills_a_running_shell_call_on_the_head_root() {
+    run_subc_bridge_test_with_dispatch(
+        "codemode-withdraw-head-root",
+        Duration::from_secs(40),
+        |input| async move {
+            let mut daemon = open_scope_daemon_session(input).await;
+            write_project_config(&daemon.root1, json!({}));
+            write_project_config(&daemon.root2, json!({}));
+            // Ledger keys outlive one module run, so each run uses a fresh one.
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let shell_key = format!("program-withdrawn-shell-{unique}");
+            bind_route_as(
+                &mut daemon.stream,
+                &daemon.root1,
+                1,
+                Some(subc_protocol::call_mode::CallMode::Classic),
+                Some(head_stamp("agent-a")),
+                "head-session",
+                Principal::Direct,
+                true,
+            )
+            .await;
+            bind_route_as(
+                &mut daemon.stream,
+                &daemon.root2,
+                2,
+                Some(subc_protocol::call_mode::CallMode::Codemode),
+                Some(stamp()),
+                "program-session",
+                Principal::Reserved {
+                    module_id: "basal".into(),
+                },
+                true,
+            )
+            .await;
+            wait_for_ledger(&mut daemon.stream, 2, 300).await;
+            let pid_path = daemon.root1.join("withdrawn.pid");
+            let command = format!("sleep 30 & echo $! > '{}'; wait", pid_path.display());
+            let keyed_shell = json!({
+                "name": "bash",
+                "preset": "head",
+                "call_key": &shell_key,
+                "arguments": {"command": command, "timeout": 30000},
+            });
+            send_frame(
+                &mut daemon.stream,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    2,
+                    1,
+                    400,
+                    serde_json::to_vec(&keyed_shell).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+            let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
+            answer(
+                &mut daemon.stream,
+                &request,
+                subc_protocol::scope::ScopeStatus::Live,
+                true,
+                Some(1),
+            )
+            .await;
+            let pid = child_pid(&pid_path).await;
+            let _cleanup = ChildCleanup(pid);
+            assert!(alive(pid), "the shell call must be running before withdraw");
+
+            provider_op(
+                &mut daemon.stream,
+                2,
+                401,
+                json!({"name": "tool.withdraw", "arguments": {"call_key": &shell_key}}),
+            )
+            .await;
+            // The killed call's own reply may arrive before the withdraw answer.
+            let mut call_ended = false;
+            let withdrawn = loop {
+                let frame = read_frame_timeout(&mut daemon.stream, "withdraw answer").await;
+                match frame.header.corr {
+                    401 => break frame,
+                    400 => call_ended = true,
+                    corr => panic!(
+                        "unexpected frame corr={corr}: {}",
+                        String::from_utf8_lossy(&frame.body)
+                    ),
+                }
+            };
+            assert_eq!(
+                withdrawn.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&withdrawn.body)
+            );
+            assert_eq!(
+                reply_json(&withdrawn),
+                json!({"answer": "already_started", "outcome": "unknown"})
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while alive(pid) {
+                assert!(
+                    Instant::now() < deadline,
+                    "tool.withdraw on the run route left the head-root shell call running"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if !call_ended {
+                let ended = read_frame_timeout(&mut daemon.stream, "withdrawn call end").await;
+                assert_eq!(ended.header.corr, 400);
+            }
+            // The answer is frozen once the kill landed: a repeat returns it.
+            provider_op(
+                &mut daemon.stream,
+                2,
+                402,
+                json!({"name": "tool.withdraw", "arguments": {"call_key": &shell_key}}),
+            )
+            .await;
+            let repeat = read_frame_timeout(&mut daemon.stream, "repeated withdraw").await;
+            assert_eq!(repeat.body, withdrawn.body);
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        configured_dispatch,
+    );
+}
