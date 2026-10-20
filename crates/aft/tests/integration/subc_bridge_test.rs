@@ -12828,6 +12828,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             .map(|operation| operation.name.as_str())
             .collect::<HashSet<_>>(),
         HashSet::from([
+            "bash.kill_scope",
             "health.digest",
             "memory.census",
             "writes.census",
@@ -12963,6 +12964,32 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     );
     let root2_id = ProjectRootId::from_path(&root2).expect("root2 id");
     assert!(!executor.actor_registered(&root2_id));
+
+    let fixture: Value =
+        serde_json::from_str(include_str!("../fixtures/bash-kill-scope/wire.json")).unwrap();
+    send_management_request(&mut stream, 2, 320, fixture["not_owner"]["request"].clone()).await;
+    let refused = read_management_response(&mut stream, 2, 320, "bash.kill_scope").await;
+    assert_eq!(refused, fixture["not_owner"]["reply"]);
+    send_management_route_bind(
+        &mut stream,
+        12,
+        321,
+        &root2,
+        Some(Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 321).await;
+    send_management_request(
+        &mut stream,
+        12,
+        322,
+        fixture["nothing_running"]["request"].clone(),
+    )
+    .await;
+    let empty = read_management_response(&mut stream, 12, 322, "bash.kill_scope").await;
+    assert_eq!(empty, fixture["nothing_running"]["reply"]);
 
     send_management_request(&mut stream, 2, 30, json!({ "op": "memory.census" })).await;
     let census = read_management_response(&mut stream, 2, 30, "memory.census").await;

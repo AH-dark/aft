@@ -95,6 +95,7 @@ pub(crate) enum Script {
     Refused,
     Restart,
     Cancel,
+    CancelRefused,
     MissingTerminal,
     KnownRefused,
     WorkspaceSetupRefused,
@@ -376,7 +377,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -447,6 +448,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                             }
                         },
+                        "exec.cancel" if matches!(script, Script::CancelRefused) => replies.push(reply(FrameType::Error, json!({"code":"cancel_refused","message":"runner unavailable"}))),
                         "exec.cancel" => { cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst); replies.push(reply(FrameType::Response, serde_json::to_value(CancelReply::new(id())).unwrap())); },
                         "exec.status" => replies.push(reply(FrameType::Response, serde_json::to_value(StatusReply::new(0, vec![], true, vec![], "rustc test")).unwrap())),
                         _ => panic!("unexpected caller operation {body}"),

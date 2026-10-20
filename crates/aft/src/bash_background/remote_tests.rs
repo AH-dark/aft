@@ -184,10 +184,19 @@ fn start_with_hard_kill(
     connection: PathBuf,
     hard_kill: crate::bash_background::HardKill,
 ) -> String {
+    start_with_launch(registry, dir, launch(connection), hard_kill)
+}
+
+fn start_with_launch(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    launch: crate::bash_background::RemoteLaunch,
+    hard_kill: crate::bash_background::HardKill,
+) -> String {
     ensure_git_fixture(dir);
     registry
         .spawn_remote(
-            launch(connection),
+            launch,
             SpawnPlan::Unsandboxed,
             "printf local-proof",
             resolve_posix_shell(),
@@ -1047,6 +1056,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -2250,6 +2260,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -3542,6 +3553,7 @@ fn persist_accepted_with_snapshot(
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: Some(digest),
         env_not_forwarded: None,
@@ -5473,6 +5485,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -5587,6 +5600,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -5978,6 +5992,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -7258,4 +7273,289 @@ fn precommit_remote_handle_failure_removes_layout() {
         "uncommitted remote layout leaked"
     );
     assert!(registry.list(0).is_empty());
+}
+
+#[tokio::test]
+async fn bash_kill_scope_runon_cancels_remote_job_and_releases_local_task() {
+    assert_bash_kill_scope_runon_cancel(Script::Cancel, "sent").await;
+}
+
+#[tokio::test]
+async fn bash_kill_scope_runon_cancel_failure_still_kills_local_task() {
+    assert_bash_kill_scope_runon_cancel(Script::CancelRefused, "failed:").await;
+}
+
+async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
+    let daemon = daemon(script, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let scope = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        "worker",
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    );
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        start_with_launch(
+            &registry,
+            dir.path(),
+            launch,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+        )
+    });
+    let job = wait_for("runner acceptance before pause", || {
+        registry
+            .status(&task, "session", None, None, 0)
+            .unwrap()
+            .remote_job_id
+    })
+    .await;
+    let paused_registry = registry.clone();
+    let reply = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &[paused_registry],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["killed"][0]["remote"]["job_id"], job);
+    assert!(
+        reply.data["killed"][0]["remote"]["cancel"]
+            .as_str()
+            .unwrap()
+            .starts_with(expected),
+        "{reply:?}"
+    );
+    if expected == "failed:" {
+        assert!(
+            reply.data["killed"][0]["remote"]["cancel"]
+                .as_str()
+                .unwrap()
+                .contains("runner unavailable"),
+            "{reply:?}"
+        );
+    }
+    assert_eq!(
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body["method"] == "exec.cancel")
+            .count(),
+        1
+    );
+    let done = registry.status(&task, "session", None, None, 0).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+}
+
+#[tokio::test]
+async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are_first() {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    // Prepare repositories before either remote worker connects: synchronous
+    // Git setup must not starve the fake daemon's authentication handshake.
+    for dir in &dirs {
+        ensure_git_fixture(dir.path());
+    }
+    let first = daemon(Script::GatedRoute, "exec-remote/v1").await;
+    let second = daemon(Script::GatedRoute, "exec-remote/v1").await;
+    let registries = [registry(), registry()];
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/bash-kill-scope/wire.json"
+    ))
+    .unwrap();
+    let scope: subc_protocol::scope::ScopeStamp =
+        serde_json::from_value(fixture["unaccepted"]["request"]["params"]["scope"].clone())
+            .unwrap();
+    let mut tasks = Vec::new();
+    for (index, connection) in [first.connection.clone(), second.connection.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+            let mut launch = launch(connection);
+            launch.explicit_runon = true;
+            start_with_launch(
+                &registries[index],
+                dirs[index].path(),
+                launch,
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            )
+        });
+        tasks.push(task);
+    }
+    for daemon in [&first, &second] {
+        wait_for("remote route setup must be in flight", || {
+            daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["op"] == "route.open")
+                .then_some(())
+        })
+        .await;
+    }
+    let local = super::super::with_scope_spawn(Some(scope.clone()), || {
+        registries[1].spawn(
+            SpawnPlan::Unsandboxed,
+            "sleep 30",
+            "local".into(),
+            dirs[1].path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dirs[1].path().into(),
+            10,
+            true,
+            false,
+            Some(dirs[1].path().into()),
+        )
+    })
+    .unwrap();
+    let pausing = registries.clone();
+    let started = Instant::now();
+    let operation = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &pausing,
+        )
+    });
+    wait_for("local kill must not wait for remote cancellation", || {
+        (registries[1]
+            .status(&local, "local", None, None, 0)
+            .unwrap()
+            .info
+            .status
+            == BgTaskStatus::Killed)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "local kill waited for a runner: {:?}",
+        started.elapsed()
+    );
+    let reply = tokio::time::timeout(Duration::from_secs(12), operation)
+        .await
+        .expect("both unaccepted tasks must share one 10-second deadline")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(12));
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["killed"].as_array().unwrap().len(), 3);
+    for (index, task) in tasks.iter().enumerate() {
+        let entry = reply.data["killed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["task_id"] == *task)
+            .unwrap();
+        assert_eq!(
+            entry["remote"],
+            fixture["unaccepted"]["reply"]["data"]["killed"][0]["remote"]
+        );
+        assert_eq!(
+            registries[index]
+                .status(&task, "session", None, None, 0)
+                .unwrap()
+                .info
+                .status,
+            BgTaskStatus::Killed
+        );
+    }
+    first.acceptance_gate.notify_one();
+    second.acceptance_gate.notify_one();
+    for (registry, task) in registries.iter().zip(&tasks) {
+        wait_for(
+            "paused submission must be withdrawn after route setup",
+            || {
+                registry
+                    .task(task)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .owner_pause_cancel
+                    .clone()
+            },
+        )
+        .await;
+    }
+    assert!(exec_runs(&first).is_empty());
+    assert!(exec_runs(&second).is_empty());
+}
+
+#[tokio::test]
+async fn bash_kill_scope_withdraws_submission_before_acceptance() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/bash-kill-scope/wire.json"
+    ))
+    .unwrap();
+    let case = &fixture["withdrawn_before_acceptance"];
+    let scope: subc_protocol::scope::ScopeStamp =
+        serde_json::from_value(case["request"]["params"]["scope"].clone()).unwrap();
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        start_with_launch(
+            &registry,
+            dir.path(),
+            launch,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+        )
+    });
+    daemon.wait_for_requests("exec.run", 1).await;
+    let pausing = registry.clone();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill_scope::handle_bash_kill_scope(
+                serde_json::json!({"scope":scope}),
+                Some(&scope.owner),
+                &[pausing],
+            )
+        }),
+    )
+    .await
+    .expect("withdrawal must not wait for acceptance")
+    .unwrap();
+    assert!(reply.success, "{reply:?}");
+    let mut expected = case["reply"]["data"].clone();
+    expected["killed"][0]["task_id"] = serde_json::json!(task);
+    assert_eq!(reply.data, expected);
+    wait_for("call-key Cancel must reach the runner", || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        !daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["method"] == "exec.cancel"),
+        "no job ID was known for exec.cancel"
+    );
+    daemon.acceptance_gate.notify_one();
 }
