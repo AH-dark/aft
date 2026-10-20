@@ -5290,20 +5290,34 @@ mod storage_retention_tests {
             }),
         );
         let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (finish_bind_tx, finish_bind_rx) = std::sync::mpsc::channel();
+        let finish_bind_rx = Mutex::new(finish_bind_rx);
         let _pending = observe_test_hook(
             &root,
             Arc::new(move |step| {
                 if step == "bind-pending" {
                     pending_tx.send(()).unwrap();
+                    // Keep the bind pending for the whole observed pass. Once
+                    // it finishes, the lexical lane may legitimately retry the
+                    // cache, and that later reread does not indicate a failed yield.
+                    finish_bind_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
                 }
             }),
         );
         let storage = temp.path().to_path_buf();
         let bind = std::thread::spawn(move || record_bind(&storage, &root, "fedcba9876543210"));
         pending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let pending_before_sweep = bind_pending(temp.path());
         release.send(()).unwrap();
         let report = sweep.join().unwrap();
+        let pending_after_sweep = bind_pending(temp.path());
+        finish_bind_tx.send(()).unwrap();
         bind.join().unwrap().unwrap();
+        assert!(pending_before_sweep && pending_after_sweep);
         assert_eq!(
             reads.load(std::sync::atomic::Ordering::SeqCst),
             0,
