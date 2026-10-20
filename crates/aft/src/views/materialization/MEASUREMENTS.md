@@ -923,7 +923,9 @@ its data table and caveats are also preserved above if target artifacts are swep
 `update_bench` on this repository (`AFT_UPDATE_BENCH_OLD=HEAD~N`, `EDITS=1`,
 `ONLY=edit-1`, `PARITY=1`, `AFT_VIEW_PROFILE=1`): one edited file
 (`crates/aft/tests/list_envelope_core/trailer_grammar_test.rs`) in a 5,408-entry
-manifest. Before is `origin/main` 88c06d5ef; after is this change.
+manifest. Before is `origin/main` 88c06d5ef. The quiet after run predates the
+last step, which replays only type-target answers that depend on a changed
+entry; the loaded run includes it but shared the runner with other jobs.
 
 | incremental phase, ms | before | after (quiet run) | after (loaded run) |
 | --- | ---: | ---: | ---: |
