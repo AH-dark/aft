@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "172d0da005a7f018d07dc1719a2b8e7fb12126f1da35f3987903145ec1f3462d",
-      "catalog_digest": "172d0da005a7f018d07dc1719a2b8e7fb12126f1da35f3987903145ec1f3462d",
+      "generation": "0afe8c8f0aad9e55c0ae659c75f358187dec381b37f97958d948b64a81530a2a",
+      "catalog_digest": "0afe8c8f0aad9e55c0ae659c75f358187dec381b37f97958d948b64a81530a2a",
       "tools": [
         {
           "name": "status",
@@ -994,7 +994,7 @@
         },
         {
           "name": "safety",
-          "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
+          "schema_digest": "15decddce4704d6bee2980603562727f50089c5abeb1f39a40aed33ce67bff54",
           "semantics": 1,
           "modes": [
             "classic",
@@ -1003,7 +1003,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n- 'purge': Permanently delete this session's undo backups and checkpoint copies of 'path' (a file, or everything under a directory); cannot be undone.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1016,11 +1016,12 @@
                   "history",
                   "checkpoint",
                   "restore",
-                  "list"
+                  "list",
+                  "purge"
                 ]
               },
               "path": {
-                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file, required for purge — a file or directory). Absolute or relative to project root",
                 "type": "string"
               },
               "name": {
@@ -1264,8 +1265,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "49558ab830475bca96a7cdd9048f344a1e63010de6940fea8e9b1b6f1d7a87dd",
-      "catalog_digest": "49558ab830475bca96a7cdd9048f344a1e63010de6940fea8e9b1b6f1d7a87dd",
+      "generation": "18366f3678dae8150d08946da8b1225e638e36082c16589f5263e65031d2fb85",
+      "catalog_digest": "18366f3678dae8150d08946da8b1225e638e36082c16589f5263e65031d2fb85",
       "tools": [
         {
           "name": "status",
@@ -2321,7 +2322,7 @@
         },
         {
           "name": "safety",
-          "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
+          "schema_digest": "15decddce4704d6bee2980603562727f50089c5abeb1f39a40aed33ce67bff54",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2330,7 +2331,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n- 'purge': Permanently delete this session's undo backups and checkpoint copies of 'path' (a file, or everything under a directory); cannot be undone.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2343,11 +2344,12 @@
                   "history",
                   "checkpoint",
                   "restore",
-                  "list"
+                  "list",
+                  "purge"
                 ]
               },
               "path": {
-                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file, required for purge — a file or directory). Absolute or relative to project root",
                 "type": "string"
               },
               "name": {
@@ -3541,8 +3543,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "c695fbd728621fe2a474c551b869904050fdb81fe414a33d119cdf690b15ecc3",
-      "catalog_digest": "c695fbd728621fe2a474c551b869904050fdb81fe414a33d119cdf690b15ecc3",
+      "generation": "baa7b5e6e6ecb86bfdc25e880bc18ceb18301809ec155d8ee5701d2d4e294291",
+      "catalog_digest": "baa7b5e6e6ecb86bfdc25e880bc18ceb18301809ec155d8ee5701d2d4e294291",
       "tools": [
         {
           "name": "status",
@@ -4529,7 +4531,7 @@
         },
         {
           "name": "safety",
-          "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
+          "schema_digest": "15decddce4704d6bee2980603562727f50089c5abeb1f39a40aed33ce67bff54",
           "semantics": 1,
           "modes": [
             "classic",
@@ -4538,7 +4540,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n- 'purge': Permanently delete this session's undo backups and checkpoint copies of 'path' (a file, or everything under a directory); cannot be undone.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4551,11 +4553,12 @@
                   "history",
                   "checkpoint",
                   "restore",
-                  "list"
+                  "list",
+                  "purge"
                 ]
               },
               "path": {
-                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file, required for purge — a file or directory). Absolute or relative to project root",
                 "type": "string"
               },
               "name": {
@@ -4800,8 +4803,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "bfebba083fa993a748f3401b99a17ae4c92485c7bc44b2cdb3858cc17537099e",
-      "catalog_digest": "bfebba083fa993a748f3401b99a17ae4c92485c7bc44b2cdb3858cc17537099e",
+      "generation": "f49aba543fe9a55451399b6b139f8d0a073b8fed369926ecfbb3c91f1dadfa9a",
+      "catalog_digest": "f49aba543fe9a55451399b6b139f8d0a073b8fed369926ecfbb3c91f1dadfa9a",
       "tools": [
         {
           "name": "status",
@@ -5861,7 +5864,7 @@
         },
         {
           "name": "safety",
-          "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
+          "schema_digest": "15decddce4704d6bee2980603562727f50089c5abeb1f39a40aed33ce67bff54",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5870,7 +5873,7 @@
           "capabilities": [
             "aft:safety/v1"
           ],
-          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot (on disk across restarts; expires in 14 days; may contain secrets). Explicit files may be untracked/gitignored; omit for backup-tracked files. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n- 'purge': Permanently delete this session's undo backups and checkpoint copies of 'path' (a file, or everything under a directory); cannot be undone.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5883,11 +5886,12 @@
                   "history",
                   "checkpoint",
                   "restore",
-                  "list"
+                  "list",
+                  "purge"
                 ]
               },
               "path": {
-                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file, required for purge — a file or directory). Absolute or relative to project root",
                 "type": "string"
               },
               "name": {

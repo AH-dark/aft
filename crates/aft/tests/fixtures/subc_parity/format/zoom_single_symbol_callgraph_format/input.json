@@ -9,6 +9,7 @@
       "start_line": 10,
       "end_line": 12
     },
+    "text": "src/main.ts:10-12 [function run]\n\n 9: const value = 1;\n10: function run() {\n11:   helper();\n12: }\n13: run();\n\n──── calls_out\n  helper (line 11) +2\n\n──── called_by (this file)\n  main (line 20)",
     "content": "function run() {\n  helper();\n}",
     "context_before": [
       "const value = 1;"
@@ -34,7 +35,7 @@
   },
   "ctx": {
     "agent_args": {
-      "filePath": "src/main.ts",
+      "path": "src/main.ts",
       "symbols": "run",
       "callgraph": true
     },

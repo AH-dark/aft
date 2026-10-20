@@ -1,7 +1,7 @@
 {
   "agent_args": {
-    "filePath": "<PROJECT_ROOT>/src/main.ts",
-    "op": "undo"
+    "op": "undo",
+    "path": "<PROJECT_ROOT>/src/main.ts"
   },
   "project_root": "<PROJECT_ROOT>",
   "tool_name": "safety"

@@ -172,7 +172,9 @@ function translateAftSafetyToolCall(rawArgs: Record<string, unknown>): BridgeCal
         : op === "checkpoint"
           ? "checkpoint"
           : op === "restore"
-            ? "restore_checkpoint"
+          ? "restore_checkpoint"
+          : op === "purge"
+            ? "safety_purge"
             : "list_checkpoints";
   const params: Record<string, unknown> = {};
   if (rawArgs.name !== undefined) params.name = rawArgs.name;
@@ -348,7 +350,6 @@ function successForTranslate(command: string, params: Record<string, unknown>): 
   return { id: "translate", success: true, text: "" };
 }
 
-
 function translateAftZoomToolCall(rawArgs: Record<string, unknown>): BridgeCall {
   const batch = rawArgs.batch as Array<{ target?: string; symbols?: string | string[] }>;
   const targets = batch.map((entry, index) => {
@@ -439,36 +440,17 @@ async function captureFormatCase(caseDef: FormatCase): Promise<void> {
     expected = formatStatus(caseDef.native_response_json);
   } else {
     const calls: BridgeCall[] = [];
-    const multiTargetResponses = zoomMultiTargetResponses(caseDef.native_response_json);
-    let multiTargetIndex = 0;
-    const ctx = makeCtx(calls, (command, params) => {
-      if (command === "apply_patch" && params.preview === true) {
-        return {
-          id: "preview",
-          success: true,
-          preview: true,
-          preview_diff: `Index: ${PROJECT_ROOT}/src/main.ts\n--- ${PROJECT_ROOT}/src/main.ts\n+++ ${PROJECT_ROOT}/src/main.ts\n`,
-          affected_paths: [`${PROJECT_ROOT}/src/main.ts`],
-          affected_rel_paths: ["src/main.ts"],
-          filepath: "src/main.ts",
-          text: "",
-        };
-      }
-      if (params.preview === true) {
-        return { id: "preview", success: true, diff: { before: "old\n", after: "new\n" } };
-      }
-      if (caseDef.tool_name === "zoom" && command === "zoom" && multiTargetResponses) {
-        return multiTargetResponses[multiTargetIndex++] ?? { success: false, message: "missing zoom response" };
-      }
-      return caseDef.server_text === undefined
+    const ctx = makeCtx(calls, () =>
+      caseDef.server_text === undefined
         ? caseDef.native_response_json
-        : { ...caseDef.native_response_json, text: caseDef.server_text };
-    });
+        : { ...caseDef.native_response_json, text: caseDef.server_text },
+    );
     const def = tools(ctx)[caseDef.tool_name];
     if (!def) throw new Error(`missing tool ${caseDef.tool_name}`);
     try {
       const result = await def.execute(caseDef.agent_args, makeRuntime());
-      expected = typeof result === "string" ? result : String((result as { output?: unknown }).output ?? "");
+      expected =
+        typeof result === "string" ? result : String((result as { output?: unknown }).output ?? "");
     } catch (error) {
       expected = error instanceof Error ? error.message : String(error);
     }
@@ -531,13 +513,16 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "import_organize_translate", tool_name: "import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "import_add_missing_module", tool_name: "import", expected_error: "'module' is required for 'add' op", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "import_missing_file_path", tool_name: "import", expected_error: "aft_import: missing required param 'filePath'", agent_args: { op: "organize" } },
-  { name: "safety_undo_file", tool_name: "safety", agent_args: { op: "undo", filePath: `${PROJECT_ROOT}/src/main.ts` } },
-  { name: "safety_history_file", tool_name: "safety", agent_args: { op: "history", filePath: `${PROJECT_ROOT}/src/main.ts` } },
-  { name: "safety_checkpoint_files", tool_name: "safety", agent_args: { op: "checkpoint", name: "before-edit", files: [`${PROJECT_ROOT}/src/main.ts`, "docs/guide.md"] } },
-  { name: "safety_checkpoint_filePath", tool_name: "safety", agent_args: { op: "checkpoint", name: "single-file", filePath: "src/main.ts" } },
+  { name: "safety_undo_file", tool_name: "safety", agent_args: { op: "undo", path: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "safety_history_file", tool_name: "safety", agent_args: { op: "history", path: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "safety_checkpoint_files", tool_name: "safety", agent_args: { op: "checkpoint", name: "before-edit", files: [`${PROJECT_ROOT}/src/main.ts`, `${PROJECT_ROOT}/docs/guide.md`] } },
+  { name: "safety_checkpoint_path", tool_name: "safety", agent_args: { op: "checkpoint", name: "single-file", path: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "safety_restore_name", tool_name: "safety", agent_args: { op: "restore", name: "before-edit" } },
   { name: "safety_list", tool_name: "safety", agent_args: { op: "list" } },
-  { name: "safety_missing_filePath_for_history", tool_name: "safety", expected_error: "'filePath' is required for 'history' op", agent_args: { op: "history" } },
+  { name: "safety_purge_file", tool_name: "safety", agent_args: { op: "purge", path: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "safety_purge_directory", tool_name: "safety", agent_args: { op: "purge", path: `${PROJECT_ROOT}/src` } },
+  { name: "safety_missing_path_for_history", tool_name: "safety", expected_error: "'path' is required for 'history' op", agent_args: { op: "history" } },
+  { name: "safety_missing_path_for_purge", tool_name: "safety", expected_error: "'path' is required for 'purge' op", agent_args: { op: "purge" } },
   { name: "safety_missing_name_for_checkpoint", tool_name: "safety", expected_error: "'name' is required for 'checkpoint' op", agent_args: { op: "checkpoint" } },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
@@ -554,11 +539,11 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "zoom_batch_empty_translate", tool_name: "zoom", agent_args: { batch: [] } },
   { name: "zoom_batch_conflict_translate", tool_name: "zoom", agent_args: { batch: [{ target: "a.ts", url: "b.ts", symbols: "run" }] } },
   { name: "zoom_url_translate", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features", contextLines: 2 } },
-  { name: "zoom_single_symbol_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run", contextLines: 2, callgraph: true } },
-  { name: "zoom_multi_symbol_batch_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: ["run", "missing"] } },
-  { name: "zoom_multitarget_all_success_translate", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "Guide" }], contextLines: 2, callgraph: true } },
-  { name: "zoom_multitarget_partial_translate", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "missing" }] } },
-  { name: "zoom_multitarget_file_error_translate", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "missing.ts", symbol: "run" }] } },
+  { name: "zoom_single_symbol_translate", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: "run", contextLines: 2, callgraph: true } },
+  { name: "zoom_multi_symbol_batch_translate", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: ["run", "missing"] } },
+  { name: "zoom_multitarget_all_success_translate", tool_name: "zoom", agent_args: { targets: [{ path: "src/main.ts", symbol: "run" }, { path: "docs/guide.md", symbol: "Guide" }], contextLines: 2, callgraph: true } },
+  { name: "zoom_multitarget_partial_translate", tool_name: "zoom", agent_args: { targets: [{ path: "src/main.ts", symbol: "run" }, { path: "docs/guide.md", symbol: "missing" }] } },
+  { name: "zoom_multitarget_file_error_translate", tool_name: "zoom", agent_args: { targets: [{ path: "src/main.ts", symbol: "run" }, { path: "missing.ts", symbol: "run" }] } },
   { name: "callgraph_callers_translate", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "run", depth: 2, includeTests: true } },
   { name: "callgraph_call_tree_translate", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run", depth: 3 } },
   { name: "callgraph_trace_to_translate", tool_name: "callgraph", agent_args: { op: "trace_to", filePath: "src/main.ts", symbol: "handler", depth: 4, includeTests: false } },
@@ -689,15 +674,15 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "inspect_no_text_fallback", tool_name: "inspect", agent_args: {}, native_response_json: { id: "1", success: true, summary: { diagnostics: { errors: 0, warnings: 1, info: 0, hints: 0 } } } },
   { name: "inspect_duplicate_guard", tool_name: "inspect", agent_args: {}, native_response_json: { id: "1", success: true, text: "summary\nDiagnostics: already rendered", summary: { diagnostics: { errors: 1, warnings: 0, info: 0, hints: 0 } } } },
   { name: "edit_error_message_only", tool_name: "edit", agent_args: { filePath: "src/main.ts", oldString: "x", newString: "y" }, native_response_json: { id: "1", success: false, code: "invalid_request", message: "edit failed clearly" } },
-  { name: "zoom_url_format", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features" }, native_response_json: { id: "1", success: true, name: "Features", kind: "heading", range: { start_line: 5, end_line: 7 }, content: "## Features\n\nFeature details live here.", context_before: ["Intro paragraph for the document.", ""], context_after: ["### Fast Path"], annotations: { calls_out: [], called_by: [] } } },
-  { name: "zoom_single_symbol_callgraph_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run", callgraph: true }, native_response_json: { id: "1", success: true, name: "run", kind: "function", range: { start_line: 10, end_line: 12 }, content: "function run() {\n  helper();\n}", context_before: ["const value = 1;"], context_after: ["run();"], annotations: { calls_out: [{ name: "helper", line: 11, extra_count: 2 }], called_by: [{ name: "main", line: 20 }] } } },
-  { name: "zoom_multi_symbol_batch_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run missing" }, native_response_json: { id: "1", success: true, complete: false, symbols: [{ name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { name: "missing", response: { id: "missing", success: false, code: "symbol_not_found", message: "symbol 'missing' not found" } }] } },
-  { name: "zoom_multitarget_all_success_format", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "Guide" }], callgraph: true }, native_response_json: { id: "1", success: true, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  helper();\n}", context_before: [], context_after: [], annotations: { calls_out: [{ name: "helper", line: 2 }], called_by: [] } } }, { targetLabel: "docs/guide.md", name: "Guide", response: { id: "guide", success: true, name: "Guide", kind: "heading", range: { start_line: 5, end_line: 6 }, content: "## Guide\nDetails.", context_before: ["# parity"], context_after: [], annotations: { calls_out: [], called_by: [] } } }] } },
-  { name: "zoom_multitarget_partial_format", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "docs/guide.md", symbol: "missing" }] }, native_response_json: { id: "1", success: true, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { targetLabel: "docs/guide.md", name: "missing", response: { id: "missing", success: false, code: "symbol_not_found", message: "symbol 'missing' not found" } }] } },
-  { name: "zoom_multitarget_file_error_format", tool_name: "zoom", agent_args: { targets: [{ filePath: "src/main.ts", symbol: "run" }, { filePath: "missing.ts", symbol: "run" }] }, native_response_json: { id: "1", success: true, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { targetLabel: "missing.ts", name: "run", response: { id: "missing-file", success: false, code: "file_not_found", message: "file not found: <PROJECT_ROOT>/missing.ts" } }] } },
-  { name: "zoom_large_container_member_menu_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "BigContainer" }, native_response_json: { id: "1", success: true, name: "BigContainer", kind: "class", range: { start_line: 1, end_line: 200 }, content: "class BigContainer (2 members) — member-signature menu; zoom a member for its body\nBigContainer\n  .BigContainer.methodOne(): number\n  .BigContainer.methodTwo(): void", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } },
-  { name: "zoom_ambiguous_name_candidates_format", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run" }, native_response_json: { id: "1", success: true, name: "run", kind: "ambiguous_symbol", content: "symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body\n- run() — function run(): void\n- Worker.run() — method run(): Promise<void>", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] }, candidates: [{ name: "run", qualified_name: "run", kind: "function", signature: "run(): void" }, { name: "run", qualified_name: "Worker.run", kind: "method", signature: "run(): Promise<void>" }] } },
-  { name: "zoom_single_symbol_not_found_error", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "missing" }, native_response_json: { id: "1", success: false, code: "symbol_not_found", message: "symbol 'missing' not found, did you mean: [run]" } },
+  { name: "zoom_url_format", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features" }, native_response_json: { id: "1", success: true, text: `https://example.com/doc:5-7 [heading Features]\n\n3: Intro paragraph for the document.\n4: \n5: ## Features\n6: \n7: Feature details live here.\n8: ### Fast Path`, name: "Features", kind: "heading", range: { start_line: 5, end_line: 7 }, content: "## Features\n\nFeature details live here.", context_before: ["Intro paragraph for the document.", ""], context_after: ["### Fast Path"], annotations: { calls_out: [], called_by: [] } } },
+  { name: "zoom_single_symbol_callgraph_format", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: "run", callgraph: true }, native_response_json: { id: "1", success: true, name: "run", kind: "function", range: { start_line: 10, end_line: 12 }, text: `src/main.ts:10-12 [function run]\n\n 9: const value = 1;\n10: function run() {\n11:   helper();\n12: }\n13: run();\n\n──── calls_out\n  helper (line 11) +2\n\n──── called_by (this file)\n  main (line 20)`, content: "function run() {\n  helper();\n}", context_before: ["const value = 1;"], context_after: ["run();"], annotations: { calls_out: [{ name: "helper", line: 11, extra_count: 2 }], called_by: [{ name: "main", line: 20 }] } } },
+  { name: "zoom_multi_symbol_batch_format", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: ["run", "missing"] }, native_response_json: { id: "1", success: true, text: `Incomplete zoom results: one or more symbols failed.\n\nsrc/main.ts:1-3 [function run]\n\n1: function run() {\n2:   return 1;\n3: }\n\nSymbol "missing" not found: symbol 'missing' not found`, complete: false, symbols: [{ name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { name: "missing", response: { id: "missing", success: false, code: "symbol_not_found", message: "symbol 'missing' not found" } }] } },
+  { name: "zoom_multitarget_all_success_format", tool_name: "zoom", agent_args: { targets: [{ path: "src/main.ts", symbol: "run" }, { path: "docs/guide.md", symbol: "Guide" }], callgraph: true }, native_response_json: { id: "1", success: true, text: `src/main.ts:1-3 [function run]\n\n1: function run() {\n2:   helper();\n3: }\n\n──── calls_out\n  helper (line 2)\n\ndocs/guide.md:5-6 [heading Guide]\n\n4: # parity\n5: ## Guide\n6: Details.`, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  helper();\n}", context_before: [], context_after: [], annotations: { calls_out: [{ name: "helper", line: 2 }], called_by: [] } } }, { targetLabel: "docs/guide.md", name: "Guide", response: { id: "guide", success: true, name: "Guide", kind: "heading", range: { start_line: 5, end_line: 6 }, content: "## Guide\nDetails.", context_before: ["# parity"], context_after: [], annotations: { calls_out: [], called_by: [] } } }] } },
+  { name: "zoom_multitarget_partial_format", tool_name: "zoom", agent_args: { targets: [{ path: "src/main.ts", symbol: "run" }, { path: "docs/guide.md", symbol: "missing" }] }, native_response_json: { id: "1", success: true, text: `Incomplete zoom results: one or more symbols failed.\n\nsrc/main.ts:1-3 [function run]\n\n1: function run() {\n2:   return 1;\n3: }\n\nSymbol "missing" not found in docs/guide.md: symbol 'missing' not found`, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { targetLabel: "docs/guide.md", name: "missing", response: { id: "missing", success: false, code: "symbol_not_found", message: "symbol 'missing' not found" } }] } },
+  { name: "zoom_multitarget_file_error_format", tool_name: "zoom", agent_args: { targets: [{ path: "src/main.ts", symbol: "run" }, { path: "missing.ts", symbol: "run" }] }, native_response_json: { id: "1", success: true, text: `Incomplete zoom results: one or more symbols failed.\n\nsrc/main.ts:1-3 [function run]\n\n1: function run() {\n2:   return 1;\n3: }\n\nSymbol "run" not found in missing.ts: file not found: <PROJECT_ROOT>/missing.ts`, targets: [{ targetLabel: "src/main.ts", name: "run", response: { id: "run", success: true, name: "run", kind: "function", range: { start_line: 1, end_line: 3 }, content: "function run() {\n  return 1;\n}", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } }, { targetLabel: "missing.ts", name: "run", response: { id: "missing-file", success: false, code: "file_not_found", message: "file not found: <PROJECT_ROOT>/missing.ts" } }] } },
+  { name: "zoom_large_container_member_menu_format", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: "BigContainer" }, native_response_json: { id: "1", success: true, text: `src/main.ts:1-200 [class BigContainer]\n\n  1: class BigContainer (2 members) — member-signature menu; zoom a member for its body\n  2: BigContainer\n  3:   .BigContainer.methodOne(): number\n  4:   .BigContainer.methodTwo(): void`, name: "BigContainer", kind: "class", range: { start_line: 1, end_line: 200 }, content: "class BigContainer (2 members) — member-signature menu; zoom a member for its body\nBigContainer\n  .BigContainer.methodOne(): number\n  .BigContainer.methodTwo(): void", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] } } },
+  { name: "zoom_ambiguous_name_candidates_format", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: "run" }, native_response_json: { id: "1", success: true, text: `src/main.ts:1-1 [ambiguous_symbol run]\n\n1: symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body\n2: - run() — function run(): void\n3: - Worker.run() — method run(): Promise<void>`, name: "run", kind: "ambiguous_symbol", content: "symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body\n- run() — function run(): void\n- Worker.run() — method run(): Promise<void>", context_before: [], context_after: [], annotations: { calls_out: [], called_by: [] }, candidates: [{ name: "run", qualified_name: "run", kind: "function", signature: "run(): void" }, { name: "run", qualified_name: "Worker.run", kind: "method", signature: "run(): Promise<void>" }] } },
+  { name: "zoom_single_symbol_not_found_error", tool_name: "zoom", agent_args: { path: "src/main.ts", symbols: "missing" }, native_response_json: { id: "1", success: false, code: "symbol_not_found", message: "symbol 'missing' not found, did you mean: [run]" } },
   { name: "callgraph_callers_format", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "leaf" }, native_response_json: { id: "1", success: true, total_callers: 3, depth_limited: true, truncated: 2, hub_summary: { message: "Showing first 20 callers; 7 omitted high-fan-in callers." }, callers: [{ file: `${PROJECT_ROOT}/src/main.ts`, callers: [{ symbol: "run", line: 12 }, { symbol: "run", line: 9 }, { symbol: "fallback", line: 30, resolved_by: "name_match" }] }, { file: `${HOME_ROOT}/aft-callgraph-home.ts`, callers: [{ symbol: "homeCaller", line: 5 }] }] } },
   { name: "callgraph_call_tree_format", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run", includeUnresolved: true }, native_response_json: { id: "1", success: true, name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 1, depth_limited: true, truncated: 1, children: [{ name: "helper", file: `${PROJECT_ROOT}/src/helper.ts`, line: 4, resolved_by: "name_match", children: [{ name: "external", file: `${PROJECT_ROOT}/src/helper.ts`, line: 5, resolved: false, children: [] }] }] } },
   { name: "callgraph_call_tree_unresolved_collapse", tool_name: "callgraph", agent_args: { op: "call_tree", filePath: "src/main.ts", symbol: "run" }, native_response_json: { id: "1", success: true, name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 1, children: [{ name: "alpha", file: `${PROJECT_ROOT}/src/main.ts`, line: 2, resolved: false, children: [] }, { name: "beta", file: `${PROJECT_ROOT}/src/main.ts`, line: 3, resolved: false, children: [] }, { name: "gamma", file: `${PROJECT_ROOT}/src/main.ts`, line: 4, resolved: false, children: [] }, { name: "delta", file: `${PROJECT_ROOT}/src/main.ts`, line: 5, resolved: false, children: [] }, { name: "epsilon", file: `${PROJECT_ROOT}/src/main.ts`, line: 6, resolved: false, children: [] }, { name: "zeta", file: `${PROJECT_ROOT}/src/main.ts`, line: 7, resolved: false, children: [] }, { name: "eta", file: `${PROJECT_ROOT}/src/main.ts`, line: 8, resolved: false, children: [] }, { name: "theta", file: `${PROJECT_ROOT}/src/main.ts`, line: 9, resolved: false, children: [] }, { name: "iota", file: `${PROJECT_ROOT}/src/main.ts`, line: 10, resolved: false, children: [] }, { name: "kappa", file: `${PROJECT_ROOT}/src/main.ts`, line: 11, resolved: false, children: [] }, { name: "lambda", file: `${PROJECT_ROOT}/src/main.ts`, line: 12, resolved: false, children: [] }, { name: "project", file: `${PROJECT_ROOT}/src/project.ts`, line: 13, resolved: true, children: [] }] } },
@@ -720,17 +705,23 @@ if (onlyIndex >= 0 && (!onlyFilter || onlyFilter.startsWith("--"))) {
   throw new Error("--only requires a fixture-name substring");
 }
 
-if (!onlyFilter) {
-  rmSync(FIXTURES_ROOT, { recursive: true, force: true });
-}
-mkdirSync(FIXTURES_ROOT, { recursive: true });
-
 const translateCases = onlyFilter
   ? TRANSLATE_CASES.filter((caseDef) => caseDef.name.includes(onlyFilter))
   : TRANSLATE_CASES;
 const formatCases = onlyFilter
   ? FORMAT_CASES.filter((caseDef) => caseDef.name.includes(onlyFilter))
   : FORMAT_CASES;
+
+// Keep manually maintained parity cases that are not in the capture lists.
+// Clear only directories this run will regenerate, rather than deleting the
+// entire corpus and silently dropping coverage that this script does not own.
+for (const caseDef of translateCases) {
+  rmSync(join(FIXTURES_ROOT, "translate", caseDef.name), { recursive: true, force: true });
+}
+for (const caseDef of formatCases) {
+  rmSync(join(FIXTURES_ROOT, "format", caseDef.name), { recursive: true, force: true });
+}
+mkdirSync(FIXTURES_ROOT, { recursive: true });
 
 for (const caseDef of translateCases) {
   await captureTranslateCase(caseDef);

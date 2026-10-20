@@ -3,6 +3,7 @@
   "native_response_json": {
     "id": "1",
     "success": true,
+    "text": "Incomplete zoom results: one or more symbols failed.\n\nsrc/main.ts:1-3 [function run]\n\n1: function run() {\n2:   return 1;\n3: }\n\nSymbol \"missing\" not found in docs/guide.md: symbol 'missing' not found",
     "targets": [
       {
         "targetLabel": "src/main.ts",
@@ -41,11 +42,11 @@
     "agent_args": {
       "targets": [
         {
-          "filePath": "src/main.ts",
+          "path": "src/main.ts",
           "symbol": "run"
         },
         {
-          "filePath": "docs/guide.md",
+          "path": "docs/guide.md",
           "symbol": "missing"
         }
       ]

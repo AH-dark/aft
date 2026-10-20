@@ -9,5 +9,5 @@ src/main.ts:10-12 [function run]
 ──── calls_out
   helper (line 11) +2
 
-──── called_by
+──── called_by (this file)
   main (line 20)

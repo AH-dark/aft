@@ -120,6 +120,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
         ("PATH", OsStr::new(CONTROLLED_PATH)),
         ("LC_ALL", OsStr::new("C")),
         ("LANG", OsStr::new("C")),
+        ("HOME", aft_home.as_os_str()),
         (
             "AFT_BASH_REWRITE_ROUTE_RECORD",
             route_file.path().as_os_str(),
@@ -150,7 +151,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
     } else {
         aft_root.path().join(&row.workdir)
     };
-    let aft_response = run_aft(&mut aft, row, &workdir, &aft_home);
+    let aft_response = run_aft(&mut aft, row, &workdir);
     let shutdown = aft.shutdown();
     if !shutdown.success() {
         return Err(format!("AFT shutdown failed: {shutdown:?}"));
@@ -235,20 +236,11 @@ fn run_oracle(
     ))
 }
 
-fn run_aft(
-    aft: &mut AftProcess,
-    row: &CorpusRow,
-    workdir: &Path,
-    home: &Path,
-) -> Result<Value, String> {
-    // PATH is deliberately inherited from the AFT child process. The public
-    // bash contract rejects PATH in the per-command env map, while the child
-    // process itself is launched with the controlled PATH above.
-    let env = json!({
-        "LC_ALL": "C",
-        "LANG": "C",
-        "HOME": home,
-    });
+fn run_aft(aft: &mut AftProcess, row: &CorpusRow, workdir: &Path) -> Result<Value, String> {
+    // The process and oracle use identical locale and home settings. Put those
+    // deterministic test controls on the child environment instead of the
+    // request: request-level env overrides intentionally require shell execution
+    // and should not disable the rewrite routes this differential test covers.
     let mut response = aft.send(
         &json!({
             "id": row.id,
@@ -256,7 +248,6 @@ fn run_aft(
             "params": {
                 "command": row.command,
                 "workdir": workdir,
-                "env": env,
                 "compressed": false,
             },
         })
