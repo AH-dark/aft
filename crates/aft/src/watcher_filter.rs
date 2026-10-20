@@ -3528,6 +3528,9 @@ mod tests {
             )]),
             "an overflowing backlog must fall back to a rescan"
         );
+        // Overflows are logged as one summary per burst, written when the
+        // burst ends; end it here instead of waiting for the quiet period.
+        filter.flush_overflow_summary();
         let root_label = format!("root={}", root.display());
         assert!(
             take_watcher_overflow_logs_for_test()
