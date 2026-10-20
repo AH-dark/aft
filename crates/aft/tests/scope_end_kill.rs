@@ -820,7 +820,9 @@ async fn first_party_worker_bash_runs_with_default_relaxed_and_reports_unenforce
         let output = body(&reply).to_string();
         assert!(output.contains("relaxed-worker-ran"), "{output}");
         assert!(
-            output.contains("profile=relaxed unenforced=[all filesystem read/write denies]"),
+            output.contains(
+                "profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"
+            ),
             "{output}"
         );
         assert!(
