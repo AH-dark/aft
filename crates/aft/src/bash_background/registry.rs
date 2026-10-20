@@ -1222,6 +1222,8 @@ pub(crate) struct BgTaskState {
     /// The path stays in persisted metadata until this worker result succeeds,
     /// so a crash or a full queue leaves enough information for the stale sweep.
     temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
+    /// Spaces out removal attempts after this task's scratch removal failed.
+    temp_cleanup_retry: super::temp_cleanup::RetryBackoff,
     /// The scratch directory this task used, kept in memory after cleanup has
     /// deleted it and cleared `metadata.sandbox_temp_dir`. A later read of a
     /// path inside it by the same session can then fail as not-found instead
@@ -2630,12 +2632,15 @@ impl BgTaskRegistry {
         if metadata.remote.is_some() && !metadata.is_terminal() {
             return true;
         }
-        let child_pid = metadata.child_pid;
-        let group_leader = metadata.pgid.and_then(|pid| u32::try_from(pid).ok());
-        child_pid
+        Self::persisted_task_recorded_pids(metadata)
             .into_iter()
-            .chain(group_leader)
             .any(|pid| is_recorded_process_alive(pid, metadata.started_at))
+    }
+
+    /// The task's recorded child and process group leader, in that order.
+    fn persisted_task_recorded_pids(metadata: &PersistedTask) -> Vec<u32> {
+        let group_leader = metadata.pgid.and_then(|pid| u32::try_from(pid).ok());
+        metadata.child_pid.into_iter().chain(group_leader).collect()
     }
 
     fn db_has_live_process_for_task(&self, task_id: &str) -> bool {
@@ -3621,6 +3626,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
                 metadata,
@@ -3966,6 +3972,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
                 metadata,
@@ -4216,6 +4223,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
                 metadata,
@@ -6464,10 +6472,11 @@ impl BgTaskRegistry {
                     if !metadata.status.is_terminal()
                         || (!metadata.completion_delivered && !abandoned)
                     {
-                        // Only a finished, undelivered result is remembered: a
+                        // A finished, undelivered result is remembered: a
                         // delivery rewrites its metadata, and abandonment is
-                        // checked again on every visit. Unfinished tasks
-                        // depend on processes, so they are judged every time.
+                        // checked again on every visit. So is a running task
+                        // whose recorded process is alive; any other
+                        // unfinished task is judged every time.
                         if metadata.status.is_terminal() {
                             if let Some(evidence) = evidence.take() {
                                 memo.remember_undelivered(
@@ -6481,6 +6490,31 @@ impl BgTaskRegistry {
                                     },
                                 );
                             }
+                        } else if matches!(
+                            metadata.status,
+                            BgTaskStatus::Running | BgTaskStatus::Killing
+                        ) && metadata.remote.is_none()
+                        {
+                            // A running task stays until its recorded process
+                            // exits or its metadata changes, so later laps
+                            // probe that process instead of rereading the
+                            // task. `evidence` is gone if the exit was just
+                            // recovered above.
+                            let pids = Self::persisted_task_recorded_pids(&metadata);
+                            if pids
+                                .iter()
+                                .any(|pid| is_recorded_process_alive(*pid, metadata.started_at))
+                            {
+                                if let Some(evidence) = evidence.take() {
+                                    memo.remember_recorded_process(
+                                        &session_dir,
+                                        task_id,
+                                        evidence,
+                                        pids,
+                                        metadata.started_at,
+                                    );
+                                }
+                            }
                         }
                         continue;
                     }
@@ -6490,6 +6524,17 @@ impl BgTaskRegistry {
                     if metadata.sandbox_temp_dir.is_some()
                         && task_db_write_order_is_live(&metadata.session_id, task_id)
                     {
+                        // Later laps check that ownership instead of rereading
+                        // the task; the removal's own metadata write, or the
+                        // owner going away, makes the sweep judge it again.
+                        if let Some(evidence) = evidence.take() {
+                            memo.remember_scratch_owner(
+                                &session_dir,
+                                task_id,
+                                evidence,
+                                &metadata.session_id,
+                            );
+                        }
                         continue;
                     }
                     if Self::persisted_task_process_is_alive(&metadata) || live_in_db(self, task_id)
@@ -8114,8 +8159,16 @@ impl BgTaskRegistry {
                 }
             };
             state.temp_cleanup = None;
-            result?;
+            if let Err(error) = result {
+                state.temp_cleanup_retry.failed(Instant::now());
+                return Err(error);
+            }
         } else {
+            // A removal that just failed is not rescheduled until its backoff
+            // ends; this is called on every watchdog pass.
+            if !state.temp_cleanup_retry.ready(Instant::now()) {
+                return Ok(false);
+            }
             state.temp_cleanup = super::temp_cleanup::schedule(&path, task.db_write_order.clone());
             return Ok(false);
         }
@@ -8297,6 +8350,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                temp_cleanup_retry: Default::default(),
                 removed_temp_dir: None,
                 scratch_released: false,
                 metadata,
@@ -14034,6 +14088,51 @@ mod tests {
             );
             assert!(scratch.exists());
         }
+        wait_for_task_temp_cleanup(&registry, &task);
+        assert!(!scratch.exists());
+    }
+
+    /// A scratch removal that fails every time is retried with growing waits,
+    /// not rescheduled on every observer call: every watchdog pass asks again,
+    /// and unspaced retries kept the removal worker busy around the clock.
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_terminal_temp_cleanup_backs_off_after_failed_removal() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.sandbox_temp_dir = Some(scratch.clone());
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        super::super::temp_cleanup::fail_removal(&scratch);
+        // Ask far more often than the watchdog's two passes a second.
+        let started = Instant::now();
+        let mut calls = 0usize;
+        while started.elapsed() < Duration::from_millis(2_500) {
+            let _ = registry.cleanup_terminal_task_temp(&task);
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let attempts = super::super::temp_cleanup::stop_failing_removal(&scratch);
+        eprintln!(
+            "persistently failing scratch removal: {attempts} removal attempts for {calls} observer calls in 2.5s"
+        );
+        assert!(attempts >= 1, "the failing removal was never attempted");
+        // One attempt at once, one after the first one-second wait, and the
+        // next only after a further two seconds.
+        assert!(
+            attempts <= 3,
+            "a failing scratch removal was retried on every observer call: {attempts} attempts for {calls} calls"
+        );
+        assert!(scratch.exists());
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().sandbox_temp_dir,
+            Some(scratch.clone()),
+            "a failed removal must keep the scratch path for later attempts"
+        );
         wait_for_task_temp_cleanup(&registry, &task);
         assert!(!scratch.exists());
     }

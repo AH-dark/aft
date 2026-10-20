@@ -248,6 +248,85 @@ fn watchdog_cost_persisted_gc_reopens_only_changed_tasks() {
     assert!(paths.iter().all(|path| path.json.exists()));
 }
 
+/// Running tasks whose recorded process is alive, and finished tasks that a
+/// registry in this process still owns while it removes their scratch folder,
+/// are kept on every lap. Later laps check that process or that ownership
+/// instead of reopening and rereading each task, and judge a task again as
+/// soon as the process exits or the ownership ends.
+#[cfg(unix)]
+#[test]
+fn watchdog_cost_persisted_gc_skips_unchanged_running_and_scratch_owned_tasks() {
+    const EACH: usize = 100;
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    // Spawned before the fixtures are written, so their start times are not
+    // earlier than the process start (an older task start would read as a
+    // recycled process id).
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
+    let mut running = Vec::new();
+    for _ in 0..EACH {
+        let (_, paths) = fixture(storage.path(), "session-running", true, 0);
+        rewrite_fixture(&paths, |metadata| {
+            metadata.mark_running(child.id(), child.id() as i32);
+            metadata.finished_at = None;
+            metadata.duration_ms = None;
+        });
+        running.push(paths);
+    }
+    let mut owned = Vec::new();
+    let mut owners = Vec::new();
+    for index in 0..EACH {
+        let (_, paths) = fixture(storage.path(), "session-owned", true, 2);
+        rewrite_fixture(&paths, |metadata| {
+            metadata.sandbox_temp_dir = Some(storage.path().join(format!("scratch-{index}")));
+        });
+        owners.push(DbWriteOrder::for_task("session-owned", &paths.task_id));
+        owned.push(paths);
+    }
+
+    gc_until_lap(&registry, storage.path(), 1);
+    work_counts::reset();
+    for _ in 0..8 {
+        assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 0);
+    }
+    let unchanged = work_counts::get();
+    eprintln!(
+        "8 passes over {EACH} running and {EACH} scratch-owned unchanged tasks: {unchanged:?}"
+    );
+    assert_eq!(
+        unchanged.metadata_reads, 0,
+        "unchanged running or scratch-owned tasks were reread on every lap: {unchanged:?}"
+    );
+    assert_eq!(gc_health(storage.path()).remembered_tasks, 2 * EACH);
+    assert!(running.iter().chain(&owned).all(|path| path.json.exists()));
+
+    // The ownership ends: the finished, delivered tasks are deleted on the
+    // next lap.
+    drop(owners);
+    let laps = gc_health(storage.path()).laps_completed;
+    gc_until_lap(&registry, storage.path(), laps + 1);
+    assert!(
+        owned.iter().all(|path| !path.dir.exists()),
+        "a remembered task outlived the end of its scratch ownership"
+    );
+
+    // The process exits: the running tasks are read and judged again.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    work_counts::reset();
+    let laps = gc_health(storage.path()).laps_completed;
+    gc_until_lap(&registry, storage.path(), laps + 1);
+    let after_exit = work_counts::get();
+    eprintln!("one lap after the recorded process exited: {after_exit:?}");
+    assert!(
+        after_exit.metadata_reads >= EACH,
+        "running tasks were not judged again after their process exited: {after_exit:?}"
+    );
+}
+
 fn gc_health(storage: &Path) -> crate::bash_background::PersistedGcHealth {
     super::super::gc_memo::persisted_gc_health_for(&canonicalized_path(&storage.join("bash-tasks")))
         .expect("sweep health recorded")

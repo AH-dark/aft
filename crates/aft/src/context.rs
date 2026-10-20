@@ -1389,6 +1389,9 @@ pub(crate) struct WatcherCounters {
     /// Call-graph source files the watcher thread has received but is still
     /// holding in its flush window, before they reach the dispatch channel.
     unflushed_source_paths: Mutex<BTreeSet<PathBuf>>,
+    /// Events the watcher thread is holding because the dispatch channel was
+    /// full when it tried to hand them on.
+    dispatch_backlog_events: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1462,6 +1465,18 @@ impl WatcherCounters {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Record how many events the watcher thread holds for a full dispatch
+    /// channel.
+    pub(crate) fn set_dispatch_backlog(&self, events: usize) {
+        self.dispatch_backlog_events
+            .store(events, Ordering::Release);
+    }
+
+    /// Events the watcher thread holds because the dispatch channel was full.
+    pub(crate) fn dispatch_backlog(&self) -> usize {
+        self.dispatch_backlog_events.load(Ordering::Acquire)
     }
 
     #[cfg(target_os = "linux")]
@@ -5748,10 +5763,20 @@ impl AppContext {
     /// advances `watcher_drain_activity` when it starts and when it ends, so
     /// reading it before and after the channel, slot and in-flight count
     /// catches any drain that moved work between those reads.
+    /// Events the watcher thread holds for a full dispatch channel are
+    /// pending too, even while the channel itself is momentarily empty.
     pub fn watcher_query_has_pending_changes(&self) -> bool {
         let activity = self.watcher_drain_activity.load(Ordering::Acquire);
         self.watcher_drain_has_work()
             || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
+            || match self.watcher_counters.try_read() {
+                Ok(counters) => counters.dispatch_backlog() > 0,
+                Err(std::sync::TryLockError::Poisoned(counters)) => {
+                    counters.into_inner().dispatch_backlog() > 0
+                }
+                // Contended: assume events may be held, as the probes above do.
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            }
             || self.watcher_drain_activity.load(Ordering::Acquire) != activity
     }
 
