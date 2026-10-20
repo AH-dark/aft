@@ -924,7 +924,7 @@ pub(crate) struct RegistryInner {
     /// persisted GC so a sweep never judges a session that replay is in the
     /// middle of restoring.
     session_recovery: Mutex<HashMap<String, SessionRecovery>>,
-    /// Project replay resumes its bounded disk scan on the next replay call
+    /// Project replay retains its iterator between bounded maintenance passes
     /// rather than restarting at the first session after every bind.
     project_replay_scan: Mutex<Option<ProjectReplayScanCursor>>,
     #[cfg(test)]
@@ -4545,6 +4545,34 @@ impl BgTaskRegistry {
         self.replay_session_inner(storage_dir, session_id, Some(project_root))
     }
 
+    pub(crate) fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {
+        let project_root = canonicalized_path(project_root);
+        self.inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|cursor| {
+                cursor.storage_dir == storage_dir
+                    && cursor.project_root == project_root
+                    && (cursor.current.is_some() || !cursor.sessions.is_empty())
+            })
+    }
+
+    /// Continue only the saved disk walk. The configure tail schedules one
+    /// batch at a time, releasing recovery guards and locks between batches.
+    pub(crate) fn continue_project_replay(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Result<bool, String> {
+        if self.project_replay_pending(storage_dir, project_root) {
+            self.replay_session_batch(storage_dir, session_id, Some(project_root), true)?;
+        }
+        Ok(self.project_replay_pending(storage_dir, project_root))
+    }
+
     pub(crate) fn repair_legacy_root_tasks(&self, storage_root: &Path, harness: Harness) {
         let root_tasks = storage_root.join("bash-tasks");
         // Replayed tasks pin their artifact directories, including after exit.
@@ -4749,6 +4777,16 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
+        self.replay_session_batch(storage_dir, session_id, project_root, false)
+    }
+
+    fn replay_session_batch(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: Option<&Path>,
+        continuation: bool,
+    ) -> Result<(), String> {
         // Held for the whole call: from here on this session's task directory is
         // being rewritten, and the persisted GC below sweeps the same storage
         // root from another thread. Tasks belonging to other sessions are
@@ -4757,9 +4795,11 @@ impl BgTaskRegistry {
         // Standalone NDJSON: every session for a project replays through the same
         // bridge, so replay unions this session into live delivery routes.
         // Only subc route synchronization (subc/mod.rs:2120) replaces the whole set.
-        self.record_live_delivery_session(session_id);
-        self.retire_orphaned_watch_tombstones(session_id)?;
-        self.start_watchdog();
+        if !continuation {
+            self.record_live_delivery_session(session_id);
+            self.retire_orphaned_watch_tombstones(session_id)?;
+            self.start_watchdog();
+        }
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -4787,7 +4827,32 @@ impl BgTaskRegistry {
         // (see GitHub user report against v0.27.0). INFO-level logs only when
         // disk actually returned tasks (real migration signal); WARN when the
         // DB lookup itself errored.
-        let tasks = match self.replay_session_from_db(session_id, project_root) {
+        let database_replay = if continuation {
+            None
+        } else {
+            self.replay_session_from_db(session_id, project_root)
+        };
+        let tasks = match database_replay {
+            _ if continuation => {
+                let batch = self.replay_session_from_disk_for_project(
+                    storage_dir,
+                    project_root.expect("project replay continuation requires a root"),
+                    std::iter::empty(),
+                    &HashSet::new(),
+                );
+                crate::slog_info!(
+                    "replay merged {} disk tasks; scan {}: {}, examined {}",
+                    batch.tasks.len(),
+                    if batch.incomplete_reason.is_some() {
+                        "incomplete"
+                    } else {
+                        "complete"
+                    },
+                    batch.incomplete_reason.unwrap_or("iterator exhausted"),
+                    batch.examined
+                );
+                batch.tasks
+            }
             Some(Ok(mut tasks)) if !tasks.is_empty() => {
                 // A task can be written to its disk bundle while this registry
                 // has no database pool. Preserve DB rows as authoritative for

@@ -6757,9 +6757,11 @@ impl ConfigureMaintenanceStage {
         }
     }
 
-    /// Stages a request's correctness depends on. They run to completion before
-    /// the first request after a configure is served: bash replay (a queued
-    /// `bash_drain_completions` must see the previous process's tasks), the
+    /// Initial work that runs before the first request after configure: bash
+    /// replay restores the DB tasks and one bounded disk batch, so an immediate
+    /// `bash_drain_completions` sees those results. Disk-only tasks beyond that
+    /// batch arrive through later maintenance and completion delivery rather
+    /// than delaying requests for a full disk scan. The prefix also prepares the
     /// project runtime (a queued `outline`/`glob` must see the rebuilt gitignore
     /// matcher), and the watcher start. The watcher only observes changes made
     /// after it subscribes, so a file written between the configure ack and the
@@ -7404,7 +7406,15 @@ fn run_configure_maintenance_unit_inner(
                     return ConfigureMaintenanceUnitResult::Complete;
                 }
                 replay_configure_session(ctx, job);
-                return ConfigureMaintenanceUnitResult::Complete;
+                if ctx
+                    .bash_background()
+                    .project_replay_pending(&job.harness_dir, &job.root_path)
+                {
+                    continuation.stage = ConfigureMaintenanceStage::Status;
+                } else {
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
+                return ConfigureMaintenanceUnitResult::Continue;
             }
 
             delay_configure_deferred_maintenance_for_test(&job.root_path);
@@ -7676,6 +7686,23 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::Status;
         }
         ConfigureMaintenanceStage::Status => {
+            // The cursor belongs to the root, not one configure generation.
+            // A newer tail also finishes a scan started by a superseded tail.
+            match ctx.bash_background().continue_project_replay(
+                &job.harness_dir,
+                &job.session_id,
+                &job.root_path,
+            ) {
+                Ok(true) => {
+                    ctx.signal_status_changed();
+                    return ConfigureMaintenanceUnitResult::Continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    slog_warn!("failed to continue background bash replay: {error}");
+                    return ConfigureMaintenanceUnitResult::Continue;
+                }
+            }
             ctx.signal_status_changed();
             return ConfigureMaintenanceUnitResult::Complete;
         }
@@ -8362,6 +8389,178 @@ mod tests {
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         super::handle_configure(req, ctx)
+    }
+
+    fn bash_background_replay_fixture(
+        count: usize,
+        budget: Option<usize>,
+    ) -> (
+        tempfile::TempDir,
+        TestContext,
+        super::ConfigureMaintenanceState,
+        Vec<String>,
+    ) {
+        use crate::bash_background::persistence::{create_task_layout, write_task, PersistedTask};
+        #[cfg(unix)]
+        {
+            // Hundreds of recovered tasks retain pinned directory handles.
+            // Leave headroom for sibling tests, and never lower their limit.
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit.rlim_cur = limit.rlim_cur.max(8192.min(limit.rlim_max));
+            assert!(
+                limit.rlim_cur >= 4096,
+                "replay fixture needs descriptor headroom"
+            );
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        }
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = test_context();
+        let response = handle_configure_for_test(
+            &configure_request_with_session(
+                json!({
+                    "project_root": project.path(),
+                    "storage_dir": ctx._storage.path(),
+                    "harness": "opencode",
+                    "config": [user_tier(json!({
+                        "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                        "views": {"enabled": false}
+                    }))]
+                }),
+                "bounded-recovery",
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        if let Some(budget) = budget {
+            ctx.bash_background()
+                .set_project_replay_scan_budget_for_test(budget, Duration::from_secs(5));
+        }
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let task_ids: Vec<_> = (0..count).map(|i| format!("bash-{i:016x}")).collect();
+        for task_id in &task_ids {
+            let layout = create_task_layout(&storage, "bounded-recovery", task_id).unwrap();
+            let paths = &layout.paths;
+            let mut metadata = PersistedTask::starting(
+                task_id.clone(),
+                "bounded-recovery".into(),
+                "printf recovered".into(),
+                project.path().into(),
+                Some(project.path().into()),
+                Some(30000),
+                true,
+                true,
+            );
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&paths.json, &metadata).unwrap();
+            fs::write(&paths.stdout, "recovered\n").unwrap();
+            fs::write(&paths.stderr, "").unwrap();
+        }
+        let mut state = super::ConfigureMaintenanceState::default();
+        assert!(super::drain_standalone_configure_prefix(&ctx, &mut state));
+        // Reach the yieldable tail without manually replaying or querying task
+        // status: only scheduled maintenance may discover the remaining tasks.
+        for _ in 0..30 {
+            if state
+                .jobs
+                .front()
+                .is_some_and(|job| job.stage == ConfigureMaintenanceStage::Status)
+            {
+                return (project, ctx, state, task_ids);
+            }
+            assert!(super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+        }
+        panic!("configure did not reach its status stage");
+    }
+
+    #[test]
+    fn bash_background_project_replay_maintenance_recovers_all_disk_tasks() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(520, None);
+        let registry = ctx.bash_background();
+        assert!(
+            task_ids
+                .iter()
+                .filter(|id| registry.task_for_test(id).is_some())
+                .count()
+                < task_ids.len()
+        );
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for _ in 0..1000 {
+                if !super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {
+                    break;
+                }
+            }
+        });
+        assert!(state.jobs.is_empty(), "the recovery scan must complete");
+        assert_eq!(
+            task_ids
+                .iter()
+                .filter(|id| registry.task_for_test(id).is_some())
+                .count(),
+            task_ids.len(),
+            "maintenance must recover every disk-only task: {logs:?}"
+        );
+        let completions = registry.drain_completions();
+        assert_eq!(
+            completions.len(),
+            task_ids.len(),
+            "every recovered task needs a completion notice"
+        );
+        assert!(
+            logs.iter().any(|line| line.contains("scan complete")),
+            "completion progress must be reported: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn bash_background_project_replay_maintenance_stops_on_unbind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(40, Some(8));
+        let registry = ctx.bash_background();
+        let before = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        assert!(
+            super::drain_deferred_configure_maintenance_unit(&ctx, &mut state),
+            "an incomplete scan must keep maintenance scheduled"
+        );
+        let after = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        assert!(
+            after > before,
+            "the continuation must actually scan before unbind"
+        );
+        assert!(task_ids
+            .iter()
+            .any(|id| registry.task_for_test(id).is_none()));
+        ctx.mark_subc_unbound();
+        assert!(!super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            Some(after),
+            "an unbound root must not scan another entry"
+        );
+        assert!(
+            state.jobs.is_empty(),
+            "unbound maintenance must be cancelled"
+        );
     }
 
     fn identical_bind_repairs_evicted_artifact_beside_reader(early_fast_path: bool) {
