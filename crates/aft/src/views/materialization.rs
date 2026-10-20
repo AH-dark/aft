@@ -113,8 +113,10 @@ pub(crate) mod profile;
 mod resolution_facts;
 
 // Rebuild older generations rather than retaining rows produced by the
-// per-reference skip optimization when reference ordinals collide.
-const MATERIALIZATION_VERSION: &str = "10";
+// per-reference skip optimization when reference ordinals collide, or Go
+// bindings whose package file listings were not recorded (an added sibling
+// `.go` file would never reselect them).
+const MATERIALIZATION_VERSION: &str = "11";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
