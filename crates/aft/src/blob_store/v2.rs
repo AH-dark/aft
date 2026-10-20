@@ -1318,6 +1318,46 @@ mod tests {
         );
     }
 
+    /// A store whose allocated pages already fit the byte budget skips the
+    /// payload scan, but its large free list must still be returned to the
+    /// file system in bounded passes, and the remaining work reported.
+    #[test]
+    fn family_gc_reclaims_large_freelists_when_the_store_fits_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::views::registry::FamilyRegistry::open(dir.path(), "family").unwrap();
+        let store = FamilyStore::open(&access(dir.path()), FamilyPlane::Semantic).unwrap();
+        {
+            // 320 MiB of free pages clears the production 256 MiB threshold.
+            let connection = lock(&store.inner.connection);
+            connection
+                .execute_batch(
+                    "CREATE TABLE reclaim_fixture (data BLOB);
+                INSERT INTO reclaim_fixture VALUES (zeroblob(335544320));
+                DELETE FROM reclaim_fixture;",
+                )
+                .unwrap();
+        }
+        let before = store.usage().unwrap().file_bytes;
+        let budget = store.payload_bytes_upper_bound().unwrap() * 2;
+        let report = crate::gc::family::sweep_family(
+            &registry,
+            None,
+            crate::gc::family::FamilySweepPolicy {
+                byte_budget: budget,
+            },
+            None,
+        )
+        .unwrap();
+        let after = store.usage().unwrap().file_bytes;
+        assert_eq!(report.deleted_blobs, 0);
+        assert_eq!(report.examined_blobs, 0, "the fitting store skips the scan");
+        assert_eq!(report.space_reclaim.examined_stores, 1);
+        assert!(report.space_reclaim.reclaimed_pages > 0);
+        assert!(report.space_reclaim.reclaimed_pages <= 4096);
+        assert!(before > after, "{before} -> {after}");
+        assert!(report.reclaim_deferred, "eligible free pages remain");
+    }
+
     #[test]
     fn a_reader_never_creates_a_store() {
         let dir = tempfile::tempdir().unwrap();
