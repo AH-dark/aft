@@ -85,6 +85,21 @@ pub(crate) struct RevisionSession {
     scratch_parent: PathBuf,
     scratch: RefCell<Option<ScratchDir>>,
     materialized: RefCell<HashMap<String, PathBuf>>,
+    symbol_cache: crate::parser::SharedSymbolCache,
+}
+
+impl Drop for RevisionSession {
+    fn drop(&mut self) {
+        // Staged paths are unique to this request and can never yield a cache
+        // hit later. Remove their symbols before the scratch files disappear.
+        let mut cache = self
+            .symbol_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for path in self.materialized.get_mut().values() {
+            cache.invalidate(path);
+        }
+    }
 }
 
 impl RevisionSession {
@@ -185,6 +200,12 @@ impl RevisionSession {
             scratch_parent: ctx.storage_dir().join("revision-reads"),
             scratch: RefCell::new(None),
             materialized: RefCell::new(HashMap::new()),
+            symbol_cache: ctx
+                .provider()
+                .as_any()
+                .downcast_ref::<crate::parser::TreeSitterProvider>()
+                .map(|provider| provider.symbol_cache())
+                .unwrap_or_else(|| ctx.symbol_cache()),
         })
     }
 

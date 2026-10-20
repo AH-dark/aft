@@ -3414,6 +3414,87 @@ mod tests {
     }
 
     #[test]
+    fn revision_outline_zoom_cache_retains_no_staged_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn historical() {}\n").unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "lib.rs"],
+            vec![
+                "-c",
+                "user.name=AFT",
+                "-c",
+                "user.email=aft@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let provider = TreeSitterProvider::new();
+        let cache = provider.symbol_cache();
+        let ctx = AppContext::new(
+            Box::new(provider),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                revision_reads: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..3 {
+            for (command, params) in [
+                ("outline", serde_json::json!({"file": root.join("lib.rs")})),
+                (
+                    "zoom",
+                    serde_json::json!({"file": root.join("lib.rs"), "symbol": "historical"}),
+                ),
+            ] {
+                let mut value = params;
+                value["id"] = serde_json::json!(command);
+                value["command"] = serde_json::json!(command);
+                value["ref"] = serde_json::json!("HEAD");
+                let request = serde_json::from_value(value).unwrap();
+                let response = if command == "outline" {
+                    handle_outline(&request, &ctx)
+                } else {
+                    crate::commands::zoom::handle_zoom(&request, &ctx)
+                };
+                assert!(response.success, "{response:?}");
+                assert!(response.data[if command == "outline" {
+                    "text"
+                } else {
+                    "content"
+                }]
+                .as_str()
+                .unwrap()
+                .contains("historical"));
+                assert_eq!(
+                    cache.read().unwrap().len(),
+                    0,
+                    "{command} left a staged cache entry"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn single_outline_cache_hit_does_no_source_work() {
         let (_temp, files, ctx) = navigation_fixture();
         let mut counts = Vec::new();
