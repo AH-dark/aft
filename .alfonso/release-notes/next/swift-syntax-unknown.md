@@ -1,0 +1,1 @@
+- A new Swift file is no longer reported as having a syntax error when the Swift compiler could not finish checking it; AFT reports the check as unknown instead.

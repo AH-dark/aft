@@ -47,6 +47,7 @@ struct DiffEntry {
     delete_lines: Option<usize>,
     hunk_count: usize,
     syntax_error_line: Option<usize>,
+    syntax_skipped_reason: Option<&'static str>,
 }
 
 fn path_string(path: &Path) -> String {
@@ -364,7 +365,7 @@ fn write_patched_file(
     let params = command_params(req);
     // A file this patch created has nothing from before the call to protect:
     // it is never rolled back, and its final content is syntax-checked once
-    // after every hunk has run (see `created_file_syntax_errors`).
+    // after every hunk has run (see `created_file_syntax_checks`).
     let written = if created_in_call {
         edit::write_format_deferred_created(path, content, &ctx.config(), params)
     } else {
@@ -598,41 +599,47 @@ fn add_failure(failures: &mut Vec<Value>, path: &str, error: String) {
 }
 
 /// Check the final content of every file this patch created and still exists,
-/// and return the first parse-error line of each one that does not parse.
+/// including why a compiler confirmation could not establish its validity.
 ///
 /// The check runs once per file after all hunks, because a later hunk in the
 /// same patch can fix, break, move or delete a file an earlier hunk created.
-fn created_file_syntax_errors(created: &HashMap<PathBuf, usize>) -> HashMap<PathBuf, usize> {
+fn created_file_syntax_checks(
+    created: &HashMap<PathBuf, usize>,
+) -> HashMap<PathBuf, edit::CreatedFileSyntax> {
     created
         .keys()
         .filter_map(|path| {
             let content = fs::read_to_string(path).ok()?;
-            let line = edit::check_created_file_syntax(path, &content).first_error_line?;
-            Some((path.clone(), line))
+            let check = edit::check_created_file_syntax(path, &content);
+            Some((path.clone(), check))
         })
         .collect()
 }
 
 /// Put the created-file syntax notice directly under the reply line that
-/// created each broken file ("Created" or "Updated and moved"), because one
-/// patch can create several files and the notice itself does not name the
+/// created each broken or unconfirmed file ("Created" or "Updated and moved").
+/// A patch can create several files and the notice itself does not name the
 /// file. `created` maps each created file to the index of that reply line.
 fn insert_created_syntax_notices(
     output_lines: &mut Vec<String>,
     created: &HashMap<PathBuf, usize>,
-    errors: &HashMap<PathBuf, usize>,
+    checks: &HashMap<PathBuf, edit::CreatedFileSyntax>,
 ) {
-    let mut notices: Vec<(usize, usize)> = errors
+    let mut notices: Vec<(usize, String)> = checks
         .iter()
-        .filter_map(|(path, error_line)| Some((*created.get(path)?, *error_line)))
+        .filter_map(|(path, check)| {
+            let notice = if let Some(line) = check.first_error_line {
+                edit::created_file_syntax_error_notice(line as u64)
+            } else {
+                edit::syntax_unknown_notice(check.skipped_reason?)
+            };
+            Some((*created.get(path)?, notice))
+        })
         .collect();
     // Insert from the bottom up so earlier reply-line indices stay valid.
     notices.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    for (reply_index, error_line) in notices {
-        output_lines.insert(
-            reply_index + 1,
-            edit::created_file_syntax_error_notice(error_line as u64),
-        );
+    for (reply_index, notice) in notices {
+        output_lines.insert(reply_index + 1, notice);
     }
 }
 
@@ -985,12 +992,11 @@ fn report_key(applied: &AppliedHunkResult) -> String {
     }
 }
 
-/// `created_errors` holds the final first parse-error line of each file this
-/// patch created that does not parse (see `created_file_syntax_errors`).
+/// Carry each created file's final syntax verdict into its metadata entry.
 fn metadata_files(
     applied: &[AppliedHunkResult],
     root: Option<&Path>,
-    created_errors: &HashMap<PathBuf, usize>,
+    created_checks: &HashMap<PathBuf, edit::CreatedFileSyntax>,
 ) -> (String, Vec<Value>) {
     let mut entries: Vec<(String, DiffEntry)> = Vec::new();
 
@@ -1017,19 +1023,21 @@ fn metadata_files(
                     delete_lines: applied_hunk.delete_lines,
                     hunk_count: 1,
                     syntax_error_line: None,
+                    syntax_skipped_reason: None,
                 },
             ));
         }
     }
 
-    // Carry each broken created file's error line on the last entry that
+    // Carry each created file's syntax result on the last entry that
     // ends at that path, so a file reported by several entries (for example
     // moved onto, then updated) carries it once.
     let mut marked = HashSet::new();
     for (_, entry) in entries.iter_mut().rev() {
-        if let Some(line) = created_errors.get(&entry.display_path) {
+        if let Some(check) = created_checks.get(&entry.display_path) {
             if marked.insert(entry.display_path.clone()) {
-                entry.syntax_error_line = Some(*line);
+                entry.syntax_error_line = check.first_error_line;
+                entry.syntax_skipped_reason = check.skipped_reason;
             }
         }
     }
@@ -1079,6 +1087,7 @@ fn metadata_files(
             if let Some(line) = entry.syntax_error_line {
                 value[edit::CREATED_SYNTAX_ERROR_LINE_FIELD] = json!(line);
             }
+            edit::append_syntax_skipped_reason(&mut value, entry.syntax_skipped_reason);
             value
         })
         .collect::<Vec<_>>();
@@ -1188,8 +1197,8 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         }
     }
 
-    let created_errors = created_file_syntax_errors(&created);
-    insert_created_syntax_notices(&mut output_lines, &created, &created_errors);
+    let created_checks = created_file_syntax_checks(&created);
+    insert_created_syntax_notices(&mut output_lines, &created, &created_checks);
 
     if !failures.is_empty() {
         let partial = failures.len() < resolved.len();
@@ -1210,7 +1219,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     }
 
     let root = project_root_for_relative_paths(ctx);
-    let (diff, mut files) = metadata_files(&applied, root.as_deref(), &created_errors);
+    let (diff, mut files) = metadata_files(&applied, root.as_deref(), &created_checks);
     // A partial patch keeps successful writes, but is not a completed project
     // mutation. Do not run checkers when any hunk failed or rolled back.
     if failures.is_empty() {

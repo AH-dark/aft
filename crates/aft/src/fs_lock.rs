@@ -185,7 +185,8 @@ pub fn try_acquire(path: &Path, timeout: Duration) -> Result<LockGuard, AcquireE
 }
 
 /// Preserve a caller's deadline across filesystem preparation instead of
-/// starting a fresh timeout after that work has finished.
+/// starting a fresh timeout after that work has finished. Always allow the
+/// first attempt: slow preparation does not imply another writer owns the lock.
 pub(crate) fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGuard, AcquireError> {
     crate::production_storage::refuse_write(path)?;
     #[cfg(test)]
@@ -410,7 +411,7 @@ fn acquire_with_deadline(
     let mut malformed_grace_used = false;
 
     loop {
-        if attempted_once || strict_deadline {
+        if attempted_once {
             if immediate_retry_budget > 0 && !strict_deadline {
                 immediate_retry_budget -= 1;
             } else if let Some(deadline) = deadline {

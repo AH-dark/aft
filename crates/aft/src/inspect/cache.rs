@@ -2864,6 +2864,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn uncontended_writer_lease_opens_after_slow_preparation() {
+        let temp = tempfile::tempdir().expect("create temporary cache root");
+        let project_root = temp.path().join("project");
+        let inspect_dir = temp.path().join("inspect");
+        fs::create_dir_all(&project_root).expect("create project root");
+        crate::root_cache::configure_artifact_access(&project_root, "shared", false);
+
+        // Cold filesystem preparation can exhaust the retry budget before
+        // the first lock attempt, even when no other process owns the cache.
+        let clock = crate::fs_lock::retry_clock::Guard::install(Duration::from_secs(6));
+        let cache = InspectCache::open(inspect_dir, project_root)
+            .expect("an uncontended lease must not require preparation to fit the retry budget");
+        assert!(cache.writer_epoch_for_test().is_some());
+        assert_eq!(clock.observations(), (Duration::from_secs(6), vec![], 1));
+    }
+
+    #[test]
     fn held_writer_lease_fails_within_the_inspect_deadline() {
         let temp = tempfile::tempdir().expect("create temporary cache root");
         let project_root = temp.path().join("project");
@@ -2884,7 +2901,7 @@ pub(crate) mod tests {
         for (preparation_ms, expected_elapsed_ms, expected_sleeps, expected_attempts) in [
             (0, 2_000, vec![Duration::from_millis(100); 20], 20),
             (1_975, 2_000, vec![Duration::from_millis(25)], 1),
-            (6_000, 6_000, vec![], 0),
+            (6_000, 6_000, vec![], 1),
         ] {
             let inspect_dir = inspect_dir.clone();
             let project_root = project_root.clone();
@@ -2915,6 +2932,10 @@ pub(crate) mod tests {
             assert_eq!(attempts, expected_attempts, "bounded lease poll iterations");
         }
 
+        assert!(
+            held.verify_writer_epoch().unwrap(),
+            "the holder keeps its lease"
+        );
         drop(held);
         InspectCache::open(inspect_dir, project_root)
             .expect("cache opens after the competing writer releases");

@@ -67,8 +67,7 @@ pub(crate) fn render_memory_census_with_roots(
         (None, None) => None,
     };
     let process_io = crate::process_io::ProcessIoSnapshot::capture().to_value();
-    json!({
-        "roots": roots,
+    let mut result = json!({
         "process": {
             "phys_footprint_bytes": process.phys_footprint_bytes,
             "rss_bytes": process.rss_bytes,
@@ -103,7 +102,11 @@ pub(crate) fn render_memory_census_with_roots(
             "process_io": process_io.clone(),
         },
         "process_io": process_io,
-    })
+    });
+    // The rows are already JSON. Move them into the reply rather than
+    // serializing and allocating a second copy of every root's object.
+    result["roots"] = Value::Object(roots);
+    result
 }
 
 fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Value {
@@ -153,7 +156,45 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
 /// remain live, and the health publisher adds the current index-walk ages.
 #[derive(Default)]
 pub(crate) struct CensusRootRows {
-    rows: std::collections::BTreeMap<String, (crate::memory::RootMemorySnapshot, Value)>,
+    rows: std::collections::BTreeMap<String, (RootRowInputs, Value)>,
+}
+
+#[derive(PartialEq, Eq)]
+struct RootRowInputs {
+    planes: [u64; 7],
+    semantic_worker: u64,
+    semantic_overlay: u64,
+    evictable: u64,
+}
+
+impl From<&crate::memory::RootMemorySnapshot> for RootRowInputs {
+    fn from(detail: &crate::memory::RootMemorySnapshot) -> Self {
+        Self {
+            planes: [
+                &detail.trigram,
+                &detail.semantic,
+                &detail.symbols,
+                &detail.callgraph,
+                &detail.callgraph_projection,
+                &detail.inspect,
+                &detail.pending_install,
+            ]
+            .map(|plane| plane.estimated_bytes.unwrap_or(0)),
+            semantic_worker: detail
+                .semantic
+                .counts
+                .get("worker_index_bytes")
+                .copied()
+                .unwrap_or(0),
+            semantic_overlay: detail
+                .semantic
+                .counts
+                .get("checkout_overlay_bytes")
+                .copied()
+                .unwrap_or(0),
+            evictable: detail.evictable_bytes(),
+        }
+    }
 }
 
 impl CensusRootRows {
@@ -167,14 +208,14 @@ impl CensusRootRows {
             .roots
             .iter()
             .map(|(root, detail)| {
-                let entry = self
-                    .rows
-                    .entry(root.clone())
-                    .or_insert_with(|| (detail.clone(), render_root_row(root, detail)));
-                // Equality validates every input to the pure row renderer; no
-                // timestamp is reset and no live health state is cached here.
-                if entry.0 != *detail {
-                    *entry = (detail.clone(), render_root_row(root, detail));
+                let inputs = RootRowInputs::from(detail);
+                let entry = self.rows.entry(root.clone()).or_insert_with(|| {
+                    (RootRowInputs::from(detail), render_root_row(root, detail))
+                });
+                // Only rendered inputs invalidate a row. Index diagnostics and
+                // counts not shown in the census can change on every read.
+                if entry.0 != inputs {
+                    *entry = (inputs, render_root_row(root, detail));
                 }
                 (root.clone(), entry.1.clone())
             })
@@ -217,6 +258,115 @@ mod tests {
             zero,
         );
         MemorySnapshot::new("ready", BTreeMap::from([("/repo".to_string(), root)]))
+    }
+
+    #[test]
+    fn census_render_moves_110_prebuilt_rows_without_copying() {
+        let snapshot = row_cache_fixture();
+        let roots = (0..110)
+            .map(|index| {
+                let root = format!("/repo-{index}");
+                (
+                    root.clone(),
+                    render_root_row(&root, &snapshot.roots["/repo"]),
+                )
+            })
+            .collect::<Map<_, _>>();
+        // Moving JSON preserves its string buffers; serializing it allocates
+        // new buffers while the input is still alive.
+        let buffers = roots
+            .iter()
+            .map(|(root, row)| {
+                (
+                    root.clone(),
+                    row["root"].as_str().unwrap().as_ptr() as usize,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let rendered = render_memory_census_with_roots(&snapshot, roots);
+        let copies = buffers
+            .iter()
+            .filter(|(root, buffer)| {
+                rendered["roots"][root.as_str()]["root"]
+                    .as_str()
+                    .unwrap()
+                    .as_ptr() as usize
+                    != **buffer
+            })
+            .count();
+        println!("prebuilt census rows copied: {copies}/110");
+        assert_eq!(
+            copies, 0,
+            "prebuilt JSON rows were serialized into another copy"
+        );
+    }
+
+    #[test]
+    fn census_110_roots_ignore_unrendered_churn_but_keep_current_numbers() {
+        let mut snapshot = row_cache_fixture();
+        let detail = snapshot.roots.remove("/repo").unwrap();
+        for root in 0..110 {
+            snapshot
+                .roots
+                .insert(format!("/repo-{root}"), detail.clone());
+        }
+        let mut cache = CensusRootRows::default();
+        let first = cache.render(&snapshot);
+        for detail in snapshot.roots.values_mut() {
+            detail.trigram.counts.insert("files".into(), 1001);
+            detail.semantic.counts.insert("chunks".into(), 2001);
+        }
+        let before = ROOT_ROW_RENDERS.with(|renders| renders.get());
+        let second = cache.render(&snapshot);
+        let rendered = ROOT_ROW_RENDERS.with(|renders| renders.get()) - before;
+        println!("110-root metadata-only churn: {rendered} root row renders/tick");
+        assert_eq!(
+            rendered, 0,
+            "unrendered diagnostics invalidated census rows"
+        );
+        assert_eq!(first, second);
+
+        let detail = snapshot.roots.get_mut("/repo-0").unwrap();
+        detail.trigram.estimated_bytes = Some(42);
+        detail
+            .semantic
+            .counts
+            .insert("worker_index_bytes".into(), 7);
+        detail
+            .semantic
+            .counts
+            .insert("checkout_overlay_bytes".into(), 9);
+        let updated = cache.render(&snapshot);
+        assert_eq!(ROOT_ROW_RENDERS.with(|renders| renders.get()) - before, 1);
+        assert_eq!(updated["/repo-0"]["planes"]["search"], 42);
+        assert_eq!(updated["/repo-0"]["semantic_worker_bytes"], 7);
+        assert_eq!(updated["/repo-0"]["semantic_overlay_bytes"], 9);
+        assert_eq!(updated["/repo-0"]["attributed_bytes"], 42);
+    }
+
+    #[test]
+    fn census_row_key_covers_every_rendered_input() {
+        let mut snapshot = row_cache_fixture();
+        let mut cache = CensusRootRows::default();
+        cache.render(&snapshot);
+        for plane in 0..7 {
+            let detail = snapshot.roots.get_mut("/repo").unwrap();
+            let changed = match plane {
+                0 => &mut detail.trigram,
+                1 => &mut detail.semantic,
+                2 => &mut detail.symbols,
+                3 => &mut detail.callgraph,
+                4 => &mut detail.callgraph_projection,
+                5 => &mut detail.inspect,
+                _ => &mut detail.pending_install,
+            };
+            changed.estimated_bytes = Some(100 + plane);
+            let actual = cache.render(&snapshot);
+            assert_eq!(
+                actual["/repo"],
+                render_root_row("/repo", &snapshot.roots["/repo"])
+            );
+        }
     }
 
     #[test]

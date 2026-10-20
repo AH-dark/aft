@@ -304,6 +304,7 @@ thread_local! {
     /// sweep it started most recently. The sweep's report does not record
     /// its budget, so tests read it here.
     static LAST_SWEEP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TREE_LISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
@@ -312,14 +313,18 @@ fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     fs::symlink_metadata(path)
 }
 
-/// Immutable artifacts are reconciled even if an out-of-band writer changes
-/// them in place. SQLite files, pins, markers and temporary files are never cached.
+/// Published v1 and v2 generation artifacts are reconciled even if an
+/// out-of-band writer changes them in place. SQLite files, pins, markers and
+/// temporary files are never cached.
 const SIZE_RECONCILE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub(super) struct ViewSizeCache {
     directory: Option<Vec<u64>>,
     reconciled: Option<Instant>,
-    files: BTreeMap<PathBuf, u64>,
+    files: BTreeMap<PathBuf, (u64, u64)>,
+    // Stable namespaces reuse the immutable total and list only mutable paths.
+    snapshot: Option<(u64, Vec<PathBuf>)>,
+    top_paths: BTreeSet<PathBuf>,
 }
 
 /// The size caches of one family's views, keyed by view directory. The
@@ -343,6 +348,8 @@ impl Default for ViewSizeCache {
             directory: None,
             reconciled: None,
             files: BTreeMap::new(),
+            snapshot: None,
+            top_paths: BTreeSet::new(),
         }
     }
 }
@@ -365,7 +372,9 @@ fn immutable_generation(path: &Path) -> Option<&str> {
     .find_map(|(prefix, suffix)| {
         name.strip_prefix(prefix)
             .and_then(|name| name.strip_suffix(suffix))
-            .filter(|generation| super::manifest_v2::GenerationName::parse(generation).is_some())
+            // Both formats write manifests once. The v1 publisher uses names
+            // without a g2 prefix, so validate those alongside v2 names.
+            .filter(|generation| super::validate_generation(generation).is_ok())
     })
 }
 
@@ -406,11 +415,22 @@ fn view_tree_bytes(
     let reconcile = cache
         .reconciled
         .is_none_or(|last| last.elapsed() >= SIZE_RECONCILE_INTERVAL);
-    if identity.is_none() || identity != cache.directory || reconcile {
+    let same_directory = identity
+        .as_ref()
+        .zip(cache.directory.as_ref())
+        .is_some_and(|(current, previous)| current[..2] == previous[..2]);
+    if !same_directory || reconcile {
         cache.files.clear();
         cache.reconciled = Some(Instant::now());
     }
+    // Publication changes the namespace, not old generations. Re-list names
+    // on that change, but validate old artifacts using readdir's inode instead
+    // of throwing away every retained generation's measured length.
+    if identity.is_none() || identity != cache.directory || reconcile || past(deadline) {
+        cache.snapshot = None;
+    }
     cache.directory = identity;
+    let reused_snapshot = cache.snapshot.is_some();
     let result = tree_bytes_inner(dir, deadline, Some(cache), None);
     let after = measured_metadata(dir)
         .ok()
@@ -421,16 +441,32 @@ fn view_tree_bytes(
     // with a manifest published after that file was measured.
     if !matches!(result, Ok((_, true))) || after != cache.directory {
         cache.files.clear();
-    } else {
+        cache.snapshot = None;
+    } else if !reused_snapshot {
         let manifests = cache
             .files
             .keys()
+            .filter(|path| cache.top_paths.contains(*path))
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .filter_map(|path| immutable_generation(path).map(str::to_owned))
             .collect::<BTreeSet<_>>();
         cache.files.retain(|path, _| {
-            immutable_generation(path).is_some_and(|generation| manifests.contains(generation))
+            cache.top_paths.contains(path)
+                && immutable_generation(path)
+                    .is_some_and(|generation| manifests.contains(generation))
         });
+        cache.snapshot = Some((
+            cache
+                .files
+                .values()
+                .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes)),
+            cache
+                .top_paths
+                .iter()
+                .filter(|path| !cache.files.contains_key(*path))
+                .cloned()
+                .collect(),
+        ));
     }
     result
 }
@@ -460,16 +496,53 @@ fn tree_bytes_inner(
 ) -> std::io::Result<(u64, bool)> {
     #[cfg(test)]
     TREE_WALKS.with(|walks| walks.set(walks.get() + 1));
-    let mut bytes = 0u64;
-    let mut read = 0usize;
+    let mut bytes = cache
+        .as_ref()
+        .and_then(|cache| cache.snapshot.as_ref())
+        .map_or(0, |(bytes, _)| *bytes);
+    let mut read = cache
+        .as_ref()
+        .filter(|cache| cache.snapshot.is_some())
+        .map_or(0, |cache| cache.files.len());
     let mut complete = true;
     let mut pending = vec![(dir.to_path_buf(), 0usize)];
     while let Some((current, depth)) = pending.pop() {
-        let entries = match fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
+        let cached_paths = (depth == 0)
+            .then(|| {
+                cache
+                    .as_ref()
+                    .and_then(|cache| cache.snapshot.as_ref())
+                    .map(|(_, paths)| paths.clone())
+            })
+            .flatten();
+        let entries: Box<dyn Iterator<Item = std::io::Result<(PathBuf, Option<u64>)>>> =
+            if let Some(paths) = cached_paths {
+                Box::new(paths.into_iter().map(|path| Ok((path, None))))
+            } else {
+                if depth == 0 {
+                    if let Some(cache) = cache.as_mut() {
+                        cache.top_paths.clear();
+                    }
+                }
+                #[cfg(test)]
+                TREE_LISTS.with(|lists| lists.set(lists.get() + 1));
+                match fs::read_dir(&current) {
+                    Ok(entries) => Box::new(entries.map(|entry| {
+                        entry.map(|entry| {
+                            #[cfg(unix)]
+                            let inode = {
+                                use std::os::unix::fs::DirEntryExt;
+                                Some(entry.ino())
+                            };
+                            #[cfg(not(unix))]
+                            let inode = None;
+                            (entry.path(), inode)
+                        })
+                    })),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
+            };
         let remaining = MAX_WALK_ENTRIES.saturating_sub(read);
         for entry in entries.take(remaining.saturating_add(1)) {
             if read >= MAX_WALK_ENTRIES
@@ -480,22 +553,30 @@ fn tree_bytes_inner(
                 break;
             }
             read += 1;
-            let entry = match entry {
+            let (path, inode) = match entry {
                 Ok(entry) => entry,
                 // Removed while listed: nothing to count.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            let path = entry.path();
+            if depth == 0 {
+                if let Some(cache) = cache.as_mut() {
+                    cache.top_paths.insert(path.clone());
+                }
+            }
             let immutable = depth == 0 && immutable_generation(&path).is_some();
             if immutable {
-                if let Some(size) = cache
+                if let Some((_, size)) = cache
                     .as_ref()
                     .filter(|cache| cache.directory.is_some())
                     .and_then(|cache| cache.files.get(&path))
+                    .filter(|(previous_inode, _)| inode == Some(*previous_inode))
                 {
                     bytes = bytes.saturating_add(*size);
                     continue;
+                }
+                if let Some(cache) = cache.as_mut() {
+                    cache.files.remove(&path);
                 }
             }
             let metadata = match measured_metadata(&path) {
@@ -505,7 +586,7 @@ fn tree_bytes_inner(
             };
             if metadata.is_dir() {
                 if depth + 1 < MAX_WALK_DEPTH {
-                    pending.push((entry.path(), depth + 1));
+                    pending.push((path.clone(), depth + 1));
                 } else {
                     complete = false;
                 }
@@ -513,7 +594,9 @@ fn tree_bytes_inner(
                 bytes = bytes.saturating_add(metadata.len());
                 if immutable {
                     if let Some(cache) = cache.as_mut() {
-                        cache.files.insert(path, metadata.len());
+                        if let Some(inode) = inode {
+                            cache.files.insert(path, (inode, metadata.len()));
+                        }
                     }
                 }
             }
@@ -1512,6 +1595,73 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn republishing_views_measure_only_changed_artifacts() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        let publish = |dir: &Path, generation: usize| {
+            let generation = if generation % 2 == 0 {
+                format!("{generation}-42-1234567890-{generation}-deadbeef")
+            } else {
+                format!("g2-{generation:064x}-1-1-{generation}")
+            };
+            for (prefix, suffix) in [("manifest", "json"), ("trigram", "bin"), ("derived", "ref")] {
+                fs::write(
+                    dir.join(format!("{prefix}-{generation}.{suffix}")),
+                    b"immutable",
+                )
+                .unwrap();
+            }
+        };
+        let mut dirs = Vec::new();
+        for index in 0..24 {
+            let root = storage.path().join(format!("checkout-{index}"));
+            fs::create_dir(&root).unwrap();
+            let view = registry
+                .register_view(&format!("view-{index}"), &root)
+                .unwrap();
+            fs::write(view.view_dir().join("derived-owner.sqlite"), vec![0; 8192]).unwrap();
+            fs::create_dir_all(view.view_dir().join("readers/current")).unwrap();
+            fs::write(view.view_dir().join("progress.marker"), b"reader").unwrap();
+            for generation in 0..64 {
+                publish(view.view_dir(), generation);
+            }
+            dirs.push(view.view_dir().to_path_buf());
+        }
+        measure(&registry, None).unwrap();
+        let mut calls = Vec::new();
+        for pass in 0..6 {
+            // Six checkouts publish between ten-minute enforcement passes.
+            for dir in dirs.iter().take(6) {
+                publish(dir, 64 + pass);
+                fs::write(dir.join("derived-owner.sqlite"), vec![0; 8192 + pass]).unwrap();
+            }
+            TREE_STATS.with(|stats| stats.set(0));
+            let report = enforce(&registry, EnforceOptions::default()).unwrap();
+            let stats = TREE_STATS.with(|stats| stats.replace(0));
+            calls.push(stats);
+            assert!(report.evicted.is_empty());
+            for view in &report.after.views {
+                assert_eq!(
+                    (view.bytes, view.complete),
+                    tree_bytes(&view.view_dir, None).unwrap()
+                );
+            }
+            println!("republish enforcement pass {pass}: {stats} lstat/pass, {} lstat/hour at six passes/hour", stats * 6);
+        }
+        assert!(
+            calls.iter().all(|calls| *calls < 500),
+            "retained generations re-statted after publication: {calls:?}"
+        );
+        let usage = measure(&registry, None).unwrap();
+        registry.set_disk_budget(budget(1, u64::MAX));
+        let report = enforce(&registry, EnforceOptions::default()).unwrap();
+        assert_eq!(report.evicted.len(), dirs.len());
+        assert_eq!(report.after.view_store_bytes, 0);
+        assert!(usage.view_store_bytes > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn immutable_view_totals_avoid_repeated_stats() {
         let storage = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
@@ -1545,13 +1695,22 @@ mod tests {
         }
         TREE_STATS.with(|stats| stats.set(0));
         TREE_WALKS.with(|walks| walks.set(0));
+        TREE_LISTS.with(|lists| lists.set(0));
         let cold = measure(&registry, None).unwrap();
         let cold_stats = TREE_STATS.with(|stats| stats.replace(0));
+        let cold_lists = TREE_LISTS.with(|lists| lists.replace(0));
         let warm = measure(&registry, None).unwrap();
         let warm_stats = TREE_STATS.with(|stats| stats.replace(0));
+        let warm_lists = TREE_LISTS.with(|lists| lists.replace(0));
         let walks = TREE_WALKS.with(|walks| walks.get());
         assert_eq!(walks, 2 * (24 + 1));
         assert_eq!(cold.views, warm.views);
+        println!("directory listings: cold={cold_lists}, warm={warm_lists}");
+        assert_eq!(
+            warm_lists + 24,
+            cold_lists,
+            "unchanged view namespaces were listed again"
+        );
         println!("disk measurement / 24 views x 64 generations: cold={cold_stats} lstat, warm={warm_stats} lstat, {walks} tree walks; two measurements per enforcement, interval={}s", ENFORCEMENT_INTERVAL.as_secs());
         assert!(cold_stats > 24 * 64 * 3);
         assert!(
@@ -1613,6 +1772,17 @@ mod tests {
         );
         fs::remove_file(&manifest).unwrap();
         fs::write(&manifest, b"replacement manifest").unwrap();
+        assert_eq!(
+            view_tree_bytes(dir, None, &mut cache).unwrap(),
+            tree_bytes(dir, None).unwrap()
+        );
+        let replacement = dir.join("replacement.tmp");
+        fs::write(
+            &replacement,
+            b"atomic replacement has a different inode and length",
+        )
+        .unwrap();
+        fs::rename(&replacement, &manifest).unwrap();
         assert_eq!(
             view_tree_bytes(dir, None, &mut cache).unwrap(),
             tree_bytes(dir, None).unwrap()

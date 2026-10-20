@@ -1,0 +1,1 @@
+- Language servers that standalone AFT started for a project now shut down as soon as that project folder is deleted, instead of running until the hour-long idle timeout. Thanks to @chrisolszewski for reporting and diagnosing this (#631).

@@ -11,7 +11,7 @@ use crate::format::{FormatError, SubprocessOutcome};
 const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(test, target_os = "macos"))]
 const NATIVE_SWIFTC_TEST_TIMEOUT: Duration = Duration::from_secs(120);
-static SWIFTC: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static SWIFTC: OnceLock<LookupOutcome> = OnceLock::new();
 
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
@@ -48,6 +48,15 @@ enum ParseOutcome {
     Unavailable(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LookupOutcome {
+    Found(PathBuf),
+    Missing,
+    #[cfg(any(test, target_os = "macos"))]
+    TimedOut,
+    Unavailable(String),
+}
+
 pub(super) fn confirm_if_needed(
     path: &Path,
     source: &str,
@@ -76,73 +85,120 @@ pub(super) fn confirm_if_needed(
 /// Confirm a tree-sitter error in a Swift file that the current call created.
 ///
 /// There is no original to compare against, so the compiler's verdict on the
-/// new content decides directly. When `swiftc` is unavailable or fails, the
-/// tree-sitter verdict stands.
-pub(super) fn confirm_created(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
+/// new content decides directly. Without an installed compiler, tree-sitter
+/// remains the authority. An unfinished confirmation is unknown, not evidence
+/// that the new file contains a syntax error.
+pub(super) fn confirm_created(
+    path: &Path,
+    source: &str,
+    is_valid: Option<bool>,
+) -> Result<Option<bool>, &'static str> {
     if path.extension().and_then(|ext| ext.to_str()) != Some("swift") || is_valid != Some(false) {
-        return is_valid;
+        return Ok(is_valid);
     }
-    confirm_with_compiler(path, source, is_valid)
+    compiler_verdict(path, source).map(|verdict| verdict.or(is_valid))
 }
 
 fn confirm_with_compiler(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
+    // Existing files keep the conservative rollback policy when confirmation
+    // cannot finish; newly created files have no original content to protect.
+    compiler_verdict(path, source).unwrap_or(None).or(is_valid)
+}
+
+fn compiler_verdict(path: &Path, source: &str) -> Result<Option<bool>, &'static str> {
     let outcome = parse(source);
+    log::debug!(
+        "Swift syntax confirmation for {}: {outcome:?}",
+        path.display()
+    );
     match outcome {
-        ParseOutcome::Exited(Some(0)) => {
-            log::debug!(
-                "swiftc confirmed syntax after tree-sitter errors: {}",
-                path.display()
-            );
-            Some(true)
-        }
+        ParseOutcome::Exited(Some(0)) => Ok(Some(true)),
+        ParseOutcome::Exited(Some(1)) => Ok(Some(false)),
+        ParseOutcome::TimedOut => Err("swiftc_timeout"),
+        ParseOutcome::Missing => Ok(None),
         ParseOutcome::Unavailable(reason) => {
-            log::debug!(
-                "Swift syntax confirmation unavailable for {}: {reason}",
-                path.display()
-            );
-            is_valid
+            log::debug!("Swift syntax confirmation unavailable: {reason}");
+            Err("swiftc_unavailable")
         }
-        other => {
-            log::debug!(
-                "Swift syntax confirmation failed for {}: {other:?}",
-                path.display()
-            );
-            is_valid
-        }
+        ParseOutcome::Exited(None) => Err("swiftc_terminated"),
+        ParseOutcome::Exited(Some(_)) => Err("swiftc_failed"),
     }
 }
 
-fn find_swiftc() -> &'static Result<PathBuf, String> {
-    SWIFTC.get_or_init(|| {
-        if let Ok(path) = which::which("swiftc") {
-            return Ok(path);
+fn cached_lookup(
+    cache: &OnceLock<LookupOutcome>,
+    lookup: impl FnOnce() -> LookupOutcome,
+) -> LookupOutcome {
+    if let Some(outcome) = cache.get() {
+        return outcome.clone();
+    }
+    let outcome = lookup();
+    // A slow or failed lookup does not establish whether Swift is installed.
+    // Leave discovery retryable instead of poisoning the daemon's cache.
+    if matches!(outcome, LookupOutcome::Found(_) | LookupOutcome::Missing) {
+        cache.get_or_init(|| outcome).clone()
+    } else {
+        outcome
+    }
+}
+
+fn find_swiftc() -> LookupOutcome {
+    cached_lookup(&SWIFTC, discover_swiftc)
+}
+
+fn discover_swiftc() -> LookupOutcome {
+    match which::which("swiftc") {
+        Ok(path) if path.is_absolute() => return LookupOutcome::Found(path),
+        Ok(_) => {
+            return LookupOutcome::Unavailable("swiftc lookup returned a relative path".into())
         }
-        #[cfg(target_os = "macos")]
-        {
-            let mut command = Command::new("xcrun");
-            command.args(["--find", "swiftc"]);
-            match run_command(command, "", Instant::now() + parse_timeout()) {
-                Ok(result) if result.status.success() => {
-                    let path = PathBuf::from(result.stdout.trim());
-                    if path.is_absolute() && path.is_file() {
-                        return Ok(path);
-                    }
-                    return Err("xcrun returned no swiftc path".into());
-                }
-                Ok(result) => return Err(format!("xcrun exited with {}", result.status)),
-                Err(error) => return Err(format!("xcrun lookup failed: {error}")),
+        Err(which::Error::CannotFindBinaryPath) => {}
+        Err(error) => return LookupOutcome::Unavailable(error.to_string()),
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("xcrun");
+        command.args(["--find", "swiftc"]);
+        xcrun_lookup_outcome(run_command(command, "", Instant::now() + parse_timeout()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    LookupOutcome::Missing
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn xcrun_lookup_outcome(result: Result<SubprocessOutcome, FormatError>) -> LookupOutcome {
+    match result {
+        Ok(result) => match result.status.code() {
+            Some(0) if result.truncated => {
+                LookupOutcome::Unavailable("xcrun output was truncated".into())
             }
-        }
-        #[cfg(not(target_os = "macos"))]
-        Err("swiftc is not on PATH".into())
-    })
+            Some(0) => {
+                let output = result.stdout.trim();
+                if output.is_empty() {
+                    LookupOutcome::Missing
+                } else {
+                    let path = PathBuf::from(output);
+                    if path.is_absolute() {
+                        LookupOutcome::Found(path)
+                    } else {
+                        LookupOutcome::Unavailable("xcrun returned a relative swiftc path".into())
+                    }
+                }
+            }
+            Some(_) => LookupOutcome::Missing,
+            None => LookupOutcome::Unavailable("xcrun was terminated".into()),
+        },
+        Err(FormatError::Timeout { .. }) => LookupOutcome::TimedOut,
+        Err(error) => LookupOutcome::Unavailable(format!("xcrun lookup failed: {error}")),
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 pub(super) fn available() -> bool {
     with_parse_timeout(NATIVE_SWIFTC_TEST_TIMEOUT, || {
-        if let Err(reason) = find_swiftc() {
-            eprintln!("swiftc discovery failed: {reason}");
+        let lookup = find_swiftc();
+        if !matches!(lookup, LookupOutcome::Found(_)) {
+            eprintln!("swiftc discovery failed: {lookup:?}");
             return false;
         }
         // Warm up the compiler under the same generous guard as the native tests.
@@ -173,13 +229,24 @@ fn parse(source: &str) -> ParseOutcome {
     {
         return outcome;
     }
-    let path = match find_swiftc() {
-        Ok(path) => path,
-        Err(reason) => {
-            log::debug!("Swift syntax confirmation lookup failed: {reason}");
-            return ParseOutcome::Missing;
-        }
-    };
+    parse_with_lookup(source, find_swiftc, run_swiftc)
+}
+
+fn parse_with_lookup(
+    source: &str,
+    lookup: impl FnOnce() -> LookupOutcome,
+    checker: impl FnOnce(&Path, &str) -> ParseOutcome,
+) -> ParseOutcome {
+    match lookup() {
+        LookupOutcome::Found(path) => checker(&path, source),
+        LookupOutcome::Missing => ParseOutcome::Missing,
+        #[cfg(any(test, target_os = "macos"))]
+        LookupOutcome::TimedOut => ParseOutcome::TimedOut,
+        LookupOutcome::Unavailable(reason) => ParseOutcome::Unavailable(reason),
+    }
+}
+
+fn run_swiftc(path: &Path, source: &str) -> ParseOutcome {
     let mut command = Command::new(path);
     // Parsing stdin avoids temporary files. -parse performs no type checking or imports.
     command.args(["-parse", "-"]);
@@ -492,6 +559,339 @@ mod tests {
         }
     }
 
+    fn created_write_response(source: &str, runner: Runner) -> serde_json::Value {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("new.swift");
+        assert_eq!(validate_syntax_str(source, &path), Some(false));
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                format_on_edit: false,
+                ..Config::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "created-swift", "command": "write", "file": path, "content": source
+        }))
+        .unwrap();
+        let response = with_runner(runner, || {
+            crate::commands::write::handle_write(&request, &ctx)
+        });
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["created"], true);
+        assert_eq!(response.data["rolled_back"], false);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        if response.data.get("syntax_skipped_reason").is_some() {
+            let text = crate::subc_format::format_response("write", &response, false);
+            assert!(text.contains("Syntax check: unknown"), "{text}");
+            assert!(!text.contains("new file does not parse"), "{text}");
+        }
+        response.data
+    }
+
+    #[test]
+    fn swift_parser_created_timeout_is_unknown() {
+        let response = created_write_response(TUPLE, Box::new(|_| ParseOutcome::TimedOut));
+        assert!(response.get("syntax_valid").is_none(), "{response:?}");
+        assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+        assert_eq!(response["syntax_skipped_reason"], "swiftc_timeout");
+        assert!(
+            response["warnings"].to_string().contains("unknown"),
+            "{response:?}"
+        );
+    }
+
+    #[test]
+    fn swift_parser_created_unavailable_is_unknown() {
+        for (outcome, reason) in [
+            (
+                ParseOutcome::Unavailable("permission denied".into()),
+                "swiftc_unavailable",
+            ),
+            (ParseOutcome::Exited(None), "swiftc_terminated"),
+            (ParseOutcome::Exited(Some(2)), "swiftc_failed"),
+        ] {
+            let mut outcome = Some(outcome);
+            let response = created_write_response(
+                TUPLE,
+                Box::new(move |_| outcome.take().expect("one compiler confirmation")),
+            );
+            assert!(response.get("syntax_valid").is_none(), "{response:?}");
+            assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+            assert_eq!(response["syntax_skipped_reason"], reason);
+        }
+    }
+
+    #[test]
+    fn swift_parser_created_missing_keeps_tree_sitter_verdict() {
+        let response = created_write_response(TUPLE, Box::new(|_| ParseOutcome::Missing));
+        assert_eq!(response["syntax_valid"], false, "{response:?}");
+        assert_eq!(response["syntax_error_line"], 1);
+        assert!(
+            response.get("syntax_skipped_reason").is_none(),
+            "{response:?}"
+        );
+    }
+
+    #[test]
+    fn swift_parser_lookup_timeout_retries_then_confirms_created_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let compiler = temp.path().join("swiftc");
+        let cache = std::rc::Rc::new(OnceLock::new());
+        let lookups = std::rc::Rc::new(std::cell::Cell::new(0));
+        let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+        for attempt in 0..3 {
+            let cache = cache.clone();
+            let lookups = lookups.clone();
+            let checks = checks.clone();
+            let compiler = compiler.clone();
+            let response = created_write_response(
+                TUPLE,
+                Box::new(move |source| {
+                    parse_with_lookup(
+                        source,
+                        || {
+                            cached_lookup(&cache, || {
+                                lookups.set(lookups.get() + 1);
+                                if lookups.get() == 1 {
+                                    LookupOutcome::TimedOut
+                                } else {
+                                    LookupOutcome::Found(compiler.clone())
+                                }
+                            })
+                        },
+                        |path, source| {
+                            assert_eq!(path, compiler);
+                            assert_eq!(source, TUPLE);
+                            checks.set(checks.get() + 1);
+                            ParseOutcome::Exited(Some(0))
+                        },
+                    )
+                }),
+            );
+            if attempt == 0 {
+                assert!(response.get("syntax_valid").is_none(), "{response:?}");
+                assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+                assert_eq!(response["syntax_skipped_reason"], "swiftc_timeout");
+            } else {
+                assert_eq!(response["syntax_valid"], true, "{response:?}");
+                assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+                assert!(
+                    response.get("syntax_skipped_reason").is_none(),
+                    "{response:?}"
+                );
+            }
+        }
+        assert_eq!(lookups.get(), 2, "retry once, then use the discovered path");
+        assert_eq!(
+            checks.get(),
+            2,
+            "a timed-out lookup must not run the compiler"
+        );
+    }
+
+    #[test]
+    fn swift_parser_lookup_caches_definitive_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        for outcome in [
+            LookupOutcome::Found(temp.path().join("swiftc")),
+            LookupOutcome::Missing,
+        ] {
+            let cache = OnceLock::new();
+            assert_eq!(cached_lookup(&cache, || outcome.clone()), outcome);
+            assert_eq!(
+                cached_lookup(&cache, || panic!("definitive answers are cached")),
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn swift_parser_lookup_unavailable_is_retryable() {
+        let cache = OnceLock::new();
+        let outcome = cached_lookup(&cache, || LookupOutcome::Unavailable("spawn denied".into()));
+        assert!(matches!(outcome, LookupOutcome::Unavailable(_)));
+        assert!(
+            cache.get().is_none(),
+            "a transient error must not poison discovery"
+        );
+        assert_eq!(
+            cached_lookup(&cache, || LookupOutcome::Missing),
+            LookupOutcome::Missing
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn swift_parser_xcrun_lookup_distinguishes_definitive_answers() {
+        let output = |code, stdout: String, truncated| {
+            #[cfg(unix)]
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(code << 8)
+            };
+            #[cfg(windows)]
+            let status = {
+                use std::os::windows::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(code as u32)
+            };
+            Ok(SubprocessOutcome {
+                stdout,
+                stderr: String::new(),
+                status,
+                truncated,
+            })
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let compiler = temp.path().join("swiftc");
+        assert_eq!(
+            xcrun_lookup_outcome(output(0, compiler.display().to_string(), false)),
+            LookupOutcome::Found(compiler)
+        );
+        assert_eq!(
+            xcrun_lookup_outcome(output(0, " \n".into(), false)),
+            LookupOutcome::Missing
+        );
+        assert_eq!(
+            xcrun_lookup_outcome(output(1, String::new(), false)),
+            LookupOutcome::Missing
+        );
+        assert!(matches!(
+            xcrun_lookup_outcome(output(0, "relative/swiftc".into(), false)),
+            LookupOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            xcrun_lookup_outcome(output(0, String::new(), true)),
+            LookupOutcome::Unavailable(_)
+        ));
+        assert_eq!(
+            xcrun_lookup_outcome(Err(FormatError::Timeout {
+                tool: "xcrun".into(),
+                timeout_secs: 5
+            })),
+            LookupOutcome::TimedOut
+        );
+        for error in [
+            FormatError::NotFound {
+                tool: "xcrun".into(),
+            },
+            FormatError::Failed {
+                tool: "xcrun".into(),
+                stderr: "spawn denied".into(),
+            },
+        ] {
+            assert!(matches!(
+                xcrun_lookup_outcome(Err(error)),
+                LookupOutcome::Unavailable(_)
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(matches!(
+                xcrun_lookup_outcome(Ok(SubprocessOutcome {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                    truncated: false,
+                })),
+                LookupOutcome::Unavailable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn swift_parser_created_answer_is_definite() {
+        for (source, status, valid) in [(TUPLE, 0, true), (BROKEN, 1, false)] {
+            let response = created_write_response(
+                source,
+                Box::new(move |actual| {
+                    assert_eq!(actual, source);
+                    ParseOutcome::Exited(Some(status))
+                }),
+            );
+            assert_eq!(response["syntax_valid"], valid, "{response:?}");
+            assert!(
+                response.get("syntax_skipped_reason").is_none(),
+                "{response:?}"
+            );
+            if valid {
+                assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+            } else {
+                assert_eq!(response["syntax_error_line"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn swift_parser_created_append_and_patch_report_unknown() {
+        for command in ["edit_match", "apply_patch"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("new.swift");
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                Config {
+                    format_on_edit: false,
+                    ..Config::default()
+                },
+            );
+            let params = if command == "edit_match" {
+                serde_json::json!({ "id": "append", "command": command, "file": path, "op": "append", "appendContent": TUPLE })
+            } else {
+                serde_json::json!({ "id": "patch", "command": command, "patch_text": format!("*** Begin Patch\n*** Add File: {}\n+{}*** End Patch\n", path.display(), TUPLE) })
+            };
+            let request = serde_json::from_value(params).unwrap();
+            let response = with_runner(Box::new(|_| ParseOutcome::TimedOut), || {
+                if command == "edit_match" {
+                    crate::commands::edit_match::handle_edit_match(&request, &ctx)
+                } else {
+                    crate::commands::apply_patch::handle_apply_patch(&request, &ctx)
+                }
+            });
+            assert!(response.success, "{response:?}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), TUPLE);
+            let data = if command == "edit_match" {
+                &response.data
+            } else {
+                assert!(response.data["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Syntax check: unknown"));
+                &response.data["metadata"]["files"][0]
+            };
+            assert!(
+                data.get("syntax_valid")
+                    .is_none_or(serde_json::Value::is_null),
+                "{data:?}"
+            );
+            assert!(data.get("syntax_error_line").is_none(), "{data:?}");
+            assert_eq!(data["syntax_skipped_reason"], "swiftc_timeout");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swift_parser_created_slow_checker_is_unknown() {
+        let response = created_write_response(
+            TUPLE,
+            Box::new(|source| {
+                assert_eq!(source, TUPLE);
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", "exec sleep 30"]);
+                let outcome = parse_outcome(run_command(
+                    command,
+                    source,
+                    Instant::now() + Duration::from_millis(50),
+                ));
+                assert!(matches!(outcome, ParseOutcome::TimedOut), "{outcome:?}");
+                outcome
+            }),
+        );
+        assert!(response.get("syntax_valid").is_none(), "{response:?}");
+        assert!(response.get("syntax_error_line").is_none(), "{response:?}");
+        assert_eq!(response["syntax_skipped_reason"], "swiftc_timeout");
+    }
+
     #[test]
     fn swift_parser_valid_to_valid_skips_compiler() {
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -653,10 +1053,24 @@ mod tests {
         };
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_parser_native_created_file_is_valid() {
+        let Some(()) = with_native_swiftc(|| {
+            let check = crate::edit::check_created_file_syntax(Path::new("new.swift"), TUPLE);
+            assert_eq!(check.valid, Some(true), "{check:?}");
+            assert_eq!(check.first_error_line, None);
+            assert_eq!(check.skipped_reason, None);
+        }) else {
+            eprintln!("skipping native Swift parser test: swiftc is unavailable");
+            return;
+        };
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn swift_parser_real_missing_binary_fallback() {
-        if find_swiftc().is_ok() {
+        if matches!(find_swiftc(), LookupOutcome::Found(_)) {
             eprintln!("skipping missing-swiftc test: swiftc is available on PATH");
             return;
         }
@@ -721,7 +1135,7 @@ mod tests {
     #[test]
     fn swift_parser_available_fails_for_discovered_broken_compiler() {
         with_parse_timeout(NATIVE_SWIFTC_TEST_TIMEOUT, || {
-            if find_swiftc().is_err() {
+            if !matches!(find_swiftc(), LookupOutcome::Found(_)) {
                 eprintln!("skipping native Swift parser test: swiftc is unavailable");
                 return;
             }

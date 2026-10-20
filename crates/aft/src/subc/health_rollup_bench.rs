@@ -43,7 +43,7 @@ impl Timer {
 }
 
 #[test]
-#[ignore = "offline per-step CPU measurement with 40 roots and a large aft.db"]
+#[ignore = "offline per-step measurement with configurable roots and a large aft.db"]
 fn bench_health_rollup_steps() {
     use super::super::test_support::test_root;
     // The defaults reproduce the original 40-root run. The variables below
@@ -177,6 +177,8 @@ fn bench_health_rollup_steps() {
     }));
     STEPS.with(|steps| *steps.borrow_mut() = Some(BTreeMap::new()));
     let mut total = 0u64;
+    let mut elapsed_steps = BTreeMap::<String, f64>::new();
+    let mut elapsed_total = 0.0;
     for tick in 1..=TICKS {
         if churn {
             // What publishing views, reads and an occasional edit do between
@@ -213,6 +215,12 @@ fn bench_health_rollup_steps() {
             &app,
             executor.actor_entries(),
         );
+        let tick = &built.memory_census["health_rollup_tick"];
+        elapsed_total += tick["elapsed_ms"].as_f64().unwrap();
+        for (step, value) in tick["steps"].as_object().unwrap() {
+            *elapsed_steps.entry(step.clone()).or_default() +=
+                value["elapsed_ms"].as_f64().unwrap();
+        }
         let mut publish_timer = Timer::new();
         cache.publish(Some(built));
         publish_timer.mark("publish holder / old JSON drop");
@@ -230,6 +238,13 @@ fn bench_health_rollup_steps() {
             ns as f64 / TICKS as f64 / 3000.
         );
     }
+    for (step, ms) in elapsed_steps {
+        println!("{step}: elapsed_ms/tick={:.3}", ms / TICKS as f64);
+    }
+    println!(
+        "BUILD TOTAL: elapsed_ms/tick={:.3}",
+        elapsed_total / TICKS as f64
+    );
     println!(
         "TOTAL: us/tick={:.2} us/second={:.2}",
         total as f64 / TICKS as f64 / 1000.,

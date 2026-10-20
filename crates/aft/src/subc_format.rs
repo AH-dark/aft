@@ -1271,6 +1271,14 @@ fn format_write_response(data: &Value) -> String {
     }
     append_lsp_error_lines(&mut output, data, true);
     append_lsp_server_notes(&mut output, data);
+    if data.get("created").and_then(Value::as_bool) == Some(true)
+        && data.get("syntax_valid").and_then(Value::as_bool).is_none()
+    {
+        if let Some(reason) = data.get("syntax_skipped_reason").and_then(Value::as_str) {
+            output.push_str("\n\n");
+            output.push_str(&crate::edit::syntax_unknown_notice(reason));
+        }
+    }
     output
 }
 

@@ -409,6 +409,8 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     if let Some(line) = syntax_error_line {
         result[edit::CREATED_SYNTAX_ERROR_LINE_FIELD] = serde_json::json!(line);
     }
+    let syntax_skipped_reason = created_syntax.and_then(|check| check.skipped_reason);
+    edit::append_syntax_skipped_reason(&mut result, syntax_skipped_reason);
 
     if let Some(reason) = &format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -440,6 +442,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     if lsp_outcome.is_some() {
         let write_result = edit::WriteResult {
             syntax_valid,
+            syntax_skipped_reason,
             syntax_error_line,
             formatted,
             format_skipped_reason: format_skipped_reason.clone(),

@@ -5209,6 +5209,7 @@ mod watcher_filter_tests {
         ctx.set_canonical_cache_root(root);
 
         let watcher_tx = install_watcher_rx(&ctx);
+        tmp.close().expect("delete project root");
         watcher_tx.send(WatcherDispatchEvent::RootDeleted).unwrap();
 
         drain_watcher_events(&ctx);

@@ -45,6 +45,8 @@ pub struct SemanticArena {
     decodes: AtomicU64,
     store_reads: AtomicU64,
     chunk_batch: Mutex<()>,
+    #[cfg(test)]
+    chunk_shortcut: std::sync::atomic::AtomicBool,
 }
 
 /// Resident arena memory. Every key is counted once, whatever the number of
@@ -69,39 +71,51 @@ pub struct ArenaMemory {
 #[derive(Debug, Default)]
 struct VectorPool {
     by_digest: HashMap<blake3::Hash, Weak<[f32]>>,
+    // Populate only from chunk-row vectors that were read or stored; a file
+    // payload can contain different legacy floats.
+    by_chunk: HashMap<FamilyKey, Weak<[f32]>>,
     live_after_prune: usize,
     scratch: Vec<u8>,
 }
 
 impl VectorPool {
-    /// Points every vector of `run` at an equal resident vector when there is
-    /// one, and records the rest. Equality is bitwise, so scores computed
-    /// from a shared vector are exactly those of the vector it replaced.
+    /// Shares only bit-identical vectors, preserving cached norms and scores.
     fn share(&mut self, run: &mut SemanticVectors) {
         for vector in run.vectors_mut() {
-            self.scratch.clear();
-            for value in vector.iter() {
-                self.scratch
-                    .extend_from_slice(&value.to_bits().to_le_bytes());
-            }
-            let digest = blake3::hash(&self.scratch);
-            match self.by_digest.get(&digest).and_then(Weak::upgrade) {
-                Some(resident) if same_bits(&resident, vector) => *vector = resident,
-                // A digest collision between different floats: keep both.
-                Some(_) => {}
-                None => {
-                    self.by_digest.insert(digest, Arc::downgrade(vector));
-                }
-            }
+            self.share_vector(vector);
         }
-        if self.by_digest.len() > self.live_after_prune.max(1024).saturating_mul(2) {
+        if self.by_digest.len() + self.by_chunk.len()
+            > self.live_after_prune.max(1024).saturating_mul(2)
+        {
             self.prune();
+        }
+    }
+
+    fn share_vector(&mut self, vector: &mut Arc<[f32]>) {
+        self.scratch.clear();
+        for value in vector.iter() {
+            self.scratch
+                .extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let digest = blake3::hash(&self.scratch);
+        match self.by_digest.get(&digest).and_then(Weak::upgrade) {
+            Some(resident) if same_bits(&resident, vector) => *vector = resident,
+            // Keep unequal allocations on a digest collision.
+            Some(_) => {}
+            None => {
+                self.by_digest.insert(digest, Arc::downgrade(vector));
+            }
         }
     }
 
     fn prune(&mut self) {
         self.by_digest.retain(|_, vector| vector.strong_count() > 0);
-        self.live_after_prune = self.by_digest.len();
+        self.by_chunk.retain(|_, vector| vector.strong_count() > 0);
+        // `retain` keeps the table's allocation, which `memory()` reports;
+        // return it once the views that filled it are gone.
+        self.by_digest.shrink_to_fit();
+        self.by_chunk.shrink_to_fit();
+        self.live_after_prune = self.by_digest.len() + self.by_chunk.len();
     }
 }
 
@@ -145,6 +159,8 @@ pub fn arena_for(storage: &Path, family: &str) -> Arc<SemanticArena> {
         decodes: AtomicU64::new(0),
         store_reads: AtomicU64::new(0),
         chunk_batch: Mutex::new(()),
+        #[cfg(test)]
+        chunk_shortcut: std::sync::atomic::AtomicBool::new(true),
     });
     arenas.insert(key, Arc::downgrade(&arena));
     arena
@@ -172,6 +188,22 @@ impl Drop for ArenaClaim {
 }
 
 impl SemanticArena {
+    #[cfg(test)]
+    pub(crate) fn set_chunk_shortcut(&self, enabled: bool) {
+        self.chunk_shortcut.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Looks up the key derived from the producer identity and exact text.
+    /// Weak handles do not keep floats alive. Cold file loads must first validate
+    /// chunk rows before those vectors become eligible for this shortcut.
+    pub(crate) fn chunk_vector(&self, key: &FamilyKey) -> Option<Arc<[f32]>> {
+        #[cfg(test)]
+        if !self.chunk_shortcut.load(Ordering::Relaxed) {
+            return None;
+        }
+        lock(&self.vectors).by_chunk.get(key)?.upgrade()
+    }
+
     /// Serializes bounded chunk-vector batches across all views of the family.
     pub(crate) fn chunk_batch(&self) -> MutexGuard<'_, ()> {
         lock(&self.chunk_batch)
@@ -217,19 +249,38 @@ impl SemanticArena {
         Ok(Some(self.install(*key, run)))
     }
 
-    /// Makes a run that was just stored resident without decoding it again.
-    /// When another view installed the key first, its run is kept and
-    /// returned, so the key never has two resident copies. A new run's
-    /// vectors are shared with equal ones already resident.
+    /// Makes a stored run resident, sharing equal allocations. File payloads
+    /// alone cannot populate the chunk index: legacy floats may not match the
+    /// independently immutable chunk rows.
     pub fn install(&self, key: FamilyKey, mut run: SemanticVectors) -> Arc<SemanticVectors> {
         if let Some(resident) = self.get(&key) {
             return resident;
         }
-        // Digesting a run takes a moment; do it outside the run table lock.
-        // A run that then loses the race is dropped, and the handles it
-        // recorded are pruned with the rest.
         lock(&self.vectors).share(&mut run);
         Arc::clone(lock(&self.runs).entry(key).or_insert_with(|| Arc::new(run)))
+    }
+
+    /// Records a vector only after its exact chunk row was read or stored.
+    /// The caller keeps this allocation alive until the file run shares it.
+    pub(crate) fn remember_chunk(&self, key: FamilyKey, vector: Vec<f32>) -> Arc<[f32]> {
+        // Cap index entries separately: distinct chunk keys can share the same
+        // vector allocation. Weak references never keep the floats alive.
+        const MAX_CHUNK_KEYS: usize = 65_536;
+        let mut vector: Arc<[f32]> = vector.into();
+        let mut pool = lock(&self.vectors);
+        pool.share_vector(&mut vector);
+        if pool.by_chunk.len() >= MAX_CHUNK_KEYS {
+            if let Some(old) = pool.by_chunk.keys().next().copied() {
+                pool.by_chunk.remove(&old);
+            }
+        }
+        pool.by_chunk.insert(key, Arc::downgrade(&vector));
+        if pool.by_digest.len() + pool.by_chunk.len()
+            > pool.live_after_prune.max(1024).saturating_mul(2)
+        {
+            pool.prune();
+        }
+        vector
     }
 
     /// Claims `key` for embedding, or returns `None` while another fill holds
@@ -297,6 +348,10 @@ impl SemanticArena {
             }
         }
         memory.bytes = memory.bytes.saturating_add(memory.vector_bytes);
+        memory.bytes = memory.bytes.saturating_add(
+            (lock(&self.vectors).by_chunk.capacity()
+                * std::mem::size_of::<(FamilyKey, Weak<[f32]>)>()) as u64,
+        );
         memory
     }
 

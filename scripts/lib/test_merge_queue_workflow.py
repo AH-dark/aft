@@ -155,9 +155,16 @@ class MergeQueueDescriptorTests(unittest.TestCase):
         fake_gh.write_text(
             f"#!{sys.executable}\n"
             "import json, pathlib, sys\n"
-            "assert sys.argv[1:4] == ['api', '--paginate', '--slurp']\n"
-            "head = sys.argv[4].split('/commits/')[1].split('/')[0]\n"
-            "print(json.dumps([json.loads(pathlib.Path('.fixture-prs.json').read_text()).get(head, [])]))\n"
+            "fixture = json.loads(pathlib.Path('.fixture-prs.json').read_text())\n"
+            "if sys.argv[1:4] == ['api', '--paginate', '--slurp']:\n"
+            "    head = sys.argv[4].split('/commits/')[1].split('/')[0]\n"
+            "    print(json.dumps([fixture.get(head, [])]))\n"
+            "elif sys.argv[1:2] == ['api'] and '/pulls/' in sys.argv[2]:\n"
+            "    number = int(sys.argv[2].rsplit('/', 1)[1])\n"
+            "    pr = next((pr for prs in fixture.values() for pr in prs if pr['number'] == number), None)\n"
+            "    print(json.dumps(pr))\n"
+            "else:\n"
+            "    raise AssertionError(sys.argv)\n"
         )
         fake_gh.chmod(0o755)
         self.env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}

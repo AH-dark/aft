@@ -547,24 +547,17 @@ fn access_policy_foreign_worker_status_and_controls_are_denied() {
 }
 
 #[test]
-fn access_policy_task_folder_cache_is_pinned_and_shared_between_files() {
+fn access_policy_task_folder_cache_is_identity_checked_and_shared_between_files() {
     let f = fixture();
     crate::access_policy::with_scope(Some(f.head.clone()), || {
         assert!(read_as(&f.ctx, "head-session", &f.worker.command).success);
         std::fs::write(&f.worker.json, "invalid metadata").unwrap();
         assert!(read_as(&f.ctx, "head-session", &f.worker.stdout).success);
-        // Windows refuses to rename a folder while the pinned record holds a
-        // handle to it, which already rules out the swap this test guards.
-        let renamed = std::fs::rename(&f.worker.dir, f.worker.dir.with_extension("old"));
-        if cfg!(windows) {
-            assert!(
-                renamed.is_err(),
-                "a pinned task folder must not be renamable"
-            );
-            return;
-        }
-        renamed.unwrap();
+        // Cached permissions retain identities, not handles. Renaming is allowed,
+        // but a new directory at the same path must not inherit those permissions.
+        std::fs::rename(&f.worker.dir, f.worker.dir.with_extension("old")).unwrap();
         std::fs::create_dir_all(&f.worker.control_dir).unwrap();
+        std::fs::create_dir_all(&f.worker.io_dir).unwrap();
         std::fs::write(&f.worker.command, "replacement").unwrap();
         assert_floor(
             read_as(&f.ctx, "head-session", &f.worker.command),

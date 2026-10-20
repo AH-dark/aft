@@ -15430,6 +15430,12 @@ mod tests {
         );
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
+        // Windows cannot delete the project while it is a child's cwd. The fake
+        // moves outside it before initialization, without changing its LSP root.
+        ctx.lsp().set_extra_env(
+            "AFT_FAKE_LSP_CWD",
+            &root.as_path().parent().unwrap().to_string_lossy(),
+        );
         assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let pids = ctx.lsp_child_registry().pids();
@@ -15438,6 +15444,46 @@ mod tests {
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         (root_dir, root, ctx, executor, live_roots, pids[0])
+    }
+
+    #[test]
+    fn deleted_root_reclaim_shuts_down_running_lsp_without_registry_sweep() {
+        let (root_dir, root, ctx, executor, mut live_roots, pid) =
+            root_with_running_fake_server("deleted-root-lsp-reclaim");
+        let bound = HashMap::from([(root.clone(), HashSet::from([route_key(31, 1)]))]);
+        root_dir.close().expect("delete project root");
+        let metrics = DispatchPathMetrics::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let outcome = reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &bound,
+                &executor,
+                &metrics,
+            );
+            if !outcome.forgotten_deleted_roots.is_empty() {
+                assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "deleted root was not retired");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!executor.actor_registered(&root));
+        assert!(live_roots.is_empty());
+
+        // Retiring the actor must stop its server without either the watcher
+        // drain or the process-wide orphan sweep assisting the teardown.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::bash_background::process::is_process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "retired root left LSP child {pid} running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ctx.lsp().server_count(), 0);
     }
 
     fn quiesce_whole_connection(
@@ -17665,6 +17711,58 @@ mod tests {
         assert_eq!(bind_response.data["code"], "request_cancelled");
     }
 
+    fn frozen_lsp_edit_write_is_visible(
+        file_len: std::io::Result<u64>,
+        edit_in_flight: bool,
+    ) -> std::io::Result<bool> {
+        match file_len {
+            Ok(len) => Ok(len >= 1024 * 1024),
+            // On Windows, replacing a file can briefly make its path return
+            // NotFound. Retry only while the edit is in flight; absence is not
+            // evidence that the replacement bytes have been written.
+            Err(error) if edit_in_flight && error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn frozen_lsp_write_poll_retries_not_found_only_in_flight() {
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!frozen_lsp_edit_write_is_visible(Err(missing()), true).unwrap());
+        assert_eq!(
+            frozen_lsp_edit_write_is_visible(Err(missing()), false)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn frozen_lsp_write_poll_requires_large_file() {
+        for in_flight in [false, true] {
+            assert!(!frozen_lsp_edit_write_is_visible(Ok(0), in_flight).unwrap());
+            assert!(!frozen_lsp_edit_write_is_visible(Ok(1024 * 1024 - 1), in_flight).unwrap());
+            assert!(frozen_lsp_edit_write_is_visible(Ok(1024 * 1024), in_flight).unwrap());
+        }
+    }
+
+    #[test]
+    fn frozen_lsp_write_poll_rejects_other_errors() {
+        for in_flight in [false, true] {
+            assert_eq!(
+                frozen_lsp_edit_write_is_visible(
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                    in_flight,
+                )
+                .unwrap_err()
+                .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
     #[tokio::test]
     async fn frozen_lsp_edit_releases_writer_before_route_bind_deadline() {
         use crate::lsp::client::LspEvent;
@@ -17726,7 +17824,16 @@ mod tests {
             Box::new(move |ctx| crate::commands::edit_match::handle_edit_match(&request, ctx)),
         );
         let write_deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(&file).unwrap().len() < 1024 * 1024 {
+        loop {
+            let edit_in_flight = edit.is_empty();
+            if frozen_lsp_edit_write_is_visible(
+                std::fs::metadata(&file).map(|metadata| metadata.len()),
+                edit_in_flight,
+            )
+            .unwrap()
+            {
+                break;
+            }
             assert!(Instant::now() < write_deadline, "edit never wrote the file");
             std::thread::sleep(Duration::from_millis(5));
         }

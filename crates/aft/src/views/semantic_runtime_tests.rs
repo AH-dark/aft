@@ -1360,7 +1360,8 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     }
     assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
     assert_eq!(written_bytes, 2048 * 65 * 2);
-    assert_eq!(transactions, 1);
+    // Every key was just stored in this epoch, so folding needs no writer.
+    assert_eq!(transactions, 0);
 }
 
 /// A large, already-filled checkout must not read or embed unchanged sources

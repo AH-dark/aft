@@ -1,0 +1,1 @@
+- Finished and recovered background commands no longer keep a folder handle open each, so a long command history can no longer exhaust the daemon's open-file limit.

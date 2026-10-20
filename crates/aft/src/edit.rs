@@ -1722,8 +1722,10 @@ pub fn compute_reformatted_excerpt(
 /// Returned by `write_format_validate` to give callers a single struct
 /// with all post-write signals for the response JSON.
 pub struct WriteResult {
-    /// Whether tree-sitter syntax validation passed. `None` if unsupported language.
+    /// Whether syntax validation passed. `None` if unsupported or unconfirmed.
     pub syntax_valid: Option<bool>,
+    /// Why a created file's compiler confirmation could not establish validity.
+    pub syntax_skipped_reason: Option<&'static str>,
     /// 1-based line of the first parse error, set only when this call created
     /// the file and its confirmed syntax check failed. Such a file is kept on
     /// disk as written (there is nothing to roll back to), and the reply tells
@@ -1892,6 +1894,24 @@ impl WriteResult {
         if let Some(line) = self.syntax_error_line {
             result[CREATED_SYNTAX_ERROR_LINE_FIELD] = serde_json::json!(line);
         }
+        append_syntax_skipped_reason(result, self.syntax_skipped_reason);
+    }
+}
+
+pub(crate) fn syntax_unknown_notice(reason: &str) -> String {
+    format!("Syntax check: unknown ({reason}); the new file was written, but its syntax could not be confirmed.")
+}
+
+pub(crate) fn append_syntax_skipped_reason(result: &mut serde_json::Value, reason: Option<&str>) {
+    if let Some(reason) = reason {
+        result["syntax_skipped_reason"] = serde_json::json!(reason);
+        if !result["warnings"].is_array() {
+            result["warnings"] = serde_json::json!([]);
+        }
+        result["warnings"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(syntax_unknown_notice(reason)));
     }
 }
 
@@ -2084,6 +2104,7 @@ fn write_format_validate_impl(
     WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
     let mut final_text = ObservedFinalText::read(path);
     let mut syntax_error_line = None;
+    let mut syntax_skipped_reason = None;
     let syntax_valid = final_text
         .as_ref()
         .map(|observed| observed.text.as_str())
@@ -2092,6 +2113,7 @@ fn write_format_validate_impl(
             if !existed {
                 let check = check_created_file_syntax(path, source);
                 syntax_error_line = check.first_error_line;
+                syntax_skipped_reason = check.skipped_reason;
                 return check.valid;
             }
             let syntax_valid = validate_captured_syntax(path, source);
@@ -2152,6 +2174,7 @@ fn write_format_validate_impl(
 
     Ok(WriteResult {
         syntax_valid,
+        syntax_skipped_reason,
         syntax_error_line,
         formatted,
         format_skipped_reason,
@@ -2180,8 +2203,9 @@ fn parse_captured_syntax(path: &Path, source: &str) -> Option<tree_sitter::Tree>
 /// Syntax verdict for a file the current call created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CreatedFileSyntax {
-    /// `None` when the language has no parser.
+    /// `None` when the language has no parser or confirmation could not finish.
     pub valid: Option<bool>,
+    pub skipped_reason: Option<&'static str>,
     /// 1-based line of the first parse error. Set only when `valid` is
     /// `Some(false)` after any compiler confirmation.
     pub first_error_line: Option<usize>,
@@ -2193,16 +2217,22 @@ pub(crate) struct CreatedFileSyntax {
 /// is kept on disk and reported to the agent instead. The error line comes
 /// from the same tree-sitter parse that produced the verdict. Swift files that
 /// tree-sitter rejects are confirmed with `swiftc -parse` first, so a file the
-/// compiler accepts counts as valid and carries no error line.
+/// compiler accepts counts as valid and carries no error line. An unavailable
+/// compiler verdict is unknown and carries a reason instead of an error line.
 pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
     let Some(tree) = parse_captured_syntax(path, source) else {
         return CreatedFileSyntax {
             valid: None,
+            skipped_reason: None,
             first_error_line: None,
         };
     };
     let root = tree.root_node();
-    let valid = swift::confirm_created(path, source, Some(!root.has_error()));
+    let (valid, skipped_reason) =
+        match swift::confirm_created(path, source, Some(!root.has_error())) {
+            Ok(valid) => (valid, None),
+            Err(reason) => (None, Some(reason)),
+        };
     let first_error_line = if valid == Some(false) {
         first_syntax_error_line(root)
     } else {
@@ -2210,6 +2240,7 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
     };
     CreatedFileSyntax {
         valid,
+        skipped_reason,
         first_error_line,
     }
 }
