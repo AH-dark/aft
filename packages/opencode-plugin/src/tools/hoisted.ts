@@ -142,8 +142,8 @@ type DiffOp =
   | { tag: "del"; beforeIdx: number; line: string }
   | { tag: "ins"; afterIdx: number; line: string };
 
-/** Maximum cell count for the exact LCS table, matching its previous cost ceiling. */
-const LCS_TABLE_CELL_BUDGET = 25_000_000;
+/** Maximum LCS cell count; a 5000-line pair needs 5001×5001 entries. */
+const LCS_TABLE_CELL_BUDGET = 25_010_001;
 /** Bound the saved Myers frontiers so a large rewrite cannot consume unbounded memory. */
 const MYERS_TRACE_CELL_BUDGET = 1_500_000;
 const MYERS_WORK_BUDGET = 25_000_000;
