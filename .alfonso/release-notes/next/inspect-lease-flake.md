@@ -1,0 +1,1 @@
+- `aft_inspect` no longer reports a writer-lease timeout when no other process holds its cache but preparing the cache was slow.
