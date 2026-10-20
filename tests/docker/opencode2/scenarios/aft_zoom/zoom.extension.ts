@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
 const here = dirname(fileURLToPath(import.meta.url));
-const expectedIds = ["zoom/T1/happy","zoom/T2/invalid_arguments","zoom/T2/read-rule-batch","zoom/T7/happy"];
+const expectedIds = ["zoom/T1/happy","zoom/T2/invalid_arguments","zoom/T2/missing_target","zoom/T2/read-rule-batch","zoom/T7/happy"];
 async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "zoom");
   const actual = scenarios.map((scenario) => scenario.id).sort();

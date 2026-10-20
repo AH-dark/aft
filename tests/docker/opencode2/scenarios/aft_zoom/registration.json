@@ -22,8 +22,12 @@
                 "id": "zoom-happy",
                 "name": "aft_zoom",
                 "arguments": {
-                  "path": "sample.ts",
-                  "symbols": "uniqueScenarioSymbol"
+                  "batch": [
+                    {
+                      "target": "sample.ts",
+                      "symbols": "uniqueScenarioSymbol"
+                    }
+                  ]
                 },
                 "non_mutating_evidence": {
                   "reason": "zoom only observes fixture state"
@@ -82,10 +86,56 @@
                 "id": "zoom-invalid",
                 "name": "aft_zoom",
                 "arguments": {
-                  "path": 42
+                  "batch": 42
                 },
                 "non_mutating_evidence": {
-                  "reason": "the host rejects the argument type before execution"
+                  "reason": "the invalid batch is refused before any read is dispatched"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "zoom/T2/missing_target",
+      "tool": "zoom",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted zoom call without its required batch.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "compare_call_id": "zoom-missing",
+      "comparison": {
+        "mode": "exact",
+        "expected": "{\"error\":{\"type\":\"unknown\",\"message\":\"'batch' must be a non-empty array of {target, symbols}\"},\"content\":[]}"
+      },
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "zoom-missing",
+                "name": "aft_zoom",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the missing batch is refused before any read is dispatched"
                 }
               }
             ]
