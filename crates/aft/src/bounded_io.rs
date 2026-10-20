@@ -1365,7 +1365,7 @@ mod modes_macos_tests {
         tests::fifo(&fifo);
         let blocker = tests::block_directory_probe(&root, &fifo);
         let mut config = crate::config::Config::default();
-        config.project_root = Some(root);
+        config.project_root = Some(root.clone());
         config.storage_dir = Some(dir.path().join("store"));
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let request: RawRequest = serde_json::from_value(
@@ -1373,14 +1373,18 @@ mod modes_macos_tests {
         )
         .unwrap();
         let started = Instant::now();
-        let budget = Budget::after(Duration::from_millis(100));
+        // The access cap starts only after the helper is scheduled. A short
+        // whole-request budget can expire during unrelated preflight I/O and
+        // never reach the blocked directory, especially on a loaded test host.
+        let budget = Budget::after(Duration::from_secs(30))
+            .with_path_access_budget(&root, Duration::from_millis(100));
         let response = with_budget(Some(budget.clone()), || {
             crate::commands::write::handle_write(&request, &ctx)
         });
         assert_eq!(response.data["code"], "read_blocked", "{response:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "remaining reply budget must cap the five-second I/O helper"
+            "the blocked probe must hit its per-access cap, not the five-second default"
         );
         assert_eq!(blocker.fired.load(Ordering::Relaxed), 1);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
