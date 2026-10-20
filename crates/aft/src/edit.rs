@@ -13,6 +13,10 @@ use crate::error::AftError;
 use crate::format;
 use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser};
 
+// The alternative Windows commit primitive is an experiment, not a user option.
+#[cfg(all(windows, test))]
+mod windows_rename_experiment;
+
 /// How [`atomic_write_source`] stored the new bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceWriteMode {
@@ -464,6 +468,20 @@ mod source_replacement {
             replacement: &Path,
             parent: &Path,
         ) -> io::Result<bool> {
+            #[cfg(test)]
+            super::super::windows_rename_experiment::checkpoint(destination, replacement);
+            #[cfg(test)]
+            if super::super::windows_rename_experiment::enabled() {
+                return super::super::windows_rename_experiment::replace_with_fallback(
+                    destination,
+                    replacement,
+                    || replace_file(destination, replacement, parent),
+                );
+            }
+            replace_file(destination, replacement, parent)
+        }
+
+        fn replace_file(destination: &Path, replacement: &Path, parent: &Path) -> io::Result<bool> {
             // With a backup name, every documented failure leaves the original
             // either under its own name or under the backup name, never gone.
             let backup = parent.join(format!(
