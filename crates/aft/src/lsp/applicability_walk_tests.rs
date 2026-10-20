@@ -1,5 +1,6 @@
 use super::*;
 use crate::lsp::applicability_cache::ApplicabilityCache;
+use crate::lsp::registry::servers_with_root_marker;
 use crate::lsp::roots::RootPathMode;
 
 fn config(root: &Path) -> Config {
@@ -860,10 +861,23 @@ fn applicability_walk_matches_legacy_nested_workspaces_and_outside_symlinks() {
 // Frozen pre-optimization algorithm: keep the independent traversal and public
 // root-resolution APIs so parity checks do not compare the fast path to itself.
 fn legacy_walk(project_root: &Path, config: &Config) -> ApplicabilityWalk {
+    legacy_scoped_walk(project_root, config, None)
+}
+
+fn legacy_scoped_walk(
+    project_root: &Path,
+    config: &Config,
+    scopes: Option<&[PathBuf]>,
+) -> ApplicabilityWalk {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     let mut markers = HashMap::new();
-    let mut builder = ignore::WalkBuilder::new(project_root);
+    let roots = scopes.unwrap_or_default();
+    let mut builder =
+        ignore::WalkBuilder::new(roots.first().map_or(project_root, PathBuf::as_path));
+    for root in roots.iter().skip(1) {
+        builder.add(root);
+    }
     builder.same_file_system(true).standard_filters(true);
     let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
         .filter_entry(|entry| {
@@ -905,6 +919,148 @@ fn legacy_walk(project_root: &Path, config: &Config) -> ApplicabilityWalk {
         candidates,
         markers,
     }
+}
+
+#[test]
+fn applicability_walk_mixed_registry_matches_legacy_byte_for_byte() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for (name, contents) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers=['crates/member']\nexclude=['nested']",
+        ),
+        (
+            "crates/member/Cargo.toml",
+            "[package]\nname='member'\nversion='0.1.0'",
+        ),
+        ("crates/member/src/lib.rs", ""),
+        ("nested/Cargo.toml", "[workspace]\nmembers=[]"),
+        ("nested/src/lib.rs", ""),
+        ("package.json", "{}"),
+        (
+            "biome.json",
+            r#"{"files":{"includes":["**/*.ts","!**/skip.ts"]}}"#,
+        ),
+        ("src/keep.ts", ""),
+        ("src/skip.ts", ""),
+        ("src/data.json", "{}"),
+        ("src/UPPER.TS", ""),
+        ("next/package.json", "{}"),
+        (
+            "next/node_modules/typescript/package.json",
+            r#"{"name":"typescript","version":"7.0.2"}"#,
+        ),
+        ("next/src/index.ts", ""),
+        ("old/package.json", "{}"),
+        (
+            "old/node_modules/typescript/package.json",
+            r#"{"name":"typescript","version":"5.9.3"}"#,
+        ),
+        ("old/src/index.ts", ""),
+        ("python/pyproject.toml", "[tool.pyright]"),
+        ("python/deep/requirements.txt", ""),
+        ("python/deep/helper.py", ""),
+        ("scripts/helper.py", ""),
+        ("next/scripts/run.sh", ""),
+        ("next/data.yaml", ""),
+        ("custom/marker.root", ""),
+        ("custom/main.xyz", ""),
+        ("custom/other.XYZ", ""),
+    ] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    for overrides in [false, true] {
+        let mut config = config(&root);
+        config.experimental_lsp_ty = true;
+        if overrides {
+            use crate::config::UserServerDef;
+            config.lsp_servers = vec![
+                UserServerDef {
+                    id: "custom".into(),
+                    binary: "custom-lsp".into(),
+                    extensions: vec!["xyz".into(), "XYZ".into()],
+                    root_markers: vec!["marker.root".into()],
+                    ..Default::default()
+                },
+                UserServerDef {
+                    id: "typescript".into(),
+                    args: vec!["--stdio".into()],
+                    initialization_options: Some(
+                        serde_json::json!({"preferences":{"quotePreference":"single"}}),
+                    ),
+                    ..Default::default()
+                },
+                UserServerDef {
+                    id: "biome".into(),
+                    root_markers: vec!["package.json".into()],
+                    ..Default::default()
+                },
+                UserServerDef {
+                    id: "go".into(),
+                    disabled: true,
+                    ..Default::default()
+                },
+            ];
+        }
+        for scopes in [
+            None,
+            Some(vec![root.join("src/skip.ts")]),
+            Some(vec![root.join("src/keep.ts")]),
+            Some(vec![root.join("next"), root.join("custom")]),
+        ] {
+            let old = legacy_scoped_walk(&root, &config, scopes.as_deref());
+            let new = walk_applicable_area_uncached(
+                &root,
+                scopes.as_deref(),
+                &config,
+                Instant::now() + Duration::from_secs(30),
+                200_000,
+                RootPathMode::WalkEntry,
+            )
+            .unwrap();
+            let candidates = |walk: ApplicabilityWalk| {
+                walk.candidates
+                    .into_iter()
+                    .map(|c| (c.key, c.definition, c.source_file))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(new.markers, old.markers);
+            assert_eq!(candidates(new), candidates(old));
+        }
+    }
+}
+
+fn cost_fixture(files_per_directory: usize, directories: usize) -> (tempfile::TempDir, Config) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("package.json"), "{}").unwrap();
+    std::fs::write(root.join("biome.json"), r#"{"files":{"includes":["**"]}}"#).unwrap();
+    for directory in 0..directories {
+        let dir = root.join(format!("packages/pkg{directory}/src"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..files_per_directory {
+            let extension = ["ts", "json", "py", "sh", "yaml", "rs", "go", "txt"][file % 8];
+            std::fs::write(dir.join(format!("file{file}.{extension}")), "").unwrap();
+        }
+    }
+    let config = config(&root);
+    (temp, config)
+}
+
+#[test]
+fn applicability_walk_sibling_cost_does_not_rebuild_definitions_or_roots() {
+    let (temp, config) = cost_fixture(512, 1);
+    let root = temp.path().canonicalize().unwrap();
+    let (walk, allocations) = crate::test_allocations::count(|| scan(&root, &config));
+    println!("sibling_files=512 allocations={allocations}");
+    assert!(!walk.candidates.is_empty());
+    assert!(
+        allocations < 40_000,
+        "per-file server discovery allocated {allocations} times"
+    );
 }
 
 #[test]
