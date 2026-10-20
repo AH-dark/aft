@@ -5767,16 +5767,19 @@ impl AppContext {
     /// pending too, even while the channel itself is momentarily empty.
     pub fn watcher_query_has_pending_changes(&self) -> bool {
         let activity = self.watcher_drain_activity.load(Ordering::Acquire);
-        self.watcher_drain_has_work()
-            || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
-            || match self.watcher_counters.try_read() {
-                Ok(counters) => counters.dispatch_backlog() > 0,
-                Err(std::sync::TryLockError::Poisoned(counters)) => {
-                    counters.into_inner().dispatch_backlog() > 0
-                }
-                // Contended: assume events may be held, as the probes above do.
-                Err(std::sync::TryLockError::WouldBlock) => true,
+        // Dispatch sends held events before clearing the backlog count. Read
+        // that count first so a handoff cannot hide events from both probes.
+        let backlog_pending = match self.watcher_counters.try_read() {
+            Ok(counters) => counters.dispatch_backlog() > 0,
+            Err(std::sync::TryLockError::Poisoned(counters)) => {
+                counters.into_inner().dispatch_backlog() > 0
             }
+            // Contended: assume events may be held, as the probes below do.
+            Err(std::sync::TryLockError::WouldBlock) => true,
+        };
+        backlog_pending
+            || self.watcher_drain_has_work()
+            || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
             || self.watcher_drain_activity.load(Ordering::Acquire) != activity
     }
 

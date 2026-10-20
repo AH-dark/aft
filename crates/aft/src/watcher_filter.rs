@@ -3193,6 +3193,12 @@ mod tests {
             std::fs::write(root.join(name), "fn f() {}\n").unwrap();
         }
         let (mut filter, rx, shutdown) = filter_with_full_dispatch_channel(&root);
+        let ctx = crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        );
+        ctx.update_config(|config| config.project_root = Some(root.clone()));
+        *ctx.watcher_rx().lock() = Some(rx.clone());
         let batches_root = root.clone();
         let flusher = thread::spawn(move || {
             for batch in [["a.rs", "b.rs"], ["b.rs", "c.rs"]] {
@@ -3227,10 +3233,21 @@ mod tests {
             rx.try_recv().unwrap(),
             WatcherDispatchEvent::Paths(vec![root.join("earlier.rs")])
         );
+        assert!(rx.is_empty());
+        assert!(
+            ctx.watcher_query_has_pending_changes(),
+            "held events remain pending even after the channel empties"
+        );
         assert!(filter.retry_backlog());
+        assert_eq!(filter.config.counters.dispatch_backlog(), 0);
+        assert!(
+            ctx.watcher_query_has_pending_changes(),
+            "dispatched events remain pending after the backlog clears"
+        );
         assert_eq!(rx.try_recv().unwrap(), merged);
         assert!(filter.backlog.is_empty());
         assert_eq!(filter.config.counters.dispatch_backlog(), 0);
+        assert!(!ctx.watcher_query_has_pending_changes());
     }
 
     /// Held events keep their order and collapse instead of growing: a rescan

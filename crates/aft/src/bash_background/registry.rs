@@ -14120,7 +14120,9 @@ mod tests {
         let started = Instant::now();
         let mut calls = 0usize;
         while started.elapsed() < Duration::from_millis(2_500) {
-            let _ = registry.cleanup_terminal_task_temp(&task);
+            // Exercise failed deletion after retention, not the successful
+            // handoff that keeps a newly finished task's scratch on disk.
+            let _ = registry.cleanup_terminal_task_temp_at(&task, u64::MAX);
             calls += 1;
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -14332,6 +14334,73 @@ mod tests {
             .is_none());
         assert_eq!(task.lock_state().unwrap().removed_temp_dir, Some(scratch));
         assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_release_preserves_one_cleanup_backoff_step() {
+        for scope_end in [false, true] {
+            let registry = BgTaskRegistry::default();
+            let dir = tempfile::tempdir().unwrap();
+            let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+            let scope = subc_protocol::scope::ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "owner".into(),
+                },
+                "retained",
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true);
+            task.lock_state().unwrap().metadata.scope = Some(scope.clone());
+            let (scratch, finished_at) = attach_scratch(&task);
+            assert!(registry
+                .cleanup_terminal_task_temp_at(&task, finished_at + 1)
+                .unwrap());
+
+            // Seed the longest retry step to prove retention release does not
+            // wait for, or restart, the deletion worker's failure backoff.
+            let retry_started = Instant::now();
+            for _ in 0..10 {
+                task.lock_state()
+                    .unwrap()
+                    .temp_cleanup_retry
+                    .failed(retry_started);
+            }
+            if scope_end {
+                registry.kill_scope(&scope);
+            } else {
+                registry.sweep_retained_scratch_at(finished_at + retention_ms());
+            }
+            assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
+            assert!(registry
+                .inner
+                .watchdog_tasks
+                .lock()
+                .unwrap()
+                .contains_key(&task.task_id));
+            for _ in 0..64 {
+                assert!(!registry.cleanup_terminal_task_temp(&task).unwrap());
+                let state = task.lock_state().unwrap();
+                assert!(state.scratch_released);
+                assert!(state.temp_cleanup.is_none());
+                assert!(!state
+                    .temp_cleanup_retry
+                    .ready(retry_started + Duration::from_secs(299)));
+                assert!(state
+                    .temp_cleanup_retry
+                    .ready(retry_started + Duration::from_secs(300)));
+            }
+
+            // Move the failure clock into the past instead of sleeping through
+            // five minutes; the next observer must schedule the real deletion.
+            task.lock_state()
+                .unwrap()
+                .temp_cleanup_retry
+                .failed(Instant::now() - Duration::from_secs(301));
+            wait_for_released_scratch(&registry, &task);
+            assert!(!scratch.exists());
+        }
     }
 
     #[test]
