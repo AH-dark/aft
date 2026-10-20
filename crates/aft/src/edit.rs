@@ -3161,6 +3161,35 @@ mod in_place_write_tests {
     }
 
     #[test]
+    fn hard_linked_file_is_rewritten_in_place_on_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        std::fs::write(&path, "old\r\n").unwrap();
+        std::fs::hard_link(&path, &other_name).unwrap();
+        let outcome = atomic_write_source(&path, b"new\r\n").unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::InPlace);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\r\n");
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"new\r\n");
+        assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn single_link_file_is_replaced_with_its_new_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        std::fs::write(&path, "\u{feff}old\r\n").unwrap();
+        let outcome = atomic_write_source(&path, "\u{feff}new\r\n\u{e9}".as_bytes()).unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::Replaced);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            "\u{feff}new\r\n\u{e9}".as_bytes()
+        );
+        assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
     fn next_write_reports_a_leftover_recovery_copy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.txt");
@@ -3229,6 +3258,20 @@ mod in_place_write_tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// The access entries of `icacls` output for `path`, without the path
+    /// itself or the summary line, so two files' DACLs can be compared.
+    #[cfg(windows)]
+    fn acl_entries(output: &str, path: &Path) -> Vec<String> {
+        let shown = path.display().to_string();
+        output
+            .replace(&shown, "")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("Successfully processed"))
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[cfg(windows)]
     #[test]
     fn replace_keeps_an_explicit_windows_acl() {
@@ -3254,6 +3297,54 @@ mod in_place_write_tests {
         let outcome = atomic_write_source(&path, b"third\n").unwrap();
         assert_eq!(outcome.mode, SourceWriteMode::Replaced);
         assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        assert_eq!(icacls(&path), before);
+        assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    /// An in-place write's recovery copy must carry exactly the file's own
+    /// DACL, not the folder's inheritable entries.
+    #[cfg(windows)]
+    #[test]
+    fn in_place_recovery_copy_carries_the_files_own_dacl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-5-32-551:(R)"])
+            .output()
+            .unwrap();
+        assert!(granted.status.success(), "{granted:?}");
+        std::fs::hard_link(&path, &other_name).unwrap();
+        let before = icacls(&path);
+        let mut copy_acl = None;
+        let mut copy_path = None;
+        let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
+            use std::io::Write;
+            let copies = recovery_entries(dir.path());
+            assert_eq!(copies.len(), 1, "{copies:?}");
+            assert!(copies[0].ends_with("-linked.txt.orig"), "{copies:?}");
+            let copy = dir.path().join(&copies[0]);
+            assert_eq!(std::fs::read(&copy).unwrap(), b"old\n");
+            copy_acl = Some(icacls(&copy));
+            copy_path = Some(copy);
+            file.write_all(bytes)
+        })
+        .unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::InPlace);
+        let copy_acl = copy_acl.expect("the writer saw the recovery copy");
+        assert!(
+            copy_acl.contains("Backup Operators") || copy_acl.contains("S-1-5-32-551"),
+            "{copy_acl}"
+        );
+        assert_eq!(
+            acl_entries(&copy_acl, &copy_path.expect("copy path")),
+            acl_entries(&before, &path),
+            "the copy must carry exactly the file's own DACL"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"new\n");
         assert_eq!(icacls(&path), before);
         assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
     }

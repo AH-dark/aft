@@ -2311,3 +2311,44 @@ mod audit11_regressions {
         assert_eq!(fs::metadata(&path).unwrap().nlink(), 2);
     }
 }
+
+/// Hashline writes on every platform: a single-link file is replaced with the
+/// new bytes, and a hard-linked file is rewritten so every name sees them.
+#[cfg(test)]
+mod portable_durable_write_tests {
+    use super::*;
+
+    fn leftover_sidecars(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".aft-source-"))
+            .collect()
+    }
+
+    #[test]
+    fn durable_write_replaces_a_single_link_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        fs::write(&path, b"old\r\n").unwrap();
+        let warnings = durable_write(&path, b"\xef\xbb\xbfnew\r\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"\xef\xbb\xbfnew\r\n");
+        assert_eq!(leftover_sidecars(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn durable_write_rewrites_every_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        fs::write(&path, b"old\n").unwrap();
+        fs::hard_link(&path, &other_name).unwrap();
+        let warnings = durable_write(&path, b"new\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(fs::read(&other_name).unwrap(), b"new\n");
+        assert_eq!(leftover_sidecars(dir.path()), Vec::<String>::new());
+    }
+}
