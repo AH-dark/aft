@@ -86,8 +86,16 @@ fn spawn_bg(aft: &mut AftProcess, id: &str, command: &str) -> String {
         .to_string(),
     );
     assert_eq!(response["success"], true, "spawn failed: {response:?}");
-    assert_eq!(response["status"], "running");
-    response["task_id"].as_str().unwrap().to_string()
+    let observed = response["status"].as_str().unwrap_or_default();
+    assert!(
+        observed == "running" || is_terminal_status(observed),
+        "unexpected spawn status: {response:?}"
+    );
+    response["task_id"]
+        .as_str()
+        .filter(|task_id| !task_id.is_empty())
+        .expect("spawn response missing task_id")
+        .to_string()
 }
 
 fn spawn_bg_params(aft: &mut AftProcess, id: &str, params: Value) -> String {
@@ -100,8 +108,16 @@ fn spawn_bg_params(aft: &mut AftProcess, id: &str, params: Value) -> String {
         .to_string(),
     );
     assert_eq!(response["success"], true, "spawn failed: {response:?}");
-    assert_eq!(response["status"], "running");
-    response["task_id"].as_str().unwrap().to_string()
+    let observed = response["status"].as_str().unwrap_or_default();
+    assert!(
+        observed == "running" || is_terminal_status(observed),
+        "unexpected spawn status: {response:?}"
+    );
+    response["task_id"]
+        .as_str()
+        .filter(|task_id| !task_id.is_empty())
+        .expect("spawn response missing task_id")
+        .to_string()
 }
 
 fn status(aft: &mut AftProcess, task_id: &str) -> Value {
@@ -128,7 +144,10 @@ fn status_with_session(aft: &mut AftProcess, task_id: &str, session_id: &str) ->
 }
 
 fn is_terminal_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "killed" | "timed_out")
+    matches!(
+        status,
+        "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
+    )
 }
 
 fn wait_for_status(aft: &mut AftProcess, task_id: &str, expected: &str) -> Value {

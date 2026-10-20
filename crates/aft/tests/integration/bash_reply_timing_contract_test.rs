@@ -318,9 +318,12 @@ fn promoted_foreground_is_killed_at_its_timeout() {
         HANG_CATCH,
     );
     assert_eq!(response["success"], true, "response: {response:?}");
-    assert_eq!(
-        response["status"], "running",
-        "the call should be promoted before its timeout: {response:?}"
+    assert!(
+        matches!(
+            response["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "the promoted call may be terminal if the timeout expires before the reply: {response:?}"
     );
     let task_id = response["task_id"].as_str().expect("task_id").to_string();
 

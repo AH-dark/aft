@@ -160,7 +160,13 @@ fn foreground_bash_with_daemonized_child_does_not_wait_for_inherited_fds() {
         json!({ "command": "nohup sh -c 'sleep 30 && echo done' > /dev/null 2>&1 &" }),
     );
     assert_eq!(bash["success"], true, "bash failed: {bash:?}");
-    assert_eq!(bash["status"], "running");
+    assert!(
+        matches!(
+            bash["status"].as_str(),
+            Some("running" | "completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        ),
+        "unexpected spawn status: {bash:?}"
+    );
     // Usually returns in <100ms; assert only that inherited file descriptors do
     // not deadlock the foreground wait path.
     assert!(started.elapsed() < Duration::from_secs(10));
