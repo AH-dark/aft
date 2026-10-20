@@ -15359,6 +15359,46 @@ mod tests {
         (root_dir, root, ctx, executor, live_roots, pids[0])
     }
 
+    #[test]
+    fn deleted_root_reclaim_shuts_down_running_lsp_without_registry_sweep() {
+        let (root_dir, root, ctx, executor, mut live_roots, pid) =
+            root_with_running_fake_server("deleted-root-lsp-reclaim");
+        let bound = HashMap::from([(root.clone(), HashSet::from([route_key(31, 1)]))]);
+        root_dir.close().expect("delete project root");
+        let metrics = DispatchPathMetrics::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let outcome = reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &bound,
+                &executor,
+                &metrics,
+            );
+            if !outcome.forgotten_deleted_roots.is_empty() {
+                assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "deleted root was not retired");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!executor.actor_registered(&root));
+        assert!(live_roots.is_empty());
+
+        // Retiring the actor must stop its server without either the watcher
+        // drain or the process-wide orphan sweep assisting the teardown.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::bash_background::process::is_process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "retired root left LSP child {pid} running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ctx.lsp().server_count(), 0);
+    }
+
     fn quiesce_whole_connection(
         live_roots: &mut HashMap<ProjectRootId, RootMeta>,
         executor: &Arc<Executor>,

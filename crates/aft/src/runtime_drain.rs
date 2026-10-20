@@ -3496,6 +3496,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     let configure_generation = ctx.configure_generation();
     let content_generation = ctx.configure_content_generation();
     let mut outcome = DrainBatchOutcome::default();
+    // Ordinary admission rejects missing directories, but their cleanup must
+    // still run. It retains the lifecycle gate and retries without a watcher.
+    if ctx.try_cleanup_deleted_root(configure_generation) {
+        return outcome;
+    }
     // Admission before touching the continuation: an unbound invocation must
     // leave the retained state in place for the rebind to rebase, not take
     // and drop it.
@@ -3657,13 +3662,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         .is_some_and(|rx| !rx.is_empty());
 
     if root_deleted {
-        ctx.stop_watcher_runtime_in_background();
-        let _ = ctx.add_degraded_reason("project_root_deleted".to_string());
-        aft::slog_warn!(
-            "project root deleted; dropping watcher to avoid delete-storm: {:?}",
-            ctx.canonical_cache_root_opt()
-        );
-        ctx.signal_status_changed();
+        ctx.try_cleanup_deleted_root(configure_generation);
         return outcome;
     }
     if let Some(error) = watcher_failed {
@@ -8799,7 +8798,7 @@ mod watcher_slice_tests {
 // Every test here spawns a real child process, so the module is Unix-only.
 #[cfg(all(test, unix))]
 mod idle_lsp_tests {
-    use super::shutdown_idle_lsp_at;
+    use super::{drain_watcher_events_bounded, shutdown_idle_lsp_at};
     use crate::config::Config;
     use crate::context::AppContext;
     use crate::lsp::child_registry::LspChildRegistry;
@@ -8838,6 +8837,230 @@ mod idle_lsp_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    fn deleted_root_context(
+        root: &Path,
+    ) -> (
+        AppContext,
+        crossbeam_channel::Sender<crate::watcher_filter::WatcherDispatchEvent>,
+    ) {
+        std::fs::create_dir(root).unwrap();
+        let mut config = Config::default();
+        config.project_root = Some(root.to_path_buf());
+        let ctx = AppContext::new(crate::context::default_language_provider_factory(), config);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        (ctx, tx)
+    }
+
+    #[test]
+    fn deleted_root_drain_shuts_down_running_lsp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, tx) = deleted_root_context(&root);
+        let pid = spawn_sleep_client(&ctx, root.clone());
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        tx.send(crate::watcher_filter::WatcherDispatchEvent::RootDeleted)
+            .unwrap();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            drain_watcher_events_bounded(&ctx, 1);
+            drain_watcher_events_bounded(&ctx, 1);
+        });
+
+        assert_eq!(
+            ctx.lsp().server_count(),
+            0,
+            "deleted root must release LSP clients"
+        );
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(6)),
+            "deleted-root LSP child must exit"
+        );
+        assert!(ctx.watcher_rx().lock().is_none());
+        let cleanup_logs = logs
+            .iter()
+            .filter(|line| line.contains("project root deleted"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cleanup_logs.len(),
+            1,
+            "cleanup must log only once: {logs:?}"
+        );
+        assert!(cleanup_logs[0].contains(&root.display().to_string()));
+        assert!(cleanup_logs[0].contains("shut down 1 language server(s)"));
+    }
+
+    #[test]
+    fn deleted_root_drain_retries_busy_lsp_without_watcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, _tx) = deleted_root_context(&root);
+        let pid = spawn_sleep_client(&ctx, root.clone());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let held = ctx.lsp();
+        let started = Instant::now();
+        drain_watcher_events_bounded(&ctx, 1);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(held.server_count(), 1);
+        assert!(
+            ctx.watcher_rx().lock().is_none(),
+            "the retry must not depend on a watcher"
+        );
+        assert!(
+            ctx.watcher_drain_has_work(),
+            "subc maintenance must schedule the retry"
+        );
+        drop(held);
+
+        drain_watcher_events_bounded(&ctx, 1);
+        assert_eq!(
+            ctx.lsp().server_count(),
+            0,
+            "later drain must retry the busy manager"
+        );
+        assert!(!ctx.watcher_drain_has_work());
+        assert!(wait_until_dead(pid, Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn deleted_root_drain_preserves_unbind_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, _tx) = deleted_root_context(&root);
+        let pid = spawn_sleep_client(&ctx, root.clone());
+        ctx.mark_subc_unbound();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        drain_watcher_events_bounded(&ctx, 1);
+        assert_eq!(ctx.lsp().server_count(), 1);
+        assert!(ctx.watcher_rx().lock().is_some());
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        ctx.mark_subc_bound();
+        drain_watcher_events_bounded(&ctx, 1);
+        assert_eq!(ctx.lsp().server_count(), 0);
+        assert!(wait_until_dead(pid, Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn deleted_root_cleanup_defers_contended_watcher_receiver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, _tx) = deleted_root_context(&root);
+        let pid = spawn_sleep_client(&ctx, root.clone());
+        std::fs::remove_dir_all(&root).unwrap();
+        let held = ctx.watcher_rx().lock();
+        let started = Instant::now();
+        assert!(ctx.try_cleanup_deleted_root(ctx.configure_generation()));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(held.is_some());
+        assert!(ctx.watcher_drain_has_work());
+        assert_eq!(ctx.lsp().server_count(), 1);
+        drop(held);
+
+        drain_watcher_events_bounded(&ctx, 1);
+        assert_eq!(ctx.lsp().server_count(), 0);
+        assert!(wait_until_dead(pid, Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn deleted_root_cleanup_rejects_stale_generation_after_recreation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, _tx) = deleted_root_context(&root);
+        let old_generation = ctx.configure_generation();
+        let old_pid = spawn_sleep_client(&ctx, root.clone());
+        std::fs::remove_dir_all(&root).unwrap();
+        drain_watcher_events_bounded(&ctx, 1);
+        assert!(wait_until_dead(old_pid, Duration::from_secs(6)));
+
+        std::fs::create_dir(&root).unwrap();
+        ctx.advance_configure_generation();
+        let pid = spawn_sleep_client(&ctx, root.clone());
+        assert!(!ctx.try_cleanup_deleted_root(ctx.configure_generation()));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        tx.send(crate::watcher_filter::WatcherDispatchEvent::RootDeleted)
+            .unwrap();
+        drain_watcher_events_bounded(&ctx, 1);
+        assert_eq!(
+            ctx.lsp().server_count(),
+            1,
+            "an old deletion event must not reap a recreated root"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!ctx.try_cleanup_deleted_root(old_generation));
+        assert_eq!(
+            ctx.lsp().server_count(),
+            1,
+            "stale cleanup must not touch the replacement"
+        );
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        assert!(ctx.try_cleanup_deleted_root(ctx.configure_generation()));
+        assert!(wait_until_dead(pid, Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn deleted_root_drain_rejects_initializing_lsp_with_no_published_clients() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let (ctx, _tx) = deleted_root_context(&root);
+        let ctx = std::sync::Arc::new(ctx);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='deleted'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "pub fn f() {}\n").unwrap();
+        let signal = tmp.path().join("initializing");
+        ctx.lsp().override_binary(
+            ServerKind::Rust,
+            crate::fake_lsp_test_helper::fake_server_binary(),
+        );
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_INIT_DELAY_MS", "1500");
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_INIT_DELAY_SIGNAL", signal.to_str().unwrap());
+        let worker_ctx = std::sync::Arc::clone(&ctx);
+        let worker = std::thread::spawn(move || {
+            crate::lsp::manager::start_servers_for_file_unlocked(
+                || worker_ctx.lsp(),
+                &file,
+                &worker_ctx.config(),
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !signal.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fake LSP never received initialize"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !worker.is_finished(),
+            "initialize delay must still hold the server"
+        );
+        assert_eq!(ctx.lsp().server_count(), 0);
+        let pids = ctx.lsp_child_registry().pids();
+        assert_eq!(pids.len(), 1);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        drain_watcher_events_bounded(&ctx, 1);
+        worker.join().unwrap();
+        assert_eq!(
+            ctx.lsp().server_count(),
+            0,
+            "initializing server must not publish after deletion"
+        );
+        assert!(wait_until_dead(pids[0], Duration::from_secs(6)));
     }
 
     #[cfg(unix)]

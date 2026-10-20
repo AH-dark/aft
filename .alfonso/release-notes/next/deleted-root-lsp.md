@@ -1,0 +1,1 @@
+Language servers started by standalone AFT now shut down promptly when their project root is deleted, including servers still initializing and managers temporarily busy with another request. Cleanup preserves lifecycle generation checks so it cannot stop servers belonging to a replacement project at the same path. Thanks to @chrisolszewski for reporting and diagnosing issue #631.

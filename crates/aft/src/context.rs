@@ -1740,6 +1740,12 @@ pub(crate) fn watcher_counters_for_root(root: &Path) -> Arc<WatcherCounters> {
 }
 
 #[derive(Debug)]
+enum DeletedRootCleanup {
+    Pending(u64),
+    Complete(u64),
+}
+
+#[derive(Debug)]
 pub(crate) struct WatcherDrainSliceState {
     pub(crate) configure_generation: u64,
     /// Content identity of the configuration this continuation was built
@@ -3792,6 +3798,7 @@ pub struct AppContext {
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
+    deleted_root_cleanup: parking_lot::Mutex<Option<DeletedRootCleanup>>,
     watcher_drains_in_flight: AtomicUsize,
     /// Advances when a watcher drain starts and when it ends.
     watcher_drain_activity: AtomicU64,
@@ -4550,6 +4557,7 @@ impl AppContext {
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
+            deleted_root_cleanup: parking_lot::Mutex::new(None),
             watcher_drains_in_flight: AtomicUsize::new(0),
             watcher_drain_activity: AtomicU64::new(0),
             watcher_thread: parking_lot::Mutex::new(None),
@@ -5643,6 +5651,58 @@ impl AppContext {
         )
     }
 
+    /// Clean up a missing root without admitting ordinary work on that root.
+    /// Returns true when the drain should stop, including when the LSP
+    /// manager is busy and cleanup must be retried on a later drain call.
+    pub(crate) fn try_cleanup_deleted_root(&self, expected_generation: u64) -> bool {
+        self.subc_lifecycle
+            .run_if_current(
+                self.configure_generation.as_ref(),
+                expected_generation,
+                || {
+                    let Some(root) = self
+                        .canonical_cache_root_opt()
+                        .or_else(|| self.config().project_root.clone())
+                    else {
+                        return false;
+                    };
+                    let mut cleanup = self.deleted_root_cleanup.lock();
+                    if root.is_dir() {
+                        *cleanup = None;
+                        return false;
+                    }
+                    if matches!(*cleanup, Some(DeletedRootCleanup::Complete(generation)) if generation == expected_generation) {
+                        return true;
+                    }
+                    *cleanup = Some(DeletedRootCleanup::Pending(expected_generation));
+                    // A concurrent drain may hold the receiver while awaiting
+                    // lifecycle admission. Never wait for it under this gate.
+                    if !self.try_stop_watcher_runtime_in_background() {
+                        return true;
+                    }
+                    let Some(mut lsp) = self.try_lsp() else {
+                        // Directory absence survives watcher shutdown. The next
+                        // drain retries even though no receiver remains to wake it.
+                        return true;
+                    };
+                    // Also invalidate starts that have not published a client yet.
+                    let clients = lsp.take_all_clients();
+                    drop(lsp);
+                    *cleanup = Some(DeletedRootCleanup::Complete(expected_generation));
+                    let _ = self.add_degraded_reason("project_root_deleted".to_string());
+                    crate::slog_warn!(
+                        "project root deleted {}: shut down {} language server(s); dropping watcher",
+                        root.display(),
+                        clients.len()
+                    );
+                    LspManager::spawn_idle_lsp_reap(clients);
+                    self.signal_status_changed();
+                    true
+                },
+            )
+            .unwrap_or(false)
+    }
+
     /// Commit the warm-maintenance identity for a successful configure.
     ///
     /// The semantic epoch decision shares the warm-state lock with equivalence
@@ -5732,11 +5792,15 @@ impl AppContext {
     /// whole module for as long as any other thread holds the source, so
     /// never add one: use `try_lock` and treat contention as pending work.
     pub fn watcher_drain_has_work(&self) -> bool {
+        let cleanup_pending = self.deleted_root_cleanup.try_lock().is_none_or(|cleanup| {
+            matches!(*cleanup, Some(DeletedRootCleanup::Pending(generation)) if generation == self.configure_generation())
+        });
         let receiver_pending = self
             .watcher_rx
             .try_lock()
             .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
-        receiver_pending
+        cleanup_pending
+            || receiver_pending
             || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
                 slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
@@ -11833,6 +11897,34 @@ impl AppContext {
     /// Request watcher shutdown without joining on the executor lane.
     pub fn stop_watcher_runtime_in_background(&self) {
         self.stop_watcher_runtime();
+    }
+
+    fn try_stop_watcher_runtime_in_background(&self) -> bool {
+        let taken = (|| {
+            let _runtime = self.watcher_runtime_lock.try_lock()?;
+            let mut thread = self.watcher_thread.try_lock()?;
+            let mut rx = self.watcher_rx.try_lock()?;
+            let mut slice = self.watcher_drain_slice.try_lock()?;
+            let mut watcher = self.watcher.try_lock()?;
+            let mut identity = self.watcher_runtime_identity.try_lock()?;
+            *rx = None;
+            *slice = None;
+            *watcher = None;
+            Some((thread.take(), identity.take()))
+        })();
+        let Some((runtime, identity)) = taken else {
+            return false;
+        };
+        if let Some(identity) = identity {
+            crate::lsp::manager::invalidate_applicability_walk(
+                &identity.root,
+                crate::lsp::manager::InvalidationCause::WatcherRemoved,
+            );
+        }
+        if let Some(runtime) = runtime {
+            Self::spawn_watcher_shutdown(Arc::clone(&self.app), self.watcher_root_path(), runtime);
+        }
+        true
     }
 
     /// Remove a watcher runtime whose OS thread already exited (backend
