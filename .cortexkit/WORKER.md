@@ -46,6 +46,7 @@ New test files go under `src/__tests__/`. A guard fails the suite on any test fi
 - **Run `aft_inspect` on Rust files while your own build or tests are compiling.** Its rust-analyzer check can hold the target lock.
 - **Send a `read` in the same step as the bash command whose effect it checks** (for example a `git checkout --` revert). Parallel calls race, and the read can finish first and show the old file. Read in the next step.
 - **Write closing keywords** (`Fixes #N`, `Closes #N`, `Resolves #N`) in commit messages. Write `(#N)`.
+- **Write scratch files to `/tmp` or `$TMPDIR`** (diffs, logs, extracted outputs). Reading them back raises a permission ask your head has to answer. Keep scratch under `target/` in your worktree, which is git-ignored and readable without asking.
 - **Edit `ARCHITECTURE.md` or `STRUCTURE.md`** to log a change.
 
 ## Before you report

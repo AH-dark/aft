@@ -52,6 +52,18 @@ pub(crate) fn report_vector(name: &str) -> TerminalRecord {
     }
 }
 
+/// ck-motor's `queue_wait_exceeded` detail for a job that waited on its
+/// workspace owner, in the runner's own layout: `waiting_on=<phase>; ...;
+/// holders=[job=<id> workspace=<key> permits=<n> phase=<p> since_ms=<t>; ...]; ...`.
+/// It lists every running job, so an unrelated job in another workspace
+/// appears beside the owner.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn queue_owner_detail(holder: Uuid) -> String {
+    format!(
+        "waiting_on=workspace owner; requested_permits=4; held_permits=8/16; accepted_ms=1000; holders=[job={holder} workspace=/work/task permits=4 phase=running since_ms=900; job=0192a64a-1234-7000-8000-0000000000bb workspace=/work/other permits=4 phase=running since_ms=950]; reservations=[]; heads_ahead=[]"
+    )
+}
+
 // Most scripts drive the Unix-only remote bash tests.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
@@ -121,6 +133,11 @@ pub(crate) enum Script {
     Windows {
         code: Option<u32>,
         acknowledge: bool,
+    },
+    /// Accepted, then refused with `queue_wait_exceeded` while waiting on its
+    /// workspace owner `holder`, with ck-motor's queue report as the detail.
+    QueueWaitOwner {
+        holder: Uuid,
     },
 }
 
@@ -292,6 +309,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::RefusedWithDetail => Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerDraining },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
                                     Script::Expired => Outcome::HistoryExpired,
+                                    Script::QueueWaitOwner { .. } => Outcome::RefusedBeforeStart { reason: RefusalReason::QueueWaitExceeded },
                                     Script::Windows { code: Some(code), .. } => Outcome::WindowsExit { code },
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
@@ -328,6 +346,9 @@ pub(crate) async fn daemon_with_capabilities(
                                         let mut value = serde_json::to_value(&terminal).unwrap();
                                         value["refusal_detail"] = json!("runner says:\nmaintenance\twindow");
                                         terminal = serde_json::from_value(value).unwrap();
+                                    }
+                                    if let Script::QueueWaitOwner { holder } = script {
+                                        terminal.refusal_detail = Some(queue_owner_detail(holder));
                                     }
                                     if matches!(script, Script::NetworkUnsupported) {
                                         terminal.refusal_detail = Some("outbound access disabled by runner policy".into());
@@ -589,6 +610,261 @@ pub(crate) async fn daemon_with_capabilities(
         output_gate,
         completion_gate,
         requests,
+        server,
+        _dir: dir,
+    }
+}
+
+/// A daemon whose exec-remote provider (ck-motor) goes away mid-job, the way a
+/// module restart closes its routes, and stays away until the test brings it
+/// back with [`OutageDaemon::restore`]. While it is away the daemon still
+/// accepts connections, but its catalog lists no provider, so a caller can
+/// neither open a route nor attach. Once restored, `exec.attach` replays the
+/// job's records from the requested `from_seq` and ends with its terminal.
+///
+/// Every frame is an `exec-remote/v1` type from the published types crate, and
+/// the fake does no more than ck-motor does: attach replays from `from_seq`
+/// without repeating `accepted`, and nothing else reports a job's state.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct OutageDaemon {
+    pub(crate) connection: std::path::PathBuf,
+    pub(crate) log: Arc<Mutex<Vec<Value>>>,
+    /// Connections that asked for the catalog while the provider was away.
+    pub(crate) refused_connects: Arc<tokio::sync::watch::Sender<usize>>,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    server: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl OutageDaemon {
+    /// Bring the provider back, as when ck-motor finishes restarting.
+    pub(crate) fn restore(&self) {
+        self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Wait until at least `count` connections found the provider away.
+    pub(crate) async fn after_refused_connects(&self, count: usize) {
+        let mut seen = self.refused_connects.subscribe();
+        tokio::time::timeout(Duration::from_secs(30), seen.wait_for(|n| *n >= count))
+            .await
+            .expect("the caller must keep reconnecting while the runner is away")
+            .unwrap();
+    }
+
+    pub(crate) fn methods(&self, method: &str) -> Vec<Value> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body["method"] == method)
+            .cloned()
+            .collect()
+    }
+}
+
+impl Drop for OutageDaemon {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// The job's records, in sequence order, as ck-motor retains them for replay.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn outage_job_records() -> Vec<StreamRecord> {
+    vec![
+        StreamRecord::Started(Started::new(0, 0, 1)),
+        StreamRecord::Output(Output::new(
+            1,
+            OutputStream::Stdout,
+            BytePayload(b"A".to_vec()),
+        )),
+        StreamRecord::Output(Output::new(
+            2,
+            OutputStream::Stdout,
+            BytePayload(b"B".to_vec()),
+        )),
+    ]
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) async fn outage_daemon() -> OutageDaemon {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let key = vec![0x42; subc_transport::KEY_LEN];
+    let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let refused_connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let up = Arc::new(AtomicBool::new(true));
+    let (server_log, server_refused, server_up, server_key) = (
+        log.clone(),
+        refused_connects.clone(),
+        up.clone(),
+        key.clone(),
+    );
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (log, refused, up, key) = (
+                server_log.clone(),
+                server_refused.clone(),
+                server_up.clone(),
+                server_key.clone(),
+            );
+            connections.spawn(async move {
+                if subc_transport::authenticate_server(
+                    &mut socket,
+                    &key,
+                    &daemon_id,
+                    "exec-client-test",
+                    Duration::from_secs(5),
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                let (mut reader, mut writer) = tokio::io::split(socket);
+                while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
+                    let header = frame.header;
+                    let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
+                    let frame_of = |ty, bytes: Vec<u8>| {
+                        Frame::build_with_version(
+                            header.ver,
+                            ty,
+                            header.flags,
+                            header.channel,
+                            header.epoch,
+                            header.corr,
+                            bytes,
+                        )
+                        .unwrap()
+                    };
+                    let reply = |ty, value: Value| frame_of(ty, serde_json::to_vec(&value).unwrap());
+                    let record = |record: &StreamRecord| {
+                        frame_of(FrameType::StreamData, serde_json::to_vec(record).unwrap())
+                    };
+                    let mut replies = Vec::new();
+                    let mut drop_route = false;
+                    match header.ty {
+                        FrameType::Hello => replies.push(reply(
+                            FrameType::HelloAck,
+                            serde_json::to_value(ModuleHelloAckBody {
+                                negotiated_ver: PROTOCOL_VERSION,
+                                subc_ops: vec!["catalog.list".into()],
+                                subc_capabilities: vec![],
+                                storage: None,
+                                machine_id: None,
+                            })
+                            .unwrap(),
+                        )),
+                        FrameType::Request if header.channel == 0 => match body["op"].as_str() {
+                            Some("catalog.list") => {
+                                // A provider that is restarting is absent from the catalog.
+                                let modules = if up.load(Ordering::SeqCst) {
+                                    json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":["exec-remote/v1"], "requires":[]}}])
+                                } else {
+                                    refused.send_modify(|count| *count += 1);
+                                    json!([])
+                                };
+                                replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"], "modules":modules})));
+                            }
+                            Some("route.open") => replies.push(reply(
+                                FrameType::Response,
+                                json!({"op":"route.open", "route_channel":40, "route_epoch":1}),
+                            )),
+                            _ => panic!("unexpected control request {body}"),
+                        },
+                        FrameType::Request => {
+                            log.lock().unwrap().push(body.clone());
+                            match body["method"].as_str().unwrap() {
+                                "exec.run" => {
+                                    replies.push(record(&StreamRecord::Accepted(Accepted::new(
+                                        id(),
+                                        1,
+                                    ))));
+                                    for job_record in &outage_job_records()[..2] {
+                                        replies.push(record(job_record));
+                                    }
+                                    // The provider restarts: its route closes with the job
+                                    // still running, and it stays away until restored.
+                                    up.store(false, Ordering::SeqCst);
+                                    drop_route = true;
+                                }
+                                "exec.attach" => {
+                                    let from = body["params"]["from_seq"].as_u64().unwrap();
+                                    for job_record in outage_job_records() {
+                                        let seq = match &job_record {
+                                            StreamRecord::Started(started) => started.seq,
+                                            StreamRecord::Output(output) => output.seq,
+                                            _ => unreachable!(),
+                                        };
+                                        if seq >= from {
+                                            replies.push(record(&job_record));
+                                        }
+                                    }
+                                    let terminal =
+                                        TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0)
+                                            .with_ran(Ran::Remote);
+                                    replies.push(record(&StreamRecord::Terminal(terminal)));
+                                    replies.push(frame_of(FrameType::StreamEnd, vec![]));
+                                }
+                                "exec.cancel" => replies.push(reply(
+                                    FrameType::Response,
+                                    serde_json::to_value(CancelReply::new(id())).unwrap(),
+                                )),
+                                _ => panic!("unexpected caller operation {body}"),
+                            }
+                        }
+                        _ => {}
+                    }
+                    for response in replies {
+                        if subc_transport::write_frame(&mut writer, &response).await.is_err() {
+                            return;
+                        }
+                    }
+                    if drop_route {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    // Connection files contain authentication material, so their parent must
+    // stay private even when the test runner uses a permissive umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let connection = dir.path().join("connection.json");
+    connection_file::write_atomic(
+        &connection,
+        &ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: Some(PROTOCOL_VERSION),
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".into(),
+                port,
+            }],
+            key,
+            daemon_id,
+            pid: std::process::id(),
+            daemon_ver: "exec-client-test".into(),
+        },
+    )
+    .unwrap();
+    OutageDaemon {
+        connection,
+        log,
+        refused_connects,
+        up,
         server,
         _dir: dir,
     }

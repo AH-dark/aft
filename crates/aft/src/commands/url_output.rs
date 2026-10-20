@@ -50,9 +50,72 @@ pub(crate) fn request_has_url(req: &RawRequest) -> bool {
         })
 }
 
+/// Replace cached-document paths before a URL response is shown to an agent.
+/// The cache location is private; the caller already has the URL.
+pub(crate) fn redact_url_cache_paths(
+    req: &RawRequest,
+    ctx: &crate::context::AppContext,
+    response: &mut Response,
+) {
+    if !request_has_url(req) {
+        return;
+    }
+    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let cache_dir = storage_dir.join("url_cache").to_string_lossy().into_owned();
+    redact_cache_paths_in_value(&mut response.data, &cache_dir);
+}
+
+fn redact_cache_paths_in_value(value: &mut serde_json::Value, cache_dir: &str) {
+    match value {
+        serde_json::Value::String(text) => redact_cache_paths_in_text(text, cache_dir),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_cache_paths_in_value(item, cache_dir);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values_mut() {
+                redact_cache_paths_in_value(item, cache_dir);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_cache_paths_in_text(text: &mut String, cache_dir: &str) {
+    if cache_dir.is_empty() || !text.contains(cache_dir) {
+        return;
+    }
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find(cache_dir) {
+        redacted.push_str(&rest[..start]);
+        let mut end = start + cache_dir.len();
+        let suffix = &rest[end..];
+        if suffix.starts_with('/') || suffix.starts_with('\\') {
+            let after_separator = &suffix[1..];
+            let filename_end = after_separator
+                .char_indices()
+                .find(|(_, ch)| ch.is_whitespace() || ",;:)]}".contains(*ch))
+                .map(|(offset, _)| offset)
+                .unwrap_or(after_separator.len());
+            end += 1 + filename_end;
+        }
+        redacted.push_str("the requested URL");
+        rest = &rest[end..];
+    }
+    redacted.push_str(rest);
+    *text = redacted;
+}
+
 /// Cap the rendered aggregate, not each symbol separately. This also bounds
 /// multi-symbol and mixed local/URL batches and the formatter's line gutters.
-pub(crate) fn cap_zoom_response(req: &RawRequest, mut response: Response) -> Response {
+pub(crate) fn cap_zoom_response(
+    req: &RawRequest,
+    ctx: &crate::context::AppContext,
+    mut response: Response,
+) -> Response {
+    redact_url_cache_paths(req, ctx, &mut response);
     if !request_has_url(req) {
         return response;
     }
@@ -266,5 +329,37 @@ mod tests {
         cap_text(&mut text, URL_OUTPUT_BYTES, "symbols");
         assert!(text.len() <= URL_OUTPUT_BYTES);
         assert!(text.ends_with("of 150000 bytes; narrow with symbols"));
+    }
+
+    #[test]
+    fn url_responses_replace_cached_document_paths_with_the_requested_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "url-cache-redaction",
+            "command": "outline",
+            "file": "https://example.com/docs.md"
+        }))
+        .unwrap();
+        let cache_file = storage.join("url_cache").join("c7502988ff3e8388.md");
+        let mut response = Response::error(
+            "url-cache-redaction",
+            "parse_error",
+            format!("syntax errors in {}", cache_file.display()),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("the requested URL"), "{message}");
+        assert!(!message.contains("url_cache"), "{message}");
+        assert!(!message.contains("c7502988ff3e8388.md"), "{message}");
     }
 }

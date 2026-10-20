@@ -44,6 +44,11 @@ pub(crate) struct ThreadCensus {
     pub total: u64,
     pub classified: bool,
     pub by_class: BTreeMap<String, u64>,
+    /// Age of the `by_class` figures. The health rollup counts threads on
+    /// every pass but reads every thread's name only every
+    /// [`THREAD_CLASSIFICATION_REUSE`], so between those reads `by_class`
+    /// is an earlier pass's figures and need not sum to `total`.
+    pub classified_age_ms: u64,
 }
 
 impl Default for ThreadCensus {
@@ -52,6 +57,7 @@ impl Default for ThreadCensus {
             total: 0,
             classified: true,
             by_class: empty_thread_classes(),
+            classified_age_ms: 0,
         }
     }
 }
@@ -147,7 +153,7 @@ pub(crate) fn collect(
 
     LifecycleCensusSnapshot {
         lsp,
-        threads: thread_census(),
+        threads: sampled_thread_census(),
         sqlite: crate::db::connection_snapshot(),
         children: ChildrenCensus { detached_total },
         fds: fd_census(),
@@ -212,6 +218,8 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
 }
 
 pub(crate) fn thread_census() -> ThreadCensus {
+    #[cfg(test)]
+    THREAD_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
     let (count, names) = os_thread_names();
     let total = count as u64;
     let Some(names) = names else {
@@ -219,6 +227,7 @@ pub(crate) fn thread_census() -> ThreadCensus {
             total,
             classified: false,
             by_class: empty_thread_classes(),
+            classified_age_ms: 0,
         };
     };
 
@@ -232,7 +241,67 @@ pub(crate) fn thread_census() -> ThreadCensus {
         total,
         classified: true,
         by_class,
+        classified_age_ms: 0,
     }
+}
+
+/// How long the health rollup reuses a thread classification. Classifying
+/// reads every thread's name with one system call or `/proc` file read per
+/// thread; a daemon serving many roots runs hundreds of threads, and the
+/// rollup runs every few seconds. Counting them stays one call per pass.
+const THREAD_CLASSIFICATION_REUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    /// Full thread classifications (one name read per thread) on this thread.
+    static THREAD_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Only the census test reads it, and that test runs where threads can be named.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn thread_classifications_for_test() -> usize {
+    THREAD_CLASSIFICATIONS.with(std::cell::Cell::get)
+}
+
+/// The thread census for the health rollup: a fresh total on every call, and
+/// a classification reused for up to [`THREAD_CLASSIFICATION_REUSE`], with
+/// its age in `classified_age_ms`. Callers that need an exact classification
+/// use [`thread_census`].
+pub(crate) fn sampled_thread_census() -> ThreadCensus {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, ThreadCensus)>> =
+        std::sync::Mutex::new(None);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((classified_at, census)) = last.as_ref() {
+        let age = classified_at.elapsed();
+        if age < THREAD_CLASSIFICATION_REUSE {
+            return ThreadCensus {
+                total: os_thread_count() as u64,
+                classified_age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                ..census.clone()
+            };
+        }
+    }
+    let census = thread_census();
+    // An unclassified census (too many threads to name) has nothing to
+    // reuse; the next pass counts again.
+    *last = census
+        .classified
+        .then(|| (std::time::Instant::now(), census.clone()));
+    census
+}
+
+#[cfg(target_os = "linux")]
+fn os_thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task").map_or(0, |entries| entries.count())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_thread_count() -> usize {
+    // macOS lists thread IDs with one call; the names are what cost a call
+    // per thread. Other targets report zero, as `os_thread_names` does.
+    os_thread_ids().map_or(0, |ids| ids.len())
 }
 
 #[cfg(target_os = "linux")]
@@ -260,10 +329,50 @@ fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
 }
 
 #[cfg(target_os = "macos")]
-fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
+#[link(name = "proc")]
+extern "C" {
+    fn proc_pidinfo(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffer_size: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// This process's thread IDs, or `None` when the kernel refused the listing.
+#[cfg(target_os = "macos")]
+fn os_thread_ids() -> Option<Vec<u64>> {
     const PROC_PIDLISTTHREADS: libc::c_int = 6;
     const MAX_THREADS: usize = 16_384;
 
+    let mut ids = vec![0u64; MAX_THREADS];
+    let buffer_size = std::mem::size_of_val(ids.as_slice()) as libc::c_int;
+    // SAFETY: ids is writable storage of the passed byte length.
+    let bytes = unsafe {
+        proc_pidinfo(
+            std::process::id() as libc::c_int,
+            PROC_PIDLISTTHREADS,
+            0,
+            ids.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    if bytes <= 0 {
+        return None;
+    }
+    let count = (bytes as usize / std::mem::size_of::<u64>()).min(ids.len());
+    ids.truncate(count);
+    Some(ids)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn os_thread_ids() -> Option<Vec<u64>> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct ProcThreadInfo {
@@ -280,42 +389,18 @@ fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
         name: [libc::c_char; 64],
     }
 
-    #[link(name = "proc")]
-    extern "C" {
-        fn proc_pidinfo(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            arg: u64,
-            buffer: *mut libc::c_void,
-            buffer_size: libc::c_int,
-        ) -> libc::c_int;
-    }
-
     // LISTTHREADS returns thread IDs, not proc_threadinfo records. Query each
     // ID separately so the census cannot silently divide an ID buffer by the
     // larger record size and report zero runtime threads.
-    let mut ids = vec![0u64; MAX_THREADS];
-    let buffer_size = std::mem::size_of_val(ids.as_slice()) as libc::c_int;
-    // SAFETY: ids is writable storage of the passed byte length.
-    let bytes = unsafe {
-        proc_pidinfo(
-            std::process::id() as libc::c_int,
-            PROC_PIDLISTTHREADS,
-            0,
-            ids.as_mut_ptr().cast(),
-            buffer_size,
-        )
-    };
-    if bytes <= 0 {
+    let Some(ids) = os_thread_ids() else {
         return (0, None);
-    }
-    let count = (bytes as usize / std::mem::size_of::<u64>()).min(ids.len());
+    };
+    let count = ids.len();
     if count > THREAD_CLASSIFICATION_CAP {
         return (count, None);
     }
     let names = ids
         .into_iter()
-        .take(count)
         .map(|id| {
             // SAFETY: this plain C record is initialized before the kernel fills it.
             let mut info: ProcThreadInfo = unsafe { std::mem::zeroed() };
@@ -433,6 +518,35 @@ fn soft_fd_limit() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::thread_class;
+
+    /// The health rollup counts threads on every pass but must not read every
+    /// thread's name each time: a reused classification is served with its
+    /// age, while the exact census used elsewhere still names every thread.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rollup_thread_census_reuses_its_classification_and_reports_its_age() {
+        let first = super::sampled_thread_census();
+        assert!(first.total > 0, "the census found no threads: {first:?}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before = super::thread_classifications_for_test();
+        let reused = super::sampled_thread_census();
+        assert_eq!(
+            super::thread_classifications_for_test() - before,
+            0,
+            "a rollup pass read every thread's name again"
+        );
+        assert!(reused.total > 0);
+        assert!(
+            reused.classified_age_ms >= 20,
+            "a reused classification must report its age: {reused:?}"
+        );
+        assert_eq!(reused.by_class, first.by_class);
+
+        let before = super::thread_classifications_for_test();
+        let exact = super::thread_census();
+        assert_eq!(super::thread_classifications_for_test() - before, 1);
+        assert_eq!(exact.classified_age_ms, 0);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

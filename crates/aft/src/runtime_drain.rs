@@ -1011,6 +1011,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     }
 
     let mut pending = Vec::new();
+    let mut replay_parked = BTreeSet::new();
     let installed =
         ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
             let installed = if let Some(store) = reopened {
@@ -1033,14 +1034,16 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                 // This take and the refresh worker's post-defer re-check form a
                 // check-then-act handoff: one site sees parked paths with a
                 // ready current store, so neither site needs to poll alone.
-                pending = ctx
-                    .take_pending_callgraph_store_paths()
+                // The paths stay parked until the worker has them (see below).
+                let (paths, parked) = ctx.pending_callgraph_store_paths_for_replay();
+                pending = paths
                     .into_iter()
                     .filter(|path| {
                         invalidates_workspace_crate_prefix_cache(path)
                             || !watcher_path_is_generated_for_callgraph(ctx, path)
                     })
                     .collect();
+                replay_parked = parked;
                 true
             } else {
                 false
@@ -1066,9 +1069,13 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     };
 
     if installed {
+        // The worker moves the paths from the sink into its queue under its
+        // queue lock, so they are never in neither place while an answer
+        // reads both.
         if !pending.is_empty() {
-            let _ = ctx.enqueue_callgraph_store_refresh(pending);
+            ctx.enqueue_callgraph_store_refresh(pending.clone());
         }
+        ctx.settle_replayed_callgraph_store_paths(&replay_parked, &pending);
         let _ = ctx.request_tier2_refresh_pull();
     }
     if terminal {
@@ -5954,6 +5961,70 @@ mod tests {
             MUTATION_WALK_STATS.with(|stats| assert_eq!(stats.get(), 1));
         }
         MUTATION_WALK_STATS.with(|stats| assert_eq!(stats.get(), 1));
+    }
+
+    /// A session may edit files outside its root: another checkout, a
+    /// temporary directory. Those writes must not enter this root's search
+    /// index, or every later disk-cache write of the index fails with
+    /// "refusing to cache path outside project root" and the index is rebuilt
+    /// from scratch on each start.
+    #[test]
+    fn own_mutation_outside_the_root_stays_out_of_the_search_index() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("project");
+        let sibling = base.join("sibling-checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let inside = root.join("inside.ts");
+        let outside = sibling.join("outside.ts");
+        std::fs::write(&inside, "const value = 'before';\n").unwrap();
+        std::fs::write(&outside, "const value = 'qqqq_outside_token';\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        // A scratch root often holds links to sibling repositories. Writes
+        // reached through such a link resolve outside the root as well.
+        #[cfg(unix)]
+        let through_link = {
+            std::os::unix::fs::symlink(&sibling, root.join("linked-sibling")).unwrap();
+            root.join("linked-sibling").join("outside.ts")
+        };
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+
+        drop(record_file_mutation(&ctx, [outside.as_path()]));
+        #[cfg(unix)]
+        drop(record_file_mutation(&ctx, [through_link.as_path()]));
+        std::fs::write(&inside, "const value = 'qqqq_inside_token';\n").unwrap();
+        drop(record_file_mutation(&ctx, [inside.as_path()]));
+
+        let mut search = ctx.search_index().write().unwrap();
+        let index = search.as_mut().unwrap();
+        let found = |token: &str| {
+            index
+                .grep(token, true, &[], &[], &base, 10)
+                .matches
+                .into_iter()
+                .map(|found| found.file)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found("qqqq_inside_token"), vec![inside.clone()]);
+        let outside_hits = found("qqqq_outside_token");
+        assert!(
+            outside_hits.iter().all(|path| path.starts_with(&root)),
+            "an edit outside the root entered its index: {outside_hits:?}"
+        );
+        let cache_dir = base.join("cache");
+        assert!(
+            index.write_to_disk(&cache_dir, None),
+            "the index could not be written to its disk cache"
+        );
     }
 
     #[test]

@@ -61,7 +61,9 @@ pub struct OutlineEntry {
 ///
 /// Output is capped at 30KB; if exceeded, truncates with a narrowing hint.
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_outline_inner)
+    let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
+    super::url_output::redact_url_cache_paths(req, ctx, &mut response);
+    response
 }
 
 fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -243,6 +245,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        text = format_url_outline(file, &text);
         super::url_output::cap_text(
             &mut text,
             super::url_output::URL_OUTPUT_BYTES,
@@ -289,17 +292,21 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(entries) => entries,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
-    let filename = path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| file.to_string());
+    let filename = if is_http_url(file) {
+        file.to_string()
+    } else {
+        path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.to_string())
+    };
     let mut text = format_single_file_tree(&filename, &entries);
     let mut complete = true;
     if is_http_url(file) {
-        if let Some(notice) = crate::url_fetch::download_notice(&path) {
-            text = format!("{notice}\n\n{text}");
+        let notice = crate::url_fetch::download_notice(&path);
+        if notice.is_some() {
             complete = false;
         }
+        text = format_url_outline_with_header(file, &text, notice.as_deref());
         complete &= text.len() <= super::url_output::URL_OUTPUT_BYTES;
         super::url_output::cap_text(
             &mut text,
@@ -312,6 +319,24 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         &req.id,
         serde_json::json!({ "text": text, "complete": complete, "content_files": if is_http_url(file) { vec![] } else { vec![path] } }),
     )
+}
+
+fn format_url_outline(url: &str, contents: &str) -> String {
+    format!(
+        "{url}\nSections are read with aft_zoom using the same url plus a heading.\n\n{contents}"
+    )
+}
+
+fn format_url_outline_with_header(url: &str, text: &str, notice: Option<&str>) -> String {
+    let body = text
+        .strip_prefix(url)
+        .and_then(|remainder| remainder.strip_prefix('\n'))
+        .unwrap_or(text);
+    let contents = match notice {
+        Some(notice) => format!("{notice}\n\n{body}"),
+        None => body.to_string(),
+    };
+    format_url_outline(url, &contents)
 }
 
 /// Host adapters can re-render a held outline after applying their own read policy.

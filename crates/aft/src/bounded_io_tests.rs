@@ -754,3 +754,114 @@ fn running_helper_timeout_has_only_native_platform_hint() {
     };
     assert_eq!(hint, expected_hint);
 }
+
+#[cfg(unix)]
+fn delete_context(root: &Path) -> AppContext {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.to_path_buf());
+    // Unrestricted validation hands the target path itself to the first
+    // helper (the access-policy identity check), so the test gate can key on it.
+    config.restrict_to_project_root = false;
+    config.storage_dir = Some(root.join(".store"));
+    config.backup.enabled = Some(false);
+    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+}
+
+/// Runs a recursive delete of a fresh directory while its first path-check
+/// helper is held unscheduled for `stall`, then releases it.
+#[cfg(unix)]
+fn delete_with_unscheduled_helper(
+    budget: Option<Budget>,
+    stall: Duration,
+) -> (crate::protocol::Response, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let target = root.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("file.txt"), "delete me").unwrap();
+    let ctx = delete_context(&root);
+    let gate = stall_helper(&target);
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "late-helper", "command": "delete_file", "files": [target], "recursive": true
+    }))
+    .unwrap();
+    let (result_tx, result_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        let response = with_budget(budget, || {
+            crate::commands::delete_file::handle_delete_file(&request, &ctx)
+        });
+        result_tx.send(response).unwrap();
+    });
+    gate.reached.recv_timeout(IO_BUDGET).unwrap();
+    std::thread::sleep(stall);
+    drop(gate);
+    let response = result_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    caller.join().unwrap();
+    let deleted = !target.exists();
+    drop(dir);
+    assert_eq!(deleted, response.success, "{:?}", response.data);
+    (response, target)
+}
+
+// A tool-call delete runs under a long request budget. A helper scheduled
+// after the per-access cap has still done nothing, so the delete must wait
+// for it rather than refuse with read_io_queue_timeout.
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn tool_call_delete_waits_for_a_late_helper_instead_of_refusing() {
+    let budget =
+        Budget::after(Duration::from_secs(25)).with_access_budget(Duration::from_millis(200));
+    let (response, _) = delete_with_unscheduled_helper(Some(budget), Duration::from_millis(800));
+    assert!(response.success, "{:?}", response.data);
+}
+
+// A native `delete_file` has no caller budget. Hold its helper past the
+// five-second access cap, the delay observed on a loaded Windows runner.
+#[cfg(unix)]
+#[test]
+fn native_delete_waits_for_a_helper_scheduled_after_the_access_cap() {
+    let (response, _) =
+        delete_with_unscheduled_helper(None, IO_BUDGET + Duration::from_millis(500));
+    assert!(response.success, "{:?}", response.data);
+}
+
+// Waiting for admission must not lengthen OS access: a mutation's helper that
+// started and then hangs still fails as read_blocked within the access cap.
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn mutation_admission_keeps_the_running_access_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("running-mutation-check");
+    let gate = stall_running_helper(&path);
+    let budget =
+        Budget::after(Duration::from_secs(25)).with_access_budget(Duration::from_millis(200));
+    let started = Instant::now();
+    let error = with_budget(Some(budget), || {
+        let _mutation = enter_mutation();
+        run(&path, None, |_| Ok(()))
+    })
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    drop(gate);
+    assert_eq!(timeout_code(&error), "read_blocked", "{error}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+// Reads keep the per-access queue cap: outside a mutation, a helper that is
+// not scheduled within one access cap still refuses with
+// read_io_queue_timeout.
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn read_admission_keeps_the_queue_cap_outside_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued-read");
+    let gate = stall_helper(&path);
+    let budget =
+        Budget::after(Duration::from_secs(25)).with_access_budget(Duration::from_millis(200));
+    let started = Instant::now();
+    let error = with_budget(Some(budget), || run(&path, None, |_| Ok(()))).unwrap_err();
+    let elapsed = started.elapsed();
+    drop(gate);
+    assert_eq!(timeout_code(&error), "read_io_queue_timeout", "{error}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}

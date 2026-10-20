@@ -2150,18 +2150,22 @@ impl RefreshBatch {
         // lets the batch finish that missed replay, but only once the lease no
         // longer has a live owner.
         for sink in &self.pending_sinks {
+            // Leave the paths parked: when the worker accepts them into its
+            // queue it takes them out of the sink under the queue lock, and
+            // when it keeps them waiting or refuses them they must stay parked
+            // for the next ready store.
             let paths = {
-                let mut pending = sink.lock();
+                let pending = sink.lock();
                 self.paths
                     .iter()
-                    .filter(|path| pending.remove(*path))
+                    .filter(|path| pending.contains(*path))
                     .cloned()
                     .collect::<Vec<_>>()
             };
             if paths.is_empty() {
                 continue;
             }
-            let _ = enqueue_callgraph_store_refresh_inner(
+            enqueue_callgraph_store_refresh_inner(
                 self.root.callgraph_dir.clone(),
                 self.root.project_root.clone(),
                 paths,
@@ -2170,6 +2174,8 @@ impl RefreshBatch {
                 self.ticket.clone(),
                 Some(Arc::new(self.keepalive.clone())),
             );
+            #[cfg(test)]
+            hold_open_failure_replay_for_test(&self.root.project_root);
         }
     }
 
@@ -2258,6 +2264,10 @@ impl RefreshOpenFailure {
 
 fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Result<bool> {
     use crate::fs_lock::LockAvailability;
+    #[cfg(test)]
+    if refresh_worker_test_seam(&root.project_root).writer_busy {
+        return Ok(false);
+    }
     let lease = crate::root_cache::writer_lease_path(&root.callgraph_dir);
     match crate::fs_lock::lock_availability(&lease)? {
         LockAvailability::Available | LockAvailability::Stale => Ok(true),
@@ -2582,6 +2592,10 @@ impl RefreshWorker {
                 .merge(paths, pending_sink, refresh_states, ticket);
             waiting.batch.keepalive.extend(keepalive);
             if !waiting.writer_available(false) {
+                // The batch keeps waiting for another writer, so its paths
+                // stay parked in the pending sink. A lifecycle change may
+                // retire this waiting batch, and the sink is then the only
+                // place the next ready store can replay them from.
                 waiting.batch.defer();
                 queue.waiting.insert(root, waiting);
                 self.shared.wake.notify_all();
@@ -2593,6 +2607,17 @@ impl RefreshWorker {
             queue.queued.insert(root, batch);
             self.shared.wake.notify_all();
             return true;
+        }
+        // The paths now wait in the worker queue, which answers read before
+        // the sink's second read, so they leave the sink here, under the queue
+        // lock. A shutdown or open failure that later gives up on the queued
+        // batch parks them again. Callers replaying parked paths rely on this:
+        // they never remove replayed paths from the sink themselves.
+        {
+            let mut parked = pending_sink.lock();
+            for path in &paths {
+                parked.remove(path);
+            }
         }
         if let Some(batch) = queue.queued.get_mut(&root) {
             batch.merge(paths, pending_sink, refresh_states, ticket);
@@ -3532,6 +3557,14 @@ struct RefreshWorkerTestSeam {
     /// after it has snapshotted this root's waiter, until the test releases it.
     #[cfg(test)]
     retire_snapshot_hold: Option<RetireSnapshotHold>,
+    /// Pauses the worker right after a failed writer open has handed its
+    /// parked paths back to the queue, until the test releases it.
+    #[cfg(test)]
+    open_failure_replay_hold: Option<TestHold>,
+    /// Makes the writer lease look held by another live process, so a
+    /// waiting batch stays waiting without a second process.
+    #[cfg(test)]
+    writer_busy: bool,
     delay: Duration,
     fail_refresh: bool,
     fail_open: bool,
@@ -3550,6 +3583,30 @@ struct RetireSnapshotHold {
     thread: std::thread::ThreadId,
     held: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestHold {
+    held: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+fn hold_open_failure_replay_for_test(project_root: &Path) {
+    let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() else {
+        return;
+    };
+    let hold = seams
+        .lock()
+        .unwrap()
+        .get_mut(project_root)
+        .and_then(|seam| seam.open_failure_replay_hold.take());
+    if let Some(hold) = hold {
+        hold.held.send(()).unwrap();
+        // Dropping the fixture's release sender also unblocks a panicking test.
+        let _ = hold.release.recv();
+    }
 }
 
 /// Parks a retire call between its out-of-lock snapshot and its removal pass,
@@ -3715,6 +3772,17 @@ pub fn set_callgraph_refresh_worker_test_seam(
                 ..RefreshWorkerTestSeam::default()
             },
         );
+}
+
+/// Make the root's writer lease look held by another live process (or free
+/// again), as the refresh worker's availability check sees it.
+#[cfg(test)]
+pub(crate) fn set_callgraph_refresh_worker_test_writer_busy(project_root: &Path, busy: bool) {
+    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
+        if let Some(seam) = seams.lock().unwrap().get_mut(project_root) {
+            seam.writer_busy = busy;
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -23056,6 +23124,74 @@ mod refresh_worker_tests {
                 .children[0]
                 .name,
             "new_leaf"
+        );
+    }
+
+    /// A failed writer open that finds a ready store installed meanwhile hands
+    /// its parked paths back to the worker queue. A shutdown that gives up on
+    /// the queue right after that hand-off parks them again, and they must
+    /// stay parked so the next process can replay them.
+    #[test]
+    fn open_failure_replay_given_up_by_shutdown_stays_parked() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let installed = Arc::new(std::sync::RwLock::new(None));
+        let state =
+            CallgraphRefreshState::new(Arc::clone(&installed), Arc::new(AtomicBool::new(true)));
+        let pending = pending_paths();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::new(AtomicU64::new(1)),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        let (replay_held_tx, replay_held) = crossbeam_channel::bounded(1);
+        let (replay_release, replay_release_rx) = crossbeam_channel::bounded(1);
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .open_failure_replay_hold = Some(TestHold {
+            held: replay_held_tx,
+            release: replay_release_rx,
+        });
+        let (held, release) = install_callgraph_refresh_worker_test_gate(root.clone());
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            state,
+            ticket,
+            None,
+        );
+        held.recv_timeout(Duration::from_secs(12)).unwrap();
+        drop(foreign);
+        let ready = Arc::new(
+            CallGraphStore::open_readonly(dir, root.clone())
+                .unwrap()
+                .unwrap(),
+        );
+        *installed.write().unwrap() = Some(ready);
+        release.send(()).unwrap();
+        replay_held.recv_timeout(Duration::from_secs(12)).unwrap();
+        // The failed batch is still active, so a shutdown with no budget left
+        // gives up on the queued replay and parks its paths again.
+        assert!(!worker.worker.shutdown_with_budget(Duration::ZERO));
+        replay_release.send(()).unwrap();
+        assert!(worker.wait(Duration::from_secs(12)), "refresh worker hung");
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        assert!(
+            pending.lock().contains(&source),
+            "a replay the shutdown gave up on must stay parked"
         );
     }
 

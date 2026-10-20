@@ -31,6 +31,134 @@ use serde_json::{json, Value};
 const DEADLINE: Duration = Duration::from_secs(180);
 const MODEL: &str = "parent-folder-mock";
 const COMMON: &str = "PARENT_FOLDER_COMMON_TOKEN";
+const PARENT_SEARCH_WATCHDOG_DEADLINE: Duration = Duration::from_secs(400);
+const PARENT_SEARCH_WATCHDOG_SELF_TEST_ENV: &str = "AFT_PARENT_SEARCH_WATCHDOG_SELF_TEST";
+
+enum ParentSearchWatchdogMessage {
+    EnterPhase { name: String, at: Instant },
+    Stop { at: Instant },
+}
+
+struct ParentSearchWatchdog {
+    sender: std::sync::mpsc::Sender<ParentSearchWatchdogMessage>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+fn abort_parent_search_watchdog(
+    timeout: Duration,
+    phase: &str,
+    phase_elapsed: Duration,
+    total_elapsed: Duration,
+) -> ! {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "parent search phase watchdog timed out after {timeout:?} in phase `{phase}` (phase elapsed {:.3}s, total elapsed {:.3}s); aborting the process",
+        phase_elapsed.as_secs_f64(),
+        total_elapsed.as_secs_f64()
+    );
+    std::process::abort()
+}
+
+impl ParentSearchWatchdog {
+    fn new(timeout: Duration) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+        let handle = thread::Builder::new()
+            .name("parent-search-phase-watchdog".into())
+            .spawn(move || {
+                let _ = ready_sender.send(());
+                let Ok(ParentSearchWatchdogMessage::EnterPhase { name, at }) = receiver.recv()
+                else {
+                    return;
+                };
+                let mut phase = name;
+                let mut phase_started = at;
+                let watchdog_started = at;
+                let deadline = watchdog_started + timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(remaining) {
+                        Ok(ParentSearchWatchdogMessage::EnterPhase { name, at }) => {
+                            let elapsed = at.saturating_duration_since(phase_started);
+                            let total_elapsed = at.saturating_duration_since(watchdog_started);
+                            if total_elapsed >= timeout {
+                                abort_parent_search_watchdog(
+                                    timeout,
+                                    &phase,
+                                    elapsed,
+                                    total_elapsed,
+                                );
+                            }
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "parent search watchdog: phase `{phase}` elapsed {:.3}s",
+                                elapsed.as_secs_f64()
+                            );
+                            phase = name;
+                            phase_started = at;
+                        }
+                        Ok(ParentSearchWatchdogMessage::Stop { at }) => {
+                            let total_elapsed = at.saturating_duration_since(watchdog_started);
+                            if total_elapsed >= timeout {
+                                abort_parent_search_watchdog(
+                                    timeout,
+                                    &phase,
+                                    at.saturating_duration_since(phase_started),
+                                    total_elapsed,
+                                );
+                            }
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "parent search watchdog: phase `{phase}` elapsed {:.3}s (total {:.3}s)",
+                                at.saturating_duration_since(phase_started).as_secs_f64(),
+                                total_elapsed.as_secs_f64()
+                            );
+                            return;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let phase_elapsed = phase_started.elapsed();
+                            let total_elapsed = watchdog_started.elapsed();
+                            abort_parent_search_watchdog(
+                                timeout,
+                                &phase,
+                                phase_elapsed,
+                                total_elapsed,
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            })
+            .expect("spawn parent search phase watchdog");
+        ready_receiver
+            .recv()
+            .expect("parent search phase watchdog started");
+        Self {
+            sender,
+            handle: Some(handle),
+        }
+    }
+
+    fn enter(&self, phase: &str) {
+        self.sender
+            .send(ParentSearchWatchdogMessage::EnterPhase {
+                name: phase.to_owned(),
+                at: Instant::now(),
+            })
+            .expect("parent search phase watchdog is running");
+    }
+}
+
+impl Drop for ParentSearchWatchdog {
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .send(ParentSearchWatchdogMessage::Stop { at: Instant::now() });
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 fn fast_refresh() {
     aft::views::parent::set_default_refresh_interval(Duration::from_millis(100));
@@ -951,12 +1079,43 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
     drop(child);
 }
 
+#[test]
+fn parent_search_phase_watchdog_aborts_with_phase() {
+    if std::env::var_os(PARENT_SEARCH_WATCHDOG_SELF_TEST_ENV).is_some() {
+        let watchdog = ParentSearchWatchdog::new(Duration::from_millis(300));
+        watchdog.enter("injected blocked phase");
+        thread::sleep(Duration::from_millis(1500));
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "per_checkout_9::parent_search_phase_watchdog_aborts_with_phase",
+            "--nocapture",
+        ])
+        .env(PARENT_SEARCH_WATCHDOG_SELF_TEST_ENV, "1")
+        .output()
+        .expect("run watchdog self-test child");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "watchdog child should abort; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("timed out after 300ms in phase `injected blocked phase`"),
+        "watchdog child did not report its blocked phase: {stderr}"
+    );
+}
+
 /// `aft_search` merges the children's semantic views by score under the
 /// parent prefix, even when a child also has a legacy semantic artifact larger
 /// than the borrowed reader's size cap: the parent reads the child's
 /// per-checkout view, which has no such cap.
 #[test]
 fn parent_search_merges_child_semantic_views_without_a_size_cap() {
+    let watchdog = ParentSearchWatchdog::new(PARENT_SEARCH_WATCHDOG_DEADLINE);
+    watchdog.enter("fixture setup");
     fast_refresh();
     let embedder = MockEmbedder::start();
     let temp = tempfile::tempdir().unwrap();
@@ -989,8 +1148,10 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     // The child sessions stay alive so they fold their fills into published
     // generations, which is what the parent serves.
     let mut sessions = Vec::new();
-    for child in [&alpha, &beta] {
+    for (name, child) in [("alpha", &alpha), ("beta", &beta)] {
+        watchdog.enter(&format!("configure child {name}"));
         let ctx = configure(child, &storage, config_doc(true, semantic, Some(&embedder)));
+        watchdog.enter(&format!("fill child {name} semantic view"));
         let deadline = Instant::now() + DEADLINE;
         loop {
             drain(&ctx);
@@ -1020,8 +1181,10 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
         .set_len(65 * 1024 * 1024)
         .unwrap();
 
+    watchdog.enter("configure parent");
     let parent = configure(&root, &storage, config_doc(true, semantic, Some(&embedder)));
     let session = parent_session(&parent);
+    watchdog.enter("wait for parent semantic views");
     let deadline = Instant::now() + DEADLINE;
     while !session
         .children()
@@ -1035,6 +1198,7 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
         thread::sleep(Duration::from_millis(20));
     }
     let search = || {
+        watchdog.enter("parent route search");
         data(
             aft::views::parent::route(
                 &request(json!({
@@ -1107,6 +1271,7 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     for (session_ctx, (child_root, prefix)) in
         sessions.iter().zip([(&alpha, "alpha"), (&beta, "beta")])
     {
+        watchdog.enter("handle_semantic_search");
         let direct = aft::commands::semantic_search::handle_semantic_search(
             &request(json!({
                 "id": "child-search",
@@ -1140,7 +1305,9 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     }
 
     // Paging: offset and topK select a window of the same merged ranking.
+    watchdog.enter("compare precomputed child semantic query");
     precomputed_query_vector_ranks_byte_identically(&sessions[0], "retry with exponential backoff");
+    watchdog.enter("parent route search");
     let page = data(
         aft::views::parent::route(
             &request(json!({
@@ -1157,6 +1324,18 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     assert_eq!(rows(&page), parent_rows[1..2].to_vec(), "{page:#}");
     assert_eq!(page["more_available"], parent_rows.len() > 2, "{page:#}");
     assert_eq!(page["results_list_envelope"]["shown"], 1, "{page:#}");
+
+    drop(session);
+    watchdog.enter("drop parent context");
+    drop(parent);
+    watchdog.enter("drop child beta context");
+    drop(sessions.pop().unwrap());
+    watchdog.enter("drop child alpha context");
+    drop(sessions.pop().unwrap());
+    watchdog.enter("drop temporary directory");
+    drop(temp);
+    watchdog.enter("drop mock embedder");
+    drop(embedder);
 }
 
 /// A search given the query's own embedding as a precomputed vector answers

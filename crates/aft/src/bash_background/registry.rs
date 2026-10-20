@@ -640,6 +640,8 @@ pub struct BgTaskHealthCounts {
     pub pending_completions: usize,
     /// Abandoned undelivered results retired by this registry's disk sweeps.
     pub retired_undelivered_completions: u64,
+    /// Scratch directories of finished commands still kept on disk.
+    pub retained_scratch: RetainedScratchHealth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,8 +790,11 @@ pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
 }
 
+#[path = "scratch_retention.rs"]
+mod scratch_retention;
 #[path = "task_access.rs"]
 mod task_access;
+pub use scratch_retention::{RetainedScratchHealth, SCRATCH_RETENTION};
 pub(crate) use task_access::{is_task_environment, safe_task_entry};
 
 /// What woke the watchdog pass in which a task was observed terminal.
@@ -833,6 +838,9 @@ pub(crate) struct RegistryInner {
     retired_undelivered_completions: AtomicU64,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    /// Finished tasks whose scratch directory is kept on disk until its
+    /// delete time, keyed by task id. See `scratch_retention`.
+    retained_scratch: Mutex<HashMap<String, scratch_retention::RetainedScratch>>,
     revoked_scopes: Mutex<HashSet<(String, String, u64)>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
@@ -875,6 +883,16 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    /// Ids of tasks whose aft.db row write found no handle attached. A
+    /// configured root opens aft.db after its bind is acknowledged and
+    /// releases the handle while it is unbound, so its tasks can be written
+    /// to disk with no handle in place. Installing a handle writes each listed
+    /// task's current row; without that, a task that finished in the gap would
+    /// keep a missing or stale (still running) row.
+    db_writes_awaiting_pool: Mutex<HashSet<String>>,
+    /// Whether the current interval without a handle has been logged, so the
+    /// skipped writes are reported once per interval instead of once each.
+    db_detached_logged: AtomicBool,
     /// Harness of the most recent configure of this root. Routes from several
     /// harnesses share the root, so this is only a fallback for a task,
     /// session or request that cannot name its own harness (a spawn with no
@@ -1209,6 +1227,11 @@ pub(crate) struct BgTaskState {
     /// path inside it by the same session can then fail as not-found instead
     /// of asking for permission to read a file that no longer exists.
     pub(crate) removed_temp_dir: Option<PathBuf>,
+    /// Delete the scratch directory without waiting for its retention time:
+    /// the retention sweep found it due, the session's scope ended, or the
+    /// task record is being pruned. In memory only; a restart re-derives the
+    /// time from the persisted `metadata.sandbox_temp_delete_at`.
+    scratch_released: bool,
     pub(crate) runtime: TaskRuntime,
     /// Pinned task-io directory and original O_EXCL output handles retained for
     /// the process lifetime. Daemon writes never reopen child-writable names.
@@ -1282,6 +1305,7 @@ impl BgTaskRegistry {
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
                 retired_undelivered_completions: AtomicU64::new(0),
                 watchdog_tasks: Mutex::new(HashMap::new()),
+                retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
@@ -1305,6 +1329,8 @@ impl BgTaskRegistry {
                 session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                db_writes_awaiting_pool: Mutex::new(HashSet::new()),
+                db_detached_logged: AtomicBool::new(false),
                 db_harness: RwLock::new(None),
                 session_harnesses: Mutex::new(HashMap::new()),
                 session_task_ids: Mutex::new(HashMap::new()),
@@ -1562,17 +1588,53 @@ impl BgTaskRegistry {
             *slot = Some(conn);
         }
         self.inner.compression_aggregates.clear();
-        // Tasks started while no handle was installed have no row yet; the
-        // in-memory task is authoritative, so write their rows now.
-        let running = self
+        self.inner.db_detached_logged.store(false, Ordering::SeqCst);
+        // Taken after the handle is installed: a write that found no handle
+        // recorded its task while holding the handle's read lock, so it is
+        // either in this set or saw the new handle and wrote its own row.
+        let awaiting = self
+            .inner
+            .db_writes_awaiting_pool
+            .lock()
+            .map(|mut awaiting| std::mem::take(&mut *awaiting))
+            .unwrap_or_default();
+        let tasks = self
             .inner
             .tasks
             .lock()
             .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        for task in running.into_iter().filter(|task| !task.is_terminal()) {
-            self.ensure_task_row(&task);
+        let mut written = 0usize;
+        for task in tasks {
+            if awaiting.contains(&task.task_id) {
+                // Its last row write was skipped, so the row is missing or
+                // older than the task, whatever its status now.
+                self.write_current_task_row(&task);
+                written += 1;
+            } else if !task.is_terminal() {
+                // The in-memory task is authoritative while it runs; write
+                // its row if it has none.
+                self.ensure_task_row(&task);
+            }
         }
+        if written > 0 {
+            crate::slog_info!(
+                "wrote {written} bash_task row(s) skipped while aft.db was not attached to this registry"
+            );
+        }
+    }
+
+    /// Writes the task's current metadata as its aft.db row, in the same
+    /// order as the JSON writes it mirrors.
+    fn write_current_task_row(&self, task: &BgTask) {
+        // Declared first so it drops last: the row is written after both
+        // locks below are released.
+        let mut db = DeferredDbWrites::new(self, task);
+        let Ok(state) = task.lock_state() else {
+            return;
+        };
+        let _json_writes = task.db_write_order.lock_json_writes();
+        db.capture(&state.metadata);
     }
 
     pub fn clear_db_pool(&self) {
@@ -2317,20 +2379,47 @@ impl BgTaskRegistry {
         *task.db_write_order.lock_json_writes()
     }
 
-    fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
-        let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
-        let Some(pool) = pool else {
-            // A registry without a harness belongs to an unconfigured library
-            // context, which never has a database. A configured one without a
-            // handle is missing a row it should have; a later watch
-            // registration or erased-row check writes it once the handle is
-            // installed.
-            if self.fallback_db_harness().is_some() {
-                crate::slog_warn!(
-                    "dual-write bash_task to DB skipped for {}: aft.db is not attached to this registry",
-                    metadata.task_id
-                );
+    /// Records that `task_id`'s aft.db row write found no handle attached, and
+    /// logs the first such write of each interval without a handle.
+    fn queue_task_row_until_db_attaches(&self, task_id: &str) {
+        if let Ok(mut awaiting) = self.inner.db_writes_awaiting_pool.lock() {
+            // Ids of tasks this registry no longer holds have nothing left to
+            // write; drop them as the set grows so a root whose database never
+            // opens does not keep every id it ever ran. `try_lock`, because a
+            // caller may already hold the task map.
+            if awaiting.len() >= 1024 && awaiting.len().is_power_of_two() {
+                if let Ok(tasks) = self.inner.tasks.try_lock() {
+                    awaiting.retain(|id| tasks.contains_key(id));
+                }
             }
+            awaiting.insert(task_id.to_string());
+        }
+        if !self.inner.db_detached_logged.swap(true, Ordering::SeqCst) {
+            crate::slog_info!(
+                "aft.db is not attached to this registry yet; bash_task rows (first: {task_id}) are written when it attaches"
+            );
+        }
+    }
+
+    fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
+        let pool = {
+            let slot = self.inner.db_pool.read().ok();
+            let pool = slot.as_ref().and_then(|slot| (*slot).clone());
+            if pool.is_none() {
+                // A registry without a harness belongs to an unconfigured
+                // library context, which never has a database. A configured
+                // one opens aft.db after its bind is acknowledged and releases
+                // it while unbound, so this write is expected; the task is
+                // queued and `set_db_pool` writes its current row. The read
+                // lock is held while queueing so `set_db_pool` cannot drain
+                // the queue between this check and the insert.
+                if self.fallback_db_harness().is_some() {
+                    self.queue_task_row_until_db_attaches(&metadata.task_id);
+                }
+            }
+            pool
+        };
+        let Some(pool) = pool else {
             return;
         };
         let harness = metadata
@@ -3533,6 +3622,7 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
                 removed_temp_dir: None,
+                scratch_released: false,
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -3877,6 +3967,7 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
                 removed_temp_dir: None,
+                scratch_released: false,
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
                 io_handles: Some(io_handles),
@@ -4126,6 +4217,7 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
                 removed_temp_dir: None,
+                scratch_released: false,
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -7060,10 +7152,13 @@ impl BgTaskRegistry {
                 (Some(_), None) => true,
                 (None, _) => false,
             };
-            if !delivered_terminal
-                || !expired
-                || !self.cleanup_terminal_task_temp(&task).unwrap_or(false)
-            {
+            // Pruning the record ends the scratch's retention too: without the
+            // record nothing could find and delete the directory later.
+            let ready = delivered_terminal && expired && {
+                self.release_task_scratch(&task, false);
+                self.cleanup_terminal_task_temp(&task).unwrap_or(false)
+            };
+            if !ready {
                 self.inner
                     .cleanup_queue
                     .lock()
@@ -7937,9 +8032,24 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    /// Schedule scratch deletion without waiting for filesystem work. Keep the
-    /// task record and watchdog candidate until a later observer sees success.
+    /// Settle a finished task's scratch directory without waiting for
+    /// filesystem work. Returns true when nothing is left for the watchdog:
+    /// the directory is gone, or it is kept until its delete time and listed
+    /// for the retention sweep. Returns false while deletion is pending, so the
+    /// task record and watchdog candidate stay until a later observer sees it
+    /// finish.
     pub(crate) fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool> {
+        self.cleanup_terminal_task_temp_at(task, unix_millis())
+    }
+
+    /// [`Self::cleanup_terminal_task_temp`] with the current time passed in
+    /// (Unix milliseconds), so tests can move past the retention time without
+    /// waiting for it.
+    pub(crate) fn cleanup_terminal_task_temp_at(
+        &self,
+        task: &BgTask,
+        now_ms: u64,
+    ) -> std::io::Result<bool> {
         // Schema probes reuse the launch sandbox after the command exits. Its
         // scratch paths must still exist until the probe has finished, even if
         // another observer or the watchdog sees a quiescent process group.
@@ -7954,11 +8064,46 @@ impl BgTaskRegistry {
         let mut state = task
             .lock_state()
             .map_err(|_| std::io::Error::other("task lock poisoned"))?;
-        let Some(path) = state.metadata.sandbox_temp_dir.as_ref() else {
+        let Some(path) = state.metadata.sandbox_temp_dir.clone() else {
             return Ok(true);
         };
         if state.kill_in_flight || !super::persistence::task_temp_quiescent(&state.metadata) {
             return Ok(false);
+        }
+        // Keep the scratch for a while after the command exits, so the same
+        // session can still read what it wrote there. The delete time goes into
+        // the task record first, so a restarted daemon keeps the same deadline.
+        if state.temp_cleanup.is_none() && !state.scratch_released {
+            let delete_at = match state.metadata.sandbox_temp_delete_at {
+                Some(delete_at) => delete_at,
+                None => {
+                    let delete_at = scratch_retention::delete_at_for(&state.metadata, now_ms);
+                    state.metadata.sandbox_temp_delete_at = Some(delete_at);
+                    task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+                    self.persist_task_locked(task, &state.metadata, &mut db)?;
+                    task.terminal_persist_dirty.store(false, Ordering::SeqCst);
+                    delete_at
+                }
+            };
+            if now_ms < delete_at {
+                self.retain_scratch(&task.task_id, path.clone(), delete_at);
+                // List the scratch before reading the ended scopes: a scope end
+                // records itself before it reads this list, so either it sees
+                // the entry and releases it, or this check sees the scope end.
+                let scope_ended = state
+                    .metadata
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| self.scope_revoked(scope));
+                if !scope_ended {
+                    return Ok(true);
+                }
+                // The session's scope ended before this command's scratch was
+                // listed, so its scope-end pass could not release it. Nothing
+                // will read the scratch any more: delete it now.
+                state.scratch_released = true;
+                self.forget_retained_scratch(&task.task_id);
+            }
         }
         if let Some(result) = state.temp_cleanup.as_ref() {
             let result = match result.try_recv() {
@@ -7971,10 +8116,11 @@ impl BgTaskRegistry {
             state.temp_cleanup = None;
             result?;
         } else {
-            state.temp_cleanup = super::temp_cleanup::schedule(path, task.db_write_order.clone());
+            state.temp_cleanup = super::temp_cleanup::schedule(&path, task.db_write_order.clone());
             return Ok(false);
         }
         state.removed_temp_dir = state.metadata.sandbox_temp_dir.take();
+        self.forget_retained_scratch(&task.task_id);
         // A crash before this write is harmless: deletion is idempotent, and
         // replay can retry from the old record without touching another task.
         task.terminal_persist_dirty.store(true, Ordering::SeqCst);
@@ -8041,11 +8187,19 @@ impl BgTaskRegistry {
                 }
             }
         }
+        // Finished commands of the ended scope keep no scratch for later reads.
+        self.release_scope_scratch(scope);
     }
 
     pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
-        let revoked = self
-            .inner
+        if self.scope_revoked(scope) {
+            self.kill_scope(scope);
+        }
+    }
+
+    /// Whether `scope` has ended, as recorded by [`Self::kill_scope`].
+    fn scope_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) -> bool {
+        self.inner
             .revoked_scopes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -8053,10 +8207,7 @@ impl BgTaskRegistry {
                 serde_json::to_string(&scope.owner).expect("principal is JSON"),
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
-            ));
-        if revoked {
-            self.kill_scope(scope);
-        }
+            ))
     }
 
     /// Whether any task is still under watch, without waiting: `None` when
@@ -8147,6 +8298,7 @@ impl BgTaskRegistry {
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
                 removed_temp_dir: None,
+                scratch_released: false,
                 metadata,
                 runtime: if mode == BgMode::Pty {
                     TaskRuntime::Pty(None)
@@ -9773,7 +9925,9 @@ impl BgTaskRegistry {
             .ok()
             .map(|tasks| tasks.values().filter(|task| task.try_is_running()).count())?;
         let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
+        let retained_scratch = self.try_retained_scratch_health()?;
         Some(BgTaskHealthCounts {
+            retained_scratch,
             running,
             pending_completions,
             retired_undelivered_completions: self
@@ -13670,6 +13824,8 @@ mod tests {
         {
             let mut state = task.lock_state().unwrap();
             state.metadata.sandbox_temp_dir = Some(scratch.clone());
+            // Already past its retention time, so the exit itself deletes it.
+            state.metadata.sandbox_temp_delete_at = Some(0);
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
         let (entered, release) = super::super::temp_cleanup::block_removal(&scratch);
@@ -13725,6 +13881,8 @@ mod tests {
         {
             let mut state = task.lock_state().unwrap();
             state.metadata.sandbox_temp_dir = Some(scratch.clone());
+            // Already past its retention time, so the watchdog deletes it.
+            state.metadata.sandbox_temp_delete_at = Some(0);
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
         let (entered, release) = super::super::temp_cleanup::block_removal(&scratch);
@@ -13774,11 +13932,16 @@ mod tests {
         assert!(!scratch.exists());
     }
 
+    /// Drive scratch cleanup to completion with the clock past any retention
+    /// time, the way the watchdog finishes it once the delete time is due.
     #[cfg(unix)]
     fn wait_for_task_temp_cleanup(registry: &BgTaskRegistry, task: &BgTask) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if registry.cleanup_terminal_task_temp(task).unwrap() {
+            if registry
+                .cleanup_terminal_task_temp_at(task, u64::MAX)
+                .unwrap()
+            {
                 assert!(read_task(&task.paths.json)
                     .unwrap()
                     .sandbox_temp_dir
@@ -13800,6 +13963,8 @@ mod tests {
         {
             let mut state = task.lock_state().unwrap();
             state.metadata.sandbox_temp_dir = Some(scratch.clone());
+            // Already past its retention time, so cleanup starts the deletion.
+            state.metadata.sandbox_temp_delete_at = Some(0);
             state.metadata.completion_delivered = true;
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
@@ -13954,6 +14119,285 @@ mod tests {
                 assert!(read_task(&paths.json).unwrap().sandbox_temp_dir.is_none());
             }
         }
+    }
+
+    /// Attach fresh scratch holding one file to a finished task, as a spawn
+    /// records it, and return the scratch directory and the task's exit time.
+    #[cfg(unix)]
+    fn attach_scratch(task: &BgTask) -> (PathBuf, u64) {
+        let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+        fs::write(scratch.join("note.txt"), "kept").unwrap();
+        let mut state = task.lock_state().unwrap();
+        state.metadata.sandbox_temp_dir = Some(scratch.clone());
+        write_task(&task.paths.json, &state.metadata).unwrap();
+        (scratch, state.metadata.finished_at.unwrap())
+    }
+
+    /// Run real-clock cleanup until the scratch is gone, as the watchdog does
+    /// after a sweep or a scope end has released it.
+    #[cfg(unix)]
+    fn wait_for_released_scratch(registry: &BgTaskRegistry, task: &BgTask) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !registry.cleanup_terminal_task_temp(task).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "released scratch was not deleted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn retention_ms() -> u64 {
+        SCRATCH_RETENTION.as_millis() as u64
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_keeps_scratch_until_its_delete_time() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        let (scratch, finished_at) = attach_scratch(&task);
+        let delete_at = finished_at + retention_ms();
+
+        // Right after exit the scratch stays, still recorded on the task, and
+        // the delete time is in the task record for a later restart.
+        assert!(registry
+            .cleanup_terminal_task_temp_at(&task, finished_at + 1)
+            .unwrap());
+        assert_eq!(
+            fs::read_to_string(scratch.join("note.txt")).unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            task.lock_state().unwrap().metadata.sandbox_temp_dir,
+            Some(scratch.clone())
+        );
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().sandbox_temp_delete_at,
+            Some(delete_at)
+        );
+        assert!(!registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .contains_key(&task.task_id));
+        let health = registry.try_retained_scratch_health().unwrap();
+        assert_eq!(
+            (health.count, health.bytes, health.bytes_state),
+            (1, None, "unmeasured")
+        );
+
+        // A sweep before the delete time keeps it and measures it.
+        registry.sweep_retained_scratch_at(delete_at - 1);
+        assert!(scratch.join("note.txt").is_file());
+        assert!(registry
+            .cleanup_terminal_task_temp_at(&task, delete_at - 1)
+            .unwrap());
+        assert!(scratch.join("note.txt").is_file());
+        let health = registry.try_retained_scratch_health().unwrap();
+        assert_eq!(
+            (
+                health.count,
+                health.bytes,
+                health.bytes_state,
+                health.unmeasured
+            ),
+            (1, Some(4), "measured", 0)
+        );
+
+        // Once the time passes the sweep hands it back to the watchdog, which
+        // deletes it; reads then take the removed-scratch not-found path.
+        registry.sweep_retained_scratch_at(delete_at);
+        assert!(registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .contains_key(&task.task_id));
+        wait_for_released_scratch(&registry, &task);
+        assert!(!scratch.exists());
+        assert!(read_task(&task.paths.json)
+            .unwrap()
+            .sandbox_temp_dir
+            .is_none());
+        assert_eq!(task.lock_state().unwrap().removed_temp_dir, Some(scratch));
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_restart_honors_the_recorded_delete_time() {
+        let now = unix_millis();
+        // (recorded delete time, exit time, kept after replay)
+        for (delete_at, finished_at, kept) in [
+            (Some(now + 60_000), now, true),
+            (Some(1), now, false),
+            // Records written before scratch was kept count from their exit.
+            (None, now, true),
+            (None, now - retention_ms() - 1, false),
+        ] {
+            let registry = BgTaskRegistry::default();
+            let dir = tempfile::tempdir().unwrap();
+            let paths = task_paths(dir.path(), "session", &random_slug()).unwrap();
+            fs::create_dir_all(&paths.io_dir).unwrap();
+            let scratch = crate::sandbox_spawn::create_task_temp_dir(&paths.io_dir).unwrap();
+            let mut metadata = PersistedTask::starting(
+                paths.task_id.clone(),
+                "session".into(),
+                "true".into(),
+                dir.path().into(),
+                None,
+                None,
+                false,
+                false,
+            );
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            metadata.finished_at = Some(finished_at);
+            metadata.sandbox_temp_dir = Some(scratch.clone());
+            metadata.sandbox_temp_delete_at = delete_at;
+            write_task(&paths.json, &metadata).unwrap();
+            registry
+                .rehydrate_resolved_task(metadata, paths.clone(), "session")
+                .unwrap();
+            let task = registry.task(&paths.task_id).unwrap();
+            let case = format!("delete_at={delete_at:?} finished_at={finished_at}");
+            if kept {
+                assert!(scratch.is_dir(), "{case}: replay deleted kept scratch");
+                assert_eq!(
+                    read_task(&paths.json).unwrap().sandbox_temp_dir,
+                    Some(scratch.clone()),
+                    "{case}"
+                );
+                assert_eq!(registry.try_retained_scratch_health().unwrap().count, 1);
+                wait_for_task_temp_cleanup(&registry, &task);
+            } else {
+                assert!(
+                    registry
+                        .inner
+                        .watchdog_tasks
+                        .lock()
+                        .unwrap()
+                        .contains_key(&paths.task_id),
+                    "{case}: due scratch was not handed to the watchdog"
+                );
+                wait_for_released_scratch(&registry, &task);
+                assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
+            }
+            assert!(!scratch.exists(), "{case}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_scope_end_deletes_early() {
+        let stamp = |scope_ref: &str| {
+            subc_protocol::scope::ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "owner".into(),
+                },
+                scope_ref,
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true)
+        };
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut kept = Vec::new();
+        for scope_ref in ["ended", "other"] {
+            let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+            task.lock_state().unwrap().metadata.scope = Some(stamp(scope_ref));
+            let (scratch, _) = attach_scratch(&task);
+            assert!(registry.cleanup_terminal_task_temp(&task).unwrap());
+            assert!(scratch.is_dir());
+            kept.push((task, scratch));
+        }
+        registry.kill_scope(&stamp("ended"));
+        let (ended, ended_scratch) = &kept[0];
+        wait_for_released_scratch(&registry, ended);
+        assert!(!ended_scratch.exists(), "ended scope kept its scratch");
+        let (other, other_scratch) = &kept[1];
+        assert!(registry.cleanup_terminal_task_temp(other).unwrap());
+        assert!(
+            other_scratch.is_dir(),
+            "another scope's scratch was deleted"
+        );
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 1);
+        wait_for_task_temp_cleanup(&registry, other);
+    }
+
+    /// A command can finish just before its scope ends and reach scratch
+    /// cleanup only afterwards. The scope-end pass then finds nothing listed
+    /// to release, so cleanup itself must see that the scope has ended and
+    /// delete the scratch now instead of keeping it for the retention time.
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_scope_ended_before_cleanup_deletes_early() {
+        let stamp = |scope_ref: &str| {
+            subc_protocol::scope::ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "owner".into(),
+                },
+                scope_ref,
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true)
+        };
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut finished = Vec::new();
+        for scope_ref in ["ended", "other"] {
+            let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+            task.lock_state().unwrap().metadata.scope = Some(stamp(scope_ref));
+            let (scratch, _) = attach_scratch(&task);
+            finished.push((task, scratch));
+        }
+        // The scope ends while both commands have finished but neither has
+        // been through scratch cleanup, so no scratch is listed as kept yet.
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
+        registry.kill_scope(&stamp("ended"));
+
+        let (ended, ended_scratch) = &finished[0];
+        wait_for_released_scratch(&registry, ended);
+        assert!(
+            !ended_scratch.exists(),
+            "scratch of a scope that ended before cleanup was kept"
+        );
+        let (other, other_scratch) = &finished[1];
+        assert!(registry.cleanup_terminal_task_temp(other).unwrap());
+        assert!(
+            other_scratch.is_dir(),
+            "another scope's scratch was deleted"
+        );
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 1);
+        wait_for_task_temp_cleanup(&registry, other);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_scratch_retention_pruned_record_deletes_kept_scratch() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        task.lock_state().unwrap().metadata.completion_delivered = true;
+        let (scratch, _) = attach_scratch(&task);
+        assert!(registry.cleanup_terminal_task_temp(&task).unwrap());
+        assert!(scratch.is_dir());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while task.paths.json.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "record with kept scratch was not pruned"
+            );
+            registry.cleanup_finished(Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!scratch.exists(), "pruned record leaked its kept scratch");
+        assert_eq!(registry.try_retained_scratch_health().unwrap().count, 0);
     }
 
     #[test]
@@ -16899,6 +17343,77 @@ mod tests {
         .expect("bash_tasks row");
         assert_eq!(row.status, "completed");
         let _ = registry.kill(&task_id, "session");
+    }
+
+    /// A configured registry can write tasks while it has no aft.db handle:
+    /// the database opens after the bind is acknowledged and is released
+    /// while the root is unbound. Those skipped row writes must land when a
+    /// handle is installed, including for tasks that finished in the gap.
+    #[cfg(unix)]
+    #[test]
+    fn bash_task_rows_skipped_without_aft_db_are_written_when_it_attaches() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let spawn = |command: &str| {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    command,
+                    "session".to_string(),
+                    storage.path().to_path_buf(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    storage.path().to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(storage.path().to_path_buf()),
+                )
+                .unwrap()
+        };
+        let row_status = |task_id: &str| {
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                task_id,
+            )
+            .unwrap()
+            .map(|row| row.status)
+        };
+
+        // Written as running while attached, then killed while detached.
+        let killed = spawn(LONG_RUNNING_COMMAND);
+        let attached_status = row_status(&killed).expect("row written while attached");
+        assert!(
+            !matches!(attached_status.as_str(), "killed" | "completed"),
+            "{attached_status}"
+        );
+        registry.clear_db_pool();
+        let _ = registry.kill(&killed, "session");
+        wait_for_terminal_snapshot(
+            &registry,
+            &killed,
+            "session",
+            storage.path(),
+            storage.path(),
+        );
+        // Started and finished entirely while detached.
+        let finished = spawn(QUICK_SUCCESS_COMMAND);
+        wait_for_terminal_snapshot(
+            &registry,
+            &finished,
+            "session",
+            storage.path(),
+            storage.path(),
+        );
+        assert_eq!(row_status(&killed), Some(attached_status));
+        assert_eq!(row_status(&finished), None);
+
+        registry.set_db_pool(Arc::clone(&db));
+
+        assert_eq!(row_status(&killed).as_deref(), Some("killed"));
+        assert_eq!(row_status(&finished).as_deref(), Some("completed"));
     }
 
     /// Companion to the above for the kill path: when a kill observes an

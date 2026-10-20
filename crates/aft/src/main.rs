@@ -1294,8 +1294,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let _publication_gate = aft::executor::standalone_request_gate();
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
-    let watcher_pending = aft::response_finalize::watcher_query_pending(ctx, &req.command);
-    let callgraph_pending = aft::response_finalize::callgraph_query_pending(ctx, &req.command);
+    let (watcher_pending, callgraph_pending) =
+        aft::response_finalize::query_pending(ctx, &req.command);
     let mut response = dispatch_command(req, ctx);
     aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
     aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);

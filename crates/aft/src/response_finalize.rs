@@ -1186,6 +1186,12 @@ pub const WATCHER_PENDING_NOTICE: &str = "Watcher changes pending: indexed or ca
 /// and so are `outline` and `zoom`: they parse the file on disk, and the symbol
 /// cache they consult is checked against each file's current mtime and size.
 pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
+    is_watcher_query_command(command) && ctx.watcher_query_has_pending_changes()
+}
+
+/// Commands whose answers come from indexed or cached producers that the
+/// watcher keeps current.
+fn is_watcher_query_command(command: &str) -> bool {
     matches!(
         command,
         "grep"
@@ -1200,7 +1206,7 @@ pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
             | "trace_to"
             | "trace_to_symbol"
             | "trace_data"
-    ) && ctx.watcher_query_has_pending_changes()
+    )
 }
 
 /// Commands answered from the call graph.
@@ -1217,19 +1223,34 @@ fn is_callgraph_command(command: &str) -> bool {
     )
 }
 
-/// The call-graph changes still being applied when a call-graph command
-/// starts. Captured before execution for the same reason as
-/// [`watcher_query_pending`]: a refresh that lands while the answer is being
-/// computed does not make that answer current. `None` for other commands and
-/// when nothing is pending.
-pub fn callgraph_query_pending(
+/// Two values captured together before a command runs, because a refresh that
+/// lands while the answer is computed does not make that answer current:
+/// whether unsorted watcher events exist (as [`watcher_query_pending`]
+/// reports), and the files the call graph has not applied yet (`None` for
+/// commands not answered from the call graph and when nothing is pending).
+///
+/// One pass reads each stage a changed file travels (the watcher thread's
+/// flush window, then the dispatch channel and drain, then the refresh
+/// worker) before the stage it moves to next; see
+/// `AppContext::pending_changes_for_query`. Computing the two values
+/// separately would read the dispatch channel first and the flush window
+/// second. A flush between those reads moves the file out of the flush
+/// window into the channel after the channel was read, so neither read would
+/// see it.
+pub fn query_pending(
     ctx: &AppContext,
     command: &str,
-) -> Option<crate::context::CallgraphUnappliedChanges> {
-    if !is_callgraph_command(command) {
-        return None;
+) -> (bool, Option<crate::context::CallgraphUnappliedChanges>) {
+    let watcher_command = is_watcher_query_command(command);
+    let callgraph_command = is_callgraph_command(command);
+    if !watcher_command && !callgraph_command {
+        return (false, None);
     }
-    Some(ctx.callgraph_unapplied_changes()).filter(|changes| !changes.is_empty())
+    let pending = ctx.pending_changes_for_query(callgraph_command);
+    (
+        watcher_command && pending.watcher,
+        Some(pending.callgraph).filter(|changes| callgraph_command && !changes.is_empty()),
+    )
 }
 
 /// Above this many files of one kind, a call-graph answer reports how many

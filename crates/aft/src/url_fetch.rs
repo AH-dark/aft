@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -194,7 +195,44 @@ pub fn fetch_url_to_cache(
     Ok(content_file)
 }
 
+/// What a cleanup sweep learned from one metadata file, kept so the next sweep
+/// can skip re-reading it. `len` and `modified` identify the file version the
+/// fetch time was read from: the cache rewrites metadata only through a rename
+/// of a freshly written file, which always produces a new modification time.
+#[derive(Debug, Clone)]
+struct CleanupMemoEntry {
+    len: u64,
+    modified: SystemTime,
+    fetched_at: u64,
+    extension: String,
+}
+
+/// Per cache directory, the metadata facts of the last sweep, keyed by file
+/// name. Every configure runs the cleanup sweep, and almost every metadata
+/// file is unchanged since the previous one, so an unchanged file costs one
+/// stat instead of an open, a read and a JSON parse. A sweep replaces its
+/// directory's map with only the files it saw and kept, so removed entries do
+/// not accumulate.
+fn cleanup_memo() -> &'static std::sync::Mutex<HashMap<PathBuf, HashMap<String, CleanupMemoEntry>>>
+{
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, HashMap<String, CleanupMemoEntry>>>,
+    > = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Metadata files the cleanup sweep opened on this thread, for tests that
+    /// check unchanged files are not read again.
+    static CLEANUP_META_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn cleanup_url_cache(storage_dir: &Path) -> Result<usize, UrlFetchError> {
+    cleanup_url_cache_at(storage_dir, now_ms())
+}
+
+fn cleanup_url_cache_at(storage_dir: &Path, now: u64) -> Result<usize, UrlFetchError> {
     let dir = cache_dir(storage_dir);
     if !dir.exists() {
         return Ok(0);
@@ -207,7 +245,15 @@ pub fn cleanup_url_cache(storage_dir: &Path) -> Result<usize, UrlFetchError> {
         ))
     })?;
     let mut removed = 0usize;
-    let now = now_ms();
+    // Taken out for the sweep and put back at the end, so the lock is never
+    // held across file I/O. A concurrent sweep of the same directory finds no
+    // memo and reads every file, which is only slower.
+    let previous = cleanup_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&dir)
+        .unwrap_or_default();
+    let mut kept = HashMap::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -218,28 +264,61 @@ pub fn cleanup_url_cache(storage_dir: &Path) -> Result<usize, UrlFetchError> {
             continue;
         }
 
-        let meta = fs::read_to_string(&path)
+        let version = entry
+            .metadata()
             .ok()
-            .and_then(|content| serde_json::from_str::<CacheMeta>(&content).ok());
-        let Some(meta) = meta else {
-            if fs::remove_file(&path).is_ok() {
-                removed += 1;
+            .and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?)));
+        let remembered = version.and_then(|(len, modified)| {
+            previous
+                .get(name)
+                .filter(|known| known.len == len && known.modified == modified)
+                .cloned()
+        });
+        let facts = match remembered {
+            Some(known) => known,
+            None => {
+                #[cfg(test)]
+                CLEANUP_META_READS.with(|reads| reads.set(reads.get() + 1));
+                let meta = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|content| serde_json::from_str::<CacheMeta>(&content).ok());
+                let Some(meta) = meta else {
+                    if fs::remove_file(&path).is_ok() {
+                        removed += 1;
+                    }
+                    continue;
+                };
+                let (len, modified) = version.unwrap_or((u64::MAX, UNIX_EPOCH));
+                CleanupMemoEntry {
+                    len,
+                    modified,
+                    fetched_at: meta.fetched_at,
+                    extension: meta.extension,
+                }
             }
-            continue;
         };
 
-        if now.saturating_sub(meta.fetched_at) <= CACHE_TTL_MS {
+        if now.saturating_sub(facts.fetched_at) <= CACHE_TTL_MS {
+            // A file whose version could not be read is not remembered, so the
+            // next sweep reads it again.
+            if version.is_some() {
+                kept.insert(name.to_string(), facts);
+            }
             continue;
         }
 
         let hash = name.trim_end_matches(".meta.json");
-        let content = content_path(storage_dir, hash, &meta.extension);
+        let content = content_path(storage_dir, hash, &facts.extension);
         let _ = fs::remove_file(content);
         if fs::remove_file(&path).is_ok() {
             removed += 1;
         }
     }
 
+    cleanup_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(dir, kept);
     Ok(removed)
 }
 
@@ -1267,6 +1346,90 @@ fn reqwest_error_detail(error: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use url::Url;
+
+    fn write_cache_entry(storage: &Path, hash: &str, url: &str, fetched_at: u64) -> PathBuf {
+        let dir = cache_dir(storage);
+        fs::create_dir_all(&dir).unwrap();
+        let meta = CacheMeta {
+            url: url.to_string(),
+            content_type: "text/markdown".to_string(),
+            extension: ".md".to_string(),
+            fetched_at,
+            download_truncated: false,
+            downloaded_bytes: 4,
+            total_bytes: Some(4),
+        };
+        fs::write(content_path(storage, hash, ".md"), "body").unwrap();
+        let meta_file = meta_path(storage, hash);
+        fs::write(&meta_file, serde_json::to_vec(&meta).unwrap()).unwrap();
+        meta_file
+    }
+
+    fn cleanup_counting_reads(storage: &Path, now: u64) -> (usize, usize) {
+        CLEANUP_META_READS.with(|reads| reads.set(0));
+        let removed = cleanup_url_cache_at(storage, now).unwrap();
+        (removed, CLEANUP_META_READS.with(std::cell::Cell::get))
+    }
+
+    /// Every configure sweeps the URL cache, so a sweep must not reopen
+    /// metadata files that have not changed since the previous sweep.
+    #[test]
+    fn url_cache_cleanup_does_not_reread_unchanged_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let now = 10 * CACHE_TTL_MS;
+        for index in 0..3 {
+            write_cache_entry(
+                storage.path(),
+                &format!("fresh{index}"),
+                "https://example.com/a",
+                now - 1_000,
+            );
+        }
+        let stale = write_cache_entry(
+            storage.path(),
+            "stale",
+            "https://example.com/b",
+            now - CACHE_TTL_MS - 1,
+        );
+
+        assert_eq!(cleanup_counting_reads(storage.path(), now), (1, 4));
+        assert!(!stale.exists());
+        assert!(!content_path(storage.path(), "stale", ".md").exists());
+
+        // Nothing changed: no metadata file is opened again.
+        assert_eq!(cleanup_counting_reads(storage.path(), now), (0, 0));
+    }
+
+    /// A remembered fetch time is still compared with the current time, and a
+    /// rewritten metadata file is read again, so the memo never keeps an entry
+    /// alive past its TTL.
+    #[test]
+    fn url_cache_cleanup_memo_still_expires_and_notices_rewrites() {
+        let storage = tempfile::tempdir().unwrap();
+        let now = 10 * CACHE_TTL_MS;
+        let kept = write_cache_entry(storage.path(), "kept", "https://example.com/a", now);
+        let rewritten =
+            write_cache_entry(storage.path(), "rewritten", "https://example.com/b", now);
+        assert_eq!(cleanup_counting_reads(storage.path(), now), (0, 2));
+
+        // A different size is a different version even within one mtime tick.
+        write_cache_entry(
+            storage.path(),
+            "rewritten",
+            "https://example.com/b-longer",
+            now - CACHE_TTL_MS - 1,
+        );
+        assert_eq!(cleanup_counting_reads(storage.path(), now), (1, 1));
+        assert!(!rewritten.exists());
+        assert!(kept.exists());
+
+        // The unchanged file expires from its remembered fetch time.
+        assert_eq!(
+            cleanup_counting_reads(storage.path(), now + CACHE_TTL_MS + 1),
+            (1, 0)
+        );
+        assert!(!kept.exists());
+    }
 
     #[test]
     fn web_view_urls_rewrite_to_raw_content() {

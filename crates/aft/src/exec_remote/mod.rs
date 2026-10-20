@@ -40,7 +40,7 @@ impl std::fmt::Display for Error {
             Self::Connection(error) => write!(f, "remote execution connection: {error}"),
             Self::RecoveryRequired { reason, .. } => write!(
                 f,
-                "remote execution needs status/attach, not resubmission: {reason}"
+                "remote execution needs re-attach, not resubmission: {reason}"
             ),
         }
     }

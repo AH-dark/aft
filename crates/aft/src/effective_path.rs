@@ -64,6 +64,10 @@ const LOGIN_SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const LOGIN_SHELL_PATH_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(4);
 #[cfg(unix)]
+const SPAWN_BUSY_RETRY_COUNT: usize = 3;
+#[cfg(unix)]
+const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+#[cfg(unix)]
 const EFFECTIVE_PATH_CACHE_SCHEMA: u32 = 1;
 
 /// Compute and export AFT's process PATH.
@@ -589,7 +593,7 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
             Ok(())
         });
     }
-    let mut child = command.spawn().ok()?;
+    let mut child = spawn_retrying_executable_file_busy(&mut command, "login shell")?;
     let mut stdout = child.stdout.take()?;
     let _ = set_nonblocking(&stdout);
     let mut output_bytes = Vec::new();
@@ -659,6 +663,57 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
                 return None;
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_retrying_executable_file_busy(command: &mut Command, purpose: &str) -> Option<Child> {
+    for retry in 0..=SPAWN_BUSY_RETRY_COUNT {
+        match command.spawn() {
+            Ok(child) => return Some(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && retry < SPAWN_BUSY_RETRY_COUNT =>
+            {
+                #[cfg(test)]
+                busy_retry_hook::run();
+                std::thread::sleep(SPAWN_BUSY_RETRY_DELAY);
+            }
+            Err(error) => {
+                log::debug!("failed to spawn {purpose}: {error}");
+                return None;
+            }
+        }
+    }
+
+    unreachable!("the final spawn attempt returns or exits the retry loop")
+}
+
+/// Lets a test act at the moment a spawn hit a busy executable and is about
+/// to retry, on the thread that spawns. Parallel tests do not see each
+/// other's hooks.
+#[cfg(all(test, unix))]
+mod busy_retry_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run() {
+        HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Run `body` with `hook` called before each busy-file retry.
+    pub(super) fn with<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let value = body();
+        HOOK.with(|slot| *slot.borrow_mut() = None);
+        value
     }
 }
 
@@ -956,7 +1011,8 @@ fn spawn_cached_path_refresh() {
 /// `wait()` the finished helper stays a zombie for the life of this process.
 #[cfg(unix)]
 fn spawn_reaped(command: &mut Command) -> Option<u32> {
-    let Ok(child) = command.spawn() else {
+    let Some(child) = spawn_retrying_executable_file_busy(command, "login-shell PATH cache helper")
+    else {
         return None;
     };
     let pid = child.id();
@@ -1407,6 +1463,117 @@ eval "$2"
             .path,
             Some(OsString::from("/custom/bin:/usr/bin"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn login_shell_probe_survives_concurrent_fork_stress() {
+        use std::os::fd::AsRawFd;
+        const ITERATIONS: usize = 128;
+
+        fn cloexec_pipe() -> (libc::c_int, libc::c_int) {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            (fds[0], fds[1])
+        }
+        fn write_byte(fd: libc::c_int) {
+            assert_eq!(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) }, 1);
+        }
+        fn read_byte(fd: libc::c_int) {
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) },
+                1
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        let body = format!(
+            "#!/bin/sh\n#{}\nprintf '%s' '__AFT_PATH_BEGIN__/custom/bin:/usr/bin__AFT_PATH_END__'\n",
+            "x".repeat(64 * 1024)
+        );
+        write_executable_shim(&shell, &body);
+
+        let expected = Some(OsString::from("/custom/bin:/usr/bin"));
+        let mut failed_probe = None;
+        for _ in 0..ITERATIONS {
+            fs::write(&shell, &body).unwrap();
+            let writable = fs::OpenOptions::new().write(true).open(&shell).unwrap();
+            let writable_fd = writable.as_raw_fd();
+            // The child holds its copy of the writable descriptor until the
+            // test writes to `release`, reproducing the fork-to-exec window
+            // that makes a concurrent shell spawn busy. It then closes the
+            // descriptor and reports that on `closed`. No timing is involved.
+            let (release_read, release_write) = cloexec_pipe();
+            let (closed_read, closed_write) = cloexec_pipe();
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // Only async-signal-safe calls between fork and _exit.
+                unsafe {
+                    let mut byte = 0u8;
+                    libc::read(release_read, (&mut byte as *mut u8).cast(), 1);
+                    libc::close(writable_fd);
+                    libc::write(closed_write, b"x".as_ptr().cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0, "fork failed with {pid}");
+            unsafe {
+                libc::close(release_read);
+                libc::close(closed_write);
+            }
+            drop(writable);
+
+            let error = Command::new(&shell)
+                .spawn()
+                .expect_err("the forked child should still hold the writable file descriptor");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "expected Linux ETXTBSY, got {error}"
+            );
+
+            // The probe's first spawn finds the file busy too. Its retry hook
+            // releases the child and waits until the descriptor is closed, so
+            // the retry that follows must succeed.
+            let busy_retries = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let hook_retries = std::rc::Rc::clone(&busy_retries);
+            let actual = super::busy_retry_hook::with(
+                move || {
+                    hook_retries.set(hook_retries.get() + 1);
+                    if hook_retries.get() == 1 {
+                        write_byte(release_write);
+                        read_byte(closed_read);
+                    }
+                },
+                || probe_login_shell_path_once(&shell, Duration::from_secs(10)),
+            );
+            if busy_retries.get() == 0 {
+                // The probe never saw the file busy, so the child was never
+                // released by the hook. Release it here before reaping.
+                write_byte(release_write);
+            }
+            unsafe {
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                libc::close(release_write);
+                libc::close(closed_read);
+            }
+            assert!(
+                busy_retries.get() >= 1,
+                "the probe's first spawn must find the file busy and retry"
+            );
+            if actual != expected {
+                failed_probe = Some(actual);
+                break;
+            }
+        }
+
+        assert_eq!(
+            failed_probe, None,
+            "login-shell PATH probe failed during a fork/spawn race"
+        );
+        println!("observed ETXTBSY and recovered across {ITERATIONS} concurrent fork/probe cycles");
     }
 
     #[test]

@@ -2129,8 +2129,8 @@ async fn worker_jail_temp_denies_other_task_directory() {
     let mut jail = Jail::start().await;
     let recorded = jail.worktree.join("first-temp.txt");
     let release = jail.worktree.join("release-first-temp");
-    // Keep the first command alive while checking isolation. Finished commands
-    // relinquish scratch, so a sequential probe could mistake deletion for denial.
+    // Probe once while the first command runs and once after it finished,
+    // when its scratch is retained for its own session.
     let ready = jail.bash("true").await;
     let first_corr = jail.submit_tool("bash", json!({
         "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; while [ ! -f {} ]; do sleep 0.05; done", quote(&recorded), quote(&release)),
@@ -2175,15 +2175,33 @@ else:
         "original"
     );
     std::fs::write(&release, "done").unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while first.exists() || first.with_extension("owner").exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "finished task leaked scratch: {}",
-            first.display()
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // Wait for the first command's own reply, so the checks below run after it
+    // finished rather than while it still holds its scratch.
+    loop {
+        let frame = next_frame(&mut jail.stream).await;
+        if frame.header.channel == 1 && frame.header.corr == first_corr {
+            break;
+        }
     }
+    // A finished command's scratch stays for its own session to read for
+    // SCRATCH_RETENTION (expiry and scope-end deletion are tested in
+    // bash_background::registry). Retention must not open it to other tasks.
+    assert_eq!(
+        std::fs::read_to_string(first.join("sentinel")).unwrap(),
+        "original"
+    );
+    let reply = jail
+        .bash(&format!(
+            "python3 -B -c {} {}",
+            quote(Path::new(script)),
+            quote(&first)
+        ))
+        .await;
+    assert!(reply.contains("OTHER_TASK_DENIED"), "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(first.join("sentinel")).unwrap(),
+        "original"
+    );
 }
 
 #[tokio::test]

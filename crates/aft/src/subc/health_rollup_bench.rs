@@ -46,8 +46,42 @@ impl Timer {
 #[ignore = "offline per-step CPU measurement with 40 roots and a large aft.db"]
 fn bench_health_rollup_steps() {
     use super::super::test_support::test_root;
-    const ROOTS: usize = 40;
+    // The defaults reproduce the original 40-root run. The variables below
+    // model a busier daemon (the live one runs 100+ roots, hundreds of
+    // threads, populated indexes and views that publish continuously):
+    //   AFT_ROLLUP_BENCH_ROOTS    bound roots, one installed view each
+    //   AFT_ROLLUP_BENCH_THREADS  extra idle named threads in the process
+    //   AFT_ROLLUP_BENCH_FILES    files in each root's in-memory trigram index
+    //   AFT_ROLLUP_BENCH_CHURN=1  between ticks, every root republishes its
+    //                             view without changing its path status
+    //                             (open, re-mark, clear, close, as assembly
+    //                             does) and reads one new file into its
+    //                             symbol cache; one root in ten also edits a
+    //                             file in its trigram index
+    let env_count = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let roots_count = env_count("AFT_ROLLUP_BENCH_ROOTS", 40);
+    let thread_count = env_count("AFT_ROLLUP_BENCH_THREADS", 0);
+    let files_per_root = env_count("AFT_ROLLUP_BENCH_FILES", 0);
+    let churn = std::env::var("AFT_ROLLUP_BENCH_CHURN").is_ok_and(|value| value == "1");
     const TICKS: usize = 20;
+    let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
+    let park_rx = Arc::new(std::sync::Mutex::new(park_rx));
+    let parked = (0..thread_count)
+        .map(|index| {
+            let park_rx = Arc::clone(&park_rx);
+            std::thread::Builder::new()
+                .name(format!("bench-idle-{index}"))
+                .spawn(move || {
+                    let _ = park_rx.lock().map(|rx| rx.recv());
+                })
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
@@ -71,7 +105,8 @@ fn bench_health_rollup_steps() {
     });
     let mut dirs = Vec::new();
     let mut registrations = Vec::new();
-    for i in 0..ROOTS {
+    let mut churn_view_dirs = Vec::new();
+    for i in 0..roots_count {
         let (dir, root) = test_root(&format!("rollup-steps-{i}"));
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -91,6 +126,9 @@ fn bench_health_rollup_steps() {
             status.mark_pending(b"src/a.rs", "bench", 1).unwrap();
             status.mark_failed(b"src/b.rs", "bench", 1).unwrap();
             if view == 0 {
+                if churn {
+                    churn_view_dirs.push(registration.view_dir().to_path_buf());
+                }
                 ctx.update_config(|config| config.views.enabled = true);
                 ctx.install_view_runtime(
                     crate::context::ViewRuntimeSnapshot {
@@ -116,20 +154,58 @@ fn bench_health_rollup_steps() {
             }
             registrations.push(registration);
         }
+        if files_per_root > 0 {
+            let mut index = crate::search_index::SearchIndex::new();
+            for file in 0..files_per_root {
+                let path = root
+                    .as_path()
+                    .join(format!("src/module_{}/file_{file}.rs", file % 64));
+                index.index_file(&path, format!("fn item_{file}() {{}}").as_bytes());
+            }
+            *ctx.search_index().write().unwrap() = Some(index);
+        }
         assert!(executor.register_actor(root, ctx));
         dirs.push(dir);
     }
     let cache = HealthRollupCache::new();
     cache.clock_ms.store(0, Ordering::Relaxed);
     cache.refresh_for_test(&executor, &app);
-    assert_eq!(registrations.len(), 400);
+    assert_eq!(registrations.len(), roots_count * 10);
     assert!(executor.actor_entries().iter().all(|(_, ctx)| {
         ctx.view_health_snapshot()
             .is_some_and(|view| view.pending_paths == 1 && view.failed_paths == 1)
     }));
     STEPS.with(|steps| *steps.borrow_mut() = Some(BTreeMap::new()));
-    let started = cpu_ns();
+    let mut total = 0u64;
     for tick in 1..=TICKS {
+        if churn {
+            // What publishing views, reads and an occasional edit do between
+            // two ticks; kept out of the measured time.
+            for view_dir in &churn_view_dirs {
+                let mut status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
+                status
+                    .mark_pending_many([(&b"src/a.rs"[..], "bench")], 1)
+                    .unwrap();
+                status.clear_many([&b"src/gone.rs"[..]]).unwrap();
+            }
+            let path = format!("src/churn_{tick}.rs");
+            for (index, (root, ctx)) in executor.actor_entries().into_iter().enumerate() {
+                let file = root.as_path().join(&path);
+                ctx.symbol_cache().write().unwrap().insert(
+                    file.clone(),
+                    std::time::SystemTime::UNIX_EPOCH,
+                    1,
+                    blake3::hash(path.as_bytes()),
+                    Vec::new(),
+                );
+                if index % 10 == tick % 10 {
+                    if let Some(index) = ctx.search_index().write().unwrap().as_mut() {
+                        index.index_file(&file, b"fn churn() {}");
+                    }
+                }
+            }
+        }
+        let started = cpu_ns();
         cache.clock_ms.store(tick as u64 * 3000, Ordering::Relaxed);
         let built = build_health_diagnostic_rollup_from_actors(
             &cache,
@@ -140,10 +216,13 @@ fn bench_health_rollup_steps() {
         let mut publish_timer = Timer::new();
         cache.publish(Some(built));
         publish_timer.mark("publish holder / old JSON drop");
+        total += cpu_ns() - started;
     }
-    let total = cpu_ns() - started;
     let steps = STEPS.with(|steps| steps.borrow_mut().take().unwrap());
-    println!("roots={ROOTS} routes=300 persisted_views=400 installed_views=40 aft_db_bytes={bytes} ticks={TICKS} interval_s=3 CPU (not wall)");
+    println!(
+        "roots={roots_count} routes=300 persisted_views={} installed_views={roots_count} extra_threads={thread_count} files_per_root={files_per_root} churn={churn} aft_db_bytes={bytes} ticks={TICKS} interval_s=3 CPU (not wall)",
+        roots_count * 10
+    );
     for (step, ns) in steps {
         println!(
             "{step}: us/tick={:.2} us/second={:.2}",
@@ -167,4 +246,8 @@ fn bench_health_rollup_steps() {
         "on-demand reply + wire JSON (not tick): us/probe={:.2}",
         (cpu_ns() - before) as f64 / TICKS as f64 / 1000.
     );
+    drop(park_tx);
+    for thread in parked {
+        thread.join().unwrap();
+    }
 }

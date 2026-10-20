@@ -24,9 +24,12 @@ import {
   isBashTransportDeadError,
   isRouteOpenReloadWindowError,
   isSubcFrameReadTimeoutError,
+  SHELL_TIMEOUT_UNKNOWN_DISPOSITION,
   SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
   SUBC_MODULE_RESTART_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
+  shellTimeoutNotStartedDisposition,
+  shellTimeoutTaskDisposition,
 } from "../error-contract.js";
 import {
   isLocalRouteCloseRejection,
@@ -260,8 +263,13 @@ describe("isRouteOpenReloadWindowError", () => {
 });
 
 describe("adaptToolError", () => {
-  test("adds bash transport disposition guidance while preserving the error", () => {
-    const original = new BridgeTransportTimeoutError("bash", 11_000, "bash transport timed out");
+  // A bridge timeout means the request was sent, so AFT may have started the
+  // command. The guidance therefore comes from what the bridge learned after
+  // the deadline, never from the "no task was created, re-run" text.
+  test("a bash timeout with no late reply admits the outcome is unknown, preserving the error", () => {
+    const original = new BridgeTransportTimeoutError("bash", 11_000, "bash transport timed out", {
+      kind: "unknown",
+    });
 
     let thrown: unknown;
     try {
@@ -271,8 +279,48 @@ describe("adaptToolError", () => {
     }
 
     expect(thrown).toBe(original);
-    expect(original.message).toBe(`bash transport timed out ${BASH_TRANSPORT_DISPOSITION}`);
+    expect(original.message).toBe(`bash transport timed out ${SHELL_TIMEOUT_UNKNOWN_DISPOSITION}`);
+    expect(original.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
     expect(isBridgeTransportTimeout(original)).toBe(true);
+  });
+
+  test("a bash timeout without any outcome also gets the unknown text", () => {
+    const original = new BridgeTransportTimeoutError("bash", 11_000, "bash transport timed out");
+
+    adaptToolError("bash", original);
+
+    expect(original.message).toContain(SHELL_TIMEOUT_UNKNOWN_DISPOSITION);
+    expect(original.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+  });
+
+  test("a bash timeout whose late reply named a task names that task", () => {
+    for (const command of ["bash", "powershell"]) {
+      const original = new BridgeTransportTimeoutError(command, 11_000, "timed out", {
+        kind: "task_started",
+        taskId: "bash-123",
+      });
+
+      adaptToolError(command, original);
+      adaptToolError(command, original);
+
+      expect(original.message).toBe(`timed out ${shellTimeoutTaskDisposition("bash-123")}`);
+      expect(original.message).toContain("Use bash_status or bash_watch with task ID bash-123");
+    }
+  });
+
+  test("a bash timeout whose late reply was an error reports that answer", () => {
+    const original = new BridgeTransportTimeoutError("bash", 11_000, "timed out", {
+      kind: "not_started",
+      code: "permission_required",
+      message: "bash command requires permission",
+    });
+
+    adaptToolError("bash", original);
+
+    expect(original.message).toBe(
+      `timed out ${shellTimeoutNotStartedDisposition("permission_required", "bash command requires permission")}`,
+    );
+    expect(original.message).toContain("no task ID was assigned");
   });
 
   test("does not add bash transport guidance to non-bash commands", () => {

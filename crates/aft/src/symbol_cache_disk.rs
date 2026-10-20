@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::fs_lock;
 use crate::parser::SymbolCache;
-use crate::search_index::{cache_relative_path, validate_cached_relative_path};
-use crate::slog_warn;
+use crate::search_index::validate_cached_relative_path;
 use crate::symbols::Symbol;
+use crate::{slog_debug, slog_warn};
 
 const MAGIC: &[u8; 8] = b"AFTSYM1\0";
 pub const FORMAT_VERSION: u32 = 3;
@@ -410,15 +410,26 @@ fn write_cache_file(
     tmp_path: &Path,
 ) -> std::io::Result<()> {
     let mut writer = BufWriter::new(crate::private_storage::create(tmp_path)?);
-    let entries = cache
-        .disk_entries()
+    // The in-memory cache holds every file this root's tools parsed,
+    // including files outside the root (an outline of another checkout, for
+    // example). This disk cache belongs to the root and stores relative paths,
+    // so it keeps only the files under it; the rest stay cached in memory.
+    let parsed = cache.disk_entries();
+    let parsed_count = parsed.len();
+    let entries = parsed
         .into_iter()
-        .map(|(path, mtime, size, content_hash, symbols)| {
-            cache_relative_path(project_root, path)
+        .filter_map(|(path, mtime, size, content_hash, symbols)| {
+            crate::search_index::storable_relative_path(project_root, path)
                 .map(|relative_path| (relative_path, mtime, size, content_hash, symbols))
         })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| std::io::Error::other("refusing to cache path outside project root"))?;
+        .collect::<Vec<_>>();
+    if entries.len() < parsed_count {
+        slog_debug!(
+            "symbol cache: not persisting {} parsed file(s) outside {}",
+            parsed_count - entries.len(),
+            project_root.display()
+        );
+    }
     let root = project_root.to_string_lossy();
     let root_len = u32::try_from(root.len())
         .map_err(|_| std::io::Error::other("project root too large to cache"))?;
@@ -722,8 +733,11 @@ mod tests {
         assert!(read_from_disk(storage.path(), "schema-project").is_none());
     }
 
+    /// The in-memory cache also holds files parsed outside the root (an
+    /// outline of another checkout). The disk cache must never store them,
+    /// and must not let them stop the files under the root being persisted.
     #[test]
-    fn symbol_cache_rejects_paths_outside_project_root_on_write() {
+    fn symbol_cache_persists_only_paths_under_project_root() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project");
@@ -732,7 +746,7 @@ mod tests {
         let metadata = fs::metadata(&outside).expect("metadata");
 
         let mut cache = SymbolCache::new();
-        cache.set_project_root(project);
+        cache.set_project_root(project.clone());
         cache.insert(
             outside.clone(),
             metadata.modified().expect("mtime"),
@@ -740,9 +754,17 @@ mod tests {
             blake3::hash(&fs::read(&outside).expect("read outside")),
             vec![test_symbol("outside")],
         );
+        insert_file(&mut cache, &project, "inside.rs", test_symbol("inside"));
 
-        let error = write_to_disk(&cache, dir.path(), "escape-project").expect_err("reject escape");
-        assert!(error.to_string().contains("outside project root"));
+        write_to_disk(&cache, dir.path(), "escape-project")
+            .expect("a cache holding an outside file still persists");
+        let loaded = read_from_disk(dir.path(), "escape-project").expect("load symbol cache");
+        let paths = loaded
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![PathBuf::from("inside.rs")]);
     }
 
     /// A symbol whose serialized payload is just over the per-entry limit.

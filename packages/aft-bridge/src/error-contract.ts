@@ -17,6 +17,7 @@ import {
   BridgeTransportUnavailableError,
   BridgeTransportUnknownOutcomeError,
   isBridgeTransportTimeout,
+  type ShellTimeoutOutcome,
 } from "./bridge.js";
 import {
   isLocalRouteCloseRejection,
@@ -72,6 +73,37 @@ export function toolErrorFromResponse(
 /** Agent-facing guidance for a bash request whose transport outcome is unknown. */
 export const BASH_TRANSPORT_DISPOSITION =
   "The transport to the AFT daemon was interrupted; no background task was created for this command and no task ID exists. Re-run the command. Do not poll bash_status for it.";
+
+/**
+ * Agent-facing guidance for a shell call that timed out at the standalone
+ * bridge when the bridge could not learn whether AFT started the command: no
+ * reply came even after the grace period. It must not claim that no task
+ * exists, because AFT may still be starting or running the command.
+ */
+export const SHELL_TIMEOUT_UNKNOWN_DISPOSITION =
+  "AFT did not answer before the deadline, so whether this command started is unknown. The command may not have started; check bash_status before rerunning.";
+
+/** Guidance for a timed-out shell call whose late reply named its task. */
+export function shellTimeoutTaskDisposition(taskId: string): string {
+  return `AFT started this command as task ${taskId}, but its reply arrived after the deadline. Use bash_status or bash_watch with task ID ${taskId} to follow it; do not re-run the command.`;
+}
+
+/** Guidance for a timed-out shell call whose late reply was an error without a task. */
+export function shellTimeoutNotStartedDisposition(code?: string, message?: string): string {
+  const answer = [code, message].filter((part) => part !== undefined && part !== "").join(": ");
+  return `AFT answered after the deadline that it did not start this command${answer ? ` (${answer})` : ""}; no task ID was assigned.`;
+}
+
+function shellTimeoutDisposition(outcome: ShellTimeoutOutcome | undefined): string {
+  switch (outcome?.kind) {
+    case "task_started":
+      return shellTimeoutTaskDisposition(outcome.taskId);
+    case "not_started":
+      return shellTimeoutNotStartedDisposition(outcome.code, outcome.message);
+    default:
+      return SHELL_TIMEOUT_UNKNOWN_DISPOSITION;
+  }
+}
 
 /**
  * Agent-facing guidance for a call the daemon GOODBYE'd mid-flight.
@@ -273,15 +305,13 @@ export function isBashTransportDeadError(error: unknown): error is Error {
   return classifyBashHostFallbackError(error) !== undefined;
 }
 
-function isTransportClassError(error: unknown): boolean {
-  return isBridgeTransportTimeout(error) || isBashTransportDeadError(error);
-}
-
 /**
  * Append agent-facing recovery guidance without changing the original error
  * object, class, code, or retry behavior. Unknown-outcome errors append safety
- * guidance on every command; proven bash transport failures append re-run
- * guidance. Commands matching neither retain their errors untouched.
+ * guidance on every command; a shell call that timed out at the bridge gets
+ * guidance built from what AFT answered after the deadline; proven bash
+ * transport failures append re-run guidance. Commands matching none of these
+ * retain their errors untouched.
  */
 export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;
@@ -327,7 +357,18 @@ export function adaptToolError(command: string, error: unknown): unknown {
     return error;
   }
 
-  if (command !== "bash" || !isTransportClassError(error)) return error;
+  // A timed-out request was sent, so AFT may have started the command. The
+  // re-run text below ("no task was created") would be a guess presented as a
+  // fact; the bridge's late-reply outcome says what is actually known.
+  if ((command === "bash" || command === "powershell") && isBridgeTransportTimeout(error)) {
+    const outcome = (error as { shellOutcome?: ShellTimeoutOutcome }).shellOutcome;
+    const disposition = shellTimeoutDisposition(outcome);
+    if (error.message.includes(disposition)) return error;
+    error.message = error.message ? `${error.message} ${disposition}` : disposition;
+    return error;
+  }
+
+  if (command !== "bash" || !isBashTransportDeadError(error)) return error;
   if (error.message.includes(BASH_TRANSPORT_DISPOSITION)) return error;
   error.message = error.message
     ? `${error.message} ${BASH_TRANSPORT_DISPOSITION}`

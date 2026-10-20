@@ -607,12 +607,8 @@ pub fn run_tool_call(
                     .as_deref()
                     .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
             );
-            let watcher_pending =
-                crate::response_finalize::watcher_query_pending(app_ctx, &prepared.request.command);
-            let callgraph_pending = crate::response_finalize::callgraph_query_pending(
-                app_ctx,
-                &prepared.request.command,
-            );
+            let (watcher_pending, callgraph_pending) =
+                crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
             let mut response = if prepared.request.command == "inspect" {
                 crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
             } else {

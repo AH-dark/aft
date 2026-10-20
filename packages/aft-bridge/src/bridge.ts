@@ -249,14 +249,64 @@ class BridgeReplacedDuringVersionCheck extends Error {
  */
 export class BridgeTransportTimeoutError extends Error {
   readonly code = "transport_timeout" as const;
+  /**
+   * For a `bash`/`powershell` call, what the bridge learned about the command
+   * while it waited a short grace period after the deadline. Undefined for
+   * other commands.
+   */
+  readonly shellOutcome: ShellTimeoutOutcome | undefined;
   constructor(
     public readonly command: string,
     public readonly timeoutMs: number,
     message: string,
+    shellOutcome?: ShellTimeoutOutcome,
   ) {
     super(message);
     this.name = "BridgeTransportTimeoutError";
+    this.shellOutcome = shellOutcome;
   }
+}
+
+/**
+ * What is known about a shell command whose call timed out at the bridge.
+ *
+ * - `task_started`: AFT answered after the deadline with this task id, so the
+ *   command exists as a task the agent can poll.
+ * - `not_started`: AFT answered after the deadline with an error and no task
+ *   id, so it reported that it did not start the command.
+ * - `unknown`: no usable answer arrived in the grace period, so the bridge
+ *   cannot tell whether the command started.
+ */
+export type ShellTimeoutOutcome =
+  | { kind: "task_started"; taskId: string }
+  | { kind: "not_started"; code?: string; message?: string }
+  | { kind: "unknown" };
+
+/** Commands that start a shell task in AFT and answer with its task id. */
+const SHELL_TASK_COMMANDS: ReadonlySet<string> = new Set(["bash", "powershell"]);
+
+/**
+ * How long a timed-out shell call keeps listening for AFT's late reply. AFT
+ * can start the command and answer just after the bridge's deadline (for
+ * example while it is busy with other work); that reply carries the task id,
+ * which is the only way the agent can find the running command. Kept short
+ * because the agent waits this much longer for its error.
+ */
+const DEFAULT_LATE_SHELL_REPLY_GRACE_MS = 10_000;
+
+function shellOutcomeFromLateReply(response: Record<string, unknown>): ShellTimeoutOutcome {
+  const taskId = bashTaskIdFrom(response);
+  if (taskId) return { kind: "task_started", taskId };
+  if (response.success === false) {
+    return {
+      kind: "not_started",
+      ...(typeof response.code === "string" ? { code: response.code } : {}),
+      ...(typeof response.message === "string" ? { message: response.message } : {}),
+    };
+  }
+  // A successful reply without a task id is not a shape AFT sends for a shell
+  // command, so it proves nothing either way.
+  return { kind: "unknown" };
 }
 
 /** A standalone bridge cannot carry a request because its process transport died. */
@@ -291,6 +341,13 @@ export interface BridgeOptions {
    * the request still keeps the bridge warm regardless of this counter.
    */
   hangThreshold?: number;
+  /**
+   * How long a `bash`/`powershell` call that timed out with
+   * `keepBridgeOnTimeout` keeps waiting for AFT's late reply, so its timeout
+   * error can name the task AFT started. 0 rejects at the deadline. Default:
+   * 10000.
+   */
+  lateShellReplyGraceMs?: number;
   /**
    * Extra environment variables to set on the spawned `aft` child process,
    * applied on top of the inherited `process.env` at spawn time. Use this to
@@ -471,6 +528,7 @@ export class BinaryBridge implements AftProjectTransport {
   private _shuttingDown = false;
   private timeoutMs: number;
   private hangThreshold: number;
+  private lateShellReplyGraceMs: number;
   private maxRestarts: number;
   private configured = false;
   private _configurePromise: Promise<void> | null = null;
@@ -526,6 +584,8 @@ export class BinaryBridge implements AftProjectTransport {
     this.cwd = cwd;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
     this.hangThreshold = options?.hangThreshold ?? BRIDGE_HANG_TIMEOUT_THRESHOLD;
+    this.lateShellReplyGraceMs =
+      options?.lateShellReplyGraceMs ?? DEFAULT_LATE_SHELL_REPLY_GRACE_MS;
     this.maxRestarts = options?.maxRestarts ?? 3;
     this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
     // P1 config relocation: semantic config now arrives as raw `config` tiers and
@@ -1093,6 +1153,12 @@ export class BinaryBridge implements AftProjectTransport {
         const timer = setTimeout(() => {
           const entry = this.pending.get(id);
           if (!entry) return;
+          if (
+            keepBridgeOnTimeout &&
+            this.holdForLateShellReply(id, entry, effectiveTimeoutMs, requestSessionId)
+          ) {
+            return;
+          }
           this.pending.delete(id);
           clearTimeout(entry.timer);
           entry.onSettled?.();
@@ -1817,6 +1883,16 @@ export class BinaryBridge implements AftProjectTransport {
         this.scheduleRestartCountReset();
         this.accountForBashTaskResponse(entry.command, response);
         entry.resolve(response);
+      } else if (id && typeof response.type !== "string") {
+        // A reply for a request that already settled (its deadline and any
+        // grace period passed). One that names a task is a warning: the task
+        // may still be running, and this log line is the only record of its id.
+        const taskId = bashTaskIdFrom(response);
+        if (taskId) {
+          this.warnVia(`Dropped late reply for settled request id=${id} task_id=${taskId}`);
+        } else {
+          this.logVia(`Dropped late reply for settled request id=${id}`);
+        }
       } else if (typeof response.type === "string") {
         this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
       }
@@ -1828,6 +1904,58 @@ export class BinaryBridge implements AftProjectTransport {
           : line;
       this.warnVia(`Failed to parse stdout line: ${quoted}`);
     }
+  }
+
+  /**
+   * Keep a timed-out shell call listening for AFT's reply for a short grace
+   * period instead of rejecting it at once. AFT may already have started the
+   * command; its late reply carries the task id, and dropping it would leave the
+   * agent with a running task it cannot find, which it may then start twice.
+   *
+   * The entry stays in `pending`, so the ordinary reply path still records the
+   * task (see accountForBashTaskResponse) and clears the grace timer. The call
+   * then rejects with a timeout error whose `shellOutcome` says what AFT
+   * answered, or that nothing arrived. Returns false when the call is not a
+   * shell command or the grace period is disabled; the caller then rejects as
+   * before.
+   */
+  private holdForLateShellReply(
+    id: string,
+    entry: PendingRequest,
+    effectiveTimeoutMs: number,
+    requestSessionId: string | undefined,
+  ): boolean {
+    const graceMs = this.lateShellReplyGraceMs;
+    if (!SHELL_TASK_COMMANDS.has(entry.command) || graceMs <= 0) return false;
+
+    const timeoutMsg = `Request "${entry.command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms; waiting up to ${graceMs}ms for a late reply naming its task`;
+    if (requestSessionId) {
+      this.sessionWarnVia(requestSessionId, timeoutMsg);
+    } else {
+      this.warnVia(timeoutMsg);
+    }
+
+    const message = `${this.errorPrefix} Request "${entry.command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`;
+    const rejectWith = entry.reject;
+    const settle = (outcome: ShellTimeoutOutcome): void => {
+      rejectWith(
+        new BridgeTransportTimeoutError(entry.command, effectiveTimeoutMs, message, outcome),
+      );
+    };
+    // A reply now arrives after the caller's deadline, so it settles the call
+    // as a timeout that reports what AFT answered.
+    entry.resolve = (response) => settle(shellOutcomeFromLateReply(response));
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (this.pending.get(id) !== entry) return;
+      this.pending.delete(id);
+      entry.onSettled?.();
+      this.warnVia(
+        `Request "${entry.command}" (id=${id}) got no reply within ${graceMs}ms after its deadline`,
+      );
+      settle({ kind: "unknown" });
+    }, graceMs);
+    return true;
   }
 
   private accountForBashTaskResponse(command: string, response: Record<string, unknown>): void {

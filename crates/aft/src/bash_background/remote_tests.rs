@@ -170,6 +170,20 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
 }
 
 fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
+    start_with_hard_kill(
+        registry,
+        dir,
+        connection,
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    )
+}
+
+fn start_with_hard_kill(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    connection: PathBuf,
+    hard_kill: crate::bash_background::HardKill,
+) -> String {
     ensure_git_fixture(dir);
     registry
         .spawn_remote(
@@ -180,7 +194,7 @@ fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
             "session".into(),
             dir.into(),
             HashMap::from([("BUILD_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
-            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            hard_kill,
             dir.into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -753,7 +767,7 @@ async fn exec_remote_bash_unknown_reply_names_job_and_safe_rerun() {
     let registry = registry();
     let task = start(&registry, dir.path(), daemon.connection.clone());
     let done = terminal(&registry, &task).await;
-    let expected = format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status {} first if you need its result", id(), id());
+    let expected = format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; job {} may still be running on ck-motor and holding this workspace for up to its run timeout of 30s, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end, then rerun", id(), id());
     assert_eq!(done.info.status_reason.as_deref(), Some(expected.as_str()));
     assert!(
         done.output_preview.contains(&expected),
@@ -969,10 +983,10 @@ async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
     assert_eq!(
         done.info.status_reason.as_deref(),
-        Some(format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status {} first if you need its result", id(), id()).as_str())
+        Some(format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; job {} may still be running on ck-motor and holding this workspace for up to its run timeout of 30s, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end, then rerun", id(), id()).as_str())
     );
     assert!(done.output_preview.contains(&format!(
-        "job {} could not be re-attached for 5 minutes",
+        "job {} could not be re-attached before its own time limit passed",
         id()
     )));
     assert!(!done.output_preview.contains("local-proof"));
@@ -1194,7 +1208,7 @@ async fn exec_remote_bash_attach_call_and_reconnect_failures_exhaust_budget() {
         .unwrap()
         .contains("rerunning is safe"));
     assert!(done.output_preview.contains(&format!(
-        "job {} could not be re-attached for 5 minutes; command not rerun",
+        "job {} could not be re-attached before its own time limit passed (",
         id()
     )));
     assert!(!done.output_preview.contains("local-proof"));
@@ -1231,10 +1245,219 @@ async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
         .unwrap()
         .contains("rerunning is safe"));
     assert!(done.output_preview.contains(&format!(
-        "job {} could not be re-attached for 5 minutes; command not rerun",
+        "job {} could not be re-attached before its own time limit passed (",
         id()
     )));
     assert_eq!(fs::read(&paths.stdout).unwrap(), b"");
+}
+
+/// ck-motor restarted mid-job and its provider stayed away longer than the
+/// five minutes AFT used to allow, while the job kept running on the build
+/// server. AFT must keep re-attaching (never resubmitting) and deliver the
+/// job's real result once the runner is back.
+#[tokio::test]
+async fn exec_remote_bash_route_outage_past_five_minutes_still_delivers_result() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(3).await;
+    // Past the old five-minute cap, short of this job's own limits (a 5m queue
+    // wait limit plus a 30s run timeout, plus 5m of grace).
+    clock.advance(Duration::from_secs(6 * 60));
+    let refused = *daemon.refused_connects.borrow();
+    let still_trying = wait_for("AFT must keep reconnecting during the outage", || {
+        let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+        if snapshot.info.status.is_terminal() {
+            return Some(Err(snapshot));
+        }
+        (*daemon.refused_connects.borrow() >= refused + 3).then_some(Ok(()))
+    })
+    .await;
+    if let Err(snapshot) = still_trying {
+        panic!(
+            "AFT gave up six minutes into the outage: {:?}: {}",
+            snapshot.info.status, snapshot.output_preview
+        );
+    }
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+    let attaches = daemon.methods("exec.attach");
+    assert_eq!(attaches.last().unwrap()["params"]["from_seq"], 2);
+    drop(clock);
+}
+
+/// The common agent call: `runon` with no `timeout`. It gets the 30-minute
+/// background default as its run timeout, which AFT records and sends to the
+/// runner, so a restart outage far past five minutes must still end with the
+/// job's result.
+#[tokio::test]
+async fn exec_remote_bash_untimed_runon_survives_an_outage_past_five_minutes() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    // `bash` without `timeout` builds its hard kill exactly like this.
+    let task_id = start_with_hard_kill(
+        &registry,
+        dir.path(),
+        daemon.connection.clone(),
+        crate::bash_background::HardKill::from_timeout_ms(None),
+    );
+    let task = registry.task(&task_id).unwrap();
+    // Recorded no lower than the 30-minute default that was sent: inserting
+    // the record can raise a default kill to one worker wait from now.
+    let recorded = task.state.lock().unwrap().metadata.timeout_ms;
+    assert!(
+        recorded.is_some_and(|ms| ms >= 30 * 60 * 1000),
+        "an untimed runon records at least the background default as its run timeout: {recorded:?}"
+    );
+    daemon.after_refused_connects(3).await;
+    assert_eq!(
+        daemon.methods("exec.run")[0]["params"]["timeout"],
+        30 * 60,
+        "the runner enforces the same limit AFT records"
+    );
+    // Far past the old five-minute cap, short of 5m queue + 30m run + 5m grace.
+    clock.advance(Duration::from_secs(25 * 60));
+    let refused = *daemon.refused_connects.borrow();
+    let still_trying = wait_for("AFT must keep reconnecting during the outage", || {
+        let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+        if snapshot.info.status.is_terminal() {
+            return Some(Err(snapshot));
+        }
+        (*daemon.refused_connects.borrow() >= refused + 3).then_some(Ok(()))
+    })
+    .await;
+    if let Err(snapshot) = still_trying {
+        panic!(
+            "AFT gave up 25 minutes into the outage of an untimed runon: {:?}: {}",
+            snapshot.info.status, snapshot.output_preview
+        );
+    }
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+    drop(clock);
+}
+
+/// The same outage outlasting the job's own limits ends the wait, and the
+/// result says why, names the job and gives advice the agent can follow.
+#[tokio::test]
+async fn exec_remote_bash_route_outage_gives_up_after_the_jobs_own_limits() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(3).await;
+    clock.advance(Duration::from_secs(12 * 60));
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(
+        done.output_preview.contains(&format!(
+            "job {} could not be re-attached before its own time limit passed (ck-motor's queue wait limit of 5m and its run timeout of 30s have passed since AFT submitted it, plus 5m of grace); command not rerun",
+            id()
+        )),
+        "{}",
+        done.output_preview
+    );
+    let reason = done.info.status_reason.unwrap();
+    assert!(
+        reason.contains(&format!("job {} may still be running on ck-motor", id())),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("wait for it to end, then rerun"),
+        "{reason}"
+    );
+    assert!(!done.output_preview.contains("exec.status"));
+    assert!(!done.output_preview.contains("local-proof"));
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+}
+
+#[test]
+fn reattach_backoff_doubles_from_a_tenth_of_a_second_up_to_thirty_seconds() {
+    let schedule: Vec<_> = (0..12).map(reattach_backoff).collect();
+    assert_eq!(
+        schedule,
+        [100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800, 25_600, 30_000, 30_000, 30_000]
+            .map(Duration::from_millis)
+    );
+    assert_eq!(reattach_backoff(u32::MAX), Duration::from_secs(30));
+}
+
+#[test]
+fn workspace_owner_holders_reads_ck_motor_queue_report() {
+    let holder: Uuid = "0192a64a-1234-7000-8000-0000000000aa".parse().unwrap();
+    let other: Uuid = "0192a64a-1234-7000-8000-0000000000bb".parse().unwrap();
+    let detail = crate::exec_remote::wire_tests::queue_owner_detail(holder);
+    assert_eq!(workspace_owner_holders(&detail), [holder, other]);
+    // Another blocker is not a workspace owner, even with running holders.
+    let other_phase = detail.replacen("waiting_on=workspace owner", "waiting_on=permits", 1);
+    assert!(workspace_owner_holders(&other_phase).is_empty());
+    assert!(workspace_owner_holders("maintenance").is_empty());
+}
+
+async fn queue_wait_refusal(holder: Uuid, earlier_job: Uuid) -> (BgTaskSnapshot, String, String) {
+    let daemon = daemon(Script::QueueWaitOwner { holder }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let (registry, earlier, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf earlier");
+    registry
+        .task(&earlier)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_mut()
+        .unwrap()
+        .job_id = Some(earlier_job);
+    let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    let task = registry.task(&task_id).unwrap();
+    // A restarted reader renders the refusal from the saved record alone.
+    let durable = read_task(&task.paths.json).unwrap();
+    let restarted = remote_refusal(&durable).unwrap().message;
+    (done, restarted, earlier)
+}
+
+#[tokio::test]
+async fn runon_queue_wait_refusal_names_this_sessions_earlier_job_in_the_workspace() {
+    let holder: Uuid = "0192a64a-1234-7000-8000-0000000000aa".parse().unwrap();
+    let (done, restarted, earlier) = queue_wait_refusal(holder, holder).await;
+    let expected = format!(
+        "runon refused: your earlier job {holder} in this workspace is still running (task {earlier}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {earlier} to end (bash_status shows it), then retry"
+    );
+    assert_eq!(done.info.status_reason.as_deref(), Some(expected.as_str()));
+    assert_eq!(restarted, expected);
+}
+
+#[tokio::test]
+async fn runon_queue_wait_refusal_behind_another_owner_keeps_the_runner_report() {
+    let holder: Uuid = "0192a64a-1234-7000-8000-0000000000aa".parse().unwrap();
+    let unrelated: Uuid = "0192a64a-1234-7000-8000-0000000000cc".parse().unwrap();
+    let (done, restarted, _) = queue_wait_refusal(holder, unrelated).await;
+    let reason = done.info.status_reason.unwrap();
+    assert!(
+        reason.starts_with(
+            "runon refused: remote refused: queue_wait_exceeded (waiting_on=workspace owner;"
+        ),
+        "{reason}"
+    );
+    assert!(!reason.contains("your earlier job"), "{reason}");
+    assert_eq!(restarted, reason);
 }
 
 #[tokio::test]
@@ -1630,6 +1853,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         output_received: false,
         retry: None,
         output_incomplete: None,
+        workspace_holder: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -2921,6 +3145,7 @@ fn persist_accepted_with_snapshot(
         output_received: false,
         retry: None,
         output_incomplete: None,
+        workspace_holder: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -4788,6 +5013,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         output_received: false,
         retry: None,
         output_incomplete: None,
+        workspace_holder: None,
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Submitting);
     remote.job_id = Some(id());
@@ -4901,6 +5127,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         output_received: false,
         retry: None,
         output_incomplete: None,
+        workspace_holder: None,
     });
     let now = 1_042_900;
     // Before acceptance the runner has not confirmed it copied the inputs.
@@ -5225,6 +5452,132 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     let requests = exec_runs(&daemon);
     assert_eq!(requests.len(), 3);
     assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    // The record keeps when the accepted resubmission was sent, so re-attach
+    // limits count from it after a restart too.
+    let saved = read_task(&registry.task(&task_id).unwrap().paths.json).unwrap();
+    let resubmitted_at = saved
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.retry.as_ref())
+        .and_then(|retry| retry.resubmitted_at_ms);
+    assert!(
+        resubmitted_at.is_some_and(|at| at >= saved.started_at),
+        "the accepted resubmission must record its time: {resubmitted_at:?}"
+    );
+}
+
+/// A draining retry the runner accepts late starts a new queue wait and run
+/// there. AFT's re-attach limit must count from that resubmission, both in
+/// the worker that sent it and after a daemon restart reads the record back.
+#[tokio::test]
+async fn reattach_limit_counts_from_a_late_draining_resubmission() {
+    const MINUTE_MS: u64 = 60_000;
+    let dir = tempfile::tempdir().unwrap();
+    let now = unix_millis();
+    let mut metadata = PersistedTask::starting(
+        "bash-0000000000000002".into(),
+        "session".into(),
+        "cargo test".into(),
+        dir.path().into(),
+        None,
+        // An untimed runon records the 30-minute background default.
+        Some(30 * MINUTE_MS),
+        true,
+        false,
+    );
+    // Submitted first nine minutes ago; the runner drained until now.
+    metadata.started_at = now - 9 * MINUTE_MS;
+    metadata.remote = Some(RemoteTask {
+        accepted_platform: None,
+        connection_file: None,
+        explicit_runon: true,
+        harness: "runner".into(),
+        session: "session".into(),
+        requested_platform: None,
+        requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: false,
+        started: None,
+        job_id: None,
+        last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
+        stdout_len: 0,
+        stderr_len: 0,
+        unknown_len: 0,
+        cancel_requested: false,
+        terminal: None,
+        fallback_digest: None,
+        env_not_forwarded: None,
+        queue_position: None,
+        output_received: false,
+        retry: Some(DrainingRetry {
+            request_digest: "digest".into(),
+            attempts: 1,
+            first_refusal_at_ms: Some(metadata.started_at),
+            next_retry_at_ms: None,
+            waited_ms: None,
+            resubmitted_at_ms: None,
+        }),
+        output_incomplete: None,
+        workspace_holder: None,
+    });
+    let minutes_left = |budget: &ReattachBudget| {
+        budget
+            .job_end
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs_f64()
+            / 60.0
+    };
+    // 5 minutes of queue wait plus 30 of run, counted from the submission.
+    let full_window = 35.0;
+
+    let mut budget = ReattachBudget::new(dir.path(), &metadata);
+    let before = minutes_left(&budget);
+    assert!(
+        (full_window - 9.5..=full_window - 9.0).contains(&before),
+        "before the resubmission the limit counts from the first submission: {before:.2} minutes left"
+    );
+
+    metadata
+        .remote
+        .as_mut()
+        .unwrap()
+        .retry
+        .as_mut()
+        .unwrap()
+        .resubmitted_at_ms = Some(now);
+    budget.resubmitted(&metadata);
+    let live = minutes_left(&budget);
+    assert!(
+        live >= full_window - 0.5,
+        "the worker that resubmitted must get the full window from the resubmission: {live:.2} minutes left"
+    );
+
+    let record = dir.path().join("task.json");
+    write_task(&record, &metadata).unwrap();
+    let reloaded = read_task(&record).unwrap();
+    let restarted = minutes_left(&ReattachBudget::new(dir.path(), &reloaded));
+    assert!(
+        restarted >= full_window - 0.5,
+        "a restarted daemon must count from the recorded resubmission: {restarted:.2} minutes left"
+    );
+
+    // A record written before the resubmission time existed still loads and
+    // counts from the task's start.
+    let mut older = serde_json::to_value(&reloaded).unwrap();
+    let removed = older["remote"]["retry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resubmitted_at_ms");
+    assert!(removed.is_some());
+    let older: PersistedTask = serde_json::from_value(older).unwrap();
+    let fallback = minutes_left(&ReattachBudget::new(dir.path(), &older));
+    assert!(
+        (full_window - 9.5..=full_window - 9.0).contains(&fallback),
+        "an older record counts from the task's start: {fallback:.2} minutes left"
+    );
 }
 
 fn draining_budgets() -> &'static Mutex<HashMap<PathBuf, u64>> {

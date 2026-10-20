@@ -1,7 +1,9 @@
 use rayon::prelude::*;
 #[cfg(debug_assertions)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(any(debug_assertions, test))]
