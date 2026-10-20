@@ -253,7 +253,7 @@ thread_local! {
 }
 
 /// Point this thread's shim checks at test homes instead of the account's.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn with_test_homes<R>(homes: Vec<PathBuf>, run: impl FnOnce() -> R) -> R {
     let previous = TEST_HOMES.with(|slot| slot.replace(Some(homes)));
     struct Restore(Option<Vec<PathBuf>>);
