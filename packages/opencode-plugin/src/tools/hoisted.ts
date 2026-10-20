@@ -96,8 +96,8 @@ let diffTableCells = 0;
 export const _diffTableCellsForTest = (): number => diffTableCells;
 
 /**
- * Build a unified diff string from before/after content using a proper
- * LCS-based diff algorithm with grouped hunks and 3 lines of context.
+ * Build a unified diff string from before/after content using a line diff
+ * with grouped hunks and 3 lines of context.
  *
  * The previous implementation compared lines by index, so any insertion
  * or deletion that shifted line numbers caused every subsequent line to
@@ -113,19 +113,10 @@ function buildUnifiedDiff(fp: string, before: string, after: string): string {
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
 
-  // LCS is O(n*m) in the lines between the common prefix and suffix; a
-  // whole-file rewrite at 5000x5000 still needs a ~50 MB table and ~250 ms.
-  // Above that we skip diff generation rather than block the plugin event
-  // loop on a single edit.
-  // Byte-size gating misses the real cost (a 100 KB minified bundle is one
-  // line; a 30 KB markdown file with 1500 lines is the expensive case).
-  const LINE_CAP = 5000;
-  if (beforeLines.length > LINE_CAP || afterLines.length > LINE_CAP) {
-    const limit = Math.max(beforeLines.length, afterLines.length);
-    return `Index: ${fp}\n(diff skipped: file has ${limit} lines, above ${LINE_CAP}-line diff cap)\n`;
-  }
-
   const ops = diffLines(beforeLines, afterLines);
+  if (ops === null) {
+    return `Index: ${fp}\n(diff skipped: changed region exceeds the diff-work budget)\n`;
+  }
 
   // No changes → empty diff (caller decides whether to render the header).
   if (ops.every((op) => op.tag === "eq")) {
@@ -151,20 +142,18 @@ type DiffOp =
   | { tag: "del"; beforeIdx: number; line: string }
   | { tag: "ins"; afterIdx: number; line: string };
 
+/** Maximum cell count for the exact LCS table, matching its previous cost ceiling. */
+const LCS_TABLE_CELL_BUDGET = 25_000_000;
+/** Bound the saved Myers frontiers so a large rewrite cannot consume unbounded memory. */
+const MYERS_TRACE_CELL_BUDGET = 1_500_000;
+const MYERS_WORK_BUDGET = 25_000_000;
+
 /**
- * LCS-based line diff. Builds a length table then walks back to produce ops.
- *
- * Lines shared at the start and end of both files are matched before the
- * table is built, so its size is (changed region)² rather than (file)²: a
- * one-line edit in a 3000-line file needs a 2×2 table instead of 3001×3001.
- * The ops are exactly those of the full-table walk. The walk starts at the
- * end and takes every equal pair first, which is the common suffix. Inside
- * the common prefix the full table is known without computing it: the LCS of
- * the first i lines of `a` and the first j lines of `b` is min(i, j) whenever
- * min(i, j) is within the prefix, and prefix length plus the trimmed table
- * otherwise. The walk reads those values, so its tie-breaks match.
+ * Line diff with common-edge trimming. Small changed regions keep the legacy
+ * LCS walk, including its tie-breaks; wide but sparse regions use Myers so
+ * distant edits in a large file do not require a file-sized LCS table.
  */
-function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
+function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] | null {
   const n = a.length;
   const m = b.length;
 
@@ -175,14 +164,33 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
   const maxSuffix = maxPrefix - prefix;
   while (suffix < maxSuffix && a[n - 1 - suffix] === b[m - 1 - suffix]) suffix++;
 
-  // inner[i][j] = LCS length of a[prefix..prefix+i] and b[prefix..prefix+j]
-  // within the trimmed middle. Values never exceed min(innerN, innerM), so a
-  // 16-bit table suffices below 65535 lines and halves the memory.
   const innerN = n - prefix - suffix;
   const innerM = m - prefix - suffix;
   const w = innerM + 1;
   const cells = (innerN + 1) * w;
+
+  if (cells > LCS_TABLE_CELL_BUDGET) {
+    const middle = myersDiff(a.slice(prefix, n - suffix), b.slice(prefix, m - suffix), prefix);
+    if (middle === null) return null;
+
+    const ops: DiffOp[] = [];
+    for (let i = 0; i < prefix; i++) {
+      ops.push({ tag: "eq", beforeIdx: i, afterIdx: i, line: a[i] });
+    }
+    ops.push(...middle);
+    for (let i = 0; i < suffix; i++) {
+      ops.push({
+        tag: "eq",
+        beforeIdx: n - suffix + i,
+        afterIdx: m - suffix + i,
+        line: a[n - suffix + i],
+      });
+    }
+    return ops;
+  }
+
   diffTableCells += cells;
+  // Values never exceed min(innerN, innerM), so 16 bits suffice below 65535.
   const inner = Math.min(innerN, innerM) < 0xffff ? new Uint16Array(cells) : new Uint32Array(cells);
   for (let i = 1; i <= innerN; i++) {
     const ai = a[prefix + i - 1];
@@ -196,11 +204,9 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
       }
     }
   }
-  // LCS length of a[0..i] and b[0..j] in the full (untrimmed) table.
   const lcs = (i: number, j: number): number =>
     i <= prefix || j <= prefix ? Math.min(i, j) : prefix + inner[(i - prefix) * w + (j - prefix)];
 
-  // Walk back to produce ops in reverse, then reverse at the end.
   const ops: DiffOp[] = [];
   let i = n;
   let j = m;
@@ -227,6 +233,107 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
   }
   ops.reverse();
   return ops;
+}
+
+/** Myers shortest-edit-path fallback for regions too wide for the LCS table. */
+function myersDiff(a: readonly string[], b: readonly string[], baseIndex: number): DiffOp[] | null {
+  const n = a.length;
+  const m = b.length;
+  const max = n + m;
+  const maxDepth = Math.min(max, Math.floor((Math.sqrt(1 + 8 * MYERS_TRACE_CELL_BUDGET) - 1) / 2));
+  const offset = maxDepth + 1;
+  const frontier = new Int32Array(2 * maxDepth + 3);
+  frontier[offset + 1] = 0;
+  const trace: number[][] = [];
+  let traceCells = 0;
+  let work = 0;
+
+  for (let d = 0; d <= maxDepth; d++) {
+    let reachedEnd = false;
+    for (let k = -d; k <= d; k += 2) {
+      if (++work > MYERS_WORK_BUDGET) return null;
+      let x: number;
+      if (k === -d || (k !== d && frontier[offset + k - 1] < frontier[offset + k + 1])) {
+        x = frontier[offset + k + 1];
+      } else {
+        x = frontier[offset + k - 1] + 1;
+      }
+      let y = x - k;
+      while (x < n && y < m && a[x] === b[y]) {
+        if (++work > MYERS_WORK_BUDGET) return null;
+        x++;
+        y++;
+      }
+      frontier[offset + k] = x;
+      if (x >= n && y >= m) {
+        reachedEnd = true;
+        break;
+      }
+    }
+
+    if (reachedEnd) {
+      const reversed: DiffOp[] = [];
+      let x = n;
+      let y = m;
+      for (let depth = d; depth > 0; depth--) {
+        const previous = trace[depth - 1];
+        const k = x - y;
+        const insert =
+          k === -depth ||
+          (k !== depth && previous[(k - 1 + depth - 1) / 2] < previous[(k + 1 + depth - 1) / 2]);
+        const previousK = insert ? k + 1 : k - 1;
+        const previousX = previous[(previousK + depth - 1) / 2];
+        const previousY = previousX - previousK;
+
+        while (x > previousX && y > previousY) {
+          reversed.push({
+            tag: "eq",
+            beforeIdx: baseIndex + x - 1,
+            afterIdx: baseIndex + y - 1,
+            line: a[x - 1],
+          });
+          x--;
+          y--;
+        }
+        if (x === previousX) {
+          reversed.push({ tag: "ins", afterIdx: baseIndex + y - 1, line: b[y - 1] });
+          y--;
+        } else {
+          reversed.push({ tag: "del", beforeIdx: baseIndex + x - 1, line: a[x - 1] });
+          x--;
+        }
+      }
+      while (x > 0 && y > 0 && a[x - 1] === b[y - 1]) {
+        reversed.push({
+          tag: "eq",
+          beforeIdx: baseIndex + x - 1,
+          afterIdx: baseIndex + y - 1,
+          line: a[x - 1],
+        });
+        x--;
+        y--;
+      }
+      while (x > 0) {
+        reversed.push({ tag: "del", beforeIdx: baseIndex + x - 1, line: a[x - 1] });
+        x--;
+      }
+      while (y > 0) {
+        reversed.push({ tag: "ins", afterIdx: baseIndex + y - 1, line: b[y - 1] });
+        y--;
+      }
+      reversed.reverse();
+      return reversed;
+    }
+
+    const snapshotSize = d + 1;
+    if (traceCells + snapshotSize > MYERS_TRACE_CELL_BUDGET) return null;
+    const snapshot = new Array<number>(snapshotSize);
+    let index = 0;
+    for (let k = -d; k <= d; k += 2) snapshot[index++] = frontier[offset + k];
+    trace.push(snapshot);
+    traceCells += snapshotSize;
+  }
+  return null;
 }
 
 interface Hunk {

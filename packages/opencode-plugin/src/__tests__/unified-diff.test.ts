@@ -140,13 +140,48 @@ describe("buildUnifiedDiff", () => {
     expect(deletions).toBe(3);
   });
 
-  test("files with too many lines skip diff computation", () => {
-    // The cost guard is line count, not bytes — LCS is O(n*m) in lines.
-    // A short string with 5001 newlines exceeds the 5000-line cap.
-    const tooManyLines = Array.from({ length: 5001 }, () => "x").join("\n");
-    const diff = buildUnifiedDiff("file.ts", tooManyLines, "small");
-    expect(diff).toContain("(diff skipped");
-    expect(diff).toMatch(/file has \d+ lines/);
+  test("four-line edit in a 7000-line file renders its hunk", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    for (let i = 100; i < 104; i++) afterLines[i] = `edited line ${i + 1}`;
+
+    const diff = buildUnifiedDiff("large.swift", beforeLines.join("\n"), afterLines.join("\n"));
+    const body = diffBody(diff);
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(diff.split("\n").filter((line) => line.startsWith("@@"))).toHaveLength(1);
+    expect(body.split("\n").filter((line) => line.startsWith("+")).length).toBe(4);
+    expect(body.split("\n").filter((line) => line.startsWith("-")).length).toBe(4);
+  });
+
+  test("three distant edits in a 7000-line file render three hunks", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    for (const index of [49, 3499, 6899]) afterLines[index] = `edited line ${index + 1}`;
+
+    const diff = buildUnifiedDiff("large.swift", beforeLines.join("\n"), afterLines.join("\n"));
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(diff.split("\n").filter((line) => line.startsWith("@@"))).toHaveLength(3);
+    const body = diffBody(diff);
+    expect(body.split("\n").filter((line) => line.startsWith("+")).length).toBe(3);
+    expect(body.split("\n").filter((line) => line.startsWith("-")).length).toBe(3);
+    for (const line of [50, 3500, 6900]) {
+      expect(body).toContain(`-line ${line}`);
+      expect(body).toContain(`+edited line ${line}`);
+    }
+  });
+
+  test("large whole-file rewrites skip within the diff work budget", () => {
+    const before = Array.from({ length: 7000 }, (_, i) => `before ${i + 1}`).join("\n");
+    const after = Array.from({ length: 7000 }, (_, i) => `after ${i + 1}`).join("\n");
+
+    const started = performance.now();
+    const diff = buildUnifiedDiff("large.swift", before, after);
+    const elapsed = performance.now() - started;
+
+    expect(diff).toMatch(/diff skipped: changed region exceeds .* diff-work budget/);
+    expect(elapsed).toBeLessThan(250);
   });
 
   test("large-byte minified file with few lines is still diffed", () => {
