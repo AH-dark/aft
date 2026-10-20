@@ -435,6 +435,19 @@ fn aft_search_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     crate::commands::semantic_search::handle_semantic_search(&request, ctx)
 }
 
+fn head_root_search_preflight(request: RawRequest, ctx: &AppContext) -> Response {
+    // Exercise the shared path gate without scanning the host's entire root.
+    match ctx.validate_search_path(
+        &request.id,
+        "head",
+        Path::new("/"),
+        crate::context::WorkerSearchTool::AftSearch,
+    ) {
+        Ok(_) => Response::success(&request.id, json!({})),
+        Err(response) => response,
+    }
+}
+
 fn ast_search_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     crate::commands::ast_search::handle_ast_search(&request, ctx)
 }
@@ -3788,10 +3801,10 @@ async fn consent_stamped_head_search_of_filesystem_root_keeps_todays_behavior() 
             "search",
             json!({"query": "needle", "path": "/"}),
             7,
-            aft_search_dispatch,
+            head_root_search_preflight,
         )
         .await;
 
-    assert_eq!(code(&reply), "not_a_git_root", "{reply}");
+    assert_eq!(reply["structuredContent"]["success"], true, "{reply}");
     assert!(f.fake.calls("consent.request").is_empty());
 }
