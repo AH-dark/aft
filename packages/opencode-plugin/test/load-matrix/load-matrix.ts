@@ -32,7 +32,7 @@ import {
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = join(pluginRoot, "../..");
 const packageName = "@cortexkit/aft-opencode";
-const v2Version = "2.0.29";
+const v2Version = "2.1.0";
 const v2CoreVersion = v2Version;
 const allowLiveOperatorWrites = process.env.AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR === "1";
 const suiteTempParent = join(pluginRoot, "tmp");

@@ -1,0 +1,1 @@
+- AFT is now tested against OpenCode 2.1.0 (host contracts re-captured; no plugin changes needed).

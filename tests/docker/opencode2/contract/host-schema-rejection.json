@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-2.0.29-20261017-schema",
-  "observed_run_id": "oc2-ga-2.0.29-20261017-schema",
-  "observed_sha": "7f001b797715b7bbc57cd6b69d9bc358ebb396e",
-  "supersedes_host_version": "2.0.11",
-  "host_version": "2.0.29",
+  "run_id": "oc2-ga-2.1.0-isolated-capture",
+  "observed_run_id": "oc2-ga-2.1.0-isolated-capture",
+  "observed_sha": "8aceb397b5d9836004b548ea1a5aa8f1d75cd0e8",
+  "supersedes_host_version": "2.0.29",
+  "host_version": "2.1.0",
   "host": "opencode2",
   "platform": "linux-x64",
-  "session_id": "ses_eb88be9deffeWrRyb7hHkEGaa2",
-  "transcript": "probe/host-schema-rejection-ga-2.0.29.txt",
+  "transcript": "probe/isolated-ga-2.1.0.txt",
   "guard_transcript": "probe/host-schema-contract-guard.txt",
+  "session_id": "ses_ea560bd10ffe0sieBQnpuCvCAl",
   "probe": {
     "t2_subcase": "read/T2/host_schema_rejection_probe",
     "error_origin": "host",
@@ -26,8 +26,12 @@
       "state_input": "arguments object",
       "state_error": "message string",
       "state_metadata": {
-        "providerCall": { "executed": false },
-        "providerResult": { "executed": false },
+        "providerCall": {
+          "executed": false
+        },
+        "providerResult": {
+          "executed": false
+        },
         "rawInput": "{}"
       }
     },
@@ -53,10 +57,32 @@
         "message": "Invalid arguments for tool \"read\":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again."
       },
       "content": []
-    },
-    "supersedes": {
-      "host_version": "2.0.3",
-      "json_event_error": "Invalid arguments for tool \"read\":\n- path: Invalid input: expected string, received undefined\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again."
+    }
+  },
+  "observed_tool_part": {
+    "partID": "prt_15a9f4ec6001vyXyECv1RwS4HM",
+    "sessionID": "ses_ea560bd10ffe0sieBQnpuCvCAl",
+    "messageID": "msg_15a9f4c93001sn8VD21w5y3bqo",
+    "type": "tool",
+    "id": "host-schema-rejection",
+    "tool": "read",
+    "state": {
+      "status": "error",
+      "input": {},
+      "error": "Invalid arguments for tool \"read\":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.",
+      "metadata": {
+        "providerCall": {
+          "executed": false
+        },
+        "providerResult": {
+          "executed": false
+        },
+        "rawInput": "{}"
+      },
+      "time": {
+        "start": 1792521752262,
+        "end": 1792521752315
+      }
     }
   }
 }

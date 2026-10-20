@@ -1,9 +1,9 @@
 {
   "recorded": {
     "host": "@opencode/cli",
-    "version": "2.0.29",
+    "version": "2.1.0",
     "channel": "latest",
-    "date": "2026-10-16",
+    "date": "2026-10-20",
     "theme": "the host default, resolved with no terminal palette available",
     "how": "read off context.theme inside a plugin running in the host; the light record was taken after dispatching the host command theme.switch_mode",
     "leaves": "a colour is {\"rgba\": \"#rrggbbaa\"} — an @opentui/core RGBA read back through toInts(); \"<function>\" is a token group the host exposes as a callable"
@@ -443,6 +443,9 @@
               "rgba": "#56b6c2ff"
             }
           }
+        },
+        "faint": {
+          "rgba": "#808080ff"
         }
       },
       "background": {
@@ -1271,6 +1274,9 @@
               "rgba": "#318795ff"
             }
           }
+        },
+        "faint": {
+          "rgba": "#8a8a8aff"
         }
       },
       "background": {

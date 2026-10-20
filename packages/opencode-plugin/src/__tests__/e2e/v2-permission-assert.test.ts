@@ -28,7 +28,7 @@ function liveStoreCanary() {
 }
 
 test.skipIf(!binary)(
-  "real 2.0.29 assert allows, denies, returns feedback, aborts and saves always",
+  "real 2.1.0 assert allows, denies, returns feedback, aborts and saves always",
   async () => {
     const before = liveStoreCanary();
     const commands = {
@@ -53,7 +53,7 @@ test.skipIf(!binary)(
       ),
     });
     try {
-      expect(host.version).toBe("2.0.29");
+      expect(host.version).toBe("2.1.0");
       const session = await host.newSession("Assert probes");
       async function reply(
         name: "once" | "feedback" | "reject" | "always",
