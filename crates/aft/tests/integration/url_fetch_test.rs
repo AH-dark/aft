@@ -1,4 +1,6 @@
 use super::helpers::AftProcess;
+use aft::protocol::Response;
+use aft::subc_format::{format_response_with_context, FormatContext};
 use aft::url_fetch::{
     cache_content_path_for_url, cache_meta_path_for_url, fetch_url_to_cache,
     is_private_ip_for_test, UrlFetchOptions,
@@ -453,6 +455,101 @@ fn html_url_is_converted_to_markdown_before_cache_and_zoom_heading_is_clean() {
     assert_eq!(meta["extension"], ".md");
     assert_eq!(meta["contentType"], "text/markdown; charset=utf-8");
 
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn url_outline_and_zoom_outputs_hide_cache_paths() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/markdown; charset=utf-8",
+            b"# Cache safety\n\nThe URL is the section handle.\n",
+        );
+    });
+    let url = server.url("/docs/cache-safety.md");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+
+    let outline = aft.send(
+        &json!({
+            "id": "cache-safe-outline",
+            "command": "outline",
+            "file": &url,
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(outline["success"], true, "URL outline failed: {outline:?}");
+    let outline_text = outline["text"].as_str().expect("outline text");
+
+    let zoom = aft.send(
+        &json!({
+            "id": "cache-safe-zoom",
+            "command": "zoom",
+            "file": &url,
+            "symbol": "Cache safety",
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(zoom["success"], true, "URL zoom failed: {zoom:?}");
+    let mut zoom_data = zoom.clone();
+    zoom_data.as_object_mut().unwrap().remove("id");
+    zoom_data.as_object_mut().unwrap().remove("success");
+    let zoom_response = Response::success("cache-safe-zoom", zoom_data);
+    let zoom_context = FormatContext::from_tool_call(
+        "zoom",
+        &json!({"url": &url, "symbol": "Cache safety"}),
+        project.path(),
+    );
+    let zoom_text = format_response_with_context("zoom", &zoom_response, &zoom_context);
+
+    let cache_path = cache_content_path_for_url(storage.path(), &url, ".md");
+    let cache_filename = cache_path.file_name().unwrap().to_string_lossy();
+    assert_eq!(
+        outline_text,
+        format!(
+            "{url}\nSections are read with aft_zoom using the same url plus a heading.\n\n  # Cache safety 1:3\n"
+        )
+    );
+    assert!(
+        outline_text.starts_with(&url),
+        "URL must head its outline: {outline_text}"
+    );
+    assert!(
+        outline_text
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.contains("aft_zoom")
+                && line.contains("same url")
+                && line.contains("heading")),
+        "outline must explain how to read a section: {outline_text}"
+    );
+    for (label, visible) in [("outline", outline_text), ("zoom", zoom_text.as_str())] {
+        assert!(
+            !visible.contains("url_cache"),
+            "{label} exposed a cache path: {visible}"
+        );
+        assert!(
+            !visible.contains("url-cache"),
+            "{label} exposed a cache path: {visible}"
+        );
+        assert!(
+            !visible.contains(cache_filename.as_ref()),
+            "{label} exposed a cache filename: {visible}"
+        );
+        assert!(
+            !visible.contains(&cache_path.to_string_lossy().to_string()),
+            "{label} exposed a cache path: {visible}"
+        );
+    }
+    assert!(
+        zoom_text.starts_with(&url),
+        "URL must head its zoom output: {zoom_text}"
+    );
     assert!(aft.shutdown().success());
 }
 

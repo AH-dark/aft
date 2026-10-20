@@ -1,0 +1,4 @@
+https://example.com/docs/guide.md
+Sections are read with aft_zoom using the same url plus a heading.
+
+  # Guide 1:2

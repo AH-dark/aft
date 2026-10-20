@@ -1,0 +1,14 @@
+{
+  "tool_name": "outline",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "text": "https://example.com/docs/guide.md\nSections are read with aft_zoom using the same url plus a heading.\n\n  # Guide 1:2"
+  },
+  "ctx": {
+    "agent_args": {
+      "target": "https://example.com/docs/guide.md"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}
