@@ -178,20 +178,23 @@ fn audit_repository_names_have_only_github_characters() {
 fn audit_daemon_resolves_verified_v20_checkout_not_ambient_repo() {
     let fixture = Fixture::new(20);
     let repo = fixture.repo();
+    let snapshot = ticket_repository_snapshot(&repo);
+    assert_eq!(snapshot.as_deref(), Some("cortexkit/aft"));
     let _foreign = Env::set("GH_REPO", Some(OsStr::new("cortexkit/common-auth")));
     assert_eq!(
-        verified_worker_read_repository(&repo).unwrap(),
+        verified_worker_read_repository(snapshot.as_deref()).unwrap(),
         "cortexkit/aft"
     );
     fixture.regress();
-    assert!(verified_worker_read_repository(&repo).is_err());
+    assert!(verified_worker_read_repository(snapshot.as_deref()).is_err());
 }
 
 #[test]
 fn audit_daemon_rejects_v19_manifest_before_read_binding() {
     let fixture = Fixture::new(19);
     let repo = fixture.repo();
-    let error = verified_worker_read_repository(&repo).unwrap_err();
+    let snapshot = ticket_repository_snapshot(&repo);
+    let error = verified_worker_read_repository(snapshot.as_deref()).unwrap_err();
     assert!(error.contains("manifest v20"), "{error}");
 }
 
@@ -204,34 +207,503 @@ fn audit_v19_status_matches_legacy_bytes_even_with_a_lookup_record() {
     )
     .unwrap();
     let rendered = render_self_report(&fixture.paths).unwrap();
-    let report: Value = serde_json::from_str(&rendered).unwrap();
-    let legacy_keys = [
-        "shim_version",
-        "gh_routing_schema_floor",
-        "unexpected_gh_route_advertiser",
-        "bound_holder",
-        "agent_binding",
-        "last_seam_refusal",
-        "cached_manifest",
-        "last_rung",
-        "last_probe",
-        "bypass_audit",
-        "bypass_audit_error",
-        "executing_image",
-        "executing_image_error",
-        "real_gh_resolution",
-        "real_gh_resolution_error",
-        "manifests_retained",
-        "manifests_dir",
-    ];
-    let mut legacy = Map::new();
-    for key in legacy_keys {
-        legacy.insert(key.to_string(), report[key].clone());
-    }
-    let expected = format!("{}\n", serde_json::to_string(&legacy).unwrap());
+    let captured = include_str!("../../tests/fixtures/gh_shim/v19-main-status.jsonc");
+    let (_, expected) = captured.split_once("// END HEADER\n").unwrap();
+    let normalized = super::v19_compat_tests::normalize_v19_status(&rendered).unwrap();
     assert_eq!(
-        rendered, expected,
-        "v19's closed field sequence and serialization must remain unchanged"
+        normalized, expected,
+        "v19 status must match the frozen origin/main binary capture"
     );
-    assert!(report.get("last_read_lookup").is_none());
+}
+
+fn relay(ticket: Option<&str>) -> RelayContext {
+    RelayContext {
+        connection_file: None,
+        ticket: ticket.map(str::to_string),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(1),
+    }
+}
+
+#[test]
+fn audit_worker_native_exit_is_closed_for_every_legacy_command_shape() {
+    for raw in [
+        vec!["api", "--include", "repos/cortexkit/aft/issues"],
+        vec![
+            "api",
+            "-X",
+            "GET",
+            "-X",
+            "GET",
+            "repos/cortexkit/aft/issues",
+        ],
+        vec!["api", "graphql", "-f", "query=query { viewer { login } }"],
+        vec!["auth", "status"],
+        vec!["repo", "clone", "other/repo"],
+        vec!["--help"],
+    ] {
+        let status = native_guard::dispatch_with(
+            &args(&raw),
+            &relay(Some("worker-ticket")),
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false,
+                ticket_present: true,
+            },
+            |_| Ok(Some(true)),
+            |_| panic!("worker reached operator gh: {raw:?}"),
+        );
+        assert_eq!(status, 86);
+    }
+}
+
+#[test]
+fn audit_authenticated_head_keeps_native_argv_and_exit_status() {
+    let argv = args(&["api", "graphql", "-f", "query=query { viewer { login } }"]);
+    let mut calls = Vec::new();
+    let status = native_guard::dispatch_with(
+        &argv,
+        &relay(Some("head-ticket")),
+        native_guard::ShellSignals {
+            sandboxed: true,
+            worker_marked: false,
+            ticket_present: true,
+        },
+        |_| Ok(Some(false)),
+        |forwarded| {
+            calls.push(forwarded.to_vec());
+            27
+        },
+    );
+    assert_eq!(status, 27);
+    assert_eq!(calls, vec![argv]);
+    assert!(native_guard::permission_with(
+        &relay(None),
+        native_guard::ShellSignals::default(),
+        |_| panic!("ordinary head must not need a lookup")
+    )
+    .is_ok());
+}
+
+#[test]
+fn audit_unattributed_agent_never_gets_operator_gh() {
+    for signals in [
+        native_guard::ShellSignals {
+            sandboxed: true,
+            ..Default::default()
+        },
+        native_guard::ShellSignals {
+            worker_marked: true,
+            ..Default::default()
+        },
+        native_guard::ShellSignals {
+            ticket_present: true,
+            ..Default::default()
+        },
+    ] {
+        let status = native_guard::dispatch_with(
+            &args(&["api", "repos/cortexkit/aft/issues"]),
+            &relay(None),
+            signals,
+            |_| panic!("missing ticket cannot be looked up"),
+            |_| panic!("stripped agent reached operator gh"),
+        );
+        assert_eq!(status, 86);
+    }
+    for outcome in [Err("old daemon".into()), Ok(None)] {
+        assert!(native_guard::permission_with(
+            &relay(Some("bad-ticket")),
+            native_guard::ShellSignals::default(),
+            |_| outcome
+        )
+        .is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn audit_env_i_and_unset_ticket_keep_kernel_worker_fence() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let _lock = crate::test_env::process_env_lock();
+    for clear_all in [false, true] {
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("gh");
+        fs::write(
+            &fake,
+            b"#!/bin/sh\nprintf invoked > \"$0.ran\"\nprintf '123\\n'\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.current_dir(bin.path());
+        command.args([
+            "--exact",
+            "gh_shim::security_audit_tests::stripped_worker_probe_child",
+            "--ignored",
+            "--nocapture",
+        ]);
+        if clear_all {
+            command.env_clear();
+        } else {
+            command
+                .env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+                .env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+        }
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!bin.path().join("gh.ran").exists());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore]
+fn stripped_worker_probe_child() {
+    assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).is_none());
+    assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_none());
+    let signals = native_guard::ShellSignals::from_process();
+    assert!(signals.sandboxed);
+    let error = native_guard::permission_with(&RelayContext::from_process(), signals, |_| {
+        panic!("no ticket")
+    })
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here"
+    );
+    let status = native_guard::dispatch_with(
+        &args(&["api", "repos/cortexkit/aft/issues"]),
+        &RelayContext::from_process(),
+        signals,
+        |_| panic!("no ticket"),
+        |_| panic!("env -i reached native gh"),
+    );
+    assert_eq!(status, 86);
+    let _guard = crate::test_env::gh_shim_state_guard();
+    std::env::set_var("PATH", std::env::current_dir().unwrap());
+    assert!(resolve_and_cache_numeric_id(&StatePaths::from_process(), "test-user").is_none());
+    assert!(rename_guard::resolve_preflight_gh().is_none());
+    assert_eq!(run(&args(&["api", "repos/cortexkit/aft/issues"])), 86);
+}
+
+#[test]
+fn audit_repository_snapshot_survives_origin_rewrite_after_ticket_mint() {
+    use crate::gh_shim_relay::{
+        RelayCall, RelayTransport, RouteScopes, ScopeSelector, ScopeStamp, TransportError,
+        READ_REQUEST_OPERATION,
+    };
+    use std::sync::Mutex;
+    struct Transport(Mutex<Vec<Value>>);
+    impl RelayTransport for Transport {
+        async fn plexus(
+            &self,
+            _root: &str,
+            _session: &str,
+            _scope: Option<&ScopeSelector>,
+            body: Value,
+        ) -> Result<Value, TransportError> {
+            self.0.lock().unwrap().push(body);
+            Ok(json!({"isError":false,"result":{"status":200,"body":[],"next_page":null}}))
+        }
+        fn opens_scoped_routes(&self) -> bool {
+            true
+        }
+    }
+    let fixture = Fixture::new(20);
+    let repo = fixture.repo();
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        "snapshot-worker",
+        "read-call",
+        repo.to_str().unwrap(),
+    );
+    let value = ticket.value().unwrap();
+    assert_eq!(
+        crate::gh_shim_ticket::redeem(value)
+            .unwrap()
+            .read_repository
+            .as_deref(),
+        Some("cortexkit/aft")
+    );
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/cortexkit/common-auth.git"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let mut scopes = RouteScopes::default();
+    assert_eq!(
+        crate::gh_shim_ticket::redeem(value)
+            .unwrap()
+            .read_repository
+            .as_deref(),
+        Some("cortexkit/aft")
+    );
+    scopes.push(
+        "snapshot-worker",
+        Some(
+            ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                "worker",
+                1,
+                subc_protocol::scope::ScopeKind::Worker,
+            )
+            .with_owner_authorized(true),
+        ),
+    );
+    let transport = Transport(Mutex::new(Vec::new()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (repository, allowed) in [("cortexkit/common-auth", false), ("cortexkit/aft", true)] {
+        let params = json!({"ticket":value,"request":{"action":"github.repo.get","repository":repository,"args":{"path":"issues"}}});
+        let response = runtime.block_on(crate::gh_shim_relay::relay(
+            &transport,
+            RelayCall {
+                operation: READ_REQUEST_OPERATION,
+                params: &params,
+                first_party: true,
+                route_scopes: &scopes,
+            },
+            &|_| {},
+        ));
+        assert_eq!(response.ok, allowed, "{repository}: {:?}", response.data);
+    }
+    let calls = transport.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["arguments"]["repository"], "cortexkit/aft");
+}
+
+#[test]
+fn audit_worker_speech_still_uses_governed_relay_not_native_gh() {
+    use std::sync::Arc;
+    let fixture = Fixture::new(19);
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v19-manifest.json"
+    ))
+    .unwrap();
+    let bindings: Vec<Value> = manifest
+        .bindings
+        .iter()
+        .map(|(repo, agent)| json!({"repository":repo,"agent_id":agent,"app_handle_id":"test"}))
+        .collect();
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(move |body| {
+        if body["op"] == crate::gh_shim_relay::BINDINGS_READ_OPERATION {
+            json!({"op":body["op"],"status":"ok","data":{"result":{"repo_binding_generation":1,"bindings":bindings}}})
+        } else {
+            assert_eq!(body["op"], crate::gh_shim_relay::BOT_REQUEST_OPERATION);
+            json!({"op":body["op"],"status":"ok","data":{"repo_binding_generation":1,"result":{"status":"completed","result":{"url":"https://github.com/cortexkit/aft/issues/7#issuecomment-1","id":1}}}})
+        }
+    }));
+    let file = fixture.home.path().join("connection.json");
+    daemon.write_connection_file(&file);
+    let relay = RelayContext {
+        connection_file: Some(file),
+        ticket: Some("worker-ticket".into()),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(5),
+    };
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: manifest.bindings["cortexkit/aft"].clone(),
+    };
+    let argv = args(&[
+        "issue",
+        "comment",
+        "7",
+        "--body",
+        "hello",
+        "--repo",
+        "cortexkit/aft",
+    ]);
+    let rung = RungDetermination::r3(
+        unix_seconds(),
+        19,
+        &RungRecordProvenance {
+            image_path: "test".into(),
+            version: "test".into(),
+            repo_key: "cortexkit/aft".into(),
+        },
+    )
+    .record;
+    let status = dispatch_r3_with_relay_at(
+        &argv,
+        classify(&argv, &manifest, "linux"),
+        &manifest,
+        &fixture.paths,
+        &rung,
+        &binding,
+        unix_seconds(),
+        |forwarded| {
+            native_guard::dispatch_with(
+                forwarded,
+                &relay,
+                native_guard::ShellSignals {
+                    sandboxed: true,
+                    worker_marked: true,
+                    ticket_present: true,
+                },
+                |_| Ok(Some(true)),
+                |_| panic!("worker speech reached native gh"),
+            )
+        },
+        &relay,
+        fixture.home.path(),
+    );
+    assert_eq!(status, 0);
+    assert!(daemon
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["op"] == crate::gh_shim_relay::BOT_REQUEST_OPERATION));
+}
+
+#[test]
+fn audit_worker_marker_is_injected_from_daemon_jail_state_not_inherited() {
+    let _lock = crate::test_env::process_env_lock();
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.github.shim = false;
+    config.git.co_author = "off".into();
+    let mut environment = std::collections::HashMap::new();
+    crate::sandbox_spawn::with_worker_jail(true, || {
+        crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
+    })
+    .unwrap();
+    assert_eq!(
+        environment
+            .get(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV)
+            .map(String::as_str),
+        Some("1")
+    );
+    crate::sandbox_spawn::with_worker_jail(false, || {
+        crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
+    })
+    .unwrap();
+    assert!(!environment.contains_key(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
+}
+
+#[test]
+fn audit_ticket_snapshot_uses_primary_config_not_worktree_override() {
+    let fixture = Fixture::new(20);
+    let primary = fixture.repo();
+    let hooks = fixture.home.path().join("empty-hooks");
+    fs::create_dir(&hooks).unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&primary)
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c"
+        ])
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .args(["commit", "--allow-empty", "--quiet", "-m", "fixture"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&primary)
+        .args(["config", "extensions.worktreeConfig", "true"])
+        .status()
+        .unwrap()
+        .success());
+    let linked = fixture.home.path().join("linked");
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&primary)
+        .args(["worktree", "add", "--quiet", "--detach"])
+        .arg(&linked)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&linked)
+        .args([
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "https://github.com/cortexkit/common-auth.git"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let effective = Command::new("git")
+        .arg("-C")
+        .arg(&linked)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(effective.stdout).unwrap().trim(),
+        "https://github.com/cortexkit/common-auth.git"
+    );
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        "primary-snapshot-worker",
+        "read",
+        linked.to_str().unwrap(),
+    );
+    assert_eq!(
+        crate::gh_shim_ticket::redeem(ticket.value().unwrap())
+            .unwrap()
+            .read_repository
+            .as_deref(),
+        Some("cortexkit/aft")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_head_child_adapters_do_not_inherit_worker_markers() {
+    let _lock = crate::test_env::process_env_lock();
+    let _marker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let mut child = Command::new("/bin/sh");
+    child.args(["-c", "printf '%s' \"${AFT_GH_SHIM_WORKER-unset}\""]);
+    crate::agent_child_env::apply_to_command(&mut child, &std::collections::HashMap::new());
+    assert_eq!(child.output().unwrap().stdout, b"unset");
+    let root = tempfile::tempdir().unwrap();
+    let (pty, _) = crate::sandbox_spawn::pty_command_for_plan(
+        &crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+        OsStr::new("/bin/sh"),
+        &[],
+        &root.path().join("task"),
+        root.path(),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    assert!(pty
+        .iter_full_env_as_str()
+        .all(|(key, _)| key != crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
 }

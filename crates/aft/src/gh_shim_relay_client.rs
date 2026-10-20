@@ -1058,9 +1058,38 @@ fn describe_session_agent_mismatch(
 #[path = "gh_shim_relay_client_tests.rs"]
 pub(super) mod tests;
 
-/// Resolve worker policy from the ticket's daemon-stamped route, never from a
-/// caller-supplied session id or an environment variable claiming to be a worker.
+/// Resolve session kind from the daemon's ticket record, never from a body claim.
 pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, String> {
+    session_context(relay).map(|context| {
+        context.and_then(|context| {
+            if context.worker {
+                Some(true)
+            } else if context.head {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+pub(super) struct SessionContext {
+    pub(super) worker: bool,
+    pub(super) head: bool,
+    pub(super) repository: Option<String>,
+}
+
+pub(super) fn worker_repository(relay: &RelayContext) -> Result<String, String> {
+    let context = session_context(relay)?.ok_or("no authenticated session context")?;
+    if !context.worker {
+        return Err("the session is not a worker".into());
+    }
+    context.repository.ok_or_else(|| {
+        "the ticket has no immutable repository snapshot; restart the command".into()
+    })
+}
+
+fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, String> {
     let Some(ticket) = relay.ticket.as_deref().filter(|ticket| !ticket.is_empty()) else {
         return Ok(None);
     };
@@ -1068,14 +1097,15 @@ pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, Strin
         .connection_file
         .as_ref()
         .ok_or("worker read session lookup requires the AFT daemon connection")?;
+    let budget = SETUP_TIMEOUT.min(relay.relay_budget);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
-        tokio::time::timeout(SETUP_TIMEOUT, async {
+        tokio::time::timeout(budget, async {
             let consumer = SubcConsumer::connect(connection, ConsumerOptions {
-                call_timeout: SETUP_TIMEOUT, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
+                call_timeout: budget, handshake_timeout: budget, ..ConsumerOptions::default()
             }).await.map_err(|error| format!("worker read session lookup failed: {error}"))?;
             let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
             let route = consumer.open_route(
@@ -1092,8 +1122,16 @@ pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, Strin
                 if envelope["data"]["refusal_code"] == "session_unscoped" { return Ok(None); }
                 return Err(format!("worker read session lookup refused: {}", envelope["data"]["message"].as_str().unwrap_or("no authenticated session context")));
             }
-            envelope["data"]["worker"].as_bool().map(Some).ok_or_else(|| "the daemon returned no authenticated worker context".to_string())
-        }).await.map_err(|_| "worker read session lookup timed out; the command was not run".to_string())?
+            let worker = envelope["data"]["worker"].as_bool().ok_or("the daemon returned no authenticated worker context")?;
+            let head = envelope["data"].get("head").and_then(Value::as_bool).unwrap_or(false);
+            if worker && head { return Err("the daemon returned conflicting caller roles".into()); }
+            let repository = match envelope["data"].get("repository") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(repository)) if super::canonical_repository_key(repository).as_deref() == Some(repository.as_str()) => Some(repository.clone()),
+                _ => return Err("the daemon returned an invalid repository snapshot".into()),
+            };
+            Ok(Some(SessionContext {worker, head, repository}))
+        }).await.map_err(|_| "worker read session lookup timed out; caller identity was not established".to_string())?
     })
 }
 

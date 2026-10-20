@@ -867,24 +867,13 @@ fn v20_native_modifiers_are_not_silently_ignored() {
 }
 
 #[test]
-fn v20_rest_backed_json_hydrates_repository_and_preserves_native_aliases() {
+fn v20_rest_backed_json_preserves_native_aliases() {
     let (value, _, _) = run_json(
         &["run", "list", "--json", "startedAt"],
         vec![json!({"workflow_runs":[{"id":9,"run_started_at":"2026-10-19T12:00:00Z"}]})],
     );
     assert_eq!(value, json!([{"startedAt":"2026-10-19T12:00:00Z"}]));
-    let (value, requests, _) = run_json(
-        &["search", "issues", "needle", "--json", "number,repository"],
-        vec![
-            json!({"items":[{"number":42,"repository_url":"https://api.github.com/repos/cortexkit/aft"}]}),
-            json!({"full_name":"cortexkit/aft","name":"aft","private":true}),
-        ],
-    );
-    assert_eq!(value[0]["repository"]["nameWithOwner"], "cortexkit/aft");
-    assert_eq!(value[0]["repository"]["isPrivate"], true);
-    assert!(
-        matches!(&requests[1], ReadRequest::Get { path, .. } if path == "/repos/cortexkit/aft")
-    );
+
     let (value, _, _) = run_json(
         &["release", "view", "v1", "--json", "author"],
         vec![json!({"author":{"node_id":"user-id","login":"bot","type":"Bot"}})],
@@ -1068,15 +1057,15 @@ fn audit_checkout_binding_cannot_be_retargeted_by_repo_flag() {
     assert!(manifest.bindings.contains_key("cortexkit/common-auth"));
     let old = std::env::var_os("GH_REPO");
     std::env::set_var("GH_REPO", "cortexkit/aft");
-    let denied = checkout_bound_repository(
+    let denied = ticket_bound_repository(
         &args(&["repo", "view", "--repo", "cortexkit/common-auth"]),
         &manifest,
-        dir.path(),
+        "cortexkit/aft",
     );
-    let control = checkout_bound_repository(
+    let control = ticket_bound_repository(
         &args(&["repo", "view", "--repo", "cortexkit/aft"]),
         &manifest,
-        dir.path(),
+        "cortexkit/aft",
     );
     match old {
         Some(value) => std::env::set_var("GH_REPO", value),
@@ -1110,9 +1099,9 @@ fn audit_checkout_binding_cannot_be_retargeted_by_gh_repo() {
         .success());
     let old = std::env::var_os("GH_REPO");
     std::env::set_var("GH_REPO", "cortexkit/common-auth");
-    let result = checkout_bound_repository(&args(&["repo", "view"]), &manifest(), dir.path());
+    let result = ticket_bound_repository(&args(&["repo", "view"]), &manifest(), "cortexkit/aft");
     std::env::set_var("GH_REPO", "cortexkit/aft");
-    let control = checkout_bound_repository(&args(&["repo", "view"]), &manifest(), dir.path());
+    let control = ticket_bound_repository(&args(&["repo", "view"]), &manifest(), "cortexkit/aft");
     match old {
         Some(value) => std::env::set_var("GH_REPO", value),
         None => std::env::remove_var("GH_REPO"),
@@ -1178,4 +1167,21 @@ fn audit_preparer_timestamp_guard_has_a_valid_reviewed_baseline() {
     let output = preparer_probe("timestamp");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must be later"));
+}
+
+#[test]
+fn audit_search_repository_json_is_refused_before_any_result_relabeling() {
+    for verb in ["code", "issues"] {
+        let error = plan(
+            &args(&["search", verb, "needle", "--json", "repository"]),
+            "cortexkit/aft",
+        )
+        .unwrap_err();
+        assert!(error.contains("repository"), "{error}");
+        assert!(plan(
+            &args(&["search", verb, "needle", "--json", "url"]),
+            "cortexkit/aft"
+        )
+        .is_ok());
+    }
 }

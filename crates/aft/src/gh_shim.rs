@@ -32,6 +32,7 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
 mod worker_reads;
@@ -39,6 +40,10 @@ mod worker_reads;
 #[cfg(test)]
 #[path = "gh_shim/security_audit_tests.rs"]
 mod security_audit_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/v19_compat_tests.rs"]
+mod v19_compat_tests;
 
 pub const SCHEMA_FLOOR: u64 = 1;
 /// Envelope version that carries the manifest as exact signed bytes. Envelope
@@ -452,6 +457,7 @@ const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 /// callers must parse these identifiers rather than human prose.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalCode {
+    WorkerNativeGh,
     Unclassified,
     AdminTier,
     ManifestBelowFloor,
@@ -474,7 +480,8 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
+        Self::WorkerNativeGh,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -498,6 +505,7 @@ impl RefusalCode {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::WorkerNativeGh => "gh_shim_worker_native_gh",
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
@@ -3123,7 +3131,9 @@ fn checkout_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
     resolved_agent_binding(manifest, &TargetRepository::default(), cwd)
 }
 
-pub(crate) fn verified_worker_read_repository(project_root: &Path) -> Result<String, String> {
+pub(crate) fn verified_worker_read_repository(
+    repository_at_mint: Option<&str>,
+) -> Result<String, String> {
     let paths = StatePaths::from_process();
     let ManifestResolution::Active(manifest) = resolve_manifest(&paths, unix_seconds()) else {
         return Err("worker read relay requires a verified active manifest".into());
@@ -3131,31 +3141,53 @@ pub(crate) fn verified_worker_read_repository(project_root: &Path) -> Result<Str
     if manifest.manifest_version < 20 {
         return Err("worker read relay requires manifest v20".into());
     }
-    worker_read_checkout_binding(&manifest, project_root)
-        .map(|binding| binding.repo)
-        .ok_or_else(|| "the ticket's checkout has no bot binding".into())
+    let repository =
+        repository_at_mint.ok_or("the ticket has no repository snapshot; restart the command")?;
+    if !manifest.bindings.contains_key(repository) {
+        return Err("the ticket's repository snapshot has no signed bot binding".into());
+    }
+    Ok(repository.to_string())
 }
 
-fn worker_read_checkout_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBinding> {
-    let git = which::which("git").ok()?;
-    let mut command = Command::new(git);
-    command.env_clear().env("GIT_CONFIG_NOSYSTEM", "1");
-    #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", root);
+pub(crate) fn ticket_repository_snapshot(project_root: &Path) -> Option<String> {
+    if !project_root.is_dir() {
+        return None;
     }
-    let output = command
+    let git = which::which("git").ok()?;
+    let command = || {
+        let mut command = Command::new(&git);
+        command.env_clear().env("GIT_CONFIG_NOSYSTEM", "1");
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+        command
+    };
+    let output = command()
         .arg("-C")
-        .arg(project_root_for(cwd))
-        .args(["config", "--local", "--get", "remote.origin.url"])
+        .arg(project_root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let repo = canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())?;
-    let agent_id = manifest.bindings.get(&repo)?.clone();
-    Some(AgentBinding { repo, agent_id })
+    let common = PathBuf::from(std::str::from_utf8(&output.stdout).ok()?.trim());
+    if !common.is_absolute() {
+        return None;
+    }
+    // Read the primary repository's config, not a worktree-specific override.
+    // The resulting name is saved in the daemon's ticket registry before exec.
+    let output = command()
+        .args(["config", "--no-includes", "--file"])
+        .arg(common.join("config"))
+        .args(["--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())
 }
 
 /// The target's binding, else the checkout's.
@@ -3222,6 +3254,7 @@ fn cached_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
 }
 
 fn resolve_and_cache_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
+    native_guard::permission_from_process().ok()?;
     let image = executing_image();
     let real_gh = resolve_real_gh(&image)?;
     let encoded_login = url::form_urlencoded::byte_serialize(login.as_bytes()).collect::<String>();
@@ -7373,6 +7406,15 @@ fn executing_image_path_positions(image: &Path) -> Vec<usize> {
 }
 
 fn delegate(args: &[OsString]) -> i32 {
+    native_guard::dispatch(
+        args,
+        &RelayContext::from_process(),
+        native_guard::ShellSignals::from_process(),
+        |args| delegate_allowed(args),
+    )
+}
+
+fn delegate_allowed(args: &[OsString]) -> i32 {
     let image = executing_image();
     let Some(real_gh) = resolve_real_gh(&image) else {
         return refuse(
@@ -10473,7 +10515,11 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 19);
+        assert_eq!(RefusalCode::ALL.len(), 20);
+        assert_eq!(
+            RefusalCode::WorkerNativeGh.as_str(),
+            "gh_shim_worker_native_gh"
+        );
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));

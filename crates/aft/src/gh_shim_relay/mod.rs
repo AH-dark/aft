@@ -176,10 +176,10 @@ impl RouteScopes {
 /// The outbound call the relay makes. Production uses the daemon's own
 /// `reserved:aft` subc connection; tests use fakes that record the bodies.
 pub trait RelayTransport: Send + Sync {
-    /// Resolve only the daemon-recorded ticket checkout against its verified
-    /// local manifest, never a repository or working directory from the request.
-    fn read_repository(&self, project_root: &str) -> Result<String, String> {
-        crate::gh_shim::verified_worker_read_repository(std::path::Path::new(project_root))
+    /// Validate the immutable ticket-time repository against the signed local
+    /// manifest. Neither request data nor later Git config can select a target.
+    fn read_repository(&self, ticket: &crate::gh_shim_ticket::Redeemed) -> Result<String, String> {
+        crate::gh_shim::verified_worker_read_repository(ticket.read_repository.as_deref())
     }
     /// Send `body` to plexus's tool provider and return the parsed JSON reply.
     /// With `scope`, the route to plexus must be opened under that scope, so
@@ -326,8 +326,10 @@ pub async fn relay<T: RelayTransport>(
             }
             SESSION_CONTEXT_OPERATION => {
                 match call.route_scopes.for_session(&redeemed.session_id) {
-                    Some(stamp) => RelayReply::relayed(json!({"worker": worker_scope(stamp)})),
-                    None => RelayReply::refused(
+                    Some(stamp) if worker_scope(stamp) || head_scope(stamp) => RelayReply::relayed(
+                        json!({"worker": worker_scope(stamp), "head": head_scope(stamp), "repository": redeemed.read_repository}),
+                    ),
+                    _ => RelayReply::refused(
                         "session_unscoped",
                         "scope",
                         "the ticket has no unambiguous daemon-stamped session",
@@ -372,6 +374,14 @@ fn worker_scope(stamp: &ScopeStamp) -> bool {
             || (stamp.kind == ScopeKind::Ephemeral && stamp.parent.is_some()))
 }
 
+fn head_scope(stamp: &ScopeStamp) -> bool {
+    use subc_protocol::scope::ScopeKind;
+    stamp.owner_authorized
+        && matches!(&stamp.owner, subc_protocol::Principal::Reserved {module_id} if module_id == "prefrontal-core")
+        && stamp.parent.is_none()
+        && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
+}
+
 async fn read_request<T: RelayTransport>(
     transport: &T,
     redeemed: &crate::gh_shim_ticket::Redeemed,
@@ -405,7 +415,7 @@ async fn read_request<T: RelayTransport>(
             "-",
         );
     };
-    let bound = match transport.read_repository(&redeemed.project_root) {
+    let bound = match transport.read_repository(redeemed) {
         Ok(bound) => bound,
         Err(message) => {
             return (

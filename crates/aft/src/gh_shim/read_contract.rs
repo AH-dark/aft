@@ -156,21 +156,17 @@ pub(crate) fn validate_search(q: &str) -> Result<(), String> {
     if q.contains(['(', ')']) || boolean.is_match(q) {
         return Err("worker search does not allow boolean operators or parentheses; Plexus appends a repository constraint".into());
     }
+    if q.contains('\\') {
+        return Err("worker search does not allow backslashes: GitHub search syntaxes have different escape rules".into());
+    }
     let mut quoted = false;
-    let mut escaped = false;
     for character in q.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            '"' => quoted = !quoted,
-            _ => {}
+        if character == '"' {
+            quoted = !quoted;
         }
     }
-    if quoted || escaped {
-        return Err("worker search requires balanced double quotes and no dangling escape before the appended repository constraint".into());
+    if quoted {
+        return Err("worker search requires balanced double quotes before the appended repository constraint".into());
     }
     Ok(())
 }

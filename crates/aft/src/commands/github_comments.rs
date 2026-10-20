@@ -447,6 +447,10 @@ pub(crate) fn run_governed_gh(
     body: &str,
 ) -> Result<std::process::Output, String> {
     let config = ctx.config();
+    let worker = req.worker_session() || crate::sandbox_spawn::worker_jail_active();
+    if worker && !config.github.shim {
+        return Err(format!("{}: worker bot speech requires the governed gh shim; operator gh is not available here", crate::gh_shim::RefusalCode::WorkerNativeGh.as_str()));
+    }
     let mut environment = unicode_environment(std::env::vars_os());
     // This `gh` run speaks for the requesting session. Its ticket is revoked
     // when this function returns, whether or not the shim used it.
@@ -462,6 +466,12 @@ pub(crate) fn run_governed_gh(
         ticket.value(),
     )
     .map_err(|error| format!("could not prepare the governed gh shim: {error}"))?;
+    if worker {
+        environment.insert(
+            crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.to_string(),
+            "1".to_string(),
+        );
+    }
 
     let mut command = Command::new("gh");
     command
@@ -613,6 +623,72 @@ mod tests {
     use crate::context::default_language_provider_factory;
     use crate::harness::Harness;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_comment_cannot_use_operator_gh_when_the_shim_is_disabled() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _lock = crate::test_env::process_env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let restore = Restore(
+            ["PATH", "AFT_STORAGE_DIR"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("PATH", root.path());
+        std::env::set_var("AFT_STORAGE_DIR", root.path().join("storage"));
+        let gh = root.path().join("gh");
+        std::fs::write(&gh,b"#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf invoked > \"$0.ran\"\nprintf 'https://github.com/cortexkit/aft/issues/7#issuecomment-1\\n'\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = Config::default();
+        config.github.shim = false;
+        config.git.co_author = "off".into();
+        let ctx = AppContext::new(default_language_provider_factory(), config);
+        let mut request = RawRequest {
+            id: "comment".into(),
+            command: "write".into(),
+            lsp_hints: None,
+            session_id: Some("comment-session".into()),
+            params: json!({}),
+        };
+        assert!(run_governed_gh(
+            &ctx,
+            &request,
+            root.path(),
+            &["issue".into(), "comment".into(), "7".into()],
+            "hello"
+        )
+        .unwrap()
+        .status
+        .success());
+        assert!(root.path().join("gh.ran").exists());
+        std::fs::remove_file(root.path().join("gh.ran")).unwrap();
+        request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+        let error = run_governed_gh(
+            &ctx,
+            &request,
+            root.path(),
+            &["issue".into(), "comment".into(), "7".into()],
+            "hello",
+        )
+        .unwrap_err();
+        assert!(error.contains("gh_shim_worker_native_gh"), "{error}");
+        assert!(!root.path().join("gh.ran").exists());
+        drop(ctx);
+        drop(restore);
+    }
 
     #[cfg(unix)]
     #[test]

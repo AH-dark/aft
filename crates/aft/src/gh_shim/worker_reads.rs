@@ -234,7 +234,7 @@ pub(super) fn last_lookup(paths: &StatePaths) -> Option<LookupRecord> {
 pub(super) fn dispatch(
     args: &[OsString],
     manifest: &Manifest,
-    cwd: &Path,
+    _cwd: &Path,
     paths: &StatePaths,
     identity: &mut impl FnMut(
         &[OsString],
@@ -249,7 +249,11 @@ pub(super) fn dispatch(
         Err(_) => return None,
         Ok(Some(true)) => {}
     }
-    let binding = match checkout_bound_repository(args, manifest, cwd) {
+    let repository = match relay_client::worker_repository(&relay) {
+        Ok(repository) => repository,
+        Err(text) => return Some(refuse(RefusalCode::UnboundTarget, &text)),
+    };
+    let binding = match ticket_bound_repository(args, manifest, &repository) {
         Ok(binding) => binding,
         Err(text) => return Some(refuse(RefusalCode::UnboundTarget, &text)),
     };
@@ -277,17 +281,24 @@ pub(super) fn dispatch(
     })
 }
 
-fn checkout_bound_repository(
+fn ticket_bound_repository(
     args: &[OsString],
     manifest: &Manifest,
-    cwd: &Path,
+    repository: &str,
 ) -> Result<AgentBinding, String> {
-    let binding = worker_read_checkout_binding(manifest, cwd)
-        .ok_or("worker reads require this session's checkout to be bound to a bot")?;
+    let agent_id = manifest
+        .bindings
+        .get(repository)
+        .ok_or("the ticket's immutable repository snapshot has no signed bot binding")?
+        .clone();
+    let binding = AgentBinding {
+        repo: repository.to_string(),
+        agent_id,
+    };
     for named in [explicit_repo(args), gh_repo_env()].into_iter().flatten() {
         if canonical_repository_key(&named).as_deref() != Some(binding.repo.as_str()) {
             return Err(format!(
-                "worker reads are bound to this checkout ({}) and cannot select {named}",
+                "worker reads are bound to this ticket ({}) and cannot select {named}",
                 binding.repo
             ));
         }

@@ -54,7 +54,8 @@ impl FakeTransport {
 }
 
 impl RelayTransport for FakeTransport {
-    fn read_repository(&self, project_root: &str) -> Result<String, String> {
+    fn read_repository(&self, ticket: &crate::gh_shim_ticket::Redeemed) -> Result<String, String> {
+        let project_root = &ticket.project_root;
         self.read_roots
             .lock()
             .unwrap()
@@ -1429,6 +1430,7 @@ fn session_context_uses_the_redeemed_ticket_and_authenticated_worker_stamp() {
         );
         assert!(reply.ok, "{:?}", reply.data);
         assert_eq!(reply.data["worker"], expected);
+        assert_eq!(reply.data["head"], !expected);
     }
     for mut scope in [
         delegating_stamp(),
@@ -1446,7 +1448,8 @@ fn session_context_uses_the_redeemed_ticket_and_authenticated_worker_stamp() {
             json!({"ticket":ticket.value().unwrap()}),
             &scopes_for("ses-context", Some(scope)),
         );
-        assert_eq!(reply.data["worker"], false);
+        assert!(!reply.ok);
+        assert_eq!(reply.data["refusal_code"], "session_unscoped");
     }
     let (reply, _) = run(
         &transport,
@@ -1740,5 +1743,27 @@ fn audit_daemon_read_refuses_an_unverifiable_checkout_binding() {
     );
     assert!(!reply.ok);
     assert_eq!(reply.data["refusal_code"], "repository_not_visible");
+    assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn audit_session_context_never_calls_untrusted_scopes_a_head() {
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue("untrusted-head-scope", "query", "/p");
+    let transport = FakeTransport::scoped();
+    for mut scope in [stamp(None, false, false), stamp(None, false, true)] {
+        if scope.owner_authorized {
+            scope.owner = subc_protocol::Principal::Reserved {
+                module_id: "other-owner".into(),
+            };
+        }
+        let (reply, _) = run_with_scopes(
+            &transport,
+            SESSION_CONTEXT_OPERATION,
+            json!({"ticket":ticket.value().unwrap()}),
+            &scopes_for("untrusted-head-scope", Some(scope)),
+        );
+        assert!(!reply.ok);
+        assert_eq!(reply.data["refusal_code"], "session_unscoped");
+    }
     assert!(transport.calls().is_empty());
 }

@@ -20488,6 +20488,7 @@ mod tests {
                 session_id: session.to_string(),
                 task_id: task_id.clone(),
                 project_root: "/project".to_string(),
+                read_repository: None,
             }),
             "a running task's ticket redeems to its own session"
         );

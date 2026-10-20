@@ -451,12 +451,12 @@ fn audit_search_repo_org_user_qualifiers_have_one_shared_guard() {
 }
 
 #[test]
-fn audit_search_unclosed_quotes_and_dangling_escapes_are_rejected() {
-    for q in ["needle \"", "label:\"unfinished", "needle\\"] {
+fn audit_search_unclosed_quotes_are_rejected() {
+    for q in ["needle \"", "label:\"unfinished"] {
         assert!(read_contract::validate_search(q).is_err(), "{q}");
     }
     assert!(read_contract::validate_search("label:\"two words\" needle").is_ok());
-    assert!(read_contract::validate_search(r#"label:"a\"b" needle"#).is_ok());
+    assert!(read_contract::validate_search(r#"label:"a\"b" needle"#).is_err());
 }
 
 #[test]
@@ -496,5 +496,76 @@ fn audit_identity_lookup_reports_missing_connection_bad_ticket_and_old_daemon() 
             .unwrap_err()
             .contains(message));
         assert_eq!(daemon.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn audit_search_backslashes_are_refused_without_assuming_github_escape_rules() {
+    for q in [
+        r"needle\path",
+        r"needle\\path",
+        r#"label:"a\"b""#,
+        r"needle\",
+        r"needle\q",
+    ] {
+        let error = read_contract::validate_search(q).unwrap_err();
+        assert!(error.contains("backslashes"), "{q}: {error}");
+    }
+    assert!(read_contract::validate_search("label:\"two words\" needle").is_ok());
+}
+
+#[test]
+fn audit_identity_timeout_does_not_claim_the_command_was_not_run() {
+    use std::sync::Arc;
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(|_| Value::Null));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("connection.json");
+    daemon.write_connection_file(&file);
+    let relay = RelayContext {
+        connection_file: Some(file),
+        ticket: Some("ticket".into()),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_millis(500),
+    };
+    let error = relay_client::worker_session(&relay).unwrap_err();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(!error.contains("command was not run"), "{error}");
+    assert!(
+        error.contains("caller identity was not established"),
+        "{error}"
+    );
+    assert_eq!(daemon.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn audit_native_head_permission_requires_affirmative_head_attribution() {
+    use std::sync::Arc;
+    for (data, allowed) in [
+        (json!({"worker":false,"head":true}), true),
+        (json!({"worker":false}), false),
+        (json!({"worker":true,"head":false}), false),
+    ] {
+        let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(
+            move |body| json!({"op":body["op"],"status":"ok","data":data}),
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("connection.json");
+        daemon.write_connection_file(&file);
+        let context = RelayContext {
+            connection_file: Some(file),
+            ticket: Some("ticket".into()),
+            transient_delays: [Duration::ZERO; 2],
+            relay_budget: Duration::from_secs(1),
+        };
+        let permission = super::super::native_guard::permission_with(
+            &context,
+            super::super::native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false,
+                ticket_present: true,
+            },
+            relay_client::worker_session,
+        );
+        assert_eq!(permission.is_ok(), allowed);
     }
 }

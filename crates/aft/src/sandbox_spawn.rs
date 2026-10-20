@@ -5285,6 +5285,7 @@ pub(crate) fn pty_command_for_plan(
         // it belongs to whatever started this process, and the request map
         // re-adds the child's own ticket when one was issued.
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
+        command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
         for (key, value) in env {
             command.env(key, value);
         }

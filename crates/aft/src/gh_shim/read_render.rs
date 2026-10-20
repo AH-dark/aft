@@ -338,7 +338,7 @@ fn json_fields(tuple: &str) -> &'static [&'static str] {
             "visibility",
             "watchers",
         ],
-        "search code" => &["path", "repository", "sha", "textMatches", "url"],
+        "search code" => &["path", "sha", "textMatches", "url"],
         "search issues" => &[
             "assignees",
             "author",
@@ -352,7 +352,6 @@ fn json_fields(tuple: &str) -> &'static [&'static str] {
             "isPullRequest",
             "labels",
             "number",
-            "repository",
             "state",
             "title",
             "updatedAt",
@@ -417,7 +416,7 @@ fn native(
     plan: &Plan,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
 ) -> Result<Value, ReadError> {
-    let mut value = match plan.tuple.as_str() {
+    let value = match plan.tuple.as_str() {
         "search code" | "search issues" => {
             let mut query_text = search_query(plan).map_err(refused)?;
             if plan.tuple == "search issues" && !plan.flag("include-prs") {
@@ -696,18 +695,7 @@ fn native(
         "repo view" => get(format!("/repos/{}", plan.repository), execute)?,
         _ => return Err(refused("unimplemented read verb")),
     };
-    if plan.tuple == "search issues"
-        && plan
-            .value("json")
-            .is_some_and(|fields| fields.split(',').any(|field| field == "repository"))
-    {
-        if let Some(rows) = value.as_array_mut().filter(|rows| !rows.is_empty()) {
-            let repository = get(format!("/repos/{}", plan.repository), execute)?;
-            for row in rows {
-                row["repository"] = repository.clone();
-            }
-        }
-    }
+
     if let Value::String(_) = value {
         return Ok(value);
     }

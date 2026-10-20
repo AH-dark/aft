@@ -279,11 +279,12 @@ fn ensure_time(deadline: Instant) -> Result<(), String> {
     }
 }
 
-fn resolve_preflight_gh() -> Option<PathBuf> {
+pub(super) fn resolve_preflight_gh() -> Option<PathBuf> {
     #[cfg(test)]
     if TEST_PREFLIGHT_RUNNER.with(std::cell::Cell::get).is_some() {
         return Some(PathBuf::new());
     }
+    super::native_guard::permission_from_process().ok()?;
     resolve_real_gh(&executing_image())
 }
 
