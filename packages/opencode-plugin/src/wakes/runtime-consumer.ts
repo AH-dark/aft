@@ -5,6 +5,7 @@ import type {
   BashCompletedPayload,
   BashLongRunningPayload,
   BgNudgeRef,
+  BashPatternMatchAck,
   BridgeOptions,
 } from "@cortexkit/aft-bridge";
 import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
@@ -63,7 +64,7 @@ interface WakeRoute {
   longRunning(reminder: BashLongRunningPayload): Promise<void>;
   /** Optional for route registrations created before pattern-match delivery was added. */
   standalonePatternMatch?(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<void>;
-  drainPatterns?(sessionID: string): Promise<void>;
+  drainPatterns?(sessionID: string, root?: string): Promise<void>;
 }
 
 /** A completion that arrived while no Location had its session registered. */
@@ -250,10 +251,22 @@ const sharedBridgeOptions: Pick<
 };
 
 const sharedTransportOptions: Pick<AftTransportFactoryOptions, "onBgEventsNudge"> = {
-  onBgEventsNudge: (_root, sessionID) => {
-    void wakeRouteState().routes.get(sessionID)?.drainPatterns?.(sessionID);
+  onBgEventsNudge: (root, sessionID) => {
+    void wakeRouteState().routes.get(sessionID)?.drainPatterns?.(sessionID, root);
   },
 };
+
+function isCompletionEntry(value: unknown): value is BashCompletedPayload {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Partial<BashCompletedPayload>;
+  return (
+    typeof entry.session_id === "string" &&
+    typeof entry.task_id === "string" &&
+    typeof entry.command === "string" &&
+    typeof entry.status === "string" &&
+    (entry.exit_code === null || typeof entry.exit_code === "number")
+  );
+}
 
 export interface V2RuntimeConsumer extends V2ToolConsumers {
   readonly bridgeOptions: typeof sharedBridgeOptions;
@@ -319,7 +332,7 @@ function detachWaitsForCompletion(
 export function createV2RuntimeConsumer(
   context: V2WakeHostContext,
   getConfig: () => AftConfig = () => ({}),
-  getBridge?: () => AftProjectTransport,
+  getBridge?: (root?: string) => AftProjectTransport,
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
   const sessions = new Set<string>();
@@ -354,16 +367,44 @@ export function createV2RuntimeConsumer(
           await awaitV2ExecutionSettlement(context, match.session_id);
           if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return;
         }
+        const wake = {
+          sessionID: match.session_id,
+          taskIDs: [match.task_id],
+          watchID: match.watch_id,
+          matchOffset: match.match_offset,
+          reason: match.reason,
+          text: formatPatternMatchReminder([match]),
+        };
+        // A late push can arrive after its ack, or after a newer sticky match
+        // replaced it. Durable pending state is the replay fence, not an
+        // ever-growing set of every offset this Location has delivered.
+        const current = await pending.bridge.send("bash_drain_completions", {
+          session_id: match.session_id,
+        });
+        if (current.success === false || !Array.isArray(current.pending_matches)) {
+          throw new Error("pattern replay validation failed");
+        }
+        if (
+          !current.pending_matches
+            .filter(isPatternMatchEntry)
+            .some(
+              (entry) =>
+                entry.session_id === match.session_id &&
+                entry.task_id === match.task_id &&
+                entry.watch_id === match.watch_id &&
+                entry.match_offset === match.match_offset &&
+                entry.reason === match.reason,
+            )
+        ) {
+          delivery.retirePatternMatch(wake);
+          pendingMatches.delete(key);
+          return;
+        }
         if (!pending.admitted) {
-          const text = formatPatternMatchReminder([match]);
+          const text = wake.text;
           const admitted = await Effect.runPromise(
             delivery.patternMatch({
-              sessionID: match.session_id,
-              taskIDs: [match.task_id],
-              watchID: match.watch_id,
-              matchOffset: match.match_offset,
-              reason: match.reason,
-              text,
+              ...wake,
               metadata: { source: "aft", kind: "bash_pattern_match", watch_id: match.watch_id },
             }),
           );
@@ -378,11 +419,39 @@ export function createV2RuntimeConsumer(
         // sticky watch's pending match so it can keep scanning later output.
         const ack = await pending.bridge.send("bash_ack_completions", {
           session_id: match.session_id,
-          task_ids: [match.task_id],
+          ...(match.reason === "task_exit"
+            ? { task_ids: [match.task_id] }
+            : {
+                matches: [
+                  {
+                    task_id: match.task_id,
+                    watch_id: match.watch_id,
+                    match_offset: match.match_offset,
+                  } satisfies BashPatternMatchAck,
+                ],
+              }),
         });
         if (ack.success === false)
           throw new Error(String(ack.message ?? "pattern acknowledgement failed"));
+        if (
+          match.reason !== "task_exit" &&
+          (!Array.isArray(ack.acked_matches) ||
+            !ack.acked_matches.some((entry) => {
+              if (typeof entry !== "object" || entry === null) return false;
+              const confirmed = entry as Partial<BashPatternMatchAck>;
+              return (
+                confirmed.task_id === match.task_id &&
+                confirmed.watch_id === match.watch_id &&
+                confirmed.match_offset === match.match_offset
+              );
+            }))
+        ) {
+          // Older engines may ignore the matches parameter. Keep the admission
+          // reserved until a later drain proves this match is no longer pending.
+          throw new Error("pattern acknowledgement was not confirmed");
+        }
         pendingMatches.delete(key);
+        delivery.retirePatternMatch(wake);
       };
       const attempt = deliver()
         .catch((error) => {
@@ -394,19 +463,29 @@ export function createV2RuntimeConsumer(
       matching.set(key, attempt);
       return attempt;
     },
-    drainPatterns: async (sessionID) => {
+    drainPatterns: async (sessionID, root) => {
       if (!getBridge || disposed) return;
-      const active = draining.get(sessionID);
+      const drainKey = JSON.stringify([sessionID, root]);
+      const active = draining.get(drainKey);
       if (active) return active;
       const drain = async () => {
-        const bridge = getBridge();
+        const bridge = getBridge(root);
         const response = await bridge.send("bash_drain_completions", { session_id: sessionID });
         if (response.success === false || disposed) return;
-        if (!Array.isArray(response.pending_matches)) return;
-        for (const match of response.pending_matches.filter(isPatternMatchEntry)) {
+        for (const match of (Array.isArray(response.pending_matches)
+          ? response.pending_matches
+          : []
+        ).filter(isPatternMatchEntry)) {
           // A drain is scoped to its requesting session, even if a malformed
           // response includes a frame for another registered session.
           if (match.session_id === sessionID) await routePatternMatch(match, bridge);
+        }
+        for (const completion of Array.isArray(response.bg_completions)
+          ? response.bg_completions
+          : []) {
+          if (isCompletionEntry(completion) && completion.session_id === sessionID) {
+            await routeCompletion({ ...completion, type: "bash_completed" }, bridge);
+          }
         }
       };
       const attempt = drain()
@@ -415,8 +494,8 @@ export function createV2RuntimeConsumer(
             `[bash_pattern_match] drain for session ${sessionID} failed: ${error instanceof Error ? error.message : String(error)}`,
           );
         })
-        .finally(() => draining.delete(sessionID));
-      draining.set(sessionID, attempt);
+        .finally(() => draining.delete(drainKey));
+      draining.set(drainKey, attempt);
       return attempt;
     },
     completion: async (completion, bridge, acknowledge = true) => {
@@ -485,6 +564,20 @@ export function createV2RuntimeConsumer(
             task_ids: [completion.task_id],
           });
         }
+      }
+      for (const [key, pending] of pendingMatches) {
+        const match = pending.match;
+        if (match.session_id !== completion.session_id || match.task_id !== completion.task_id)
+          continue;
+        delivery.retirePatternMatch({
+          sessionID: match.session_id,
+          taskIDs: [match.task_id],
+          watchID: match.watch_id,
+          matchOffset: match.match_offset,
+          reason: match.reason,
+          text: "",
+        });
+        pendingMatches.delete(key);
       }
       forgetV2Watch(context, completion.session_id, completion.task_id);
       return true;

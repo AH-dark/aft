@@ -8,6 +8,16 @@ use crate::protocol::{RawRequest, Response};
 struct BashAckCompletionsParams {
     #[serde(default)]
     task_ids: Vec<String>,
+    #[serde(default)]
+    matches: Vec<PatternMatchAck>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatternMatchAck {
+    task_id: String,
+    watch_id: String,
+    match_offset: u64,
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -38,12 +48,30 @@ pub fn handle_ack(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    let background = ctx.bash_background();
+    let mut acked_matches = Vec::new();
+    for pattern_match in params.matches {
+        match background.ack_pattern_match_for_session(
+            req.session(),
+            &pattern_match.task_id,
+            &pattern_match.watch_id,
+            pattern_match.match_offset,
+        ) {
+            Ok(Some(watch_removed)) => acked_matches.push(json!({
+                "task_id": pattern_match.task_id,
+                "watch_id": pattern_match.watch_id,
+                "match_offset": pattern_match.match_offset,
+                "watch_removed": watch_removed,
+            })),
+            Ok(None) => {}
+            Err(error) => return Response::error(&req.id, "pattern_ack_failed", error),
+        }
+    }
     Response::success(
         &req.id,
         json!({
-            "acked_task_ids": ctx
-                .bash_background()
-                .ack_completions_for_session(Some(req.session()), &params.task_ids),
+            "acked_task_ids": background.ack_completions_for_session(Some(req.session()), &params.task_ids),
+            "acked_matches": acked_matches,
         }),
     )
 }

@@ -2460,6 +2460,75 @@ fn pi_erased_watch_with_restored_task_row_does_not_replay_tombstone() {
 }
 
 #[test]
+fn per_match_ack_preserves_sibling_watch_and_rejects_stale_offset() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-matches");
+    let exit = project.path().join("release-exit");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let _exit_guard = ReleaseOnDrop::new(exit.clone());
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY\\n'; while [ ! -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&release), shell_quote_path(&exit),
+    );
+    let mut aft = AftProcess::spawn();
+    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let task_id = spawn_bg(&mut aft, SESSION, &command, Some(120_000));
+    let first = notify_once(&mut aft, SESSION, &task_id, "READY");
+    let second = notify(&mut aft, SESSION, &task_id, "READY", false);
+    assert_eq!(first["success"], true);
+    assert_eq!(second["success"], true);
+    drop(release_guard);
+    let _ = wait_for_pattern_frame(&mut aft, &task_id);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pending = loop {
+        let drained = drain(&mut aft, SESSION);
+        let pending = drained["pending_matches"].as_array().unwrap().clone();
+        if pending.len() == 2 {
+            break pending;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both watches must become pending: {drained:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for (index, watch) in [first, second].iter().enumerate() {
+        let frame = pending
+            .iter()
+            .find(|frame| frame["watch_id"] == watch["watch_id"])
+            .unwrap();
+        let offset = frame["match_offset"].as_u64().unwrap();
+        let stale = aft.send(&json!({
+            "id": "stale-match-ack", "command": "bash_ack_completions", "session_id": SESSION,
+            "params": { "matches": [{ "task_id": task_id, "watch_id": watch["watch_id"], "match_offset": offset + 1 }] },
+        }).to_string());
+        assert_eq!(stale["success"], true);
+        assert_eq!(
+            drain(&mut aft, SESSION)["pending_matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2 - index
+        );
+        let ack = aft.send(&json!({
+            "id": "exact-match-ack", "command": "bash_ack_completions", "session_id": SESSION,
+            "params": { "matches": [{ "task_id": task_id, "watch_id": watch["watch_id"], "match_offset": offset }] },
+        }).to_string());
+        assert_eq!(ack["success"], true, "{ack:?}");
+        assert_eq!(ack["acked_matches"][0]["watch_removed"], index == 0);
+        assert_eq!(
+            drain(&mut aft, SESSION)["pending_matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1 - index
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
     const WATCH_A: &str = "EARLY-WATCH-MATCH";
     const WATCH_B: &str = "LATE-WATCH-MATCH";

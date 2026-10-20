@@ -409,6 +409,49 @@ for (const work of [
   });
 }
 
+test("per-match ACK releases only removed watches and preserves sibling wake carriers", async () => {
+  let registered = 0;
+  const client = new FakeClient(async (_channel, rawBody) => {
+    const body = rawBody as { name: string; arguments: { matches?: unknown[] } };
+    if (body.name === "bash_notify")
+      return envelope({ success: true, text: "", watch_id: `watch-${++registered}` });
+    if (body.name === "bash_ack_completions")
+      return envelope({
+        success: true,
+        text: "",
+        acked_task_ids: [],
+        acked_matches: body.arguments.matches?.map((match) => ({
+          ...(match as object),
+          watch_removed: true,
+        })),
+      });
+    return envelope({ success: true, text: "", bg_completions: [], pending_matches: [] });
+  });
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "opencode",
+    connect: async () => client,
+    onBgEventsNudge: () => {},
+  });
+  try {
+    pool.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    for (let i = 0; i < 2; i++)
+      await bridge.send("bash_notify", { session_id: "fresh", task_id: "task", pattern: "READY" });
+    await settleMicrotasks();
+    for (let i = 1; i <= 2; i++) {
+      await bridge.send("bash_ack_completions", {
+        session_id: "fresh",
+        matches: [{ task_id: "task", watch_id: `watch-${i}`, match_offset: 0 }],
+      });
+      await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+      expect(pool.__retainedSessionCountsForTests().subscriptions).toBe(i === 1 ? 1 : 0);
+    }
+  } finally {
+    await pool.shutdown();
+  }
+});
+
 test("ambiguous background status pins the carrier until an explicit ACK", async () => {
   let statusFailed = true;
   const client = new FakeClient(async (_channel, rawBody) => {

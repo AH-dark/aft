@@ -1,4 +1,14 @@
 import { Effect, Exit } from "effect";
+import { warn } from "../logger.js";
+
+export const MAX_ADMITTED_WAKES = 4096;
+
+export class WakeDeliveryOverflow extends Error {
+  readonly type = "wake_delivery_overflow";
+  constructor() {
+    super(`wake_delivery_overflow: ${MAX_ADMITTED_WAKES} unretired wake keys; admission deferred`);
+  }
+}
 
 /**
  * The `metadata.source` marker for AFT-written session input. Synthetic wakes
@@ -85,20 +95,24 @@ export class V2SessionDelivery {
   patternMatch(input: PatternMatchWake): Effect.Effect<boolean, unknown> {
     // A sticky watch can match repeatedly before the task completes. Neither
     // its later offsets nor the task's completion may share a delivery key.
-    return this.admitWake(
-      input,
-      [
-        JSON.stringify([
-          "pattern",
-          input.sessionID,
-          input.taskIDs,
-          input.watchID,
-          input.matchOffset,
-          input.reason,
-        ]),
-      ],
-      "Background bash pattern matched",
-    );
+    return this.admitWake(input, [this.patternKey(input)], "Background bash pattern matched");
+  }
+
+  private patternKey(input: PatternMatchWake): string {
+    return JSON.stringify([
+      "pattern",
+      input.sessionID,
+      input.taskIDs,
+      input.watchID,
+      input.matchOffset,
+      input.reason,
+    ]);
+  }
+
+  // The consumer checks durable pending matches before admitting a replay, so
+  // an acknowledged or superseded match needs no permanent in-memory tombstone.
+  retirePatternMatch(input: PatternMatchWake): void {
+    this.admittedWakes.delete(this.patternKey(input));
   }
 
   private admitWake(
@@ -112,6 +126,18 @@ export class V2SessionDelivery {
         return Effect.succeed(false);
       }
       const reserved = keys.filter((key) => !this.admittedWakes.has(key));
+      if (this.admittedWakes.size + reserved.length > MAX_ADMITTED_WAKES) {
+        const error = new WakeDeliveryOverflow();
+        warn(
+          JSON.stringify({
+            type: error.type,
+            cap: MAX_ADMITTED_WAKES,
+            session_id: input.sessionID,
+          }),
+        );
+        // Evicting an existing key could admit the same pattern or completion twice.
+        return Effect.fail(error);
+      }
       for (const key of reserved) this.admittedWakes.add(key);
 
       return Effect.suspend(() =>
