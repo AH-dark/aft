@@ -957,7 +957,7 @@ The 3-second target is not met: the ordinary join's surface replay (948
 callers, 312,039 queries, selected through the crate-wide Rust module domain)
 and the type-target trace load (868 traces through the same domain) remain,
 and the SQLite commit of 157 pages took about 1 s in both after runs against
-~78 ms before; that commit cost is not yet explained.
+~78 ms before; the follow-up below traces that to device sync latency.
 
 ### Commit phase, WAL size and work counters (rebased on bdbf17caf)
 
