@@ -398,6 +398,7 @@ impl RevisionSession {
             .iter()
             .fold(self.toplevel.clone(), |path, part| path.join(part));
         ctx.check_location_lexically_in_root(&req.id, requested, &location)?;
+        ctx.check_historical_read_location(&req.id, &location)?;
         Ok(parts.join("/"))
     }
 

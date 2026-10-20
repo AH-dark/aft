@@ -258,6 +258,56 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
     assert!(!text.contains("    99"), "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn revision_read_deny_checks_historical_location_before_today_symlink() {
+    let fixture = fixture();
+    fs::create_dir(fixture.repo.join("secrets")).unwrap();
+    fs::create_dir(fixture.repo.join("public")).unwrap();
+    let secret = fixture.repo.join("secrets/key.rs");
+    let public = fixture.repo.join("public/key.rs");
+    fs::write(&secret, "pub fn secret_key() {}\n").unwrap();
+    fs::write(&public, "pub fn public_key() {}\n").unwrap();
+    git(&fixture.repo, &["add", "secrets", "public"]);
+    git(&fixture.repo, &["commit", "--quiet", "-m", "keys"]);
+    fs::remove_file(&secret).unwrap();
+    std::os::unix::fs::symlink(&public, &secret).unwrap();
+    let mut aft = AftProcess::spawn();
+    let config = aft.send(
+        &json!({
+            "id": "cfg", "command": "configure", "harness": "opencode",
+            "project_root": fixture.repo, "storage_dir": fixture.storage,
+            "config": [user_config_tier(json!({
+                "revision_reads": true, "restrict_to_project_root": true,
+                "sandbox": { "read_deny": [fixture.repo.join("secrets")] },
+            }))],
+        })
+        .to_string(),
+    );
+    assert_eq!(config["success"], true, "{config:?}");
+    for (name, mut arguments) in [
+        ("read", json!({"path": "secrets/key.rs"})),
+        ("outline", json!({"target": "secrets/key.rs"})),
+        (
+            "zoom",
+            json!({"path": "secrets/key.rs", "symbols": "secret_key"}),
+        ),
+    ] {
+        arguments["ref"] = json!("HEAD");
+        let denied = call(&mut aft, name, arguments);
+        assert_eq!(denied["success"], false, "{name}: {denied:?}");
+        assert_eq!(denied["code"], "denied_floor", "{name}: {denied:?}");
+    }
+    let allowed = call(
+        &mut aft,
+        "read",
+        json!({ "path": "public/key.rs", "ref": "HEAD" }),
+    );
+    assert!(ok_text(&allowed).contains("public_key"));
+    let live = call(&mut aft, "read", json!({ "path": "secrets/key.rs" }));
+    assert!(ok_text(&live).contains("public_key"));
+}
+
 #[test]
 fn revision_read_of_a_path_missing_at_that_revision_names_the_revision() {
     let fixture = fixture();

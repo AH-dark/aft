@@ -13909,6 +13909,51 @@ impl AppContext {
         }
     }
 
+    /// Authorize the repository location of a historical read without resolving
+    /// today's symlinks. The current target's permission cannot authorize the
+    /// different content stored under the original name in a commit.
+    pub(crate) fn check_historical_read_location(
+        &self,
+        req_id: &str,
+        location: &Path,
+    ) -> Result<(), crate::protocol::Response> {
+        use crate::access_policy::{AccessDecision, AccessOperation};
+        let identity = crate::inspect::job::normalize_path(location);
+        let config = self.config();
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        // Configured denies protect their written location too, even if that
+        // location has since become a symlink to an allowed file or directory.
+        let denied = config.sandbox.read_deny.iter().any(|path| {
+            let path = crate::access_policy::expand_home(path, &home);
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            identity.starts_with(crate::inspect::job::normalize_path(&absolute))
+        });
+        let decision = self
+            .access_policy(req_id)?
+            .decide(AccessOperation::Read, &identity, false);
+        if denied || matches!(decision, AccessDecision::Deny(_)) {
+            return Err(crate::protocol::Response::error(
+                req_id,
+                "denied_floor",
+                format!(
+                    "historical path '{}' is denied by the access policy",
+                    location.display()
+                ),
+            ));
+        }
+        if decision == AccessDecision::Ask {
+            self.answer_ask(req_id, location, &identity, AccessOperation::Read)?;
+        }
+        Ok(())
+    }
+
     /// Resolve an `ask` decision for the call on this thread. A lowered route
     /// treats the ask as allow. A consent route allows only what an
     /// `allow_once` answer approved for this dispatch; anything else refuses
