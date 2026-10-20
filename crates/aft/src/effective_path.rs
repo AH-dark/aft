@@ -64,6 +64,10 @@ const LOGIN_SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const LOGIN_SHELL_PATH_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(4);
 #[cfg(unix)]
+const SPAWN_BUSY_RETRY_COUNT: usize = 3;
+#[cfg(unix)]
+const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+#[cfg(unix)]
 const EFFECTIVE_PATH_CACHE_SCHEMA: u32 = 1;
 
 /// Compute and export AFT's process PATH.
@@ -589,7 +593,7 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
             Ok(())
         });
     }
-    let mut child = command.spawn().ok()?;
+    let mut child = spawn_retrying_executable_file_busy(&mut command, "login shell")?;
     let mut stdout = child.stdout.take()?;
     let _ = set_nonblocking(&stdout);
     let mut output_bytes = Vec::new();
@@ -660,6 +664,27 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn spawn_retrying_executable_file_busy(command: &mut Command, purpose: &str) -> Option<Child> {
+    for retry in 0..=SPAWN_BUSY_RETRY_COUNT {
+        match command.spawn() {
+            Ok(child) => return Some(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && retry < SPAWN_BUSY_RETRY_COUNT =>
+            {
+                std::thread::sleep(SPAWN_BUSY_RETRY_DELAY);
+            }
+            Err(error) => {
+                log::debug!("failed to spawn {purpose}: {error}");
+                return None;
+            }
+        }
+    }
+
+    unreachable!("the final spawn attempt returns or exits the retry loop")
 }
 
 #[cfg(unix)]
@@ -956,7 +981,8 @@ fn spawn_cached_path_refresh() {
 /// `wait()` the finished helper stays a zombie for the life of this process.
 #[cfg(unix)]
 fn spawn_reaped(command: &mut Command) -> Option<u32> {
-    let Ok(child) = command.spawn() else {
+    let Some(child) = spawn_retrying_executable_file_busy(command, "login-shell PATH cache helper")
+    else {
         return None;
     };
     let pid = child.id();
@@ -1407,6 +1433,83 @@ eval "$2"
             .path,
             Some(OsString::from("/custom/bin:/usr/bin"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn login_shell_probe_survives_concurrent_fork_stress() {
+        const ITERATIONS: usize = 128;
+        const FORK_CHILD_DELAY: libc::timespec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 15_000_000,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        let body = format!(
+            "#!/bin/sh\n#{}\nprintf '%s' '__AFT_PATH_BEGIN__/custom/bin:/usr/bin__AFT_PATH_END__'\n",
+            "x".repeat(64 * 1024)
+        );
+        write_executable_shim(&shell, &body);
+
+        let (request_fork, fork_requests) = std::sync::mpsc::channel();
+        let (fork_complete, forked_children) = std::sync::mpsc::channel();
+        let forker = std::thread::spawn(move || {
+            while fork_requests.recv().is_ok() {
+                // The child keeps the inherited writable descriptor until exec,
+                // reproducing the window that can make a concurrent shell spawn busy.
+                let pid = unsafe { libc::fork() };
+                if pid == 0 {
+                    let executable = b"/bin/true\0";
+                    let argv = [executable.as_ptr().cast(), std::ptr::null()];
+                    unsafe {
+                        libc::nanosleep(&FORK_CHILD_DELAY, std::ptr::null_mut());
+                        libc::execv(executable.as_ptr().cast(), argv.as_ptr());
+                        libc::_exit(127);
+                    }
+                }
+                let _ = fork_complete.send(pid);
+                if pid > 0 {
+                    unsafe {
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        });
+
+        let expected = Some(OsString::from("/custom/bin:/usr/bin"));
+        let mut failed_probe = None;
+        for _ in 0..ITERATIONS {
+            fs::write(&shell, &body).unwrap();
+            let writable = fs::OpenOptions::new().write(true).open(&shell).unwrap();
+            request_fork.send(()).unwrap();
+            let pid = forked_children.recv().unwrap();
+            assert!(pid > 0, "fork failed with {pid}");
+            drop(writable);
+
+            let error = Command::new(&shell)
+                .spawn()
+                .expect_err("the forked child should still hold the writable file descriptor");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "expected Linux ETXTBSY, got {error}"
+            );
+
+            let actual = probe_login_shell_path_once(&shell, Duration::from_secs(1));
+            if actual != expected {
+                failed_probe = Some(actual);
+                break;
+            }
+        }
+
+        drop(request_fork);
+        forker.join().unwrap();
+        assert_eq!(
+            failed_probe, None,
+            "login-shell PATH probe failed during a fork/spawn race"
+        );
+        println!("observed ETXTBSY and recovered across {ITERATIONS} concurrent fork/probe cycles");
     }
 
     #[test]
