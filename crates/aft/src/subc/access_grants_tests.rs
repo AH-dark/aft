@@ -1,4 +1,5 @@
 use super::*;
+use crate::access_policy::{AccessDecision, AccessDenial};
 
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
     let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
@@ -66,6 +67,51 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
 }
 fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
+}
+
+#[test]
+fn grants_allow_paths_denied_floor_names_module_and_credential_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = policy_path(dir.path());
+    let policy = AccessPolicy::from_config(
+        &crate::config::Config::default(),
+        &home.join("aft-store"),
+        vec![home.join("project")],
+        &home,
+    );
+    // Built one component at a time: the policy names the floor with the
+    // platform's own separators, so a "/"-joined literal differs on Windows.
+    for (target, floor, rule, description) in [
+        (
+            home.join(".local/share/cortexkit/synapse/hy-memory"),
+            home.join(".local").join("share").join("cortexkit"),
+            "cortexkit_module_data",
+            "module data store under ~/.local/share/cortexkit/<module>",
+        ),
+        (
+            home.join(".ssh/keys"),
+            home.join(".ssh"),
+            "credential_path",
+            "credential path",
+        ),
+    ] {
+        let error = validate(&json!([{"path":target,"mode":"write"}]), Some(&policy)).unwrap_err();
+        assert_eq!(error.code, "plan_param_refused");
+        assert_eq!(
+            error.detail,
+            Some(json!({
+                "param":"allow_paths", "index":0, "path":target, "reason":"denied_floor",
+                "floor_rule":rule, "floor_path":floor,
+            }))
+        );
+        assert_eq!(
+            error.message,
+            format!(
+                "allow_paths[0]: denied_floor ({description}: {})",
+                floor.display()
+            )
+        );
+    }
 }
 
 #[test]

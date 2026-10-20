@@ -4917,13 +4917,15 @@ mod storage_retention_tests {
     /// A drain burst over a large backlog. Every removal rechecks binding
     /// history under the retention barrier, and that history is every binding
     /// record in the storage. The recheck must not reread all of it for each
-    /// removed cache: with thousands of records that made each pass cost
-    /// seconds of file reads, and a burst runs pass after pass.
+    /// removed cache: even hundreds of records make repeated file reads costly,
+    /// and a burst runs pass after pass.
     #[test]
     fn storage_retention_due_drain_rereads_history_per_batch_not_per_cache() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        const DUE: usize = 600;
-        const LIVE: usize = 1400;
+        // More than one pass and several admission batches still distinguish
+        // per-batch history reads from a reread for every removed cache.
+        const DUE: usize = 96;
+        const LIVE: usize = 128;
         let (temp, root, scope) = fixture();
         let template: Binding =
             read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();

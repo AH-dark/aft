@@ -934,6 +934,29 @@ async fn start_read(
     readiness::PendingControlReplies,
     u64,
 ) {
+    start_dispatch(
+        executor,
+        parent,
+        child,
+        parent_wait,
+        hooks,
+        json!({"op":"file.read_exact","path":"script"}),
+    )
+    .await
+}
+
+async fn start_dispatch(
+    executor: &Arc<Executor>,
+    parent: &RouteIdentity,
+    child: RouteIdentity,
+    parent_wait: Duration,
+    hooks: DispatchHooks,
+    body: Value,
+) -> (
+    mpsc::Receiver<WriterFrame>,
+    readiness::PendingControlReplies,
+    u64,
+) {
     let routes = HashMap::from([
         (route_key(41, 1), child.clone()),
         (route_key(42, 1), parent.clone()),
@@ -951,7 +974,6 @@ async fn start_read(
         pending.clone(),
         HELLO_CORR + 1,
     ));
-    let body = json!({"op":"file.read_exact","path":"script"});
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),
@@ -1353,4 +1375,122 @@ async fn flow_read_policy_lock_held_past_limit_replies_once_with_timeout() {
             String::from_utf8_lossy(&late.body)
         );
     }
+}
+
+#[tokio::test]
+async fn perf_sweep_admission_only_the_basal_flow_route() {
+    let dir = tempfile::tempdir().unwrap();
+    for scope_ref in ["head/call", "codemode/call"] {
+        let mut scope = stamp();
+        scope["ref"] = json!(scope_ref);
+        let error = wire(
+            identity(dir.path(), scope, "reserved:basal"),
+            json!({"op":"perf.sweep"}),
+        )
+        .await;
+        assert_eq!(error["code"], "file_read_exact_route_not_admitted");
+        assert_eq!(error["message"], "Route not admitted: scope_ref.");
+    }
+    let error = wire(
+        identity(dir.path(), stamp(), "reserved:other"),
+        json!({"op":"perf.sweep"}),
+    )
+    .await;
+    assert_eq!(error["message"], "Route not admitted: principal.");
+    let error = wire(
+        identity(dir.path(), stamp(), "reserved:basal"),
+        json!({"op":"tool.call", "name":"perf.sweep", "arguments":{}}),
+    )
+    .await;
+    assert_eq!(error["message"], "Route not admitted: operation.");
+    let error = wire(
+        identity(dir.path(), stamp(), "reserved:basal"),
+        json!({"op":"perf.sweep"}),
+    )
+    .await;
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("no open AFT route for the parent head scope"),
+        "{error}"
+    );
+}
+
+/// perf.sweep samples the daemon itself, not the parent project, so a long
+/// sample must not occupy the project's executor lanes: a write on the same
+/// root is admitted while the sweep is still sampling. The sweep still sends
+/// exactly one answer at its deadline, and its busy guard stays held until the
+/// sample itself ends.
+#[tokio::test]
+async fn perf_sweep_long_sample_does_not_block_project_writes() {
+    let (_dir, ctx, parent, mut child) = read_fixture();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(parent.root.clone(), ctx);
+    // The child scope expires while the sample is still held, so the sweep
+    // answers at its deadline and never starts a real profiler child here.
+    Arc::get_mut(&mut child.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .expires_at_ms = Some(crate::db::call_ledger::now_ms() as u64 + 3000);
+    let (started, sampling) = oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (mut output, pending, corr) = start_dispatch(
+        &executor,
+        &parent,
+        child,
+        super::super::perf_sweep::DISPATCH_BUDGET,
+        DispatchHooks {
+            submitted: None,
+            before_read: Some(Box::new(move || {
+                let _ = started.send(());
+                // Stands in for the profiler's sample, which can last 35 s.
+                let _ = held.recv();
+            })),
+        },
+        json!({"op":"perf.sweep","profile_seconds":30}),
+    )
+    .await;
+    confirm_live(&pending, corr, &parent);
+    tokio::time::timeout(Duration::from_secs(2), sampling)
+        .await
+        .expect("the sweep is sampling")
+        .unwrap();
+
+    let write = executor.submit_async(
+        parent.root.clone(),
+        Lane::Mutating,
+        "write".into(),
+        Box::new(|_| Response::success("write", json!({}))),
+    );
+    tokio::time::timeout(Duration::from_secs(1), write)
+        .await
+        .expect("a write on the same root is admitted while the sweep samples")
+        .unwrap();
+
+    let answer = tokio::time::timeout(Duration::from_secs(5), output.recv())
+        .await
+        .expect("the sweep answers at its deadline while the sample is held")
+        .expect("one terminal frame");
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(answer.header.ty, FrameType::Error, "{body}");
+    assert_eq!(body["message"], "Route not admitted: expiry.");
+    match super::super::perf_sweep::admit(&json!({"op":"perf.sweep"})) {
+        Ok(_) => panic!("a second sweep was admitted while the first still samples"),
+        Err(error) => assert_eq!(error.code, "busy"),
+    }
+
+    release.send(()).unwrap();
+    let released_by = Instant::now() + Duration::from_secs(2);
+    while let Err(error) = super::super::perf_sweep::admit(&json!({"op":"perf.sweep"})) {
+        assert!(
+            Instant::now() < released_by,
+            "the busy guard outlived the sample: {}",
+            error.message
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    no_second_frame(&mut output).await;
 }

@@ -263,12 +263,72 @@ pub enum HeadPolicy {
     NotHeld,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FloorRule {
+    CredentialPath,
+    CortexkitConfig,
+    CortexkitModuleData,
+    CortexkitModuleState,
+    AftStorage,
+    #[cfg(unix)]
+    SessionStore,
+    SubcConnection,
+    ConfiguredReadDeny,
+    TaskEnvironment,
+    PolicyFloor,
+}
+
+impl FloorRule {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::CredentialPath => "credential_path",
+            Self::CortexkitConfig => "cortexkit_config",
+            Self::CortexkitModuleData => "cortexkit_module_data",
+            Self::CortexkitModuleState => "cortexkit_module_state",
+            Self::AftStorage => "aft_storage",
+            #[cfg(unix)]
+            Self::SessionStore => "session_store",
+            Self::SubcConnection => "subc_connection",
+            Self::ConfiguredReadDeny => "configured_read_deny",
+            Self::TaskEnvironment => "task_environment",
+            Self::PolicyFloor => "policy_floor",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::CredentialPath => "credential path",
+            Self::CortexkitConfig => "CortexKit configuration store",
+            Self::CortexkitModuleData => {
+                "module data store under ~/.local/share/cortexkit/<module>"
+            }
+            Self::CortexkitModuleState => {
+                "module state store under ~/.local/state/cortexkit/<module>"
+            }
+            Self::AftStorage => "AFT storage directory",
+            #[cfg(unix)]
+            Self::SessionStore => "session storage directory",
+            Self::SubcConnection => "subc connection credentials",
+            Self::ConfiguredReadDeny => "configured sandbox read deny",
+            Self::TaskEnvironment => "private bash task environment",
+            Self::PolicyFloor => "protected filesystem path",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PolicyFloor {
+    pub(crate) path: PathBuf,
+    pub(crate) rule: FloorRule,
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessPolicy {
     pub roots: Vec<PathBuf>,
     pub mode: ApprovalMode,
     pub outside: AccessDecision,
     pub absolute_floor: Vec<PathBuf>,
+    floor_rules: Vec<PolicyFloor>,
     /// Built-in protected paths only. User read_deny retains the native shell's
     /// existing read-only restriction rather than denying the enclosing write root.
     pub shell_write_floor: Vec<PathBuf>,
@@ -287,21 +347,28 @@ impl AccessPolicy {
     /// Snapshot the route configuration. Unrestricted outside access is represented
     /// as Ask and lowered to the existing behavior by the in-process caller.
     pub fn from_config(config: &Config, storage: &Path, roots: Vec<PathBuf>, home: &Path) -> Self {
+        let mut floor_rules = Vec::new();
         let roots = roots
             .into_iter()
             .map(|root| crate::inspect::job::normalize_path(&root))
             .collect::<Vec<_>>();
         let shell_write_floor = [
-            ".ssh",
-            ".aws",
-            ".gnupg",
-            ".config/gcloud",
-            ".azure",
-            ".config/cortexkit",
+            (".ssh", FloorRule::CredentialPath),
+            (".aws", FloorRule::CredentialPath),
+            (".gnupg", FloorRule::CredentialPath),
+            (".config/gcloud", FloorRule::CredentialPath),
+            (".azure", FloorRule::CredentialPath),
+            (".config/cortexkit", FloorRule::CortexkitConfig),
         ]
         .into_iter()
-        .map(|path| home.join(path))
-        .map(|path| policy_path(&path))
+        .map(|(path, rule)| {
+            let path = policy_path(&home.join(path));
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule,
+            });
+            path
+        })
         .collect::<Vec<_>>();
         #[cfg(target_os = "linux")]
         let shell_write_floor = shell_write_floor
@@ -313,35 +380,67 @@ impl AccessPolicy {
                     PathBuf::from("/run/secrets"),
                 ]
                 .into_iter()
-                .map(|path| policy_path(&path)),
+                .map(|path| {
+                    let path = policy_path(&path);
+                    floor_rules.push(PolicyFloor {
+                        path: path.clone(),
+                        rule: FloorRule::CredentialPath,
+                    });
+                    path
+                }),
             )
             .collect::<Vec<_>>();
         let mut absolute_floor = shell_write_floor.clone();
-        absolute_floor.extend(
-            config
-                .sandbox
-                .read_deny
-                .iter()
-                .map(|path| policy_path(&expand_home(path, home))),
-        );
-        let mut deny = vec![
-            home.join(".local/share/cortexkit"),
-            home.join(".local/state/cortexkit"),
-            storage.to_path_buf(),
-            home.join(".local/share/cortexkit/run/subc-connection.json"),
-        ];
+        absolute_floor.extend(config.sandbox.read_deny.iter().map(|path| {
+            let path = policy_path(&expand_home(path, home));
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule: FloorRule::ConfiguredReadDeny,
+            });
+            path
+        }));
+        let mut deny: Vec<_> = [
+            (
+                home.join(".local/share/cortexkit"),
+                FloorRule::CortexkitModuleData,
+            ),
+            (
+                home.join(".local/state/cortexkit"),
+                FloorRule::CortexkitModuleState,
+            ),
+            (storage.to_path_buf(), FloorRule::AftStorage),
+            (
+                home.join(".local/share/cortexkit/run/subc-connection.json"),
+                FloorRule::SubcConnection,
+            ),
+        ]
+        .into_iter()
+        .map(|(path, rule)| {
+            let path = policy_path(&path);
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule,
+            });
+            path
+        })
+        .collect();
         if let Some(path) = &config.semantic.subc_connection_file {
             let path = expand_home(path, home);
-            deny.push(if path.is_absolute() {
+            let path = policy_path(&if path.is_absolute() {
                 path
             } else {
                 home.join(path)
             });
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule: FloorRule::SubcConnection,
+            });
+            deny.push(path);
         }
-        let mut deny: Vec<_> = deny.into_iter().map(|path| policy_path(&path)).collect();
-        deny.extend(environment_private_store_denies(|key| {
-            std::env::var_os(key)
-        }));
+        for floor in environment_private_store_floors(|key| std::env::var_os(key)) {
+            deny.push(floor.path.clone());
+            floor_rules.push(floor);
+        }
         let mut private_store_carveouts =
             vec![home.join(".local/share/cortexkit/alfonso/worktrees")];
         if let Some(path) = crate::environment::non_empty_os_var("XDG_DATA_HOME") {
@@ -388,6 +487,7 @@ impl AccessPolicy {
                 AccessDecision::Ask
             },
             absolute_floor,
+            floor_rules,
             shell_write_floor,
             grants: Vec::new(),
             shell_write_allow: config
@@ -430,13 +530,9 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
-        if crate::bash_background::registry::is_task_environment(path) {
-            return AccessDecision::Deny(AccessDenial::Floor);
-        }
         if self
-            .absolute_floor
-            .iter()
-            .any(|floor| floor_contains(path, floor))
+            .floor_for_path(operation, path, owned_artifact)
+            .is_some()
         {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
@@ -444,20 +540,6 @@ impl AccessPolicy {
             AccessOperation::Read => &self.private_stores.read_allow,
             AccessOperation::Write => &self.private_stores.write_allow,
         };
-        if self
-            .private_stores
-            .deny
-            .iter()
-            .any(|floor| floor_contains(path, floor))
-            && !exceptions.iter().any(|root| path.starts_with(root))
-            && !(operation == AccessOperation::Read && owned_artifact)
-            && !self
-                .private_store_carveouts
-                .iter()
-                .any(|carveout| path.starts_with(carveout))
-        {
-            return AccessDecision::Deny(AccessDenial::Floor);
-        }
         let inside = self.roots.iter().any(|root| path.starts_with(root));
         if self.mode == ApprovalMode::ReadOnly && operation == AccessOperation::Write && !inside {
             return AccessDecision::Deny(AccessDenial::ReadOnly);
@@ -479,16 +561,95 @@ impl AccessPolicy {
         }
     }
 
+    fn describe_floor(&self, path: &Path) -> PolicyFloor {
+        self.floor_rules
+            .iter()
+            .find(|floor| floor.path == path)
+            .cloned()
+            .unwrap_or_else(|| PolicyFloor {
+                path: path.to_path_buf(),
+                // Public floor vectors also accept programmatically supplied denies.
+                rule: FloorRule::PolicyFloor,
+            })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn add_session_store_floor(&mut self, path: PathBuf) {
+        self.floor_rules.push(PolicyFloor {
+            path: path.clone(),
+            rule: FloorRule::SessionStore,
+        });
+        self.private_stores.deny.push(path);
+    }
+
+    fn floor_for_path(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+    ) -> Option<PolicyFloor> {
+        if crate::bash_background::registry::is_task_environment(path) {
+            return Some(PolicyFloor {
+                path: path.to_path_buf(),
+                rule: FloorRule::TaskEnvironment,
+            });
+        }
+        if let Some(floor) = self
+            .absolute_floor
+            .iter()
+            .find(|floor| floor_contains(path, floor))
+        {
+            return Some(self.describe_floor(floor));
+        }
+        let exceptions = match operation {
+            AccessOperation::Read => &self.private_stores.read_allow,
+            AccessOperation::Write => &self.private_stores.write_allow,
+        };
+        if !exceptions.iter().any(|root| path.starts_with(root))
+            && !(operation == AccessOperation::Read && owned_artifact)
+            && !self
+                .private_store_carveouts
+                .iter()
+                .any(|carveout| path.starts_with(carveout))
+        {
+            return self
+                .private_stores
+                .deny
+                .iter()
+                .find(|floor| floor_contains(path, floor))
+                .map(|floor| self.describe_floor(floor));
+        }
+        None
+    }
+
+    /// Report the same floor that rejects a capability, including a protected
+    /// descendant of a subtree. Provenance is recorded when the floor is built.
+    pub(crate) fn capability_floor(
+        &self,
+        operation: AccessOperation,
+        kind: GrantKind,
+        path: &Path,
+    ) -> Option<PolicyFloor> {
+        if kind == GrantKind::Subtree {
+            for floor in self.absolute_floor.iter().chain(&self.private_stores.deny) {
+                if floor_contains(floor, path) {
+                    if let Some(matched) = self.floor_for_path(operation, floor, false) {
+                        return Some(matched);
+                    }
+                }
+            }
+        }
+        self.floor_for_path(operation, path, false)
+    }
+
     /// A tree replacement/unlink must not indirectly remove a denied descendant.
     /// Exact location checks still preserve final symlinks instead of following them.
     pub fn decide_tree_write(&self, path: &Path) -> AccessDecision {
-        for floor in self.absolute_floor.iter().chain(&self.private_stores.deny) {
-            if floor_contains(floor, path)
-                && self.decide(AccessOperation::Write, floor, false)
-                    == AccessDecision::Deny(AccessDenial::Floor)
-            {
-                return AccessDecision::Deny(AccessDenial::Floor);
-            }
+        if self
+            .capability_floor(AccessOperation::Write, GrantKind::Subtree, path)
+            .is_some()
+        {
+            return AccessDecision::Deny(AccessDenial::Floor);
         }
         self.decide(AccessOperation::Write, path, false)
     }
@@ -504,12 +665,8 @@ impl AccessPolicy {
         if kind == GrantKind::File {
             return self.decide(operation, path, false);
         }
-        for floor in self.absolute_floor.iter().chain(&self.private_stores.deny) {
-            if floor_contains(floor, path)
-                && self.decide(operation, floor, false) == AccessDecision::Deny(AccessDenial::Floor)
-            {
-                return AccessDecision::Deny(AccessDenial::Floor);
-            }
+        if self.capability_floor(operation, kind, path).is_some() {
+            return AccessDecision::Deny(AccessDenial::Floor);
         }
         let mut tree_policy = self.clone();
         tree_policy
@@ -527,8 +684,34 @@ impl AccessPolicy {
         }
     }
 
-    /// Compile only directory write capabilities. An ask contributes nothing,
-    /// and a file grant must never widen into a writable parent directory.
+    /// Select held shell capabilities without widening file grants to directories.
+    /// A subtree must be usable in full; a denied descendant cannot be delegated.
+    pub(crate) fn shell_grants(&self, operation: AccessOperation) -> Vec<PathBuf> {
+        self.grants
+            .iter()
+            .filter(|grant| {
+                grant.covers(operation, &grant.path)
+                    && match operation {
+                        AccessOperation::Write => {
+                            grant.kind == GrantKind::Subtree
+                                && grant.path.is_dir()
+                                && self.decide_tree_write(&grant.path) == AccessDecision::Allow
+                        }
+                        AccessOperation::Read => {
+                            (match grant.kind {
+                                GrantKind::Subtree => grant.path.is_dir(),
+                                GrantKind::File => grant.path.is_file(),
+                            }) && self.decide_capability(operation, grant.kind, &grant.path)
+                                == AccessDecision::Allow
+                        }
+                    }
+            })
+            .map(|grant| grant.path.clone())
+            .collect()
+    }
+
+    /// Compile directory write capabilities and exact read capabilities. An ask
+    /// contributes nothing, and a file grant never opens its parent directory.
     pub fn compile_shell(
         &self,
         temp_dir: PathBuf,
@@ -537,17 +720,8 @@ impl AccessPolicy {
     ) -> Result<SandboxProfile, SandboxProfileError> {
         let mut writable = self.roots.clone();
         writable.extend(self.shell_write_allow.iter().cloned());
-        writable.extend(
-            self.grants
-                .iter()
-                .filter(|grant| {
-                    grant.kind == GrantKind::Subtree
-                        && grant.operation == AccessOperation::Write
-                        && grant.path.is_dir()
-                        && self.decide_tree_write(&grant.path) == AccessDecision::Allow
-                })
-                .map(|grant| grant.path.clone()),
-        );
+        let write_grants = self.shell_grants(AccessOperation::Write);
+        writable.extend(write_grants.iter().cloned());
         let mut profile = SandboxProfile::build(
             writable,
             self.shell_write_floor.clone(),
@@ -559,21 +733,41 @@ impl AccessPolicy {
             temp_dir.clone(),
         )?;
         profile.data_policy = self.private_stores.clone();
+        profile.data_policy.write_allow.extend(write_grants);
+        profile
+            .data_policy
+            .read_allow
+            .extend(self.shell_grants(AccessOperation::Read));
         profile.data_policy.read_allow.push(temp_dir.clone());
         profile.data_policy.write_allow.push(temp_dir);
         Ok(profile)
     }
 }
 
-fn environment_private_store_denies(
+fn environment_private_store_floors(
     getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Vec<PathBuf> {
+) -> Vec<PolicyFloor> {
     let mut denies = Vec::new();
-    for (variable, suffix, absolute_only) in [
-        ("SUBC_CONNECTION_FILE", "", false),
-        ("XDG_RUNTIME_DIR", "subc-connection.json", false),
-        ("XDG_DATA_HOME", "cortexkit", true),
-        ("XDG_STATE_HOME", "cortexkit", true),
+    for (variable, suffix, absolute_only, rule) in [
+        ("SUBC_CONNECTION_FILE", "", false, FloorRule::SubcConnection),
+        (
+            "XDG_RUNTIME_DIR",
+            "subc-connection.json",
+            false,
+            FloorRule::SubcConnection,
+        ),
+        (
+            "XDG_DATA_HOME",
+            "cortexkit",
+            true,
+            FloorRule::CortexkitModuleData,
+        ),
+        (
+            "XDG_STATE_HOME",
+            "cortexkit",
+            true,
+            FloorRule::CortexkitModuleState,
+        ),
     ] {
         let Some(value) = getenv(variable).filter(|value| !value.is_empty()) else {
             continue;
@@ -596,14 +790,29 @@ fn environment_private_store_denies(
                     }
                 }
             }
-            denies.extend(crate::sandbox_profile::resolved_env_deny_paths(
-                variable, path,
-            ));
+            denies.extend(
+                crate::sandbox_profile::resolved_env_deny_paths(variable, path)
+                    .into_iter()
+                    .map(|path| PolicyFloor { path, rule }),
+            );
         }
         #[cfg(not(unix))]
-        denies.push(policy_path(&path));
+        denies.push(PolicyFloor {
+            path: policy_path(&path),
+            rule,
+        });
     }
     denies
+}
+
+#[cfg(all(test, unix))]
+fn environment_private_store_denies(
+    getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    environment_private_store_floors(getenv)
+        .into_iter()
+        .map(|floor| floor.path)
+        .collect()
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

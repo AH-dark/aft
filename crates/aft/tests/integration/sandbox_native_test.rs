@@ -944,6 +944,22 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_sandbox_non_worker_strict_project_git_config_remains_writable() {
+    let mut fixture = CortexkitFloorFixture::new();
+    let response = foreground(
+        &mut fixture.aft,
+        "ordinary-project-git-config",
+        "git init -q --template= && printf '\n# ordinary-project-metadata\n' >> .git/config",
+    );
+    assert_eq!(response["status"], "completed", "{response:?}");
+    assert!(std::fs::read_to_string(fixture.project.join(".git/config"))
+        .unwrap()
+        .contains("# ordinary-project-metadata"));
+    assert!(fixture.aft.shutdown().success());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_macos() {
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
@@ -954,14 +970,30 @@ fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_mac
     let configured_secret = home.join("extra-secret.txt");
     let git = project.join(".git");
     let git_config = git.join("config");
-    std::fs::create_dir_all(&git).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&ssh).unwrap();
     std::fs::create_dir_all(&storage).unwrap();
+    let git_init = std::process::Command::new("git")
+        .args(["init", "-q", "--template="])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        git_init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
     std::fs::write(&secret, "credential").unwrap();
     std::fs::write(&configured_secret, "configured-secret").unwrap();
-    std::fs::write(&git_config, "safe").unwrap();
 
-    let mut aft = AftProcess::spawn_with_env(&[("HOME", OsStr::new(&home))]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("HOME", OsStr::new(&home)),
+        ("GIT_CONFIG_COUNT", OsStr::new("0")),
+    ]);
     let configured = configure_native_policy(
         &mut aft,
         &project,
@@ -1005,13 +1037,18 @@ fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_mac
     let git_write = foreground(
         &mut aft,
         "native-git-write",
-        &format!("printf corrupted > {}", quote(&git_config)),
+        &format!(
+            "printf '\\n# writable-metadata-test\\n' >> {}",
+            quote(&git_config)
+        ),
     );
     assert_eq!(
         git_write["status"], "completed",
         "ordinary Git metadata write should pass: {git_write:?}"
     );
-    assert_eq!(std::fs::read_to_string(&git_config).unwrap(), "corrupted");
+    assert!(std::fs::read_to_string(&git_config)
+        .unwrap()
+        .contains("# writable-metadata-test"));
 
     let hook = git.join("hooks/pre-commit");
     let hook_write = foreground(

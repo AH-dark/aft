@@ -1,0 +1,266 @@
+use super::*;
+use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+use crate::db::access_grants::{self as grants, ScopeKey};
+
+#[test]
+fn granted_checkout_controls_join_relaxed_denies() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let root = base.join("own");
+    let granted = base.join("granted");
+    let home = base.join("home");
+    let store = base.join("store");
+    let task_io = base.join("tasks/session/task/io");
+    let temp = base.join("temp");
+    for path in [&root, &granted, &home, &store, &task_io, &temp] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&granted)
+        .status()
+        .unwrap()
+        .success());
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(store.clone()),
+            ..Default::default()
+        },
+    );
+    let scope = ScopeKey {
+        owner: "reserved:prefrontal-core".into(),
+        scope_ref: "checkout-controls".into(),
+        epoch: 1,
+    };
+    let conn = crate::db::open(&store.join("aft.db")).unwrap();
+    grants::register_scope(&conn, &scope, None, &ctx.config()).unwrap();
+    grants::register_worker(&conn, &scope).unwrap();
+    grants::insert(
+        &conn,
+        &scope,
+        &AccessGrant {
+            path: granted.clone(),
+            operation: AccessOperation::Write,
+            kind: GrantKind::Subtree,
+        },
+    )
+    .unwrap();
+    ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
+    crate::access_policy::with_scope(Some(scope), || {
+        let profile = build_relaxed_profile(
+            &ctx,
+            &home,
+            &[root.clone()],
+            &[resolve_git_policy(&root).unwrap()],
+            &store,
+            &task_io,
+            &temp,
+        )
+        .unwrap();
+        for path in [
+            ".git/hooks",
+            ".git/config",
+            ".cortexkit/aft.jsonc",
+            ".cortexkit/aft/filters",
+        ] {
+            assert!(
+                profile.write_deny.contains(&granted.join(path)),
+                "missing deny: {path}"
+            );
+        }
+    });
+}
+
+#[test]
+fn checkout_control_denies_preserve_nested_and_non_repository_root_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    let nested = root.join("src");
+    std::fs::create_dir(&nested).unwrap();
+    let nonrepo = tempfile::tempdir().unwrap();
+    let nonrepo = nonrepo.path().canonicalize().unwrap();
+    for path in [&nested, &nonrepo] {
+        // Project roots without a local .git do not discover an ancestor
+        // repository. Grants keep that behavior and add no ancestor paths.
+        let git = resolve_git_policy(path).unwrap();
+        assert!(git.read_roots.is_empty());
+        let denies = checkout_control_denies(path, &git).unwrap();
+        assert!(denies.iter().all(|deny| deny.starts_with(path)));
+        assert!(denies.contains(&path.join(".cortexkit/aft.jsonc")));
+        assert!(denies.contains(&path.join(".git/config")));
+    }
+}
+
+#[test]
+fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let root = home.join("Work/own");
+    let granted = home.join("Work/shared");
+    let sibling = home.join("Work/sibling");
+    let read_only = home.join("Work/reference");
+    let credential = home.join(".ssh");
+    let other_scope = home.join("Work/other-scope");
+    let store = base.join("store");
+    let temp = base.join("temp");
+    let task_io = base.join("tasks/session/task/io");
+    let private = home.join(".local/share/cortexkit/another-session");
+    for path in [
+        &root,
+        &granted,
+        &sibling,
+        &read_only,
+        &credential,
+        &other_scope,
+        &store,
+        &temp,
+        &task_io,
+        &private,
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let file = sibling.join("one-file");
+    std::fs::write(&file, "file").unwrap();
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(store.clone()),
+            sandbox: crate::config::SandboxConfig {
+                read_deny: vec![credential.clone(), private.clone()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let scope = ScopeKey {
+        owner: "reserved:prefrontal-core".into(),
+        scope_ref: "worker".into(),
+        epoch: 1,
+    };
+    let other = ScopeKey {
+        scope_ref: "other".into(),
+        ..scope.clone()
+    };
+    let conn = crate::db::open(&store.join("aft.db")).unwrap();
+    for key in [&scope, &other] {
+        grants::register_scope(&conn, key, None, &ctx.config()).unwrap();
+        grants::register_worker(&conn, key).unwrap();
+    }
+    for (path, operation, kind) in [
+        (&granted, AccessOperation::Write, GrantKind::Subtree),
+        (&read_only, AccessOperation::Read, GrantKind::Subtree),
+        (&credential, AccessOperation::Write, GrantKind::Subtree),
+        (&private, AccessOperation::Write, GrantKind::Subtree),
+        (&file, AccessOperation::Write, GrantKind::File),
+        (&sibling, AccessOperation::Write, GrantKind::File),
+    ] {
+        grants::insert(
+            &conn,
+            &scope,
+            &AccessGrant {
+                path: path.clone(),
+                operation,
+                kind,
+            },
+        )
+        .unwrap();
+    }
+    grants::insert(
+        &conn,
+        &other,
+        &AccessGrant {
+            path: other_scope.clone(),
+            operation: AccessOperation::Write,
+            kind: GrantKind::Subtree,
+        },
+    )
+    .unwrap();
+    ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
+
+    crate::access_policy::with_scope(Some(scope), || {
+        let policy = ctx.access_policy("").unwrap();
+        let strict = policy.compile_shell(temp.clone(), vec![], vec![]).unwrap();
+        let relaxed = build_relaxed_profile(
+            &ctx,
+            &home,
+            &[root.clone()],
+            &[resolve_git_policy(&root).unwrap()],
+            &store,
+            &task_io,
+            &temp,
+        )
+        .unwrap();
+        for profile in [&strict, &relaxed] {
+            assert!(
+                profile.writable_roots.contains(&granted),
+                "{:?}",
+                profile.mode
+            );
+            assert!(
+                profile.data_policy.write_allow.contains(&granted),
+                "{:?}",
+                profile.mode
+            );
+            assert!(
+                profile.data_policy.read_allow.contains(&granted),
+                "{:?}",
+                profile.mode
+            );
+            assert!(
+                profile.data_policy.read_allow.contains(&read_only),
+                "{:?}",
+                profile.mode
+            );
+            for excluded in [
+                &sibling,
+                &other_scope,
+                &credential,
+                &private,
+                &read_only,
+                &file,
+            ] {
+                assert!(
+                    !profile.writable_roots.contains(excluded),
+                    "{:?}: {}",
+                    profile.mode,
+                    excluded.display()
+                );
+                assert!(
+                    !profile.data_policy.write_allow.contains(excluded),
+                    "{:?}: {}",
+                    profile.mode,
+                    excluded.display()
+                );
+            }
+            assert!(!profile.data_policy.read_allow.contains(&credential));
+            assert!(!profile.data_policy.read_allow.contains(&private));
+            assert!(!profile.data_policy.read_allow.contains(&other_scope));
+            assert!(!profile.data_policy.read_allow.contains(&sibling));
+        }
+        assert!(relaxed.write_deny_nested.contains(&home.join("Work")));
+        #[cfg(target_os = "linux")]
+        {
+            let linux =
+                compute_linux_profile(strict, &home, &[], &[], &mut SecureReadDirectoryLister)
+                    .unwrap();
+            assert!(linux.writable_roots.contains(&granted));
+            assert!(linux.read_allow.contains(&granted));
+            assert!(linux.read_allow.contains(&read_only));
+            assert!(!linux
+                .read_allow
+                .iter()
+                .any(|path| credential.starts_with(path)));
+        }
+    });
+    assert!(ctx.access_policy("").unwrap().grants.is_empty());
+}

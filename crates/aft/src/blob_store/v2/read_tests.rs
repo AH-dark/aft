@@ -147,6 +147,138 @@ fn cache_misses(connection: &rusqlite::Connection, reset: bool) -> i32 {
 }
 
 #[test]
+fn contains_query_plan_uses_covering_membership_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "membership"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    store.put_or_touch(&key, &vec![42; 16 * 1024]).unwrap();
+    let probe = ReadProbe::start(&store);
+    assert!(store.contains(&key).unwrap());
+    assert!(!store
+        .contains(&FamilyKey::new(FamilyPlane::Semantic, [2; 32]))
+        .unwrap());
+    let counts = probe.finish();
+    let queries = counts
+        .statements
+        .keys()
+        .filter(|sql| sql.starts_with("SELECT 1 FROM blob_payloads"))
+        .collect::<Vec<_>>();
+    assert_eq!(queries.len(), 1, "{counts:?}");
+    let connection = lock(&store.inner.connection);
+    let mut statement = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", queries[0]))
+        .unwrap();
+    let plans = statement
+        .query_map(params![key.as_bytes().as_slice()], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("USING COVERING INDEX blob_membership")),
+        "contains must use the payload-free membership index: {plans:?}"
+    );
+}
+
+fn total_changes(store: &FamilyStore) -> u64 {
+    lock(&store.inner.connection)
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn put_or_touch_same_epoch_reuse_writes_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "reuse"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    store.put_or_touch(&key, b"payload").unwrap();
+    let before = total_changes(&store);
+    assert_eq!(
+        store.put_or_touch(&key, b"payload").unwrap(),
+        PutOrTouch::Reused { ref_epoch: 0 }
+    );
+    assert_eq!(
+        total_changes(&store) - before,
+        0,
+        "same-epoch reuse wrote a row"
+    );
+}
+
+#[test]
+fn put_or_touch_older_epoch_reuse_advances_and_prevents_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "advance"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    store.put_or_touch(&key, b"payload").unwrap();
+    let epoch = store.raise_epoch(1).unwrap();
+    let before = total_changes(&store);
+    assert_eq!(
+        store.put_or_touch(&key, b"payload").unwrap(),
+        PutOrTouch::Reused { ref_epoch: epoch }
+    );
+    assert_eq!(total_changes(&store) - before, 1);
+    assert!(!store.delete_if_unreferenced_since(&key, epoch).unwrap());
+    assert!(store.delete_if_unreferenced_since(&key, epoch + 1).unwrap());
+}
+
+#[test]
+fn put_or_touch_digest_conflict_does_not_write_or_advance_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "conflict"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    store.put_or_touch(&key, b"payload").unwrap();
+    let epoch = store.raise_epoch(1).unwrap();
+    let before = total_changes(&store);
+    assert!(
+        matches!(store.put_or_touch(&key, b"different"), Err(StoreError::ConflictingPayload(k)) if k == key)
+    );
+    assert_eq!(total_changes(&store), before);
+    assert_eq!(store.get(&key).unwrap().as_deref(), Some(&b"payload"[..]));
+    assert!(store.delete_if_unreferenced_since(&key, epoch).unwrap());
+}
+
+#[test]
+fn payload_upper_bound_includes_uncheckpointed_wal_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "wal-bound"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    lock(&store.inner.connection)
+        .execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let main_bytes = std::fs::metadata(store.path()).unwrap().len();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    let payload = vec![42; 1024 * 1024];
+    store.put_or_touch(&key, &payload).unwrap();
+    assert_eq!(std::fs::metadata(store.path()).unwrap().len(), main_bytes);
+    let bound = store.payload_bytes_upper_bound().unwrap();
+    assert!(bound > main_bytes);
+    assert!(bound >= payload.len() as u64);
+    assert!(bound >= store.usage().unwrap().payload_bytes);
+}
+
+#[test]
 fn current_epoch_semantic_touch_reads_only_membership_index() {
     let dir = tempfile::tempdir().unwrap();
     let access = StoreWriteAccess::for_registered_view(dir.path(), "read-budget");

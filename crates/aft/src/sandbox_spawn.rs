@@ -1637,12 +1637,26 @@ fn build_native_profile(
         policy.private_stores.read_allow.sort_unstable();
         policy.private_stores.read_allow.dedup();
         policy.private_stores.write_allow = project_roots.clone();
-        policy.private_stores.deny.push(session_store.clone());
+        policy.add_session_store_floor(session_store.clone());
         policy.private_stores.session_task_read_dir = Some(session_store.clone());
         let mut write_deny_nested = Vec::new();
         let mut shell_write_deny = Vec::new();
         let mut shell_read_deny = Vec::new();
         let jailed = worker_jail_active();
+        // Ordinary sessions retain writable project Git configuration; jailed
+        // workers and delegated write roots must not change execution controls.
+        let mut control_roots = if jailed {
+            project_roots.clone()
+        } else {
+            Vec::new()
+        };
+        control_roots.extend(policy.shell_grants(crate::access_policy::AccessOperation::Write));
+        control_roots.sort_unstable();
+        control_roots.dedup();
+        for root in &control_roots {
+            let git = resolve_git_policy(root)?;
+            write_deny_nested.extend(checkout_control_denies(root, &git)?);
+        }
         #[cfg(target_os = "macos")]
         if jailed {
             install_worker_mktemp(&temp_dir)?;
@@ -1650,23 +1664,7 @@ fn build_native_profile(
         for (root, git_policy) in project_roots.iter().zip(&git_policies) {
             #[cfg(target_os = "linux")]
             write_deny_nested.push(root.join(".git"));
-            if jailed {
-                if let Some((git_dir, _)) = &git_policy.linked {
-                    // These files bind the checkout to operator-owned Git
-                    // configuration. A shell must not redirect that binding
-                    // and turn model-written configuration into read grants.
-                    write_deny_nested.push(root.join(".git"));
-                    write_deny_nested.extend(
-                        ["config.worktree", "commondir", "gitdir"].map(|name| git_dir.join(name)),
-                    );
-                }
-                // Protect executable filters and project configuration, not
-                // scratch documents that file tools already let workers write.
-                write_deny_nested.extend([
-                    root.join(".cortexkit/aft.jsonc"),
-                    root.join(".cortexkit/aft/filters"),
-                ]);
-            } else {
+            if !jailed {
                 write_deny_nested.push(root.join(".cortexkit"));
             }
             #[cfg(target_os = "macos")]
@@ -1851,7 +1849,7 @@ fn build_relaxed_profile(
     task_io: &Path,
     temp: &Path,
 ) -> Result<SandboxProfile, String> {
-    let policy = ctx
+    let mut policy = ctx
         .access_policy("")
         .map_err(|error| error.data.to_string())?;
     let mut read_deny = policy.absolute_floor.clone();
@@ -1923,31 +1921,27 @@ fn build_relaxed_profile(
     stores
         .write_allow
         .extend([temp.to_path_buf(), task_io.to_path_buf()]);
+    // Select grants against the complete credential and store floors before
+    // protecting their control files or carving out sibling checkout denies.
+    policy.absolute_floor = read_deny.clone();
+    policy.private_stores = stores.clone();
+    let write_grants = policy.shell_grants(crate::access_policy::AccessOperation::Write);
+    let mut control_roots = roots.to_vec();
+    control_roots.extend(write_grants.iter().cloned());
+    control_roots.sort_unstable();
+    control_roots.dedup();
+    let control_git_policies = control_roots
+        .iter()
+        .map(|root| resolve_git_policy(root))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut writable = roots.to_vec();
     writable.extend(linked_git_grants(git_policies));
     let files = linked_git_file_grants(git_policies);
     stores.write_allow.extend(writable.iter().cloned());
     stores.write_allow.extend(files.iter().cloned());
     let mut checkout_denies = vec![home.join("Work")];
-    for (root, git) in roots.iter().zip(git_policies) {
-        if git.read_roots.is_empty() {
-            write_deny.extend(
-                ["config", "config.worktree", "hooks"].map(|name| root.join(".git").join(name)),
-            );
-        }
-        for dir in &git.read_roots {
-            // Config and hooks remain immutable even in the worker's own .git.
-            write_deny.push(dir.join("config"));
-            write_deny.push(dir.join("config.worktree"));
-            write_deny.push(dir.join("hooks"));
-        }
-        write_deny.extend(git.hooks.iter().cloned());
-        write_deny.extend(
-            git.configured_paths
-                .iter()
-                .filter(|(key, _)| key != "core.excludesFile")
-                .map(|(_, path)| path.clone()),
-        );
+    for (root, git) in control_roots.iter().zip(&control_git_policies) {
+        write_deny.extend(checkout_control_denies(root, git)?);
         stores.read_allow.extend(git.read_roots.iter().cloned());
         stores.read_allow.extend(git.hooks.iter().cloned());
         stores
@@ -1964,7 +1958,6 @@ fn build_relaxed_profile(
             {
                 let mut metadata = Vec::new();
                 if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
-                    write_deny.push(path.clone());
                     if path.is_dir() {
                         stores.read_allow.push(path);
                     }
@@ -1972,14 +1965,6 @@ fn build_relaxed_profile(
                 }
             }
         }
-        if let Some((git_dir, _)) = &git.linked {
-            write_deny.push(root.join(".git"));
-            write_deny.extend(["commondir", "gitdir"].map(|name| git_dir.join(name)));
-        }
-        write_deny.extend([
-            root.join(".cortexkit/aft.jsonc"),
-            root.join(".cortexkit/aft/filters"),
-        ]);
         let listing = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"])
             .map_err(|error| format!("cannot enumerate sibling checkouts: {error}"))?;
         if listing.status.success() {
@@ -2016,6 +2001,11 @@ fn build_relaxed_profile(
         write_deny.push(binary);
     }
     stores.read_allow.retain(|path| path.exists());
+    writable.extend(write_grants.iter().cloned());
+    stores.write_allow.extend(write_grants);
+    stores
+        .read_allow
+        .extend(policy.shell_grants(crate::access_policy::AccessOperation::Read));
     let mut profile = SandboxProfile {
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
@@ -2037,6 +2027,51 @@ fn build_relaxed_profile(
     profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())
+}
+
+/// Build the same control-file denies for project and granted write roots,
+/// including a linked worktree's common Git directory. Backends that cannot
+/// enforce nested denies report those paths as unenforced.
+#[cfg(unix)]
+fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>, String> {
+    let mut denies = Vec::new();
+    let git_dirs = if git.read_roots.is_empty() {
+        vec![root.join(".git")]
+    } else {
+        git.read_roots.clone()
+    };
+    for dir in git_dirs {
+        denies.extend(["config", "config.worktree", "hooks"].map(|name| dir.join(name)));
+    }
+    denies.extend(git.hooks.iter().cloned());
+    denies.extend(
+        git.configured_paths
+            .iter()
+            .filter(|(key, _)| key != "core.excludesFile")
+            .map(|(_, path)| path.clone()),
+    );
+    for key in ["core.hooksPath", "mason.originalHooksPath"] {
+        if !git
+            .configured_paths
+            .iter()
+            .any(|(existing, _)| existing == key)
+        {
+            if let Some((_, path)) = configured_git_path(root, key, &mut Vec::new())? {
+                denies.push(path);
+            }
+        }
+    }
+    if let Some((git_dir, _)) = &git.linked {
+        // Binding pointers must stay immutable too: redirecting one would
+        // replace the operator-owned configuration used on the next spawn.
+        denies.push(root.join(".git"));
+        denies.extend(["commondir", "gitdir"].map(|name| git_dir.join(name)));
+    }
+    denies.extend([
+        root.join(".cortexkit/aft.jsonc"),
+        root.join(".cortexkit/aft/filters"),
+    ]);
+    Ok(denies)
 }
 
 #[cfg(unix)]
@@ -7588,6 +7623,10 @@ mod git_policy_cache_tests {
         std::hint::black_box(heap);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "sandbox_scope_grants_tests.rs"]
+mod scope_grant_tests;
 
 #[cfg(test)]
 mod policy_tests {

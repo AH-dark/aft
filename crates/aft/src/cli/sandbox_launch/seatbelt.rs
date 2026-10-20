@@ -711,6 +711,58 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_granted_folder_carves_work_and_sibling_checkout_denies() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let work = home.join("Work");
+        let own = work.join("own");
+        let sibling = work.join("sibling");
+        let granted = sibling.join("granted");
+        let temp = home.join("temp");
+        let config = granted.join(".git/config");
+        for dir in [&own, &granted, &temp] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut profile = SandboxProfile::build(
+            vec![own.clone(), granted.clone()],
+            vec![config.clone()],
+            vec![work.clone(), sibling.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        profile.mode = aft::config::SandboxMode::Relaxed;
+        let source = render_profile(&profile).unwrap();
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* (require-all {} (require-not {}) (require-not {})))",
+                relaxed_filter(&work, false).unwrap(),
+                relaxed_filter(&own, false).unwrap(),
+                relaxed_filter(&granted, false).unwrap(),
+            )),
+            "{source}"
+        );
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* (require-all {} (require-not {})))",
+                relaxed_filter(&sibling, false).unwrap(),
+                relaxed_filter(&granted, false).unwrap(),
+            )),
+            "{source}"
+        );
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* {})",
+                relaxed_filter(&config, false).unwrap(),
+            )),
+            "{source}"
+        );
+    }
+
+    #[test]
     fn relaxed_renderer_is_default_allow_with_scoped_and_case_alias_denies() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();

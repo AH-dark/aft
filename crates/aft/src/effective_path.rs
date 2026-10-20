@@ -483,19 +483,31 @@ struct LoginPathProbe {
 
 #[cfg(unix)]
 fn probe_login_shell_path() -> LoginPathProbe {
+    probe_login_shell_path_with_budgets(
+        LOGIN_SHELL_PATH_PROBE_TIMEOUT,
+        LOGIN_SHELL_PATH_PROBE_TOTAL_BUDGET,
+    )
+}
+
+#[cfg(unix)]
+// Success-path tests use a generous timeout without changing startup's budget.
+fn probe_login_shell_path_with_budgets(
+    probe_timeout: Duration,
+    total_budget: Duration,
+) -> LoginPathProbe {
     let candidates = login_shell_candidates();
     let fallback_shell = candidates
         .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-    let deadline = Instant::now() + LOGIN_SHELL_PATH_PROBE_TOTAL_BUDGET;
+    let deadline = Instant::now() + total_budget;
 
     for shell in candidates {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
-        let timeout = LOGIN_SHELL_PATH_PROBE_TIMEOUT.min(deadline.saturating_duration_since(now));
+        let timeout = probe_timeout.min(deadline.saturating_duration_since(now));
         if let Some(path) =
             probe_login_shell_path_once(&shell, timeout).and_then(|path| filter_login_path(&path))
         {
@@ -1388,7 +1400,11 @@ eval "$2"
         let _candidates =
             EnvVarGuard::set("AFT_TEST_LOGIN_SHELL_CANDIDATES", shell.to_str().unwrap());
         assert_eq!(
-            probe_login_shell_path().path,
+            probe_login_shell_path_with_budgets(
+                TEST_PROBE_SUCCESS_TIMEOUT,
+                TEST_PROBE_SUCCESS_TIMEOUT,
+            )
+            .path,
             Some(OsString::from("/custom/bin:/usr/bin"))
         );
     }

@@ -378,6 +378,12 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     {
         unenforced.push("nested_write_deny");
     }
+    let nested_paths = profile
+        .write_deny_nested
+        .iter()
+        .filter(|deny| write_roots.iter().any(|root| paths_overlap(deny, root)))
+        .map(|path| format!("write:{}", path.display()))
+        .collect::<Vec<_>>();
     if profile.read_deny.iter().any(|deny| {
         profile
             .read_allow
@@ -395,11 +401,13 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
         unenforced.push("sccache_server_unblockable_on_landlock");
     }
     if profile.write_deny_nested.iter().any(|deny| {
-        deny.file_name() == Some(std::ffi::OsStr::new("config.worktree"))
-            && write_roots.iter().any(|root| paths_overlap(deny, root))
+        matches!(
+            deny.file_name().and_then(|name| name.to_str()),
+            Some("config" | "config.worktree")
+        ) && write_roots.iter().any(|root| paths_overlap(deny, root))
     }) {
-        // The linked Git directory must be writable for index updates, but
-        // Landlock cannot subtract its operator-owned hooks configuration.
+        // Git metadata must be writable for index updates, but Landlock's
+        // additive grants cannot subtract repository configuration.
         unenforced.push("worktree_git_config_mutable_on_landlock");
     }
     if profile.write_deny_nested.iter().any(|deny| {
@@ -411,7 +419,11 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
         unenforced.push("worktree_git_binding_mutable_on_landlock");
     }
 
-    eprint!("sandbox-launch: unenforced=[{}]", unenforced.join(","));
+    eprint!(
+        "sandbox-launch: unenforced=[{}] nested_write_deny_paths=[{}]",
+        unenforced.join(","),
+        nested_paths.join(",")
+    );
     if applied.partially_enforced {
         eprint!(
             " landlock_abi={} landlock_required={}",

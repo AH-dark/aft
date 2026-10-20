@@ -102,7 +102,10 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
     # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # Green runs take 17-24 minutes (library tests, conformance, then the Bun
+    # unit suites), so 25 left no margin: a loaded merge-queue run was
+    # cancelled while its Bun tests were still passing.
+    timeout-minutes: 35
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache

@@ -1596,7 +1596,9 @@ impl DifferentialCorpus {
 fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
     let f = fixture();
     let conn = Connection::open(&f.blobs).unwrap();
-    for seed in 1..=6_u64 {
+    // These seeds collectively exercise every corpus edit with fewer redundant
+    // all-pairs SQLite materializations.
+    for seed in [1_u64, 2, 4] {
         let mut corpus = DifferentialCorpus::new(seed);
         let mut versions = Vec::new();
         let mut steps = Vec::new();

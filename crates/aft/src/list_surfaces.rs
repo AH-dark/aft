@@ -395,6 +395,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "the module operation refuses oversized files after at most one lookahead byte; no truncated list or partial file is returned",
     },
     ExclusionEntry {
+        file: "subc/perf_sweep.rs",
+        enclosing_item: "parse_log",
+        location_or_primitive: "bounded log iterator and take(8) metric previews",
+        reason: "flow-only telemetry stops at byte or line caps and reports truncated plus scanned counts; top tool and WARN previews disclose tools_total and warn_shapes_total, not a paginated agent list",
+    },
+    ExclusionEntry {
+        file: "subc/perf_sweep.rs",
+        enclosing_item: "summarize_profile, child_output, ChildCapture::drain",
+        location_or_primitive: "top eight threads, first stack, leaf frame and child-output ceilings",
+        reason: "flow-only profile summary preserves the sweep script's preview limits with threads_total; bounded child stdout is refused as a named gap rather than returned partially, and a marked bounded stderr tail preserves the failure cause",
+    },
+    ExclusionEntry {
         file: "url_fetch.rs",
         enclosing_item: "read_response_body, fetch_url_to_cache",
         location_or_primitive: "URL download byte ceiling and UTF-8 prefix repair",

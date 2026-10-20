@@ -209,6 +209,7 @@ mod consent;
 mod drain;
 mod flow_read;
 mod health;
+mod perf_sweep;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
 mod manifest;
@@ -3879,6 +3880,7 @@ pub fn run_subc_mode(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
 ) -> Result<(), SubcError> {
+    perf_sweep::initialize();
     run_subc_mode_with_probe(
         connection_file_path,
         ctx,
