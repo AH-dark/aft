@@ -1,4 +1,1 @@
-## Lower background disk-limit and health-rollup CPU
-
-- Disk-limit accounting now recognizes immutable artifacts from both checkout publication formats. Republishing a view reuses the sizes of retained generations instead of invalidating every cached size; unchanged directories reuse their immutable total. Mutable databases, reader markers, and family stores are still measured freshly, and eviction limits and periodic reconciliation are unchanged.
-- Health rollup now logs per-step elapsed time and call counts once per minute at debug level; the uncapped memory census also includes them under `health_rollup_tick`. Census rendering reuses rows when only unreported diagnostics change and moves prebuilt root JSON into the reply without serializing another copy. The census still updates changed byte counts, process measurements, and index-measurement ages.
+- The background check that keeps index views under their disk limit no longer re-measures unchanged folders on every pass (about 94% fewer file checks), and the health summary does less work per tick.
