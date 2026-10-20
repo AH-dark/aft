@@ -1,0 +1,1 @@
+- Background commands started right after a project binds, before AFT's database has finished opening, are now saved, so they survive a daemon restart.

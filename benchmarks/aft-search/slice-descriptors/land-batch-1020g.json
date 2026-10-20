@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Batch G: the search_index.rs change only keeps files AFT writes outside the project root out of that root's search index, so later cache saves don't refuse and force a cold rebuild. In-root admission, query routing and ranking are unchanged; benchmark rows must remain byte-identical. The rest of the batch is URL outline headers, bash timeout task ids, runon re-attach, a parent-search test watchdog, health rollup cost, early bash-task persistence, login-shell retry, delete under load, call-graph pending capture order and 30-minute scratch retention."
+}
