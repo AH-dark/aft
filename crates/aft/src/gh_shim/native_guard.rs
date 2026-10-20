@@ -5,12 +5,14 @@ use super::*;
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ShellSignals {
     pub(super) sandboxed: bool,
+    pub(super) worker_marked: bool,
 }
 
 impl ShellSignals {
     pub(super) fn from_process() -> Self {
         Self {
             sandboxed: native_sandbox_active(),
+            worker_marked: std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_some(),
         }
     }
 }
@@ -66,6 +68,14 @@ pub(super) fn permission_with(
                 .into(),
         );
     }
+    // AFT also marks worker shells on platforms without an enforced canary
+    // fence. Keep those shells off operator gh even when scope lookup is down.
+    if signals.worker_marked {
+        return Err(
+            "operator gh is not available to worker-marked shells; use governed reads or bot speech"
+                .into(),
+        );
+    }
     if relay
         .ticket
         .as_deref()
@@ -79,8 +89,8 @@ pub(super) fn permission_with(
         }
     }
     // The main agent can have a ticket without an authenticated session scope
-    // when prefrontal-core is offline. In an unconfined shell, a failed or empty
-    // lookup does not establish worker status.
+    // when prefrontal-core is offline. In an unconfined, unmarked shell, a failed
+    // or empty lookup does not establish worker status.
     Ok(())
 }
 

@@ -617,7 +617,10 @@ fn audit_native_permission_combines_canary_and_daemon_worker_evidence() {
         for sandboxed in [false, true] {
             let permission = super::super::native_guard::permission_with(
                 &context,
-                super::super::native_guard::ShellSignals { sandboxed },
+                super::super::native_guard::ShellSignals {
+                    sandboxed,
+                    worker_marked: false,
+                },
                 relay_client::worker_session,
             );
             assert_eq!(permission.is_ok(), !sandboxed && !worker);

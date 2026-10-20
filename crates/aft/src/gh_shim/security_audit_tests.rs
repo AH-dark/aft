@@ -245,7 +245,10 @@ fn audit_worker_native_exit_is_closed_for_every_legacy_command_shape() {
         let status = native_guard::dispatch_with(
             &args(&raw),
             &relay(Some("worker-ticket")),
-            native_guard::ShellSignals { sandboxed: true },
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false,
+            },
             |_| Ok(Some(true)),
             |_| panic!("worker reached operator gh: {raw:?}"),
         );
@@ -260,7 +263,10 @@ fn audit_authenticated_head_keeps_native_argv_and_exit_status() {
     let status = native_guard::dispatch_with(
         &argv,
         &relay(Some("head-ticket")),
-        native_guard::ShellSignals { sandboxed: false },
+        native_guard::ShellSignals {
+            sandboxed: false,
+            worker_marked: false,
+        },
         |_| Ok(Some(false)),
         |forwarded| {
             calls.push(forwarded.to_vec());
@@ -297,6 +303,38 @@ fn review_unscoped_head_ticket_preserves_native_passthrough() {
     }
 }
 
+fn assert_worker_marker_refuses_native_gh(outcome: Result<Option<bool>, String>) {
+    for ticket in [Some("worker-ticket"), None] {
+        let permission = native_guard::permission_with(
+            &relay(ticket),
+            native_guard::ShellSignals {
+                sandboxed: false,
+                worker_marked: true,
+            },
+            |_| outcome.clone(),
+        );
+        assert_eq!(
+            permission.unwrap_err(),
+            "operator gh is not available to worker-marked shells; use governed reads or bot speech"
+        );
+    }
+}
+
+#[test]
+fn review_worker_marker_refuses_native_gh_when_scope_lookup_errors() {
+    assert_worker_marker_refuses_native_gh(Err("prefrontal-core unavailable".into()));
+}
+
+#[test]
+fn review_worker_marker_refuses_native_gh_when_scope_is_empty() {
+    assert_worker_marker_refuses_native_gh(Ok(None));
+}
+
+#[test]
+fn review_worker_marker_cannot_be_overridden_by_head_attribution() {
+    assert_worker_marker_refuses_native_gh(Ok(Some(false)));
+}
+
 #[test]
 fn review_unscoped_head_keeps_v19_and_missing_manifest_reads() {
     for missing in [false, true] {
@@ -331,7 +369,10 @@ fn review_canary_denial_overrides_missing_or_head_scope() {
         let status = native_guard::dispatch_with(
             &args(&["pr", "view", "42"]),
             &relay(Some("ticket")),
-            native_guard::ShellSignals { sandboxed: true },
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false,
+            },
             |_| outcome,
             |_| panic!("jailed worker reached native gh"),
         );
@@ -402,7 +443,10 @@ fn audit_unattributed_jailed_worker_never_gets_operator_gh() {
     for outcome in [Err("old daemon".into()), Ok(None)] {
         assert!(native_guard::permission_with(
             &relay(Some("bad-ticket")),
-            native_guard::ShellSignals { sandboxed: true },
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false
+            },
             |_| outcome
         )
         .is_err());
@@ -812,7 +856,10 @@ fn audit_worker_speech_still_uses_governed_relay_not_native_gh() {
             native_guard::dispatch_with(
                 forwarded,
                 &relay,
-                native_guard::ShellSignals { sandboxed: true },
+                native_guard::ShellSignals {
+                    sandboxed: true,
+                    worker_marked: false,
+                },
                 |_| Ok(Some(true)),
                 |_| panic!("worker speech reached native gh"),
             )
