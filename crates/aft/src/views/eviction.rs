@@ -300,6 +300,9 @@ thread_local! {
     /// path such as admission walks nothing.
     static TREE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TREE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The byte budget of the last family sweep an enforcement pass on this
+    /// thread started, which its report does not carry.
+    static LAST_SWEEP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
@@ -880,6 +883,8 @@ pub fn enforce(
         },
     };
     if !past(deadline) {
+        #[cfg(test)]
+        LAST_SWEEP_BUDGET.with(|last| last.set(Some(policy.byte_budget)));
         match family::sweep_family_bounded(registry, None, policy, walk_bounds(deadline), None) {
             Ok(sweep) => {
                 report.stopped_early |= sweep.stopped_early;
@@ -2820,5 +2825,284 @@ mod tests {
         assert!(reason.starts_with("queued: view store disk"), "{reason}");
         assert!(reason.contains("did not finish"), "{reason}");
         assert!(!registered(&registry, "c"));
+    }
+
+    /// `SUM(length(payload))` over every plane of the family, the logical
+    /// total the occupancy report prints next to the file bytes.
+    fn payload_total(registry: &FamilyRegistry, _usage: &DiskUsage) -> u64 {
+        let mut total = 0u64;
+        for plane in FamilyPlane::ALL {
+            if let Some(store) =
+                FamilyStoreReader::open_existing(registry.storage(), registry.family(), plane)
+                    .unwrap()
+            {
+                total += store.usage().unwrap().payload_bytes;
+            }
+        }
+        total
+    }
+
+    /// The usage rows the last recorded measurement left in the registry,
+    /// without their timestamps.
+    fn recorded_rows(registry: &FamilyRegistry) -> Vec<String> {
+        registry
+            .read(|connection| {
+                let mut rows = Vec::new();
+                let mut statement = connection
+                    .prepare("SELECT scope, bytes, held FROM view_usage ORDER BY scope")?;
+                let views = statement.query_map([], |row| {
+                    Ok(format!(
+                        "recorded view_usage scope={} bytes={} held={}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(2)?
+                    ))
+                })?;
+                for view in views {
+                    rows.push(view?);
+                }
+                rows.push(format!(
+                    "recorded family_usage file_bytes={}",
+                    connection.query_row(
+                        "SELECT file_bytes FROM family_usage WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )?
+                ));
+                rows.push(format!(
+                    "recorded usage_record complete={}",
+                    connection.query_row(
+                        "SELECT complete FROM usage_record WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, bool>(0)
+                    )?
+                ));
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    /// An admission outcome without the sentence about the background pass,
+    /// which depends on whether another test's pass is running.
+    fn admission(registry: &FamilyRegistry) -> String {
+        match admit_new_view(registry) {
+            Ok(()) => "admitted".to_string(),
+            Err(RegistryError::AdmissionQueued(reason)) => format!(
+                "refused: {}",
+                reason
+                    .split("; ")
+                    .filter(|part| !part.contains("eviction pass"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Err(error) => format!("error: {error}"),
+        }
+    }
+
+    fn enforcement_values(label: &str, report: &EnforcementReport) -> String {
+        let sweep = report.sweep.as_ref();
+        format!(
+            "{label} evicted={:?} sweep_byte_budget={:?} deleted_blobs={:?} deleted_bytes={:?} \
+             deleted_segments={:?} sweep_error={:?} before_file_bytes={} after_file_bytes={} \
+             after_complete={} over_hard={:?} stopped_early={}",
+            report.evicted,
+            LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
+            sweep.map(|sweep| sweep.deleted_blobs),
+            sweep.map(|sweep| sweep.deleted_bytes),
+            sweep.map(|sweep| sweep.deleted_segments),
+            report.sweep_error,
+            report.before.family_store.file_bytes,
+            report.after.family_store.file_bytes,
+            report.after.complete,
+            report.over_hard,
+            report.stopped_early
+        )
+    }
+
+    /// Builds one fixed family (three idle views of their own content plus
+    /// three rows no view references), then measures, accounts, records,
+    /// admits and enforces it below and above its limits, and lists every
+    /// value those steps produce.
+    fn golden_fixture_values() -> Vec<String> {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        for (seed, scope) in ["a", "b", "c"].into_iter().enumerate() {
+            idle_view(&registry, scope, seed as u64, 16);
+        }
+        set_last_bind(&registry, "a", 3_000);
+        set_last_bind(&registry, "b", 1_000);
+        set_last_bind(&registry, "c", 2_000);
+        {
+            let access = crate::blob_store::v2::StoreWriteAccess::for_registered_view(
+                storage.path(),
+                FAMILY,
+            );
+            let store =
+                crate::blob_store::v2::FamilyStore::open(&access, FamilyPlane::Trigram).unwrap();
+            for seed in 10..13 {
+                let bytes = text(seed, 4_000);
+                store
+                    .put_or_touch(
+                        &trigram_key(&bytes),
+                        &TrigramPayload::extract(&bytes, &policy()).encode(),
+                    )
+                    .unwrap();
+            }
+        }
+        wait_for_background_enforcement(&registry);
+        LAST_SWEEP_BUDGET.with(|last| last.set(None));
+
+        let mut values = Vec::new();
+        let usage = measure(&registry, None).unwrap();
+        values.push(format!(
+            "measure family_store file_bytes={} complete={} view_store_bytes={} \
+             held_view_bytes={} complete={}",
+            usage.family_store.file_bytes,
+            usage.family_store.complete,
+            usage.view_store_bytes,
+            usage.held_view_bytes,
+            usage.complete
+        ));
+        values.push(format!(
+            "payload_total={}",
+            payload_total(&registry, &usage)
+        ));
+        values.push(format!("{:?}", account_keys(&registry, None).unwrap()));
+        values.extend(recorded_rows(&registry));
+        values.push(format!("admission default {}", admission(&registry)));
+
+        let below = enforce(&registry, EnforceOptions::default()).unwrap();
+        values.push(enforcement_values("below-limit", &below));
+        values.extend(recorded_rows(&registry));
+
+        registry.set_disk_budget(budget(view_bytes(&below.after, "a"), u64::MAX));
+        let collect = enforce(&registry, EnforceOptions::default()).unwrap();
+        values.push(enforcement_values("collect-all", &collect));
+        values.extend(recorded_rows(&registry));
+        values.push(format!("{:?}", account_keys(&registry, None).unwrap()));
+
+        registry.set_disk_budget(budget(u64::MAX, 1));
+        values.push(format!("admission over-hard {}", admission(&registry)));
+        wait_for_background_enforcement(&registry);
+        values
+    }
+
+    /// Values one fixed family produces through measurement, key accounting,
+    /// recorded usage, admission and two enforcement passes, recorded on
+    /// Linux on main before the disk-limit sweep measured the family's files
+    /// to skip deletion. File
+    /// sizes depend on the platform's SQLite page and write-ahead-log
+    /// behaviour, so other platforms only run the fixture.
+    const GOLDEN_VALUES: &[&str] = &[
+        "measure family_store file_bytes=482989 complete=true view_store_bytes=124704 \
+         held_view_bytes=0 complete=true",
+        "payload_total=98874",
+        "KeyAccounting { referenced_bytes: 159686, shared_bytes: 0, exclusive_bytes: \
+         {\"a\": 53014, \"b\": 53322, \"c\": 53350}, unreferenced_bytes: 64737, complete: true }",
+        "recorded view_usage scope=a bytes=41568 held=false",
+        "recorded view_usage scope=b bytes=41568 held=false",
+        "recorded view_usage scope=c bytes=41568 held=false",
+        "recorded family_usage file_bytes=482989",
+        "recorded usage_record complete=true",
+        "admission default admitted",
+        "below-limit evicted=[] sweep_byte_budget=Some(2147483648) deleted_blobs=Some(0) \
+         deleted_bytes=Some(0) deleted_segments=Some(0) sweep_error=None \
+         before_file_bytes=499469 after_file_bytes=528309 after_complete=true over_hard=[] \
+         stopped_early=false",
+        "recorded view_usage scope=a bytes=41568 held=false",
+        "recorded view_usage scope=b bytes=41568 held=false",
+        "recorded view_usage scope=c bytes=41568 held=false",
+        "recorded family_usage file_bytes=528309",
+        "recorded usage_record complete=true",
+        "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
+         deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
+         sweep_error=None before_file_bytes=544789 after_file_bytes=514481 \
+         after_complete=true over_hard=[] stopped_early=false",
+        "recorded view_usage scope=a bytes=41568 held=false",
+        "recorded family_usage file_bytes=514481",
+        "recorded usage_record complete=true",
+        "KeyAccounting { referenced_bytes: 53014, shared_bytes: 0, exclusive_bytes: \
+         {\"a\": 53014}, unreferenced_bytes: 0, complete: true }",
+        "admission over-hard refused: queued: view store disk: 0 of 41568 bytes are held by \
+         active sessions or protected generations, hard limit 1 bytes, a new view reserves \
+         41568 bytes",
+    ];
+
+    #[test]
+    fn measurement_sweep_and_admission_values_match_the_recorded_golden() {
+        let actual = golden_fixture_values();
+        eprintln!("golden values: {actual:#?}");
+        if cfg!(target_os = "linux") {
+            assert_eq!(actual, GOLDEN_VALUES);
+        }
+    }
+
+    /// Receipt for the views performance gate G2a subset: the process-wide
+    /// `metrics.views_work.logical_aggregates` counter across below-limit
+    /// enforcement passes, with their wall time (reported, not gated). Other
+    /// tests running at the same time would add to that counter, so this one
+    /// is ignored and run alone:
+    /// `cargo test -p agent-file-tools --lib -- --ignored --exact
+    /// views::eviction::tests::g2a_below_limit_pass_logical_aggregates_receipt`.
+    #[test]
+    #[ignore = "reads a process-wide counter; run alone with --ignored --exact"]
+    fn g2a_below_limit_pass_logical_aggregates_receipt() {
+        use std::sync::atomic::Ordering;
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        for (seed, scope) in ["a", "b", "c"].into_iter().enumerate() {
+            idle_view(&registry, scope, seed as u64, 16);
+        }
+        wait_for_background_enforcement(&registry);
+        let planes = FamilyPlane::ALL
+            .into_iter()
+            .filter(|plane| {
+                crate::blob_store::v2::plane_path(storage.path(), FAMILY, *plane)
+                    .unwrap()
+                    .is_file()
+            })
+            .count();
+        let mut passes = Vec::new();
+        for _ in 0..5 {
+            let before = crate::views::io::WORK
+                .logical_aggregates
+                .load(Ordering::SeqCst);
+            let started = Instant::now();
+            let report = enforce(&registry, EnforceOptions::default()).unwrap();
+            let wall_us = started.elapsed().as_micros() as u64;
+            let aggregates = crate::views::io::WORK
+                .logical_aggregates
+                .load(Ordering::SeqCst)
+                - before;
+            assert!(report.evicted.is_empty() && report.sweep.is_some());
+            assert_eq!(
+                LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
+                Some(FAMILY_PAYLOAD_BUDGET_BYTES),
+                "a below-limit pass keeps unreferenced rows under the payload budget"
+            );
+            passes.push(serde_json::json!({
+                "logical_aggregates": aggregates,
+                "enforce_wall_us": wall_us,
+                "family_file_bytes": report.before.family_store.file_bytes,
+            }));
+        }
+        eprintln!(
+            "G2A_RECEIPT {}",
+            serde_json::json!({
+                "counter": "metrics.views_work.logical_aggregates",
+                "plane_stores": planes,
+                "passes": passes,
+            })
+        );
+        // On main since "reduce v2 blob reuse and disk-limit read costs",
+        // measurement opens no plane store and the sweep's page-capacity bound
+        // already rules out deletion for a family this small.
+        for pass in &passes {
+            assert_eq!(
+                pass["logical_aggregates"],
+                serde_json::json!(0),
+                "a below-limit pass ran a logical payload aggregate"
+            );
+        }
     }
 }

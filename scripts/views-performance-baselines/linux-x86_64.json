@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "platform": "Linux 7.0.0-34-generic x86_64",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "recorded_on": "8aceb397b5d9836004b548ea1a5aa8f1d75cd0e8",
+  "note": "Recorded on unchanged main before any slice-2 candidate result. These baselines come from in-process library tests, not from scripts/views-performance-gate.py, because the harness's daemon arms have no per-pass enforcement probe. Main at this commit already contains 00fead598c (measurement opens no plane store; the family sweep skips the payload SUM when a plane's page capacity plus segment bytes fit the budget), so a below-limit pass already runs 0 logical aggregates here.",
+  "gates": {
+    "g2a_subset_below_limit_enforcement": {
+      "counter": "metrics.views_work.logical_aggregates",
+      "definition": "SUM(length(payload)) usage queries on v1/v2 blob stores (views::io::WORK.logical_aggregates), counted across one enforce() pass of a family below every limit (no eviction, sweep byte budget = family_payload).",
+      "command": "cargo test -p agent-file-tools --lib -- --ignored --exact views::eviction::tests::g2a_below_limit_pass_logical_aggregates_receipt --nocapture",
+      "fixture": "three idle views of 2000 text bytes each with a 16 KiB derived database; one plane store (trigram)",
+      "plane_stores": 1,
+      "logical_aggregates_per_pass": 0,
+      "passes": [
+        {"logical_aggregates": 0, "enforce_wall_us": 7448, "family_file_bytes": 396901},
+        {"logical_aggregates": 0, "enforce_wall_us": 5410, "family_file_bytes": 442221},
+        {"logical_aggregates": 0, "enforce_wall_us": 5074, "family_file_bytes": 487541},
+        {"logical_aggregates": 0, "enforce_wall_us": 4522, "family_file_bytes": 532861},
+        {"logical_aggregates": 0, "enforce_wall_us": 4732, "family_file_bytes": 578181}
+      ],
+      "family_file_bytes_note": "The registry's write-ahead log grows by 41200 or 45320 bytes per pass depending on timing; a second run on the same commit read 574061 at the fifth pass.",
+      "wall_time_gated": false
+    },
+    "slice2_exactness_golden": {
+      "command": "cargo test -p agent-file-tools --lib -- --exact views::eviction::tests::measurement_sweep_and_admission_values_match_the_recorded_golden",
+      "values": "GOLDEN_VALUES in crates/aft/src/views/eviction.rs (Linux only)",
+      "stability": "30 runs on this commit: every line constant except the collect-all after_file_bytes and the recorded family_usage after it, which read 514481 in 26 runs and 510361 in 4."
+    }
+  }
+}
