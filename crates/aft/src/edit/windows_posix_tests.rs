@@ -158,6 +158,21 @@ fn windows_posix_verbatim_destination_is_supported() {
 }
 
 #[test]
+fn windows_posix_rename_path_alignment_preserves_content() {
+    let dir = tempfile::tempdir().unwrap();
+    // Exercise every alignment of the counted UTF-16 name within the u64
+    // buffer; success must not depend on zero-filled allocator padding.
+    for length in 1..=8 {
+        let path = dir.path().join(format!("{}.txt", "a".repeat(length)));
+        std::fs::write(&path, b"old\n").unwrap();
+        atomic_write_source(&path, b"new\n").unwrap();
+        assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n", "{path:?}");
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 8);
+}
+
+#[test]
 fn windows_posix_metadata_matches_replace_file() {
     use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
     fn stamp(info: &BY_HANDLE_FILE_INFORMATION) -> (u32, u64, u64, u64) {

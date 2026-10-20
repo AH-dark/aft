@@ -365,6 +365,9 @@ fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
     // ReplaceFileW path instead of changing their meaning.
     use std::path::{Component, Prefix};
     let absolute = std::path::absolute(destination)?;
+    if absolute.to_str().is_none() {
+        return Err(io::Error::other("rename namespace is unsupported"));
+    }
     let path = crate::windows_path::normalize_windows_path(&absolute);
     if matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(
         prefix.kind(), Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(_)
@@ -379,7 +382,13 @@ fn posix_rename(temp: &File, destination: &Path, _fault: Fault) -> io::Result<()
     if let Fault::Rename(code) = _fault {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
-    let name = rename_name(destination)?;
+    let mut name = rename_name(destination)?;
+    let name_bytes =
+        u32::try_from(name.len() * 2).map_err(|_| io::Error::other("rename path is too long"))?;
+    // FileNameLength excludes the terminator, but the Win32 API's path
+    // conversion also consumes a NUL-terminated string. Explicit termination
+    // prevents allocator padding from becoming part of the destination name.
+    name.push(0);
     let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let size = offset
         .checked_add(name.len() * 2)
@@ -398,7 +407,7 @@ fn posix_rename(temp: &File, destination: &Path, _fault: Fault) -> io::Result<()
         (*info).Anonymous.Flags =
             FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
         (*info).RootDirectory = std::ptr::null_mut();
-        (*info).FileNameLength = (name.len() * 2) as u32;
+        (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
             buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
