@@ -261,9 +261,14 @@ else
 fi
 
 bounded_probe() (
+  # A resolver may spawn children that retain stdout after it exits or is killed.
+  # Capture into a private regular file: reading a pipe to EOF could otherwise
+  # keep the caller's command substitution open beyond the watchdog deadline.
+  probe_output=$(mktemp "${TMPDIR:-/tmp}/aft-git-probe.XXXXXXXXXX") || return 125
+  trap 'rm -f "$probe_output"' 0
   # Resolver commands do not consume hook input. The watchdog owns and reaps its
   # timer; none of its output may keep a resolver command-substitution pipe open.
-  "$@" </dev/null &
+  "$@" </dev/null >"$probe_output" &
   probe_pid=$!
   # Read the timer PID only after the watchdog has started its child. Both the
   # watchdog and timer close the publication pipe so this substitution ends
@@ -291,6 +296,7 @@ bounded_probe() (
   wait "$probe_pid" 2>/dev/null
   probe_status=$?
   kill -KILL "$timer_pid" 2>/dev/null || :
+  cat "$probe_output" || return 125
   # Git uses 128 for ordinary errors, including --show-toplevel in a bare
   # repository. Only the watchdog's SIGKILL status denotes a deadline here.
   if [ "$probe_status" -eq 137 ]; then
@@ -307,6 +313,10 @@ probe_value() {
   if [ "$probe_status" -eq 124 ]; then
     printf '%s\n' "AFT: $hook_name resolver exceeded its deadline" >&2
     return 124
+  fi
+  if [ "$probe_status" -eq 125 ]; then
+    printf '%s\n' "AFT: $hook_name could not capture resolver output" >&2
+    return 125
   fi
   return 0
 }
@@ -3690,6 +3700,101 @@ mod tests {
         }
         let elapsed = started.elapsed();
         eprintln!("managed-set read-only verification: {iterations} iterations, {} hooks, {} content reads per iteration, {:.3} ms total, {:.3} ms/launch", expected.len(), expected.len() * 2, elapsed.as_secs_f64() * 1000.0, elapsed.as_secs_f64() * 1000.0 / f64::from(iterations));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_output_capture_does_not_wait_for_resolver_descendants() {
+        use std::process::Stdio;
+
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        fs::create_dir_all(&scratch).unwrap();
+        let temp = tempfile::tempdir_in(scratch).unwrap();
+        let git = temp.path().join("git");
+        let hook = temp.path().join("post-index-change");
+        let output = temp.path().join("output");
+        let generated = managed_git_hook_contents("post-index-change");
+        let bounded = generated.split("\nprobe_value()").next().unwrap();
+        write_executable(
+            &hook,
+            &format!(
+                "{bounded}\nvalue=$(bounded_probe git)\nstatus=$?\nprintf '%s' \"$value\" > \"$AFT_TEST_OUTPUT\"\nexit \"$status\"\n"
+            ),
+        );
+
+        for (finish, expected, allowance) in [
+            ("exit 0", 0, Duration::from_secs(6)),
+            ("wait", 124, Duration::from_secs(15)),
+        ] {
+            // A resolver can leave a child holding stdout after it exits or is
+            // killed. Waiting for that pipe's EOF would outlive the watchdog.
+            write_executable(
+                &git,
+                &format!("#!/bin/sh\nsleep 60 &\nprintf 'probe-output\\n'\n{finish}\n"),
+            );
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg(&hook)
+                .env("AFT_TEST_OUTPUT", &output)
+                .env("TMPDIR", temp.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        temp.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::bash_background::process::start_new_session(&mut command);
+            let mut child = command.spawn().unwrap();
+            let session = child.id();
+            let deadline = Instant::now() + allowance;
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // The mock's detached child is deliberately longer-lived than the
+            // deadline. Reap the whole test session even on the failure path.
+            unsafe { libc::kill(-(session as libc::pid_t), libc::SIGKILL) };
+            child.wait().unwrap();
+            assert!(
+                status.is_some(),
+                "resolver descendant held captured stdout beyond {allowance:?}: {finish}"
+            );
+            assert_eq!(status.unwrap().code(), Some(expected), "{finish}");
+            assert_eq!(fs::read_to_string(&output).unwrap(), "probe-output");
+            assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("aft-git-probe.")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_fails_closed_when_probe_capture_cannot_be_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let hook = temp.path().join("post-index-change");
+        write_executable(&hook, &managed_git_hook_contents("post-index-change"));
+        let output = Command::new("/bin/sh")
+            .arg(&hook)
+            .env("TMPDIR", temp.path().join("missing"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("could not capture resolver output"),
+            "{output:?}"
+        );
     }
 
     #[cfg(unix)]
