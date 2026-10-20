@@ -634,7 +634,7 @@ fn merge_grant(grants: &mut Vec<AccessGrant>, grant: AccessGrant) {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum LaunchTarget {
-    Existing { identity: [u64; 2] },
+    Existing {},
     Future { parent: PathBuf },
 }
 
@@ -645,49 +645,9 @@ fn missing_target(error: &std::io::Error) -> bool {
     )
 }
 
-fn launch_target_identity(path: &Path) -> std::io::Result<[u64; 2]> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = crate::bounded_io::metadata(path)?;
-        Ok([metadata.dev(), metadata.ino()])
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-        use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-        };
-        crate::bounded_io::run(path, None, |path| {
-            let file = std::fs::OpenOptions::new()
-                .access_mode(0)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(path)?;
-            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-            // SAFETY: the live file owns the handle and the successful call
-            // initializes the writable information buffer before it is read.
-            let info = unsafe {
-                if GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) == 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                info.assume_init()
-            };
-            Ok([
-                u64::from(info.dwVolumeSerialNumber),
-                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-            ])
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(std::io::ErrorKind::Unsupported.into())
-    }
-}
-
 fn save_launch_target(path: &Path) -> std::io::Result<LaunchTarget> {
-    match launch_target_identity(path) {
-        Ok(identity) => Ok(LaunchTarget::Existing { identity }),
+    match crate::bounded_io::metadata(path) {
+        Ok(_) => Ok(LaunchTarget::Existing {}),
         Err(error) if missing_target(&error) => {
             // Preserve the ancestor used to resolve a future destination. Its
             // disappearance must not silently move the grant to a higher root.
@@ -731,8 +691,9 @@ fn restorable_launch_target(
         .map(|target| serde_json::from_value::<LaunchTarget>(target.clone()))
         .transpose()
         .map_err(|error| restore_refusal(&grant.path, "invalid_launch_target", error))?;
-    match (launch_target_identity(&grant.path), target) {
-        (Ok(current), Some(LaunchTarget::Existing { identity })) => Ok(current == identity),
+    // Grants name canonical paths, not inodes: an atomic save replaces the
+    // object without changing the path authority delegated by the head.
+    match (crate::bounded_io::metadata(&grant.path), target) {
         (Ok(_), _) => Ok(true),
         (Err(error), Some(LaunchTarget::Existing { .. })) if missing_target(&error) => Ok(false),
         (Err(error), Some(LaunchTarget::Future { parent })) if missing_target(&error) => {
@@ -1057,8 +1018,8 @@ pub(super) fn catalog(
                     entry.get("path").and_then(Value::as_str).map(Path::new)
                         == Some(grant.path.as_path())
                 });
-                // Catalog refetches validate current head authority above, but
-                // cannot turn a saved path into authority over a new object.
+                // Catalog refetches validate current head authority above and
+                // apply launch-time existence rules to the saved canonical path.
                 if let Some(entry) = entry {
                     if !ctx.launch_grant_state.is_absent(key, &grant) {
                         if restorable_launch_target(entry, &grant)? {
@@ -1072,7 +1033,7 @@ pub(super) fn catalog(
             grants = restorable;
         }
         // Save the validated canonical authority and its launch-time target
-        // before taking the database lock, since identity probes can block.
+        // before taking the database lock, since metadata probes can block.
         let saved = if let Some(stored) = &stored {
             stored.clone()
         } else {

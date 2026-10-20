@@ -351,39 +351,72 @@ fn grants_legacy_missing_target_remains_retryable() {
 }
 
 #[test]
-fn grants_replaced_target_does_not_inherit_launch_identity() {
-    let (_dir, ctx, head, worker) = default_fixture();
-    let target = head.project_root.join("original-target");
-    std::fs::create_dir(&target).unwrap();
-    remote_policy::catalog(
-        catalog_request(json!([{"path":target,"mode":"write"}])),
-        &worker,
-        &ctx,
-    )
-    .unwrap();
-    std::fs::rename(&target, head.project_root.join("moved-original")).unwrap();
-    std::fs::create_dir(&target).unwrap();
-    let revived = at_epoch(&worker, 8);
-    restore_launch(&revived, &ctx, "worker").unwrap();
-    let db = ctx.db().unwrap();
-    assert!(
-        store::list(&db.lock().unwrap(), &scope_key(&revived))
-            .unwrap()
-            .is_empty(),
-        "replacement object inherited launch authority"
-    );
-    let refetched = at_epoch(&worker, 9);
-    remote_policy::catalog(json!({"preset":"worker"}), &refetched, &ctx).unwrap();
-    assert!(store::list(&db.lock().unwrap(), &scope_key(&refetched))
-        .unwrap()
-        .is_empty());
-    let fresh = context(&head.project_root, &ctx.storage_dir());
-    let restarted = at_epoch(&worker, 10);
-    restore_launch(&restarted, &fresh, "worker").unwrap();
-    let db = fresh.db().unwrap();
-    assert!(store::list(&db.lock().unwrap(), &scope_key(&restarted))
-        .unwrap()
-        .is_empty());
+fn grants_atomically_replaced_file_keeps_launch_path_authority() {
+    use std::os::unix::fs::MetadataExt;
+
+    for old_identity_field in [false, true] {
+        let (_dir, ctx, head, worker) = default_fixture();
+        let target = head.project_root.join("atomically-saved.txt");
+        std::fs::write(&target, "original content").unwrap();
+        let original = std::fs::metadata(&target).unwrap();
+        remote_policy::catalog(
+            catalog_request(json!([{"path":target,"mode":"write"}])),
+            &worker,
+            &ctx,
+        )
+        .unwrap();
+        let db = ctx.db().unwrap();
+        if old_identity_field {
+            let conn = db.lock().unwrap();
+            let mut saved = store::launch_params(&conn, &launch_key(&worker, "worker").unwrap())
+                .unwrap()
+                .unwrap();
+            saved[0]["target"]["identity"] = json!([original.dev(), original.ino()]);
+            conn.execute(
+                "UPDATE access_launch_params SET params=?1",
+                [saved.to_string()],
+            )
+            .unwrap();
+        }
+        let replacement = head.project_root.join("replacement.tmp");
+        std::fs::write(&replacement, "atomically saved content").unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+        let current = std::fs::metadata(&target).unwrap();
+        assert_ne!(
+            (original.dev(), original.ino()),
+            (current.dev(), current.ino())
+        );
+        let expected = vec![AccessGrant {
+            path: target.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }];
+        let revived = at_epoch(&worker, 8);
+        restore_launch(&revived, &ctx, "worker").unwrap();
+        assert_eq!(
+            store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+            expected,
+            "atomic file replacement lost path authority (old_identity_field={old_identity_field})"
+        );
+        let refetched = at_epoch(&worker, 9);
+        remote_policy::catalog(json!({"preset":"worker"}), &refetched, &ctx).unwrap();
+        assert_eq!(
+            store::list(&db.lock().unwrap(), &scope_key(&refetched)).unwrap(),
+            expected
+        );
+        let fresh = context(&head.project_root, &ctx.storage_dir());
+        let restarted = at_epoch(&worker, 10);
+        restore_launch(&restarted, &fresh, "worker").unwrap();
+        let db = fresh.db().unwrap();
+        assert_eq!(
+            store::list(&db.lock().unwrap(), &scope_key(&restarted)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "atomically saved content"
+        );
+    }
 }
 
 #[tokio::test]
