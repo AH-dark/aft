@@ -170,6 +170,20 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
 }
 
 fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
+    start_with_hard_kill(
+        registry,
+        dir,
+        connection,
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    )
+}
+
+fn start_with_hard_kill(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    connection: PathBuf,
+    hard_kill: crate::bash_background::HardKill,
+) -> String {
     ensure_git_fixture(dir);
     registry
         .spawn_remote(
@@ -180,7 +194,7 @@ fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
             "session".into(),
             dir.into(),
             HashMap::from([("BUILD_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
-            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            hard_kill,
             dir.into(),
             crate::bash_background::TaskSlot::Background { max: 10 },
             true,
@@ -1276,6 +1290,62 @@ async fn exec_remote_bash_route_outage_past_five_minutes_still_delivers_result()
     assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
     let attaches = daemon.methods("exec.attach");
     assert_eq!(attaches.last().unwrap()["params"]["from_seq"], 2);
+    drop(clock);
+}
+
+/// The common agent call: `runon` with no `timeout`. It gets the 30-minute
+/// background default as its run timeout, which AFT records and sends to the
+/// runner, so a restart outage far past five minutes must still end with the
+/// job's result.
+#[tokio::test]
+async fn exec_remote_bash_untimed_runon_survives_an_outage_past_five_minutes() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    // `bash` without `timeout` builds its hard kill exactly like this.
+    let task_id = start_with_hard_kill(
+        &registry,
+        dir.path(),
+        daemon.connection.clone(),
+        crate::bash_background::HardKill::from_timeout_ms(None),
+    );
+    let task = registry.task(&task_id).unwrap();
+    // Recorded no lower than the 30-minute default that was sent: inserting
+    // the record can raise a default kill to one worker wait from now.
+    let recorded = task.state.lock().unwrap().metadata.timeout_ms;
+    assert!(
+        recorded.is_some_and(|ms| ms >= 30 * 60 * 1000),
+        "an untimed runon records at least the background default as its run timeout: {recorded:?}"
+    );
+    daemon.after_refused_connects(3).await;
+    assert_eq!(
+        daemon.methods("exec.run")[0]["params"]["timeout"],
+        30 * 60,
+        "the runner enforces the same limit AFT records"
+    );
+    // Far past the old five-minute cap, short of 5m queue + 30m run + 5m grace.
+    clock.advance(Duration::from_secs(25 * 60));
+    let refused = *daemon.refused_connects.borrow();
+    let still_trying = wait_for("AFT must keep reconnecting during the outage", || {
+        let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+        if snapshot.info.status.is_terminal() {
+            return Some(Err(snapshot));
+        }
+        (*daemon.refused_connects.borrow() >= refused + 3).then_some(Ok(()))
+    })
+    .await;
+    if let Err(snapshot) = still_trying {
+        panic!(
+            "AFT gave up 25 minutes into the outage of an untimed runon: {:?}: {}",
+            snapshot.info.status, snapshot.output_preview
+        );
+    }
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
     drop(clock);
 }
 

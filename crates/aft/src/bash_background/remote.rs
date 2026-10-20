@@ -306,8 +306,8 @@ fn local_os_name() -> &'static str {
 #[cfg(unix)]
 struct ReattachBudget {
     grace: Duration,
-    /// When the job's own limits have passed; `None` when it has no run timeout.
-    job_end: Option<tokio::time::Instant>,
+    /// When the job's own limits have passed.
+    job_end: tokio::time::Instant,
     /// Human-readable summary of those limits, for the give-up message.
     limit_note: String,
     deadline: Option<tokio::time::Instant>,
@@ -325,46 +325,42 @@ struct ReattachBudget {
 impl ReattachBudget {
     fn new(_root: &Path, metadata: &PersistedTask) -> Self {
         let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
-        let run_timeout = metadata.timeout_ms.map(Duration::from_millis);
-        let until_job_end = run_timeout.map(|timeout| {
-            let job_end_ms = metadata
-                .started_at
-                .saturating_add(duration_ms(queue_wait))
-                .saturating_add(duration_ms(timeout));
-            Duration::from_millis(job_end_ms.saturating_sub(unix_millis()))
-        });
+        // A remote task records the run timeout AFT sent with the job: the
+        // caller's `timeout`, or the 30-minute background default when the
+        // call named none. A record without one predates that; assume the
+        // default, the most AFT has sent for an untimed call.
+        let recorded_timeout = metadata.timeout_ms.map(Duration::from_millis);
+        let run_timeout = recorded_timeout.unwrap_or(DEFAULT_BG_TIMEOUT);
+        let job_end_ms = metadata
+            .started_at
+            .saturating_add(duration_ms(queue_wait))
+            .saturating_add(duration_ms(run_timeout));
+        let until_job_end = Duration::from_millis(job_end_ms.saturating_sub(unix_millis()));
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
         #[cfg(test)]
         let (grace, until_job_end) = match tests::take_reattach_budget(_root) {
-            Some(budget) => (budget, until_job_end.map(|_| Duration::ZERO)),
+            Some(budget) => (budget, Duration::ZERO),
             None => (grace, until_job_end),
         };
-        let limit_note = match run_timeout {
-            Some(timeout) => format!(
-                "ck-motor's queue wait limit of {} and its run timeout of {} have passed since AFT submitted it, plus {} of grace",
-                retry_duration(duration_ms(queue_wait)),
-                retry_duration(duration_ms(timeout)),
-                retry_duration(duration_ms(grace)),
-            ),
-            None => format!(
-                "it has no run timeout, so AFT waited {}",
-                retry_duration(duration_ms(grace))
-            ),
-        };
+        let limit_note = format!(
+            "ck-motor's queue wait limit of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
+            retry_duration(duration_ms(queue_wait)),
+            if recorded_timeout.is_some() { "" } else { "assumed " },
+            retry_duration(duration_ms(run_timeout)),
+            retry_duration(duration_ms(grace)),
+        );
         #[cfg(test)]
         let clock = tests::reattach_clock(_root);
         Self {
             grace,
-            job_end: until_job_end.map(|until| tokio::time::Instant::now() + until),
+            job_end: tokio::time::Instant::now() + until_job_end,
             limit_note,
             deadline: None,
             attempts: 0,
             #[cfg(test)]
-            clock_job_end: clock
-                .as_ref()
-                .and_then(|clock| until_job_end.map(|until| clock.now() + until)),
+            clock_job_end: clock.as_ref().map(|clock| clock.now() + until_job_end),
             #[cfg(test)]
             clock,
             #[cfg(test)]
@@ -417,7 +413,7 @@ impl ReattachBudget {
         let (job_end, grace) = (self.job_end, self.grace);
         *self.deadline.get_or_insert_with(|| {
             let now = tokio::time::Instant::now();
-            job_end.map_or(now, |end| end.max(now)) + grace
+            job_end.max(now) + grace
         })
     }
 
