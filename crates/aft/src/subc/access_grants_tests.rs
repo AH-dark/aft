@@ -274,7 +274,7 @@ async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str)
         7,
         serde_json::to_vec(&json!({
             "op":"tool.call", "name":"read", "preset":preset,
-            "arguments":{"filePath":target}
+            "arguments":{"path":target}
         }))
         .unwrap(),
     )
