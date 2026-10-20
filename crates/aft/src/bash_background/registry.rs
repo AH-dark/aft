@@ -201,13 +201,13 @@ pub(crate) const OWNER_PAUSED_REASON: &str = "paused_by_owner";
 pub const RUN_ENDED_REASON: &str = "run_ended";
 
 /// How an owner-directed stop is labelled to the agent: a run or scope end,
-/// or a pause that leaves the scope usable.
+/// or a cancellation that leaves the scope usable.
 /// `None` for any other status reason.
 pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     match reason {
         Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
         Some(RUN_ENDED_REASON) => Some("run ended"),
-        Some(OWNER_PAUSED_REASON) => Some("paused by owner"),
+        Some(OWNER_PAUSED_REASON) => Some("cancelled by owner"),
         _ => None,
     }
 }
@@ -8022,9 +8022,9 @@ impl BgTaskRegistry {
         }
     }
 
-    /// Name unannounced cancelled calls and owner-paused tasks once on the
+    /// Name unannounced cancelled calls and owner-cancelled tasks once on the
     /// session's next bash-family reply. Running tasks include how to check or
-    /// stop them; owner-paused tasks explain their expected terminal status.
+    /// stop them; owner-cancelled tasks explain their expected terminal status.
     /// Taking a notice clears its flag on disk. Other finished tasks are left
     /// to their completion notices.
     pub(crate) fn take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
@@ -8057,7 +8057,7 @@ impl BgTaskRegistry {
             if state.metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
                 && state.metadata.status == BgTaskStatus::Killed
             {
-                lines.push(format!("task {task_id}: killed (paused by owner)"));
+                lines.push(format!("task {task_id}: killed (cancelled by owner)"));
                 continue;
             }
             if state.metadata.status.is_terminal() {
@@ -9410,7 +9410,7 @@ impl BgTaskRegistry {
         self.release_scope_scratch(scope);
     }
 
-    /// Stop this scope's current tasks without ending its authority to spawn.
+    /// Cancel this scope's current tasks without ending its authority to spawn.
     pub(crate) fn pause_scope(
         &self,
         scope: &subc_protocol::scope::ScopeStamp,
@@ -13751,10 +13751,10 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     if metadata.status == BgTaskStatus::Killed
         && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
     {
-        let pause = "[killed (paused by owner); expected stop, not a command failure]";
+        let cancellation = "[killed (cancelled by owner); expected stop, not a command failure]";
         Some(match note {
-            Some(note) => format!("{pause}\n{note}"),
-            None => pause.to_owned(),
+            Some(note) => format!("{cancellation}\n{note}"),
+            None => cancellation.to_owned(),
         })
     } else {
         note

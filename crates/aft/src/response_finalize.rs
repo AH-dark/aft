@@ -198,7 +198,7 @@ fn acknowledge_terminal_bash_reply(
 
 /// A bash-family reply names tasks the session has not heard about: commands
 /// still running after their waiting call was cancelled, and commands stopped
-/// by an owner pause. The registry supplies the appropriate status for each.
+/// by an owner cancellation. The registry supplies the appropriate status for each.
 fn append_cancelled_call_notices(
     text: &mut String,
     ctx: &AppContext,

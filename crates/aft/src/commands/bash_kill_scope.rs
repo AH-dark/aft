@@ -8,6 +8,7 @@ use crate::protocol::Response;
 
 pub(crate) const BASH_KILL_SCOPE_OPERATION: &str = "bash.kill_scope";
 
+/// Stop a cancelled worker's bash tasks without revoking its scope.
 pub(crate) fn handle_bash_kill_scope(
     params: Value,
     principal: Option<&Principal>,
