@@ -81,6 +81,31 @@ fn inspect_view_pending_publication_race_and_dispatch_are_root_local() {
     assert!(!manager.note_view_publication(&root), "accepted refresh must consume the owed demand");
 }
 
+/// The publication hook names the checkout by its configured cache root (raw
+/// `fs::canonicalize`, a `\\?\` verbatim path on Windows) while background jobs
+/// carry the normalized root. Differently spelled names for one checkout must
+/// share one owed-refresh entry, or the dispatched refresh never clears it.
+#[test]
+fn inspect_view_pending_refresh_keys_ignore_root_spelling() {
+    let manager = InspectManager::new();
+    let job_root = std::env::temp_dir().join("aft-view-key-checkout");
+    let mut spellings = vec![job_root.join("nested").join("..")];
+    #[cfg(windows)]
+    spellings.push(PathBuf::from(format!(r"\\?\{}", job_root.display())));
+    for publication_root in spellings {
+        assert_ne!(publication_root, job_root);
+        let epoch = manager.view_publication_epoch(&job_root);
+        manager.note_view_pending(&job_root, epoch);
+        assert!(manager.note_view_publication(&publication_root));
+        assert!(manager.deferred_view_refresh_ready(&publication_root));
+        manager.view_refresh_dispatched(&job_root, InspectCategory::DeadCode);
+        assert!(
+            !manager.deferred_view_refresh_ready(&publication_root),
+            "dispatch under {job_root:?} must clear the refresh owed under {publication_root:?}"
+        );
+    }
+}
+
 #[test]
 fn inspect_view_pending_unavailability_reuses_request_files() {
     let (_project, _storage, mut job, _request) = view_projection_fixture();

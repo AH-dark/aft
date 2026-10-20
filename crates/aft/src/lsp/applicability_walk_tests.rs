@@ -579,6 +579,27 @@ fn applicability_walk_custom_marker_and_captured_ignore_content_invalidate() {
     assert!(metrics.dependency_count > 0);
 }
 
+/// The cache may be handed a root spelled differently from the normalized
+/// paths its probes record: on Windows, `fs::canonicalize` returns a `\\?\`
+/// verbatim path. Watcher paths built from that root must still be recognised
+/// as selection inputs. A `..` component reproduces the mismatch everywhere.
+#[test]
+fn applicability_walk_selection_inputs_match_across_root_spellings() {
+    let mut fixture = WatcherWalkFixture::new();
+    std::fs::create_dir(fixture.root.join("nested")).unwrap();
+    fixture.root = fixture.root.join("nested").join("..");
+    let ignore = fixture.root.join(".ignore");
+    std::fs::write(&ignore, "# before").unwrap();
+    fixture.walk();
+    std::fs::write(&ignore, "# after").unwrap();
+    fixture.batch(&[ignore], data_modify());
+    fixture.assert_one_new_walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).invalidations["marker_ignore_config_or_ts_install"],
+        1
+    );
+}
+
 #[test]
 fn applicability_walk_directory_and_ambiguous_modify_invalidate() {
     for (name, kind) in [
