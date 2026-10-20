@@ -636,6 +636,12 @@ pub struct BgTaskSnapshot {
     pub remote_phase_note: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct PatternMatchAckResult {
+    pub watch_removed: bool,
+    pub task_settled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BgTaskHealthCounts {
     pub running: usize,
@@ -3483,7 +3489,7 @@ impl BgTaskRegistry {
         task_id: &str,
         watch_id: &str,
         match_offset: u64,
-    ) -> Result<Option<bool>, String> {
+    ) -> Result<Option<PatternMatchAckResult>, String> {
         let terminal = self
             .persisted_task_is_terminal(session_id, task_id)
             .unwrap_or(false);
@@ -3540,7 +3546,10 @@ impl BgTaskRegistry {
             let _ = self.remove_pending_completion(task_id);
             self.clear_task_watch_state(task_id);
         }
-        Ok(Some(removed))
+        Ok(Some(PatternMatchAckResult {
+            watch_removed: removed,
+            task_settled: settled,
+        }))
     }
 
     /// Task-wide ack: once-watches (and any terminal-task watches)
@@ -21351,11 +21360,17 @@ mod tests {
                 .unwrap(),
             None
         );
+        let first_ack = registry
+            .ack_pattern_match_for_session("session", task_id, "watch-00000001", 756_237)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            registry
-                .ack_pattern_match_for_session("session", task_id, "watch-00000001", 756_237)
-                .unwrap(),
-            Some(true)
+            serde_json::to_value(&first_ack).unwrap()["task_settled"],
+            false
+        );
+        assert_eq!(
+            serde_json::to_value(&first_ack).unwrap()["watch_removed"],
+            true
         );
         assert!(!task.lock_state().unwrap().metadata.completion_delivered);
         assert_eq!(
@@ -21364,11 +21379,17 @@ mod tests {
                 .len(),
             1
         );
+        let last_ack = registry
+            .ack_pattern_match_for_session("session", task_id, "watch-00000002", 756_237)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            registry
-                .ack_pattern_match_for_session("session", task_id, "watch-00000002", 756_237)
-                .unwrap(),
-            Some(true)
+            serde_json::to_value(&last_ack).unwrap()["task_settled"],
+            true
+        );
+        assert_eq!(
+            serde_json::to_value(&last_ack).unwrap()["watch_removed"],
+            true
         );
         assert!(task.lock_state().unwrap().metadata.completion_delivered);
         assert!(registry

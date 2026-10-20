@@ -2517,6 +2517,7 @@ fn per_match_ack_preserves_sibling_watch_and_rejects_stale_offset() {
         }).to_string());
         assert_eq!(ack["success"], true, "{ack:?}");
         assert_eq!(ack["acked_matches"][0]["watch_removed"], index == 0);
+        assert_eq!(ack["acked_matches"][0]["task_settled"], false);
         assert_eq!(
             drain(&mut aft, SESSION)["pending_matches"]
                 .as_array()
@@ -3713,4 +3714,50 @@ fn redaction_replay_shows_new_output_with_only_revoked_ticket() {
         "ordinary post-restart output\n"
     );
     assert!(restored.shutdown().success());
+}
+
+#[test]
+fn per_match_ack_wire_reports_settlement_only_after_last_terminal_watch() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-terminal-matches");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY\\n'",
+        shell_quote_path(&release),
+    );
+    let mut aft = AftProcess::spawn();
+    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let task_id = spawn_bg(&mut aft, SESSION, &command, Some(120_000));
+    let first = notify_once(&mut aft, SESSION, &task_id, "READY");
+    let second = notify(&mut aft, SESSION, &task_id, "READY", false);
+    assert_eq!(first["success"], true);
+    assert_eq!(second["success"], true);
+    drop(release_guard);
+    wait_for_status(&mut aft, SESSION, &task_id, "completed");
+    let pending = drain(&mut aft, SESSION)["pending_matches"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(pending.len(), 2);
+    for (index, watch) in [first, second].iter().enumerate() {
+        let frame = pending
+            .iter()
+            .find(|frame| frame["watch_id"] == watch["watch_id"])
+            .unwrap();
+        let ack = aft.send(&json!({
+            "id": "terminal-match-ack", "command": "bash_ack_completions", "session_id": SESSION,
+            "params": { "matches": [{ "task_id": task_id, "watch_id": watch["watch_id"], "match_offset": frame["match_offset"] }] },
+        }).to_string());
+        assert_eq!(ack["success"], true, "{ack:?}");
+        assert_eq!(ack["acked_matches"][0]["watch_removed"], true);
+        assert_eq!(ack["acked_matches"][0]["task_settled"], index == 1);
+        let drained = drain(&mut aft, SESSION);
+        assert_eq!(
+            drained["pending_matches"].as_array().unwrap().len(),
+            1 - index
+        );
+        assert!(drained["bg_completions"].as_array().unwrap().is_empty());
+    }
+    assert!(aft.shutdown().success());
 }

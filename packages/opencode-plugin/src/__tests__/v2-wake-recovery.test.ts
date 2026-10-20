@@ -60,7 +60,9 @@ test("V2 routing catches a failed synthetic admission and holds it for the next 
   const bridge = {
     send: async (command: string) => {
       sends.push(command);
-      return { success: true };
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [completion], pending_matches: [] };
+      return { success: true, acked_task_ids: [completion.task_id] };
     },
   };
   try {
@@ -68,12 +70,17 @@ test("V2 routing catches a failed synthetic admission and holds it for the next 
     await expect(
       Promise.resolve(consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never)),
     ).resolves.toBeUndefined();
-    expect(sends).toEqual([]);
+    expect(sends).toEqual(["bash_drain_completions"]);
     await execute(consumer, "bash");
     await settle();
     expect(host.attempts()).toBe(2);
     // An admitted completion detaches the session's waits, then is acknowledged.
-    expect(sends).toEqual(["bash_wait_detach", "bash_ack_completions"]);
+    expect(sends).toEqual([
+      "bash_drain_completions",
+      "bash_drain_completions",
+      "bash_wait_detach",
+      "bash_ack_completions",
+    ]);
   } finally {
     consumer.dispose();
   }
@@ -94,7 +101,9 @@ test("V2 bash companions route held completions without launching bash", async (
     const bridge = {
       send: async (command: string) => {
         sends.push(command);
-        return { success: true };
+        if (command === "bash_drain_completions")
+          return { success: true, bg_completions: [completion], pending_matches: [] };
+        return { success: true, acked_task_ids: [completion.task_id] };
       },
     };
     try {
@@ -104,7 +113,7 @@ test("V2 bash companions route held completions without launching bash", async (
       await settle();
       expect(synthetic).toHaveLength(1);
       // An admitted completion detaches the session's waits, then is acknowledged.
-      expect(sends).toEqual(["bash_wait_detach", "bash_ack_completions"]);
+      expect(sends).toEqual(["bash_drain_completions", "bash_wait_detach", "bash_ack_completions"]);
     } finally {
       consumer.dispose();
     }
@@ -125,20 +134,27 @@ test("V2 routing withholds acknowledgement during a staged revert and retries af
   const bridge = {
     send: async (command: string) => {
       sends.push(command);
-      return { success: true };
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [completion], pending_matches: [] };
+      return { success: true, acked_task_ids: [completion.task_id] };
     },
   };
   try {
     consumer.registerSession?.("s");
     await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
     expect(synthetic).toEqual([]);
-    expect(sends).toEqual([]);
+    expect(sends).toEqual(["bash_drain_completions"]);
     reverted = false;
     consumer.registerSession?.("s");
     await settle();
     expect(synthetic).toHaveLength(1);
     // An admitted completion detaches the session's waits, then is acknowledged.
-    expect(sends).toEqual(["bash_wait_detach", "bash_ack_completions"]);
+    expect(sends).toEqual([
+      "bash_drain_completions",
+      "bash_drain_completions",
+      "bash_wait_detach",
+      "bash_ack_completions",
+    ]);
   } finally {
     consumer.dispose();
   }
