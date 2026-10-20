@@ -1657,6 +1657,19 @@ fn build_native_profile(
             let git = resolve_git_policy(root)?;
             write_deny_nested.extend(checkout_control_denies(root, &git)?);
         }
+        // Only a worker jail denies the gh-shim canary; that deny is how the
+        // shim tells AFT's worker jail from any other sandbox. A canary that
+        // cannot be created refuses the worker launch. Head shells get an
+        // explicit read grant so a canary left by an earlier worker, inside
+        // otherwise private storage, never makes a head look jailed.
+        let canary_dir = if jailed {
+            Some(crate::worker_jail_canary::prepare(&home)?)
+        } else {
+            if let Ok(dir) = crate::worker_jail_canary::prepare(&home) {
+                policy.private_stores.read_allow.push(dir);
+            }
+            None
+        };
         #[cfg(target_os = "macos")]
         if jailed {
             install_worker_mktemp(&temp_dir)?;
@@ -1785,6 +1798,13 @@ fn build_native_profile(
         profile.write_deny.extend(shell_write_deny);
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
+        if let Some(dir) = &canary_dir {
+            profile.read_deny.push(dir.clone());
+            profile.write_deny.push(dir.clone());
+            profile.worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Canary {
+                path: dir.join(crate::worker_jail_canary::CANARY_FILE),
+            });
+        }
         if let Some(jail) = jail {
             // Read server destinations from the operator's environment, never
             // from a worker request or a file the worker can edit.
@@ -1829,6 +1849,7 @@ fn build_native_profile(
             );
             profile
         };
+        verify_worker_gh_fence(&profile)?;
 
         Ok(profile)
     })();
@@ -1836,6 +1857,53 @@ fn build_native_profile(
         let _ = cleanup_task_temp_dir(&temp_dir);
     }
     result
+}
+
+/// Check the final worker-jail profile against its gh-shim canary before the
+/// launch: the canary directory must be denied for reads and writes, and no
+/// read or write grant may cover it or one of its ancestors. A grant over an
+/// ancestor would let a worker read the canary (Landlock grants are whole
+/// subtrees) or rename a directory above it. Any such profile is refused.
+#[cfg(unix)]
+fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
+    let Some(crate::sandbox_profile::WorkerGhFence::Canary { path }) = &profile.worker_gh_fence
+    else {
+        return Ok(());
+    };
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("worker-jail canary has no directory: {}", path.display()))?;
+    let covers = |grant: &Path| dir.starts_with(grant);
+    if !profile.read_deny.iter().any(|deny| covers(deny)) {
+        return Err("the worker jail does not deny reading its gh-shim canary".into());
+    }
+    if !profile.write_deny.iter().any(|deny| covers(deny)) {
+        return Err("the worker jail does not deny writing its gh-shim canary".into());
+    }
+    let read_grants = profile
+        .read_allow
+        .iter()
+        .chain(&profile.data_policy.read_allow)
+        .chain(&profile.data_policy.session_task_read_dir);
+    let write_grants = profile
+        .write_allow_roots()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(profile.writable_files.iter().cloned())
+        .chain(profile.data_policy.write_allow.iter().cloned())
+        .collect::<Vec<_>>();
+    if let Some(grant) = read_grants
+        .map(PathBuf::as_path)
+        .chain(write_grants.iter().map(PathBuf::as_path))
+        .find(|grant| covers(grant))
+    {
+        return Err(format!(
+            "worker jail grant {} covers its gh-shim canary {}; refusing to start an unfenced worker shell",
+            grant.display(),
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Build relaxed's protected-path list without predicting the caches, sockets
@@ -2007,6 +2075,25 @@ fn build_relaxed_profile(
     stores
         .read_allow
         .extend(policy.shell_grants(crate::access_policy::AccessOperation::Read));
+    // The worker jail's gh-shim fence, as in the strict builder. Relaxed Linux
+    // grants all of `/` and enforces no deny, so there the fence is reported
+    // as unenforced instead; macOS relaxed enforces explicit denies.
+    let jailed = worker_jail_active();
+    let mut worker_gh_fence = None;
+    if jailed && cfg!(target_os = "linux") {
+        worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
+    } else if jailed {
+        let dir = crate::worker_jail_canary::prepare(home)?;
+        read_deny.push(dir.clone());
+        write_deny.push(dir.clone());
+        worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Canary {
+            path: dir.join(crate::worker_jail_canary::CANARY_FILE),
+        });
+    } else if !cfg!(target_os = "linux") {
+        if let Ok(dir) = crate::worker_jail_canary::prepare(home) {
+            stores.read_allow.push(dir);
+        }
+    }
     let mut profile = SandboxProfile {
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
@@ -2025,12 +2112,14 @@ fn build_relaxed_profile(
         loopback_tcp_connect_deny: Vec::new(),
         cache_roots: Vec::new(),
         temp_dir: temp.to_path_buf(),
+        worker_gh_fence,
     };
     add_relaxed_cargo_credential_denies(&mut profile, cargo_homes);
     protect_worker_credential_services(&mut profile, home)?;
     profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())
+        .and_then(|profile| verify_worker_gh_fence(&profile).map(|()| profile))
 }
 
 /// Mark only authenticated, sandboxed workers for credential-service isolation.
@@ -9443,6 +9532,7 @@ mod read_allow_tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: vec!["/home/alice/.npm".into()],
             temp_dir: temp.into(),
+            worker_gh_fence: None,
         };
         let inventory = FakeLister::default()
             .directory(
@@ -10018,5 +10108,80 @@ mod read_allow_tests {
                 .expect("canonical project")
                 .join("custom-hooks")]
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod worker_gh_fence_tests {
+    use super::*;
+    use crate::sandbox_profile::WorkerGhFence;
+
+    fn fenced_profile(canary_dir: &Path) -> SandboxProfile {
+        SandboxProfile {
+            v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+            mode: crate::config::SandboxMode::Strict,
+            deny_prefixes: Vec::new(),
+            data_policy: Default::default(),
+            writable_roots: vec![PathBuf::from("/home/alice/work")],
+            writable_files: Vec::new(),
+            write_deny: vec![canary_dir.to_path_buf()],
+            write_deny_nested: Vec::new(),
+            read_allow: vec![PathBuf::from("/usr"), PathBuf::from("/home/alice/work")],
+            read_allow_listed: Vec::new(),
+            read_deny: vec![canary_dir.to_path_buf()],
+            socket_deny: Vec::new(),
+            loopback_tcp_connect_deny: Vec::new(),
+            cache_roots: Vec::new(),
+            temp_dir: PathBuf::from("/home/alice/work/tmp"),
+            worker_gh_fence: Some(WorkerGhFence::Canary {
+                path: canary_dir.join(crate::worker_jail_canary::CANARY_FILE),
+            }),
+        }
+    }
+
+    const CANARY: &str = "/home/alice/.local/share/cortexkit/aft/gh-shim-worker-jail";
+
+    #[test]
+    fn a_fenced_worker_profile_passes_only_with_the_canary_denied_and_ungranted() {
+        let dir = Path::new(CANARY);
+        assert!(verify_worker_gh_fence(&fenced_profile(dir)).is_ok());
+
+        let mut no_read_deny = fenced_profile(dir);
+        no_read_deny.read_deny.clear();
+        assert!(verify_worker_gh_fence(&no_read_deny).is_err());
+
+        let mut no_write_deny = fenced_profile(dir);
+        no_write_deny.write_deny.clear();
+        assert!(verify_worker_gh_fence(&no_write_deny).is_err());
+
+        // Landlock grants are whole subtrees: a grant over any ancestor makes
+        // the canary readable, and a writable ancestor lets a worker rename it.
+        for ancestor in ["/home/alice", "/home/alice/.local/share", CANARY] {
+            let mut read = fenced_profile(dir);
+            read.read_allow.push(PathBuf::from(ancestor));
+            assert!(verify_worker_gh_fence(&read).is_err(), "read {ancestor}");
+            let mut data = fenced_profile(dir);
+            data.data_policy.read_allow.push(PathBuf::from(ancestor));
+            assert!(verify_worker_gh_fence(&data).is_err(), "data {ancestor}");
+            let mut write = fenced_profile(dir);
+            write.writable_roots.push(PathBuf::from(ancestor));
+            assert!(verify_worker_gh_fence(&write).is_err(), "write {ancestor}");
+        }
+        // A sibling grant beside the canary is fine.
+        let mut sibling = fenced_profile(dir);
+        sibling.read_allow.push(PathBuf::from(
+            "/home/alice/.local/share/cortexkit/aft/shims",
+        ));
+        assert!(verify_worker_gh_fence(&sibling).is_ok());
+    }
+
+    #[test]
+    fn profiles_without_a_canary_fence_are_not_checked() {
+        let mut head = fenced_profile(Path::new(CANARY));
+        head.worker_gh_fence = None;
+        head.read_allow.push(PathBuf::from("/home/alice"));
+        assert!(verify_worker_gh_fence(&head).is_ok());
+        head.worker_gh_fence = Some(WorkerGhFence::Unenforced);
+        assert!(verify_worker_gh_fence(&head).is_ok());
     }
 }

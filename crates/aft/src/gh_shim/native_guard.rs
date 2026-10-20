@@ -19,31 +19,22 @@ impl ShellSignals {
     }
 }
 
+/// Whether this shell runs inside AFT's own worker jail, from kernel state only.
+///
+/// A generic sandbox signal is not enough. Linux `no_new_privs` and macOS
+/// `sandbox_check(pid, NULL, 0)` are also set by containers, Kubernetes pods
+/// with `allowPrivilegeEscalation: false`, systemd `NoNewPrivileges=`,
+/// bubblewrap, CI job sandboxes and other tools' Seatbelt profiles. A standalone
+/// user there had working gh passthrough and must keep it.
+///
+/// Only the worker-jail profile denies reading a canary file at a fixed path in
+/// the account's default AFT storage (see `crate::worker_jail_canary`). The
+/// deny is enforced by Landlock or Seatbelt, inherited across exec and
+/// irremovable, so clearing the environment or unsetting the ticket cannot
+/// make a jailed worker look like a head. Relaxed Linux grants all of `/` and
+/// cannot deny the canary; there the fence is reported as unenforced.
 pub(super) fn native_sandbox_active() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // no_new_privs is inherited across exec and cannot be unset. Clearing
-        // environment variables therefore cannot turn a jailed shell into a head.
-        unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0 }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn sandbox_check(
-                pid: libc::pid_t,
-                operation: *const libc::c_char,
-                filter: libc::c_int,
-                ...
-            ) -> libc::c_int;
-        }
-        // A null operation asks only whether this process has a Seatbelt policy.
-        // It neither probes credential files nor changes the policy.
-        unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) != 0 }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
-    }
+    crate::worker_jail_canary::inside_worker_jail()
 }
 
 pub(super) fn permission_with(

@@ -621,6 +621,7 @@ mod tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: task_temp,
+            worker_gh_fence: None,
         };
         let source = render_profile(&profile).expect("render profile");
         let allow = source.find("(allow file-write*").expect("write allow");

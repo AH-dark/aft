@@ -13207,6 +13207,7 @@ mod tests {
                 loopback_tcp_connect_deny: Vec::new(),
                 cache_roots: Vec::new(),
                 temp_dir: PathBuf::from("/tmp/aft-test-sandbox"),
+                worker_gh_fence: None,
             },
             PathBuf::from("/bin/true"),
         );

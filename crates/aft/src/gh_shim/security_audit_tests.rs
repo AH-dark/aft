@@ -320,36 +320,57 @@ fn audit_unattributed_agent_never_gets_operator_gh() {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn audit_env_i_and_unset_ticket_keep_kernel_worker_fence() {
+/// Run the probe child in a fresh process, as a shell would run the shim:
+/// `mode` picks what confines it, and `clear_all` mimics `env -i`.
+///
+/// Modes: `jail` confines the child the way AFT's worker jail does for the
+/// canary (reads and writes of the canary directory denied). `outer-missing`
+/// and `outer-readable` confine it the way a container or another tool's
+/// sandbox does (Linux no_new_privs; macOS an unrelated Seatbelt profile), with
+/// no canary or a readable one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_probe_child(mode: &str, clear_all: bool) -> (std::process::Output, tempfile::TempDir) {
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::process::CommandExt;
-    let _lock = crate::test_env::process_env_lock();
-    for clear_all in [false, true] {
-        let bin = tempfile::tempdir().unwrap();
-        let fake = bin.path().join("gh");
-        fs::write(
-            &fake,
-            b"#!/bin/sh\nprintf invoked > \"$0.ran\"\nprintf '123\\n'\nexit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command.current_dir(bin.path());
-        command.args([
-            "--exact",
-            "gh_shim::security_audit_tests::stripped_worker_probe_child",
-            "--ignored",
-            "--nocapture",
-        ]);
-        if clear_all {
-            command.env_clear();
-        } else {
-            command
-                .env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
-                .env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
-        }
+    let bin = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home = home.keep().canonicalize().unwrap();
+    if mode != "outer-missing" {
+        crate::worker_jail_canary::prepare(&home).unwrap();
+    }
+    fs::write(bin.path().join("probe-mode"), mode).unwrap();
+    fs::write(
+        bin.path().join("probe-home"),
+        home.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    let fake = bin.path().join("gh");
+    fs::write(
+        &fake,
+        b"#!/bin/sh\nprintf invoked > \"$0.ran\"\nprintf '123\\n'\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.current_dir(bin.path());
+    command.args([
+        "--exact",
+        "gh_shim::security_audit_tests::stripped_worker_probe_child",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    if clear_all {
+        command.env_clear();
+    } else {
+        command
+            .env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+            .env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // Every Linux confinement in these modes sets no_new_privs, as an
+        // outer container or CI sandbox does; only `jail` adds the canary deny.
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 {
@@ -359,47 +380,163 @@ fn audit_env_i_and_unset_ticket_keep_kernel_worker_fence() {
                 }
             });
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+    }
+    let output = command.output().unwrap();
+    let _ = fs::remove_dir_all(&home);
+    (output, bin)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn audit_env_i_and_unset_ticket_keep_kernel_worker_fence() {
+    let _lock = crate::test_env::process_env_lock();
+    for clear_all in [false, true] {
+        let (output, bin) = run_probe_child("jail", clear_all);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
         assert!(!bin.path().join("gh.ran").exists());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(stdout.contains("1 passed"), "{stdout}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"));
     }
 }
 
+/// A sandbox AFT did not create (a container's no_new_privs, a CI job sandbox,
+/// another tool's Seatbelt profile) is not a worker jail: gh passes through.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn audit_outer_sandbox_without_the_worker_canary_keeps_native_passthrough() {
+    let _lock = crate::test_env::process_env_lock();
+    for mode in ["outer-missing", "outer-readable"] {
+        for clear_all in [false, true] {
+            let (output, bin) = run_probe_child(mode, clear_all);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            // The shim execs the real gh in place of the probe process, so the
+            // fake gh's output, not a test summary, ends the child's stdout.
+            assert!(stdout.ends_with("123\n"), "{mode}: {stdout}");
+            assert!(
+                bin.path().join("gh.ran").exists(),
+                "{mode}: native gh did not run"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// Deny reads and writes of `denied` and nothing else, the way the worker jail
+/// treats its canary directory. Landlock grants are allow-lists, so grant every
+/// sibling along the path from `/` and leave only `denied` out.
 #[cfg(target_os = "linux")]
+fn confine_like_the_worker_jail(denied: &Path) {
+    use landlock::{
+        Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus, ABI,
+    };
+    let abi = ABI::V3;
+    let mut ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .unwrap()
+        .create()
+        .unwrap();
+    let mut chain = denied.ancestors().collect::<Vec<_>>();
+    chain.reverse();
+    for pair in chain.windows(2) {
+        for entry in fs::read_dir(pair[0]).unwrap() {
+            let path = entry.unwrap().path();
+            if path == pair[1] {
+                continue;
+            }
+            let Ok(fd) = PathFd::new(&path) else { continue };
+            let access = if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                AccessFs::from_all(abi)
+            } else {
+                AccessFs::from_file(abi)
+            };
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, access)).unwrap();
+        }
+    }
+    let status = ruleset.restrict_self().unwrap();
+    assert_eq!(status.ruleset, RulesetStatus::FullyEnforced);
+}
+
+#[cfg(target_os = "macos")]
+fn confine_with_seatbelt(source: &str) {
+    unsafe extern "C" {
+        fn sandbox_init(
+            profile: *const libc::c_char,
+            flags: u64,
+            errorbuf: *mut *mut libc::c_char,
+        ) -> libc::c_int;
+    }
+    let source = std::ffi::CString::new(source).unwrap();
+    let mut error = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SBPL source and a writable error pointer.
+    assert_eq!(unsafe { sandbox_init(source.as_ptr(), 0, &mut error) }, 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[ignore]
 fn stripped_worker_probe_child() {
     assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).is_none());
     assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_none());
-    let signals = native_guard::ShellSignals::from_process();
-    assert!(signals.sandboxed);
-    let error = native_guard::permission_with(&RelayContext::from_process(), signals, |_| {
-        panic!("no ticket")
-    })
-    .unwrap_err();
-    assert_eq!(
-        error,
-        "no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here"
-    );
-    let status = native_guard::dispatch_with(
-        &args(&["api", "repos/cortexkit/aft/issues"]),
-        &RelayContext::from_process(),
-        signals,
-        |_| panic!("no ticket"),
-        |_| panic!("env -i reached native gh"),
-    );
-    assert_eq!(status, 86);
+    let cwd = std::env::current_dir().unwrap();
+    let mode = fs::read_to_string(cwd.join("probe-mode")).unwrap();
+    let home = PathBuf::from(String::from_utf8(fs::read(cwd.join("probe-home")).unwrap()).unwrap());
+    let canary_dir = crate::worker_jail_canary::dir_for_home(&home);
+    // Create the shim's state before confinement can deny new temp files.
     let _guard = crate::test_env::gh_shim_state_guard();
-    std::env::set_var("PATH", std::env::current_dir().unwrap());
-    assert!(resolve_and_cache_numeric_id(&StatePaths::from_process(), "test-user").is_none());
-    assert!(rename_guard::resolve_preflight_gh().is_none());
-    assert_eq!(run(&args(&["api", "repos/cortexkit/aft/issues"])), 86);
+    std::env::set_var("PATH", &cwd);
+    #[cfg(target_os = "linux")]
+    if mode == "jail" {
+        confine_like_the_worker_jail(&canary_dir);
+    }
+    #[cfg(target_os = "macos")]
+    confine_with_seatbelt(&if mode == "jail" {
+        format!(
+            "(version 1)\n(allow default)\n(deny file-read* file-write* (subpath \"{}\"))\n",
+            canary_dir.display()
+        )
+    } else {
+        "(version 1)\n(allow default)\n(deny file-write* (subpath \"/aft-unrelated-outer-sandbox\"))\n"
+            .to_string()
+    });
+    crate::worker_jail_canary::with_test_homes(vec![home], || {
+        let signals = native_guard::ShellSignals::from_process();
+        if mode != "jail" {
+            assert!(!signals.sandboxed);
+            assert!(native_guard::permission_from_process().is_ok());
+            // Passthrough replaces this process with the real gh, so it runs last.
+            run(&args(&["version"]));
+            unreachable!("native gh passthrough returned instead of exec");
+        }
+        assert!(signals.sandboxed);
+        let error = native_guard::permission_with(&RelayContext::from_process(), signals, |_| {
+            panic!("no ticket")
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here"
+        );
+        let status = native_guard::dispatch_with(
+            &args(&["api", "repos/cortexkit/aft/issues"]),
+            &RelayContext::from_process(),
+            signals,
+            |_| panic!("no ticket"),
+            |_| panic!("env -i reached native gh"),
+        );
+        assert_eq!(status, 86);
+        assert!(resolve_and_cache_numeric_id(&StatePaths::from_process(), "test-user").is_none());
+        assert!(rename_guard::resolve_preflight_gh().is_none());
+        assert_eq!(run(&args(&["api", "repos/cortexkit/aft/issues"])), 86);
+    });
 }
 
 #[test]

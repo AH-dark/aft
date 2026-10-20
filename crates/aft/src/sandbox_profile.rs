@@ -146,6 +146,22 @@ pub struct SandboxProfile {
     pub loopback_tcp_connect_deny: Vec<u16>,
     pub cache_roots: Vec<PathBuf>,
     pub temp_dir: PathBuf,
+    /// Set only for worker-jail shells: how this profile keeps the gh shim
+    /// from falling back to the operator's gh. See `crate::worker_jail_canary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_gh_fence: Option<WorkerGhFence>,
+}
+
+/// How a worker-jail profile fences the gh shim off the operator's gh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerGhFence {
+    /// The jail denies reads and writes of this canary file. The launcher
+    /// refuses to start the shell unless the applied jail denies it.
+    Canary { path: PathBuf },
+    /// The backend grants all of `/` (relaxed Linux), so no deny is enforced,
+    /// including the canary deny. The launcher reports the fence as unenforced.
+    Unenforced,
 }
 
 impl SandboxProfile {
@@ -190,6 +206,7 @@ impl SandboxProfile {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: canonicalize_required_dirs(cache_roots, "cache_roots")?,
             temp_dir: canonicalize_required_dir(temp_dir, "temp_dir")?,
+            worker_gh_fence: None,
         })
     }
 
@@ -261,6 +278,19 @@ impl SandboxProfile {
             cache_roots: canonicalize_required_dirs(self.cache_roots, "cache_roots")?,
             loopback_tcp_connect_deny: self.loopback_tcp_connect_deny,
             temp_dir: canonicalize_required_dir(self.temp_dir, "temp_dir")?,
+            worker_gh_fence: match self.worker_gh_fence {
+                // The canary must exist when the jail is applied; a missing one
+                // refuses the launch here rather than starting unfenced.
+                Some(WorkerGhFence::Canary { path }) => Some(WorkerGhFence::Canary {
+                    path: path.canonicalize().map_err(|error| {
+                        SandboxProfileError::new(format!(
+                            "worker-jail canary {} is unavailable: {error}",
+                            path.display()
+                        ))
+                    })?,
+                }),
+                other => other,
+            },
         })
     }
 
@@ -1372,6 +1402,7 @@ mod tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: root.clone(),
+            worker_gh_fence: None,
         }
         .canonicalize_for_launch()
         .expect("validate profile");

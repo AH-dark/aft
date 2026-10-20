@@ -200,6 +200,7 @@ pub mod write_ledger;
 pub(crate) mod windows_command;
 pub mod windows_path;
 pub mod windows_shell;
+pub mod worker_jail_canary;
 
 #[cfg(test)]
 mod gate_hermeticity_tests;

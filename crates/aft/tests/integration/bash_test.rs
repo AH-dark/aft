@@ -340,6 +340,78 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
     assert!(aft.shutdown().success());
 }
 
+/// A head shell under AFT's own (non-worker) sandbox is the operator's agent:
+/// with no ticket it keeps gh passthrough, even though the sandbox sets the
+/// same no_new_privs or Seatbelt state as a worker jail and the head's profile
+/// build creates the worker canary in its private storage.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn sandboxed_head_shell_without_a_ticket_keeps_gh_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let storage = base.join("storage");
+    // Inside the project: a strict head shell can read and run it there.
+    let upstream = project.join("upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    let real_gh = upstream.join("gh");
+    write_executable_shim(&real_gh, "#!/bin/sh\nprintf 'real-gh:%s\\n' \"$*\"\n");
+    let requested_path = std::env::join_paths([
+        upstream.clone(),
+        std::path::PathBuf::from("/usr/bin"),
+        std::path::PathBuf::from("/bin"),
+    ])
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+    let binary = aft_binary();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", std::ffi::OsStr::new(&requested_path))]);
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "configure-sandboxed-head",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "storage_dir": storage,
+            "config": user_config(serde_json::json!({
+                "github": { "shim": true },
+                "gh_shim": { "binary_path": binary },
+                "git": { "co_author": "off" },
+                "sandbox": { "profile": { "head": "strict" } }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "sandboxed-head-gh",
+            "method": "bash",
+            "params": {
+                "command": "test -f \"$HOME/.local/share/cortexkit/aft/gh-shim-worker-jail/canary\" && echo CANARY_PRESENT; env -u AFT_GH_SHIM_TICKET gh version; echo EXIT=$?"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "bash spawn failed: {response:?}");
+    let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+    let output = status["output_preview"].as_str().unwrap_or_default();
+    assert!(output.contains("CANARY_PRESENT"), "{status:?}");
+    assert!(!output.contains("gh_shim_worker_native_gh"), "{status:?}");
+    // The shim chose passthrough. On Linux the strict head profile cannot
+    // execute a file inside the project (exec fails with EACCES), so there the
+    // passthrough shows up as the shim's exec error instead of the fake gh.
+    assert!(
+        output.contains("real-gh:version\nEXIT=0")
+            || output.contains("gh_shim_no_real_gh: unable to exec upstream gh"),
+        "{status:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
     let output = std::process::Command::new("ps")

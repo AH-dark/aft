@@ -332,7 +332,19 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     }
     seatbelt::apply(profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Seatbelt profile: {error}"))
-    })
+    })?;
+    verify_worker_gh_fence(profile)
+}
+
+/// A worker jail must deny its gh-shim canary once applied; otherwise the
+/// shim could not tell the worker from a head and the shell must not start.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
+    if let Some(aft::sandbox_profile::WorkerGhFence::Canary { path }) = &profile.worker_gh_fence {
+        aft::worker_jail_canary::verify_denied_after_apply(path)
+            .map_err(SandboxLaunchError::unavailable)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -344,7 +356,7 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
         SandboxLaunchError::unavailable(format!("failed to apply Landlock ruleset: {error}"))
     })?;
     emit_linux_warning(profile, applied);
-    Ok(())
+    verify_worker_gh_fence(profile)
 }
 
 #[cfg(target_os = "linux")]
@@ -375,6 +387,11 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
         for path in &profile.deny_prefixes {
             denies.push(format!("read:{}*", path.display()));
             denies.push(format!("write:{}*", path.display()));
+        }
+        // Relaxed Linux cannot deny the gh-shim canary, so the shim
+        // cannot recognize this worker shell. Say so with the other denies.
+        if profile.worker_gh_fence == Some(aft::sandbox_profile::WorkerGhFence::Unenforced) {
+            denies.push("operator gh fence: unenforced (relaxed profile)".to_string());
         }
         eprintln!("sandbox-launch: profile=relaxed unenforced=[{}] (Landlock cannot subtract denies from default-allow root grants){session_bus_reason}", denies.join(","));
         return;

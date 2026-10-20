@@ -1042,6 +1042,115 @@ async fn off_worker_keeps_private_temp_and_governance_without_os_confinement() {
     );
 }
 
+/// The worker-jail gh fence: only the jail denies this canary, at a fixed path
+/// in the account's default AFT storage.
+fn canary_dir(jail: &Jail) -> PathBuf {
+    jail.base
+        .join("home/.local/share/cortexkit/aft/gh-shim-worker-jail")
+}
+
+/// The shim's native exits, with the ticket and worker marker removed (and
+/// once with the environment cleared down to HOME and PATH): only the kernel
+/// canary deny can tell the shim it runs in a worker jail.
+const STRIPPED_GH: &str = "env -u AFT_GH_SHIM_TICKET -u AFT_GH_SHIM_WORKER gh version; echo STRIPPED_EXIT=$?; env -i HOME=\"$HOME\" PATH=\"$PATH\" gh api repos/cortexkit/aft/issues; echo ENV_I_EXIT=$?";
+
+fn assert_stripped_gh_refused(reply: &str) {
+    assert!(reply.contains("STRIPPED_EXIT=86"), "{reply}");
+    assert!(reply.contains("ENV_I_EXIT=86"), "{reply}");
+    assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_fences_operator_gh_and_its_canary_resists_tampering() {
+    #[cfg(target_os = "linux")]
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let dir = canary_dir(&jail);
+    let canary = dir.join("canary");
+    let reply = jail.bash(STRIPPED_GH).await;
+    assert_stripped_gh_refused(&reply);
+    let original = std::fs::read(&canary).expect("the worker shell launch created the canary");
+
+    let parent = dir.parent().unwrap();
+    let tamper = format!(
+        "cat {c} >/dev/null 2>&1; echo READ=$?; chmod 644 {c} 2>/dev/null; echo CHMOD=$?; rm -f {c} 2>/dev/null; echo RM=$?; mv {c} {d}/moved 2>/dev/null; echo MV=$?; printf x > {d}/new 2>/dev/null; echo CREATE=$?; mv {d} {d}.moved 2>/dev/null; echo MVDIR=$?; mv {p} {p}.moved 2>/dev/null; echo MVPARENT=$?; {stripped}",
+        c = quote(&canary),
+        d = quote(&dir),
+        p = quote(parent),
+        stripped = STRIPPED_GH,
+    );
+    let reply = jail.bash(&tamper).await;
+    for denied in ["READ", "RM", "MV", "CREATE", "MVDIR", "MVPARENT"] {
+        assert!(!reply.contains(&format!("{denied}=0")), "{denied}: {reply}");
+    }
+    // Seatbelt denies the mode change. Landlock does not mediate chmod, but a
+    // changed mode cannot make the denied canary readable or hide it.
+    #[cfg(target_os = "macos")]
+    assert!(!reply.contains("CHMOD=0"), "{reply}");
+    assert_stripped_gh_refused(&reply);
+    assert_eq!(std::fs::read(&canary).unwrap(), original);
+    assert!(!dir.join("new").exists());
+}
+
+/// The canary sits in the account's default storage, so a configured storage
+/// root elsewhere still leaves it denied and the fence in place.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_fence_holds_with_storage_configured_elsewhere() {
+    #[cfg(target_os = "linux")]
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start_with_layout_and_env(
+        None,
+        None,
+        true,
+        "strict",
+        false,
+        false,
+        |base, command| {
+            let storage = base.join("elsewhere-storage");
+            std::fs::create_dir_all(&storage).unwrap();
+            command.env("AFT_STORAGE_DIR", storage);
+        },
+    )
+    .await;
+    let canary = canary_dir(&jail).join("canary");
+    let reply = jail
+        .bash(&format!(
+            "cat {} >/dev/null 2>&1; echo READ=$?; {STRIPPED_GH}",
+            quote(&canary)
+        ))
+        .await;
+    assert!(!reply.contains("READ=0"), "{reply}");
+    assert_stripped_gh_refused(&reply);
+    assert!(canary.is_file());
+    assert!(!jail
+        .base
+        .join("elsewhere-storage/gh-shim-worker-jail")
+        .exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_macos_worker_jail_still_fences_operator_gh() {
+    let mut jail = Jail::relaxed(false).await;
+    let canary = canary_dir(&jail).join("canary");
+    let reply = jail
+        .bash(&format!(
+            "cat {c} >/dev/null 2>&1; echo READ=$?; rm -f {c} 2>/dev/null; echo RM=$?; {STRIPPED_GH}",
+            c = quote(&canary)
+        ))
+        .await;
+    assert!(!reply.contains("READ=0"), "{reply}");
+    assert!(!reply.contains("RM=0"), "{reply}");
+    assert_stripped_gh_refused(&reply);
+    assert!(canary.is_file());
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn relaxed_linux_names_unenforced_denies_and_keeps_broad_access() {
@@ -1061,6 +1170,14 @@ async fn relaxed_linux_names_unenforced_denies_and_keeps_broad_access() {
     assert!(reply.contains("BROAD_2"), "{reply}");
     assert!(reply.contains("linux-secret-unenforced"), "{reply}");
     assert!(reply.contains("profile=relaxed unenforced=["), "{reply}");
+    // Relaxed Linux cannot deny the gh-shim canary, so the worker gets no
+    // shim-level fence; the launcher names that alongside the other denies.
+    assert!(
+        reply.contains("operator gh fence: unenforced (relaxed profile)"),
+        "{reply}"
+    );
+    let stripped = jail.bash(STRIPPED_GH).await;
+    assert!(!stripped.contains("gh_shim_worker_native_gh"), "{stripped}");
     for name in [
         ".ssh",
         ".gnupg",
