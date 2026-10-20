@@ -1,0 +1,1 @@
+- A scoped `aft_inspect` that reopens a file the previous inspect had just closed no longer reports it clean too early. The server's late empty reply to the earlier close was read as the reopened file's report, so the second inspect could show no diagnostics for a file with errors.

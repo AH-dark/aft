@@ -168,8 +168,13 @@ acquire_box_gate
 
 # Keep every phase's output in a durable location. The default is deliberately
 # outside /tmp because macOS cleanup can remove a still-running gate's only
-# failure record.
-gate_log_dir="${AFT_GATE_LOG_DIR:-$HOME/.local/share/cortexkit/aft/gate-logs}"
+# failure record. It is also outside CortexKit's data and state folders: phase
+# commands write straight into this file, so it is every test's inherited
+# stdout, and the native sandbox refuses a test whose stdout lies under a
+# folder its floor denies. It is based on HOME, not XDG_STATE_HOME, because
+# the gate points XDG_STATE_HOME into its own per-gate home under target/,
+# which a run can replace while the gate is still writing its log.
+gate_log_dir="${AFT_GATE_LOG_DIR:-$HOME/.local/state/aft-gate-logs}"
 gate_log="${AFT_GATE_LOG:-$gate_log_dir/gate-$(date -u '+%Y%m%dT%H%M%SZ')-$$.log}"
 mkdir -p "$(dirname "$gate_log")"
 if [[ "${AFT_GATE_LOG_INHERITED:-}" == "1" ]]; then
@@ -187,6 +192,13 @@ announce_gate_line() {
 }
 
 announce_gate_line "gate log: $gate_log"
+
+# An error that ends the gate before or between phases goes to stderr and into
+# the gate log, so a downloaded log still says why the job failed.
+gate_error() {
+  printf '%s\n' "$1" >&2
+  printf '%s\n' "$1" >> "$gate_log"
+}
 
 failed_test_phases=0
 first_test_failure=0
@@ -235,29 +247,70 @@ report_gate_failure() {
   tail -n 60 "$gate_log" >&2 || true
 }
 
+# Copy everything appended to the gate log after byte OFFSET to stdout, once a
+# second, until STOP_FILE exists (then one final copy) or the gate shell that
+# started it is gone. Runs in the background beside a phase command.
+stream_gate_log() {
+  local offset="$1"
+  local stop_file="$2"
+  local gate_pid="$3"
+  local size stop
+  while :; do
+    stop=0
+    if [[ -e "$stop_file" ]] || ! kill -0 "$gate_pid" 2>/dev/null; then
+      stop=1
+    fi
+    size=$(($(wc -c < "$gate_log")))
+    if (( size > offset )); then
+      tail -c "+$((offset + 1))" "$gate_log" | head -c "$((size - offset))"
+      offset=$size
+    fi
+    (( stop )) && return 0
+    sleep 1
+  done
+}
+
 run_phase() {
   local label="$1"
   shift
   local started=$SECONDS
-  local -a pipeline_status
   local rc
-  local tee_rc
+  local offset stop_dir streamer_pid
 
+  # Also proves the log is writable: under `set -e` a log that cannot be
+  # written ends the gate here, before any phase command runs.
   announce_gate_line "==> $label"
+  # The phase command writes straight into the gate log file and a background
+  # loop copies the new bytes to the console. It is deliberately not piped
+  # through `tee`: on Windows every process a test leaks inherits the write
+  # end of any pipe above it, so a leaked grandchild kept `tee` from seeing
+  # end-of-file and held a CI step open long after nextest had printed its
+  # summary and exited. A file has no reader waiting for end-of-file, so a
+  # leaked process holding it delays nothing.
+  offset=$(($(wc -c < "$gate_log")))
+  stop_dir="$(mktemp -d "${TMPDIR:-/tmp}/aft-gate-phase.XXXXXX")"
+  # errexit is off before the streamer forks: its `tail | head` pipeline ends
+  # with SIGPIPE by design and must not stop the copy loop.
   set +e
-  "$@" 2>&1 | tee -a "$gate_log"
-  pipeline_status=("${PIPESTATUS[@]}")
+  stream_gate_log "$offset" "$stop_dir/done" "$$" &
+  streamer_pid=$!
+  # `exec` replaces the inherited console descriptors instead of saving
+  # copies of them, so the command and its children never hold the console
+  # pipe.
+  (
+    exec >>"$gate_log" 2>&1
+    "$@"
+  )
+  rc=$?
+  : > "$stop_dir/done"
+  wait "$streamer_pid"
+  rm -rf "$stop_dir"
   set -e
-  rc="${pipeline_status[0]:-1}"
-  tee_rc="${pipeline_status[1]:-1}"
-  if [[ "$rc" -ne 0 || "$tee_rc" -ne 0 ]]; then
-    if [[ "$rc" -eq 0 ]]; then
-      rc="$tee_rc"
-    fi
+  if [[ "$rc" -ne 0 ]]; then
     report_gate_failure "$label" "$rc"
     # Only independent test commands may continue after a red phase. Failed
-    # archive extraction, signing, lint or log writes are fatal prerequisites.
-    if [[ -n "${CI:-}" && "$tee_rc" -eq 0 && "${1:-}" == "gate_cargo" \
+    # archive extraction, signing or lint are fatal prerequisites.
+    if [[ -n "${CI:-}" && "${1:-}" == "gate_cargo" \
       && ( "${2:-}" == "test" || ( "${2:-}" == "nextest" && "${3:-}" == "run" ) ) ]]; then
       failed_test_phases=$((failed_test_phases + 1))
       if [[ "$first_test_failure" -eq 0 ]]; then
@@ -320,11 +373,11 @@ for p in sorted(seen): print(p)
 }
 
 if [[ "$runner" != "nextest" && "$runner" != "cargo" ]]; then
-  echo "Unsupported AFT_RUST_TEST_RUNNER='$runner' (expected 'nextest' or 'cargo')" >&2
+  gate_error "Unsupported AFT_RUST_TEST_RUNNER='$runner' (expected 'nextest' or 'cargo')"
   exit 2
 fi
 if [[ "$unit_runner" != "cargo" && "$unit_runner" != "nextest" ]]; then
-  echo "Unsupported AFT_UNIT_TEST_RUNNER='$unit_runner' (expected 'cargo' or 'nextest')" >&2
+  gate_error "Unsupported AFT_UNIT_TEST_RUNNER='$unit_runner' (expected 'cargo' or 'nextest')"
   exit 2
 fi
 
@@ -346,14 +399,14 @@ if [[ "$runner" == "cargo" ]]; then
 fi
 
 if ! command -v cargo-nextest >/dev/null 2>&1; then
-  echo "cargo-nextest is required; install it with: cargo install cargo-nextest --locked" >&2
+  gate_error "cargo-nextest is required; install it with: cargo install cargo-nextest --locked"
   exit 127
 fi
 
 extract_nextest_archive_for_prewarm() {
   local archive_file="${1:-${AFT_NEXTEST_ARCHIVE_FILE:-}}"
   if [[ -z "$archive_file" ]]; then
-    echo "AFT_NEXTEST_ARCHIVE_FILE is required to extract a nextest archive" >&2
+    gate_error "AFT_NEXTEST_ARCHIVE_FILE is required to extract a nextest archive"
     return 2
   fi
 
@@ -394,7 +447,7 @@ else
     case "$selected_phase" in
       lib|lib-shard|nextest|watcher|conformance|storm) ;;
       *)
-        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, lib-shard, nextest, watcher, conformance, storm, or all)" >&2
+        gate_error "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, lib-shard, nextest, watcher, conformance, storm, or all)"
         exit 2
         ;;
     esac
@@ -470,11 +523,11 @@ fi
 
 if phase_enabled lib-shard; then
   if [[ "$unit_runner" != "nextest" ]]; then
-    echo "The lib-shard phase requires AFT_UNIT_TEST_RUNNER=nextest" >&2
+    gate_error "The lib-shard phase requires AFT_UNIT_TEST_RUNNER=nextest"
     exit 2
   fi
   if [[ -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" || -z "${AFT_NEXTEST_PARTITION:-}" ]]; then
-    echo "The lib-shard phase requires AFT_NEXTEST_ARCHIVE_FILE and AFT_NEXTEST_PARTITION" >&2
+    gate_error "The lib-shard phase requires AFT_NEXTEST_ARCHIVE_FILE and AFT_NEXTEST_PARTITION"
     exit 2
   fi
   if [[ -n "${AFT_NEXTEST_ARCHIVE_BIN_FILE:-}" ]]; then

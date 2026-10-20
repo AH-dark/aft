@@ -1353,6 +1353,15 @@ pub(crate) fn main() -> io::Result<()> {
                         uri.clone(),
                         version.clone(),
                     )?;
+                    // AFT_FAKE_LSP_OPEN_PUBLISH_DELAY_MS=<ms>: publish an opened
+                    // document's diagnostics late, as a server that analyzes
+                    // in the background (tsserver) does.
+                    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_OPEN_PUBLISH_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
                     if push_diagnostics_enabled() {
                         let mut diagnostics = opened_diagnostics();
                         if uri.as_str().is_some_and(|uri| check_errors.contains(uri)) {

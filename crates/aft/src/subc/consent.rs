@@ -1122,6 +1122,13 @@ fn probe_directory_scope_with(
             crate::access_policy::policy_path(&path)
         })
         .ok_or("home identity unknown")?;
+    // statfs and stat fail on a directory that is gone, such as task scratch
+    // that cleanup removed after its command exited. Name that cause instead
+    // of reporting it as an unknown volume.
+    if matches!(std::fs::symlink_metadata(parent), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err("directory does not exist");
+    }
     let (volume, _) =
         crate::storage_retention::volume_anchor(parent).ok_or("volume identity unknown")?;
     let volume = crate::access_policy::policy_path(&volume);

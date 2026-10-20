@@ -4,8 +4,10 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -13,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class RustGateCollectionTests(unittest.TestCase):
-    def run_gate(self, phases, ci=True, fail=False, archives=False, tee_fail=False, cargo_only=False):
+    def run_gate(self, phases, ci=True, fail=False, archives=False, cargo_only=False, leak=False,
+                 log_dir_mode=None):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             tools = home / "bin"
@@ -27,6 +30,17 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALL_LOG"], "a") as out:
     out.write(json.dumps(args) + "\\n")
+leak_pid = os.environ.get("FAKE_LEAK_PID")
+if leak_pid and not os.path.exists(leak_pid):
+    import subprocess
+    # Like a leaked test grandchild: a long-lived process that keeps this
+    # runner's stdout and stderr open after the runner itself exits.
+    child = subprocess.Popen(["sleep", "30"])
+    with open(leak_pid, "w") as out:
+        out.write(str(child.pid))
+    print("phase output before the leak")
+    sys.stdout.flush()
+    sys.exit(0)
 if os.environ.get("FAKE_FAIL") == "1":
     if args[0] == "test" and "--workspace" in args:
         sys.exit(7)
@@ -39,8 +53,6 @@ if os.environ.get("FAKE_FAIL") == "1":
 sys.exit(0)
 ''',
             }
-            if tee_fail:
-                stubs["tee"] = "#!/bin/sh\ncat\nexit 23\n"
             for name, body in stubs.items():
                 path = tools / name
                 path.write_text(body)
@@ -51,7 +63,7 @@ sys.exit(0)
                 "FAKE_REPO_ROOT": str(ROOT), "FAKE_CALL_LOG": str(calls),
                 "FAKE_FAIL": "1" if fail else "0", "AFT_GATE_DEMOTED": "1",
                 "AFT_SKIP_BOX_GATE": "1", "AFT_GATE_PHASES": phases,
-                "AFT_GATE_HOME_ROOT": str(home / "homes"), "AFT_GATE_LOG": str(home / "gate.log"),
+                "AFT_GATE_HOME_ROOT": str(home / "homes"), "AFT_GATE_LOG": str(home / "logs" / "gate.log"),
                 "AFT_RUST_TEST_RUNNER": "cargo" if cargo_only else "nextest", "AFT_UNIT_TEST_RUNNER": "nextest",
             })
             for name in ("CI", "AFT_NEXTEST_ARCHIVE_FILE", "AFT_NEXTEST_ARCHIVE_BIN_FILE",
@@ -63,8 +75,26 @@ sys.exit(0)
                 env.update({"AFT_NEXTEST_ARCHIVE_FILE": str(home / "lib.tar.zst"),
                             "AFT_NEXTEST_ARCHIVE_BIN_FILE": str(home / "bin.tar.zst"),
                             "AFT_NEXTEST_PARTITION": "hash:1/3"})
-            result = subprocess.run(["bash", str(ROOT / "scripts/rust-test-gate.sh")],
-                                    env=env, cwd=ROOT, text=True, capture_output=True, timeout=30)
+            if log_dir_mode is not None:
+                (home / "logs").mkdir(mode=log_dir_mode)
+            leak_pid = home / "leak.pid"
+            if leak:
+                env["FAKE_LEAK_PID"] = str(leak_pid)
+            started = time.monotonic()
+            try:
+                result = subprocess.run(["bash", str(ROOT / "scripts/rust-test-gate.sh")],
+                                        env=env, cwd=ROOT, text=True, capture_output=True, timeout=60)
+            finally:
+                if leak_pid.exists():
+                    try:
+                        os.kill(int(leak_pid.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if log_dir_mode is not None:
+                    (home / "logs").chmod(0o700)
+            result.elapsed = time.monotonic() - started
+            log = home / "logs" / "gate.log"
+            result.gate_log = log.read_text() if log.exists() else ""
             observed = [json.loads(row) for row in calls.read_text().splitlines()] if calls.exists() else []
             return result, observed
 
@@ -91,10 +121,31 @@ sys.exit(0)
         self.assertEqual(len(calls), 1)
         self.assertNotIn("--no-fail-fast", calls[0])
 
-    def test_ci_log_write_failure_stops_instead_of_hiding_missing_evidence(self):
-        result, calls = self.run_gate("conformance", tee_fail=True)
-        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
-        self.assertEqual(len(calls), 1)
+    def test_ci_unwritable_gate_log_stops_before_running_a_phase(self):
+        result, calls = self.run_gate("conformance", log_dir_mode=0o500)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_error_before_any_phase_is_kept_in_the_gate_log(self):
+        # CI uploads only the gate log, so the reason a gate stopped before its
+        # first phase must be in it, not only on stderr.
+        result, calls = self.run_gate("bogus")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
+        self.assertIn("Unsupported AFT_GATE_PHASES entry 'bogus'", result.stderr)
+        self.assertIn("Unsupported AFT_GATE_PHASES entry 'bogus'", result.gate_log)
+
+    def test_leaked_child_holding_runner_output_does_not_hold_the_gate_open(self):
+        # The leaked child lives 30s. A gate that pipes phase output through a
+        # reader waiting for end-of-file (`tee`) stays open until it exits.
+        result, calls = self.run_gate("watcher", leak=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertLess(result.elapsed, 15, result.stdout + result.stderr)
+        self.assertIn("phase output before the leak", result.stdout)
+        self.assertIn("phase output before the leak", result.gate_log)
+        self.assertIn("GATE PASSED", result.stdout)
+        self.assertIn("GATE PASSED", result.gate_log)
 
     def test_cargo_only_ci_exit_does_not_erase_a_failed_suite(self):
         result, calls = self.run_gate("conformance", cargo_only=True, fail=True)

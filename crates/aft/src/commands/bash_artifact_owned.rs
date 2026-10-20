@@ -1,10 +1,12 @@
 //! `bash_artifact_owned`: query the session's read-only task-content capability.
 //!
 //! Plugins use this answer before raising an external-directory permission
-//! prompt. Eligible paths are exact registered bash output files, or files and
-//! directories inside scratch roots recorded on the session's existing tasks.
-//! Scratch ownership comes from the registry's spawn metadata, never a path's
-//! shape. Canonical targets outside the recorded root are not owned.
+//! prompt. Eligible paths are exact registered bash output files, files and
+//! directories inside scratch roots recorded on the session's existing tasks,
+//! and missing paths under such roots, including roots cleanup has already
+//! removed after their command exited (the read tool answers those as
+//! not-found). Scratch ownership comes from the registry's spawn metadata,
+//! never a path's shape. Canonical targets outside the recorded root are not owned.
 //!
 //! This command grants no access. The read tools still enforce policy floors,
 //! reject live SQLite content, and check opened scratch handles for escapes.
@@ -57,6 +59,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .is_session_owned_artifact_path(req.session(), &path)
         || ctx
             .bash_background()
-            .is_session_owned_scratch_path(req.session(), &path);
+            .is_session_owned_scratch_path(req.session(), &path)
+        // A missing path under the session's own scratch has no content to
+        // protect: the read tool answers not-found, so the host need not ask.
+        || ctx.bash_background().is_session_missing_scratch_path(
+            req.session(),
+            &crate::access_policy::policy_path(&path),
+        );
     Response::success(&req.id, json!({ "owned": owned }))
 }

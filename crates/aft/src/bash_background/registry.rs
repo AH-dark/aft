@@ -1184,6 +1184,11 @@ pub(crate) struct BgTaskState {
     /// The path stays in persisted metadata until this worker result succeeds,
     /// so a crash or a full queue leaves enough information for the stale sweep.
     temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
+    /// The scratch directory this task used, kept in memory after cleanup has
+    /// deleted it and cleared `metadata.sandbox_temp_dir`. A later read of a
+    /// path inside it by the same session can then fail as not-found instead
+    /// of asking for permission to read a file that no longer exists.
+    pub(crate) removed_temp_dir: Option<PathBuf>,
     pub(crate) runtime: TaskRuntime,
     /// Pinned task-io directory and original O_EXCL output handles retained for
     /// the process lifetime. Daemon writes never reopen child-writable names.
@@ -3507,6 +3512,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -3850,6 +3856,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
                 io_handles: Some(io_handles),
@@ -4098,6 +4105,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
                 io_handles: Some(io_handles),
@@ -7932,7 +7940,7 @@ impl BgTaskRegistry {
             state.temp_cleanup = super::temp_cleanup::schedule(path, task.db_write_order.clone());
             return Ok(false);
         }
-        state.metadata.sandbox_temp_dir = None;
+        state.removed_temp_dir = state.metadata.sandbox_temp_dir.take();
         // A crash before this write is harmless: deletion is idempotent, and
         // replay can retry from the old record without touching another task.
         task.terminal_persist_dirty.store(true, Ordering::SeqCst);
@@ -8099,6 +8107,7 @@ impl BgTaskRegistry {
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
+                removed_temp_dir: None,
                 metadata,
                 runtime: if mode == BgMode::Pty {
                     TaskRuntime::Pty(None)
@@ -18219,6 +18228,18 @@ mod tests {
         (registry, shared, frames)
     }
 
+    /// Kills every task the registry still holds when the test ends, whether
+    /// it passed or panicked. Background children are detached so they can
+    /// outlive a bridge; one a test leaves running outlives the test process
+    /// too and, on Windows, keeps the test runner's output handles open.
+    struct KillTasksOnDrop(BgTaskRegistry);
+
+    impl Drop for KillTasksOnDrop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     fn spawn_long_running_task(
         registry: &BgTaskRegistry,
@@ -19487,6 +19508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
         let task_id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,
@@ -19523,6 +19545,7 @@ mod tests {
         frames.lock().unwrap().clear();
 
         let (replayed, _db2, replay_frames) = registry_with_db_and_frames(storage);
+        let _reap_replayed = KillTasksOnDrop(replayed.clone());
         // Keep the original process's task row out of the way; replay loads from DB/disk.
         registry
             .inner
@@ -19633,6 +19656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
         registry.inner.shutdown.store(true, Ordering::SeqCst);
         let spawn = || {
             registry
@@ -19680,10 +19704,14 @@ mod tests {
             .unwrap()
             .write_all(b"READY")
             .unwrap();
+        // On Windows the long-running command prints to the same stdout file,
+        // so the watch can start past offset zero. Measure the tick from
+        // wherever the cursor stood before it.
+        let before = registry.watch_stream_cursors(&noisy).0;
         registry.scan_task_watch_output(&noisy_task);
         let first = registry.watch_stream_cursors(&noisy).0;
         assert_eq!(
-            first,
+            first - before,
             1024 * 1024,
             "one running tick must not consume the whole burst"
         );
@@ -19703,6 +19731,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, db, _) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
         let task_id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,

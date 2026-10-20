@@ -4712,6 +4712,48 @@ fn scoped_blocking_inspect_stores_a_non_empty_publish_after_its_close() {
     );
 }
 
+/// A scoped inspect closes the documents it opened, and the server answers
+/// each close with an empty publish. When the next inspect reopens the file
+/// before that reply arrives, the reply still describes the closed document.
+/// Storing it made the reopened file read as checked clean before the server
+/// had analyzed it again, so the second inspect reported no diagnostics.
+#[test]
+fn scoped_inspect_reopen_ignores_the_late_reply_to_the_earlier_close() {
+    let (_temp_dir, root, _file) = external_typescript_fixture();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    // The fake answers didClose only after the close delay, so the second
+    // inspect reopens the file while that reply is still on its way. It then
+    // reads the didOpen and publishes the reopened file's report only after
+    // the open delay, leaving the late close reply alone in the meantime.
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CLOSE_DELAY_MS", "300");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_OPEN_PUBLISH_DELAY_MS", "1000");
+
+    let first = scoped_diagnostics_inspect(&ctx, "inspect-reopen-first", "broken.ts");
+    let expected = vec![
+        "test diagnostic error".to_string(),
+        "test diagnostic warning".to_string(),
+    ];
+    assert_eq!(
+        diagnostic_messages_for(&first, "broken.ts"),
+        expected,
+        "response: {first:#}"
+    );
+
+    let second = scoped_diagnostics_inspect(&ctx, "inspect-reopen-second", "broken.ts");
+    assert_eq!(
+        diagnostic_messages_for(&second, "broken.ts"),
+        expected,
+        "the reply to the earlier close was read as the reopened file's report: {second:#}"
+    );
+    assert_eq!(
+        second["summary"]["diagnostics"]["errors"], 1,
+        "response: {second:#}"
+    );
+}
+
 /// A server that answers `textDocument/diagnostic` is asked directly. The
 /// fake pushes nothing useful here (an empty list on open), so only the pull
 /// can produce its diagnostic.

@@ -17499,6 +17499,7 @@ mod tests {
                 ..Default::default()
             },
         ));
+        let _reap = ReapContextChildren(Arc::clone(&ctx));
         ctx.lsp()
             .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
         ctx.lsp()
@@ -18169,6 +18170,21 @@ mod tests {
             executor.pool_size()
         );
         assert_eq!(dirs.len(), ROOTS);
+    }
+
+    /// Reaps what a test's context started, background bash tasks and
+    /// language servers, when the test ends, whether it passed or panicked.
+    /// The executor keeps its own reference to a registered context, so the
+    /// context's own teardown may not run before the test process exits; a
+    /// child left running then outlives the test and, on Windows, keeps the
+    /// test runner's output handles open.
+    struct ReapContextChildren(Arc<AppContext>);
+
+    impl Drop for ReapContextChildren {
+        fn drop(&mut self) {
+            self.0.bash_background().shutdown();
+            self.0.lsp().shutdown_all();
+        }
     }
 
     /// A small committed git root whose first route bind (session 0, opencode)
@@ -19003,6 +19019,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let executor = Arc::new(Executor::new());
         let fixture = ConfiguredRoot::new(&executor);
+        let _reap = ReapContextChildren(Arc::clone(&fixture.ctx));
         fixture.ctx.mark_subc_bound();
         start_post_ack_database_open(&executor, &fixture.root);
         assert!(

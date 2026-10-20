@@ -13045,6 +13045,26 @@ impl AppContext {
                 } else {
                     operation
                 };
+                // A read of the session's own scratch that no longer exists
+                // (cleanup removes it when the command exits) has nothing to
+                // grant. Answer not-found rather than raising a permission ask.
+                if operation == AccessOperation::Read {
+                    if let Some(session) = artifact_session {
+                        if self
+                            .bash_background
+                            .is_session_missing_scratch_path(session, &identity)
+                        {
+                            return Err(crate::protocol::Response::error(
+                                req_id,
+                                "not_found",
+                                format!(
+                                    "file not found: {}; task scratch is removed when its command exits",
+                                    original.display()
+                                ),
+                            ));
+                        }
+                    }
+                }
                 self.answer_ask(req_id, original, &identity, operation)?;
                 crate::bounded_io::probe_access(req_id, &identity)
             }
