@@ -1427,6 +1427,64 @@ mod tests {
     }
 
     #[test]
+    fn background_spawn_notices_preserve_terminal_status_and_guidance() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project.path().into()),
+                storage_dir: Some(storage.path().into()),
+                ..crate::config::Config::default()
+            },
+        );
+        for pty in [false, true] {
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": "terminal-with-notices",
+                "command": "bash",
+                "params": {"command": "exit 7", "background": true, "pty": pty},
+            }))
+            .unwrap();
+            let spawn = Response::success(
+                &request.id,
+                json!({
+                    "task_id": "finished-task",
+                    "status": "failed",
+                    "mode": if pty { "pty" } else { "pipes" },
+                    "_bash_duplicate_warning": "Duplicate running command: earlier-task",
+                    "_bash_env_keys": ["BUILD_LABEL"],
+                }),
+            );
+            let response = match build_bash_outcome(&request, &ctx, spawn) {
+                DispatchOutcome::Immediate(response) => response,
+                DispatchOutcome::Deferred(_) => panic!("background launch must answer immediately"),
+            };
+            assert_eq!(response.data["status"], "failed");
+            let output = response.data["output"].as_str().unwrap();
+            assert!(
+                output.contains(&format_background_launch(
+                    "finished-task",
+                    pty,
+                    false,
+                    false
+                )),
+                "{output}"
+            );
+            assert!(
+                output.contains("Duplicate running command: earlier-task"),
+                "{output}"
+            );
+            assert!(
+                output
+                    .contains("Configured bash.env keys applied (values not shown): BUILD_LABEL."),
+                "{output}"
+            );
+            assert!(response.data.get("_bash_duplicate_warning").is_none());
+            assert!(response.data.get("_bash_env_keys").is_none());
+        }
+    }
+
+    #[test]
     fn foreground_scope_revocation_preserves_old_and_new_reason_text() {
         for reason in [
             "scope revoked",

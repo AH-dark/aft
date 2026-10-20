@@ -5511,6 +5511,39 @@ pub(crate) mod environment_tests {
         )));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn worker_environment_keeps_benign_values_and_strips_injection_and_credentials() {
+        let request = HashMap::from([
+            ("BUILD_LABEL".into(), "configured-value".into()),
+            ("BASH_ENV".into(), "/untrusted/startup".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
+            (
+                crate::privacy_spawn::CONTROL_ENV.into(),
+                "private-control".into(),
+            ),
+            (
+                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+                "private-ticket".into(),
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let worker = with_worker_jail(true, || sandboxed_child_environment(&request, dir.path()));
+        assert_eq!(
+            worker.get(OsStr::new("BUILD_LABEL")),
+            Some(&OsString::from("configured-value"))
+        );
+        for key in request.keys().filter(|key| key.as_str() != "BUILD_LABEL") {
+            assert!(
+                !worker.contains_key(OsStr::new(key)),
+                "worker inherited {key}"
+            );
+        }
+    }
+
     const REENTRY: &str = "AFT_TEST_RELAXED_ENV_REENTRY";
 
     // Plant daemon variables in a subprocess, not the parallel test runner's

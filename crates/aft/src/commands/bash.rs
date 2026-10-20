@@ -750,6 +750,34 @@ mod tests {
         stop_spawned_test_task(&ctx, &response);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_running_bash_uses_resolved_relative_workdir() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let subdir = root.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let ctx = spawn_test_context(root.path(), storage.path());
+        ctx.update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
+        let mut first_request = spawn_test_request("duplicate-absolute", "sleep 30", true);
+        first_request.params["params"]["workdir"] = json!(subdir);
+        let first = handle(&first_request, &ctx);
+        assert!(first.success, "{:?}", first.data);
+
+        let mut second_request = spawn_test_request("duplicate-relative", "sleep 30", true);
+        second_request.params["params"]["workdir"] = json!("subdir");
+        let second = handle(&second_request, &ctx);
+        stop_spawned_test_task(&ctx, &first);
+        stop_spawned_test_task(&ctx, &second);
+
+        assert!(second.success, "{:?}", second.data);
+        let warning = second.data["_bash_duplicate_warning"].as_str().unwrap();
+        assert!(
+            warning.contains(first.data["task_id"].as_str().unwrap()),
+            "{warning}"
+        );
+    }
+
     // Command rewriting resolves relative paths against the project root, so it
     // must only run when the effective workdir IS the project root — otherwise a
     // rewritten `echo hi >> notes.txt` with workdir=subdir writes the wrong file.
