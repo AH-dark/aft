@@ -5,6 +5,123 @@ use std::fs;
 use std::io::Write;
 
 #[test]
+fn pinned_reader_does_not_delay_refresh_by_the_write_busy_timeout() {
+    let (_temp, store, source) = fixture();
+    thresholds(&store, 1024, 2048);
+    let timeout_ms: u64 = store
+        .conn
+        .lock()
+        .unwrap()
+        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        timeout_ms, 5000,
+        "exercise the normal write timeout, not a shortened test timeout"
+    );
+    let reader = Connection::open(store.sqlite_path()).unwrap();
+    reader.execute_batch("BEGIN; SELECT * FROM nodes;").unwrap();
+    edit(&store, &source, "first");
+    for name in ["second", "third"] {
+        let started = Instant::now();
+        edit(&store, &source, name);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "reader-pinned maintenance must not spend the write busy timeout on {name}: {:?}",
+            started.elapsed()
+        );
+        let restored: u64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            restored, timeout_ms,
+            "checkpoint attempts must restore the write timeout"
+        );
+    }
+    let policy = store.refresh_wal.lock().unwrap();
+    assert_eq!(policy.restart_attempts, 2);
+    assert_eq!(policy.restart_busy, 2);
+}
+
+#[test]
+fn opening_next_queued_refresh_does_not_autocheckpoint_the_previous_batch() {
+    let _guard = REFRESH_WORKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_temp, store, source) = fixture();
+    let root = store.project_root.clone();
+    let dir = store.publication_dir.clone();
+    // Keep a SQLite reader connection open without pinning a read transaction:
+    // a checkpoint could backfill every page if opening the writer ran one.
+    let keeper = Connection::open(store.sqlite_path()).unwrap();
+    keeper
+        .query_row("SELECT count(*) FROM nodes", [], |row| row.get::<_, u64>(0))
+        .unwrap();
+    let policy = Arc::new(Mutex::new(Policy {
+        soft_bytes: 1,
+        hard_bytes: u64::MAX,
+        ..Policy::default()
+    }));
+    drop(store);
+    let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+    set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+    REFRESH_WORKER_TEST_SEAMS
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .get_mut(&root)
+        .unwrap()
+        .wal_policy = Some(Arc::clone(&policy));
+    let (first_held, first_release) = install_callgraph_refresh_worker_test_gate(root.clone());
+    let pending = Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
+    let text: String = (0..65000)
+        .map(|n| format!("export function leaf_{n}() {{ return {n}; }}\n"))
+        .collect();
+    fs::write(&source, text).unwrap();
+    enqueue_callgraph_store_refresh(
+        dir.clone(),
+        root.clone(),
+        vec![source],
+        Arc::clone(&pending),
+    );
+    first_held.recv_timeout(Duration::from_secs(30)).unwrap();
+    let (second_held, second_release) = install_callgraph_refresh_worker_test_gate(root.clone());
+    let second = root.join("second.ts");
+    fs::write(&second, "export function second() {}\n").unwrap();
+    enqueue_callgraph_store_refresh(dir, root.clone(), vec![second], pending);
+    let root_id = root.display().to_string();
+    let checkpoint_credit =
+        crate::write_ledger::register(crate::write_ledger::Domain::CallgraphCheckpoint, root_id);
+    let before = checkpoint_credit.physical_total_for_test();
+    first_release.send(()).unwrap();
+    second_held.recv_timeout(Duration::from_secs(300)).unwrap();
+    {
+        let policy = policy.lock().unwrap();
+        assert!(
+            policy.observed_bytes > 4000 * 4096,
+            "the previous committed batch must exceed the ordinary autocheckpoint threshold"
+        );
+        assert_eq!(
+            policy.events,
+            ["commit"],
+            "the queued batch must defer the soft checkpoint"
+        );
+    }
+    let after = checkpoint_credit.physical_total_for_test();
+    assert_eq!(
+        after, before,
+        "opening the next refresh must not checkpoint the queued WAL"
+    );
+    second_release.send(()).unwrap();
+    assert!(worker.wait(Duration::from_secs(30)));
+    drop(worker);
+    clear_callgraph_refresh_worker_test_seam(&root);
+}
+
+#[test]
 fn s2_queued_batch_commits_before_soft_checkpoint() {
     let _guard = REFRESH_WORKER_TEST_LOCK
         .lock()

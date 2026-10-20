@@ -41,10 +41,22 @@ impl Policy {
             return;
         }
         self.restart_attempts += 1;
-        let complete = match conn.checkpoint_wal_as(
-            WalCheckpointMode::Restart,
-            crate::write_ledger::Domain::CallgraphCheckpoint,
-        ) {
+        // A reader may pin this WAL for much longer than a write transaction.
+        // Maintenance must yield immediately rather than stall this root and
+        // every other root sharing the refresh worker. Restore the writer's
+        // existing timeout even when SQLite reports a checkpoint error.
+        let checkpoint = (|| -> rusqlite::Result<_> {
+            let timeout_ms: u64 =
+                conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+            conn.busy_timeout(Duration::ZERO)?;
+            let result = conn.checkpoint_wal_as(
+                WalCheckpointMode::Restart,
+                crate::write_ledger::Domain::CallgraphCheckpoint,
+            );
+            conn.busy_timeout(Duration::from_millis(timeout_ms))?;
+            result
+        })();
+        let complete = match checkpoint {
             Ok(result) => result.busy == 0 && result.log_frames == result.checkpointed_frames,
             Err(error) => {
                 crate::slog_warn!("callgraph refresh pre-BEGIN RESTART checkpoint failed: {error}");

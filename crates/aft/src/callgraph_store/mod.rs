@@ -3224,7 +3224,7 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
             // The failed batch's store and transaction have unwound. Open a
             // fresh connection rather than recovering its poisoned mutex.
             crate::slog_warn!("callgraph refresh batch panicked; deferred paths for replay");
-            let store = CallGraphStore::open_ready(
+            let store = CallGraphStore::open_ready_for_refresh(
                 batch.root.callgraph_dir.clone(),
                 batch.root.project_root.clone(),
             )
@@ -3395,7 +3395,7 @@ fn process_callgraph_refresh_batch(
     let opened = if test_seam.fail_open {
         Ok(None)
     } else {
-        CallGraphStore::open_ready(
+        CallGraphStore::open_ready_for_refresh(
             batch.root.callgraph_dir.clone(),
             batch.root.project_root.clone(),
         )
@@ -3998,6 +3998,13 @@ enum OpenRootRepair {
 struct OpenedStore {
     store: CallGraphStore,
     root_repair: OpenRootRepair,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriterConnectionRole {
+    Generation,
+    Refresh,
+    Build,
 }
 
 #[derive(Clone, Debug)]
@@ -5529,21 +5536,52 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, true, true)
+        Self::open_ready_with_rebuild_policy(
+            callgraph_dir,
+            project_root,
+            true,
+            true,
+            WriterConnectionRole::Generation,
+        )
     }
 
     /// Open a ready store for bounded maintenance work without repairing root
     /// metadata or starting a cold rebuild. A store that needs either action is
     /// reported as unavailable so a background build can own that work.
     pub fn open_ready(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, false)
+        Self::open_ready_with_rebuild_policy(
+            callgraph_dir,
+            project_root,
+            false,
+            false,
+            WriterConnectionRole::Generation,
+        )
+    }
+
+    fn open_ready_for_refresh(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<Self>> {
+        Self::open_ready_with_rebuild_policy(
+            callgraph_dir,
+            project_root,
+            false,
+            false,
+            WriterConnectionRole::Refresh,
+        )
     }
 
     pub fn open_ready_no_rebuild(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, true)
+        Self::open_ready_with_rebuild_policy(
+            callgraph_dir,
+            project_root,
+            false,
+            true,
+            WriterConnectionRole::Generation,
+        )
     }
 
     fn open_ready_with_rebuild_policy(
@@ -5551,6 +5589,7 @@ impl CallGraphStore {
         project_root: PathBuf,
         allow_cold_build: bool,
         allow_root_repair: bool,
+        role: WriterConnectionRole,
     ) -> Result<Option<Self>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
@@ -5567,7 +5606,7 @@ impl CallGraphStore {
             project_key.clone(),
             sqlite_path,
             generation,
-            true,
+            role,
             Some(Arc::clone(&writer_lease)),
             None,
             allow_root_repair,
@@ -6112,7 +6151,11 @@ impl CallGraphStore {
             project_key,
             sqlite_path,
             generation,
-            use_wal,
+            if use_wal {
+                WriterConnectionRole::Generation
+            } else {
+                WriterConnectionRole::Build
+            },
             writer_lease,
             read_marker,
             true,
@@ -6124,7 +6167,7 @@ impl CallGraphStore {
         project_key: String,
         sqlite_path: PathBuf,
         generation: Option<String>,
-        use_wal: bool,
+        role: WriterConnectionRole,
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
         allow_root_repair: bool,
@@ -6135,7 +6178,7 @@ impl CallGraphStore {
         if let Some(parent) = sqlite_path.parent() {
             crate::private_storage::create_dir_all(parent)?;
         }
-        let store = if use_wal {
+        let store = if role != WriterConnectionRole::Build {
             SqliteStore::CallgraphGeneration
         } else {
             SqliteStore::CallgraphColdGeneration
@@ -6145,10 +6188,10 @@ impl CallGraphStore {
             store,
             project_root.display().to_string(),
         )?;
-        if use_wal {
-            configure_connection(&conn)?;
-        } else {
-            configure_build_connection(&conn)?;
+        match role {
+            WriterConnectionRole::Generation => configure_connection(&conn)?,
+            WriterConnectionRole::Refresh => configure_generation_connection(&conn, role)?,
+            WriterConnectionRole::Build => configure_build_connection(&conn)?,
         }
         if let Some(lease) = writer_lease.as_ref() {
             verify_writer_lease(lease)?;
@@ -10846,13 +10889,28 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
 }
 
 fn configure_connection(conn: &TrackedConnection) -> Result<()> {
+    configure_generation_connection(conn, WriterConnectionRole::Generation)
+}
+
+fn configure_generation_connection(
+    conn: &TrackedConnection,
+    role: WriterConnectionRole,
+) -> Result<()> {
     // Changing journal mode takes a database lock. Install the busy handler
     // first so concurrent cold-build and refresh connections wait rather than
     // failing immediately, especially under Windows byte-range locking.
     conn.busy_timeout(Duration::from_secs(5))?;
+    if role == WriterConnectionRole::Refresh {
+        // Opening a ready generation writes schema metadata. Select the refresh
+        // policy before even the journal-mode pragma so those opening commits
+        // cannot checkpoint the WAL left by an earlier queued batch.
+        conn.configure_refresh_wal()?;
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.set_wal_autocheckpoint(CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES)?;
+    if role != WriterConnectionRole::Refresh {
+        conn.set_wal_autocheckpoint(CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES)?;
+    }
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }
