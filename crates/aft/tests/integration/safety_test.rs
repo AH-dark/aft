@@ -2829,6 +2829,104 @@ fn checkpoint_names(aft: &mut AftProcess, session: &str) -> Vec<String> {
     names
 }
 
+#[cfg(unix)]
+fn purge_final_directory_symlink(restricted: bool) {
+    let container = temp_dir(if restricted {
+        "purge_link_restricted"
+    } else {
+        "purge_link_allowed"
+    });
+    let root = container.join("project");
+    let outside = container.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("secret.txt");
+    let link = root.join("link");
+    fs::write(&secret, "original").unwrap();
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &root, "cfg-link-setup");
+    session_snapshot(&mut aft, "s1", &secret, "edited");
+    let cp = session_send(
+        &mut aft,
+        "s1",
+        "cp-link",
+        "checkpoint",
+        serde_json::json!({
+            "name": "copies", "files": [&link, &secret],
+        }),
+    );
+    assert_eq!(cp["success"], true, "{cp:?}");
+    let snap = session_send(
+        &mut aft,
+        "s1",
+        "snap-link",
+        "snapshot",
+        serde_json::json!({ "file": link }),
+    );
+    assert_eq!(snap["success"], true, "{snap:?}");
+    if restricted {
+        configure_restricted(&mut aft, &root, "cfg-link-restricted");
+    }
+
+    let preview = purge_preview(&mut aft, "s1", link.to_str().unwrap());
+    assert_eq!(
+        preview,
+        vec![fs::canonicalize(&root)
+            .unwrap()
+            .join("link")
+            .display()
+            .to_string()]
+    );
+    let purge = session_purge(&mut aft, "s1", link.to_str().unwrap());
+    assert_eq!(purge["undo_stacks_removed"], 1, "{purge:?}");
+    assert_eq!(
+        purge["checkpoints_pruned"],
+        serde_json::json!([{ "name": "copies", "files_removed": 1 }])
+    );
+    assert_eq!(purge["complete"], true);
+
+    if restricted {
+        let refused = session_send(
+            &mut aft,
+            "s1",
+            "purge-outside-refused",
+            "safety_purge",
+            serde_json::json!({ "file": outside }),
+        );
+        assert_eq!(refused["code"], "path_outside_root", "{refused:?}");
+        configure_unrestricted(&mut aft, &root, "cfg-link-restore");
+        assert_eq!(session_undo_code(&mut aft, "s1", &secret), "ok");
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "original");
+        let restore = session_send(
+            &mut aft,
+            "s1",
+            "restore-outside-copy",
+            "restore_checkpoint",
+            serde_json::json!({ "name": "copies" }),
+        );
+        assert_eq!(restore["success"], true, "{restore:?}");
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "edited");
+    } else {
+        let purge = session_purge(&mut aft, "s1", outside.to_str().unwrap());
+        assert_eq!(purge["undo_stacks_removed"], 1, "{purge:?}");
+        assert_eq!(purge["checkpoints_dropped"], serde_json::json!(["copies"]));
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_final_directory_symlink_does_not_touch_unauthorized_target() {
+    purge_final_directory_symlink(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_final_directory_symlink_keeps_target_until_explicit_authorized_purge() {
+    purge_final_directory_symlink(false);
+}
+
 #[test]
 fn purged_file_cannot_be_undone_or_restored_and_other_sessions_keep_theirs() {
     let dir = temp_dir("purge_file");

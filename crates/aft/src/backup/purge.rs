@@ -140,10 +140,10 @@ pub struct PurgeTarget {
     given: PathBuf,
     /// The path's location: parents resolved, final component kept.
     location: PathBuf,
-    /// For an existing directory, its fully resolved form. Anything strictly
-    /// under it is under the purged directory, even when the directory was
-    /// named through a final symlink.
-    resolved_directory: Option<PathBuf>,
+    /// A final symlink is only the link entry, just as it is for undo and
+    /// checkpoint restore. Saved copies of its target or of paths beneath
+    /// the link require a separate purge naming their own location.
+    entry_only: bool,
     /// For an existing non-directory, its file name. A saved path with any
     /// other final name can be neither the purged file nor under it.
     existing_file_name: Option<std::ffi::OsString>,
@@ -152,18 +152,19 @@ pub struct PurgeTarget {
 impl PurgeTarget {
     pub fn new(path: &Path) -> Self {
         let location = canonicalize_key(path);
-        let is_directory = std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir());
-        let resolved_directory = is_directory
-            .then(|| std::fs::canonicalize(path).ok())
-            .flatten()
-            .map(|resolved| canonicalize_key(&resolved));
-        let existing_file_name = (!is_directory && std::fs::symlink_metadata(path).is_ok())
+        let metadata = std::fs::symlink_metadata(path).ok();
+        let entry_only = metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink());
+        let existing_file_name = metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.is_dir())
             .then(|| path.file_name().map(std::ffi::OsStr::to_os_string))
             .flatten();
         Self {
             given: path.to_path_buf(),
             location,
-            resolved_directory,
+            entry_only,
             existing_file_name,
         }
     }
@@ -181,6 +182,16 @@ impl PurgeTarget {
     /// result is `Unknown` (or `Unrelated` for a different file name),
     /// because that parent may have been a symlink to anywhere.
     pub fn classify(&self, saved: &Path, recorded_resolved: bool) -> SavedPathMatch {
+        if self.entry_only {
+            return if saved == self.given
+                || saved == self.location
+                || (!recorded_resolved && canonicalize_key(saved) == self.location)
+            {
+                SavedPathMatch::Selected
+            } else {
+                SavedPathMatch::Unrelated
+            };
+        }
         if saved.starts_with(&self.given) || saved.starts_with(&self.location) {
             return SavedPathMatch::Selected;
         }
@@ -203,10 +214,7 @@ impl PurgeTarget {
         } else {
             canonicalize_key(saved)
         };
-        let under_directory = self.resolved_directory.as_ref().is_some_and(|directory| {
-            saved_location != *directory && saved_location.starts_with(directory)
-        });
-        if saved_location.starts_with(&self.location) || under_directory {
+        if saved_location.starts_with(&self.location) {
             SavedPathMatch::Selected
         } else {
             SavedPathMatch::Unrelated

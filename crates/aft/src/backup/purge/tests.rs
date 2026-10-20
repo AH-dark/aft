@@ -77,6 +77,42 @@ fn key(path: &Path) -> String {
     backup_key_for_path(path).display().to_string()
 }
 
+#[cfg(unix)]
+#[test]
+fn final_directory_symlink_purge_selects_only_the_link_entry() {
+    let fx = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let target_file = outside.path().join("secret.txt");
+    fs::write(&target_file, "secret").unwrap();
+    let link = fx.project.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let live = parking_lot::Mutex::new(fx.store());
+    live.lock().snapshot(S1, &target_file, "edit").unwrap();
+    live.lock().snapshot(S1, &link, "delete").unwrap();
+
+    let selected = session_path_keys(&live, S1, &link, |_| Some(Arc::clone(&fx.db)));
+    assert_eq!(selected, vec![backup_key_for_path(&link)]);
+    let target = PurgeTarget::new(&link);
+    assert_eq!(
+        target.classify(&link.join("secret.txt"), false),
+        SavedPathMatch::Unrelated
+    );
+    assert_eq!(
+        target.classify(&target_file, false),
+        SavedPathMatch::Unrelated
+    );
+
+    let report = purge_backups(
+        &fx.request(Some(&link), Some(S1), false),
+        Some(Arc::clone(&fx.db)),
+        &[&live],
+    );
+    assert!(report.is_complete(), "{:?}", report.failures);
+    assert_eq!(report.removed.stacks, 1);
+    assert_eq!(live.lock().history(S1, &target_file).len(), 1);
+    assert!(live.lock().history(S1, &link).is_empty());
+}
+
 #[test]
 fn dry_run_reports_counts_and_removes_nothing() {
     let fx = Fixture::new();
