@@ -2587,7 +2587,11 @@ impl WatcherFilterThread {
 
     fn flush_pending_with_wait(&mut self, deadline: Instant, pause: impl FnMut()) -> bool {
         #[cfg(feature = "test-timing-hooks")]
-        hold_watcher_flush_for_test(&self.shutdown);
+        if !self.raw_paths.is_empty() {
+            // An idle tick has nothing to keep pending; holding it would stop
+            // the thread before it takes in the event the test is waiting for.
+            hold_watcher_flush_for_test(&self.shutdown);
+        }
         let flushed = self.flush_raw_paths_with_wait(deadline, pause);
         // Paths kept for another window (an ignore-rule change still being
         // acknowledged) remain unflushed; everything else has been handed to
