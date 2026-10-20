@@ -2704,6 +2704,9 @@ enum ViewSurfaceQuery {
     Crate(String),
     CrateRoot(String),
     Inline(String, Vec<String>, String),
+    /// The `.go` files of the package a Go caller looks a symbol up in: its own
+    /// directory, or the directory of an imported module path.
+    GoPackage(String, Option<String>),
 }
 
 fn surface_value(value: &impl Serialize) -> String {
@@ -2729,6 +2732,11 @@ fn reexport_surface(value: &[super::ReexportIndex]) -> String {
 
 pub(crate) const VIEW_CONFIG_MEMBERSHIP_DOMAIN: &str = "\0view:config-membership";
 pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
+/// Recorded by every Go package file listing. A listing reads the directory,
+/// not the files in it, so a file added to the package is no recorded
+/// dependency of the callers that listed it; the owner rechecks this domain
+/// whenever a `.go` file is added or removed.
+pub(crate) const VIEW_GO_PACKAGE_DOMAIN: &str = "\0view:go-package-files";
 
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
@@ -2740,6 +2748,7 @@ impl ViewSurfaceQuery {
             Self::Parent(file) | Self::Inline(file, ..) => {
                 vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
             }
+            Self::GoPackage(..) => vec![VIEW_GO_PACKAGE_DOMAIN.into()],
             Self::Language(file)
             | Self::MacroUse(file)
             | Self::Module(file, _)
@@ -2773,6 +2782,9 @@ impl ViewSurfaceQuery {
             Self::Inline(file, segments, symbol) => {
                 surface_value(&index.inline_scoped_target(file, segments, symbol))
             }
+            Self::GoPackage(file, module) => {
+                surface_value(&index.go_package_files(file, module.as_deref()))
+            }
         }
     }
 }
@@ -2800,7 +2812,12 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
         value
     }
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
-        self.inner.go_package_files(caller_file, module)
+        let value = self.inner.go_package_files(caller_file, module);
+        self.record(
+            ViewSurfaceQuery::GoPackage(caller_file.into(), module.map(str::to_string)),
+            &value,
+        );
+        value
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         // resolve_ref reads only its own caller data; changed callers never reuse

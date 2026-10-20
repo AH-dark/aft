@@ -56,10 +56,12 @@ fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
     // read-side fixtures unnecessarily expensive on Windows.
     let tx = blobs.unchecked_transaction().unwrap();
     let manifest = Manifest::new(files.iter().map(|(path, source)| {
-        let language = if path.ends_with(".rs") {
-            "rust"
-        } else {
-            "typescript"
+        let language = match path.rsplit_once('.').map(|(_, extension)| extension) {
+            Some("rs") => "rust",
+            Some("go") => "go",
+            Some("java") => "java",
+            Some("cs") => "csharp",
+            _ => "typescript",
         };
         let blob = join::CallgraphBlob::extract(source, language, "fixture").unwrap();
         let payload = blob.to_bytes().unwrap();
@@ -1461,8 +1463,12 @@ fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
 const DIFFERENTIAL_CIRCLE: &str = "import { Shape } from './shapes';\n\
      export class Circle implements Shape { area() { return 3; } }\n";
 
-/// A deterministic mixed TypeScript and Rust corpus that a seeded sequence of
-/// edits walks through. Each version is a full path-to-source map.
+const DIFFERENTIAL_GO_SPEAKER: &str =
+    "package svc\n\ntype Speaker interface {\n\tSpeak()\n\tSit()\n}\n";
+
+/// A deterministic corpus of TypeScript, Rust, Go, Java and C# files that a
+/// seeded or scripted sequence of edits walks through. Each version is a full
+/// path-to-source map.
 struct DifferentialCorpus {
     files: BTreeMap<String, String>,
     next_id: usize,
@@ -1528,6 +1534,41 @@ impl DifferentialCorpus {
             "src/board.rs".into(),
             "use crate::shapes::Tile;\npub fn board(t: &Tile) -> i32 { t.width() }\n".into(),
         );
+        // One Go package. `Dog` lacks `Sit`, so it does not yet satisfy
+        // `Speaker`; `Loud` calls through an unknown receiver, whose name
+        // matches depend on the interfaces of every Go file; `Pet` names a
+        // type that no file of its directory declares yet.
+        files.insert("gosvc/iface.go".into(), DIFFERENTIAL_GO_SPEAKER.into());
+        files.insert(
+            "gosvc/dog.go".into(),
+            "package svc\n\ntype Dog struct{}\n\nfunc (d Dog) Speak() {}\n".into(),
+        );
+        files.insert(
+            "gosvc/talk.go".into(),
+            "package svc\n\nfunc Talk(s Speaker) { s.Speak() }\n".into(),
+        );
+        files.insert(
+            "gosvc/loud.go".into(),
+            "package svc\n\nfunc Loud() { pick().Speak() }\n".into(),
+        );
+        files.insert(
+            "gosvc/pet.go".into(),
+            "package svc\n\nfunc Pet(c Cat) { c.Purr() }\n".into(),
+        );
+        // Java and C# find a receiver type among the files of the caller's
+        // directory as Go does.
+        files.insert(
+            "java/zoo/Keeper.java".into(),
+            "package zoo;\n\nclass Keeper { void feed(Lion l) { l.roar(); } }\n".into(),
+        );
+        files.insert(
+            "csharp/farm/Cow.cs".into(),
+            "partial class Cow { public void Moo() {} }\n".into(),
+        );
+        files.insert(
+            "csharp/farm/Barn.cs".into(),
+            "class Barn { void Open(Cow c) { c.Moo(); } }\n".into(),
+        );
         Self {
             files,
             next_id: 100,
@@ -1550,6 +1591,16 @@ impl DifferentialCorpus {
             .filter(|path| path.starts_with("mod_"))
             .cloned()
             .collect()
+    }
+
+    /// Adds `path` with `source`, or removes it when present; true when added.
+    fn toggle_file(&mut self, path: &str, source: &str) -> bool {
+        if self.files.remove(path).is_some() {
+            false
+        } else {
+            self.files.insert(path.into(), source.into());
+            true
+        }
     }
 
     /// Apply one randomly chosen edit and describe it.
@@ -1701,6 +1752,83 @@ impl DifferentialCorpus {
                     "restore circle.ts".into()
                 }
             }
+            // Edits 14 and up are chosen only by scripted walks; see
+            // `DIFFERENTIAL_WITNESSES` for the call each one moves.
+            14 => {
+                // With `Sit`, `Dog` has every method `Speaker` requires, so
+                // the unchanged `Talk` gains `Dog.Speak` as a dispatch target.
+                let dog = self.files.get_mut("gosvc/dog.go").unwrap();
+                if dog.contains("func (d Dog) Sit") {
+                    *dog = dog.replace("\nfunc (d Dog) Sit() {}\n", "");
+                    *dog = dog.replace("\nfunc (d Dog) Sit(n int) {}\n", "");
+                    "remove go method Dog.Sit".into()
+                } else {
+                    dog.push_str("\nfunc (d Dog) Sit() {}\n");
+                    "add go method Dog.Sit".into()
+                }
+            }
+            15 => {
+                // A parameter the interface does not declare: `Dog` stops
+                // satisfying `Speaker` (or starts again when switched back).
+                let dog = self.files.get_mut("gosvc/dog.go").unwrap();
+                if dog.contains("Sit(n int)") {
+                    *dog = dog.replace("Sit(n int)", "Sit()");
+                    "drop parameter of go method Dog.Sit".into()
+                } else if dog.contains("Sit()") {
+                    *dog = dog.replace("Sit()", "Sit(n int)");
+                    "add parameter to go method Dog.Sit".into()
+                } else {
+                    dog.push_str("\nfunc (d Dog) Sit(n int) {}\n");
+                    "add go method Dog.Sit(n int)".into()
+                }
+            }
+            16 => {
+                // A sibling file of the same package declares the receiver
+                // type of the unchanged `Pet`.
+                if self.toggle_file(
+                    "gosvc/cat.go",
+                    "package svc\n\ntype Cat struct{}\n\nfunc (c Cat) Purr() {}\n",
+                ) {
+                    "add go sibling cat.go".into()
+                } else {
+                    "remove go sibling cat.go".into()
+                }
+            }
+            17 => {
+                // The Java form of the same receiver lookup.
+                if self.toggle_file(
+                    "java/zoo/Lion.java",
+                    "package zoo;\n\nclass Lion { void roar() {} }\n",
+                ) {
+                    "add java sibling Lion.java".into()
+                } else {
+                    "remove java sibling Lion.java".into()
+                }
+            }
+            18 => {
+                // A second declaration of `Cow` in the directory makes the
+                // receiver type of the unchanged `Barn` ambiguous.
+                if self.toggle_file(
+                    "csharp/farm/CowMore.cs",
+                    "partial class Cow { public void Graze() {} }\n",
+                ) {
+                    "add c# sibling CowMore.cs".into()
+                } else {
+                    "remove c# sibling CowMore.cs".into()
+                }
+            }
+            19 => {
+                // No Go interface then requires `Speak()` as `Dog` declares
+                // it, so the unknown receiver of `Loud` stops matching it.
+                let speaker = self.files.get_mut("gosvc/iface.go").unwrap();
+                if speaker.contains("Speak(loud bool)") {
+                    *speaker = DIFFERENTIAL_GO_SPEAKER.into();
+                    "restore go interface method Speaker.Speak".into()
+                } else {
+                    *speaker = speaker.replace("Speak()", "Speak(loud bool)");
+                    "add parameter to go interface method Speaker.Speak".into()
+                }
+            }
             _ => {
                 // Rename a target: callers that imported the old name stop
                 // resolving and must be relinked as unresolved.
@@ -1713,6 +1841,34 @@ impl DifferentialCorpus {
     }
 }
 
+/// For each corpus edit that only scripted walks choose, the caller file and
+/// the target file of the method-call edges the edit must add or remove. Each
+/// such caller is unchanged by the edit, so only a recorded dependency key can
+/// bring its rows up to date: methods and Go interfaces (14, 15, 19) or the
+/// directory of a Go, Java or C# caller (16, 17, 18).
+const DIFFERENTIAL_WITNESSES: &[(usize, &str, &str)] = &[
+    (14, "gosvc/talk.go", "gosvc/dog.go"),
+    (15, "gosvc/talk.go", "gosvc/dog.go"),
+    (16, "gosvc/pet.go", "gosvc/cat.go"),
+    (17, "java/zoo/Keeper.java", "java/zoo/Lion.java"),
+    (18, "csharp/farm/Barn.cs", "csharp/farm/Cow.cs"),
+    (19, "gosvc/loud.go", "gosvc/dog.go"),
+];
+
+/// The number of method-call edges from sites of `caller` into `target`.
+fn dispatch_edges_between(snapshot: &parity::LogicalSnapshot, caller: &str, target: &str) -> usize {
+    let source = format!("\"TEXT dispatch:{caller}:");
+    let target = format!(":{target}:");
+    snapshot["edges"]
+        .iter()
+        .filter(|row| {
+            row.split_once(&source).is_some_and(|(_, rest)| {
+                rest.split('"').next().unwrap_or_default().contains(&target)
+            })
+        })
+        .count()
+}
+
 /// Incremental materialization equals a cold build for adjacent steps, for a
 /// chain of steps applied to one database, and for non-adjacent pairs in both
 /// directions (which include switching back to an earlier version).
@@ -1723,11 +1879,18 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
     // The random seeds collectively exercise every corpus edit with few
     // redundant all-pairs SQLite materializations. The two fixed walks then go
     // through every method-call edit, so each one is compared whatever the
-    // random choices were.
+    // random choices were. The last two walk through the Go interface and
+    // directory lookups of unchanged callers; every reverse pair of a walk
+    // also checks undoing its edit.
     let scripts = [1_u64, 2, 4]
         .into_iter()
         .map(|seed| (seed, None))
-        .chain([(7, Some([6, 8, 9, 12])), (8, Some([7, 10, 12, 11]))])
+        .chain([
+            (7, Some([6, 8, 9, 12])),
+            (8, Some([7, 10, 12, 11])),
+            (9, Some([14, 15, 19, 18])),
+            (10, Some([16, 17, 14, 16])),
+        ])
         .collect::<Vec<_>>();
     for (seed, script) in scripts {
         let mut corpus = DifferentialCorpus::new(seed);
@@ -1777,6 +1940,26 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
                     .any(|row| row.contains(&format!("\"TEXT {provenance}\""))),
                 "{context}: the corpus has {provenance} method-call edges"
             );
+        }
+        // A scripted edit that moved no edge would compare nothing new.
+        for (step, choice) in script.iter().flatten().enumerate() {
+            assert_ne!(
+                cold[step]["edges"],
+                cold[step + 1]["edges"],
+                "{context}: edit {choice} at step {} changes edges",
+                step + 1
+            );
+            for (_, caller, target) in DIFFERENTIAL_WITNESSES
+                .iter()
+                .filter(|(witnessed, _, _)| witnessed == choice)
+            {
+                assert_ne!(
+                    dispatch_edges_between(&cold[step], caller, target),
+                    dispatch_edges_between(&cold[step + 1], caller, target),
+                    "{context}: edit {choice} at step {} moves the edges of {caller} into {target}",
+                    step + 1
+                );
+            }
         }
         let check = |from: usize, to: usize, label: &str| {
             let path = f

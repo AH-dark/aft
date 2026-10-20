@@ -389,6 +389,29 @@ fn materialize_reading(
                 }) {
                     seeds.insert(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes().to_vec());
                 }
+                // A Go package lookup lists the `.go` files of a directory, so a
+                // file appearing in or leaving that listing changes the lookup of
+                // callers that never read the file itself.
+                if changed.iter().any(|path| {
+                    path.ends_with(b".go") && {
+                        let rel = crate::views::RelPath::new(path.clone()).expect("manifest path");
+                        let listed = |entry: Option<&crate::views::ManifestEntry>| {
+                            entry.map(|entry| {
+                                (
+                                    entry.kind(),
+                                    matches!(
+                                        entry,
+                                        crate::views::ManifestEntry::Regular { planes, .. }
+                                            if planes.callgraph.is_some()
+                                    ),
+                                )
+                            })
+                        };
+                        listed(base.get(&rel)) != listed(manifest.get(&rel))
+                    }
+                }) {
+                    seeds.insert(join::VIEW_GO_PACKAGE_DOMAIN.as_bytes().to_vec());
+                }
                 Some(dependent_closure(&transaction, &seeds)?)
             }
         }
