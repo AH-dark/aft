@@ -3125,13 +3125,18 @@ mod tests {
         assert!(report.after.family_store.complete);
     }
 
-    /// Runs one enforcement pass and counts the planes whose logical totals
-    /// its family sweep read.
-    fn enforce_counting_aggregates(registry: &FamilyRegistry) -> (EnforcementReport, usize) {
+    /// Runs one enforcement pass and counts, on this thread, the planes whose
+    /// own checks its family sweep ran and the logical payload sums it ran.
+    fn enforce_counting_aggregates(registry: &FamilyRegistry) -> (EnforcementReport, usize, usize) {
         let before = crate::gc::family::delete_aggregates_on_this_thread();
+        crate::blob_store::v2::take_logical_aggregates();
         let report = enforce(registry, EnforceOptions::default()).unwrap();
         let after = crate::gc::family::delete_aggregates_on_this_thread();
-        (report, after - before)
+        (
+            report,
+            after - before,
+            crate::blob_store::v2::take_logical_aggregates(),
+        )
     }
 
     fn plane_stores(storage: &Path) -> usize {
@@ -3145,12 +3150,13 @@ mod tests {
             .count()
     }
 
-    /// A pass below every limit sweeps without reading any plane's logical
-    /// totals: the family's files already fit in the payload budget. Every
-    /// pass that could find something to delete still reads them, once per
-    /// plane: file bytes over the payload budget but under the soft limit,
-    /// a walk of the family's files that could not finish, and a pass that
-    /// evicted a view and so collects every unreferenced row.
+    /// A pass below every limit sweeps without any per-plane check: the
+    /// family's files already fit in the payload budget. Every other pass
+    /// runs them once per plane: file bytes over the payload budget but under
+    /// the soft limit, a walk of the family's files that could not finish,
+    /// and a pass that evicted a view and so collects every unreferenced row.
+    /// Of those, the incomplete walk is still settled by the plane's page
+    /// capacity, so only the other two run the logical payload sum.
     #[test]
     fn a_below_limit_sweep_reads_no_logical_totals_and_every_other_pass_reads_them() {
         let storage = tempfile::tempdir().unwrap();
@@ -3159,29 +3165,26 @@ mod tests {
         assert_eq!(planes, 1);
         LAST_SWEEP_BUDGET.with(|last| last.set(None));
 
-        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        let (report, checked, sums) = enforce_counting_aggregates(&registry);
         assert!(report.evicted.is_empty() && report.before.complete);
         assert_eq!(
             LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
             Some(FAMILY_PAYLOAD_BUDGET_BYTES)
         );
         assert_eq!(report.sweep.as_ref().unwrap().deleted_blobs, 0);
-        assert_eq!(aggregates, 0, "below-limit pass");
-        // Marking and the release of free pages still ran.
-        let sweep = report.sweep.as_ref().unwrap();
-        assert!(sweep.marked_keys > 0);
-        assert_eq!(sweep.space_reclaim.examined_stores, planes as u64);
+        assert!(report.sweep.as_ref().unwrap().marked_keys > 0);
+        assert_eq!((checked, sums), (0, 0), "below-limit pass");
 
         // Over a payload budget of one byte, far under the soft limit.
         registry.set_disk_budget(DiskBudget {
             family_payload: 1,
             ..DiskBudget::default()
         });
-        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        let (report, checked, sums) = enforce_counting_aggregates(&registry);
         assert!(report.evicted.is_empty());
         assert!(report.before.family_store.file_bytes < FAMILY_STORE_SOFT_BYTES);
         assert_eq!(LAST_SWEEP_BUDGET.with(|last| last.replace(None)), Some(1));
-        assert_eq!(aggregates, planes, "over the payload budget");
+        assert_eq!((checked, sums), (planes, planes), "over the payload budget");
 
         // A directory deeper than the walk goes leaves it incomplete.
         registry.set_disk_budget(DiskBudget::default());
@@ -3189,21 +3192,73 @@ mod tests {
             .unwrap()
             .join("deeper/than/the-walk");
         fs::create_dir_all(&deep).unwrap();
-        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        let (report, checked, sums) = enforce_counting_aggregates(&registry);
         assert!(report.evicted.is_empty() && !report.before.family_store.complete);
         assert_eq!(
             LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
             Some(FAMILY_PAYLOAD_BUDGET_BYTES)
         );
-        assert_eq!(aggregates, planes, "incomplete walk");
+        assert_eq!((checked, sums), (planes, 0), "incomplete walk");
         fs::remove_dir_all(family_dir(storage.path(), FAMILY).unwrap().join("deeper")).unwrap();
 
         registry.set_disk_budget(budget(0, u64::MAX));
-        let (report, aggregates) = enforce_counting_aggregates(&registry);
+        let (report, checked, sums) = enforce_counting_aggregates(&registry);
         assert_eq!(evicted(&report), ["a", "b"]);
         assert_eq!(LAST_SWEEP_BUDGET.with(|last| last.replace(None)), Some(0));
         assert!(report.sweep.as_ref().unwrap().deleted_blobs > 0);
-        assert_eq!(aggregates, planes, "collect-all pass");
+        assert_eq!((checked, sums), (planes, planes), "collect-all pass");
+    }
+
+    /// A family whose files fit the sweep budget skips every plane's own
+    /// checks, yet a large free list left in one of its plane stores is still
+    /// returned to the file system, in bounded steps, with the remaining work
+    /// reported.
+    #[test]
+    fn a_family_within_budget_still_reclaims_a_large_free_list() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        let access =
+            crate::blob_store::v2::StoreWriteAccess::for_registered_view(storage.path(), FAMILY);
+        drop(crate::blob_store::v2::FamilyStore::open(&access, FamilyPlane::Semantic).unwrap());
+        let path = crate::blob_store::v2::plane_path(storage.path(), FAMILY, FamilyPlane::Semantic)
+            .unwrap();
+        {
+            // The store's only connection closed above, so this one does not
+            // share a live file set. 320 MiB of free pages clears the 256 MiB
+            // threshold above which free pages are reclaimed.
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE reclaim_fixture (data BLOB);
+                     INSERT INTO reclaim_fixture VALUES (zeroblob(335544320));
+                     DELETE FROM reclaim_fixture;",
+                )
+                .unwrap();
+        }
+        let (before, complete) = family_file_bytes(storage.path(), FAMILY, None).unwrap();
+        let byte_budget = 2 * before;
+        assert!(complete && before > 320 * 1024 * 1024, "{before}");
+
+        let checked = crate::gc::family::delete_aggregates_on_this_thread();
+        let report = family::sweep_family_remeasured(
+            &registry,
+            None,
+            FamilySweepPolicy { byte_budget },
+            SweepBounds::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::gc::family::delete_aggregates_on_this_thread(),
+            checked,
+            "the walk settled the family"
+        );
+        let (after, _) = family_file_bytes(storage.path(), FAMILY, None).unwrap();
+        assert_eq!(report.deleted_blobs, 0);
+        assert_eq!(report.space_reclaim.examined_stores, 1);
+        assert!(report.space_reclaim.reclaimed_pages > 0, "{report:?}");
+        assert!(report.reclaim_deferred, "eligible free pages remain");
+        assert!(after < before, "{before} -> {after}");
     }
 
     /// Builds the two-view family, records its file bytes, then grows it with
