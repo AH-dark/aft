@@ -515,31 +515,24 @@ impl FamilyStore {
         Ok(outcome)
     }
 
-    /// Stamps the current epoch on every stored key in one transaction and
-    /// reports the ones that are gone.
+    /// Stamps the current epoch on stored keys and reports missing keys. A
+    /// covering-index read avoids opening a writer when every epoch is current.
     pub fn touch(&self, keys: &[FamilyKey]) -> StoreResult<TouchReport> {
         for key in keys {
             self.ensure_plane(key)?;
         }
-        let mut connection = lock(&self.inner.connection);
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        #[cfg(test)]
-        TOUCH_TRANSACTIONS.with(|count| count.set(count.get() + 1));
-        let epoch = read_epoch(&tx)?;
-        let mut report = TouchReport {
-            ref_epoch: epoch,
-            ..TouchReport::default()
-        };
-        {
-            // WITHOUT ROWID stores the payload in the primary-key tree. Even
-            // an unchanged UPDATE can read and rebuild its overflow pages.
-            // Most touches are in the same GC epoch; use the narrow covering
-            // index to check both presence and epoch before visiting that tree.
-            let mut lookup = tx.prepare(
+        fn inspect(
+            connection: &rusqlite::Connection,
+            keys: &[FamilyKey],
+        ) -> StoreResult<(TouchReport, Vec<FamilyKey>)> {
+            let epoch = read_epoch(connection)?;
+            let mut report = TouchReport {
+                ref_epoch: epoch,
+                ..TouchReport::default()
+            };
+            let mut outdated = Vec::new();
+            let mut lookup = connection.prepare(
                 "SELECT ref_epoch FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
-            )?;
-            let mut update = tx.prepare(
-                "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
             )?;
             for key in keys {
                 let stored: Option<i64> = lookup
@@ -548,15 +541,48 @@ impl FamilyStore {
                 match stored {
                     Some(stored) => {
                         if stored < epoch as i64 {
-                            update.execute(params![key.as_bytes().as_slice(), epoch as i64])?;
+                            outdated.push(*key);
                         }
                         report.touched += 1;
                     }
                     None => report.missing.push(*key),
                 }
             }
+            Ok((report, outdated))
+        }
+        let mut connection = lock(&self.inner.connection);
+        let read = connection.transaction()?;
+        let (report, outdated) = inspect(&read, keys)?;
+        read.commit()?;
+        if outdated.is_empty() {
+            return Ok(report);
+        }
+        // Another process may advance GC or remove a row between transactions.
+        // Recheck presence and the epoch after taking the write lock.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        #[cfg(test)]
+        TOUCH_TRANSACTIONS.with(|count| count.set(count.get() + 1));
+        let (report, outdated) = inspect(&tx, keys)?;
+        let mut written = 0;
+        {
+            let mut update = tx.prepare(
+                "UPDATE blob_payloads SET ref_epoch = ?2 WHERE full_key = ?1 AND ref_epoch < ?2",
+            )?;
+            for key in outdated {
+                written +=
+                    update.execute(params![key.as_bytes().as_slice(), report.ref_epoch as i64])?;
+            }
         }
         tx.commit()?;
+        if self.plane() == FamilyPlane::Semantic {
+            use std::sync::atomic::Ordering;
+            crate::views::io::WORK
+                .semantic_touch_transactions
+                .fetch_add(1, Ordering::Relaxed);
+            crate::views::io::WORK
+                .semantic_touch_rows_written
+                .fetch_add(written as u64, Ordering::Relaxed);
+        }
         Ok(report)
     }
 
@@ -1075,6 +1101,11 @@ fn get(inner: &StoreInner, key: &FamilyKey) -> StoreResult<Option<Vec<u8>>> {
             key: key.plane(),
         });
     }
+    if inner.plane == FamilyPlane::Semantic {
+        crate::views::io::WORK
+            .semantic_store_gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let row: Option<(Vec<u8>, Vec<u8>, i64)> = lock(&inner.connection)
         .query_row(
             "SELECT payload, payload_digest, payload_schema FROM blob_payloads WHERE full_key = ?1",
@@ -1085,6 +1116,11 @@ fn get(inner: &StoreInner, key: &FamilyKey) -> StoreResult<Option<Vec<u8>>> {
     let Some((payload, digest, schema)) = row else {
         return Ok(None);
     };
+    if inner.plane == FamilyPlane::Semantic {
+        crate::views::io::WORK
+            .semantic_store_payload_bytes
+            .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     if digest.as_slice() != blake3::hash(&payload).as_bytes()
         || schema != i64::from(inner.plane.payload_schema())
     {

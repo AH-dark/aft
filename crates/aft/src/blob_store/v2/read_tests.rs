@@ -194,6 +194,53 @@ fn total_changes(store: &FamilyStore) -> u64 {
 }
 
 #[test]
+fn touch_same_epoch_opens_no_write_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "touch-no-write"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    store.put_or_touch(&key, b"payload").unwrap();
+    take_touch_transactions();
+    let before = total_changes(&store);
+    assert_eq!(store.touch(&[key, key]).unwrap().touched, 2);
+    assert_eq!(store.touch(&[]).unwrap().touched, 0);
+    assert_eq!(total_changes(&store), before);
+    assert_eq!(
+        take_touch_transactions(),
+        0,
+        "same-epoch touch opened a writer"
+    );
+}
+
+#[test]
+fn touch_old_epoch_updates_each_row_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "touch-advance"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+    let missing = FamilyKey::new(FamilyPlane::Semantic, [2; 32]);
+    store.put_or_touch(&key, b"payload").unwrap();
+    let epoch = store.raise_epoch(1).unwrap();
+    take_touch_transactions();
+    let before = total_changes(&store);
+    let report = store.touch(&[key, missing, key]).unwrap();
+    assert_eq!(report.ref_epoch, epoch);
+    assert_eq!(report.touched, 2);
+    assert_eq!(report.missing, vec![missing]);
+    assert_eq!(total_changes(&store) - before, 1);
+    assert_eq!(take_touch_transactions(), 1);
+    assert!(!store.delete_if_unreferenced_since(&key, epoch).unwrap());
+    store.touch(&[key, missing]).unwrap();
+    assert_eq!(take_touch_transactions(), 0);
+}
+
+#[test]
 fn put_or_touch_same_epoch_reuse_writes_no_rows() {
     let dir = tempfile::tempdir().unwrap();
     let store = FamilyStore::open(

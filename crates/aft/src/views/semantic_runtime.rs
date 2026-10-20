@@ -1528,7 +1528,7 @@ where
                     || !report.store_errors.is_empty()
                 {
                     crate::slog_info!(
-                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={} elapsed_ms={} embed_ms={} embed_max_ms={} admission_wait_ms={} cold_admitted={} mutex_wait_ms={} reconcile_ms={} queue_setup_ms={} read_hash_ms={} file_lookup_ms={} chunk_ms={} chunk_wait_ms={} vector_lookup_ms={} store_write_ms={} shared_wait_ms={} fold_ms={} source_reads={} source_bytes={}",
+                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={} elapsed_ms={} embed_ms={} embed_max_ms={} admission_wait_ms={} cold_admitted={} mutex_wait_ms={} reconcile_ms={} queue_setup_ms={} read_hash_ms={} file_lookup_ms={} chunk_ms={} chunk_wait_ms={} vector_lookup_ms={} store_write_ms={} shared_wait_ms={} fold_ms={} source_reads={} source_bytes={} files_filled={} chunk_resident_hits={}",
                         schedule.root.display(),
                         report.queued,
                         report.deferred,
@@ -1560,7 +1560,9 @@ where
                         report.timing.shared_wait.as_millis(),
                         report.timing.fold.as_millis(),
                         report.source_reads,
-                        report.source_bytes
+                        report.source_bytes,
+                        report.source_reads,
+                        report.chunk_resident_hits
                     );
                 }
                 let advanced = report.installed > 0 || report.failed > 0;

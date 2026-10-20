@@ -291,6 +291,8 @@ pub struct FillReport {
     /// Chunks in claimed file versions, including reused chunks.
     pub chunks: usize,
     pub chunk_reused: usize,
+    /// Successful chunk lookups in memory, including admission rechecks.
+    pub chunk_resident_hits: usize,
     pub source_reads: usize,
     pub source_bytes: u64,
     /// Completions installed into the fill map.
@@ -704,6 +706,9 @@ impl SemanticPlane {
             self.work_items(&state, &resident, snapshot)
         };
         report.queued = items.len();
+        super::io::WORK
+            .semantic_fills
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::cold_build_limiter::progress::remaining(items.len());
         report.deferred = items.len().saturating_sub(budget.max_files);
         items.truncate(budget.max_files);
@@ -745,6 +750,9 @@ impl SemanticPlane {
                 crate::project_content::read(&source)
             };
             report.source_reads += 1;
+            super::io::WORK
+                .semantic_files_filled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             report.source_bytes += bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
             match bytes {
                 Ok(bytes) if ContentHash::of(&bytes) == item.content => {
@@ -880,9 +888,18 @@ impl SemanticPlane {
                 to_embed.push(item);
                 chunks.push(file_chunks);
             }
+            let mut canonical_chunks = Vec::new();
             let embedded = {
                 let mut rows = |batch: Vec<String>| {
-                    self.embed_chunks(&arena, &store, batch, embed, &mut report, before_embed)
+                    self.embed_chunks(
+                        &arena,
+                        &store,
+                        batch,
+                        embed,
+                        &mut report,
+                        before_embed,
+                        &mut canonical_chunks,
+                    )
                 };
                 crate::semantic_index::embed_view_files_with_rows(
                     chunks,
@@ -1041,6 +1058,7 @@ impl SemanticPlane {
         embed: &mut F,
         report: &mut FillReport,
         before_embed: &mut dyn FnMut() -> Result<(), String>,
+        canonical_chunks: &mut Vec<Arc<[f32]>>,
     ) -> Result<Vec<crate::semantic_index::BuildEmbeddingRow>, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -1066,13 +1084,22 @@ impl SemanticPlane {
             let mut rows = Vec::with_capacity(texts.len());
             let mut misses = Vec::new();
             for (text, key) in texts.iter().zip(&keys) {
-                if let Some(vector) = load_chunk(store, key, &identity, text)
-                    .map_err(|error| chunk_store_error(error, report))?
-                {
+                let resident = arena.chunk_vector(key);
+                if resident.is_some() {
+                    report.chunk_resident_hits += 1;
+                }
+                let vector = match resident {
+                    Some(vector) => Some(vector),
+                    None => load_chunk(store, key, &identity, text)
+                        .map_err(|error| chunk_store_error(error, report))?
+                        .map(|vector| arena.remember_chunk(*key, vector)),
+                };
+                if let Some(vector) = vector {
                     rows.push(Some(BuildEmbeddingRow::Embedded {
                         embedded_text: text.clone(),
-                        vector,
+                        vector: vector.to_vec(),
                     }));
+                    canonical_chunks.push(vector);
                 } else {
                     misses.push(text.clone());
                     rows.push(None);
@@ -1111,8 +1138,9 @@ impl SemanticPlane {
                     if embedded_text == text {
                         let store_started = Instant::now();
                         let payload = encode_chunk_vector(&identity, text, vector)?;
-                        match store.put_or_touch(key, &payload) {
-                            Ok(_) => {}
+                        let cacheable = match store.put_or_touch(key, &payload) {
+                            Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => true,
+                            Ok(PutOrTouch::Quarantined) => false,
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
                                 // A different process may have won. Only adopt
                                 // its floats after the same exact-text check.
@@ -1120,9 +1148,15 @@ impl SemanticPlane {
                                     .map_err(|error| chunk_store_error(error, report))?
                                 {
                                     *vector = stored;
+                                    true
+                                } else {
+                                    false
                                 }
                             }
                             Err(error) => return Err(chunk_store_error(error, report)),
+                        };
+                        if cacheable {
+                            canonical_chunks.push(arena.remember_chunk(*key, vector.clone()));
                         }
                         report.timing.store_write += store_started.elapsed();
                     }
@@ -2385,6 +2419,7 @@ mod tests {
                 &mut |_| Ok(vec![vector.clone()]),
                 &mut FillReport::default(),
                 &mut || Ok(()),
+                &mut Vec::new(),
             )
             .unwrap();
         let key = producer.chunk_key(text);
@@ -2479,6 +2514,7 @@ mod tests {
                 &mut |texts| Model::default().embed("model-a", texts),
                 &mut report,
                 &mut || Ok(()),
+                &mut Vec::new(),
             )
             .unwrap();
         match &result[0] {

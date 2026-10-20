@@ -21,6 +21,12 @@ pub(crate) struct WorkCounters {
     pub dispatch_sites_resolved: AtomicU64,
     pub dispatch_full_passes: AtomicU64,
     pub dispatch_type_target_files: AtomicU64,
+    pub semantic_store_gets: AtomicU64,
+    pub semantic_store_payload_bytes: AtomicU64,
+    pub semantic_touch_rows_written: AtomicU64,
+    pub semantic_touch_transactions: AtomicU64,
+    pub semantic_fills: AtomicU64,
+    pub semantic_files_filled: AtomicU64,
 }
 
 pub(crate) static WORK: WorkCounters = WorkCounters {
@@ -37,6 +43,12 @@ pub(crate) static WORK: WorkCounters = WorkCounters {
     dispatch_sites_resolved: AtomicU64::new(0),
     dispatch_full_passes: AtomicU64::new(0),
     dispatch_type_target_files: AtomicU64::new(0),
+    semantic_store_gets: AtomicU64::new(0),
+    semantic_store_payload_bytes: AtomicU64::new(0),
+    semantic_touch_rows_written: AtomicU64::new(0),
+    semantic_touch_transactions: AtomicU64::new(0),
+    semantic_fills: AtomicU64::new(0),
+    semantic_files_filled: AtomicU64::new(0),
 };
 
 /// Hash source bytes, counting repeated hashes as repeated work. Payload and
@@ -66,6 +78,12 @@ pub(crate) fn work_snapshot() -> serde_json::Value {
         "dispatch_sites_resolved": WORK.dispatch_sites_resolved.load(Ordering::Relaxed),
         "dispatch_full_passes": WORK.dispatch_full_passes.load(Ordering::Relaxed),
         "dispatch_type_target_files": WORK.dispatch_type_target_files.load(Ordering::Relaxed),
+        "semantic_store_gets": WORK.semantic_store_gets.load(Ordering::Relaxed),
+        "semantic_store_payload_bytes": WORK.semantic_store_payload_bytes.load(Ordering::Relaxed),
+        "semantic_touch_rows_written": WORK.semantic_touch_rows_written.load(Ordering::Relaxed),
+        "semantic_touch_transactions": WORK.semantic_touch_transactions.load(Ordering::Relaxed),
+        "semantic_fills": WORK.semantic_fills.load(Ordering::Relaxed),
+        "semantic_files_filled": WORK.semantic_files_filled.load(Ordering::Relaxed),
     })
 }
 
