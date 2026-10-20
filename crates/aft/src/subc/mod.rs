@@ -17624,6 +17624,58 @@ mod tests {
         assert_eq!(bind_response.data["code"], "request_cancelled");
     }
 
+    fn frozen_lsp_edit_write_is_visible(
+        file_len: std::io::Result<u64>,
+        edit_in_flight: bool,
+    ) -> std::io::Result<bool> {
+        match file_len {
+            Ok(len) => Ok(len >= 1024 * 1024),
+            // On Windows, replacing a file can briefly make its path return
+            // NotFound. Retry only while the edit is in flight; absence is not
+            // evidence that the replacement bytes have been written.
+            Err(error) if edit_in_flight && error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn frozen_lsp_write_poll_retries_not_found_only_in_flight() {
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!frozen_lsp_edit_write_is_visible(Err(missing()), true).unwrap());
+        assert_eq!(
+            frozen_lsp_edit_write_is_visible(Err(missing()), false)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn frozen_lsp_write_poll_requires_large_file() {
+        for in_flight in [false, true] {
+            assert!(!frozen_lsp_edit_write_is_visible(Ok(0), in_flight).unwrap());
+            assert!(!frozen_lsp_edit_write_is_visible(Ok(1024 * 1024 - 1), in_flight).unwrap());
+            assert!(frozen_lsp_edit_write_is_visible(Ok(1024 * 1024), in_flight).unwrap());
+        }
+    }
+
+    #[test]
+    fn frozen_lsp_write_poll_rejects_other_errors() {
+        for in_flight in [false, true] {
+            assert_eq!(
+                frozen_lsp_edit_write_is_visible(
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                    in_flight,
+                )
+                .unwrap_err()
+                .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
     #[tokio::test]
     async fn frozen_lsp_edit_releases_writer_before_route_bind_deadline() {
         use crate::lsp::client::LspEvent;
@@ -17685,7 +17737,16 @@ mod tests {
             Box::new(move |ctx| crate::commands::edit_match::handle_edit_match(&request, ctx)),
         );
         let write_deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(&file).unwrap().len() < 1024 * 1024 {
+        loop {
+            let edit_in_flight = edit.is_empty();
+            if frozen_lsp_edit_write_is_visible(
+                std::fs::metadata(&file).map(|metadata| metadata.len()),
+                edit_in_flight,
+            )
+            .unwrap()
+            {
+                break;
+            }
             assert!(Instant::now() < write_deadline, "edit never wrote the file");
             std::thread::sleep(Duration::from_millis(5));
         }
