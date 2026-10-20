@@ -1866,7 +1866,13 @@ impl BgTaskRegistry {
             let Some(stream) = self.submit_draining_retry(&client, &task, &root).await? else {
                 return Ok(());
             };
-            recovery.resubmitted(&task.state.lock().map_err(|_| "task lock poisoned")?.metadata);
+            recovery.resubmitted(
+                &task
+                    .state
+                    .lock()
+                    .map_err(|_| "task lock poisoned")?
+                    .metadata,
+            );
             stream
         } else if let Some((request, local)) = initial.take() {
             let request = match request {
@@ -1985,7 +1991,11 @@ impl BgTaskRegistry {
                             };
                             stream = next;
                             recovery.resubmitted(
-                                &task.state.lock().map_err(|_| "task lock poisoned")?.metadata,
+                                &task
+                                    .state
+                                    .lock()
+                                    .map_err(|_| "task lock poisoned")?
+                                    .metadata,
                             );
                             recovery.reset();
                             continue;
