@@ -1,1 +1,1 @@
-- Delete, edit, write and other file changes no longer fail with `read_io_queue_timeout` when the machine is too busy to start AFT's filesystem check promptly; they wait for it within the request deadline, and a check that starts and then hangs still fails as before.
+- File changes (delete, edit, write) no longer fail with `read_io_queue_timeout` when a busy machine is slow to start AFT's filesystem check; they wait within the request deadline.
