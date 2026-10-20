@@ -147,6 +147,17 @@ fn set_times(file: &File, creation: u64, access: u64, write: u64) {
 }
 
 #[test]
+fn windows_posix_verbatim_destination_is_supported() {
+    let (dir, path) = fixture();
+    let verbatim = std::fs::canonicalize(&path).unwrap();
+    assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+    atomic_write_source(&verbatim, b"edited").unwrap();
+    assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+    assert_no_temporary(dir.path());
+}
+
+#[test]
 fn windows_posix_metadata_matches_replace_file() {
     use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
     fn stamp(info: &BY_HANDLE_FILE_INFORMATION) -> (u32, u64, u64, u64) {
@@ -162,7 +173,18 @@ fn windows_posix_metadata_matches_replace_file() {
         )
     }
     let mut snapshots = Vec::new();
-    for posix in [false, true] {
+    for (guarded, attributes) in [
+        (false, FILE_ATTRIBUTE_ARCHIVE),
+        (true, FILE_ATTRIBUTE_ARCHIVE),
+        (
+            false,
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        ),
+        (
+            true,
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        ),
+    ] {
         let (dir, path) = fixture();
         let temp = dir.path().join("new.txt");
         let original = OpenOptions::new()
@@ -177,14 +199,10 @@ fn windows_posix_metadata_matches_replace_file() {
             132000000020000000,
         );
         drop(original);
-        // Ordinary DOS attributes come from the replacement, not the old file.
+        // Compare the guarded policy to the real legacy API, including its
+        // merging of attributes absent from the replacement.
         assert_ne!(
-            unsafe {
-                SetFileAttributesW(
-                    wide(&path).as_ptr(),
-                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
-                )
-            },
+            unsafe { SetFileAttributesW(wide(&path).as_ptr(), attributes,) },
             0
         );
         std::fs::write(&temp, b"edited").unwrap();
@@ -200,15 +218,20 @@ fn windows_posix_metadata_matches_replace_file() {
         let dacl_copy = dir.path().join("acl.txt");
         std::fs::write(&dacl_copy, b"").unwrap();
         super::super::windows_dacl::copy_protected(&path, &dacl_copy).unwrap();
-        if posix {
+        if guarded {
             assert!(replace(&path, &temp, dir.path()).unwrap());
-            assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+            let expected = if attributes == FILE_ATTRIBUTE_ARCHIVE {
+                Method::PosixRename
+            } else {
+                Method::ReplaceFile
+            };
+            assert_eq!(LAST_METHOD.get(), Some(expected));
         } else {
             assert!(replace_file(&path, &temp, dir.path()).unwrap());
         }
         let info = information(&File::open(&path).unwrap()).unwrap();
         assert_eq!(stamp(&info).1, 132000000000000000);
-        if posix {
+        if guarded && attributes == FILE_ATTRIBUTE_ARCHIVE {
             assert!(super::super::windows_dacl::matches(&path, &dacl_copy).unwrap());
         }
         assert_eq!(std::fs::read(&path).unwrap(), b"edited");
@@ -218,6 +241,10 @@ fn windows_posix_metadata_matches_replace_file() {
     assert_eq!(
         snapshots[1], snapshots[0],
         "POSIX metadata must match ReplaceFileW"
+    );
+    assert_eq!(
+        snapshots[3], snapshots[2],
+        "attribute fallback must match ReplaceFileW"
     );
 }
 

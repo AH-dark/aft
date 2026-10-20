@@ -178,8 +178,10 @@ fn streams(path: &Path) -> io::Result<Vec<Vec<u16>>> {
 
 /// ReplaceFileW carries creation time, short name, object ID, compression and
 /// encryption from the destination. Copy creation time and defer unusual
-/// metadata to ReplaceFileW instead of silently discarding it. Other ordinary
-/// attributes and the access/write times come from the replacement in both paths.
+/// metadata to ReplaceFileW instead of silently discarding it. Ordinary DOS
+/// attributes must already match: ReplaceFileW merges attributes, while rename
+/// keeps only the replacement's attributes. Access/write times come from the
+/// replacement in both paths.
 fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io::Result<()> {
     let old = information(source)?;
     let new = information(replacement)?;
@@ -195,6 +197,9 @@ fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io
         | FILE_ATTRIBUTE_TEMPORARY;
     if (old.dwFileAttributes | new.dwFileAttributes) & !ordinary != 0 {
         return Err(io::Error::other("metadata requires ReplaceFileW"));
+    }
+    if old.dwFileAttributes != new.dwFileAttributes {
+        return Err(io::Error::other("file attributes differ"));
     }
     // SAFETY: the terminated path and writable output structure outlive the call.
     let mut found: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
@@ -344,7 +349,23 @@ fn eligible(
     if matches!(_fault, Fault::MetadataUnknown) {
         return Err(io::Error::other("metadata is unknown"));
     }
+    rename_name(destination)?;
     prepare_metadata(destination, source, temp)
+}
+
+fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
+    // SetFileInformationByHandle accepts DOS/UNC names, not the verbatim
+    // namespace returned by canonicalize. Keep unsupported namespaces on the
+    // ReplaceFileW path instead of changing their meaning.
+    use std::path::{Component, Prefix};
+    let absolute = std::path::absolute(destination)?;
+    let path = crate::windows_path::normalize_windows_path(&absolute);
+    if matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(
+        prefix.kind(), Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(_)
+    )) {
+        return Err(io::Error::other("rename namespace is unsupported"));
+    }
+    Ok(path.as_os_str().encode_wide().collect())
 }
 
 fn posix_rename(temp: &File, destination: &Path, _fault: Fault) -> io::Result<()> {
@@ -352,11 +373,7 @@ fn posix_rename(temp: &File, destination: &Path, _fault: Fault) -> io::Result<()
     if let Fault::Rename(code) = _fault {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
-    // An absolute name works independently of the process current directory.
-    let name: Vec<u16> = std::path::absolute(destination)?
-        .as_os_str()
-        .encode_wide()
-        .collect();
+    let name = rename_name(destination)?;
     let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let size = offset
         .checked_add(name.len() * 2)

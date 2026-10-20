@@ -203,6 +203,8 @@ fn write_source_in_place(
     mut warnings: Vec<String>,
 ) -> std::io::Result<SourceWriteOutcome> {
     use std::io::{self, Read, Seek, SeekFrom, Write};
+    #[cfg(windows)]
+    crate::slog_debug!("source_replace method=InPlace reason=replacement cannot preserve metadata");
     let (mut file, saved) = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -426,9 +428,9 @@ mod source_replacement {
     }
 
     /// Replace `destination` with the synced `replacement` through a guarded
-    /// POSIX rename or `ReplaceFileW`. Returns `Ok(false)` when it could not, after making
-    /// sure the original is back under its own name, so the caller can
-    /// rewrite the file in place instead.
+    /// POSIX rename or `ReplaceFileW`. Returns `Ok(false)` when it could not,
+    /// after making sure the original is back under its own name, so the
+    /// caller can rewrite the file in place instead.
     #[cfg(windows)]
     pub(super) fn replace_keeping_identity(
         destination: &Path,
