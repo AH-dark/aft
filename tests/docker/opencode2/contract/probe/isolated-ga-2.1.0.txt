@@ -1,0 +1,262 @@
+OpenCode 2.1.0 isolated capture
+
+source_sha: 8aceb397b5d9836004b548ea1a5aa8f1d75cd0e8
+
+Linux x64; private HOME/XDG roots and absolute OPENCODE_DB (recorded below); serve --service registration at a loopback URL; run/API and standalone schema probes. The isolated capture script configured the reserved service port and owned the foreground server process.
+
+$ isolation
+{
+  "HOME": "/out/isolated-capture/shared-5wLfnd/home",
+  "XDG_CONFIG_HOME": "/out/isolated-capture/shared-5wLfnd/xdg-config",
+  "XDG_DATA_HOME": "/out/isolated-capture/shared-5wLfnd/xdg-data",
+  "XDG_STATE_HOME": "/out/isolated-capture/shared-5wLfnd/xdg-state",
+  "XDG_CACHE_HOME": "/out/isolated-capture/shared-5wLfnd/xdg-cache",
+  "OPENCODE_DB": "/out/isolated-capture/shared-5wLfnd/opencode2.db"
+}
+
+$ serve --service registration
+{
+  "url": "http://127.0.0.1:34521",
+  "password": "<redacted>",
+  "pid": 26,
+  "version": "2.1.0"
+}
+
+$ api GET /api/info
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/info"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 0,
+  "signal": null,
+  "stdout": "{\"version\":\"2.1.0\",\"pid\":26,\"urls\":[\"http://127.0.0.1:34521\"],\"paths\":{\"tmp\":\"/out/isolated-capture/shared-5wLfnd/tmp/opencode\"},\"capabilities\":{\"persistentPty\":true}}\n",
+  "stderr": "",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ api GET /api/health
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/health"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 1,
+  "signal": null,
+  "stdout": "",
+  "stderr": "HTTP 404 Not Found\n",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ api GET /api/server
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/server"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 1,
+  "signal": null,
+  "stdout": "",
+  "stderr": "HTTP 404 Not Found\n",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ wrong_password
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/info"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 1,
+  "signal": null,
+  "stdout": "",
+  "stderr": "Error: Server at http://127.0.0.1:34521 rejected the password\n    at cli.server-connection.resolve (/$bunfs/root/chunk-zp9bresk.js:2:1149)\n    at cli.server-connection.resolve (definition) (/$bunfs/root/chunk-mdhr3afe.js:2:402)\n    at cli.api (/$bunfs/root/chunk-ec8ws8p0.js:7:21275)\n    at cli.api (definition) (/$bunfs/root/chunk-zp9bresk.js:2:1109) {\n  [cause]: UnauthorizedError: Authentication required\n      at q (/$bunfs/root/chunk-58s763qj.js:13:27636)\n      at <anonymous> (/$bunfs/root/chunk-58s763qj.js:2:1106)\n      at processTicksAndRejections (native:7:39)\n}\n",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ missing_password
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/info"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 1,
+  "signal": null,
+  "stdout": "",
+  "stderr": "Error: Server at http://127.0.0.1:34521 requires a password; set OPENCODE_PASSWORD\n    at cli.server-connection.resolve (/$bunfs/root/chunk-zp9bresk.js:2:1149)\n    at cli.server-connection.resolve (definition) (/$bunfs/root/chunk-mdhr3afe.js:2:402)\n    at cli.api (/$bunfs/root/chunk-ec8ws8p0.js:7:21275)\n    at cli.api (definition) (/$bunfs/root/chunk-zp9bresk.js:2:1109) {\n  [cause]: UnauthorizedError: Authentication required\n      at q (/$bunfs/root/chunk-58s763qj.js:13:27636)\n      at <anonymous> (/$bunfs/root/chunk-58s763qj.js:2:1106)\n      at processTicksAndRejections (native:7:39)\n}\n",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ bad_endpoint
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:1",
+    "GET",
+    "/api/info"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 1,
+  "signal": null,
+  "stdout": "",
+  "stderr": "Error: Could not reach server at http://127.0.0.1:1\n    at cli.server-connection.resolve (/$bunfs/root/chunk-zp9bresk.js:2:1149)\n    at cli.server-connection.resolve (definition) (/$bunfs/root/chunk-mdhr3afe.js:2:402)\n    at cli.api (/$bunfs/root/chunk-ec8ws8p0.js:7:21275)\n    at cli.api (definition) (/$bunfs/root/chunk-zp9bresk.js:2:1109) {\n  [cause]: ClientError: Transport: Unable to connect. Is the computer able to access the url?\n      at <anonymous> (/$bunfs/root/chunk-58s763qj.js:2:1017)\n      at async <anonymous> (/$bunfs/root/chunk-58s763qj.js:2:1265)\n      at processTicksAndRejections (native:7:39) {\n    [cause]: TypeError: Unable to connect. Is the computer able to access the url?\n        at async <anonymous> (/$bunfs/root/chunk-58s763qj.js:2:981)\n        at async <anonymous> (/$bunfs/root/chunk-58s763qj.js:2:1265)\n  }\n}\n",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ OPENCODE_PASSWORD=<captured service password, redacted> OPENCODE_SERVER_PASSWORD=WRONG opencode api --server ${endpoint} GET /api/info
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/info"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 0,
+  "signal": null,
+  "stdout": "{\"version\":\"2.1.0\",\"pid\":26,\"urls\":[\"http://127.0.0.1:34521\"],\"paths\":{\"tmp\":\"/out/isolated-capture/shared-5wLfnd/tmp/opencode\"},\"capabilities\":{\"persistentPty\":true}}\n",
+  "stderr": "",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ run --server --format json --model openai/mock-model
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "run",
+    "--server",
+    "http://127.0.0.1:34521",
+    "--format",
+    "json",
+    "--model",
+    "openai/mock-model",
+    "Return the captured provider response."
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 0,
+  "signal": null,
+  "stdout": "{\"type\":\"step_start\",\"timestamp\":1792521738486,\"sessionID\":\"ses_ea560f26bffeQ1AUmyfbwLTnr9\",\"part\":{\"id\":\"prt_15a9f18f6001HL0zy8cz9Rpl6u\",\"sessionID\":\"ses_ea560f26bffeQ1AUmyfbwLTnr9\",\"messageID\":\"msg_15a9f1668001wRBd5jPfgK1htK\",\"type\":\"step-start\",\"snapshot\":\"098d1275637751f1d8fbf53bf54111f5fb8d8687\"}}\n{\"type\":\"text\",\"timestamp\":1792521738535,\"sessionID\":\"ses_ea560f26bffeQ1AUmyfbwLTnr9\",\"part\":{\"id\":\"prt_15a9f191100137obOWQg64yn6u\",\"sessionID\":\"ses_ea560f26bffeQ1AUmyfbwLTnr9\",\"messageID\":\"msg_15a9f1668001wRBd5jPfgK1htK\",\"type\":\"text\",\"text\":\"Probe complete.\",\"time\":{\"start\":1792521738513,\"end\":1792521738535}}}\n",
+  "stderr": "",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ retained session
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "GET",
+    "/api/session/ses_ea560f26bffeQ1AUmyfbwLTnr9"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 0,
+  "signal": null,
+  "stdout": "{\"data\":{\"id\":\"ses_ea560f26bffeQ1AUmyfbwLTnr9\",\"projectID\":\"4b467acb8c4576f18f1d0261f7a8ec9c706bb354\",\"model\":{\"id\":\"mock-model\",\"providerID\":\"openai\",\"variant\":\"default\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"outcome\":\"succeeded\",\"time\":{\"created\":1792521737230,\"updated\":1792521738640,\"idle\":1792521738653},\"title\":\"Scenario title\",\"location\":{\"directory\":\"/out/isolated-capture/shared-5wLfnd/project\"}}}\n",
+  "stderr": "",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ api PATCH --data title
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "api",
+    "--server",
+    "http://127.0.0.1:34521",
+    "PATCH",
+    "/api/session/ses_ea560f26bffeQ1AUmyfbwLTnr9",
+    "--data",
+    "{\"title\":\"Captured title\"}"
+  ],
+  "cwd": "/out/isolated-capture/shared-5wLfnd/project",
+  "exit_code": 0,
+  "signal": null,
+  "stdout": "",
+  "stderr": "",
+  "timed_out": false,
+  "stopped_early": false
+}
+
+$ api --help
+{
+  "stdout": "DESCRIPTION\n  Make a request to the running server\n\nUSAGE\n  opencode api [flags] <operation | method path...>\n\nARGUMENTS\n  operation | method path... string OpenAPI operation ID, or an HTTP method followed by a path\n\nFLAGS\n  --standalone           Run with a private server instead of the background service\n  --server string        Connect to a server URL instead of the background service\n  --data, -d string      Request body\n  --header, -H string    Request header in name:value form\n  --param key=value      OpenAPI path or query parameter\n\nGLOBAL FLAGS\n  --help, -h                                                          Show help information\n  --version, -v                                                       Show version information\n  --wizard                                                            Start wizard mode for a command\n  --completions <bash|zsh|fish|sh>                                    Print shell completion script (choices: bash, zsh, fish, sh)\n  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)\n  --print-logs                                                        Print logs to stderr (server logs require --standalone)\n",
+  "stderr": "",
+  "exit_code": 0
+}
+
+$ run --help
+{
+  "stdout": "DESCRIPTION\n  Run OpenCode with a message\n\nUSAGE\n  opencode run [flags] [<message...>]\n\nARGUMENTS\n  message... string    Message to send (optional)\n\nFLAGS\n  --standalone            Run with a private server instead of the background service\n  --server string         Connect to a server URL instead of the background service\n  --continue, -c          Continue the last session\n  --session, -s string    Session ID to continue, or to create if it does not exist\n  --fork                  Fork the session before continuing\n  --model, -m string      Model to use in the format provider/model#variant\n  --agent string          Agent to use\n  --format choice         Output format (choices: default, json)\n  --file, -f string       File to attach to the message\n  --title string          Session title\n  --thinking              Show thinking blocks\n  --auto                  Auto-approve permissions that are not explicitly denied\n\nGLOBAL FLAGS\n  --help, -h                                                          Show help information\n  --version, -v                                                       Show version information\n  --wizard                                                            Start wizard mode for a command\n  --completions <bash|zsh|fish|sh>                                    Print shell completion script (choices: bash, zsh, fish, sh)\n  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)\n  --print-logs                                                        Print logs to stderr (server logs require --standalone)\n",
+  "stderr": "",
+  "exit_code": 0
+}
+
+$ api --server http://127.0.0.1:34521 --body {} GET /api/info
+{
+  "stdout": "DESCRIPTION\n  Make a request to the running server\n\nUSAGE\n  opencode api [flags] <operation | method path...>\n\nARGUMENTS\n  operation | method path... string OpenAPI operation ID, or an HTTP method followed by a path\n\nFLAGS\n  --standalone           Run with a private server instead of the background service\n  --server string        Connect to a server URL instead of the background service\n  --data, -d string      Request body\n  --header, -H string    Request header in name:value form\n  --param key=value      OpenAPI path or query parameter\n\nGLOBAL FLAGS\n  --help, -h                                                          Show help information\n  --version, -v                                                       Show version information\n  --wizard                                                            Start wizard mode for a command\n  --completions <bash|zsh|fish|sh>                                    Print shell completion script (choices: bash, zsh, fish, sh)\n  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)\n  --print-logs                                                        Print logs to stderr (server logs require --standalone)\n",
+  "stderr": "\nERROR\n  Unrecognized flag: --body in command opencode api\n",
+  "exit_code": 1
+}
+
+$ run --standalone schema-invalid read {}
+{
+  "command": [
+    "/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode",
+    "run",
+    "--standalone",
+    "--print-logs",
+    "--format",
+    "json",
+    "--model",
+    "openai/mock-model",
+    "--auto",
+    "Call read with the supplied arguments, then report the result."
+  ],
+  "cwd": "/out/isolated-capture/schema-ZlQnsD/project",
+  "exit_code": 0,
+  "signal": null,
+  "stdout": "{\"type\":\"step_start\",\"timestamp\":1792521752244,\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"part\":{\"id\":\"prt_15a9f4eb4001iQKxO64xUvtTkd\",\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"messageID\":\"msg_15a9f4c93001sn8VD21w5y3bqo\",\"type\":\"step-start\",\"snapshot\":\"098d1275637751f1d8fbf53bf54111f5fb8d8687\"}}\n{\"type\":\"tool_use\",\"timestamp\":1792521752315,\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"part\":{\"partID\":\"prt_15a9f4ec6001vyXyECv1RwS4HM\",\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"messageID\":\"msg_15a9f4c93001sn8VD21w5y3bqo\",\"type\":\"tool\",\"id\":\"host-schema-rejection\",\"tool\":\"read\",\"state\":{\"status\":\"error\",\"input\":{},\"error\":\"Invalid arguments for tool \\\"read\\\":\\n- path: Missing key\\n\\nArguments provided:\\n{}\\n\\nUpdate the arguments and call the tool again.\",\"metadata\":{\"providerCall\":{\"executed\":false},\"providerResult\":{\"executed\":false},\"rawInput\":\"{}\"},\"time\":{\"start\":1792521752262,\"end\":1792521752315}}}}\n{\"type\":\"step_finish\",\"timestamp\":1792521752403,\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"part\":{\"id\":\"prt_15a9f4f53001KW7vGzv7N2ely7\",\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"messageID\":\"msg_15a9f4c93001sn8VD21w5y3bqo\",\"type\":\"step-finish\",\"reason\":\"tool-calls\",\"snapshot\":\"098d1275637751f1d8fbf53bf54111f5fb8d8687\",\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}}}\n{\"type\":\"step_start\",\"timestamp\":1792521752567,\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"part\":{\"id\":\"prt_15a9f4ff7001yYDytRZ6C0UeUd\",\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"messageID\":\"msg_15a9f4f85001CdxSaim8SBZRc3\",\"type\":\"step-start\",\"snapshot\":\"098d1275637751f1d8fbf53bf54111f5fb8d8687\"}}\n{\"type\":\"text\",\"timestamp\":1792521752588,\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"part\":{\"id\":\"prt_15a9f5001001nPgagCk3pns4JF\",\"sessionID\":\"ses_ea560bd10ffe0sieBQnpuCvCAl\",\"messageID\":\"msg_15a9f4f85001CdxSaim8SBZRc3\",\"type\":\"text\",\"text\":\"Probe complete.\",\"time\":{\"start\":1792521752577,\"end\":1792521752588}}}\n",
+  "stderr": "timestamp=2026-10-20T18:42:26.679Z level=INFO run=ee4e6a2b message=\"spawning process\" command=/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode args=\"[\\\"serve\\\",\\\"--stdio\\\",\\\"--port\\\",\\\"0\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=cli\ntimestamp=2026-10-20T18:42:27.683Z level=INFO run=a038ab92 message=\"cli starting\" version=2.1.0 channel=latest local=false args=\"[\\\"serve\\\",\\\"--stdio\\\",\\\"--port\\\",\\\"0\\\"]\" role=cli\ntimestamp=2026-10-20T18:42:28.453Z level=INFO run=a038ab92 message=\"database schema bootstrap started\" migrations=50 role=server\ntimestamp=2026-10-20T18:42:28.537Z level=INFO run=a038ab92 message=\"database schema bootstrap completed\" migrations=50 durationMs=84 role=server\ntimestamp=2026-10-20T18:42:28.726Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"rev-parse\\\",\\\"--git-dir\\\",\\\"--git-common-dir\\\",\\\"--show-toplevel\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=17 role=server\ntimestamp=2026-10-20T18:42:28.792Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"remote\\\",\\\"get-url\\\",\\\"origin\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=83 role=server\ntimestamp=2026-10-20T18:42:28.875Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"rev-list\\\",\\\"--max-parents=0\\\",\\\"HEAD\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=166 role=server\ntimestamp=2026-10-20T18:42:29.049Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode type=directory ignores=6 http.span=340 role=server\ntimestamp=2026-10-20T18:42:29.073Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/etc type=entries ignores=0 http.span=364 role=server\ntimestamp=2026-10-20T18:42:29.078Z level=INFO run=a038ab92 message=\"watcher started\" path=/etc type=entries backend=node ignores=0 http.span=369 role=server\ntimestamp=2026-10-20T18:42:29.079Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/ type=entries ignores=0 http.span=370 role=server\ntimestamp=2026-10-20T18:42:29.080Z level=INFO run=a038ab92 message=\"watcher started\" path=/ type=entries backend=node ignores=0 http.span=371 role=server\ntimestamp=2026-10-20T18:42:29.081Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out type=entries ignores=0 http.span=372 role=server\ntimestamp=2026-10-20T18:42:29.082Z level=INFO run=a038ab92 message=\"watcher started\" path=/out type=entries backend=node ignores=0 http.span=373 role=server\ntimestamp=2026-10-20T18:42:29.082Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture type=entries ignores=0 http.span=373 role=server\ntimestamp=2026-10-20T18:42:29.082Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture type=entries backend=node ignores=0 http.span=373 role=server\ntimestamp=2026-10-20T18:42:29.082Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD type=entries ignores=0 http.span=373 role=server\ntimestamp=2026-10-20T18:42:29.085Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD type=entries backend=node ignores=0 http.span=376 role=server\ntimestamp=2026-10-20T18:42:29.085Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/project type=entries ignores=0 http.span=376 role=server\ntimestamp=2026-10-20T18:42:29.087Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/project type=entries backend=node ignores=0 http.span=378 role=server\ntimestamp=2026-10-20T18:42:29.087Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/home type=entries ignores=0 http.span=378 role=server\ntimestamp=2026-10-20T18:42:29.088Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/home type=entries backend=node ignores=0 http.span=379 role=server\ntimestamp=2026-10-20T18:42:29.105Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode type=directory backend=inotify ignores=6 http.span=396 role=server\ntimestamp=2026-10-20T18:42:29.207Z level=INFO run=a038ab92 message=\"location services booted\" directory=/out/isolated-capture/schema-ZlQnsD/project workspaceID=undefined durationMs=491 http.span=498 role=server\ntimestamp=2026-10-20T18:42:29.240Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"rev-parse\\\",\\\"--git-dir\\\",\\\"--git-common-dir\\\",\\\"--show-toplevel\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=12 role=server\ntimestamp=2026-10-20T18:42:29.297Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper type=directory ignores=0 http.span=588 role=server\ntimestamp=2026-10-20T18:42:29.303Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper type=directory backend=inotify ignores=0 http.span=594 role=server\ntimestamp=2026-10-20T18:42:29.305Z level=INFO run=a038ab92 msg=\"loading plugin\" id=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper entrypoint=file:///out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper/index.mjs http.span=596 role=server\ntimestamp=2026-10-20T18:42:29.622Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper/index.mjs type=file ignores=0 http.span=913 role=server\ntimestamp=2026-10-20T18:42:29.624Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper/index.mjs type=file backend=node ignores=0 http.span=915 role=server\ntimestamp=2026-10-20T18:42:30.498Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"remote\\\",\\\"get-url\\\",\\\"origin\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=1270 role=server\ntimestamp=2026-10-20T18:42:30.807Z level=WARN run=a038ab92 message=\"failed to load plugin\" plugin.id=aft-opencode cause=\"Cause([Die(Error: AFT_BINARY_PATH does not name a native executable: /opt/aft/bin/aft)])\" http.span=2098 role=server\ntimestamp=2026-10-20T18:42:30.816Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"rev-list\\\",\\\"--max-parents=0\\\",\\\"HEAD\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=1588 role=server\ntimestamp=2026-10-20T18:42:30.839Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/AGENTS.md type=file ignores=0\ntimestamp=2026-10-20T18:42:30.842Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/AGENTS.md type=file backend=node ignores=0 http.span=2133 role=server\ntimestamp=2026-10-20T18:42:30.843Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/project/AGENTS.md type=file ignores=0\ntimestamp=2026-10-20T18:42:30.845Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/project/AGENTS.md type=file backend=node ignores=0 http.span=2136 role=server\ntimestamp=2026-10-20T18:42:30.937Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/skill type=file ignores=0\ntimestamp=2026-10-20T18:42:30.938Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/skill type=file backend=node ignores=0 http.span=2229 role=server\ntimestamp=2026-10-20T18:42:30.942Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/skills type=file ignores=0\ntimestamp=2026-10-20T18:42:30.944Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/skills type=file backend=node ignores=0 http.span=2235 role=server\ntimestamp=2026-10-20T18:42:30.999Z level=INFO run=a038ab92 message=event event.id=evt_15a9f49d70014cMQDDbUQ8beRc event.created=1792521750999 event.type=provider.updated event.location.directory=/out/isolated-capture/schema-ZlQnsD/project event.location.workspaceID=undefined event.data={} http.span=2290 role=server\ntimestamp=2026-10-20T18:42:31.059Z level=INFO run=a038ab92 message=event event.id=evt_15a9f4a130015g58rQ5VM7lAKJ event.created=1792521751059 event.type=model.updated event.location.directory=/out/isolated-capture/schema-ZlQnsD/project event.location.workspaceID=undefined event.data={} http.span=2350 role=server\ntimestamp=2026-10-20T18:42:31.068Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--no-optional-locks\\\",\\\"-c\\\",\\\"core.autocrlf=false\\\",\\\"-c\\\",\\\"core.fsmonitor=false\\\",\\\"-c\\\",\\\"core.longpaths=true\\\",\\\"-c\\\",\\\"core.symlinks=true\\\",\\\"-c\\\",\\\"core.quotepath=false\\\",\\\"symbolic-ref\\\",\\\"--quiet\\\",\\\"--short\\\",\\\"HEAD\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=2359 role=server\ntimestamp=2026-10-20T18:42:31.096Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--no-optional-locks\\\",\\\"-c\\\",\\\"core.autocrlf=false\\\",\\\"-c\\\",\\\"core.fsmonitor=false\\\",\\\"-c\\\",\\\"core.longpaths=true\\\",\\\"-c\\\",\\\"core.symlinks=true\\\",\\\"-c\\\",\\\"core.quotepath=false\\\",\\\"remote\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=2387 role=server\ntimestamp=2026-10-20T18:42:31.162Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--no-optional-locks\\\",\\\"-c\\\",\\\"core.autocrlf=false\\\",\\\"-c\\\",\\\"core.fsmonitor=false\\\",\\\"-c\\\",\\\"core.longpaths=true\\\",\\\"-c\\\",\\\"core.symlinks=true\\\",\\\"-c\\\",\\\"core.quotepath=false\\\",\\\"for-each-ref\\\",\\\"--format=%(refname:short)\\\",\\\"refs/heads\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=2453 role=server\ntimestamp=2026-10-20T18:42:31.250Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--no-optional-locks\\\",\\\"-c\\\",\\\"core.autocrlf=false\\\",\\\"-c\\\",\\\"core.fsmonitor=false\\\",\\\"-c\\\",\\\"core.longpaths=true\\\",\\\"-c\\\",\\\"core.symlinks=true\\\",\\\"-c\\\",\\\"core.quotepath=false\\\",\\\"config\\\",\\\"init.defaultBranch\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=2541 role=server\ntimestamp=2026-10-20T18:42:31.309Z level=INFO run=a038ab92 message=event event.id=evt_15a9f4b0c001XOJIPaiBKofZpY event.created=1792521751308 event.type=agent.updated event.location.directory=/out/isolated-capture/schema-ZlQnsD/project event.location.workspaceID=undefined event.data={} http.span=2600 role=server\ntimestamp=2026-10-20T18:42:31.312Z level=INFO run=a038ab92 message=event event.id=evt_15a9f4b0f001yKdY8QHWHd1SVr event.created=1792521751311 event.type=command.updated event.location.directory=/out/isolated-capture/schema-ZlQnsD/project event.location.workspaceID=undefined event.data={} http.span=2603 role=server\ntimestamp=2026-10-20T18:42:31.481Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"rev-parse\\\",\\\"--git-dir\\\",\\\"--git-common-dir\\\",\\\"--show-toplevel\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project http.span=2772 role=server\ntimestamp=2026-10-20T18:42:31.533Z level=INFO run=a038ab92 message=\"watcher subscribe\" path=/out/isolated-capture/schema-ZlQnsD/project/.git/HEAD type=file ignores=0 http.span=2824 role=server\ntimestamp=2026-10-20T18:42:31.535Z level=INFO run=a038ab92 message=\"watcher started\" path=/out/isolated-capture/schema-ZlQnsD/project/.git/HEAD type=file backend=node ignores=0 http.span=2826 role=server\ntimestamp=2026-10-20T18:42:31.840Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"rev-parse\\\",\\\"--git-dir\\\",\\\"--git-common-dir\\\",\\\"--show-toplevel\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:31.893Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f.init-273-4gx23z3z0n7\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"init\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:31.975Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"diff-files\\\",\\\"--name-only\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.002Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"ls-files\\\",\\\"--others\\\",\\\"--exclude-standard\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.059Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project/.git\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"check-ignore\\\",\\\"--no-index\\\",\\\"--stdin\\\",\\\"-z\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.111Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"update-index\\\",\\\"--add\\\",\\\"--remove\\\",\\\"--replace\\\",\\\"-z\\\",\\\"--stdin\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.180Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"write-tree\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.329Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"diff-files\\\",\\\"--name-only\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.349Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"ls-files\\\",\\\"--others\\\",\\\"--exclude-standard\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.497Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"diff-files\\\",\\\"--name-only\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.515Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"ls-files\\\",\\\"--others\\\",\\\"--exclude-standard\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.603Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"diff-files\\\",\\\"--name-only\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.622Z level=INFO run=a038ab92 message=\"spawning process\" command=git args=\"[\\\"--git-dir\\\",\\\"/out/isolated-capture/schema-ZlQnsD/xdg-data/opencode/snapshot/361013cf8c9306e2912175696d8475ea2c750d1d/182d3249bfd906f11bde88a42732010467c1c24f\\\",\\\"--work-tree\\\",\\\"/out/isolated-capture/schema-ZlQnsD/project\\\",\\\"ls-files\\\",\\\"--others\\\",\\\"--exclude-standard\\\",\\\"-z\\\",\\\"--\\\",\\\":(literal).\\\"]\" cwd=/out/isolated-capture/schema-ZlQnsD/project role=server\ntimestamp=2026-10-20T18:42:32.739Z level=INFO run=a038ab92 message=\"Sent HTTP response\" http.span=1812 role=server http.method=GET http.url=/api/event http.status=200\ntimestamp=2026-10-20T18:42:32.783Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/project/.git/HEAD type=file http.span=4074 role=server\ntimestamp=2026-10-20T18:42:32.837Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper/index.mjs type=file http.span=4128 role=server\ntimestamp=2026-10-20T18:42:32.840Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/aft-opencode-wrapper type=directory http.span=4131 role=server\ntimestamp=2026-10-20T18:42:32.847Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/skill type=file http.span=4138 role=server\ntimestamp=2026-10-20T18:42:32.847Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/skills type=file http.span=4138 role=server\ntimestamp=2026-10-20T18:42:32.856Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/project/AGENTS.md type=file http.span=4147 role=server\ntimestamp=2026-10-20T18:42:32.859Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode/AGENTS.md type=file http.span=4150 role=server\ntimestamp=2026-10-20T18:42:32.888Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/etc type=entries http.span=4179 role=server\ntimestamp=2026-10-20T18:42:32.889Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/ type=entries http.span=4180 role=server\ntimestamp=2026-10-20T18:42:32.889Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out type=entries http.span=4180 role=server\ntimestamp=2026-10-20T18:42:32.889Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture type=entries http.span=4180 role=server\ntimestamp=2026-10-20T18:42:32.890Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD type=entries http.span=4181 role=server\ntimestamp=2026-10-20T18:42:32.890Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/project type=entries http.span=4181 role=server\ntimestamp=2026-10-20T18:42:32.890Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/home type=entries http.span=4181 role=server\ntimestamp=2026-10-20T18:42:32.891Z level=INFO run=a038ab92 message=\"watcher stopped\" path=/out/isolated-capture/schema-ZlQnsD/xdg-config/opencode type=directory http.span=4182 role=server\n",
+  "timed_out": false,
+  "stopped_early": false
+}

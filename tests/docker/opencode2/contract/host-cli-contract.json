@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-2.0.29-20261017-shared",
-  "observed_run_id": "oc2-ga-2.0.29-20261017-shared",
-  "observed_sha": "7f001b797715b7bbc57cd6b69d9bc358ebb396e",
-  "supersedes_host_version": "2.0.11",
-  "host_version": "2.0.29",
+  "run_id": "oc2-ga-2.1.0-isolated-capture",
+  "observed_run_id": "oc2-ga-2.1.0-isolated-capture",
+  "observed_sha": "8aceb397b5d9836004b548ea1a5aa8f1d75cd0e8",
+  "supersedes_host_version": "2.0.29",
+  "host_version": "2.1.0",
   "host": "opencode2",
   "platform": "linux-x64",
-  "transcript": "probe/shared-server-ga-2.0.29.txt",
+  "transcript": "probe/isolated-ga-2.1.0.txt",
   "endpoint_handoff": {
     "run": {
       "kind": "flag",
@@ -37,42 +37,31 @@
       "kind": "env",
       "name": "OPENCODE_SERVER_PASSWORD"
     },
-    "stdout_pattern": "^server password (?<password>\\S+)$",
     "service_registration": {
       "path": "$XDG_STATE_HOME/opencode/service.json",
-      "written_by": "opencode2 serve --service",
-      "fields": ["id", "version", "url", "pid", "password"],
-      "stdout_password_line": "absent under --service",
-      "read_by": "discover() in @opencode/client/service, and the harness for the server password",
-      "observed_on": "GA 2.0.29 linux-x64; registration carries id, version, url, pid, and password while --service omits the password from stdout"
+      "fields": [
+        "id",
+        "version",
+        "url",
+        "pid",
+        "password"
+      ],
+      "stdout_password_line": "absent under --service"
     },
-    "preferred_client_environment": "OPENCODE_PASSWORD=${password}",
-    "observed_run_client_environment": "OPENCODE_SERVER_PASSWORD=${password}",
-    "observed_api_client_environment": "OPENCODE_SERVER_PASSWORD=${password}",
     "accepted_environment_precedence": [
       "OPENCODE_PASSWORD",
       "OPENCODE_SERVER_PASSWORD"
-    ],
-    "password_flag": null,
-    "basic_auth_username": "opencode",
-    "source_evidence": "https://github.com/anomalyco/opencode/blob/d86c3041c948f17a8a02d01d08925c893eaf1bdf/packages/cli/src/env.ts#L7-L13",
-    "transcript_redaction": "The ephemeral password is replaced with <redacted>; its presence and use are retained."
-  },
-  "permission_prompt": {
-    "answered_by": "The isolated 2.0.29 native-edit probe completed edit without --auto; --auto also approves permissions that are not explicitly denied",
-    "stderr_line": "not emitted; native edit completed without --auto",
-    "stderr_line_under_auto": "not printed",
-    "observed_on": "GA 2.0.29 linux-x64; the native edit probe changed patched.txt without --auto; `opencode run --help` documents --auto as 'Auto-approve permissions that are not explicitly denied'",
-    "observation_channel": "GET /api/event (SSE): permission.asked carries the request, permission.replied carries the answer. No external client can reply first, so the event stream is where a raised prompt is observed."
+    ]
   },
   "request_body_handoff": {
     "api": "--data",
-    "rejected_spellings": ["--body"],
-    "observed": "opencode api --help lists `--data, -d string  Request body`; `--body` exits 1 with `Unrecognized flag: --body in command opencode api`"
+    "rejected_spellings": [
+      "--body"
+    ]
   },
   "session_start": {
     "stream": "opencode2 run --format json NDJSON",
-    "first_record_type": "text",
+    "first_record_type": "step_start",
     "required_top_level_fields": [
       "type",
       "timestamp",
@@ -90,14 +79,18 @@
       "part.type": "string"
     },
     "fixed_values": {
-      "type": "text",
-      "part.type": "text"
+      "type": "step_start",
+      "part.type": "step-start"
     },
     "identity_invariants": [
       "sessionID == part.sessionID"
     ],
     "completion_signal": "EOF and process exit status 0 after the server reports the session idle",
-    "dedicated_success_record": false
+    "dedicated_success_record": false,
+    "observed_record_types": [
+      "step_start",
+      "text"
+    ]
   },
   "idle_retention": {
     "run_client": {
@@ -121,39 +114,22 @@
     "path": "/api/info",
     "expected_status": 0,
     "serve_processes": 1,
-    "removed_at_this_version": [
-      {
-        "path": "/api/health",
-        "served_at": "2.0.3",
-        "observed_now": "HTTP 404 Not Found, exit 1"
-      },
-      {
-        "path": "/api/server",
-        "served_at": "2.0.3",
-        "observed_now": "HTTP 404 Not Found, exit 1"
-      }
-    ],
     "positive_controls": [
       {
-        "order": 1,
         "client": "run",
-        "handoff": "--server plus OPENCODE_SERVER_PASSWORD",
         "exit_status": 0
       },
       {
-        "order": 2,
         "client": "api",
-        "request": "GET /api/info",
-        "handoff": "--server plus OPENCODE_SERVER_PASSWORD",
         "exit_status": 0,
         "response": {
-          "version": "2.0.29",
-          "pid": 80,
+          "version": "2.1.0",
+          "pid": 26,
           "urls": [
-            "http://127.0.0.1:41875"
+            "http://127.0.0.1:34521"
           ],
           "paths": {
-            "tmp": "/probe/shared/tmp/opencode"
+            "tmp": "/out/isolated-capture/shared-5wLfnd/tmp/opencode"
           },
           "capabilities": {
             "persistentPty": true
@@ -168,31 +144,22 @@
     ],
     "negative_controls": [
       {
-        "order": 1,
         "name": "wrong_password",
         "client": "api",
-        "password_environment": "OPENCODE_SERVER_PASSWORD=WRONG",
         "exit_status": 1,
-        "stable_error": "Server at http://127.0.0.1:41875 rejected the password",
-        "cause": "UnauthorizedError"
+        "stable_error": "Server at http://127.0.0.1:34521 rejected the password"
       },
       {
-        "order": 2,
         "name": "missing_password",
         "client": "api",
-        "password_environment": "unset",
         "exit_status": 1,
-        "stable_error": "Server at http://127.0.0.1:41875 requires a password; set OPENCODE_PASSWORD",
-        "cause": "UnauthorizedError"
+        "stable_error": "Server at http://127.0.0.1:34521 requires a password; set OPENCODE_PASSWORD"
       },
       {
-        "order": 3,
         "name": "bad_endpoint",
         "client": "api",
-        "endpoint": "http://127.0.0.1:1",
         "exit_status": 1,
-        "stable_error": "Could not reach server at http://127.0.0.1:1",
-        "cause": "Transport"
+        "stable_error": "Could not reach server at http://127.0.0.1:1"
       }
     ]
   }

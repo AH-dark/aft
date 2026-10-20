@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-2.0.29-20261017-shared",
-  "observed_run_id": "oc2-ga-2.0.29-20261017-shared",
-  "observed_sha": "7f001b797715b7bbc57cd6b69d9bc358ebb396e",
-  "supersedes_host_version": "2.0.11",
-  "host_version": "2.0.29",
+  "run_id": "oc2-ga-2.1.0-isolated-capture",
+  "observed_run_id": "oc2-ga-2.1.0-isolated-capture",
+  "observed_sha": "8aceb397b5d9836004b548ea1a5aa8f1d75cd0e8",
+  "supersedes_host_version": "2.0.29",
+  "host_version": "2.1.0",
   "host": "opencode2",
   "platform": "linux-x64",
-  "transcript": "probe/host-provider-config-ga-2.0.29.txt",
+  "transcript": "probe/isolated-ga-2.1.0.txt",
   "guard_transcript": "probe/host-provider-contract-guard.txt",
   "provider_config": {
     "openai": {
@@ -33,7 +33,7 @@
         "name": "Deterministic aimock",
         "package": "@opencode/ai/providers/openai-compatible",
         "settings": {
-          "baseURL": "http://127.0.0.1:4010/v1",
+          "baseURL": "http://127.0.0.1:35515/v1",
           "apiKey": "{env:OPENAI_API_KEY}"
         },
         "models": {
@@ -59,11 +59,8 @@
     "--auto",
     "${message}"
   ],
-  "environment": {
-    "OPENAI_API_KEY": "sk-mock"
-  },
   "observed_session": {
-    "session_id": "ses_eb88bf5b5ffeJsXZ1tzvJ505Dy",
+    "session_id": "ses_ea560f26bffeQ1AUmyfbwLTnr9",
     "model": {
       "id": "mock-model",
       "providerID": "openai",
