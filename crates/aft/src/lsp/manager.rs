@@ -29,8 +29,7 @@ use crate::lsp::pull_params::{
     AftWorkspaceDiagnosticRequest,
 };
 use crate::lsp::registry::{
-    is_config_file_path_with_custom, resolve_server_binary, servers_for_file,
-    servers_with_root_marker, ServerDef, ServerKind,
+    is_config_file_path_with_custom, resolve_server_binary, servers_for_file, ServerDef, ServerKind,
 };
 use crate::lsp::roots::ServerKey;
 use crate::lsp::typescript_project::{
@@ -7463,7 +7462,7 @@ fn walk_applicable_area_uncached(
         })
         .build();
 
-    let mut roots_by_directory = HashMap::new();
+    let mut resolver = crate::lsp::registry::WalkServerResolver::new(config, mode);
     for (visited, entry) in walker.enumerate() {
         if std::time::Instant::now() >= deadline {
             return Err(ApplicabilityResolutionError::RequestDeadline {
@@ -7493,7 +7492,7 @@ fn walk_applicable_area_uncached(
             continue;
         }
         let file = entry.path();
-        for definition in servers_with_root_marker(file, config) {
+        for definition in resolver.marker_servers(file) {
             if markers.contains_key(&definition.kind) {
                 continue;
             }
@@ -7504,36 +7503,26 @@ fn walk_applicable_area_uncached(
                 .unwrap_or_default();
             markers.insert(
                 definition.kind.clone(),
-                (definition, marker_dir, marker_name),
+                (definition.clone(), marker_dir, marker_name),
             );
         }
-        for definition in crate::lsp::registry::servers_for_file_with_mode(file, config, mode) {
-            let parent = file.parent().unwrap_or(project_root);
-            let key = roots_by_directory
-                .entry((definition.kind.clone(), parent.to_path_buf()))
-                .or_insert_with(|| {
-                    definition
-                        .workspace_root_with_mode(file, config.project_root.as_deref(), mode)
-                        .map(|root| ServerKey {
-                            kind: definition.kind.clone(),
-                            root,
-                        })
-                });
-            let Some(key) = key.clone() else {
-                continue;
+        resolver.for_each_file_server(file, |definition, root| {
+            let key = ServerKey {
+                kind: definition.kind.clone(),
+                root: root.to_path_buf(),
             };
             // Whether a key starts or fails depends only on the key and its
             // definition, so the first file seen for it decides, as it did
             // when the classification ran inside this loop.
             if !seen.insert(key.clone()) {
-                continue;
+                return;
             }
             candidates.push(ApplicableServerCandidate {
                 key,
-                definition,
+                definition: definition.clone(),
                 source_file: file.to_path_buf(),
             });
-        }
+        });
     }
 
     Ok(ApplicabilityWalk {

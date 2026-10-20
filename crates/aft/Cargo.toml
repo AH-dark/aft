@@ -81,6 +81,11 @@ path = "tests/semantic_embed_overflow_recovery_working_set_test.rs"
 name = "daemon_malloc_small_growth_repro"
 path = "tests/daemon_malloc_small_growth_repro.rs"
 
+# The walk cost probe counts process-wide allocations in an isolated harness.
+[[test]]
+name = "applicability_cost"
+path = "tests/applicability_cost.rs"
+
 [lints.rust]
 # The ignored navigation profile is enabled explicitly for manual measurements.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
