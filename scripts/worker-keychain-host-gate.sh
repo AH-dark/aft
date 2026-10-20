@@ -86,10 +86,12 @@ for layer in mach file; do
     [[ ! -s "$logs/$layer-restored.stat" ]] || { echo 'Restore left a tracked diff' >&2; exit 1; }
     [[ "$status" != 0 ]] || { echo "UNDEFENDED: $expected stayed green" >&2; exit 1; }
     python3 - "$logs/$layer-red.log" "$expected" "$status_marker" <<'PY'
-import pathlib, sys
+import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 name, marker = sys.argv[2:]
-assert f"test {name} ... FAILED" in text, text
+summary = re.search(r"\nfailures:\n\n?((?:    [^\n]+\n)+)\n", text)
+assert summary, text
+assert re.findall(r"^    (\S+)$", summary.group(1), re.M) == [name], text
 assert "test result: FAILED. 0 passed; 1 failed;" in text, text
 assert marker in text, "Expected denial assertion was not reached:\n" + text
 print(f"NON-VACUITY BREAK reddened only {name}; all other tests filtered out")
