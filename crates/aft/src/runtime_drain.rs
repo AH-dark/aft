@@ -1069,10 +1069,13 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     };
 
     if installed {
-        // Enqueue before clearing the sink, so the paths are never in neither
-        // place while an answer reads both.
-        let enqueued = pending.is_empty() || ctx.enqueue_callgraph_store_refresh(pending.clone());
-        ctx.settle_replayed_callgraph_store_paths(&replay_parked, &pending, enqueued);
+        // The worker moves the paths from the sink into its queue under its
+        // queue lock, so they are never in neither place while an answer
+        // reads both.
+        if !pending.is_empty() {
+            ctx.enqueue_callgraph_store_refresh(pending.clone());
+        }
+        ctx.settle_replayed_callgraph_store_paths(&replay_parked, &pending);
         let _ = ctx.request_tier2_refresh_pull();
     }
     if terminal {

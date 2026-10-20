@@ -9472,11 +9472,13 @@ impl AppContext {
                         };
                     };
                     if let Some((paths, parked)) = replay {
-                        // Enqueue before clearing the sink, so the paths are
-                        // never in neither place while an answer reads both.
-                        let enqueued =
-                            paths.is_empty() || self.enqueue_callgraph_store_refresh(paths.clone());
-                        self.settle_replayed_callgraph_store_paths(&parked, &paths, enqueued);
+                        // The worker moves the paths from the sink into its
+                        // queue under its queue lock, so they are never in
+                        // neither place while an answer reads both.
+                        if !paths.is_empty() {
+                            self.enqueue_callgraph_store_refresh(paths.clone());
+                        }
+                        self.settle_replayed_callgraph_store_paths(&parked, &paths);
                     }
                     if matches!(&outcome, CallgraphStoreAccess::Ready(_)) {
                         let _ = self.request_tier2_refresh_pull();
@@ -10006,10 +10008,12 @@ impl AppContext {
 
     /// The parked paths a ready store should replay, plus every path that was
     /// parked, without removing any of them. They stay in the sink, where
-    /// answers report them as pending, until
-    /// [`Self::settle_replayed_callgraph_store_paths`] runs after the refresh
-    /// worker has taken them: removing them first would leave a moment in
-    /// which no stage an answer reads holds them.
+    /// answers report them as pending, until the refresh worker accepts them
+    /// into its queue: the worker takes them out of the sink under its queue
+    /// lock at that moment. Removing them first would leave a moment in which
+    /// no stage an answer reads holds them. Call
+    /// [`Self::settle_replayed_callgraph_store_paths`] after the replay to drop
+    /// the parked paths that were not replayed.
     pub(crate) fn pending_callgraph_store_paths_for_replay(
         &self,
     ) -> (Vec<PathBuf>, BTreeSet<PathBuf>) {
@@ -10021,21 +10025,24 @@ impl AppContext {
     }
 
     /// Finish a replay started with
-    /// [`Self::pending_callgraph_store_paths_for_replay`]. When the refresh
-    /// worker accepted the replayed paths, every path that was parked leaves
-    /// the sink, as [`Self::take_pending_callgraph_store_paths`] would have
-    /// done. When it did not, the replayed paths stay parked for the next
-    /// ready store and only the dropped ones leave.
+    /// [`Self::pending_callgraph_store_paths_for_replay`]: the parked paths
+    /// that were not replayed leave the sink, as
+    /// [`Self::take_pending_callgraph_store_paths`] would have dropped them.
+    ///
+    /// Replayed paths are never removed here. The refresh worker removes them
+    /// when it queues them for work. When it instead keeps them in a batch
+    /// that waits for another writer, or refuses them, they stay parked: a
+    /// lifecycle change may retire that waiting batch, and the sink is then
+    /// the only place the next ready store can replay them from.
     pub(crate) fn settle_replayed_callgraph_store_paths(
         &self,
         parked: &BTreeSet<PathBuf>,
         replayed: &[PathBuf],
-        enqueued: bool,
     ) {
         let replayed: BTreeSet<&PathBuf> = replayed.iter().collect();
         let mut pending = self.pending_callgraph_store_paths.lock();
         for path in parked {
-            if enqueued || !replayed.contains(path) {
+            if !replayed.contains(path) {
                 pending.remove(path);
             }
         }
@@ -15112,6 +15119,104 @@ mod callgraph_store_for_ops_tests {
             "the answer must be marked incomplete and name the parked file: {:#}",
             response.data
         );
+        crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    /// Replay an installed store's parked paths the way the store-install
+    /// sites do: hand them to the refresh worker, then drop the parked paths
+    /// that were not replayed.
+    fn replay_parked_callgraph_paths(ctx: &AppContext) -> Vec<PathBuf> {
+        let (paths, parked) = ctx.pending_callgraph_store_paths_for_replay();
+        if !paths.is_empty() {
+            ctx.enqueue_callgraph_store_refresh(paths.clone());
+        }
+        ctx.settle_replayed_callgraph_store_paths(&parked, &paths);
+        paths
+    }
+
+    /// A replayed edit that joins a batch still waiting for another process's
+    /// writer stays parked in the pending sink. An unbind then retires the
+    /// waiting batch, so the sink is the only place left that holds the edit:
+    /// answers must keep naming it as pending, and the next bind must replay
+    /// it to the worker.
+    #[test]
+    fn an_edit_replayed_into_a_batch_waiting_for_a_busy_writer_survives_an_unbind() {
+        let (_dirs, ctx) = cold_build_context();
+        let root = std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap())
+            .expect("canonical root");
+        let family = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &family, false);
+        ctx.set_canonical_cache_root(root.clone());
+        let worker =
+            crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.clone());
+        crate::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::ZERO,
+            false,
+        );
+        // The writer open fails and the lease looks held by another live
+        // process, so the batch parks its file and waits for that writer.
+        crate::callgraph_store::set_callgraph_refresh_worker_test_open_failure(root.clone(), true);
+        crate::callgraph_store::set_callgraph_refresh_worker_test_writer_busy(&root, true);
+        let source = root.join("src/lib.rs");
+        assert!(ctx.enqueue_callgraph_store_refresh([source.clone()]));
+        assert!(worker.wait(Duration::from_secs(12)), "refresh worker hung");
+        assert_eq!(
+            crate::callgraph_store::callgraph_refresh_status(&root)["state"],
+            "waiting",
+            "the batch must wait for the busy writer"
+        );
+        assert_eq!(
+            crate::callgraph_store::callgraph_refresh_worker_test_worker_calls(&root),
+            1
+        );
+
+        // A ready store replays the parked edit. The worker merges it into
+        // the waiting batch, which keeps waiting for the busy writer.
+        assert_eq!(replay_parked_callgraph_paths(&ctx), vec![source.clone()]);
+        assert_eq!(
+            crate::callgraph_store::callgraph_refresh_status(&root)["state"],
+            "waiting"
+        );
+        assert!(
+            ctx.pending_callgraph_store_paths.lock().contains(&source),
+            "an edit the worker keeps waiting must stay parked"
+        );
+
+        ctx.mark_subc_unbound();
+        assert!(
+            crate::callgraph_store::callgraph_refresh_unapplied_paths(&root).is_empty(),
+            "the unbind must retire the waiting batch"
+        );
+        let response = call_tree_answer_with_capture_hook(&ctx, |_| {});
+        assert!(
+            names_pending_file(&response, "src/lib.rs"),
+            "after the unbind the answer must still name the edit as pending: {:#}",
+            response.data
+        );
+
+        ctx.mark_subc_bound();
+        crate::callgraph_store::set_callgraph_refresh_worker_test_writer_busy(&root, false);
+        assert_eq!(
+            replay_parked_callgraph_paths(&ctx),
+            vec![source.clone()],
+            "the next bind must find the edit to replay"
+        );
+        assert!(worker.wait(Duration::from_secs(12)), "refresh worker hung");
+        assert_eq!(
+            crate::callgraph_store::callgraph_refresh_worker_test_worker_calls(&root),
+            2,
+            "the next bind must hand the edit to the refresh worker again"
+        );
+        // The writer open still fails here, so the edit is parked again and
+        // the answer keeps disclosing it.
+        let response = call_tree_answer_with_capture_hook(&ctx, |_| {});
+        assert!(
+            names_pending_file(&response, "src/lib.rs"),
+            "the answer must name the replayed edit as pending: {:#}",
+            response.data
+        );
+        drop(worker);
         crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
     }
 
