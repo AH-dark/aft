@@ -192,7 +192,7 @@ const ANNOUNCEMENT_VERSION = "0.61.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
   "OpenCode 2 now hands every AFT permission decision to OpenCode, so your permission rules and plugins apply to AFT tools too.",
   "Shell sandboxing has per-role profiles: `sandbox.profile` (`off`, `relaxed`, `strict`) replaces `sandbox.enabled`, and `npx @cortexkit/aft doctor --fix` migrates your config.",
-  "Edits replace files atomically and keep their permissions and ownership, and `apply_patch` rejects malformed or ambiguous patches before writing anything.",
+  "Edits keep files' permissions and ownership, replacing them atomically when that is safe, and `apply_patch` rejects malformed or ambiguous patches before writing anything.",
   "Much lighter background work: less CPU, disk and memory use, and no indexing of your home folder or drive roots.",
   "Long shell waits keep their replies, remote `runon` jobs survive build-server restarts, and many reported issues are fixed.",
 ];
