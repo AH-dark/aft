@@ -131,7 +131,8 @@ impl LaunchGrantState {
         *self.0.lock().probes.entry(path.to_path_buf()).or_default() += 1;
     }
 
-    #[cfg(test)]
+    // Only the Unix-only restore tests read the count.
+    #[cfg(all(test, unix))]
     pub(crate) fn probe_count(&self, path: &Path) -> usize {
         self.0.lock().probes.get(path).copied().unwrap_or_default()
     }
