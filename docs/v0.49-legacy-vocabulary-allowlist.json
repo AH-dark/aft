@@ -7,6 +7,17 @@
   ],
   "entries": [
     {
+      "path": "crates/aft/src/subc/access_grants_tests.rs",
+      "line": 277,
+      "column": 27,
+      "token": "filePath",
+      "text": "\"arguments\":{\"filePath\":target}",
+      "location": "line 277, column 27",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
       "path": "benchmarks/codegraph-replication/src/drivers.ts",
       "line": 153,
       "column": 40,
