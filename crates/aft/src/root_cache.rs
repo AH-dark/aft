@@ -285,6 +285,18 @@ fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ArtifactAcces
     CONFIGURED_ARTIFACT_ACCESS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Return the artifact key registered during configure without deriving a new
+/// key from Git or reading the older identity pin in aft.db.
+pub(crate) fn configured_artifact_key(project_root: &Path) -> Option<String> {
+    let project_root = canonical_root(project_root);
+    configured_artifact_access()
+        .lock()
+        .ok()?
+        .get(&project_root)
+        .filter(|access| !access.shared_key.is_empty())
+        .map(|access| access.shared_key.clone())
+}
+
 /// Track scope keys belonging to roots currently bound in this process. The
 /// inspect sweep snapshots this registry at publication time so a live actor's
 /// cache cannot be mistaken for a reclaimed worktree cache.

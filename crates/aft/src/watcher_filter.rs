@@ -2045,8 +2045,9 @@ const WATCHER_OBSERVATION_STATE_PREFIX: &str = "watcher.observed_exclusion_prefi
 /// one repository ranking rather than a per-root override; the most recently
 /// persisted observation becomes the next bind's ranking for every sibling.
 fn watcher_observation_state_key(root: &Path) -> String {
-    let repository_key = crate::search_index::artifact_cache_key_memoized_only(root)
-        .unwrap_or_else(|| crate::search_index::artifact_cache_key(root));
+    let repository_key = crate::root_cache::configured_artifact_key(root)
+        .or_else(|| crate::search_index::artifact_cache_key_memoized_only(root))
+        .unwrap_or_else(|| crate::search_index::artifact_cache_key_for_build(root));
     format!("{WATCHER_OBSERVATION_STATE_PREFIX}:{repository_key}")
 }
 

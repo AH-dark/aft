@@ -2294,6 +2294,7 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
     pub(crate) root_path: PathBuf,
     pub(crate) canonical_cache_root: PathBuf,
+    pub(crate) project_key: String,
     pub(crate) harness: Harness,
     pub(crate) storage_root: PathBuf,
     pub(crate) harness_dir: PathBuf,
@@ -6690,14 +6691,16 @@ impl AppContext {
     }
 
     pub fn memoized_artifact_cache_key(&self, canonical_root: &Path) -> String {
-        let mut keys = self.artifact_cache_keys.lock();
+        let keys = self.artifact_cache_keys.lock();
         if let Some(key) = keys.get(canonical_root).cloned() {
             return key;
         }
-        let key = crate::search_index::artifact_cache_key(canonical_root);
+        let key = crate::search_index::artifact_cache_key_for_build(canonical_root);
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
-        keys.insert(canonical_root.to_path_buf(), key.clone());
+        // Configure memoizes the key only after verifying the saved identity.
+        // Do not cache a build-derived key: a later configure must still perform
+        // that verification rather than treating a build's Git probe as final.
         key
     }
 
@@ -8743,12 +8746,12 @@ impl AppContext {
                     .fingerprint()
                     .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
                     .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
-                let mut request = crate::migration::SemanticMigrationRequest::for_root(
+                let mut request = crate::migration::SemanticMigrationRequest::for_root_with_key(
                     snapshot.storage.clone(),
                     root.clone(),
+                    snapshot.family.clone(),
                     fingerprint,
                 );
-                request.family.clone_from(&snapshot.family);
                 request.view.clone_from(&snapshot.scope);
                 let handoff = crate::migration::store_live_semantic_blobs(&request, &index)
                     .map_err(|error| error.to_string())?;

@@ -16424,6 +16424,7 @@ mod tests {
             generation: ctx.configure_generation(),
             root_path: root_path.clone(),
             canonical_cache_root: root_path.clone(),
+            project_key: String::new(),
             harness: crate::harness::Harness::Opencode,
             storage_root: storage_root.clone(),
             harness_dir: storage_root.join("opencode"),

@@ -1239,6 +1239,17 @@ fn begin_semantic_index_build(
     crate::logging::IndexBuildScope,
     crate::logging::IndexBuildFailureGuard,
 ) {
+    begin_semantic_index_build_with_key(project_root, None)
+}
+
+fn begin_semantic_index_build_with_key(
+    project_root: &Path,
+    project_key: Option<&str>,
+) -> (
+    Option<crate::logging::IndexBuildGuard>,
+    crate::logging::IndexBuildScope,
+    crate::logging::IndexBuildFailureGuard,
+) {
     // The parked-backoff status is deliberately kept while a retry runs: the
     // attempt re-walks and re-chunks the corpus before it touches the backend,
     // and clearing here read as "building" for that whole window and reset the
@@ -1249,7 +1260,9 @@ fn begin_semantic_index_build(
             return (None, scope, crate::logging::IndexBuildFailureGuard::new());
         }
     }
-    let key = crate::search_index::artifact_cache_key(project_root);
+    let key = project_key
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::search_index::artifact_cache_key_for_build(project_root));
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Semantic,
         project_root,
@@ -6555,9 +6568,34 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        let project_key = crate::search_index::artifact_cache_key_for_build(project_root);
+        Self::build_with_caps_for_key(
+            project_root,
+            files,
+            embed_fn,
+            max_batch_size,
+            embed_text_caps,
+            &project_key,
+        )
+    }
+
+    /// Build a snapshot and label its semantic build events with the caller's
+    /// `project_key`, without deriving another key from the project root.
+    pub fn build_with_caps_for_key<F>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        embed_text_caps: EmbedTextCaps,
+        project_key: &str,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
         let elapsed_started = Instant::now();
         let embedding_timing = EmbeddingTimingScope::new();
-        let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let (_guard, scope, mut failure_guard) =
+            begin_semantic_index_build_with_key(project_root, Some(project_key));
         let _progress = crate::cold_build_limiter::progress::start(
             project_root,
             "semantic build",

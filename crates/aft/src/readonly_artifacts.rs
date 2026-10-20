@@ -990,6 +990,10 @@ mod tests {
     }
 
     fn build_semantic_artifact(root: &Path, storage: &Path) {
+        build_semantic_artifact_with_key(root, storage, &artifact_cache_key(root));
+    }
+
+    fn build_semantic_artifact_with_key(root: &Path, storage: &Path, project_key: &str) {
         let source = root.join("src/lib.rs");
         let fingerprint = SemanticIndexFingerprint {
             backend: "openai_compatible".to_string(),
@@ -1004,7 +1008,7 @@ mod tests {
         let mut index =
             SemanticIndex::build(root, &[source], &mut embed, 8).expect("build semantic index");
         index.set_fingerprint(fingerprint);
-        index.write_to_disk(storage, &artifact_cache_key(root));
+        index.write_to_disk(storage, project_key);
     }
 
     fn borrowed_context(root: &Path, storage: &Path) -> crate::context::AppContext {
@@ -1028,6 +1032,168 @@ mod tests {
             | ReadOnlyArtifact::Stale(ReadOnlyStale { index, .. }) => index,
             other => panic!("expected borrowed search index, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn callgraph_cold_build_reopens_saved_path_identity_after_git_is_added() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn writer_needle() {}\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let owner = borrowed_context(&root, storage.path());
+        let saved_key = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
+            .unwrap()
+            .expect("settled path identity");
+        crate::root_cache::configure_artifact_access(&root, &saved_key, false);
+
+        init_git(&root);
+        commit_all(&root);
+        assert_ne!(artifact_cache_key(&root), saved_key);
+        // A saved project identity must make writers independent of aft.db,
+        // which held the older path-identity pin before identity files existed.
+        fs::create_dir(storage.path().join("aft.db")).unwrap();
+        let callgraph_dir = storage.path().join("callgraph").join(&saved_key);
+        let (graph, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+            callgraph_dir.clone(),
+            root.clone(),
+            &[root.join("src/lib.rs")],
+        )
+        .unwrap();
+        drop(graph);
+        assert!(
+            crate::callgraph_store::CallGraphStore::open_readonly(
+                callgraph_dir.clone(),
+                root.clone()
+            )
+            .unwrap()
+            .is_some(),
+            "a graph built after Git is added must reopen under the saved path identity"
+        );
+        use crate::callgraph_store::CallGraphStore;
+        assert!(!CallGraphStore::needs_cold_build(&callgraph_dir, &root).unwrap());
+        for open in [
+            CallGraphStore::open_ready,
+            CallGraphStore::open_ready_repairing,
+            CallGraphStore::open_ready_no_rebuild,
+            CallGraphStore::migrate_legacy_with_lease,
+        ] {
+            let graph = open(callgraph_dir.clone(), root.clone()).unwrap().unwrap();
+            assert_eq!(graph.project_key(), saved_key);
+            assert_eq!(graph.indexed_file_count().unwrap(), 1);
+        }
+        let (graph, rebuilt) = CallGraphStore::ensure_built_with_lease(
+            callgraph_dir.clone(),
+            root.clone(),
+            &[root.join("src/lib.rs")],
+        )
+        .unwrap();
+        assert!(
+            rebuilt.is_none(),
+            "the saved-key generation is already complete"
+        );
+        assert_eq!(graph.project_key(), saved_key);
+        drop(graph);
+        let graph = CallGraphStore::open(callgraph_dir, root.clone()).unwrap();
+        assert_eq!(graph.project_key(), saved_key);
+        assert_eq!(graph.indexed_file_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn callgraph_writer_and_reader_keep_the_full_standing_subtree_key() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (project, root) = fixture_project();
+        let subtree = root.join("src");
+        let storage = tempfile::tempdir().unwrap();
+        let resolved = crate::scoped_key::resolve_standing_root_in_storage(
+            subtree.to_str().unwrap(),
+            storage.path(),
+            true,
+        )
+        .unwrap();
+        let key = resolved.artifact_key;
+        assert_eq!(key.len(), 64);
+        assert_ne!(
+            crate::search_index::artifact_cache_key_read_only(&subtree, storage.path()).unwrap(),
+            key
+        );
+        crate::root_cache::configure_artifact_access(&subtree, &key, false);
+        let dir = storage.path().join("callgraph").join(&key);
+        let (graph, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+            dir.clone(),
+            subtree.clone(),
+            &[subtree.join("lib.rs")],
+        )
+        .unwrap();
+        assert_eq!(graph.project_key(), key);
+        drop(graph);
+        let graph = crate::callgraph_store::CallGraphStore::open_readonly(dir, subtree)
+            .unwrap()
+            .unwrap();
+        assert_eq!(graph.project_key(), key);
+        assert_eq!(graph.indexed_file_count().unwrap(), 1);
+        drop(project);
+    }
+
+    #[test]
+    fn bound_artifact_builds_keep_saved_path_key_after_git_is_added() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn readonly_needle() {}\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let owner = borrowed_context(&root, storage.path());
+        let saved_key = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
+            .unwrap()
+            .unwrap();
+        crate::root_cache::configure_artifact_access(&root, &saved_key, false);
+        init_git(&root);
+        commit_all(&root);
+        assert_ne!(artifact_cache_key(&root), saved_key);
+        fs::create_dir(storage.path().join("aft.db")).unwrap();
+        assert_eq!(
+            crate::search_index::artifact_cache_key_for_build(&root),
+            saved_key
+        );
+        assert_eq!(owner.memoized_artifact_cache_key(&root), saved_key);
+
+        let cache_dir =
+            crate::search_index::resolve_cache_dir_with_key(&saved_key, Some(storage.path()));
+        assert_eq!(resolve_cache_dir(&root, Some(storage.path())), cache_dir);
+        let mut index = SearchIndex::build_with_limit_to_cache_dir(&root, 1_000_000, &cache_dir);
+        let head = index.stored_git_head().map(str::to_owned);
+        assert!(index.write_to_disk(&cache_dir, head.as_deref()));
+        build_semantic_artifact_with_key(&root, storage.path(), &saved_key);
+        assert!(matches!(
+            open_search_index_read_only(&root, Some(storage.path())),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        assert!(matches!(
+            open_semantic_index_read_only(&root, Some(storage.path())),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+
+        let family = crate::migration::SemanticMigrationRequest::for_root(
+            storage.path(),
+            root.clone(),
+            "test-model",
+        )
+        .family;
+        assert_eq!(family, saved_key);
+        assert!(matches!(
+            crate::migration::rebuild_legacy_callgraph_once(storage.path(), &root, 0).unwrap(),
+            crate::migration::CallgraphMigrationOutcome::Rebuilt
+        ));
+        assert!(crate::callgraph_store::CallGraphStore::open_readonly(
+            storage.path().join("callgraph").join(&saved_key),
+            root,
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]

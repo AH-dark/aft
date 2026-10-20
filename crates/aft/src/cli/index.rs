@@ -478,12 +478,13 @@ fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, St
     let fingerprint = model.fingerprint(&config.semantic)?;
     let embed_text_caps = fingerprint.embed_text_caps;
     let mut embed = |texts: Vec<String>| model.embed(texts);
-    let mut index = SemanticIndex::build_with_caps(
+    let mut index = SemanticIndex::build_with_caps_for_key(
         &unit.entry.resolved_target,
         files,
         &mut embed,
         config.semantic.max_batch_size.max(1),
         embed_text_caps,
+        &unit.entry.artifact_key,
     )?;
     index.set_fingerprint(fingerprint);
     let persisted = publish_if_current(unit, || {

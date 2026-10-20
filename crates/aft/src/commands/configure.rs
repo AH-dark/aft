@@ -3449,6 +3449,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     generation: ctx.configure_generation(),
                     root_path: root_path.clone(),
                     canonical_cache_root: canonical_root.clone(),
+                    project_key: ctx
+                        .cached_artifact_cache_key(canonical_root)
+                        .unwrap_or_default(),
                     harness: harness.clone(),
                     storage_root: storage_root.clone(),
                     harness_dir: storage_root.join(harness.storage_segment()),
@@ -3723,6 +3726,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 generation,
                 root_path: root_path.clone(),
                 canonical_cache_root: canonical_cache_root.clone(),
+                project_key: ctx
+                    .cached_artifact_cache_key(&canonical_cache_root)
+                    .unwrap_or_default(),
                 harness: harness.clone(),
                 storage_root: storage_root.clone(),
                 harness_dir: storage_root.join(harness.storage_segment()),
@@ -3832,11 +3838,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     // Choose a durable identity at the first bind that needs an artifact key.
-    // With all three indexes off, keep the no-key, no-Git-probe fast path.
+    // With indexes and views off, keep the no-key, no-Git-probe fast path.
     let artifact_key_needed = !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
-            || next_config.indexes.callgraph);
+            || next_config.indexes.callgraph
+            || next_config.views.enabled);
     ctx.begin_configure_ack_phase("cache_key_resolve");
     ctx.begin_configure_ack_step("artifact_key");
     let mut cache_key_profile = CacheKeyResolveProfile::new(&canonical_cache_root);
@@ -4393,6 +4400,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         generation: configure_generation,
         root_path: root_path.clone(),
         canonical_cache_root: canonical_cache_root.clone(),
+        project_key: project_key.clone(),
         harness: harness.clone(),
         storage_root,
         harness_dir: ctx.harness_dir(),
@@ -7259,13 +7267,13 @@ fn import_legacy_view_once(
         return Ok(false);
     };
     let semantic_config = &input.semantic;
-    let mut request = crate::migration::SemanticMigrationRequest::for_root(
+    let mut request = crate::migration::SemanticMigrationRequest::for_root_with_key(
         view.storage.clone(),
         job.canonical_cache_root.clone(),
+        view.family.clone(),
         crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&semantic_config, 1)
             .as_string(),
     );
-    request.family.clone_from(&view.family);
     request.view.clone_from(&view.scope);
     if request.legacy_semantic_path().is_file() {
         request.configured_model_fingerprint = crate::migration::configured_fingerprint_for_legacy(
@@ -8086,6 +8094,9 @@ fn open_view_runtime_for_configure(
     #[cfg(any(test, feature = "test-timing-hooks"))]
     crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_OPEN");
     let family = input.family.clone();
+    if family.is_empty() {
+        return Err("view requires a settled artifact identity".to_string());
+    }
     let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
     let view = crate::views::ViewStore::open(&job.storage_root, &scope)
         .map_err(|error| error.to_string())?;
@@ -8296,7 +8307,7 @@ struct ConfigureViewInput {
 impl ConfigureViewInput {
     fn capture(ctx: &AppContext, job: &ConfigureMaintenanceJob) -> Self {
         Self {
-            family: ctx.memoized_artifact_cache_key(&job.canonical_cache_root),
+            family: job.project_key.clone(),
             git_common_dir: ctx.git_common_dir(),
             callgraph: ctx.config().indexes.callgraph,
             defer_callgraph: ctx.defer_callgraph_build(),
@@ -11148,6 +11159,38 @@ mod tests {
         assert!(store
             .sqlite_path()
             .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
+    }
+
+    #[test]
+    fn configure_view_keeps_saved_path_key_when_git_is_added_before_maintenance() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(json!({
+            "project_root": root, "harness": "pi", "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "views": {"enabled": true},
+                "indexes": {"trigram": false, "semantic": false, "callgraph": false}
+            }))],
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        let job = ctx.drain_configure_maintenance().pop().unwrap();
+        let saved_key = crate::search_index::artifact_path_identity_key(&root);
+        assert_eq!(job.project_key, saved_key);
+        assert_eq!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            Some(crate::root_identity::Identity::Path)
+        );
+        init_git_fixture(&root);
+        assert_ne!(crate::search_index::artifact_cache_key(&root), saved_key);
+
+        let other_context = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let input = super::ConfigureViewInput::capture(&other_context, &job);
+        assert_eq!(input.family, saved_key);
+        let prepared = super::open_view_runtime_for_configure(&input, &job).unwrap();
+        assert_eq!(prepared.snapshot.family, saved_key);
     }
 
     #[test]

@@ -1620,7 +1620,15 @@ impl SearchIndex {
             return None;
         }
         let started = std::time::Instant::now();
-        let key = artifact_cache_key(root);
+        // Persistent builders already receive configure's keyed directory.
+        // Its identity must also label build events when Git changed since bind.
+        let key = cache_dir
+            .parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "index"))
+            .and_then(|_| cache_dir.file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| artifact_cache_key_for_build(root));
         let scope =
             crate::logging::IndexBuildScope::new(crate::logging::IndexPlane::Search, root, key);
         let _index_build = crate::logging::install_index_build(scope.clone());
@@ -5212,7 +5220,7 @@ fn transient_search_cache_home() -> PathBuf {
 fn transient_search_cache_dir(root: &Path) -> PathBuf {
     transient_search_cache_home().join(format!(
         "{TRANSIENT_SEARCH_CACHE_PREFIX}{}.{}",
-        artifact_cache_key(root),
+        artifact_cache_key_for_build(root),
         std::process::id()
     ))
 }
@@ -6044,8 +6052,11 @@ fn lexical_score_snapshot_reference(
     (hits as f32) / (1.0 + file_trigram_count.ln())
 }
 
+/// Resolve a cache directory using configure's registered key when available.
+/// Persistent writers should pass their chosen key to `resolve_cache_dir_with_key`
+/// directly; callers without a configured project fall back to a Git probe.
 pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> PathBuf {
-    resolve_cache_dir_with_key(&artifact_cache_key(project_root), storage_dir)
+    resolve_cache_dir_with_key(&artifact_cache_key_for_build(project_root), storage_dir)
 }
 
 pub(crate) fn build_path_filters(
@@ -6973,6 +6984,14 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
     };
     record_derived_cache_key(project_root, &key);
     key
+}
+
+/// Reuse the artifact key registered during configure when one exists; otherwise
+/// derive a key from Git at `project_root`. This fallback is for standalone build
+/// APIs whose callers have not configured a project or supplied a storage path.
+pub(crate) fn artifact_cache_key_for_build(project_root: &Path) -> String {
+    crate::root_cache::configured_artifact_key(project_root)
+        .unwrap_or_else(|| artifact_cache_key(project_root))
 }
 
 pub fn artifact_cache_key_with_memo(

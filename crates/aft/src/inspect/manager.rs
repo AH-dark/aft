@@ -4789,7 +4789,7 @@ impl Tier2PhaseTimings {
         if worked < TIER2_WORK_LOG_THRESHOLD {
             return;
         }
-        let key = crate::search_index::artifact_cache_key(project_root);
+        let key = crate::search_index::artifact_cache_key_for_build(project_root);
         crate::slog_info!("{}", self.render(category, project_root, &key));
     }
 
@@ -5051,7 +5051,7 @@ thread_local! {
 }
 
 fn log_tier2_benchmark_category_start(job: &InspectJob) {
-    let key = crate::search_index::artifact_cache_key(&job.project_root);
+    let key = crate::search_index::artifact_cache_key_for_build(&job.project_root);
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Tier2,
         &job.project_root,
