@@ -245,6 +245,15 @@ pub(crate) fn resolve_standing_root_in_storage(
     storage: &Path,
     persist: bool,
 ) -> Result<ResolvedStandingRoot, ScopedKeyError> {
+    resolve_standing_root_with_recheck(literal_path, storage, persist, true)
+}
+
+pub(crate) fn resolve_standing_root_with_recheck(
+    literal_path: &str,
+    storage: &Path,
+    persist: bool,
+    force: bool,
+) -> Result<ResolvedStandingRoot, ScopedKeyError> {
     let home = crate::environment::non_empty_os_var("HOME")
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
@@ -259,13 +268,14 @@ pub(crate) fn resolve_standing_root_in_storage(
         detail: error.to_string(),
     })?;
     let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
-    let identity = crate::search_index::resolve_root_identity(
+    let identity = crate::search_index::resolve_root_identity_with_recheck(
         &target,
         &target,
         storage,
         None,
         &mut timings,
         persist,
+        force,
     )
     .map_err(|error| ScopedKeyError::GitProbe {
         path: target.clone(),

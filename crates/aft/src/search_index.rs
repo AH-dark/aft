@@ -7080,7 +7080,31 @@ pub(crate) fn resolve_root_identity(
     timings: &mut ArtifactCacheKeyTimings,
     persist: bool,
 ) -> Result<crate::root_identity::Identity, ArtifactCacheKeyProbeError> {
-    let choose = |pinned_path: bool| -> std::io::Result<crate::root_identity::Identity> {
+    resolve_root_identity_with_recheck(
+        probe_root,
+        memo_root,
+        storage_root,
+        git_common_dir,
+        timings,
+        persist,
+        true,
+    )
+}
+
+/// `force` distinguishes a real bind from background standing reconciliation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_root_identity_with_recheck(
+    probe_root: &Path,
+    memo_root: &Path,
+    storage_root: &Path,
+    git_common_dir: Option<&Path>,
+    timings: &mut ArtifactCacheKeyTimings,
+    persist: bool,
+    force: bool,
+) -> Result<crate::root_identity::Identity, ArtifactCacheKeyProbeError> {
+    let mut choose = |pinned_path: bool,
+                      saved: Option<&crate::root_identity::Identity>|
+     -> std::io::Result<crate::root_identity::Identity> {
         use crate::root_identity::Identity;
         let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
         let canonical_key =
@@ -7135,12 +7159,13 @@ pub(crate) fn resolve_root_identity(
                 None => Ok(Identity::Path),
             };
         }
-        let marker = if crate::root_identity::nearest_git_marker(probe_root)?.is_some() {
-            GitMarkerState::Present
-        } else {
-            root_git_marker_state(probe_root, git_common_dir)
+        let marker = match crate::root_identity::nearest_git_marker(probe_root) {
+            Ok(Some(_)) => GitMarkerState::Present,
+            Ok(None) => root_git_marker_state(probe_root, git_common_dir),
+            Err(_) if saved.is_some() => return Ok(saved.unwrap().clone()),
+            Err(error) => return Err(error),
         };
-        if marker == GitMarkerState::Absent && memo.is_none() {
+        if marker == GitMarkerState::Absent && memo.is_none() && saved.is_none() {
             return Ok(Identity::Path);
         }
         match repo_root_commit_with_retry_profiled(probe_root, timings) {
@@ -7164,6 +7189,7 @@ pub(crate) fn resolve_root_identity(
             // A verified non-repository or unborn replacement must not inherit
             // the committed repository identity retained in an older memo.
             RootCommitResolution::NotARepo => Ok(Identity::Path),
+            RootCommitResolution::Failed(_) if saved.is_some() => Ok(saved.unwrap().clone()),
             RootCommitResolution::Failed(_) if memo.is_some() => {
                 Identity::git(probe_root, memo.unwrap().git_root_commit)
             }
@@ -7174,11 +7200,17 @@ pub(crate) fn resolve_root_identity(
         }
     };
     let result = if persist {
-        crate::root_identity::bind(probe_root, storage_root, choose)
+        if force {
+            crate::root_identity::bind(probe_root, storage_root, choose)
+        } else {
+            crate::root_identity::bind_with_recheck(probe_root, storage_root, false, choose)
+        }
     } else {
         match crate::root_identity::read(probe_root, storage_root) {
             Ok(Some(identity)) => Ok(identity),
-            Ok(None) => crate::root_identity::select(probe_root, storage_root, choose),
+            Ok(None) => crate::root_identity::select(probe_root, storage_root, |pinned| {
+                choose(pinned, None)
+            }),
             Err(error) => Err(error),
         }
     };
@@ -7906,6 +7938,51 @@ fn cached_root_commit(project_root: &Path, stamp: &RootCommitStamp) -> Option<St
         .get(project_root)
         .filter(|(cached, _)| cached == stamp)
         .map(|(_, commit)| commit.clone())
+}
+
+/// Cache only the digest, not Git configuration contents. Background identity
+/// checks watch directory/HEAD inode and time metadata as well as history inputs.
+pub(crate) fn repository_identity_stamp(root: &Path) -> String {
+    let marker = crate::root_identity::nearest_git_marker(root)
+        .map(|directory| directory.map(|directory| directory.join(".git")));
+    let mut paths = Vec::new();
+    if let Ok(Some(marker)) = &marker {
+        paths.push(marker.clone());
+        let git_dir = if fs::metadata(marker).is_ok_and(|metadata| metadata.is_dir()) {
+            marker.clone()
+        } else {
+            fs::read_to_string(marker)
+                .ok()
+                .and_then(|text| {
+                    text.trim_end_matches(['\r', '\n'])
+                        .strip_prefix("gitdir:")
+                        .map(|pointer| marker.parent().unwrap().join(pointer.trim_start()))
+                })
+                .unwrap_or_else(|| marker.clone())
+        };
+        let git_dir = crate::root_identity::canonical_root(&git_dir);
+        if !paths.contains(&git_dir) {
+            paths.push(git_dir.clone());
+        }
+        paths.push(crate::root_identity::canonical_root(&git_dir.join("HEAD")));
+        paths.push(git_dir.join("commondir"));
+        if let Ok(common) = fs::read_to_string(git_dir.join("commondir")) {
+            paths.push(crate::root_identity::canonical_root(
+                &git_dir.join(common.trim_end_matches(['\r', '\n'])),
+            ));
+        }
+    }
+    let watched: Vec<_> = paths
+        .iter()
+        .map(|path| (path, RootCommitFileIdentity::of(path, true)))
+        .collect();
+    let git_env: BTreeMap<_, _> = std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_some_and(|name| name.starts_with("GIT_")))
+        .collect();
+    let history = RootCommitStamp::capture(root);
+    blake3::hash(format!("{marker:?}|{watched:?}|{history:?}|{git_env:?}").as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 /// The repository state that decides `git rev-list --max-parents=0 HEAD`.
@@ -13347,6 +13424,148 @@ mod tests {
                 },
             );
         });
+    }
+
+    #[test]
+    fn saved_identity_survives_uncertain_probe_after_legacy_memo_pruning() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        assert!(crate::developer_tools::git_usable());
+        let directory = tempfile::tempdir().unwrap();
+        let root = git_like_root(&directory, "repository");
+        let storage = directory.path().join("storage");
+        let saved = {
+            let _probe = force_git_root_commit_probe_commits_for_test(BTreeMap::from([(
+                root.clone(),
+                "b".repeat(40),
+            )]));
+            artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap()
+        };
+        assert!(matches!(
+            crate::root_identity::read(&root, &storage).unwrap(),
+            Some(crate::root_identity::Identity::Git { .. })
+        ));
+        fs::remove_file(storage.join(ARTIFACT_CACHE_KEY_MEMO_FILE)).unwrap();
+        artifact_cache_key_memo_state()
+            .lock()
+            .unwrap()
+            .by_storage_root
+            .remove(&storage);
+        let _probe = force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root.clone()],
+            "temporary Git probe failure",
+        );
+        assert_eq!(
+            artifact_cache_key_with_memo(&root, &root, &storage, None).unwrap(),
+            saved,
+            "an uncertain probe must keep the saved identity without a legacy memo"
+        );
+        assert!(!storage.join(ARTIFACT_CACHE_KEY_MEMO_FILE).exists());
+    }
+
+    #[test]
+    fn unchanged_standing_passes_skip_git_identity_probes() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        assert!(crate::developer_tools::git_usable());
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/root_identity_upgrade/cases.json"
+        ))
+        .unwrap();
+        for linked in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let repository = directory.path().join("repository");
+            fs::create_dir(&repository).unwrap();
+            fs::write(repository.join("lib.rs"), "pub fn standing_fixture() {}\n").unwrap();
+            upgrade_fixture_git(&repository, &["init", "-q"], &fixture["commit"]);
+            upgrade_fixture_git(&repository, &["add", "."], &fixture["commit"]);
+            upgrade_fixture_git(
+                &repository,
+                &["commit", "-q", "-m", "standing fixture"],
+                &fixture["commit"],
+            );
+            let root = if linked {
+                let worktree = directory.path().join("worktree");
+                upgrade_fixture_git(
+                    &repository,
+                    &[
+                        "worktree",
+                        "add",
+                        "--detach",
+                        worktree.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                    &fixture["commit"],
+                );
+                worktree
+            } else {
+                repository
+            };
+            let root = fs::canonicalize(root).unwrap();
+            let config = crate::config::Config {
+                storage_dir: Some(directory.path().join("storage")),
+                index: crate::config::IndexConfig {
+                    roots: vec![crate::config::IndexRootConfig {
+                        path: root.display().to_string(),
+                        indexes: vec![crate::config::IndexKind::Search],
+                    }],
+                },
+                ..crate::config::Config::default()
+            };
+            let standing = crate::standing_roots::StandingRoots::default();
+            standing.reconcile(&config).unwrap();
+            assert!(
+                matches!(
+                    crate::root_identity::read(&root, config.storage_dir.as_deref().unwrap())
+                        .unwrap(),
+                    Some(crate::root_identity::Identity::Git { .. })
+                ),
+                "fixture must record a Git identity (linked: {linked})"
+            );
+            let first = root_commit_git_runs_for_test(&root);
+            assert!(
+                first > 0,
+                "the counter must observe the initial real Git probe"
+            );
+            for _ in 0..8 {
+                standing.reconcile_background(&config).unwrap();
+            }
+            assert_eq!(
+                root_commit_git_runs_for_test(&root) - first,
+                0,
+                "unchanged standing roots must not spawn Git (linked: {linked})"
+            );
+            let output = upgrade_fixture_git(
+                &root,
+                &["rev-parse", "--git-path", "HEAD"],
+                &fixture["commit"],
+            );
+            let head = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+            let head = if head.is_absolute() {
+                head
+            } else {
+                root.join(head)
+            };
+            let before_head_change = repository_identity_stamp(&root);
+            filetime::set_file_mtime(head, filetime::FileTime::from_unix_time(60, 0)).unwrap();
+            assert_ne!(
+                repository_identity_stamp(&root),
+                before_head_change,
+                "HEAD mtime must change repository evidence (linked: {linked})"
+            );
+            standing.reconcile_background(&config).unwrap();
+            assert_eq!(
+                root_commit_git_runs_for_test(&root) - first,
+                1,
+                "a changed HEAD stamp must recheck Git"
+            );
+            standing.reconcile_background(&config).unwrap();
+            assert_eq!(root_commit_git_runs_for_test(&root) - first, 1);
+            standing.reconcile(&config).unwrap();
+            assert_eq!(
+                root_commit_git_runs_for_test(&root) - first,
+                2,
+                "a real bind must still verify Git"
+            );
+        }
     }
 
     #[test]

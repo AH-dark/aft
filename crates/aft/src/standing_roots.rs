@@ -288,12 +288,28 @@ impl ArtifactLifecycle {
 }
 
 impl StandingRoots {
+    /// Idle passes retain verified identity until repository evidence changes.
+    pub(crate) fn reconcile_background(
+        &self,
+        config: &Config,
+    ) -> Result<StandingReconcileReport, StandingRootsError> {
+        self.reconcile_with_recheck(config, false)
+    }
+
     /// Reconcile one validated user-tier configuration snapshot. A configuration
     /// replacement revokes stale admissions before any obsolete worker can
     /// publish; new kinds remain durably strict until their own verification.
     pub fn reconcile(
         &self,
         config: &Config,
+    ) -> Result<StandingReconcileReport, StandingRootsError> {
+        self.reconcile_with_recheck(config, true)
+    }
+
+    fn reconcile_with_recheck(
+        &self,
+        config: &Config,
+        force: bool,
     ) -> Result<StandingReconcileReport, StandingRootsError> {
         let configured_db_path =
             crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
@@ -346,7 +362,7 @@ impl StandingRoots {
         };
         // Validate the storage namespace before persisting first-bind identities.
         // A failed namespace switch must not inherit an earlier empty fast path.
-        let entries = resolve_entries(config)?;
+        let entries = resolve_entries(config, force)?;
         #[cfg(test)]
         conn.trace(Some(|sql| {
             if sql == "BEGIN IMMEDIATE" {
@@ -695,19 +711,23 @@ pub(crate) fn reconciliation_work_for_test() -> [i64; 6] {
 fn counted_resolve_standing_root(
     path: &str,
     storage: &Path,
+    force: bool,
 ) -> Result<ResolvedStandingRoot, crate::scoped_key::ScopedKeyError> {
     #[cfg(test)]
     ROOT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-    crate::scoped_key::resolve_standing_root_in_storage(path, storage, true)
+    crate::scoped_key::resolve_standing_root_with_recheck(path, storage, true, force)
 }
 
-fn resolve_entries(config: &Config) -> Result<Vec<StandingRootEntry>, StandingRootsError> {
+fn resolve_entries(
+    config: &Config,
+    force: bool,
+) -> Result<Vec<StandingRootEntry>, StandingRootsError> {
     let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
     let resolved = config
         .index
         .roots
         .iter()
-        .map(|root| counted_resolve_standing_root(&root.path, &storage))
+        .map(|root| counted_resolve_standing_root(&root.path, &storage, force))
         .collect::<Result<Vec<ResolvedStandingRoot>, _>>()?;
     reject_duplicate_artifact_keys(&resolved)?;
     Ok(config

@@ -22,6 +22,9 @@ struct Record {
     version: u32,
     root: PathBuf,
     identity: Identity,
+    // A background-verification hint, not evidence for changing the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe_stamp: Option<String>,
 }
 
 pub(crate) fn canonical_root(root: &Path) -> PathBuf {
@@ -34,6 +37,10 @@ fn record_path(root: &Path, storage: &Path) -> PathBuf {
 }
 
 pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> {
+    Ok(read_record(root, storage)?.map(|record| record.identity))
+}
+
+fn read_record(root: &Path, storage: &Path) -> io::Result<Option<Record>> {
     let root = canonical_root(root);
     let path = record_path(&root, storage);
     let bytes = match std::fs::read(&path) {
@@ -48,7 +55,7 @@ pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> 
         ));
     }
     record.identity.validate(&root)?;
-    Ok(Some(record.identity))
+    Ok(Some(record))
 }
 
 /// Serialize the first choice across processes and aliases. A corrupt record
@@ -56,12 +63,22 @@ pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> 
 pub(crate) fn bind(
     root: &Path,
     storage: &Path,
-    choose: impl FnOnce(bool) -> io::Result<Identity>,
+    choose: impl FnOnce(bool, Option<&Identity>) -> io::Result<Identity>,
+) -> io::Result<Identity> {
+    bind_with_recheck(root, storage, true, choose)
+}
+
+/// Real binds force verification; background passes may reuse an observed stamp.
+pub(crate) fn bind_with_recheck(
+    root: &Path,
+    storage: &Path,
+    force: bool,
+    choose: impl FnOnce(bool, Option<&Identity>) -> io::Result<Identity>,
 ) -> io::Result<Identity> {
     let root = canonical_root(root);
-    if let Some(identity) = read(&root, storage)? {
-        if matches!(&identity, Identity::Path) || !crate::developer_tools::git_usable() {
-            return Ok(identity);
+    if let Some(record) = read_record(&root, storage)? {
+        if reusable(&record, &root, force) {
+            return Ok(record.identity);
         }
     }
     let path = record_path(&root, storage);
@@ -78,23 +95,36 @@ pub(crate) fn bind(
     }
     let lock = options.open(lock_path)?;
     lock.lock()?;
-    let previous = read(&root, storage)?;
-    if let Some(identity) = &previous {
-        if matches!(identity, Identity::Path) || !crate::developer_tools::git_usable() {
-            return Ok(identity.clone());
+    let previous = read_record(&root, storage)?;
+    if let Some(record) = &previous {
+        if reusable(record, &root, force) {
+            return Ok(record.identity.clone());
         }
     }
     // With Git available, resolve again under the record lock: a different
     // repository can replace a checkout without changing its canonical path.
-    let identity = select(&root, storage, choose)?;
+    let before = crate::developer_tools::git_usable()
+        .then(|| crate::search_index::repository_identity_stamp(&root));
+    let identity = select(&root, storage, |pinned| {
+        choose(pinned, previous.as_ref().map(|record| &record.identity))
+    })?;
     identity.validate(&root)?;
-    if previous.as_ref() == Some(&identity) {
+    let probe_stamp = if matches!(&identity, Identity::Git { .. }) {
+        before.filter(|stamp| stamp == &crate::search_index::repository_identity_stamp(&root))
+    } else {
+        None
+    };
+    if previous
+        .as_ref()
+        .is_some_and(|record| record.identity == identity && record.probe_stamp == probe_stamp)
+    {
         return Ok(identity);
     }
     let bytes = serde_json::to_vec(&Record {
         version: 1,
         root,
         identity: identity.clone(),
+        probe_stamp,
     })
     .map_err(io::Error::other)?;
     crate::production_storage::refuse_write(&path)?;
@@ -104,6 +134,14 @@ pub(crate) fn bind(
         crate::durability::AtomicWriteDurability::FileAndDirectory,
     )?;
     Ok(identity)
+}
+
+fn reusable(record: &Record, root: &Path, force: bool) -> bool {
+    matches!(&record.identity, Identity::Path)
+        || !crate::developer_tools::git_usable()
+        || (!force
+            && record.probe_stamp.as_ref()
+                == Some(&crate::search_index::repository_identity_stamp(root)))
 }
 
 /// Older standing entries already pin an identity even before this record
@@ -300,7 +338,7 @@ mod tests {
                     start.wait();
                     // Without Git, both contenders must reuse the first choice.
                     crate::developer_tools::with_git_usable_for_test(false, || {
-                        bind(root, storage, |_| {
+                        bind(root, storage, |_, _| {
                             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             Ok(choice)
                         })
@@ -323,13 +361,13 @@ mod tests {
     fn corrupt_identity_is_refused_without_replacement() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        bind(root.path(), storage.path(), |_| {
+        bind(root.path(), storage.path(), |_, _| {
             Identity::git(root.path(), "a".repeat(40))
         })
         .unwrap();
         let path = record_path(&canonical_root(root.path()), storage.path());
         std::fs::write(&path, b"broken identity").unwrap();
-        assert!(bind(root.path(), storage.path(), |_| panic!(
+        assert!(bind(root.path(), storage.path(), |_, _| panic!(
             "a corrupt repository record must not select a new identity"
         ))
         .is_err());
@@ -360,8 +398,8 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink(&root, &alias).unwrap();
         let storage = directory.path().join("storage");
-        let first = bind(&root, &storage, |_| Ok(Identity::Path)).unwrap();
-        let second = bind(&alias, &storage, |_| {
+        let first = bind(&root, &storage, |_, _| Ok(Identity::Path)).unwrap();
+        let second = bind(&alias, &storage, |_, _| {
             panic!("alias must not choose another identity")
         })
         .unwrap();

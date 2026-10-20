@@ -321,7 +321,7 @@ impl StandingActor {
         if !snapshot.index.roots.is_empty() {
             self.handoff_required.store(true, Ordering::Release);
         }
-        let report = match self.roots.reconcile(&snapshot) {
+        let report = match self.roots.reconcile_background(&snapshot) {
             Ok(report) => report,
             Err(error) => {
                 self.record_reconciliation_failure(&snapshot, &error.to_string(), now);
