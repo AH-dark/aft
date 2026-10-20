@@ -5,12 +5,16 @@
 
 use rustc_demangle::try_demangle;
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::Read;
 // The atos stdin write happens only on macOS.
 #[cfg(target_os = "macos")]
@@ -135,7 +139,6 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
     }
 
     let target = resolve_target(args.pid)?;
-    let target_report = inspect_target(&target)?;
     let captured = capture_sample(target.pid, args.seconds)?;
     let mut threads = captured.threads;
     if threads.is_empty() {
@@ -144,6 +147,23 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
             captured.sampler, target.pid
         )));
     }
+    let target_report = match inspect_target(&target, &captured.raw) {
+        Ok(report) => report,
+        Err(error) => {
+            let kept = preserve_raw_sample(target.pid, &captured.raw);
+            return Err(ProfileError::runtime(match kept {
+                Ok(path) => format!(
+                    "{error}; the unsymbolicated sample was kept at {}",
+                    path.display()
+                ),
+                Err(keep_error) => {
+                    format!(
+                        "{error}; the unsymbolicated sample could not be kept either: {keep_error}"
+                    )
+                }
+            }));
+        }
+    };
 
     // Symbolization needs a debug artifact that may have to be fetched. If that
     // step fails, the captured sample is still the evidence the operator came
@@ -824,11 +844,24 @@ fn is_aft_subc_process(args: &str) -> bool {
 fn process_image(pid: u32) -> Result<PathBuf, ProfileError> {
     #[cfg(target_os = "linux")]
     {
-        return fs::read_link(format!("/proc/{pid}/exe")).map_err(|error| {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let image = fs::read_link(format!("/proc/{pid}/exe")).map_err(|error| {
             ProfileError::runtime(format!(
                 "could not resolve executable for pid {pid}: {error}"
             ))
-        });
+        })?;
+        // Linux appends this marker after an executable is unlinked. If the
+        // executable's original path now exists, use it for disk inspection.
+        if fs::metadata(&image).is_err() {
+            if let Some(path) = image.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+                let current_path = PathBuf::from(OsString::from_vec(path.to_vec()));
+                if fs::metadata(&current_path).is_ok() {
+                    return Ok(current_path);
+                }
+            }
+        }
+        return Ok(image);
     }
     #[cfg(target_os = "macos")]
     {
@@ -858,11 +891,40 @@ struct TargetReport {
     version: String,
     #[serde(rename = "uuid_or_build_id")]
     debug_id: String,
+    image_on_disk_differs: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_on_disk_debug_id: Option<String>,
 }
 
-fn inspect_target(target: &Target) -> Result<TargetReport, ProfileError> {
-    let version_output = command_text(Command::new(&target.image).arg("--version"))?;
-    let version = version_output
+#[derive(Debug)]
+struct TargetDebugIds {
+    loaded: String,
+    image_on_disk_differs: bool,
+    image_on_disk: Option<String>,
+}
+
+fn select_debug_ids(
+    loaded: &str,
+    image_on_disk: Option<&str>,
+    inode_differs: bool,
+) -> TargetDebugIds {
+    let differs =
+        inode_differs || image_on_disk.is_some_and(|disk| !disk.eq_ignore_ascii_case(loaded));
+    TargetDebugIds {
+        loaded: loaded.to_string(),
+        image_on_disk_differs: differs,
+        image_on_disk: if differs {
+            image_on_disk.map(str::to_string)
+        } else {
+            None
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn binary_version(path: &Path) -> Result<String, ProfileError> {
+    let version_output = command_text(Command::new(path).arg("--version"))?;
+    Ok(version_output
         .split_whitespace()
         .find(|part| {
             part.chars()
@@ -871,17 +933,90 @@ fn inspect_target(target: &Target) -> Result<TargetReport, ProfileError> {
         })
         .unwrap_or("unknown")
         .trim()
-        .to_string();
-    let debug_id = binary_debug_id(&target.image)?;
+        .to_string())
+}
+
+fn inspect_target(target: &Target, sample: &str) -> Result<TargetReport, ProfileError> {
+    #[cfg(target_os = "linux")]
+    let (_loaded_image, loaded_debug_id, disk_debug_id, inode_differs) = {
+        use std::os::unix::fs::MetadataExt;
+
+        let _ = sample;
+        let loaded_image = PathBuf::from(format!("/proc/{}/exe", target.pid));
+        let loaded_debug_id = binary_debug_id(&loaded_image)?;
+        let disk_debug_id = binary_debug_id(&target.image).ok();
+        let inode_differs = match (fs::metadata(&loaded_image), fs::metadata(&target.image)) {
+            (Ok(loaded), Ok(disk)) => loaded.dev() != disk.dev() || loaded.ino() != disk.ino(),
+            _ => false,
+        };
+        (
+            Some(loaded_image),
+            loaded_debug_id,
+            disk_debug_id,
+            inode_differs,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let (_loaded_image, loaded_debug_id, disk_debug_id, inode_differs) = {
+        let loaded_debug_id =
+            parse_macos_main_image_uuid(sample, &target.image).ok_or_else(|| {
+                ProfileError::runtime(format!(
+                    "could not read loaded Mach-O UUID for {} from sample Binary Images",
+                    target.image.display()
+                ))
+            })?;
+        (
+            None::<PathBuf>,
+            loaded_debug_id,
+            binary_debug_id(&target.image).ok(),
+            false,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let (loaded_image, loaded_debug_id, disk_debug_id, inode_differs): (
+        Option<PathBuf>,
+        String,
+        Option<String>,
+        bool,
+    ) = {
+        let _ = (target, sample);
+        return Err(ProfileError::runtime(
+            "aft profile unavailable: loaded image inspection is not implemented on this platform",
+        ));
+    };
+
+    let debug_ids = select_debug_ids(&loaded_debug_id, disk_debug_id.as_deref(), inode_differs);
+    #[cfg(target_os = "linux")]
+    let (sha256, version) = {
+        let image = _loaded_image
+            .as_deref()
+            .expect("Linux loaded image path exists");
+        (
+            file_sha256(image).unwrap_or_else(|_| "unknown".to_string()),
+            binary_version(image).unwrap_or_else(|_| "unknown".to_string()),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let (sha256, version) = {
+        // `sample` exposes the loaded Mach-O UUID, but not its bytes. The file at
+        // `target.image` may have changed since launch, so its hash and version
+        // could describe a different executable.
+        ("unknown".to_string(), "unknown".to_string())
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let (sha256, version) = ("unknown".to_string(), "unknown".to_string());
     Ok(TargetReport {
         pid: target.pid,
         image: target.image.display().to_string(),
-        sha256: file_sha256(&target.image)?,
+        sha256,
         version,
-        debug_id,
+        debug_id: debug_ids.loaded,
+        image_on_disk_differs: debug_ids.image_on_disk_differs,
+        image_on_disk_debug_id: debug_ids.image_on_disk,
     })
 }
 
+#[cfg(target_os = "linux")]
 fn file_sha256(path: &Path) -> Result<String, ProfileError> {
     let mut file = File::open(path).map_err(|error| {
         ProfileError::runtime(format!("could not read {}: {error}", path.display()))
@@ -929,6 +1064,35 @@ fn binary_debug_id(path: &Path) -> Result<String, ProfileError> {
             path.display()
         )))
     }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_macos_main_image_uuid(sample: &str, image: &Path) -> Option<String> {
+    let image_name = image.file_name()?.to_string_lossy();
+    let image_path = image.to_string_lossy();
+    let mut in_binary_images = false;
+    let mut basename_uuid = None;
+    for line in sample.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Binary Images:") {
+            in_binary_images = true;
+            continue;
+        }
+        if !in_binary_images || trimmed.starts_with("Total number") {
+            continue;
+        }
+        let uuid = trimmed
+            .split_once('<')
+            .and_then(|(_, tail)| tail.split_once('>'))
+            .map(|(uuid, _)| normalize_debug_id(uuid));
+        if trimmed.contains(image_path.as_ref()) {
+            return uuid;
+        }
+        if trimmed.contains(image_name.as_ref()) && basename_uuid.is_none() {
+            basename_uuid = uuid;
+        }
+    }
+    basename_uuid
 }
 
 // Only the macOS arm of `binary_debug_id` reads `dwarfdump --uuid` output.
@@ -2474,6 +2638,8 @@ mod tests {
             sha256: "deadbeef".to_string(),
             version: "0.55.1".to_string(),
             debug_id: "ABC".to_string(),
+            image_on_disk_differs: false,
+            image_on_disk_debug_id: None,
         };
         assert!(threads.iter().all(|thread| {
             leaf_paths(thread)
@@ -2499,6 +2665,46 @@ mod tests {
             .unwrap();
         assert_eq!(log_writer.running_samples, 0);
         assert_eq!(parked.running_samples, 0);
+    }
+
+    #[test]
+    fn profile_uses_loaded_uuid_and_reports_replaced_disk_image() {
+        let loaded_uuid = "11111111-2222-3333-4444-555555555555";
+        let disk_uuid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let debug_ids = select_debug_ids(loaded_uuid, Some(disk_uuid), false);
+        assert_eq!(debug_ids.loaded, loaded_uuid);
+        assert!(debug_ids.image_on_disk_differs);
+        assert_eq!(debug_ids.image_on_disk.as_deref(), Some(disk_uuid));
+
+        let same_uuid_on_replaced_inode = select_debug_ids(loaded_uuid, Some(loaded_uuid), true);
+        assert!(same_uuid_on_replaced_inode.image_on_disk_differs);
+        assert_eq!(
+            same_uuid_on_replaced_inode.image_on_disk.as_deref(),
+            Some(loaded_uuid)
+        );
+
+        let report = TargetReport {
+            pid: 17,
+            image: "/opt/aft/daemon".to_string(),
+            sha256: "unknown".to_string(),
+            version: "unknown".to_string(),
+            debug_id: debug_ids.loaded,
+            image_on_disk_differs: debug_ids.image_on_disk_differs,
+            image_on_disk_debug_id: debug_ids.image_on_disk,
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["uuid_or_build_id"], loaded_uuid);
+        assert_eq!(json["image_on_disk_differs"], true);
+        assert_eq!(json["image_on_disk_debug_id"], disk_uuid);
+    }
+
+    #[test]
+    fn parses_loaded_macos_image_uuid_from_binary_images() {
+        let sample = "Binary Images:\n  0x1000 - 0x2000 + aft (arm64) <11111111-2222-3333-4444-555555555555> /opt/aft/daemon\n";
+        assert_eq!(
+            parse_macos_main_image_uuid(sample, Path::new("/opt/aft/daemon")),
+            Some("11111111222233334444555555555555".to_string())
+        );
     }
 
     #[test]
@@ -2550,6 +2756,8 @@ mod tests {
             sha256: "test".to_string(),
             version: "test".to_string(),
             debug_id: "test".to_string(),
+            image_on_disk_differs: false,
+            image_on_disk_debug_id: None,
         };
         let profile = build_report(target, "test".to_string(), vec![inconsistent]);
         assert!(profile.top_symbols.is_empty());
