@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "Batch E: hashline keeps file mode and refuses temp symlinks; aft_safety purge (#603); read/outline/zoom at a git revision behind revision_reads (#602); cargo test totals, edit already-applied hint, capped zoom call-graph lists (#605); duplicate running-command warning and user-tier bash.env (#607, #610). Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
