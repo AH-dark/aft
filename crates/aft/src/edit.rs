@@ -13,11 +13,14 @@ use crate::error::AftError;
 use crate::format;
 use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser};
 
+#[cfg(windows)]
+mod windows_replace;
+
 /// How [`atomic_write_source`] stored the new bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceWriteMode {
-    /// A synced sibling file replaced the target (by rename, or on Windows by
-    /// `ReplaceFileW`), or created it.
+    /// A synced sibling file replaced the target by rename or `ReplaceFileW`,
+    /// or created it.
     Replaced,
     /// The existing file was rewritten and synced in place, because a
     /// replacement file could not be created or could not keep its hard links,
@@ -46,9 +49,9 @@ pub(crate) struct SourceWriteOutcome {
 ///   were copied onto the replacement and read back equal (on Linux the ACL
 ///   is an extended attribute; on macOS it is copied by `fcopyfile` and read
 ///   back with `acl_get_fd_np`);
-/// - on Windows, a single-link file replaced through `ReplaceFileW`, which
-///   keeps the replaced file's security descriptor, attributes and identity;
-///   the temporary gets the file's own protected DACL before any content is
+/// - on Windows, a single-link file replaced by POSIX rename when its owner,
+///   streams and metadata permit it, or by `ReplaceFileW` otherwise. The
+///   temporary gets the file's own protected DACL before any content is
 ///   written, so it is never readable by more users than the file.
 ///
 /// Any other existing file is rewritten in place, as editors do when a
@@ -336,7 +339,7 @@ mod source_replacement {
     /// one hard link would be split from its other names.
     #[cfg(windows)]
     pub(super) fn may_keep_access(destination: &Path, metadata: &Metadata) -> bool {
-        metadata.is_file() && windows::link_count(destination) == Some(1)
+        metadata.is_file() && super::windows_replace::link_count(destination) == Some(1)
     }
 
     /// Other platforms offer no checked way to copy ACLs, so a replacement
@@ -422,8 +425,8 @@ mod source_replacement {
         false
     }
 
-    /// Replace `destination` with the synced `replacement` through
-    /// `ReplaceFileW`. Returns `Ok(false)` when it could not, after making
+    /// Replace `destination` with the synced `replacement` through a guarded
+    /// POSIX rename or `ReplaceFileW`. Returns `Ok(false)` when it could not, after making
     /// sure the original is back under its own name, so the caller can
     /// rewrite the file in place instead.
     #[cfg(windows)]
@@ -432,79 +435,7 @@ mod source_replacement {
         replacement: &Path,
         parent: &Path,
     ) -> std::io::Result<bool> {
-        windows::replace(destination, replacement, parent)
-    }
-
-    #[cfg(windows)]
-    mod windows {
-        use std::io;
-        use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::io::AsRawHandle;
-        use std::path::Path;
-        use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, ReplaceFileW, BY_HANDLE_FILE_INFORMATION,
-        };
-
-        fn wide(path: &Path) -> Vec<u16> {
-            path.as_os_str().encode_wide().chain(Some(0)).collect()
-        }
-
-        /// Number of hard links to the file, or `None` when it cannot be read.
-        pub(super) fn link_count(path: &Path) -> Option<u32> {
-            let file = std::fs::File::open(path).ok()?;
-            // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value.
-            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: the handle is open for the call and `info` is writable.
-            let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
-            (ok != 0).then_some(info.nNumberOfLinks)
-        }
-
-        pub(super) fn replace(
-            destination: &Path,
-            replacement: &Path,
-            parent: &Path,
-        ) -> io::Result<bool> {
-            // With a backup name, every documented failure leaves the original
-            // either under its own name or under the backup name, never gone.
-            let backup = parent.join(format!(
-                ".aft-source-{}.bak",
-                super::super::random_suffix()?
-            ));
-            let (destination_w, replacement_w, backup_w) =
-                (wide(destination), wide(replacement), wide(&backup));
-            // SAFETY: all three paths are NUL-terminated and outlive the call;
-            // the two reserved pointers must be null.
-            let ok = unsafe {
-                ReplaceFileW(
-                    destination_w.as_ptr(),
-                    replacement_w.as_ptr(),
-                    backup_w.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            };
-            if ok != 0 {
-                let _ = std::fs::remove_file(&backup);
-                return Ok(true);
-            }
-            let error = io::Error::last_os_error();
-            if !destination.exists() && backup.exists() {
-                if let Err(restore) = std::fs::rename(&backup, destination) {
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!(
-                            "replacing {} failed ({error}) and moving its original back also failed ({restore}); the original bytes are in {}",
-                            destination.display(),
-                            backup.display()
-                        ),
-                    ));
-                }
-            } else if destination.exists() {
-                let _ = std::fs::remove_file(&backup);
-            }
-            Ok(false)
-        }
+        super::windows_replace::replace(destination, replacement, parent)
     }
 
     /// Extended attributes read and written through open file descriptors.
@@ -852,6 +783,13 @@ mod windows_dacl {
             std::slice::from_raw_parts(acl.cast::<u8>(), size).to_vec()
         };
         Ok(Some(bytes))
+    }
+
+    pub(super) fn matches(source: &Path, target: &Path) -> io::Result<bool> {
+        Ok(
+            dacl_bytes(&mut dacl_descriptor(source)?)?
+                == dacl_bytes(&mut dacl_descriptor(target)?)?,
+        )
     }
 
     /// Give `target` the DACL of `source`, protected from inheritance, then
