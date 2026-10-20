@@ -24,6 +24,7 @@ fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteI
         call_mode: subc_protocol::call_mode::CallMode::Classic,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }))
 }
 fn context(root: &Path, storage: &Path) -> AppContext {

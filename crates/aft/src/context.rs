@@ -8153,6 +8153,17 @@ impl AppContext {
                 let _ = gate.installed.send(report.generation.clone().unwrap());
             }
         }
+        if report.published
+            && self.config().indexes.callgraph
+            && self
+                .inspect_manager
+                .note_view_publication(&self.canonical_cache_root())
+        {
+            // Only analysis that deferred for this view needs another pass.
+            // Retain its pull demand even while that scan is still in flight;
+            // ordinary publications must not start unsolicited analysis.
+            let _ = self.request_tier2_refresh_pull();
+        }
         Ok(report)
     }
 
@@ -10469,6 +10480,15 @@ impl AppContext {
         changed_path_count: usize,
     ) -> Option<Tier2TriggerReason> {
         let manager = self.inspect_manager();
+        // A pending result can arrive after the publication callback already
+        // ran. Epoch comparison recovers only that owed refresh, without probing
+        // the filesystem or waking roots with no deferred analysis.
+        if self
+            .canonical_cache_root_opt()
+            .is_some_and(|root| manager.deferred_view_refresh_ready(&root))
+        {
+            let _ = self.request_tier2_refresh_pull();
+        }
         let can_write = self.inspect_writer()
             && self.heavy_root_work_allowed()
             && manager.automatic_tier2_refresh_allowed();
@@ -10551,9 +10571,18 @@ impl AppContext {
         else {
             return false;
         };
+        // A late pending result may owe a published view before the scheduler
+        // knows about it. Include it in the idle probe, or no watcher drain
+        // would be scheduled to run the recovery tick on a quiet checkout.
+        let view_refresh_ready = self.canonical_cache_root_opt().is_some_and(|root| {
+            self.inspect_manager.try_deferred_view_refresh_ready(&root) == Some(true)
+        });
         self.tier2_refresh_scheduler
             .try_lock()
             .is_none_or(|mut scheduler| {
+                if view_refresh_ready {
+                    scheduler.request_pull(true);
+                }
                 scheduler.set_resource_retry_at(retry_at);
                 scheduler.dispatch_due(Instant::now())
             })
@@ -10668,7 +10697,7 @@ impl AppContext {
         }
         for wait in submission.resource_waits {
             crate::slog_info!(
-                "tier2 refresh waiting for the inspect cache writer lease: category={}, resource_retry_at_unix_ms={}",
+                "tier2 refresh waiting out a resource retry (inspect cache writer lease or locked call graph view): category={}, resource_retry_at_unix_ms={}",
                 wait.category,
                 wait.retry_at_ms
             );
@@ -11450,7 +11479,10 @@ impl AppContext {
     ) {
         let root = self.watcher_root_path();
         // Changes made while no watcher was installed were not observable.
-        crate::lsp::manager::invalidate_applicability_walk(&root);
+        crate::lsp::manager::invalidate_applicability_walk(
+            &root,
+            crate::lsp::manager::InvalidationCause::WatcherInstalled,
+        );
         let gitignore_generation = self.gitignore_generation.load(Ordering::SeqCst);
         let _runtime_guard = self.watcher_runtime_lock.lock();
         let replaced = self.watcher_thread.lock().replace(runtime);
@@ -11534,7 +11566,10 @@ impl AppContext {
         *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
         if let Some(identity) = self.watcher_runtime_identity.lock().take() {
-            crate::lsp::manager::invalidate_applicability_walk(&identity.root);
+            crate::lsp::manager::invalidate_applicability_walk(
+                &identity.root,
+                crate::lsp::manager::InvalidationCause::WatcherRemoved,
+            );
         }
         runtime
     }
@@ -11573,7 +11608,10 @@ impl AppContext {
             *self.watcher_drain_slice.lock() = None;
             *self.watcher.lock() = None;
             if let Some(identity) = self.watcher_runtime_identity.lock().take() {
-                crate::lsp::manager::invalidate_applicability_walk(&identity.root);
+                crate::lsp::manager::invalidate_applicability_walk(
+                    &identity.root,
+                    crate::lsp::manager::InvalidationCause::WatcherRemoved,
+                );
             }
             runtime
         };
@@ -12090,8 +12128,36 @@ impl AppContext {
         if paths.is_empty() {
             return;
         }
-        self.invalidate_project_applicability();
+        self.lsp_note_watcher_batch(paths, false);
         self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    /// Check the applicability cache when a watcher batch enters the drain,
+    /// before its paths are forwarded to language servers in later drain slices.
+    /// `content_only` is true only if every event for every path was a data
+    /// modification; callers with paths alone must pass false to allow creation.
+    pub(crate) fn lsp_note_watcher_batch(&self, paths: &[PathBuf], content_only: bool) {
+        let config = self.config();
+        if let Some(root) = &config.project_root {
+            if crate::lsp::manager::invalidate_applicability_batch(
+                root,
+                paths,
+                content_only,
+                &config,
+            ) {
+                self.refresh_project_applicability(config, false);
+            }
+        }
+    }
+
+    pub(crate) fn lsp_forward_classified_watcher_file_events(&self, paths: &[PathBuf]) {
+        self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    pub(crate) fn lsp_note_watcher_ignore_change(&self) {
+        self.invalidate_project_applicability(
+            crate::lsp::manager::InvalidationCause::SelectionInput,
+        );
     }
 
     /// After the file watcher lost events (an overflow that needs a rescan),
@@ -12101,14 +12167,16 @@ impl AppContext {
     /// them more than a missed notification for files AFT resyncs when it
     /// next opens or edits them.
     pub fn lsp_reload_rust_workspaces_after_lost_watcher_events(&self) {
-        self.invalidate_project_applicability();
+        self.invalidate_project_applicability(
+            crate::lsp::manager::InvalidationCause::OverflowLostEvents,
+        );
         self.lsp_forward_or_queue_watcher_changes(&[], true);
     }
 
-    fn invalidate_project_applicability(&self) {
+    fn invalidate_project_applicability(&self, cause: crate::lsp::manager::InvalidationCause) {
         let config = self.config();
         if let Some(root) = &config.project_root {
-            crate::lsp::manager::invalidate_applicability_walk(root);
+            crate::lsp::manager::invalidate_applicability_walk(root, cause);
             self.refresh_project_applicability(config, false);
         }
     }
@@ -13053,8 +13121,27 @@ impl AppContext {
         #[cfg(test)]
         confinement::note_ask();
         use crate::access_policy::{AskRoute, GrantKind};
-        let AskRoute::Consent { once } = crate::access_policy::current_ask_route() else {
-            return Ok(());
+        let once = match crate::access_policy::current_ask_route() {
+            AskRoute::Lowered => return Ok(()),
+            AskRoute::Unavailable => {
+                return Err(crate::protocol::Response::error_with_data(
+                    req_id,
+                    crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
+                    format!(
+                        "{} access to '{}' needs permission, and a codemode program can't ask for it",
+                        match operation {
+                            crate::access_policy::AccessOperation::Read => "read",
+                            crate::access_policy::AccessOperation::Write => "write",
+                        },
+                        original.display()
+                    ),
+                    serde_json::json!({
+                        "permission": operation,
+                        "resource": identity,
+                    }),
+                ));
+            }
+            AskRoute::Consent { once } => once,
         };
         if once.iter().any(|grant| grant.covers(operation, identity)) {
             return Ok(());
@@ -16130,6 +16217,88 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
+    /// An automatic dead-code refresh that finds the published graph's
+    /// database locked has nothing else to wake it: the lock clearing is not a
+    /// view publication and not a source edit. It must keep a timed retry, so
+    /// on a quiet checkout dead code refreshes by itself once the lock clears.
+    #[test]
+    fn views_busy_dead_code_refresh_retries_after_lock_clears_without_edit() {
+        use crate::inspect::{InspectCategory, InspectSnapshot, JobScope, Tier2TriggerReason};
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.ctx.set_harness(crate::harness::Harness::Opencode);
+        fixture.publish();
+        let manager = fixture.ctx.inspect_manager();
+        let config = fixture.ctx.config();
+        let wait_idle = |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while manager.tier2_any_in_flight() {
+                assert!(Instant::now() < deadline, "{what} did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            manager.drain_completions();
+        };
+
+        let busy = fixture.hold_pinned_derived_busy();
+        fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+        assert!(fixture.ctx.request_tier2_refresh_pull());
+        let dispatched_at = Instant::now();
+        assert_eq!(
+            fixture
+                .ctx
+                .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+            Some(Tier2TriggerReason::Pull)
+        );
+        wait_idle("refresh against the locked view");
+        let retry_at = manager
+            .try_tier2_resource_retry_at(&config)
+            .flatten()
+            .expect("a refresh that found the view locked must keep a timed retry");
+        assert!(
+            retry_at
+                <= dispatched_at
+                    + crate::inspect::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF
+                    + Duration::from_secs(60),
+            "the retry must fall within the resource retry bound"
+        );
+        let detail = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
+        assert!(detail.contains("call graph view"), "{detail}");
+
+        drop(busy);
+        assert!(!fixture.ctx.tier2_pull_demand_pending());
+        manager.expire_tier2_resource_waits_for_test();
+        assert!(
+            fixture.ctx.tier2_refresh_dispatch_due(),
+            "a quiet checkout must come due for the retry without an edit"
+        );
+        assert_eq!(
+            fixture
+                .ctx
+                .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+            Some(Tier2TriggerReason::ResourceRetry)
+        );
+        wait_idle("retry after the lock cleared");
+        let outcome = manager.tier2_read_cached_readonly(
+            InspectSnapshot {
+                project_root: fixture.root.clone(),
+                inspect_dir: fixture.ctx.inspect_dir(),
+                config: config.clone(),
+                symbol_cache: fixture.ctx.symbol_cache(),
+                inspect_writer: true,
+                callgraph_writer: true,
+            },
+            InspectCategory::DeadCode,
+            JobScope::for_project(fixture.root.clone()),
+        );
+        let payload = outcome.payload().expect("dead-code result after the retry");
+        assert_eq!(payload["callgraph_available"], true, "{payload:#}");
+        assert!(payload["count"].as_u64().is_some(), "{payload:#}");
+        assert_eq!(
+            manager.try_tier2_resource_retry_at(&config),
+            Some(None),
+            "a successful retry must not leave another one armed"
+        );
+    }
+
     /// Zoom's call graph field reads the same store as `callers` and must give
     /// the same verdict for a busy database: building, retry shortly. A busy
     /// open says nothing about whether the graph exists, so reporting it as
@@ -17555,6 +17724,54 @@ mod health_warming_honesty_tests {
 #[cfg(test)]
 mod configure_applicability_tests {
     use super::*;
+
+    #[test]
+    fn configure_applicability_content_batches_keep_cache_and_health_counters() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("main.py");
+        std::fs::write(&source, "print(0)").unwrap();
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        ));
+        ctx.refresh_project_applicability(Arc::new(config.clone()), false);
+        assert!(ctx.wait_for_project_applicability(Duration::from_secs(10)));
+        let spawns = ctx
+            .project_applicability_progress
+            .refresh_spawns
+            .load(Ordering::SeqCst);
+        let before = crate::lsp::manager::applicability_metrics(&root).full_walks;
+        for n in 1..=50 {
+            std::fs::write(&source, format!("print({n})")).unwrap();
+            ctx.lsp_note_watcher_batch(std::slice::from_ref(&source), true);
+            crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        }
+        assert_eq!(
+            ctx.project_applicability_progress
+                .refresh_spawns
+                .load(Ordering::SeqCst),
+            spawns
+        );
+        let census = crate::lifecycle_census::collect(&App::default(), &[ctx]);
+        let health = serde_json::to_value(census).unwrap();
+        // The census keys roots by their normalized form, which on Windows has
+        // no `\\?\` prefix; `fs::canonicalize` above returns the prefixed form.
+        let key = crate::inspect::job::canonicalize_normalized(&root)
+            .display()
+            .to_string();
+        let metrics = &health["lsp"]["applicability_by_root"][key];
+        assert_eq!(metrics["full_walks"].as_u64().unwrap() - before, 0);
+        assert_eq!(metrics["retained_content_batches"], 50);
+        assert_eq!(metrics["hits"], 50);
+        assert!(metrics["dependency_count"].as_u64().unwrap() > 0);
+        assert!(metrics["warm_validation_micros"].is_u64());
+        assert!(metrics["full_walk_micros"].is_u64());
+    }
 
     #[test]
     fn configure_applicability_coalesces_watcher_batches_during_scan() {

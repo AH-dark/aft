@@ -31,6 +31,7 @@ fn identity(root: &Path, scope: Value, principal: &str) -> RouteIdentity {
         call_mode,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }))
 }
 fn stamp() -> Value {

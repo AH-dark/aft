@@ -36,6 +36,7 @@ pub(crate) struct LspCensus {
     pub children_omitted_rss_bytes: u64,
     pub children_without_client: u64,
     pub children_with_deleted_cwd: u64,
+    pub applicability_by_root: BTreeMap<String, crate::lsp::manager::ApplicabilityMetrics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -126,6 +127,18 @@ pub(crate) fn collect(
         children_omitted_rss_bytes: lsp_health.children_omitted_rss_bytes,
         children_without_client: lsp_health.children_without_client as u64,
         children_with_deleted_cwd: lsp_health.children_with_deleted_cwd as u64,
+        applicability_by_root: contexts
+            .iter()
+            .filter_map(|context| {
+                context.config().project_root.as_ref().map(|root| {
+                    let root = crate::inspect::job::canonicalize_normalized(root);
+                    (
+                        root.display().to_string(),
+                        crate::lsp::manager::applicability_metrics(&root),
+                    )
+                })
+            })
+            .collect(),
     };
     let detached_total = contexts
         .iter()

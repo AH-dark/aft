@@ -1209,6 +1209,18 @@ fn marker_signals_language(marker: &str, server: &ServerDef) -> bool {
     true
 }
 
+pub(super) fn applicability_marker_names(config: &Config) -> std::collections::HashSet<String> {
+    resolved_servers(config)
+        .into_iter()
+        .flat_map(|server| {
+            server
+                .root_markers
+                .into_iter()
+                .chain(server.priority_root_markers)
+        })
+        .collect()
+}
+
 /// Resolve the full server set after applying user overrides.
 ///
 /// When a user-defined server's `id` matches a built-in server's `id_str()`

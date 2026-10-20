@@ -372,6 +372,186 @@ fn commit(root: &Path) {
 }
 
 #[test]
+fn inspect_view_pending_publication_without_deferred_job_requests_no_refresh() {
+    let fixture = Fixture::new();
+    fixture.ctx.set_harness(crate::harness::Harness::Opencode);
+    fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+    fixture.change("no_inspection_requested");
+    let before = fixture
+        .ctx
+        .inspect_manager()
+        .automatic_tier2_schedule_count_for_test();
+    fixture.schedule();
+    fixture.wait_idle();
+    assert!(
+        !fixture.ctx.tier2_pull_demand_pending(),
+        "publication without deferred analysis must not request a Tier-2 pull"
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        before
+    );
+}
+
+#[test]
+fn inspect_view_pending_publication_reschedules_dead_code_without_another_inspect() {
+    use crate::inspect::{InspectCategory, InspectSnapshot, JobScope};
+    let fixture = Fixture::new();
+    fixture.ctx.set_harness(crate::harness::Harness::Opencode);
+    let root = fixture.ctx.canonical_cache_root();
+    let family = crate::search_index::artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+    fixture.change("after_publication");
+    let manager = fixture.ctx.inspect_manager();
+    let snapshot = InspectSnapshot {
+        project_root: root.clone(),
+        inspect_dir: fixture.ctx.inspect_dir(),
+        config: fixture.ctx.config(),
+        symbol_cache: fixture.ctx.symbol_cache(),
+        inspect_writer: true,
+        callgraph_writer: true,
+    };
+    let pending = manager.tier2_run_with_reuse_blocking_fresh(
+        snapshot.clone(),
+        InspectCategory::DeadCode,
+        JobScope::for_project(root.clone()),
+    );
+    assert_eq!(
+        pending.payload().map(|payload| &payload["code"]),
+        Some(&serde_json::json!("view_pending")),
+        "{pending:?}"
+    );
+    assert_ne!(
+        pending
+            .payload()
+            .and_then(|payload| payload["callgraph_available"].as_bool()),
+        Some(true)
+    );
+    assert!(!fixture.ctx.tier2_pull_demand_pending());
+
+    fixture.schedule();
+    fixture.wait_idle();
+    assert!(
+        fixture.ctx.tier2_pull_demand_pending(),
+        "view publication must wake deferred Tier-2 work"
+    );
+    // A publication callback can run before the job records its pending result.
+    // Recreate that scheduler state and let only the idle probe discover demand.
+    fixture.ctx.reset_tier2_refresh_scheduler_at(Instant::now());
+    assert!(!fixture.ctx.tier2_pull_demand_pending());
+    manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+    assert!(!fixture.ctx.tier2_refresh_dispatch_due());
+    assert_eq!(
+        fixture
+            .ctx
+            .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+        None
+    );
+    assert!(manager.deferred_view_refresh_ready(&fixture.ctx.canonical_cache_root()));
+    manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, false);
+    assert!(
+        fixture.ctx.tier2_refresh_dispatch_due(),
+        "a quiet checkout must discover its owed published view without a watcher edit"
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .tick_tier2_refresh_scheduler_at(Instant::now(), 0),
+        Some(crate::inspect::Tier2TriggerReason::Pull)
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while manager.tier2_any_in_flight() {
+        assert!(
+            Instant::now() < deadline,
+            "automatic Tier-2 refresh did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    manager.drain_completions();
+    let outcome = manager.tier2_read_cached_readonly(
+        snapshot,
+        InspectCategory::DeadCode,
+        JobScope::for_project(root),
+    );
+    assert_eq!(
+        outcome
+            .payload()
+            .map(|payload| &payload["callgraph_available"]),
+        Some(&serde_json::json!(true)),
+        "{outcome:?}"
+    );
+    assert!(!manager.deferred_view_refresh_ready(&fixture.ctx.canonical_cache_root()));
+    fixture.change("no_more_deferred_analysis");
+    fixture.schedule();
+    fixture.wait_idle();
+    assert!(
+        !fixture.ctx.tier2_pull_demand_pending(),
+        "a later publication must not repeat the consumed refresh"
+    );
+}
+
+#[test]
+fn inspect_view_pending_reply_names_publication_not_changed_sources() {
+    use crate::inspect::{InspectCategory, InspectSnapshot, JobScope};
+    let fixture = Fixture::new();
+    fixture.ctx.set_harness(crate::harness::Harness::Opencode);
+    let root = fixture.ctx.canonical_cache_root();
+    let family = crate::search_index::artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    let snapshot = InspectSnapshot {
+        project_root: root.clone(),
+        inspect_dir: fixture.ctx.inspect_dir(),
+        config: fixture.ctx.config(),
+        symbol_cache: fixture.ctx.symbol_cache(),
+        inspect_writer: true,
+        callgraph_writer: true,
+    };
+    let initial = fixture
+        .ctx
+        .inspect_manager()
+        .tier2_run_with_reuse_blocking_fresh(
+            snapshot,
+            InspectCategory::DeadCode,
+            JobScope::for_project(root),
+        );
+    assert_eq!(initial.payload().unwrap()["callgraph_available"], true);
+    fixture.change("waiting_for_view");
+    let response = crate::commands::inspect::handle_inspect_warm_for_test(
+        &crate::protocol::RawRequest {
+            id: "pending-view".into(),
+            command: "inspect".into(),
+            params: serde_json::json!({"scope": "tracked.rs", "sections": ["dead_code"]}),
+            session_id: None,
+            lsp_hints: None,
+        },
+        &fixture.ctx,
+    );
+    assert!(response.success, "{:?}", response.data);
+    let text = response.data["text"].as_str().unwrap();
+    assert!(
+        text.contains("dead code waits for this checkout's index view to publish"),
+        "{text}"
+    );
+    assert!(
+        text.contains("publication schedules a Tier-2 refresh"),
+        "{text}"
+    );
+    assert!(!text.contains("sources or configuration changed"), "{text}");
+    assert!(
+        !text.contains("cached source contributions, file set, or analysis configuration changed"),
+        "{text}"
+    );
+    assert_eq!(
+        response.data["summary"]["dead_code"]["gaps"][0]["kind"],
+        "view_pending"
+    );
+}
+
+#[test]
 fn publication_busy_readiness_uses_backoff_and_recovers_after_unlock() {
     let fixture = Fixture::new();
     let derived = fixture.view.derived_path(&fixture.initial).unwrap();

@@ -167,10 +167,23 @@ impl RescanReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),
+    /// Every path had only explicit data modifications, never topology events.
+    ContentOnlyPaths(Vec<PathBuf>),
     RescanRequired(RescanReason),
-    IgnoreRulesChanged { paths: Vec<PathBuf> },
+    IgnoreRulesChanged {
+        paths: Vec<PathBuf>,
+    },
     RootDeleted,
     Error(String),
+}
+
+pub(crate) fn watcher_event_is_content_only(kind: &notify::EventKind) -> bool {
+    // Modify(Any), renames and backend-specific metadata events do not prove
+    // that the path already existed. Only explicit data modifications qualify.
+    matches!(
+        kind,
+        notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+    )
 }
 
 pub struct WatcherThreadHandle {
@@ -2208,6 +2221,7 @@ struct WatcherFilterThread {
     dispatch_tx: Sender<WatcherDispatchEvent>,
     shutdown: Arc<AtomicBool>,
     raw_paths: BTreeSet<PathBuf>,
+    content_only_paths: BTreeSet<PathBuf>,
     recent_paths: VecDeque<(PathBuf, Instant)>,
     flush_deadline: Option<Instant>,
     #[cfg(test)]
@@ -2229,6 +2243,7 @@ impl WatcherFilterThread {
             dispatch_tx,
             shutdown,
             raw_paths: BTreeSet::new(),
+            content_only_paths: BTreeSet::new(),
             recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
             #[cfg(test)]
@@ -2244,6 +2259,7 @@ impl WatcherFilterThread {
             }
             if self.project_root_was_deleted() {
                 self.raw_paths.clear();
+                self.content_only_paths.clear();
                 let _ = self.send_dispatch(WatcherDispatchEvent::RootDeleted);
                 return;
             }
@@ -2268,6 +2284,7 @@ impl WatcherFilterThread {
                         let reason = RescanReason::from_event_info(event.info());
                         let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
+                        self.content_only_paths.clear();
                         self.flush_deadline = None;
                         // Dropped events may include a config file edit; the
                         // reload compares contents, so asking is cheap.
@@ -2289,7 +2306,8 @@ impl WatcherFilterThread {
                     self.record_recent_paths(&event.paths);
                     if watcher_event_invalidates(&event.kind) {
                         self.config.counters.note_invalidating_event();
-                        if !self.push_raw_paths(event.paths) {
+                        let content_only = watcher_event_is_content_only(&event.kind);
+                        if !self.push_raw_paths_with_kind(event.paths, content_only) {
                             return;
                         }
                     }
@@ -2489,7 +2507,12 @@ impl WatcherFilterThread {
         during_rescan
     }
 
+    #[cfg(test)]
     fn push_raw_paths(&mut self, paths: Vec<PathBuf>) -> bool {
+        self.push_raw_paths_with_kind(paths, false)
+    }
+
+    fn push_raw_paths_with_kind(&mut self, paths: Vec<PathBuf>, content_only: bool) -> bool {
         for path in paths {
             // Drop high-churn ignored dirs (target/, node_modules/, agent infra)
             // on the RAW path before canonicalizing. `canonicalize_watcher_path`
@@ -2519,7 +2542,14 @@ impl WatcherFilterThread {
             self.config
                 .counters
                 .note_unflushed_paths(std::iter::once(&path));
-            self.raw_paths.insert(path);
+            let fresh = self.raw_paths.insert(path.clone());
+            if content_only && (fresh || self.content_only_paths.contains(&path)) {
+                self.content_only_paths.insert(path);
+            } else {
+                // A create followed by a write is still a create, even when the
+                // debounce window collapses both events to one path.
+                self.content_only_paths.remove(&path);
+            }
         }
         if !self.raw_paths.is_empty() && self.flush_deadline.is_none() {
             self.flush_deadline = Some(Instant::now() + WATCHER_FLUSH_WINDOW);
@@ -2569,6 +2599,7 @@ impl WatcherFilterThread {
         }
 
         let raw_paths = std::mem::take(&mut self.raw_paths);
+        let content_only_paths = std::mem::take(&mut self.content_only_paths);
         self.flush_deadline = None;
         let initial = filter_canonical_paths(&self.config, &self.matcher, raw_paths.clone());
         let filtered = if initial.ignore_file_changed {
@@ -2585,6 +2616,7 @@ impl WatcherFilterThread {
                 // Keep the batch until the ignore matcher is acknowledged; a
                 // lifecycle transition may have deferred the original rebuild.
                 self.raw_paths.extend(raw_paths);
+                self.content_only_paths.extend(content_only_paths);
                 self.flush_deadline = Some(Instant::now() + WATCHER_FLUSH_WINDOW);
                 return self
                     .send_dispatch(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown));
@@ -2600,11 +2632,17 @@ impl WatcherFilterThread {
             return true;
         }
         let paths = filtered.changed.into_iter().collect::<Vec<_>>();
+        let content_only = paths.iter().all(|path| content_only_paths.contains(path));
         let path_count = paths.len();
         // A parent folder session follows its child repositories through
         // this watcher; it only queues the paths for its own worker.
         crate::views::parent::note_changed_paths(&paths);
-        if !self.send_dispatch(WatcherDispatchEvent::Paths(paths)) {
+        let event = if content_only {
+            WatcherDispatchEvent::ContentOnlyPaths(paths)
+        } else {
+            WatcherDispatchEvent::Paths(paths)
+        };
+        if !self.send_dispatch(event) {
             return false;
         }
         self.config.counters.note_paths_dispatched(path_count);
@@ -2677,6 +2715,51 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_only_batches_preserve_kind_and_topology_dominates_coalescing() {
+        use super::*;
+        use notify::event::{CreateKind, DataChange, ModifyKind, RenameMode};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source.py");
+        std::fs::write(&source, "print(0)").unwrap();
+        let data = notify::EventKind::Modify(ModifyKind::Data(DataChange::Content));
+        let create = notify::EventKind::Create(CreateKind::File);
+        let rename = notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+        let ambiguous = notify::EventKind::Modify(ModifyKind::Any);
+        for (kinds, expected_content_only) in [
+            (vec![data, data], true),
+            (vec![create, data], false),
+            (vec![data, create], false),
+            (vec![rename, data], false),
+            (vec![ambiguous, data], false),
+        ] {
+            let (tx, rx) = watcher_dispatch_channel();
+            let matcher = Arc::new(RwLock::new(None));
+            let mut filter = WatcherFilterThread::new(
+                WatcherFilterConfig::new(root.clone(), None),
+                matcher,
+                Arc::new(AtomicU64::new(0)),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+            );
+            for kind in kinds {
+                assert!(filter.push_raw_paths_with_kind(
+                    vec![source.clone()],
+                    watcher_event_is_content_only(&kind)
+                ));
+            }
+            assert!(filter.flush_pending());
+            let expected = if expected_content_only {
+                WatcherDispatchEvent::ContentOnlyPaths(vec![source.clone()])
+            } else {
+                WatcherDispatchEvent::Paths(vec![source.clone()])
+            };
+            assert_eq!(rx.try_recv().unwrap(), expected);
+        }
+    }
+
     #[test]
     fn matcher_snapshot_releases_read_lock_before_path_work() {
         let directory = tempfile::tempdir().unwrap();
@@ -4574,7 +4657,10 @@ mod tests {
                 "timed out waiting for overflow rescan"
             );
             match dispatch_rx.recv_timeout(remaining) {
-                Ok(WatcherDispatchEvent::Paths(paths)) => {
+                Ok(
+                    WatcherDispatchEvent::Paths(paths)
+                    | WatcherDispatchEvent::ContentOnlyPaths(paths),
+                ) => {
                     let ignored = paths
                         .iter()
                         .filter(|path| is_flooding_ignored_path(path))
@@ -5476,7 +5562,7 @@ mod tests {
             dispatch_rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("source change dispatch"),
-            WatcherDispatchEvent::Paths(vec![source])
+            WatcherDispatchEvent::ContentOnlyPaths(vec![source])
         );
 
         shutdown.store(true, Ordering::SeqCst);

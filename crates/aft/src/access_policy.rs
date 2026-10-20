@@ -156,7 +156,15 @@ pub(crate) enum AskRoute {
     /// so the subc layer can put the question to Cingulate. `once` holds the
     /// capabilities an `allow_once` answer approved for this one dispatch.
     Consent { once: Vec<AccessGrant> },
+    /// A codemode program's call: nobody can be asked on its head agent's
+    /// behalf yet, so an `ask` refuses with [`PERMISSION_ASK_UNAVAILABLE`],
+    /// naming the permission and the path. Allow and deny decisions are
+    /// unaffected.
+    Unavailable,
 }
+
+/// Refusal for a codemode call that would need a permission ask.
+pub(crate) const PERMISSION_ASK_UNAVAILABLE: &str = "permission_ask_unavailable";
 
 /// Internal refusal code for an `ask` that must go to Cingulate. The subc
 /// layer turns it into a held call; it never reaches the agent as-is.

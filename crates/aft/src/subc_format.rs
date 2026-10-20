@@ -1077,13 +1077,10 @@ pub(crate) fn format_bash_task_status_header(
     status_reason: Option<&str>,
 ) -> String {
     let mut text = format!("Task {task_id}: {status}");
-    if status == "killed"
-        && matches!(
-            status_reason,
-            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
-        )
-    {
-        text.push_str(" (scope revoked)");
+    if status == "killed" {
+        if let Some(label) = crate::bash_background::registry::scope_end_label(status_reason) {
+            text.push_str(&format!(" ({label})"));
+        }
     }
     if let Some(exit_code) = exit_code {
         text.push_str(&format!(" (exit {exit_code})"));

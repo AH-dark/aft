@@ -548,6 +548,7 @@ mod tests {
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             run_scope: OnceLock::new(),
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         assert!(remote_policy::key(&worker, Some("worker")).is_some());
         (worker, unscoped)

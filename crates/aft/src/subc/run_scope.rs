@@ -25,28 +25,39 @@ impl RunBudget {
         }
     }
 
+    /// Fit a codemode program's shell call to its run. A PTY needs someone to
+    /// drive it interactively, so it is refused. A background command is
+    /// allowed: it joins the head agent's session, so the agent can read it
+    /// with `bash_status`, but it sends no completion wake, because the
+    /// program is the one waiting for it; the run's end kills it. A
+    /// foreground command blocks until it completes, and its wait is cut at
+    /// the run's deadline.
     pub(super) fn constrain_bash(
         &self,
         args: &mut serde_json::Map<String, Value>,
     ) -> Result<(), ErrorBody> {
-        if args.get("background").and_then(Value::as_bool) == Some(true)
-            || args.get("pty").and_then(Value::as_bool) == Some(true)
-        {
+        if args.get("pty").and_then(Value::as_bool) == Some(true) {
             return Err(ErrorBody::new(
-                "run_background_refused",
-                "codemode runs can't background; the run's time budget bounds the command (PTY also requires background work)",
+                "run_pty_refused",
+                "codemode runs can't open a PTY; nobody can drive it interactively",
             ));
         }
-        if let Some(deadline) = self.deadline {
-            let remaining = deadline
+        let remaining = self.deadline.map(|deadline| {
+            deadline
                 .saturating_duration_since(Instant::now())
-                .as_millis() as u64;
-            if remaining == 0 {
-                return Err(ErrorBody::new(
-                    "run_deadline_expired",
-                    "the codemode run's time budget has expired",
-                ));
-            }
+                .as_millis() as u64
+        });
+        if remaining == Some(0) {
+            return Err(ErrorBody::new(
+                "run_deadline_expired",
+                "the codemode run's time budget has expired",
+            ));
+        }
+        if args.get("background").and_then(Value::as_bool) == Some(true) {
+            args.insert("notify_on_completion".into(), json!(false));
+            return Ok(());
+        }
+        if let Some(remaining) = remaining {
             let normal = args
                 .get("timeout")
                 .and_then(Value::as_u64)
@@ -75,13 +86,23 @@ mod tests {
     }
 
     #[test]
-    fn run_background_is_refused_by_name() {
-        for args in [json!({"background": true}), json!({"pty": true})] {
-            let mut args = args.as_object().unwrap().clone();
-            let error = budget(Some(5000)).constrain_bash(&mut args).unwrap_err();
-            assert_eq!(error.code, "run_background_refused");
-            assert!(error.message.contains("codemode runs can't background"));
-        }
+    fn run_pty_is_refused_by_name() {
+        let mut args = json!({"pty": true}).as_object().unwrap().clone();
+        let error = budget(Some(5000)).constrain_bash(&mut args).unwrap_err();
+        assert_eq!(error.code, "run_pty_refused");
+        assert!(error.message.contains("codemode runs can't open a PTY"));
+    }
+
+    #[test]
+    fn run_background_launches_without_a_completion_wake() {
+        let mut args = json!({"background": true, "timeout": 60000, "notify_on_completion": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        budget(Some(5000)).constrain_bash(&mut args).unwrap();
+        assert_eq!(args["notify_on_completion"], false);
+        assert!(args.get("block_to_completion").is_none());
+        assert_eq!(args["timeout"], 60000);
     }
 
     #[test]
@@ -102,10 +123,10 @@ mod tests {
         budget(None).constrain_bash(&mut args).unwrap();
         assert!(args.get("timeout").is_none());
         assert_eq!(args["block_to_completion"], true);
-        let mut bg = json!({"background": true}).as_object().unwrap().clone();
+        let mut pty = json!({"pty": true}).as_object().unwrap().clone();
         assert_eq!(
-            budget(None).constrain_bash(&mut bg).unwrap_err().code,
-            "run_background_refused"
+            budget(None).constrain_bash(&mut pty).unwrap_err().code,
+            "run_pty_refused"
         );
     }
 }

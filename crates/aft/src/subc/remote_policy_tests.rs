@@ -757,6 +757,7 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
         call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: scoped.then_some(scope),
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }))
 }
 

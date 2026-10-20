@@ -340,6 +340,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
         call_mode: subc_protocol::call_mode::CallMode::Classic,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(false),
+        run_owner: None,
     }))
 }
 

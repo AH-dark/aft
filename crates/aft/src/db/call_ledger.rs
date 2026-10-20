@@ -510,8 +510,11 @@ pub enum Withdrawal {
     /// The answer frozen on the record, as reply body bytes.
     Answer {
         body: Vec<u8>,
-        /// The shell task to kill. Set only by the withdraw that froze
-        /// `already_started` on a running call with a linked task.
+        /// The shell task to kill. Set while the call is running with a
+        /// linked task: `body` is then NOT stored yet. The caller stores it
+        /// with [`freeze_withdraw_answer`] once the kill has landed, so a
+        /// withdraw whose kill failed leaves no answer behind and a retry
+        /// tries the kill again.
         kill_task: Option<String>,
         /// This withdraw settled a held call that never dispatched, so its
         /// held request must now end with `not_started`.
@@ -523,9 +526,12 @@ pub enum Withdrawal {
 ///
 /// The first withdraw computes the answer from the settlement table and
 /// stores its bytes; every later withdraw by any permitted caller returns
-/// those bytes, whatever expiry later does to the row. A held call that has
-/// not dispatched is settled `not_started` with reason `withdrawn` here, so
-/// the admission step that would dispatch it finds the row settled and stops.
+/// those bytes, whatever expiry later does to the row. The one exception is a
+/// running call with a linked shell task: its answer is returned with the task
+/// to kill and stored only by [`freeze_withdraw_answer`] after the kill. A
+/// held call that has not dispatched is settled `not_started` with reason
+/// `withdrawn` here, so the admission step that would dispatch it finds the
+/// row settled and stops.
 /// `max_body` bounds the answer: a `completed` answer that would not fit is
 /// reduced to its outcome, and the row with it.
 pub fn withdraw(
@@ -587,16 +593,38 @@ pub fn withdraw(
         }
     };
     let body = answer_bytes(&answer);
-    tx.execute(
-        "UPDATE call_ledger SET withdraw_answer=?3 WHERE carrier=?1 AND call_key=?2",
-        params![key.carrier, key.call_key, body],
-    )?;
+    if kill_task.is_none() {
+        tx.execute(
+            "UPDATE call_ledger SET withdraw_answer=?3 WHERE carrier=?1 AND call_key=?2",
+            params![key.carrier, key.call_key, body],
+        )?;
+    }
     tx.commit()?;
     Ok(Withdrawal::Answer {
         body,
         kill_task,
         held_withdrawn,
     })
+}
+
+/// Stores the answer of a withdraw whose kill landed, unless another withdraw
+/// stored one first, and returns the stored answer. A row that is gone (acked
+/// or dropped meanwhile) keeps nothing, and `body` is returned as is.
+pub fn freeze_withdraw_answer(
+    conn: &Connection,
+    key: &Key,
+    body: &[u8],
+) -> rusqlite::Result<Vec<u8>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE call_ledger SET withdraw_answer=COALESCE(withdraw_answer,?3) WHERE carrier=?1 AND call_key=?2",
+        params![key.carrier, key.call_key, body],
+    )?;
+    let stored = get(&tx, key)?
+        .and_then(|row| row.withdraw_answer)
+        .unwrap_or_else(|| body.to_vec());
+    tx.commit()?;
+    Ok(stored)
 }
 
 /// The `tool.withdraw` answer for a row that has already settled and has no
@@ -1478,9 +1506,11 @@ mod tests {
             (first, None, false)
         );
 
-        // A running shell call: the first withdraw names its task to kill,
-        // later ones return the frozen bytes and kill nothing. Settlement
-        // after the freeze does not change the answer.
+        // A running shell call: each withdraw names its task to kill until
+        // one stores the answer after its kill landed; a withdraw whose kill
+        // failed stores nothing, so the next one tries the kill again. After
+        // the freeze, later ones return the frozen bytes and kill nothing.
+        // Settlement after the freeze does not change the answer.
         let running = Key {
             carrier: "carrier".into(),
             call_key: "running".into(),
@@ -1494,6 +1524,23 @@ mod tests {
             json!({"answer": "already_started", "outcome": "unknown"})
         );
         assert_eq!((kill.as_deref(), held_withdrawn), (Some("task-1"), false));
+        assert!(get(&conn, &running)
+            .unwrap()
+            .unwrap()
+            .withdraw_answer
+            .is_none());
+        let (retried, kill, _) = answer(withdraw(&conn, &running, stamp, 100, usize::MAX).unwrap());
+        assert_eq!((&retried, kill.as_deref()), (&first, Some("task-1")));
+        let first_bytes = withdraw_bytes(&conn, &running, stamp, 100);
+        assert_eq!(
+            freeze_withdraw_answer(&conn, &running, &first_bytes).unwrap(),
+            first_bytes
+        );
+        // A second kill that lands later keeps the answer stored first.
+        assert_eq!(
+            freeze_withdraw_answer(&conn, &running, b"later").unwrap(),
+            first_bytes
+        );
         assert_eq!(
             answer(withdraw(&conn, &running, stamp, 100, usize::MAX).unwrap()),
             (first.clone(), None, false)

@@ -3,6 +3,11 @@ use super::*;
 use crate::db::remote_exec::{self as store, PolicyKey};
 
 pub(super) fn key(identity: &RouteIdentity, preset: Option<&str>) -> Option<PolicyKey> {
+    // A codemode call is confined exactly as its head agent's route is.
+    let identity = identity
+        .run_owner
+        .as_ref()
+        .map_or(identity, |owner| &owner.head);
     let scope = identity.scope.as_ref()?;
     if preset != Some("worker") {
         return None;

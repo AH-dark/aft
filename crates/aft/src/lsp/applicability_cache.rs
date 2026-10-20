@@ -4,7 +4,7 @@
 //! when their HEAD commits match.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
@@ -16,6 +16,47 @@ use crate::config::Config;
 
 type Key = (PathBuf, Vec<u8>);
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InvalidationCause {
+    ContentOnlyBatch,
+    CreateRemoveRename,
+    SelectionInput,
+    OverflowLostEvents,
+    WatcherInstalled,
+    WatcherRemoved,
+    DependencyValidation,
+}
+
+impl InvalidationCause {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ContentOnlyBatch => "content_only_batch",
+            Self::CreateRemoveRename => "create_remove_rename_or_directory",
+            Self::SelectionInput => "marker_ignore_config_or_ts_install",
+            Self::OverflowLostEvents => "overflow_or_lost_events",
+            Self::WatcherInstalled => "watcher_installed",
+            Self::WatcherRemoved => "watcher_removed",
+            Self::DependencyValidation => "dependency_validation",
+        }
+    }
+}
+
+/// Process-lifetime counters for one physical checkout, across configuration keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ApplicabilityMetrics {
+    pub hits: u64,
+    pub misses: u64,
+    pub coalesced_hits: u64,
+    pub invalidations: BTreeMap<&'static str, u64>,
+    pub retained_content_batches: u64,
+    pub warm_validations: u64,
+    pub warm_validation_micros: u64,
+    pub warm_validation_dependency_count: usize,
+    pub dependency_count: usize,
+    pub full_walks: u64,
+    pub full_walk_micros: u64,
+}
+
 #[derive(PartialEq, Eq)]
 enum PathState {
     Missing,
@@ -25,6 +66,7 @@ enum PathState {
         created: Option<SystemTime>,
         len: u64,
         is_dir: bool,
+        is_file: bool,
     },
     Unreadable,
 }
@@ -38,6 +80,7 @@ impl PathState {
                 created: metadata.created().ok(),
                 len: metadata.len(),
                 is_dir: metadata.is_dir(),
+                is_file: metadata.is_file(),
             },
             Err(error)
                 if matches!(
@@ -94,6 +137,8 @@ struct Dependencies {
     id: u64,
     root: PathBuf,
     paths: HashMap<PathBuf, PathState>,
+    inputs: HashSet<PathBuf>,
+    input_identities: HashSet<(u64, u64)>,
 }
 
 thread_local! {
@@ -102,12 +147,25 @@ thread_local! {
     static DEPENDENCIES: RefCell<Option<Dependencies>> = const { RefCell::new(None) };
 }
 
-/// Record a selection input before probing it. Files beneath the watched root
-/// are invalidated by watcher batches; ancestors need bounded stat rechecks.
+/// Record a selection input before probing it. Watcher batches check in-root
+/// input membership; inputs outside the watcher still need stat rechecks.
 pub(super) fn observe_path(path: &Path) {
     DEPENDENCIES.with_borrow_mut(|capture| {
         if let Some(capture) = capture {
             let path = crate::inspect::job::normalize_path(path);
+            if capture.inputs.insert(path.clone()) && path.starts_with(&capture.root) {
+                // Watcher paths are canonicalized. File identity also recognizes
+                // a changed target reached through a marker symlink or hard link,
+                // without adding a realpath call for every marker probe.
+                if let PathState::Present {
+                    identity: Some(identity),
+                    is_file: true,
+                    ..
+                } = PathState::read(&path)
+                {
+                    capture.input_identities.insert(identity);
+                }
+            }
             if !path.starts_with(&capture.root) {
                 capture
                     .paths
@@ -126,16 +184,7 @@ fn observe_ancestor_ignores(root: &Path) {
     // The ignore walker reads parent rules itself, outside the root-lookup
     // helpers instrumented below. Include absent rules so creating one counts.
     for dir in root.ancestors().skip(1) {
-        for name in [
-            ".ignore",
-            ".gitignore",
-            ".aftignore",
-            ".git",
-            ".jj",
-            ".git/info/exclude",
-        ] {
-            observe_path(&dir.join(name));
-        }
+        observe_directory_ignores(dir);
     }
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
@@ -150,6 +199,20 @@ fn observe_ancestor_ignores(root: &Path) {
     }
 }
 
+pub(super) fn observe_directory_ignores(dir: &Path) {
+    for name in [
+        ".ignore",
+        ".gitignore",
+        ".aftignore",
+        ".git",
+        ".jj",
+        ".git/info/exclude",
+        ".git/config",
+    ] {
+        observe_path(&dir.join(name));
+    }
+}
+
 struct Capture(Option<Dependencies>);
 
 impl Capture {
@@ -158,14 +221,29 @@ impl Capture {
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self(DEPENDENCIES.replace(Some(Dependencies {
             id,
-            root: root.into(),
+            // Probed paths are recorded in normalized form (no Windows `\\?\`
+            // prefix), so the in-root test must compare against the same form.
+            root: crate::inspect::job::normalize_path(root),
             paths: HashMap::new(),
+            inputs: HashSet::new(),
+            input_identities: HashSet::new(),
         })))
     }
 
-    fn finish(self) -> HashMap<PathBuf, PathState> {
+    fn finish(
+        self,
+    ) -> (
+        HashMap<PathBuf, PathState>,
+        HashSet<PathBuf>,
+        HashSet<(u64, u64)>,
+    ) {
         DEPENDENCIES.with_borrow_mut(|capture| {
-            std::mem::take(&mut capture.as_mut().expect("active capture").paths)
+            let capture = capture.as_mut().expect("active capture");
+            (
+                std::mem::take(&mut capture.paths),
+                std::mem::take(&mut capture.inputs),
+                std::mem::take(&mut capture.input_identities),
+            )
         })
     }
 }
@@ -195,6 +273,10 @@ struct State {
     running: Option<Arc<RunningScan>>,
     result: Option<ApplicabilityWalk>,
     dependencies: HashMap<PathBuf, PathState>,
+    inputs: HashSet<PathBuf>,
+    input_identities: HashSet<(u64, u64)>,
+    marker_names: HashSet<String>,
+    cause: Option<InvalidationCause>,
 }
 
 #[derive(Default)]
@@ -240,6 +322,7 @@ impl Drop for ScanGuard<'_> {
 #[derive(Default)]
 pub(super) struct ApplicabilityCache {
     entries: Mutex<HashMap<Key, Arc<Flight>>>,
+    metrics: Mutex<HashMap<PathBuf, ApplicabilityMetrics>>,
     #[cfg(test)]
     waiter_joined: (Mutex<bool>, Condvar),
 }
@@ -250,6 +333,120 @@ pub(super) fn shared() -> &'static ApplicabilityCache {
 }
 
 impl ApplicabilityCache {
+    pub(super) fn metrics(&self, root: &Path) -> ApplicabilityMetrics {
+        self.metrics.lock().get(root).cloned().unwrap_or_default()
+    }
+
+    fn record_invalidation(&self, root: &Path, cause: InvalidationCause) {
+        let mut metrics = self.metrics.lock();
+        *metrics
+            .entry(root.into())
+            .or_default()
+            .invalidations
+            .entry(cause.label())
+            .or_default() += 1;
+    }
+
+    pub(super) fn invalidate_batch(
+        &self,
+        root: &Path,
+        paths: &[PathBuf],
+        content_only: bool,
+    ) -> Option<InvalidationCause> {
+        if paths.is_empty() {
+            return None;
+        }
+        let mut known = false;
+        let mut input_changed = paths
+            .iter()
+            .any(|path| super::typescript_project::path_affects_typescript_selection(path));
+        let mut ready = true;
+        let mut active_configurations = 0;
+        let mut roots = HashSet::from([root.to_path_buf()]);
+        // Recorded inputs are normalized; watcher paths may arrive in the
+        // Windows verbatim (`\\?\C:\...`) form that `fs::canonicalize` returns.
+        let normalized_paths: Vec<_> = paths
+            .iter()
+            .map(|path| crate::inspect::job::normalize_path(path))
+            .collect();
+        let file_states: Vec<_> = if content_only {
+            paths.iter().map(|path| PathState::read(path)).collect()
+        } else {
+            Vec::new()
+        };
+        {
+            let mut entries = self.entries.lock();
+            // Invalidated snapshots from configurations nobody is using must
+            // not keep an otherwise warm configuration from retaining edits.
+            entries.retain(|(cached_root, _), flight| {
+                if !(cached_root.starts_with(root) || root.starts_with(cached_root))
+                    || Arc::strong_count(flight) > 1
+                {
+                    return true;
+                }
+                let state = flight.state.lock();
+                state.result.is_some() || state.running.is_some()
+            });
+            for ((cached_root, _), flight) in entries.iter() {
+                if cached_root.starts_with(root) || root.starts_with(cached_root) {
+                    known = true;
+                    roots.insert(cached_root.clone());
+                    let state = flight.state.lock();
+                    if state.result.is_some()
+                        || state.running.is_some()
+                        || Arc::strong_count(flight) > 1
+                    {
+                        active_configurations += 1;
+                        ready &= state.result.is_some() && state.running.is_none();
+                    }
+                    input_changed |= normalized_paths.iter().any(|path| {
+                        state.inputs.contains(path)
+                            || state
+                                .marker_names
+                                .iter()
+                                .any(|marker| path.ends_with(marker))
+                    });
+                    input_changed |= file_states.iter().any(|state_of_path| {
+                        matches!(state_of_path, PathState::Present { identity: Some(identity), is_file: true, .. }
+                            if state.input_identities.contains(identity))
+                    });
+                }
+            }
+        }
+        // Only a positively identified data modification is safe. Missing paths,
+        // directories, unreadable paths and kind-less backend events remain conservative.
+        let content_only = content_only
+            && file_states.iter().all(|state| {
+                matches!(
+                    state,
+                    PathState::Present {
+                        identity: Some(_),
+                        is_file: true,
+                        ..
+                    }
+                )
+            });
+        if content_only && known && active_configurations > 0 && ready && !input_changed {
+            for root in roots {
+                self.metrics
+                    .lock()
+                    .entry(root)
+                    .or_default()
+                    .retained_content_batches += 1;
+            }
+            return None;
+        }
+        let cause = if input_changed {
+            InvalidationCause::SelectionInput
+        } else if content_only {
+            InvalidationCause::ContentOnlyBatch
+        } else {
+            InvalidationCause::CreateRemoveRename
+        };
+        self.invalidate(root, cause);
+        Some(cause)
+    }
+
     #[cfg(test)]
     pub(super) fn wait_for_waiter_for_test(&self, deadline: Instant) -> bool {
         let (joined, changed) = &self.waiter_joined;
@@ -309,10 +506,23 @@ impl ApplicabilityCache {
                 return Err(ApplicabilityResolutionError::RequestDeadline { root: root.into() });
             }
             if let Some(result) = &state.result {
-                if unchanged(&state.dependencies) {
+                let start = Instant::now();
+                let valid = unchanged(&state.dependencies);
+                {
+                    let mut metrics = self.metrics.lock();
+                    let metrics = metrics.entry(root.into()).or_default();
+                    metrics.warm_validations += 1;
+                    metrics.warm_validation_micros += start.elapsed().as_micros() as u64;
+                    metrics.warm_validation_dependency_count = state.dependencies.len();
+                    metrics.dependency_count = state.inputs.len();
+                    metrics.hits += u64::from(valid);
+                }
+                if valid {
                     return Ok(result.clone());
                 }
+                self.record_invalidation(root, InvalidationCause::DependencyValidation);
                 state.result = None;
+                state.cause = Some(InvalidationCause::DependencyValidation);
                 state.generation = state.generation.wrapping_add(1);
             }
             if let Some(running) = &state.running {
@@ -338,6 +548,11 @@ impl ApplicabilityCache {
                 // arrived, even if they waited for that scan to release the root.
                 if joined_generation {
                     if let Some(result) = &completion.result {
+                        self.metrics
+                            .lock()
+                            .entry(root.into())
+                            .or_default()
+                            .coalesced_hits += 1;
                         return result.clone();
                     }
                 }
@@ -348,15 +563,38 @@ impl ApplicabilityCache {
                 ..RunningScan::default()
             });
             state.running = Some(Arc::clone(&running));
+            state.marker_names = super::registry::applicability_marker_names(config);
+            let cause = state
+                .cause
+                .take()
+                .map_or("cold_or_config", InvalidationCause::label);
             drop(state);
             let guard = ScanGuard {
                 flight: &flight,
                 scan: Arc::clone(&running),
             };
+            let start = Instant::now();
             let capture = Capture::start(root);
             observe_ancestor_ignores(root);
+            {
+                let mut metrics = self.metrics.lock();
+                let metrics = metrics.entry(root.into()).or_default();
+                metrics.misses += 1;
+                metrics.full_walks += 1;
+            }
             let result = scan();
-            let dependencies = capture.finish();
+            let elapsed = start.elapsed();
+            let (dependencies, inputs, input_identities) = capture.finish();
+            {
+                let mut metrics = self.metrics.lock();
+                let metrics = metrics.entry(root.into()).or_default();
+                metrics.full_walk_micros += elapsed.as_micros() as u64;
+                metrics.dependency_count = inputs.len();
+            }
+            log::debug!(
+                "LSP applicability full walk root={} cause={} duration_micros={} dependencies={} success={}",
+                root.display(), cause, elapsed.as_micros(), inputs.len(), result.is_ok()
+            );
             let mut state = flight.state.lock();
             // Under continuous edits, returning one uncached scan preserves the
             // uncached walk's progress. Only unchanged scans may serve new binds.
@@ -364,6 +602,8 @@ impl ApplicabilityCache {
                 if let Ok(walk) = &result {
                     state.result = Some(walk.clone());
                     state.dependencies = dependencies;
+                    state.inputs = inputs;
+                    state.input_identities = input_identities;
                 }
             }
             drop(state);
@@ -373,7 +613,9 @@ impl ApplicabilityCache {
         }
     }
 
-    pub(super) fn invalidate(&self, root: &Path) {
+    pub(super) fn invalidate(&self, root: &Path, cause: InvalidationCause) {
+        let mut affected = std::collections::HashSet::new();
+        affected.insert(root.to_path_buf());
         for ((cached_root, _), flight) in self.entries.lock().iter() {
             // Nested routes can observe the same change through different
             // watchers. Ancestor/descendant invalidation covers both routes.
@@ -381,7 +623,12 @@ impl ApplicabilityCache {
                 let mut state = flight.state.lock();
                 state.generation = state.generation.wrapping_add(1);
                 state.result = None;
+                state.cause = Some(cause);
+                affected.insert(cached_root.clone());
             }
+        }
+        for root in affected {
+            self.record_invalidation(&root, cause);
         }
     }
 }

@@ -1586,6 +1586,7 @@ mod tests {
                 }
                 Ok(
                     WatcherDispatchEvent::Paths(_)
+                    | WatcherDispatchEvent::ContentOnlyPaths(_)
                     | WatcherDispatchEvent::IgnoreRulesChanged { .. }
                     | WatcherDispatchEvent::RootDeleted,
                 ) => {}

@@ -3263,7 +3263,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
             // rewind cannot replay an already-sent partial notification.
             if ctx
                 .run_if_subc_bound_generation(lifecycle_generation, || {
-                    ctx.lsp_forward_watcher_file_events(paths.make_contiguous());
+                    ctx.lsp_forward_classified_watcher_file_events(paths.make_contiguous());
                 })
                 .is_none()
             {
@@ -3523,14 +3523,21 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
         loop {
             match rx.try_recv() {
-                Ok(WatcherDispatchEvent::Paths(paths)) => {
+                Ok(
+                    event @ (WatcherDispatchEvent::Paths(_)
+                    | WatcherDispatchEvent::ContentOnlyPaths(_)),
+                ) => {
+                    let content_only = matches!(event, WatcherDispatchEvent::ContentOnlyPaths(_));
+                    let (WatcherDispatchEvent::Paths(paths)
+                    | WatcherDispatchEvent::ContentOnlyPaths(paths)) = event
+                    else {
+                        unreachable!()
+                    };
                     dispatch_events_received += 1;
                     // Before the ignore filter: lockfiles and installed
                     // packages are often gitignored but still change which
                     // TypeScript server a file gets.
-                    crate::lsp::typescript_project::invalidate_typescript_selection(
-                        paths.iter().map(PathBuf::as_path),
-                    );
+                    ctx.lsp_note_watcher_batch(&paths, content_only);
                     if !state.rescan_required {
                         state.pending_paths.extend(paths.into_iter().filter(|path| {
                             !crate::watcher_filter::queued_path_is_ignored_by_matcher(
@@ -3558,6 +3565,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     dispatch_events_received += 1;
+                    ctx.lsp_note_watcher_ignore_change();
                     if !state.rescan_required {
                         let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
                         let change = ctx
@@ -4214,6 +4222,34 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn watcher_drain_fifty_content_batches_keep_applicability_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("main.py");
+        std::fs::write(&source, "print(0)").unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        let config = ctx.config();
+        crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        let before = crate::lsp::manager::applicability_metrics(&root).full_walks;
+        for n in 1..=50 {
+            std::fs::write(&source, format!("print({n})")).unwrap();
+            tx.send(WatcherDispatchEvent::ContentOnlyPaths(vec![source.clone()]))
+                .unwrap();
+            for slice in 0..64 {
+                if !drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+                    break;
+                }
+                assert!(slice < 63, "watcher batch must finish draining");
+            }
+            crate::lsp::manager::walk_applicable_area(&root, None, &config, None).unwrap();
+        }
+        let metrics = crate::lsp::manager::applicability_metrics(&root);
+        assert_eq!(metrics.full_walks - before, 0);
+        assert_eq!(metrics.retained_content_batches, 50);
+        assert!(metrics.invalidations.is_empty());
     }
 
     #[test]

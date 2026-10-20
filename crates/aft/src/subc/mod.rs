@@ -204,6 +204,7 @@ mod bash;
 mod bash_grant_tests;
 #[cfg(test)]
 mod bash_selector_tests;
+mod codemode;
 mod consent;
 mod drain;
 mod flow_read;
@@ -1418,6 +1419,10 @@ struct RouteIdentityData {
     /// Set by the route's first tool call, so the health counter of scoped
     /// routes that make tool calls counts each route once.
     made_tool_call: AtomicBool,
+    /// Present only on the identity a codemode tool call runs under: the head
+    /// agent the call acts for (see `codemode`). Routes in the route table
+    /// never carry it.
+    run_owner: Option<Arc<codemode::RunOwner>>,
 }
 
 impl Deref for RouteIdentity {
@@ -5334,14 +5339,38 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement };
-                        let decoded = if let Some(identity) = routes.get(&route) {
+                        // A codemode program's tool call runs with its head agent's
+                        // access: every step below sees the head-derived identity.
+                        let codemode_routes;
+                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok()) {
+                            codemode::Admission::Unchanged => (&routes, false),
+                            codemode::Admission::Owner(effective) => {
+                                codemode_routes = codemode::overlay(&routes, route, effective);
+                                (&codemode_routes, true)
+                            }
+                            codemode::Admission::Refused(error) => {
+                                if let Some(run) = routes.get(&route) {
+                                    note_route_tool_call(run, &dispatch_path_metrics);
+                                }
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        };
+                        // The run route's own health counter notes its calls; the
+                        // head-derived identity does not count them again.
+                        if let Some(run) = routes.get(&route).filter(|_| codemode_call) {
+                            note_route_tool_call(run, &dispatch_path_metrics);
+                        }
+                        let decoded = if let Some(identity) = routes_for_call.get(&route) {
                             match run_scopes.defer(decoded, identity, &run_ready_tx) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
                             }
                         } else { decoded };
-                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded, &routes) {
-                            match database_waits.defer(decoded, &routes, &executor) {
+                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded, routes_for_call) {
+                            match database_waits.defer(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
                             }
@@ -5353,7 +5382,7 @@ where
                         // it, then passes the ledger and admission. Calls the ledger
                         // hands back already went through this step.
                         let decoded = if !ledger_waited && !management_routes.contains(&route) {
-                            match database_waits.read_confinement(decoded, &routes, &executor) {
+                            match database_waits.read_confinement(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
                             }
@@ -5361,7 +5390,7 @@ where
                             decoded
                         };
                         let decoded = if !ledger_waited && !management_routes.contains(&route) {
-                            match ledger_edge.defer(decoded, &routes, &executor, &writer_tx, &dispatch_path_metrics) {
+                            match ledger_edge.defer(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
                             }
@@ -5437,7 +5466,7 @@ where
                                  parsed_body,
                                  confinement,
                                  phase_trace,
-                                &routes,
+                                routes_for_call,
                                 &pending_binds,
                                 &reclaimed_routes,
                                 &mut live_roots,
@@ -7305,6 +7334,7 @@ async fn handle_control_request(
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
                 scope,
                 made_tool_call: AtomicBool::new(false),
+                run_owner: None,
             }));
             if let Some(scopes) = run_scopes {
                 scopes.bind(&route_identity);
@@ -8388,16 +8418,23 @@ impl PlainToolRun {
                 // Undo history and named checkpoints belong to the issuing route,
                 // not to whichever harness configured this shared root last.
                 let harness = identity_for_run.harness.clone();
+                // A codemode program's edits are tagged with its run.
+                let run_id = identity_for_run
+                    .run_owner
+                    .as_ref()
+                    .map(|owner| owner.run_id.clone());
                 let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
                 crate::access_policy::with_scope(
                     Some(access_grants::policy_scope_key(&identity_for_run)),
                     || {
                         crate::backup::with_request_harness(&harness, || {
-                            if matches!(bind_trust, BindTrust::Untrusted) {
-                                ctx.with_force_restrict(&request_id_for_force, run)
-                            } else {
-                                run()
-                            }
+                            crate::backup::with_request_run(run_id.as_deref(), || {
+                                if matches!(bind_trust, BindTrust::Untrusted) {
+                                    ctx.with_force_restrict(&request_id_for_force, run)
+                                } else {
+                                    run()
+                                }
+                            })
                         })
                     },
                 )
@@ -8919,6 +8956,7 @@ async fn handle_tool_call(
         .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
         .map(|key| tool_provider::LedgerEdge::key(&identity, key));
     let bare_name = call.name;
+    codemode::audit_call(&identity, &bare_name, frame.header.corr);
     let arguments = strip_agent_preview_arg_owned(call.arguments);
     if bare_name == "bash_watch" {
         if let Some(ctx) = executor.actor_context(&identity.root) {
@@ -9128,6 +9166,16 @@ async fn handle_tool_call(
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
         }
+        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_some() {
+            // An untrusted head's shell call asks its consumer first; a
+            // program's run route has nobody to put that question to.
+            let error = subc_protocol::ErrorBody::new(
+                crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
+                "this shell call needs an approval, and a codemode program can't ask for it",
+            )
+            .with_detail(json!({"permission": "bash", "resource": bare_name}));
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
         if matches!(bind_trust, BindTrust::Untrusted) {
             let plan = match bash::prepare_bash_elicitation_plan(
                 &arguments,
@@ -9192,6 +9240,10 @@ async fn handle_tool_call(
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
                     && identity.scope.is_some()
                     && call_key.is_some(),
+                ledger_carrier: identity
+                    .run_owner
+                    .as_ref()
+                    .map(|owner| owner.ledger_carrier()),
                 connection: connection_cancel.clone(),
                 route: route_cancel.token.clone(),
                 drain: module_drain.clone(),
@@ -9249,6 +9301,10 @@ async fn handle_tool_call(
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
                 && identity.scope.is_some()
                 && call_key.is_some(),
+            ledger_carrier: identity
+                .run_owner
+                .as_ref()
+                .map(|owner| owner.ledger_carrier()),
             connection: connection_cancel.clone(),
             route: route_cancel.token.clone(),
             drain: module_drain.clone(),
@@ -9500,11 +9556,17 @@ async fn handle_tool_call(
                 crate::sandbox_spawn::with_authenticated_principal(
                     identity_for_run.spawn_principal.clone(),
                     || {
-                        if matches!(bind_trust, BindTrust::Untrusted) {
-                            ctx.with_force_restrict(&request_id_for_force, run)
-                        } else {
-                            run()
-                        }
+                        let run_id = identity_for_run
+                            .run_owner
+                            .as_ref()
+                            .map(|owner| owner.run_id.clone());
+                        crate::backup::with_request_run(run_id.as_deref(), || {
+                            if matches!(bind_trust, BindTrust::Untrusted) {
+                                ctx.with_force_restrict(&request_id_for_force, run)
+                            } else {
+                                run()
+                            }
+                        })
                     },
                 )
             });
@@ -11084,6 +11146,7 @@ pub(crate) mod test_support {
                 .unwrap(),
             ),
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         let live_task = if short_deadline {
             ctx.update_config(|config| config.experimental_bash_background = true);
@@ -12344,6 +12407,7 @@ pub(crate) mod test_support {
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             scope: None,
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }))
     }
 
@@ -14379,6 +14443,7 @@ mod tests {
                         run_scope: None,
                         scope: None,
                         late_results: false,
+                        ledger_carrier: None,
                         connection: PersistentCancelSignal::new(),
                         route: PersistentCancelSignal::new(),
                         drain: drain::ModuleDrainWindow::default(),
@@ -17213,6 +17278,7 @@ mod tests {
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             scope: None,
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         let replay_key = push::ReplayKey::from_identity(&identity);
         let completion = RouteBindCompletion {
@@ -17297,6 +17363,7 @@ mod tests {
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             scope: None,
             made_tool_call: AtomicBool::new(false),
+            run_owner: None,
         }));
         let completion = RouteBindCompletion {
             route,

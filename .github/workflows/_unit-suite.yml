@@ -164,6 +164,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_windows_probes.py -v
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
@@ -1139,7 +1140,21 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.x"
+          # Python's tarfile can stream the zstd archive metadata from 3.14 on.
+          python-version: "3.14"
+
+      # Run the exact archive-built harness while its local PDB still exists.
+      # A package-scoped cargo test changes workspace feature unification and
+      # recompiles it; direct execution preserves both symbols and build reuse.
+      - name: Run the serial TLS probe from the archive build
+        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe tls
+        env:
+          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+
+      - name: Run the serial backtrace probe with local PDB
+        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe backtrace
+        env:
+          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
 
       - name: Prove split Rust test inventory and hash partitions are exact
         run: python scripts/rust-test-inventory-proof.py
@@ -1235,10 +1250,6 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Rust libtest shard (nextest archive)
-        # Run `platform_verifier_tls_client_subprocess` once in shard one before
-        # hash partitioning. Its spawned system-trust check can hang when other
-        # tests contend with machine trust evaluation.
-        #
         # The gate writes AFT_GATE_LOG itself; do not pipe it through `tee`.
         # On Windows a process a test leaks inherits the write end of every
         # pipe above it, so `tee` never saw end-of-file and the step hung past
@@ -1249,7 +1260,7 @@ jobs:
           AFT_GATE_LOG: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
-          AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
+          AFT_GATE_PHASES: lib-shard
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"

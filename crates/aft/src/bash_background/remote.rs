@@ -2270,10 +2270,7 @@ impl BgTaskRegistry {
                 state.metadata.execution_note = Some(remote_note.clone());
             }
             if status == BgTaskStatus::Killed
-                && matches!(
-                    state.metadata.status_reason.as_deref(),
-                    Some(super::SCOPE_REVOKED_REASON | "scope revoked")
-                )
+                && super::scope_end_label(state.metadata.status_reason.as_deref()).is_some()
             {
                 reason = state.metadata.status_reason.clone();
             }
