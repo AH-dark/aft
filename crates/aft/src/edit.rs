@@ -47,7 +47,9 @@ pub(crate) struct SourceWriteOutcome {
 ///   is an extended attribute; on macOS it is copied by `fcopyfile` and read
 ///   back with `acl_get_fd_np`);
 /// - on Windows, a single-link file replaced through `ReplaceFileW`, which
-///   keeps the replaced file's security descriptor, attributes and identity.
+///   keeps the replaced file's security descriptor, attributes and identity;
+///   the temporary gets the file's own protected DACL before any content is
+///   written, so it is never readable by more users than the file.
 ///
 /// Any other existing file is rewritten in place, as editors do when a
 /// backup-and-rename would alter the file, so access is never silently
@@ -138,7 +140,7 @@ fn atomic_write_source_with(
     if let Some(metadata) = original.as_ref() {
         // Copy and verify access metadata before any content is written, so a
         // replacement that cannot match the original costs nothing to abandon.
-        if !source_replacement::copy_access(&destination, file, metadata) {
+        if !source_replacement::copy_access(&destination, &temporary, file, metadata) {
             drop(cleanup);
             return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
         }
@@ -281,10 +283,15 @@ fn write_source_in_place(
         use std::os::unix::fs::PermissionsExt;
         let wanted = original.permissions().mode() & 0o7777;
         let now = file.metadata()?.permissions().mode() & 0o7777;
-        if now != wanted {
+        #[cfg(test)]
+        let forced = FORCE_MODE_RESTORE_FAILURE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let forced = false;
+        if now != wanted || forced {
             // Read the mode back: some file systems accept the call but drop
             // set-id bits, which must not pass silently either.
-            let restored = file.set_permissions(original.permissions()).is_ok()
+            let restored = !forced
+                && file.set_permissions(original.permissions()).is_ok()
                 && file
                     .metadata()
                     .is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == wanted);
@@ -342,7 +349,12 @@ mod source_replacement {
     /// Give `replacement` the original's group, mode and extended attributes,
     /// then read them back. Returns false when any of them cannot be matched.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(super) fn copy_access(destination: &Path, replacement: &File, original: &Metadata) -> bool {
+    pub(super) fn copy_access(
+        destination: &Path,
+        _replacement_path: &Path,
+        replacement: &File,
+        original: &Metadata,
+    ) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Ok(source) = File::open(destination) else {
             return false;
@@ -384,22 +396,26 @@ mod source_replacement {
             && xattrs::platform_acls_match(&source, replacement)
     }
 
-    /// On Windows `ReplaceFileW` itself moves the replaced file's security
-    /// descriptor, attributes and identity onto the replacement.
+    /// `ReplaceFileW` moves the replaced file's security descriptor onto the
+    /// replacement only when it commits. Until then the temporary would carry
+    /// the folder's inherited ACL, which can admit users the file does not,
+    /// so it gets the file's own protected DACL before any content is written.
     #[cfg(windows)]
     pub(super) fn copy_access(
-        _destination: &Path,
+        destination: &Path,
+        replacement_path: &Path,
         _replacement: &File,
         _original: &Metadata,
     ) -> bool {
-        true
+        super::windows_dacl::copy_protected(destination, replacement_path).is_ok()
     }
 
-    /// Other Unix systems offer no checked way to copy ACLs, so a replacement
+    /// Other systems offer no checked way to copy ACLs, so a replacement
     /// could widen access; their existing files are rewritten in place.
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub(super) fn copy_access(
         _destination: &Path,
+        _replacement_path: &Path,
         _replacement: &File,
         _original: &Metadata,
     ) -> bool {
@@ -757,6 +773,111 @@ mod source_replacement {
     }
 }
 
+/// Copies a file's DACL onto a new sibling (a replacement temporary or a
+/// recovery copy) before any content is written to it, so the sibling is
+/// never readable by anyone the original file does not admit.
+#[cfg(windows)]
+mod windows_dacl {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use windows_sys::Win32::Security::{
+        GetFileSecurityW, GetSecurityDescriptorDacl, SetFileSecurityW, ACL,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    /// The file's self-relative security descriptor holding only its DACL,
+    /// in a u64 buffer so the descriptor is suitably aligned.
+    fn dacl_descriptor(path: &Path) -> io::Result<Vec<u64>> {
+        let path = wide(path);
+        let mut needed = 0u32;
+        // SAFETY: a null buffer with length 0 queries the needed size.
+        unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: the buffer holds at least `needed` bytes.
+        let read = unsafe {
+            GetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(buffer)
+    }
+
+    /// The DACL's raw bytes, or `None` for a missing (null) DACL.
+    fn dacl_bytes(descriptor: &mut [u64]) -> io::Result<Option<Vec<u8>>> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: the descriptor buffer was filled by GetFileSecurityW.
+        let ok = unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.as_mut_ptr().cast(),
+                &mut present,
+                &mut acl,
+                &mut defaulted,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 0 || acl.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: `acl` points into the descriptor buffer and spans AclSize
+        // bytes, as the ACL header states.
+        let bytes = unsafe {
+            let size = usize::from((*acl).AclSize);
+            std::slice::from_raw_parts(acl.cast::<u8>(), size).to_vec()
+        };
+        Ok(Some(bytes))
+    }
+
+    /// Give `target` the DACL of `source`, protected from inheritance, then
+    /// read it back. Fails unless the two DACLs are byte-for-byte equal.
+    pub(super) fn copy_protected(source: &Path, target: &Path) -> io::Result<()> {
+        let mut descriptor = dacl_descriptor(source)?;
+        let wanted = dacl_bytes(&mut descriptor)?;
+        let target_wide = wide(target);
+        // SAFETY: the buffer holds the self-relative descriptor read above.
+        let set = unsafe {
+            SetFileSecurityW(
+                target_wide.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.as_mut_ptr().cast(),
+            )
+        };
+        if set == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if dacl_bytes(&mut dacl_descriptor(target)?)? != wanted {
+            return Err(io::Error::other("the copied DACL did not read back equal"));
+        }
+        Ok(())
+    }
+}
+
 /// Private copies of a file's original bytes, kept only while an in-place
 /// write is in progress. A crash mid-write leaves the copy behind, named after
 /// the file, so the next write to that file reports where the bytes are.
@@ -779,22 +900,53 @@ mod source_recovery {
             .unwrap_or_else(|| Path::new("."))
     }
 
-    /// The recovery name embeds the file name so a leftover copy can be
-    /// matched to its file; very long names use the random part alone.
+    /// The raw bytes of a file name: Unix bytes as stored, Windows UTF-16
+    /// code units in little-endian order.
+    fn name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            name.as_bytes().to_vec()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            name.encode_wide().flat_map(u16::to_le_bytes).collect()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            name.to_string_lossy().into_owned().into_bytes()
+        }
+    }
+
+    /// The part of a recovery name that identifies its file. Creation and
+    /// lookup both use it. A short UTF-8 name is kept readable; a longer or
+    /// non-UTF-8 name becomes a hash of its bytes.
+    fn file_identifier(destination: &Path) -> Option<String> {
+        let name = destination.file_name()?;
+        Some(match name.to_str() {
+            Some(text) if text.len() <= MAX_NAMED_LEN => text.to_owned(),
+            _ => {
+                let hash = blake3::hash(&name_bytes(name));
+                format!("name-hash-{}", &hash.to_hex()[..32])
+            }
+        })
+    }
+
     fn copy_name(destination: &Path, random: &str) -> String {
-        match destination.file_name().and_then(|name| name.to_str()) {
-            Some(name) if name.len() <= MAX_NAMED_LEN => format!("{PREFIX}{random}-{name}{SUFFIX}"),
-            _ => format!("{PREFIX}{random}{SUFFIX}"),
+        match file_identifier(destination) {
+            Some(identifier) => format!("{PREFIX}{random}-{identifier}{SUFFIX}"),
+            None => format!("{PREFIX}{random}{SUFFIX}"),
         }
     }
 
     /// Warnings for recovery copies an interrupted earlier write of this file
     /// left behind; the new write does not touch them.
     pub(super) fn leftover_copy_warnings(destination: &Path) -> Vec<String> {
-        let Some(name) = destination.file_name().and_then(|name| name.to_str()) else {
+        let Some(identifier) = file_identifier(destination) else {
             return Vec::new();
         };
-        let tail = format!("-{name}{SUFFIX}");
+        let tail = format!("-{identifier}{SUFFIX}");
         let Ok(entries) = fs::read_dir(parent_of(destination)) else {
             return Vec::new();
         };
@@ -873,55 +1025,7 @@ mod source_recovery {
     /// inheritable entries cannot widen it.
     #[cfg(windows)]
     fn make_private(destination: &Path, copy: &Path, _file: &File) -> io::Result<()> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Security::{
-            GetFileSecurityW, SetFileSecurityW, DACL_SECURITY_INFORMATION,
-            PROTECTED_DACL_SECURITY_INFORMATION,
-        };
-        let wide =
-            |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
-        let (source, target) = (wide(destination), wide(copy));
-        let mut needed = 0u32;
-        // SAFETY: a null buffer with length 0 queries the needed size.
-        unsafe {
-            GetFileSecurityW(
-                source.as_ptr(),
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                0,
-                &mut needed,
-            )
-        };
-        if needed == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // A u64 buffer keeps the descriptor suitably aligned.
-        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
-        // SAFETY: the buffer holds at least `needed` bytes.
-        let read = unsafe {
-            GetFileSecurityW(
-                source.as_ptr(),
-                DACL_SECURITY_INFORMATION,
-                buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        };
-        if read == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the buffer holds the self-relative descriptor read above.
-        let set = unsafe {
-            SetFileSecurityW(
-                target.as_ptr(),
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                buffer.as_mut_ptr().cast(),
-            )
-        };
-        if set == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        super::windows_dacl::copy_protected(destination, copy)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -2142,6 +2246,10 @@ thread_local! {
     pub(crate) static LINE_OFFSET_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EXCERPT_COPIED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WRITE_PIPELINE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Makes the next in-place writes behave as if the system dropped the
+    /// file's mode and refused to restore it, so callers' warning plumbing
+    /// can be tested without a file owned by another user.
+    pub(crate) static FORCE_MODE_RESTORE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static A03_DIFF_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static A03_LINE_INDEX_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static A03_HANDLER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3189,6 +3297,40 @@ mod in_place_write_tests {
         assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
     }
 
+    /// Leave a recovery copy behind exactly as an interrupted in-place write
+    /// would, then check the next write of the same file reports it.
+    #[cfg(unix)]
+    fn assert_leftover_copy_is_reported(path: &Path) {
+        std::fs::write(path, "old\n").unwrap();
+        let copy = source_recovery::save(path, b"old\n").unwrap();
+        let outcome = atomic_write_source(path, b"new\n").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"new\n");
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].starts_with("recovery_copy_found: "));
+        assert!(
+            outcome.warnings[0].contains(&copy.display().to_string()),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(std::fs::read(&copy).unwrap(), b"old\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leftover_copy_of_a_long_name_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_leftover_copy_is_reported(&dir.path().join(format!("{}.txt", "n".repeat(230))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leftover_copy_of_a_non_utf8_name_is_reported() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"bad\xffname.txt");
+        assert_leftover_copy_is_reported(&dir.path().join(name));
+    }
+
     #[test]
     fn next_write_reports_a_leftover_recovery_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -3299,6 +3441,72 @@ mod in_place_write_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
         assert_eq!(icacls(&path), before);
         assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    /// The current user's SID, from `whoami /user`.
+    #[cfg(windows)]
+    fn current_user_sid() -> String {
+        let output = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.trim()
+            .rsplit(',')
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    /// A file readable only by its owner sits in a folder that admits more
+    /// users. The replacement temporary must carry the file's DACL before
+    /// any content reaches it; the writer callback observes the temporary
+    /// after the DACL step and before `ReplaceFileW`.
+    #[cfg(windows)]
+    #[test]
+    fn replacement_temporary_never_has_a_wider_dacl_than_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let restricted = std::process::Command::new("icacls")
+            .arg(&path)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("*{}:(F)", current_user_sid()),
+            ])
+            .output()
+            .unwrap();
+        assert!(restricted.status.success(), "{restricted:?}");
+        let before = icacls(&path);
+        assert_eq!(acl_entries(&before, &path).len(), 1, "{before}");
+        let mut seen = None;
+        let outcome = atomic_write_source_with(&path, b"new\n", |file, bytes| {
+            use std::io::Write;
+            let temporaries: Vec<String> = recovery_entries(dir.path())
+                .into_iter()
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert_eq!(temporaries.len(), 1, "{temporaries:?}");
+            let temporary = dir.path().join(&temporaries[0]);
+            seen = Some((icacls(&temporary), temporary));
+            file.write_all(bytes)
+        })
+        .unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::Replaced);
+        let (temporary_acl, temporary) = seen.expect("the writer saw the temporary");
+        assert_eq!(
+            acl_entries(&temporary_acl, &temporary),
+            acl_entries(&before, &path),
+            "the temporary must carry exactly the file's own DACL"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(
+            acl_entries(&icacls(&path), &path),
+            acl_entries(&before, &path)
+        );
     }
 
     /// An in-place write's recovery copy must carry exactly the file's own
