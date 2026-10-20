@@ -237,6 +237,95 @@ pub fn sweep_family_bounded(
     bounds: SweepBounds,
     observer: Option<&dyn SweepObserver>,
 ) -> Result<FamilySweepReport, FamilySweepError> {
+    sweep_with(
+        registry,
+        requested_by,
+        policy,
+        bounds,
+        observer,
+        SmallFamilyCheck::Never,
+    )
+}
+
+/// [`sweep_family_bounded`] for a caller that sweeps a family on a schedule
+/// and usually finds it small, such as disk-limit enforcement.
+///
+/// After marking, with the lease held and every store's epoch raised, it
+/// adds up the sizes of the files under `blobs/v2/<family>/` with the same
+/// walk disk measurement uses, bounded by the sweep's deadline and opening
+/// no SQLite file. When that walk finishes and the total is at most
+/// `policy.byte_budget`, no plane can hold more payload and segment bytes
+/// than the budget, because every plane's rows and segments are stored in
+/// those files. Deletion then skips every plane's segment listing,
+/// page-capacity bound, logical totals and row listing, which would find
+/// nothing to delete. A put that lands after the walk is just as invisible
+/// to those per-plane checks, which are also read before deletion. When the
+/// walk stops early or exceeds the budget, each plane decides as in
+/// [`sweep_family_bounded`]: first by its page capacity plus segment bytes,
+/// then by its logical totals. Marking, the removal of members whose root
+/// is gone, and the release of free pages run either way.
+///
+/// No measurement from the caller is used: the family may have grown since
+/// the caller measured it.
+pub fn sweep_family_remeasured(
+    registry: &FamilyRegistry,
+    requested_by: Option<&str>,
+    policy: FamilySweepPolicy,
+    bounds: SweepBounds,
+    observer: Option<&dyn SweepObserver>,
+) -> Result<FamilySweepReport, FamilySweepError> {
+    sweep_with(
+        registry,
+        requested_by,
+        policy,
+        bounds,
+        observer,
+        SmallFamilyCheck::FileWalk,
+    )
+}
+
+/// How a sweep decides, after marking, that the family is too small for
+/// deletion to find anything over its budget.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SmallFamilyCheck {
+    /// Never: each plane decides by its page capacity, then its logical
+    /// totals.
+    Never,
+    /// When a complete walk of the family's files is within the budget.
+    FileWalk,
+    /// When the given byte count is within the budget, as a sweep that
+    /// relied on a family size measured before the sweep started would
+    /// decide. Tests use it to show the rows such a sweep would fail to
+    /// delete when the family grew in between.
+    #[cfg(test)]
+    Assumed(u64),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts each plane for which deletion on this thread ran its own
+    /// checks (segment listing, page capacity, and logical totals when those
+    /// do not settle it), so tests can count a sweep's per-plane aggregates.
+    static DELETE_AGGREGATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many planes deletion has run its own checks for on this thread.
+#[cfg(test)]
+pub(crate) fn delete_aggregates_on_this_thread() -> usize {
+    DELETE_AGGREGATES.with(std::cell::Cell::get)
+}
+
+/// The sweep itself, shared by [`sweep_family_bounded`] and
+/// [`sweep_family_remeasured`]; `small` decides when deletion may skip the
+/// planes' own checks.
+pub(crate) fn sweep_with(
+    registry: &FamilyRegistry,
+    requested_by: Option<&str>,
+    policy: FamilySweepPolicy,
+    bounds: SweepBounds,
+    observer: Option<&dyn SweepObserver>,
+    small: SmallFamilyCheck,
+) -> Result<FamilySweepReport, FamilySweepError> {
     let _ = requested_by;
     let lease = registry.begin_sweep()?.ok_or(FamilySweepError::Busy)?;
     let epoch = lease.epoch();
@@ -282,6 +371,20 @@ pub fn sweep_family_bounded(
     report.marked_keys = marked.len();
     observe(observer, SweepStep::Marked);
 
+    let within_budget = match small {
+        SmallFamilyCheck::Never => false,
+        SmallFamilyCheck::FileWalk => matches!(
+            crate::views::eviction::family_files_within(
+                registry.storage(),
+                registry.family(),
+                bounds.deadline,
+                policy.byte_budget,
+            ),
+            Ok(true)
+        ),
+        #[cfg(test)]
+        SmallFamilyCheck::Assumed(bytes) => bytes <= policy.byte_budget,
+    };
     for store in &stores {
         delete_unmarked(
             registry,
@@ -291,6 +394,7 @@ pub fn sweep_family_bounded(
             policy,
             &bounds,
             observer,
+            within_budget,
             &mut report,
         )?;
     }
@@ -346,21 +450,46 @@ fn delete_unmarked(
     policy: FamilySweepPolicy,
     bounds: &SweepBounds,
     observer: Option<&dyn SweepObserver>,
+    family_within_budget: bool,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
+    // A family whose files all fit in the budget has no plane over it, so
+    // there is nothing to delete. Free pages are released either way.
+    if !family_within_budget {
+        delete_over_budget(
+            registry, store, marked, epoch, policy, bounds, observer, report,
+        )?;
+    }
+    reclaim_free_pages(store, bounds, report)
+}
+
+/// Deletes unmarked rows and segments of one plane, oldest epoch first,
+/// while its payload and segment bytes exceed the budget.
+#[allow(clippy::too_many_arguments)]
+fn delete_over_budget(
+    registry: &FamilyRegistry,
+    store: &FamilyStore,
+    marked: &BTreeSet<[u8; 32]>,
+    epoch: u64,
+    policy: FamilySweepPolicy,
+    bounds: &SweepBounds,
+    observer: Option<&dyn SweepObserver>,
+    report: &mut FamilySweepReport,
+) -> Result<(), FamilySweepError> {
+    #[cfg(test)]
+    DELETE_AGGREGATES.with(|planes| planes.set(planes.get() + 1));
     let segments = store.segments()?;
     let segment_bytes = segments.iter().map(|row| row.byte_len).sum::<u64>();
     // Allocated database pages include payloads, indexes and free space. If
     // even this upper bound fits, no payload can be deleted under the budget,
-    // so the exact payload sum is skipped. Free pages left by earlier deletions
-    // are still returned to the file system below. Otherwise use the exact sum,
-    // not this bound, to decide when to stop.
+    // so the exact payload sum is skipped. Otherwise use the exact sum, not
+    // this bound, to decide when to stop.
     if store
         .payload_bytes_upper_bound()?
         .saturating_add(segment_bytes)
         <= policy.byte_budget
     {
-        return reclaim_free_pages(store, bounds, report);
+        return Ok(());
     }
     // The total comes from SQLite's own sums, not from the listing, so the
     // budget check stays right when the listing below is cut at its bound.
@@ -419,7 +548,7 @@ fn delete_unmarked(
             report.deleted_bytes += segment.byte_len;
         }
     }
-    reclaim_free_pages(store, bounds, report)
+    Ok(())
 }
 
 /// One bounded incremental-vacuum pass over the store, recorded in `report`.
