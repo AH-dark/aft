@@ -275,6 +275,30 @@ pub(crate) fn barrier(storage: &Path) -> io::Result<crate::fs_lock::LockGuard> {
     .map_err(|error| io::Error::other(error.to_string()))
 }
 
+// Keep admission on sweep.lock so older binaries sharing this storage still
+// serialize their final history checks with new bindings. The separate marker
+// only signals a pending bind so cooperative sweepers yield; sweep.lock still
+// controls admission for both old and new binaries.
+pub(crate) fn bind_pending(storage: &Path) -> bool {
+    let path = storage.join("retention/bind-pending.lock");
+    if !path.exists() {
+        return false;
+    }
+    // Reclaim a dead binder's marker instead of indefinitely disabling cleanup.
+    crate::fs_lock::try_acquire(&path, Duration::ZERO).is_err()
+}
+
+fn yield_to_bind(storage: &Path) -> io::Result<()> {
+    if storage.join("retention/bind-pending.lock").exists() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "retention yielded to checkout binding",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// V1 has no ref-epoch handoff. Serialize pin admission with its marking pass.
 /// V2 pins use the family registry's epoch/barrier protocol instead.
 pub(crate) fn pin_barrier(view_dir: &Path) -> io::Result<Option<crate::fs_lock::LockGuard>> {
@@ -582,7 +606,22 @@ pub(crate) fn record_bind_until(
                 state = queue.state.lock().unwrap();
                 continue;
             };
-            let admission = bind_lock_until(&path, round_deadline, round_started);
+            // One marker covers the entire publication round, including the
+            // wait for a sweeper to release admission. Followers share it rather
+            // than serializing on a marker owned by an individual caller.
+            let admission = bind_lock_until(
+                &storage.join("retention/bind-pending.lock"),
+                round_deadline,
+                round_started,
+            )
+            .and_then(|pending| {
+                #[cfg(test)]
+                for member in &leader.members {
+                    test_hook(&member.binding.root, "bind-pending");
+                }
+                bind_lock_until(&path, round_deadline, round_started)
+                    .map(|barrier| (pending, barrier))
+            });
             #[cfg(test)]
             if admission.is_ok() {
                 test_hook(storage, "bind-round-admitted");
@@ -598,14 +637,16 @@ pub(crate) fn record_bind_until(
             drop(state);
             leader.result = if let Some(round_deadline) = round_deadline {
                 admission
-                    .and_then(|barrier| {
-                        publish_bind_round(
+                    .and_then(|(pending, barrier)| {
+                        let result = publish_bind_round(
                             storage,
                             &leader.members,
                             round_started,
                             round_deadline,
                             barrier,
-                        )
+                        );
+                        drop(pending);
+                        result
                     })
                     .map_err(|error| BindRoundError(Arc::new(error)))
             } else {
@@ -642,6 +683,7 @@ fn publish_bind_round(
     let lock_path = storage.join("retention/sweep.lock");
     #[cfg(test)]
     for member in members {
+        test_hook(&member.binding.root, "bind-protected");
         test_hook(&member.binding.root, "bind-acquired");
     }
     #[cfg(test)]
@@ -1186,6 +1228,13 @@ fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
 }
 
 fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+    bindings_with_admission(storage, false)
+}
+
+fn bindings_with_admission(
+    storage: &Path,
+    admission: bool,
+) -> io::Result<BTreeMap<String, Vec<Binding>>> {
     #[derive(Deserialize)]
     struct Memo {
         key: String,
@@ -1194,6 +1243,13 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
     let mut result: BTreeMap<String, Vec<Binding>> = BTreeMap::new();
     #[cfg(test)]
     test_hook(storage, "history-read");
+    if admission {
+        yield_to_bind(storage)?;
+    }
+    #[cfg(test)]
+    if admission {
+        test_hook(&storage.join("retention"), "admission-history");
+    }
     let mut linked_roots = HashMap::new();
     let memo = storage.join("cache-keys.json");
     if memo.exists() {
@@ -1202,6 +1258,9 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
             return Err(io::Error::other("retention history exceeds 8192 bindings"));
         }
         for (root, entry) in memo {
+            if admission {
+                yield_to_bind(storage)?;
+            }
             let binding = Binding {
                 root: root.into(),
                 artifact_key: entry.key,
@@ -1221,6 +1280,9 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
         }
     }
     for entry in bounded_dirs(&storage.join("retention/roots"), HISTORY_ENTRIES)? {
+        if admission {
+            yield_to_bind(storage)?;
+        }
         if entry
             .path()
             .extension()
@@ -1249,6 +1311,9 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
             .push(binding);
     }
     for entry in bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES)? {
+        if admission {
+            yield_to_bind(storage)?;
+        }
         if !entry.file_type()?.is_dir() {
             continue;
         }
@@ -1282,6 +1347,9 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
     // identifies same-root legacy copies that did not record either fact.
     for records in result.values_mut() {
         for binding in records {
+            if admission {
+                yield_to_bind(storage)?;
+            }
             if let Some((volume, stable_volume)) =
                 linked_roots.get(&crate::root_cache::canonical_root(&binding.root))
             {
@@ -1890,17 +1958,25 @@ struct OwnerManifests(
 
 impl OwnerManifests {
     fn read(storage: &Path) -> Self {
+        Self::read_with_admission(storage, false)
+    }
+
+    fn read_with_admission(storage: &Path, admission: bool) -> Self {
         #[cfg(test)]
         test_hook(storage, "owner-scan");
         Self(
-            bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES).map(|owners| {
-                owners
-                    .into_iter()
-                    .filter_map(|owner| {
-                        let path = owner.path().join("owner.json");
-                        path.exists().then(|| (owner.file_name(), read_json(&path)))
-                    })
-                    .collect()
+            bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES).and_then(|owners| {
+                let mut records = Vec::new();
+                for owner in owners {
+                    if admission {
+                        yield_to_bind(storage)?;
+                    }
+                    let path = owner.path().join("owner.json");
+                    if path.exists() {
+                        records.push((owner.file_name(), read_json(&path)));
+                    }
+                }
+                Ok(records)
             }),
         )
     }
@@ -1994,6 +2070,20 @@ impl DueBatch {
             report.stopped_early = true;
             return Ok(());
         }
+        #[cfg(test)]
+        test_hook(storage, "due-ready");
+        if bind_pending(storage) {
+            for item in items {
+                let before = DomainReport::from_report(report);
+                report.skipped_protected += 1;
+                item.attribute(storage, &before, report)?;
+            }
+            return Ok(());
+        }
+        // Do not hold bind admission while waiting for SQLite's open gate.
+        // Lock acquisition below is nonblocking, avoiding an inverted wait
+        // against older retirement paths that take these locks in reverse.
+        let files = crate::db::file_identity::filesystem_guard();
         let phase = Instant::now();
         // Try the retention barrier without waiting. If a bind or pin holds it,
         // that caller is protecting this storage right now, so retention backs
@@ -2012,10 +2102,11 @@ impl DueBatch {
                         report.stopped_early = true;
                         return Ok(None);
                     }
+                    yield_to_bind(storage)?;
                     Ok(Some((
                         barrier,
-                        bindings(storage)?,
-                        OwnerManifests::read(storage),
+                        bindings_with_admission(storage, true)?,
+                        OwnerManifests::read_with_admission(storage, true),
                     )))
                 });
         *report
@@ -2034,29 +2125,46 @@ impl DueBatch {
                 return Ok(());
             }
         };
+        let mut retired = Vec::new();
         for item in items {
             if clock() >= deadline {
                 report.stopped_early = true;
+                break;
+            }
+            if yield_to_bind(storage).is_err() {
                 break;
             }
             let before = DomainReport::from_report(report);
             let cache = item.directory.join(&item.key);
             let directory = item.directory.clone();
             let due_lane = item.due_lane;
+            let key = item.key.clone();
+            let deadline = item.deadline;
             if !report.cancelled {
                 if let Err(error) = item.retire(storage, &current, &owners, now, cancelled, report)
                 {
                     report.skipped_protected += 1;
-                    if report.errors.len() < 16 {
+                    if error.kind() != io::ErrorKind::Interrupted && report.errors.len() < 16 {
                         report.errors.push(format!("{}: {error}", cache.display()));
                     }
                 }
+            }
+            if report.removed_roots > before.removed_roots {
+                retired.push((key, deadline));
             }
             attribute_due(storage, &directory, due_lane, &before, report)?;
         }
         drop(barrier);
         #[cfg(test)]
         test_hook(storage, "due-released");
+        drop(files);
+        // These lookups can walk legacy flat cache domains. The roots are
+        // already retired; a bind must not queue behind this bookkeeping.
+        for (key, deadline) in retired {
+            if !cache_key_present(storage, &key, deadline)? {
+                clear_unknown_observation(storage, &key)?;
+            }
+        }
         Ok(())
     }
 }
@@ -2101,7 +2209,7 @@ impl PreparedDue {
     /// cache path, as a lane reports any candidate whose checks failed.
     fn refuse(&self, error: &io::Error, report: &mut SweepReport) {
         report.skipped_protected += 1;
-        if report.errors.len() < 16 {
+        if error.kind() != io::ErrorKind::Interrupted && report.errors.len() < 16 {
             report.errors.push(format!(
                 "{}: {error}",
                 self.directory.join(&self.key).display()
@@ -2109,8 +2217,8 @@ impl PreparedDue {
         }
     }
 
-    /// Recheck admission against history read under the barrier, then retire
-    /// the cache with a rename.
+    /// Recheck against history read while holding sweep.lock, which both old
+    /// and new binaries take before recording a binding.
     fn retire(
         self,
         storage: &Path,
@@ -2124,7 +2232,7 @@ impl PreparedDue {
             directory,
             key,
             leases,
-            deadline,
+            deadline: _,
             ..
         } = self;
         let cache = directory.join(&key);
@@ -2138,7 +2246,6 @@ impl PreparedDue {
             report.skipped_protected += 1;
             return Ok(());
         }
-        let _files = crate::db::file_identity::filesystem_guard();
         if crate::db::file_identity::has_open_connections_under(&cache) {
             report.skipped_protected += 1;
             return Ok(());
@@ -2147,6 +2254,7 @@ impl PreparedDue {
             report.cancelled = true;
             return Ok(());
         }
+        yield_to_bind(storage)?;
         let phase = Instant::now();
         retire_directory(storage, &cache)?;
         *report.timings_ms.entry("due_rename".into()).or_default() +=
@@ -2155,9 +2263,6 @@ impl PreparedDue {
         report.unmeasured_removed_roots += 1;
         if directory == storage.join("views") {
             report.due_views_remaining = report.due_views_remaining.saturating_sub(1);
-        }
-        if !cache_key_present(storage, key, deadline)? {
-            clear_unknown_observation(storage, key)?;
         }
         // Lease guards address the old pathname. Drop them before releasing
         // admission so they cannot touch a newly bound replacement at that path.
@@ -2555,12 +2660,16 @@ fn candidate_inner(
         return Ok(());
     }
     // Walks run without either admission or SQLite's process-wide open gate.
-    // Recheck protection and binding history under admission immediately before
-    // deletion, since a configure or query may have arrived during the walks.
-    // A registration binds its root under this barrier before it creates a
-    // view folder, so an orphan that gained history here is no longer one.
-    let _barrier = barrier(storage)?;
-    let current_history = bindings(storage)?;
+    // Both old and new binders use sweep.lock. Reread history under it, but
+    // never wait for SQLite's open gate while holding binding admission.
+    #[cfg(test)]
+    test_hook(storage, "candidate-ready");
+    yield_to_bind(storage)?;
+    let files_guard = crate::db::file_identity::filesystem_guard();
+    let admission =
+        crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    let current_history = bindings_with_admission(storage, true)?;
     if !eligible(
         storage,
         key,
@@ -2574,7 +2683,6 @@ fn candidate_inner(
         report.skipped_protected += 1;
         return Ok(());
     }
-    let files_guard = crate::db::file_identity::filesystem_guard();
     if crate::db::file_identity::has_open_connections_under(&cache) {
         report.skipped_protected += 1;
         return Ok(());
@@ -2583,6 +2691,7 @@ fn candidate_inner(
         report.cancelled = true;
         return Ok(());
     }
+    yield_to_bind(storage)?;
     if flat {
         // Legacy domains contain several roots. Delete only the key's file set,
         // never the directory or another key's files/coordination records.
@@ -2605,13 +2714,14 @@ fn candidate_inner(
             .min(new_bytes);
     }
     report.removed_roots += 1;
+    drop(leases);
+    drop(admission);
+    drop(files_guard);
     // The observation is shared by every plane for this key. Keep its original
     // grace until the last cache is gone, rather than restarting it per plane.
     if !cache_key_present(storage, key, deadline)? {
         clear_unknown_observation(storage, key)?;
     }
-    drop(files_guard);
-    drop(leases);
     Ok(())
 }
 
@@ -2869,6 +2979,10 @@ fn run_pass_with_budget(
         ..Default::default()
     };
     let result = (|| -> io::Result<()> {
+        if bind_pending(storage) {
+            report.stopped_early = true;
+            return Ok(());
+        }
         if !crate::root_cache::storage_allows_root_keyed(storage)? {
             return Err(io::Error::other("network storage retained"));
         }
@@ -3033,11 +3147,13 @@ fn run_pass_with_budget(
         Ok(())
     })();
     if let Err(error) = result {
-        report.errors.push(error.to_string());
+        if error.kind() != io::ErrorKind::Interrupted {
+            report.errors.push(error.to_string());
+        }
     }
     // Blob stores have their own mark-before-sweep barrier. Release the root
     // barrier before entering it; otherwise pin admission would deadlock.
-    if !report.cancelled && !cancelled() {
+    if !report.cancelled && !cancelled() && !bind_pending(storage) {
         let phase = Instant::now();
         if let Err(error) = collect_one_family(storage, cancelled, &mut report) {
             report.errors.push(error.to_string());
@@ -5190,6 +5306,18 @@ mod storage_retention_tests {
         std::thread::JoinHandle<SweepReport>,
         std::sync::mpsc::Sender<()>,
     ) {
+        paused_pass_with_budget(storage, cache, phase, PASS_BUDGET)
+    }
+
+    fn paused_pass_with_budget(
+        storage: &Path,
+        cache: &Path,
+        phase: &'static str,
+        budget: Duration,
+    ) -> (
+        std::thread::JoinHandle<SweepReport>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -5210,7 +5338,7 @@ mod storage_retention_tests {
         let storage = storage.to_path_buf();
         let cache = cache.to_path_buf();
         let worker = std::thread::spawn(move || {
-            let report = run_pass(&storage, &|| false);
+            let report = run_pass_with_budget(&storage, &|| false, &Instant::now, budget);
             test_hooks().lock().unwrap().remove(&cache);
             report
         });
@@ -5662,6 +5790,169 @@ mod storage_retention_tests {
         let report = worker.join().unwrap();
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn retention_bind_bypasses_busy_sweep_without_losing_protection() {
+        let (temp, _, _, _) = due_cache_fixture();
+        let root = temp.path().join("new-checkout");
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        let path = cache(temp.path(), "views", &scope);
+        assert_bind_bypasses_sweep(&temp, root, scope, path, "cache-presence", 1);
+    }
+
+    #[test]
+    fn retention_bind_rechecks_recent_clock_before_due_retirement() {
+        let (temp, root, scope, path) = due_cache_fixture();
+        assert_bind_bypasses_sweep(&temp, root, scope, path, "due-ready", 0);
+    }
+
+    #[test]
+    fn retention_bind_invalidates_orphan_sweep_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        let path = cache(temp.path(), "views", &scope);
+        age_orphan(temp.path(), &path, &scope);
+        assert_bind_bypasses_sweep(&temp, root, scope, path, "candidate-ready", 0);
+    }
+
+    fn assert_bind_bypasses_sweep(
+        temp: &tempfile::TempDir,
+        root: PathBuf,
+        scope: String,
+        path: PathBuf,
+        phase: &'static str,
+        retired_before_bind: usize,
+    ) {
+        let (sweep, release) =
+            paused_pass_with_budget(temp.path(), temp.path(), phase, NO_TIME_BOUND);
+        fs::create_dir_all(&root).unwrap();
+        let storage = temp.path().to_path_buf();
+        let bind_root = root.clone();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        let bind = std::thread::spawn(move || {
+            let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _observer = crate::fs_lock::observe_retry_sleeps_for_test(retries.clone());
+            let started = Instant::now();
+            // The bind uses a different key from the checkout's view cache, so
+            // clearing the bound key's unknown-observation record cannot keep
+            // this view safe by accidentally resetting its observation grace.
+            let result = record_bind(&storage, &bind_root, "fedcba9876543210");
+            bound_tx
+                .send((
+                    started.elapsed(),
+                    result,
+                    retries.load(std::sync::atomic::Ordering::SeqCst),
+                ))
+                .unwrap();
+        });
+        let acknowledged = bound_rx.recv_timeout(Duration::from_secs(10));
+        let before_release = matches!(&acknowledged, Ok((_, Ok(()), _)));
+        if before_release {
+            let binding: Binding =
+                read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+            assert!(binding.last_bound_ms > 0);
+            // Remove the checkout again so only its updated retention record,
+            // not its continued existence, can protect the cached artifacts.
+            fs::remove_dir(&root).unwrap();
+        }
+        release.send(()).unwrap();
+        let report = sweep.join().unwrap();
+        let (elapsed, result, retries) = acknowledged
+            .unwrap_or_else(|_| bound_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        bind.join().unwrap();
+        eprintln!(
+            "retention bind with {phase} paused: {}ms; acknowledged_before_release={before_release}; retry_sleeps={retries}; removed_roots={}",
+            elapsed.as_millis(), report.removed_roots
+        );
+        assert!(
+            before_release,
+            "bind waited for the busy sweep: {elapsed:?}; {result:?}"
+        );
+        result.unwrap();
+        assert_eq!(retries, 0, "bind retried the busy sweep's lock");
+        assert_eq!(report.removed_roots, retired_before_bind, "{report:?}");
+        assert!(path.join("payload.bin").exists());
+    }
+
+    #[test]
+    fn retention_bind_interrupts_admitted_history_reread() {
+        let (temp, _, _, _) = due_cache_fixture();
+        let root = temp.path().join("new-checkout");
+        fs::create_dir(&root).unwrap();
+        let (sweep, release) =
+            paused_pass_with_budget(temp.path(), temp.path(), "due-admitted", NO_TIME_BOUND);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = reads.clone();
+        let _history = observe_test_hook(
+            &temp.path().join("retention"),
+            Arc::new(move |step| {
+                if step == "admission-history" {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let _pending = observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "bind-pending" {
+                    pending_tx.send(()).unwrap();
+                }
+            }),
+        );
+        let storage = temp.path().to_path_buf();
+        let bind = std::thread::spawn(move || record_bind(&storage, &root, "fedcba9876543210"));
+        pending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release.send(()).unwrap();
+        let report = sweep.join().unwrap();
+        bind.join().unwrap().unwrap();
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an admitted sweep must yield before rereading history for a waiting bind: {report:?}"
+        );
+    }
+
+    #[test]
+    fn retention_bind_still_excludes_legacy_sweepers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let _hook = observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "bind-protected" {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }),
+        );
+        let storage = temp.path().to_path_buf();
+        let bind = std::thread::spawn(move || record_bind(&storage, &root, "fedcba9876543210"));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Older binaries know only this lock. They must remain excluded while
+        // the new binder publishes its durable registration.
+        let legacy =
+            crate::fs_lock::try_acquire(&temp.path().join("retention/sweep.lock"), Duration::ZERO);
+        release_tx.send(()).unwrap();
+        bind.join().unwrap().unwrap();
+        assert!(
+            legacy.is_err(),
+            "new binding bypassed the legacy retention lock"
+        );
     }
 
     #[test]
@@ -7512,6 +7803,8 @@ fn clear_unknown_observation(storage: &Path, key: &str) -> io::Result<()> {
 }
 
 fn cache_key_present(storage: &Path, key: &str, deadline: Instant) -> io::Result<bool> {
+    #[cfg(test)]
+    test_hook(storage, "cache-presence");
     for (directory, flat) in domain_paths(storage)? {
         if !flat {
             let cache = directory.join(key);
