@@ -5280,8 +5280,8 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
         let frame = read_frame_timeout(&mut stream, "worker limit bash").await;
         let elapsed = started.elapsed();
         assert_eq!(frame.header.corr, corr);
-        assert!(!tool_result_is_error(&frame), "{mode}");
         let text = tool_result_text(&frame);
+        assert!(!tool_result_is_error(&frame), "{mode}: {text}");
         assert!(
             elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
             "{mode}: the call must return at the 1.5s limit, took {elapsed:?}"
