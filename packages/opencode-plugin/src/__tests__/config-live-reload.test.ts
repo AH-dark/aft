@@ -3,7 +3,8 @@
 /**
  * Live config reload in the OpenCode plugins: an edit to either config file
  * reaches the plugin's own `ctx.config` for the keys it reads per call, and
- * leaves everything that shapes the registered tools as loaded.
+ * leaves restart-only registration choices as loaded. The revision-read gate
+ * also refreshes the optional `ref` argument on already registered tools.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -12,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   getConfigLoadSources,
@@ -21,6 +23,9 @@ import {
 } from "../config.js";
 import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
+import { projectV2Tool } from "../tools/definitions/v2.js";
+import { createReadTool } from "../tools/hoisted.js";
+import { readingTools } from "../tools/reading.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
 
@@ -85,6 +90,29 @@ function sdkContext(): ToolContext {
 }
 
 describe.serial("OpenCode live config reload", () => {
+  test("revision_reads refreshes registered V1 and V2 schemas in both directions", async () => {
+    const f = await fixture('{"revision_reads":false}');
+    const definitions = { read: createReadTool(f.ctx), ...readingTools(f.ctx) };
+    const projected = Object.entries(definitions).map(([name, definition]) =>
+      projectV2Tool(name, definition, { directory: PROJECT_CWD }),
+    );
+    for (const enabled of [true, false]) {
+      writeFileSync(f.userPath, JSON.stringify({ revision_reads: enabled }));
+      expect(f.reload.reload()?.applied).toContain("revision_reads");
+      expect(f.ctx.config.revision_reads).toBe(enabled);
+      for (const definition of Object.values(definitions)) {
+        expect(Object.hasOwn(definition.args, "ref")).toBe(enabled);
+        expect(definition.description.includes("git revision")).toBe(enabled);
+      }
+      for (const definition of projected) {
+        const schema = tool.schema.toJSONSchema(definition.input, { io: "input" }) as {
+          properties: Record<string, unknown>;
+        };
+        expect(Object.hasOwn(schema.properties, "ref")).toBe(enabled);
+        expect(definition.description.includes("git revision")).toBe(enabled);
+      }
+    }
+  });
   test("inspect categories and LSP idle minutes follow trusted user edits live", async () => {
     const f = await fixture(
       '{"lsp":{"idle_minutes":60},"inspect":{"categories":{"dead_code":true}}}',

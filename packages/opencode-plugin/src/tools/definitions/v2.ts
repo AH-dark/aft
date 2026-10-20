@@ -385,20 +385,28 @@ export function projectV2Tool(
   consumers: V2ToolConsumers = {},
 ): V2ProviderTool {
   const hostName = v2HostToolName(name);
-  const input = tool.schema.object(projectArguments(name, definition));
-  assertV2Contract(hostName, input);
+  const currentInput = () => {
+    const input = tool.schema.object(projectArguments(name, definition));
+    assertV2Contract(hostName, input);
+    return input;
+  };
+  currentInput();
   const sharedOptions = (definition as ToolDefinition & { options?: Record<string, unknown> })
     .options;
   const permission = hostPermission(name);
 
   return {
     name: hostName,
-    description: renameV2ToolReferences(
-      ["read", "write", "edit"].includes(name)
-        ? definition.description.replaceAll("filePath", "path")
-        : definition.description,
-    ),
-    input,
+    get description() {
+      return renameV2ToolReferences(
+        ["read", "write", "edit"].includes(name)
+          ? definition.description.replaceAll("filePath", "path")
+          : definition.description,
+      );
+    },
+    get input() {
+      return currentInput();
+    },
     options: {
       ...sharedOptions,
       ...(permission ? { permission } : {}),

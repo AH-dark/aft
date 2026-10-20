@@ -18,7 +18,11 @@ import {
   resolveBashConfig,
 } from "../config.js";
 import { startPiLiveConfigReload } from "../config-live-reload.js";
-import { registerPiToolSurface, resolvePiToolSurface } from "../tool-registration.js";
+import {
+  refreshPiRevisionReadTools,
+  registerPiToolSurface,
+  resolvePiToolSurface,
+} from "../tool-registration.js";
 import {
   executeTool,
   makeExtContext,
@@ -49,6 +53,9 @@ async function fixture(user: string, project?: string) {
   cleanup.push(releaseEnv);
   const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
   const ctx = makePluginContext(bridge, { config: loadAftConfig(projectDir) });
+  const { api, tools } = makeMockApi();
+  const surface = resolvePiToolSurface(ctx.config);
+  registerPiToolSurface(api, ctx, surface);
   const notices: string[] = [];
   const reload = startPiLiveConfigReload({
     directory: projectDir,
@@ -60,12 +67,40 @@ async function fixture(user: string, project?: string) {
     },
     notify: (message) => notices.push(message),
     watch: false,
+    refreshRevisionReadTools: () => refreshPiRevisionReadTools(api, ctx, surface),
   });
   cleanup.push(() => reload.stop());
-  return { root, projectDir, projectPath, userPath, ctx, reload, notices, calls };
+  return { root, projectDir, projectPath, userPath, ctx, reload, notices, calls, tools };
 }
 
 describe.serial("Pi live config reload", () => {
+  test("refreshed read schemas retain later live path restrictions", async () => {
+    const f = await fixture('{"revision_reads":false,"restrict_to_project_root":false}');
+    writeFileSync(f.userPath, '{"revision_reads":true,"restrict_to_project_root":false}');
+    f.reload.reload();
+    const refreshed = f.tools.get("read")!;
+    writeFileSync(f.userPath, '{"revision_reads":true,"restrict_to_project_root":true}');
+    f.reload.reload();
+    await expect(
+      executeTool(refreshed, { path: join(f.root, "outside.txt") }, makeExtContext(f.projectDir)),
+    ).rejects.toThrow("restrict_to_project_root");
+  });
+  test("revision_reads replaces captured host schemas in both directions", async () => {
+    const f = await fixture('{"revision_reads":false}');
+    for (const enabled of [true, false]) {
+      const previous = f.tools.get("read");
+      writeFileSync(f.userPath, JSON.stringify({ revision_reads: enabled }));
+      expect(f.reload.reload()?.applied).toContain("revision_reads");
+      expect(f.ctx.config.revision_reads).toBe(enabled);
+      expect(f.tools.get("read")).not.toBe(previous);
+      for (const name of ["read", "aft_outline", "aft_zoom"]) {
+        const definition = f.tools.get(name)!;
+        const schema = definition.parameters as { properties: Record<string, unknown> };
+        expect(Object.hasOwn(schema.properties, "ref")).toBe(enabled);
+        expect(definition.description.includes("git revision")).toBe(enabled);
+      }
+    }
+  });
   test("a restrict_to_project_root edit reaches the registered hoisted tools", async () => {
     const f = await fixture('{ "restrict_to_project_root": false }');
     const { api, tools } = makeMockApi();

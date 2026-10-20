@@ -78,6 +78,8 @@ export interface PiLiveConfigReloadOptions {
   initialSourceTexts?: Readonly<Record<string, string>>;
   getConfig(): AftConfig;
   setConfig(config: AftConfig): void;
+  /** Replace host-captured read schemas after the revision-read gate changes. */
+  refreshRevisionReadTools?(): void;
   /** Show a config error to the user. */
   notify(message: string): void;
   /** Tests drive `reload()` directly instead of watching. */
@@ -97,7 +99,11 @@ export function startPiLiveConfigReload(options: PiLiveConfigReloadOptions): Liv
     securityKeys: aftLiveSecurityKeys(PI_LIVE_CONFIG_KEYS),
     keys: PI_LIVE_CONFIG_KEYS,
     getConfig: options.getConfig,
-    setConfig: options.setConfig,
+    setConfig: (next) => {
+      const revisionReadsChanged = options.getConfig().revision_reads !== next.revision_reads;
+      options.setConfig(next);
+      if (revisionReadsChanged) options.refreshRevisionReadTools?.();
+    },
     log: (message) => log(`${message} (${options.directory})`),
     reportError: (message) => {
       error(message);
