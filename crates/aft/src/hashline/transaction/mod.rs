@@ -562,7 +562,7 @@ fn execute_step(
 
 fn execute_mutate(
     step_index: usize,
-    file: PlannedFile,
+    mut file: PlannedFile,
     op_id: &str,
     journaled: &mut bool,
     ctx: &mut ExecuteContext<'_>,
@@ -674,7 +674,11 @@ fn execute_mutate(
         }]);
     }
 
-    if let Err(error) = durable_write(&file.canonical_path, &file.final_bytes) {
+    let written = durable_write(&file.canonical_path, &file.final_bytes);
+    if let Ok(write_warnings) = written.as_ref() {
+        file.warnings.extend(write_warnings.iter().cloned());
+    }
+    if let Err(error) = written {
         let classification = if error.to_string().contains("durability") {
             FileClassification::FailedDurability
         } else {
@@ -771,7 +775,7 @@ fn execute_mutate(
 
 fn execute_mv(
     step_index: usize,
-    mv: PlannedMv,
+    mut mv: PlannedMv,
     op_id: &str,
     journaled: &mut bool,
     ctx: &mut ExecuteContext<'_>,
@@ -890,9 +894,12 @@ fn execute_mv(
     }
 
     // Destination durability precedes source unlink.
-    if let Err(error) = ensure_parent_dirs(&mv.dest_canonical)
-        .and_then(|_| durable_write(&mv.dest_canonical, &mv.final_bytes))
-    {
+    let written = ensure_parent_dirs(&mv.dest_canonical)
+        .and_then(|_| durable_write(&mv.dest_canonical, &mv.final_bytes));
+    if let Ok(write_warnings) = written.as_ref() {
+        mv.warnings.extend(write_warnings.iter().cloned());
+    }
+    if let Err(error) = written {
         let classification = if error.to_string().contains("durability") {
             FileClassification::FailedDurability
         } else {
@@ -1088,10 +1095,13 @@ fn ensure_parent_dirs(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write bytes via temp + fsync + rename so a crash cannot leave a torn target.
-fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Write bytes through the shared source writer: a synced replacement when
+/// that keeps the file's access metadata, otherwise an in-place rewrite backed
+/// by a recovery copy, so a failed write leaves the original bytes. Returns
+/// the writer's warnings for the file's outcome.
+fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<Vec<String>> {
     ensure_parent_dirs(path)?;
-    crate::edit::atomic_write_source(path, bytes).map(|_| ())
+    crate::edit::atomic_write_source(path, bytes).map(|outcome| outcome.warnings)
 }
 
 // ── Outcome helpers ──────────────────────────────────────────────────────────

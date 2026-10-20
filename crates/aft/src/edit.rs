@@ -16,31 +16,50 @@ use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser
 /// How [`atomic_write_source`] stored the new bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceWriteMode {
-    /// A synced sibling file replaced the target by rename, or created it.
+    /// A synced sibling file replaced the target (by rename, or on Windows by
+    /// `ReplaceFileW`), or created it.
     Replaced,
-    /// The existing file was truncated, rewritten and synced in place, because
-    /// a replacement file could not keep its hard links, owner, group, mode,
-    /// ACLs or extended attributes exactly.
+    /// The existing file was rewritten and synced in place, because a
+    /// replacement file could not be created or could not keep its hard links,
+    /// owner, group, mode, ACLs or extended attributes exactly.
     InPlace,
+}
+
+/// What [`atomic_write_source`] did, plus warnings the caller must show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceWriteOutcome {
+    pub(crate) mode: SourceWriteMode,
+    /// Each warning starts with a stable code and a colon:
+    /// `recovery_copy_found`, `no_recovery_copy` or `mode_not_restored`.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Write a source file so that a failed write leaves the original bytes
 /// untouched whenever that is possible without changing who can read or reach
 /// the file.
 ///
-/// Replacing by rename gives the path a new inode, which keeps nothing of the
-/// old file's links, owner, group, ACLs or extended attributes unless they are
-/// copied. The rename is used only when the replacement matches the original:
-/// a regular file with a single link, owned by the current user, whose owner,
-/// group, mode and extended attributes were copied and read back equal. On
-/// Linux the extended attributes include the POSIX ACL. On macOS the ACL is
-/// copied by the system's `fcopyfile` and is not read back separately. Any
-/// other existing file, and any existing file on Windows or another Unix, is
-/// rewritten in place and synced, as editors do when a backup-and-rename would
-/// alter the file, so access is never silently widened.
-/// Every source write path, including syntax rollback and hashline
-/// transactions, goes through this one decision.
-pub(crate) fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<SourceWriteMode> {
+/// Replacing a file gives the path a new file, which keeps nothing of the old
+/// one's links, owner, group, ACLs or extended attributes unless they are
+/// copied. A replacement is used only when it matches the original:
+/// - on Linux and macOS, a regular file with a single link, owned by the
+///   current user, whose owner, group, mode, extended attributes and ACL
+///   were copied onto the replacement and read back equal (on Linux the ACL
+///   is an extended attribute; on macOS it is copied by `fcopyfile` and read
+///   back with `acl_get_fd_np`);
+/// - on Windows, a single-link file replaced through `ReplaceFileW`, which
+///   keeps the replaced file's security descriptor, attributes and identity.
+///
+/// Any other existing file is rewritten in place, as editors do when a
+/// backup-and-rename would alter the file, so access is never silently
+/// widened. An in-place write first saves the original bytes to a private
+/// recovery copy next to the file and restores them if the write fails; a
+/// crash mid-write leaves that copy behind, and the next write to the file
+/// reports it. Every source write path, including syntax rollback and
+/// hashline transactions, goes through this one decision.
+pub(crate) fn atomic_write_source(
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<SourceWriteOutcome> {
     atomic_write_source_with(path, bytes, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
@@ -50,8 +69,8 @@ pub(crate) fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<
 fn atomic_write_source_with(
     path: &Path,
     bytes: &[u8],
-    writer: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
-) -> std::io::Result<SourceWriteMode> {
+    mut writer: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<SourceWriteOutcome> {
     use std::fs::{self, OpenOptions};
     use std::io;
     // Follow an existing symlink just as an in-place write would, rather than
@@ -67,22 +86,21 @@ fn atomic_write_source_with(
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    let mut warnings = Vec::new();
     if let Some(metadata) = original.as_ref() {
         // Preserve the existing file's write-access checks even when its parent
         // directory would permit replacing a read-only file by rename.
         OpenOptions::new().write(true).open(&destination)?;
-        if !source_replacement::may_keep_access(metadata) {
-            return write_source_in_place(&destination, bytes, writer);
+        warnings.extend(source_recovery::leftover_copy_warnings(&destination));
+        if !source_replacement::may_keep_access(&destination, metadata) {
+            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
         }
     }
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).map_err(io::Error::other)?;
-    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let temporary = parent.join(format!(".aft-source-{suffix}.tmp"));
+    let temporary = parent.join(format!(".aft-source-{}.tmp", random_suffix()?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -94,8 +112,11 @@ fn atomic_write_source_with(
         Ok(file) => file,
         // A writable file in a directory that refuses new entries can still be
         // rewritten in place, as it could before replacement writes existed.
-        Err(error) if original.is_some() && error.kind() == io::ErrorKind::PermissionDenied => {
-            return write_source_in_place(&destination, bytes, writer);
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let Some(metadata) = original.as_ref() else {
+                return Err(error);
+            };
+            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
         }
         Err(error) => return Err(error),
     };
@@ -119,7 +140,7 @@ fn atomic_write_source_with(
         // replacement that cannot match the original costs nothing to abandon.
         if !source_replacement::copy_access(&destination, file, metadata) {
             drop(cleanup);
-            return write_source_in_place(&destination, bytes, writer);
+            return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
         }
     }
     writer(file, bytes)?;
@@ -130,34 +151,163 @@ fn atomic_write_source_with(
     file.sync_all()
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
     cleanup.file.take();
+    #[cfg(windows)]
+    if let Some(metadata) = original.as_ref() {
+        if source_replacement::replace_keeping_identity(&destination, &temporary, parent)? {
+            return Ok(SourceWriteOutcome {
+                mode: SourceWriteMode::Replaced,
+                warnings,
+            });
+        }
+        drop(cleanup);
+        return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
+    }
     crate::fs_lock::rename_over(&temporary, &destination)?;
     // The replacement has already committed; a directory sync failure cannot
     // be reported as a failed edit without implying the original still exists.
     if let Ok(directory) = fs::File::open(parent) {
         let _ = directory.sync_all();
     }
-    Ok(SourceWriteMode::Replaced)
+    Ok(SourceWriteOutcome {
+        mode: SourceWriteMode::Replaced,
+        warnings,
+    })
+}
+
+/// 32 random hex digits for sibling temporary and recovery file names.
+fn random_suffix() -> std::io::Result<String> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Rewrite an existing file through its own inode, keeping every link, owner,
-/// ACL and extended attribute, then sync it so the torn-write window ends as
-/// soon as the full content is written.
+/// ACL and extended attribute.
+///
+/// Before the file is truncated its bytes are saved to a private recovery
+/// copy (see [`source_recovery`]). If writing or syncing the new bytes fails,
+/// the original bytes are written back in place and the copy is removed; if
+/// that also fails, the error names the copy. On Unix a write by a non-owner
+/// clears set-user-ID and set-group-ID bits, so the original mode is put back
+/// and a `mode_not_restored` warning reports when that is refused.
 fn write_source_in_place(
     destination: &Path,
+    original: &std::fs::Metadata,
     bytes: &[u8],
-    writer: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
-) -> std::io::Result<SourceWriteMode> {
-    let mut file = std::fs::OpenOptions::new()
+    writer: &mut impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    mut warnings: Vec<String>,
+) -> std::io::Result<SourceWriteOutcome> {
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    let (mut file, saved) = match std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .truncate(true)
-        .open(destination)?;
-    writer(&mut file, bytes)?;
-    file.sync_all()
-        .map_err(|error| std::io::Error::new(error.kind(), format!("durability: {error}")))?;
-    Ok(SourceWriteMode::InPlace)
+        .open(destination)
+    {
+        Ok(mut file) => {
+            let mut saved = Vec::new();
+            file.read_to_end(&mut saved)?;
+            (file, Some(saved))
+        }
+        // A write-only file cannot be read back for a recovery copy.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => (
+            std::fs::OpenOptions::new().write(true).open(destination)?,
+            None,
+        ),
+        Err(error) => return Err(error),
+    };
+    let copy = match saved.as_deref() {
+        Some(saved) => match source_recovery::save(destination, saved) {
+            Ok(copy) => Some(copy),
+            Err(error) => {
+                warnings.push(format!(
+                    "no_recovery_copy: {} was rewritten in place without a recovery copy ({error}); a crash during the write could have left it partly written",
+                    destination.display()
+                ));
+                None
+            }
+        },
+        None => {
+            warnings.push(format!(
+                "no_recovery_copy: {} is not readable, so it was rewritten in place without a recovery copy; a crash during the write could have left it partly written",
+                destination.display()
+            ));
+            None
+        }
+    };
+    fn rewrite(
+        file: &mut std::fs::File,
+        content: &[u8],
+        writer: &mut dyn FnMut(&mut std::fs::File, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writer(file, content)?;
+        file.sync_all()
+            .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))
+    }
+    if let Err(error) = rewrite(&mut file, bytes, writer) {
+        let Some(saved) = saved.as_deref() else {
+            return Err(error);
+        };
+        let restored = rewrite(&mut file, saved, &mut |file, content| {
+            file.write_all(content)
+        });
+        return match (restored, copy) {
+            (Ok(()), copy) => {
+                if let Some(copy) = copy {
+                    let _ = std::fs::remove_file(copy);
+                }
+                Err(error)
+            }
+            (Err(restore_error), Some(copy)) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; restoring the original bytes of {} also failed ({restore_error}); they are saved in {}",
+                    destination.display(),
+                    copy.display()
+                ),
+            )),
+            (Err(restore_error), None) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; restoring the original bytes of {} also failed ({restore_error})",
+                    destination.display()
+                ),
+            )),
+        };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let wanted = original.permissions().mode() & 0o7777;
+        let now = file.metadata()?.permissions().mode() & 0o7777;
+        if now != wanted {
+            // Read the mode back: some file systems accept the call but drop
+            // set-id bits, which must not pass silently either.
+            let restored = file.set_permissions(original.permissions()).is_ok()
+                && file
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == wanted);
+            if !restored {
+                warnings.push(format!(
+                    "mode_not_restored: writing {} changed its mode from {wanted:o} to {now:o} (the system clears set-user-ID and set-group-ID bits on write), and it could not be set back",
+                    destination.display()
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = original;
+    if let Some(copy) = copy {
+        source_recovery::discard(&copy);
+    }
+    Ok(SourceWriteOutcome {
+        mode: SourceWriteMode::InPlace,
+        warnings,
+    })
 }
 
-/// Decides whether a renamed replacement can carry an existing file's access
+/// Decides whether a replacement file can carry an existing file's access
 /// metadata, and copies that metadata onto the replacement.
 mod source_replacement {
     use std::fs::{File, Metadata};
@@ -167,18 +317,25 @@ mod source_replacement {
     /// rename would split a hard link, and only the owner can give a new file
     /// the original's owner.
     #[cfg(unix)]
-    pub(super) fn may_keep_access(metadata: &Metadata) -> bool {
+    pub(super) fn may_keep_access(_destination: &Path, metadata: &Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == euid
     }
 
-    /// Windows replacements take the directory's inherited ACL instead of the
-    /// file's own, and there is no cheap way to prove they match, so existing
-    /// files are always rewritten in place.
-    #[cfg(not(unix))]
-    pub(super) fn may_keep_access(_metadata: &Metadata) -> bool {
+    /// `ReplaceFileW` keeps the replaced file's security descriptor and
+    /// attributes, but it replaces only one name, so a file with more than
+    /// one hard link would be split from its other names.
+    #[cfg(windows)]
+    pub(super) fn may_keep_access(destination: &Path, metadata: &Metadata) -> bool {
+        metadata.is_file() && windows::link_count(destination) == Some(1)
+    }
+
+    /// Other platforms offer no checked way to copy ACLs, so a replacement
+    /// could widen access; their existing files are rewritten in place.
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn may_keep_access(_destination: &Path, _metadata: &Metadata) -> bool {
         false
     }
 
@@ -227,15 +384,111 @@ mod source_replacement {
             && xattrs::platform_acls_match(&source, replacement)
     }
 
-    /// Other platforms offer no checked way to copy ACLs, so a replacement
+    /// On Windows `ReplaceFileW` itself moves the replaced file's security
+    /// descriptor, attributes and identity onto the replacement.
+    #[cfg(windows)]
+    pub(super) fn copy_access(
+        _destination: &Path,
+        _replacement: &File,
+        _original: &Metadata,
+    ) -> bool {
+        true
+    }
+
+    /// Other Unix systems offer no checked way to copy ACLs, so a replacement
     /// could widen access; their existing files are rewritten in place.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     pub(super) fn copy_access(
         _destination: &Path,
         _replacement: &File,
         _original: &Metadata,
     ) -> bool {
         false
+    }
+
+    /// Replace `destination` with the synced `replacement` through
+    /// `ReplaceFileW`. Returns `Ok(false)` when it could not, after making
+    /// sure the original is back under its own name, so the caller can
+    /// rewrite the file in place instead.
+    #[cfg(windows)]
+    pub(super) fn replace_keeping_identity(
+        destination: &Path,
+        replacement: &Path,
+        parent: &Path,
+    ) -> std::io::Result<bool> {
+        windows::replace(destination, replacement, parent)
+    }
+
+    #[cfg(windows)]
+    mod windows {
+        use std::io;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::AsRawHandle;
+        use std::path::Path;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, ReplaceFileW, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().chain(Some(0)).collect()
+        }
+
+        /// Number of hard links to the file, or `None` when it cannot be read.
+        pub(super) fn link_count(path: &Path) -> Option<u32> {
+            let file = std::fs::File::open(path).ok()?;
+            // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle is open for the call and `info` is writable.
+            let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+            (ok != 0).then_some(info.nNumberOfLinks)
+        }
+
+        pub(super) fn replace(
+            destination: &Path,
+            replacement: &Path,
+            parent: &Path,
+        ) -> io::Result<bool> {
+            // With a backup name, every documented failure leaves the original
+            // either under its own name or under the backup name, never gone.
+            let backup = parent.join(format!(
+                ".aft-source-{}.bak",
+                super::super::random_suffix()?
+            ));
+            let (destination_w, replacement_w, backup_w) =
+                (wide(destination), wide(replacement), wide(&backup));
+            // SAFETY: all three paths are NUL-terminated and outlive the call;
+            // the two reserved pointers must be null.
+            let ok = unsafe {
+                ReplaceFileW(
+                    destination_w.as_ptr(),
+                    replacement_w.as_ptr(),
+                    backup_w.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if ok != 0 {
+                let _ = std::fs::remove_file(&backup);
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            if !destination.exists() && backup.exists() {
+                if let Err(restore) = std::fs::rename(&backup, destination) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "replacing {} failed ({error}) and moving its original back also failed ({restore}); the original bytes are in {}",
+                            destination.display(),
+                            backup.display()
+                        ),
+                    ));
+                }
+            } else if destination.exists() {
+                let _ = std::fs::remove_file(&backup);
+            }
+            Ok(false)
+        }
     }
 
     /// Extended attributes read and written through open file descriptors.
@@ -428,6 +681,8 @@ mod source_replacement {
                 pub(super) fn acl_to_text(acl: *mut c_void, len: *mut libc::ssize_t)
                     -> *mut c_char;
                 pub(super) fn acl_free(object: *mut c_void) -> c_int;
+                pub(super) fn acl_init(count: c_int) -> *mut c_void;
+                pub(super) fn acl_set_fd_np(fd: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
             }
         }
 
@@ -468,6 +723,212 @@ mod source_replacement {
             }
             result
         }
+
+        /// Remove every entry of the file's extended ACL, such as entries a new
+        /// file inherited from its directory, and confirm none remain.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn clear_extended_acl(file: &File) -> io::Result<()> {
+            if extended_acl_text(file)?.is_none() {
+                return Ok(());
+            }
+            // SAFETY: acl_init allocates an empty ACL or returns null.
+            let empty = unsafe { acl_sys::acl_init(0) };
+            if empty.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the descriptor is open and `empty` is a live ACL, freed
+            // exactly once after the call.
+            let set = unsafe {
+                let set =
+                    acl_sys::acl_set_fd_np(file.as_raw_fd(), empty, acl_sys::ACL_TYPE_EXTENDED);
+                acl_sys::acl_free(empty);
+                set
+            };
+            if set != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            match extended_acl_text(file)? {
+                Some(text) if text.lines().skip(1).any(|line| !line.trim().is_empty()) => {
+                    Err(io::Error::other("inherited ACL entries remain"))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// Private copies of a file's original bytes, kept only while an in-place
+/// write is in progress. A crash mid-write leaves the copy behind, named after
+/// the file, so the next write to that file reports where the bytes are.
+mod source_recovery {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+
+    const PREFIX: &str = ".aft-source-";
+    const SUFFIX: &str = ".orig";
+    /// Hex digits in the random part of a recovery copy's name.
+    const RANDOM_LEN: usize = 32;
+    /// Keep recovery names within common 255-byte file name limits.
+    const MAX_NAMED_LEN: usize = 200;
+
+    fn parent_of(destination: &Path) -> &Path {
+        destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    /// The recovery name embeds the file name so a leftover copy can be
+    /// matched to its file; very long names use the random part alone.
+    fn copy_name(destination: &Path, random: &str) -> String {
+        match destination.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.len() <= MAX_NAMED_LEN => format!("{PREFIX}{random}-{name}{SUFFIX}"),
+            _ => format!("{PREFIX}{random}{SUFFIX}"),
+        }
+    }
+
+    /// Warnings for recovery copies an interrupted earlier write of this file
+    /// left behind; the new write does not touch them.
+    pub(super) fn leftover_copy_warnings(destination: &Path) -> Vec<String> {
+        let Some(name) = destination.file_name().and_then(|name| name.to_str()) else {
+            return Vec::new();
+        };
+        let tail = format!("-{name}{SUFFIX}");
+        let Ok(entries) = fs::read_dir(parent_of(destination)) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|entry| entry.to_str())
+                    .and_then(|entry| entry.strip_prefix(PREFIX))
+                    .and_then(|entry| entry.strip_suffix(&tail))
+                    .is_some_and(|random| {
+                        random.len() == RANDOM_LEN
+                            && random.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+            .map(|copy| {
+                format!(
+                    "recovery_copy_found: {} holds the bytes {} had before an earlier write was interrupted; this write did not use or remove it",
+                    copy.display(),
+                    destination.display()
+                )
+            })
+            .collect()
+    }
+
+    /// Create the copy readable only by its owner (Unix mode 0600, no
+    /// inherited macOS ACL entries; on Windows the original file's DACL,
+    /// protected from inheritance), then write and sync it and its directory.
+    pub(super) fn save(destination: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+        let parent = parent_of(destination);
+        let copy = parent.join(copy_name(destination, &super::random_suffix()?));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&copy)?;
+        let prepared = (|| {
+            make_private(destination, &copy, &file)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            drop(file);
+            let _ = fs::remove_file(&copy);
+            return Err(error);
+        }
+        Ok(copy)
+    }
+
+    /// Remove a copy once the new bytes are safely written.
+    pub(super) fn discard(copy: &Path) {
+        let _ = fs::remove_file(copy);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_private(_destination: &Path, _copy: &Path, file: &File) -> io::Result<()> {
+        super::source_replacement::xattrs::clear_extended_acl(file)
+    }
+
+    /// Mode 0600 already limits a Linux default ACL to the owner, because a
+    /// new file's ACL mask comes from the requested group bits.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn make_private(_destination: &Path, _copy: &Path, _file: &File) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Give the copy the original's DACL, protected so the directory's
+    /// inheritable entries cannot widen it.
+    #[cfg(windows)]
+    fn make_private(destination: &Path, copy: &Path, _file: &File) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            GetFileSecurityW, SetFileSecurityW, DACL_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let wide =
+            |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
+        let (source, target) = (wide(destination), wide(copy));
+        let mut needed = 0u32;
+        // SAFETY: a null buffer with length 0 queries the needed size.
+        unsafe {
+            GetFileSecurityW(
+                source.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A u64 buffer keeps the descriptor suitably aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: the buffer holds at least `needed` bytes.
+        let read = unsafe {
+            GetFileSecurityW(
+                source.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the buffer holds the self-relative descriptor read above.
+        let set = unsafe {
+            SetFileSecurityW(
+                target.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+            )
+        };
+        if set == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn make_private(_destination: &Path, _copy: &Path, _file: &File) -> io::Result<()> {
+        Err(io::Error::other(
+            "no private file permissions on this platform",
+        ))
     }
 }
 /// Convert 0-indexed line/col to a byte offset within `source`.
@@ -1194,6 +1655,9 @@ pub struct WriteResult {
     /// Post-format excerpt when the formatter reflowed the applied edit.
     pub reformatted_excerpt: Option<ReformattedExcerpt>,
     pub(crate) final_text: Option<ObservedFinalText>,
+    /// Warnings from writing the file itself (see [`SourceWriteOutcome`]),
+    /// added to the reply's `warnings` array.
+    pub(crate) write_warnings: Vec<String>,
 }
 
 /// Render structured validation errors as a compact `line N: message` list for
@@ -1235,10 +1699,12 @@ impl WriteResult {
     /// exited list (check `lsp_complete`)."
     ///
     /// When diagnostics were NOT requested (`lsp_outcome.is_none()`),
-    /// nothing is added — keeps the no-LSP edit path's response shape
-    /// unchanged.
+    /// nothing LSP-related is added — keeps the no-LSP edit path's response
+    /// shape unchanged. `rolled_back` and any file-write warnings are always
+    /// added.
     pub fn append_lsp_diagnostics_to(&self, result: &mut serde_json::Value) {
         result["rolled_back"] = serde_json::json!(self.rolled_back);
+        self.append_write_warnings_to(result);
 
         let Some(outcome) = self.lsp_outcome.as_ref() else {
             return;
@@ -1282,6 +1748,25 @@ impl WriteResult {
                 .iter()
                 .map(|key| key.kind.id_str().to_string())
                 .collect::<Vec<_>>());
+        }
+    }
+
+    /// Add file-write warnings to the reply's `warnings` array, keeping any
+    /// warnings the handler already put there.
+    pub(crate) fn append_write_warnings_to(&self, result: &mut serde_json::Value) {
+        if self.write_warnings.is_empty() {
+            return;
+        }
+        if !result["warnings"].is_array() {
+            result["warnings"] = serde_json::json!([]);
+        }
+        if let Some(warnings) = result["warnings"].as_array_mut() {
+            warnings.extend(
+                self.write_warnings
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::from),
+            );
         }
     }
 
@@ -1481,9 +1966,11 @@ fn write_format_validate_impl(
 
     let _view_intent = crate::views::intent::record_paths([path]);
     // Step 1: Write
-    atomic_write_source(path, content.as_bytes()).map_err(|e| AftError::InvalidRequest {
-        message: format!("failed to write file: {}", e),
-    })?;
+    let mut write_warnings = atomic_write_source(path, content.as_bytes())
+        .map_err(|e| AftError::InvalidRequest {
+            message: format!("failed to write file: {}", e),
+        })?
+        .warnings;
 
     // Step 2: Format (before validate so we validate the formatted content)
     let (formatted, format_skipped_reason) = format::auto_format(path, config);
@@ -1514,11 +2001,16 @@ fn write_format_validate_impl(
         });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
-            atomic_write_source(path, original.as_bytes()).map_err(|e| {
+            let rollback = atomic_write_source(path, original.as_bytes()).map_err(|e| {
                 AftError::InvalidRequest {
                     message: format!("failed to roll back invalid edit: {}", e),
                 }
             })?;
+            for warning in rollback.warnings {
+                if !write_warnings.contains(&warning) {
+                    write_warnings.push(warning);
+                }
+            }
             true
         } else {
             false
@@ -1566,6 +2058,7 @@ fn write_format_validate_impl(
         lsp_outcome: None,
         reformatted_excerpt,
         final_text,
+        write_warnings,
     })
 }
 
@@ -2388,7 +2881,7 @@ mod source_write_access_tests {
         // The copied ACL lets the atomic replacement proceed.
         let inode = std::fs::metadata(&path).unwrap().ino();
         assert_eq!(
-            atomic_write_source(&path, b"third\n").unwrap(),
+            atomic_write_source(&path, b"third\n").unwrap().mode,
             SourceWriteMode::Replaced
         );
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
@@ -2407,21 +2900,31 @@ mod source_write_access_tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let acl_of = |path: &Path| {
-            let output = std::process::Command::new("/bin/ls")
-                .arg("-le")
-                .arg(path)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
+        // Compare each entry's tag, UUID, kind and permissions. The names in
+        // `ls -le` and `acl_to_text` come from a directory-service lookup that
+        // can briefly print a UUID instead, which is not an ACL change.
+        let acl_of = |path: &Path| -> Vec<String> {
+            let text =
+                source_replacement::xattrs::extended_acl_text(&std::fs::File::open(path).unwrap())
+                    .unwrap()
+                    .unwrap_or_default();
+            text.lines()
                 .skip(1)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
+                .map(|entry| {
+                    let fields: Vec<&str> = entry.split(':').collect();
+                    [0, 1, 4, 5]
+                        .iter()
+                        .filter_map(|index| fields.get(*index).copied())
+                        .collect::<Vec<_>>()
+                        .join(":")
+                })
+                .collect()
         };
         let before = acl_of(&path);
         assert!(
-            before.iter().any(|line| line.contains("nobody deny read")),
+            before
+                .iter()
+                .any(|entry| entry.starts_with("user:") && entry.ends_with(":deny:read")),
             "{before:?}"
         );
         write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
@@ -2460,7 +2963,7 @@ mod source_write_access_tests {
         write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), None);
-        let mode = atomic_write_source(&path, b"third\n").unwrap();
+        let mode = atomic_write_source(&path, b"third\n").unwrap().mode;
         eprintln!("inherited-ACL directory write took {mode:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
         assert_eq!(acl_of(&path), None);
@@ -2537,7 +3040,7 @@ mod source_write_access_tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let mode = atomic_write_source(&path, b"third\n").unwrap();
+        let mode = atomic_write_source(&path, b"third\n").unwrap().mode;
         eprintln!("inherited default-ACL write took {mode:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
         assert_eq!(acl_of(&path), None);
@@ -2602,12 +3105,156 @@ mod source_write_access_tests {
         if unsafe { libc::geteuid() } == 0 {
             std::os::unix::fs::chown(&path, Some(4242), None).unwrap();
             assert_eq!(
-                atomic_write_source(&path, b"third\n").unwrap(),
+                atomic_write_source(&path, b"third\n").unwrap().mode,
                 SourceWriteMode::InPlace
             );
             let metadata = std::fs::metadata(&path).unwrap();
             assert_eq!((metadata.uid(), metadata.gid()), (4242, group));
             assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
         }
+    }
+}
+
+/// In-place writes must never leave a file partly written, and must keep
+/// set-id bits; Windows replacements must keep the file's own ACL.
+#[cfg(test)]
+mod in_place_write_tests {
+    use super::*;
+
+    fn plain_config() -> Config {
+        Config {
+            format_on_edit: false,
+            ..Default::default()
+        }
+    }
+
+    fn recovery_entries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".aft-source-"))
+            .collect()
+    }
+
+    #[test]
+    fn failed_in_place_write_restores_every_link_and_removes_the_recovery_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.txt");
+        let other_name = dir.path().join("other.txt");
+        let original = b"\xef\xbb\xbforiginal\r\n\xfflast";
+        std::fs::write(&path, original).unwrap();
+        std::fs::hard_link(&path, &other_name).unwrap();
+        let result = atomic_write_source_with(&path, b"replacement\n", |file, _| {
+            use std::io::Write;
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        let error = result.expect_err("the injected failure must be reported");
+        assert!(
+            error.to_string().contains("injected write failure"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&other_name).unwrap(), original);
+        assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn next_write_reports_a_leftover_recovery_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let leftover = dir
+            .path()
+            .join(format!(".aft-source-{}-notes.txt.orig", "0".repeat(32)));
+        std::fs::write(&leftover, "saved\n").unwrap();
+        let result =
+            write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(
+            result.write_warnings.len(),
+            1,
+            "{:?}",
+            result.write_warnings
+        );
+        assert!(result.write_warnings[0].starts_with("recovery_copy_found: "));
+        assert!(result.write_warnings[0].contains(&leftover.display().to_string()));
+        assert_eq!(std::fs::read(&leftover).unwrap(), b"saved\n");
+        let mut reply = serde_json::json!({});
+        result.append_lsp_diagnostics_to(&mut reply);
+        assert_eq!(reply["warnings"][0], result.write_warnings[0].as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_place_write_keeps_set_user_id_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool.sh");
+        let other_name = dir.path().join("tool-link.sh");
+        std::fs::write(&path, "echo old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        if std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777 != 0o4755 {
+            // Some sandboxes and nosuid mounts silently drop set-id bits, so
+            // there is nothing to preserve on this host.
+            eprintln!("skipped: this file system does not keep set-user-ID bits");
+            return;
+        }
+        std::fs::hard_link(&path, &other_name).unwrap();
+        let result =
+            write_format_validate(&path, "echo new\n", &plain_config(), &serde_json::json!({}))
+                .unwrap();
+        assert_eq!(std::fs::read(&other_name).unwrap(), b"echo new\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o4755
+        );
+        assert!(
+            result.write_warnings.is_empty(),
+            "{:?}",
+            result.write_warnings
+        );
+        assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
+    }
+
+    /// `icacls` output for one file, which lists explicit and inherited ACEs.
+    #[cfg(windows)]
+    fn icacls(path: &Path) -> String {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_keeps_an_explicit_windows_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        // Backup Operators (S-1-5-32-551) never appear in a temp folder's
+        // inherited ACL, so this entry exists only on the file itself.
+        let granted = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-5-32-551:(R)"])
+            .output()
+            .unwrap();
+        assert!(granted.status.success(), "{granted:?}");
+        let before = icacls(&path);
+        assert!(
+            before.contains("Backup Operators") || before.contains("S-1-5-32-551"),
+            "{before}"
+        );
+        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(icacls(&path), before);
+        let outcome = atomic_write_source(&path, b"third\n").unwrap();
+        assert_eq!(outcome.mode, SourceWriteMode::Replaced);
+        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        assert_eq!(icacls(&path), before);
+        assert_eq!(recovery_entries(dir.path()), Vec::<String>::new());
     }
 }

@@ -35,6 +35,8 @@ struct AppliedHunkResult {
     before: String,
     after: String,
     delete_lines: Option<usize>,
+    /// Warnings from writing the file (see `edit::SourceWriteOutcome`).
+    write_warnings: Vec<String>,
 }
 
 struct DiffEntry {
@@ -400,12 +402,14 @@ fn write_patched_file(
     Ok(PatchedFile {
         final_content,
         snapshot_taken,
+        write_warnings: write_result.write_warnings,
     })
 }
 
 struct PatchedFile {
     final_content: String,
     snapshot_taken: bool,
+    write_warnings: Vec<String>,
 }
 
 fn delete_file_with_backup(
@@ -676,6 +680,7 @@ fn apply_add(
         before: String::new(),
         after: written.final_content,
         delete_lines: None,
+        write_warnings: written.write_warnings,
     })
 }
 
@@ -707,6 +712,7 @@ fn apply_delete(
         before,
         after: String::new(),
         delete_lines: Some(deletions),
+        write_warnings: Vec::new(),
     })
 }
 
@@ -758,6 +764,7 @@ fn apply_update(
             before: original,
             after: written.final_content,
             delete_lines: None,
+            write_warnings: written.write_warnings,
         })
     }
 }
@@ -868,6 +875,7 @@ fn apply_move_update(
         before: original,
         after: written.final_content,
         delete_lines: None,
+        write_warnings: written.write_warnings,
     })
 }
 
@@ -1244,6 +1252,10 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         format!("Applied {} of {} hunks", applied.len(), resolved.len())
     };
 
+    let write_warnings: Vec<String> = applied
+        .iter()
+        .flat_map(|hunk| hunk.write_warnings.iter().cloned())
+        .collect();
     let mut result = json!({
         "output": output,
         "title": title,
@@ -1253,6 +1265,9 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         "failures": failures,
         "metadata": { "diff": diff, "files": files },
     });
+    if !write_warnings.is_empty() {
+        result["warnings"] = json!(write_warnings);
+    }
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, None);
     Response::success(&req.id, result)
 }
@@ -1329,6 +1344,7 @@ mod tests {
                 before: "before\n".into(),
                 after: String::new(),
                 delete_lines: Some(1),
+                write_warnings: Vec::new(),
             }];
             let (_, files) = metadata_files(&applied, Some(&root), &HashMap::new());
             assert_eq!(files.len(), 1);
@@ -1359,6 +1375,7 @@ mod tests {
                 before: "original\n".into(),
                 after: after.into(),
                 delete_lines: None,
+                write_warnings: Vec::new(),
             })
             .collect();
         edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));
