@@ -248,9 +248,14 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     let source = path(source)?;
     let destination = path(destination)?;
     // Both NUL-terminated path buffers remain live through the native call.
+    // The raw syscall is used instead of glibc's renameat2() wrapper, which
+    // only exists from glibc 2.28: the release builds Linux binaries against an
+    // older glibc so they run on older distributions, and the wrapper's symbol
+    // fails to link there. The kernel call itself has existed since Linux 3.15.
     #[cfg(target_os = "linux")]
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
