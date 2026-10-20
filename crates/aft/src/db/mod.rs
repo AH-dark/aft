@@ -31,7 +31,7 @@ pub mod state;
 /// into a real callgraph store. Test-only: the probe wraps the platform VFS to
 /// count writes per file, which production has no reason to do.
 #[cfg(test)]
-mod wal_credit_probe;
+pub(crate) mod wal_credit_probe;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 18;
 

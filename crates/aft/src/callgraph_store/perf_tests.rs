@@ -181,7 +181,7 @@ fn dump_query_outputs(store: &CallGraphStore, samples: usize) -> String {
     out.replace(&root, "<root>")
 }
 
-fn copy_tracked_sources(source: &Path, destination: &Path) {
+pub(super) fn copy_tracked_sources(source: &Path, destination: &Path) {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(source)

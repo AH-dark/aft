@@ -1493,7 +1493,10 @@ thread_local! {
 
 mod dead_code_projection;
 #[cfg(test)]
+mod incremental_parity;
+#[cfg(test)]
 mod perf_tests;
+mod refresh_wal;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
     project_dead_code_snapshot_from_view, project_dead_code_snapshot_incremental_with_costs,
@@ -3062,6 +3065,7 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
     // The worker owns these caches so maps are shared only by refreshes for the
     // same canonical root and disappear when the worker shuts down.
     let mut workspace_crate_prefixes = HashMap::new();
+    let mut refresh_wal_states = HashMap::new();
     let mut last_idle_checkpoints: HashMap<RefreshRoot, Instant> = HashMap::new();
     // Watchers live outside the queue lock: dropping a native watcher can join
     // its callback thread, which may itself be waiting to lock the queue.
@@ -3211,6 +3215,7 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
                 &batch,
                 &mut workspace_crate_prefixes,
                 &mut open_failure,
+                &mut refresh_wal_states,
             )
         }))
         .unwrap_or_else(|_| {
@@ -3297,6 +3302,10 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
             }
         }
         // Release catch-up tickets before publishing idle to event waiters.
+        if let Some(store) = &store {
+            let queued = shared.queue.lock().unwrap().queued.contains_key(&root);
+            store.finish_refresh_wal(queued);
+        }
         drop(batch);
 
         let became_idle = active.release();
@@ -3325,6 +3334,7 @@ fn process_callgraph_refresh_batch(
     batch: &RefreshBatch,
     workspace_crate_prefixes: &mut HashMap<RefreshRoot, WorkspaceCratePrefixCache>,
     open_failure: &mut Option<RefreshOpenFailure>,
+    refresh_wal_states: &mut HashMap<PathBuf, Arc<Mutex<refresh_wal::Policy>>>,
 ) -> Option<CallGraphStore> {
     // A manifest event is an invalidation signal, not a source file to parse.
     // Drop the root's map even for a superseded batch: the filesystem changed,
@@ -3397,7 +3407,7 @@ fn process_callgraph_refresh_batch(
         // Dropping the fixture's release sender also unblocks a panicking test.
         let _ = gate.release_rx.recv();
     }
-    let store = match opened {
+    let mut store = match opened {
         Ok(Some(store)) => store,
         Ok(None) => {
             batch.defer_after_open_failure(&before_open);
@@ -3423,6 +3433,20 @@ fn process_callgraph_refresh_batch(
             return None;
         }
     };
+    // Keep the last observation and busy retry across this worker's short-lived
+    // connections, but never carry them into a different published generation.
+    refresh_wal_states.retain(|path, _| {
+        path == &store.sqlite_path || path.parent() != store.sqlite_path.parent()
+    });
+    store.refresh_wal = Arc::clone(
+        refresh_wal_states
+            .entry(store.sqlite_path.clone())
+            .or_default(),
+    );
+    #[cfg(test)]
+    if let Some(policy) = &test_seam.wal_policy {
+        store.refresh_wal = Arc::clone(policy);
+    }
     #[cfg(test)]
     {
         let panic_once = REFRESH_WORKER_TEST_SEAMS.get().is_some_and(|seams| {
@@ -3539,6 +3563,8 @@ fn workspace_crate_prefix_cache_for_root(
 
 #[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
+    #[cfg(test)]
+    wal_policy: Option<Arc<Mutex<refresh_wal::Policy>>>,
     #[cfg(test)]
     idle_writer_held: Option<crossbeam_channel::Sender<()>>,
     #[cfg(test)]
@@ -3852,6 +3878,7 @@ pub struct CallGraphStore {
     // Failed validations are not cached, so a later successful build remains visible.
     database_ready: AtomicBool,
     write_metrics: Arc<CallgraphWriteMetrics>,
+    refresh_wal: Arc<Mutex<refresh_wal::Policy>>,
     /// Held by each multi-step writer (refresh, stale marking, cold build) for
     /// its whole run, outside `conn`, so a refresh can release `conn` while it
     /// parses files without another write landing in between.
@@ -4019,6 +4046,8 @@ pub struct ColdBuildStats {
 
 #[derive(Debug, Clone)]
 pub struct IncrementalStats {
+    /// Caller set journaled for this refresh's projection revision.
+    pub projection_callers: BTreeSet<String>,
     pub changed_files: Vec<String>,
     pub surface_changed: Vec<String>,
     pub deleted_files: Vec<String>,
@@ -6216,6 +6245,7 @@ impl CallGraphStore {
             read_marker,
             database_ready: AtomicBool::new(false),
             write_metrics,
+            refresh_wal: Arc::default(),
             writer_serial: Mutex::new(()),
             conn: Mutex::new(conn),
         }
@@ -6769,10 +6799,14 @@ impl CallGraphStore {
     }
 
     pub fn refresh_files(&self, changed_files: &[PathBuf]) -> Result<IncrementalStats> {
-        self.refresh_files_with_workspace_crate_prefix_cache(
+        let result = self.refresh_files_with_workspace_crate_prefix_cache(
             changed_files,
             WorkspaceCratePrefixCache::default(),
-        )
+        );
+        if result.is_ok() {
+            self.finish_refresh_wal(false);
+        }
+        result
     }
 
     fn refresh_files_with_workspace_crate_prefix_cache(
@@ -6796,10 +6830,14 @@ impl CallGraphStore {
         &self,
         changed_files: &[PathBuf],
     ) -> Result<(IncrementalStats, RefreshFilesProfile)> {
-        self.refresh_files_profiled_with_workspace_crate_prefix_cache(
+        let result = self.refresh_files_profiled_with_workspace_crate_prefix_cache(
             changed_files,
             WorkspaceCratePrefixCache::default(),
-        )
+        );
+        if result.is_ok() {
+            self.finish_refresh_wal(false);
+        }
+        result
     }
 
     fn refresh_files_profiled_with_workspace_crate_prefix_cache(
@@ -7267,6 +7305,8 @@ impl CallGraphStore {
         }
 
         crate::cold_build_limiter::progress::phase("publishing", None);
+        conn.configure_refresh_wal()?;
+        self.refresh_wal.lock().unwrap().before_begin(&conn);
         let tx = conn.transaction()?;
         for update in &resolution_updates {
             store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;
@@ -7329,11 +7369,14 @@ impl CallGraphStore {
                 projection_callers.extend(dispatch_callers);
                 profile.method_dispatch += started.elapsed();
                 dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
+            } else {
+                projection_callers.clear();
             }
             clear_path_identity_mismatch_if_consistent(&tx, &self.project_root)?;
             let wrote_rows = tx.total_changes() != total_changes_before;
             let started = Instant::now();
             commit_incremental_if_current(tx)?;
+            self.refresh_wal.lock().unwrap().after_commit(&conn);
             if wrote_rows {
                 self.record_commit(total_changes_before, &conn);
             }
@@ -7342,6 +7385,7 @@ impl CallGraphStore {
             log_refresh_index_load(&self.project_root, &profile);
             return Ok((
                 IncrementalStats {
+                    projection_callers,
                     changed_files: changed,
                     surface_changed: surface_changed.into_iter().collect(),
                     deleted_files: reported_deleted(deleted),
@@ -7499,16 +7543,20 @@ impl CallGraphStore {
         // graph rows need a new revision and a corresponding caller delta.
         if !own_refresh.is_empty() || !selected_ref_ids.is_empty() || !deleted.is_empty() {
             dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
+        } else {
+            projection_callers.clear();
         }
         clear_path_identity_mismatch_if_consistent(&tx, &self.project_root)?;
         let started = Instant::now();
         commit_incremental_if_current(tx)?;
+        self.refresh_wal.lock().unwrap().after_commit(&conn);
         self.record_commit(total_changes_before, &conn);
         profile.commit += started.elapsed();
         profile.total = total_started.elapsed();
         log_refresh_index_load(&self.project_root, &profile);
         Ok((
             IncrementalStats {
+                projection_callers,
                 changed_files: changed,
                 surface_changed: surface_changed.into_iter().collect(),
                 deleted_files: reported_deleted(deleted),
@@ -28764,6 +28812,7 @@ edition = "2021"
             &batch([main].into_iter().collect()),
             &mut caches,
             &mut None,
+            &mut HashMap::new(),
         )
         .unwrap();
         assert!(caches[&refresh_root].1.get().is_some());
@@ -28773,6 +28822,7 @@ edition = "2021"
             &batch([manifest].into_iter().collect()),
             &mut caches,
             &mut None,
+            &mut HashMap::new(),
         )
         .unwrap();
         assert_direct_caller(&refreshed, "util/run.go", "Run", "main.go", "main");
