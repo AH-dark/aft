@@ -922,22 +922,107 @@ fn restricted_paths_keep_same_root_local_and_refuse_external_root() {
 }
 
 #[test]
-fn external_non_git_path_still_returns_not_a_git_root() {
+fn external_plain_folder_returns_unindexed_scan_hits_without_indexing() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let session_project = tempfile::tempdir().expect("session project");
-    let external_project = tempfile::tempdir().expect("external project");
+    let (external_project, _, _) = project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+
+    for query in ["needle_symbol", "fn needle_symbol"] {
+        let response = response_value(handle_semantic_search(
+            &request_with_path(query, Some("literal"), external_project.path()),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["semantic_status"], "external_unindexed");
+        let results = response["results"].as_array().expect("results");
+        assert_eq!(results.len(), 1, "{response:?}");
+        assert!(path_ends_with(
+            results[0]["file"].as_str().expect("file"),
+            "src/lib.rs"
+        ));
+        let text = response["text"].as_str().expect("text");
+        assert!(text.to_ascii_lowercase().contains("no aft index"), "{text}");
+    }
+    assert_eq!(fs::read_dir(storage.path()).unwrap().count(), 0);
+    assert!(!external_project.path().join(".git").exists());
+    assert!(!external_project.path().join(".aft").exists());
+}
+
+#[test]
+fn external_plain_folder_honours_gitignore_and_aftignore() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let session_project = tempfile::tempdir().expect("session project");
+    let (external_project, _, _) = project_with_needle();
+    for (directory, ignore_name, ignored) in [
+        ("", ".gitignore", "git_hidden.rs"),
+        ("", ".aftignore", "aft_hidden.rs"),
+        ("nested", ".gitignore", "nested_git_hidden.rs"),
+        ("nested", ".aftignore", "nested_aft_hidden.rs"),
+    ] {
+        let directory = external_project.path().join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(ignore_name), format!("{ignored}\n")).unwrap();
+        fs::write(directory.join(ignored), "pub fn needle_symbol() {}\n").unwrap();
+    }
     let ctx = test_context(session_project.path());
+    for query in ["needle_symbol", "fn needle_symbol"] {
+        let response = response_value(handle_semantic_search(
+            &request_with_path(query, Some("literal"), external_project.path()),
+            &ctx,
+        ));
+        assert_eq!(response["success"], true, "{response:?}");
+        let results = response["results"].as_array().expect("results");
+        assert_eq!(
+            results.len(),
+            1,
+            "ignored files must not appear: {response:?}"
+        );
+        assert!(path_ends_with(
+            results[0]["file"].as_str().expect("file"),
+            "src/lib.rs"
+        ));
+    }
+}
 
-    let response = response_value(handle_semantic_search(
-        &request_with_path("needle_symbol", Some("literal"), external_project.path()),
-        &ctx,
-    ));
+#[test]
+fn external_plain_folder_respects_configured_and_force_restriction() {
+    let session_project = tempfile::tempdir().expect("session project");
+    let (external_project, _, _) = project_with_needle();
+    let ctx = test_context(session_project.path());
+    for configured in [true, false] {
+        ctx.update_config(|config| config.restrict_to_project_root = configured);
+        let _guard = (!configured).then(|| ctx.force_restrict_guard("aft-search-contract"));
+        let response = response_value(handle_semantic_search(
+            &request_with_path("needle_symbol", Some("literal"), external_project.path()),
+            &ctx,
+        ));
+        assert_eq!(response["success"], false, "{response:?}");
+        assert_eq!(response["code"], "path_outside_root", "{response:?}");
+    }
+}
 
-    assert_eq!(response["success"], false);
-    assert_eq!(response["code"], "not_a_git_root");
-    let message = response["message"].as_str().expect("error message");
-    assert!(message.contains("another Git project"));
-    assert!(message.contains("grep or glob with path"));
+#[test]
+fn external_unsafe_plain_roots_are_refused_with_grep_hint() {
+    let session_project = tempfile::tempdir().expect("session project");
+    let ctx = test_context(session_project.path());
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .expect("home directory");
+    for root in home.ancestors() {
+        let response = response_value(handle_semantic_search(
+            &request_with_path("needle_symbol", Some("literal"), root),
+            &ctx,
+        ));
+        assert_eq!(response["success"], false, "{response:?}");
+        assert_eq!(response["code"], "not_a_git_root", "{response:?}");
+        let message = response["message"].as_str().expect("message");
+        assert!(message.contains("bounded"), "{message}");
+        assert!(message.contains("grep"), "{message}");
+    }
 }
 
 #[test]

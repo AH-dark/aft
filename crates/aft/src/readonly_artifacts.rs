@@ -163,10 +163,27 @@ pub(crate) fn resolve_git_root_from_user_path(
     } else {
         existing
     };
-    git_toplevel(&git_base).map_err(|error| match error.as_str() {
-        "not_a_git_root" => GitRootResolutionError::NotAGitRoot,
-        _ => GitRootResolutionError::Other(error),
-    })
+    match git_toplevel(&git_base) {
+        Ok(root) => Ok(root),
+        Err(error) if error == "not_a_git_root" => {
+            let account_home =
+                crate::commands::configure::resolve_account_home_dir().or_else(home_dir);
+            // A scan must use the same narrow-root policy as a watcher, even
+            // though it never starts a watcher or builds an index.
+            if (!crate::developer_tools::git_usable()
+                && crate::git_probe::repository_marker_or_uncertainty_in_directory(&git_base))
+                || crate::commands::configure::project_root_is_too_broad(
+                    &git_base,
+                    false,
+                    account_home.as_deref(),
+                )
+            {
+                return Err(GitRootResolutionError::NotAGitRoot);
+            }
+            Ok(git_base)
+        }
+        Err(error) => Err(GitRootResolutionError::Other(error)),
+    }
 }
 
 pub(crate) fn search_index_artifact_generation(
@@ -515,6 +532,12 @@ fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
     }
     let stdout = match crate::git_probe::toplevel_in_directory(base_dir) {
         Ok(stdout) => stdout,
+        Err(crate::git_probe::ProbeError::Spawn(error))
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !crate::git_probe::repository_marker_or_uncertainty_in_directory(base_dir) =>
+        {
+            return Err("not_a_git_root".to_string());
+        }
         Err(crate::git_probe::ProbeError::Spawn(error)) => {
             return Err(format!("failed to run git: {error}"));
         }
@@ -574,6 +597,70 @@ mod tests {
         crate::git_probe::init_repository_with_corrupt_head_for_test(dir.path());
         let error = git_toplevel(dir.path()).unwrap_err();
         assert!(error.starts_with("git rev-parse failed:"), "{error}");
+    }
+
+    #[test]
+    fn plain_folder_resolves_to_its_own_scan_root() {
+        let project = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let root = resolve_git_root_from_user_path(project.path(), folder.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            root,
+            crate::inspect::job::canonicalize_normalized(folder.path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_folder_resolves_without_a_git_executable() {
+        let project = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let root =
+            crate::git_probe::with_child_env_for_test(&[("PATH", bin.path().as_os_str())], || {
+                resolve_git_root_from_user_path(project.path(), folder.path().to_str().unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            root,
+            crate::inspect::job::canonicalize_normalized(folder.path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_without_a_git_executable_keeps_resolution_failure() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        init_git(folder.path());
+        let bin = tempfile::tempdir().unwrap();
+        let error =
+            crate::git_probe::with_child_env_for_test(&[("PATH", bin.path().as_os_str())], || {
+                resolve_git_root_from_user_path(project.path(), folder.path().to_str().unwrap())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, GitRootResolutionError::Other(ref message) if message.starts_with("failed to run git:")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn plain_folder_scan_root_refuses_home_and_ancestors() {
+        let project = tempfile::tempdir().unwrap();
+        let home = home_dir().expect("home directory");
+        for root in home.ancestors() {
+            assert!(
+                matches!(
+                    resolve_git_root_from_user_path(project.path(), root.to_str().unwrap()),
+                    Err(GitRootResolutionError::NotAGitRoot)
+                ),
+                "unsafe scan root: {}",
+                root.display()
+            );
+        }
     }
 
     #[derive(Debug, PartialEq, Eq)]

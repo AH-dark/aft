@@ -843,7 +843,7 @@ fn handle_semantic_search_with_disk_fallback(
                 return Response::error(
                     &req.id,
                     "not_a_git_root",
-                    format!("aft_search path must be the root of (or inside) another Git project to search: {requested_path}. To filter a subfolder of the current project, use grep or glob with path."),
+                    format!("aft_search cannot run a bounded lexical scan at this root: {requested_path}. Choose a narrower folder, or use grep or glob with path."),
                 );
             }
             Err(GitRootResolutionError::Other(error)) => {

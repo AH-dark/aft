@@ -542,7 +542,7 @@ fn resolve_home_dir() -> Option<PathBuf> {
     Some(std::fs::canonicalize(&raw).unwrap_or(raw))
 }
 
-fn resolve_account_home_dir() -> Option<PathBuf> {
+pub(crate) fn resolve_account_home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     let home = crate::production_storage::account_home().ok()?;
     #[cfg(windows)]
@@ -552,7 +552,7 @@ fn resolve_account_home_dir() -> Option<PathBuf> {
     canonical.is_dir().then_some(canonical)
 }
 
-fn project_root_is_too_broad(
+pub(crate) fn project_root_is_too_broad(
     canonical_root: &Path,
     canonicalization_failed: bool,
     account_home: Option<&Path>,

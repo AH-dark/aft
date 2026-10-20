@@ -927,8 +927,8 @@ cannot yet be combined with `path`.
 
 #### Cross-project search
 
-Pass `path` to search another project on the same machine — a sibling repository, a
-worktree, or any directory AFT has indexed before:
+Pass `path` to search another project or plain folder on the same machine — a sibling
+repository, a worktree, or a directory that is not in Git:
 
 ```json
 { "query": "how does the sidebar discover the RPC endpoint", "path": "~/Work/other-project" }
@@ -951,9 +951,16 @@ How it behaves:
   degrades to the lexical lane for that query.
 - **Nonexistent paths fail loud** with `path_not_found` instead of walking up to an
   unrelated parent.
-- **Never indexed?** If the target project has never been opened with AFT, there is nothing
-  to borrow and the search reports the index as unavailable — open the project once (any
-  session) to build its index.
+- **Unindexed folders.** If there is no index to borrow, including for a plain non-Git
+  directory, search runs the same bounded lexical scan and labels the reply unindexed.
+  The scan honours `.gitignore` and `.aftignore` files in the tree and reports its coverage;
+  it never builds an index or starts a watcher. Its existing file and time limits still
+  apply, so use grep with path when an exhaustive check is needed. A plain folder can be
+  searched even when Git is not installed; repository metadata that Git cannot read still
+  causes a resolution error rather than silently searching a different scope.
+- **Choose a narrow folder.** Filesystem and volume roots, the home directory, and ancestors
+  of home are refused for an unindexed plain-folder scan. Use a narrower path or grep with
+  path instead.
 
 Under `restrict_to_project_root: true` (and always for untrusted MCP callers), cross-project
 search outside the session's root is denied.
