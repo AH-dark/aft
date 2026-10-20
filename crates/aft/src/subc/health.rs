@@ -3091,6 +3091,13 @@ fn build_health_report_with_indexing(
         crate::process_io::ProcessIoSnapshot::capture().to_value(),
     );
     metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
+    // Routes the fleet status dial stopped reopening after a terminal refusal,
+    // each naming its target, session and refusal code. An empty list means
+    // no route is stopped.
+    metrics.insert(
+        "stopped_routes".to_string(),
+        crate::fleet_status::stopped_routes_snapshot(),
+    );
     metrics.insert(
         "write_ledger_top_10m".to_string(),
         json!(crate::write_ledger::recent_top_writers()),
@@ -6019,6 +6026,22 @@ mod tests {
         assert!(health["dropped_lines_total"].is_u64(), "{health}");
         assert!(health.get("last_write_error").is_some(), "{health}");
         assert!(health.get("failing_since").is_some(), "{health}");
+    }
+
+    #[test]
+    fn health_report_lists_stopped_routes() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = App::default_shared();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        );
+        let stopped = &report.metrics.expect("health metrics")["stopped_routes"];
+        assert!(stopped.is_array(), "{stopped}");
     }
 
     #[test]

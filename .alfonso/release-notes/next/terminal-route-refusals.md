@@ -1,0 +1,1 @@
+- Fleet status no longer retries a refused holder route every 5 seconds: it stops, warns once and shows in health; transient failures back off up to a minute.

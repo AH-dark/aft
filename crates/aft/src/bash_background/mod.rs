@@ -51,8 +51,153 @@ mod slot_limit_tests;
 pub(crate) struct SpawnReceipt {
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
+    startup_steps: std::sync::Mutex<StartupSteps>,
     #[cfg(feature = "test-timing-hooks")]
     startup_clock_for_test: Option<StartupClockForTest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BashStartupStep {
+    Admission,
+    Setup,
+    Environment,
+    GitPolicy,
+    Profile,
+    TaskDirectory,
+    ControlFiles,
+    SpawnPreparation,
+}
+
+impl BashStartupStep {
+    const ALL: [Self; 8] = [
+        Self::Admission,
+        Self::Setup,
+        Self::Environment,
+        Self::GitPolicy,
+        Self::Profile,
+        Self::TaskDirectory,
+        Self::ControlFiles,
+        Self::SpawnPreparation,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Admission => 0,
+            Self::Setup => 1,
+            Self::Environment => 2,
+            Self::GitPolicy => 3,
+            Self::Profile => 4,
+            Self::TaskDirectory => 5,
+            Self::ControlFiles => 6,
+            Self::SpawnPreparation => 7,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Setup => "setup",
+            Self::Environment => "environment",
+            Self::GitPolicy => "git_policy",
+            Self::Profile => "profile",
+            Self::TaskDirectory => "task_directory",
+            Self::ControlFiles => "control_files",
+            Self::SpawnPreparation => "spawn_prep",
+        }
+    }
+
+    pub(crate) const fn description(self) -> &'static str {
+        match self {
+            Self::Admission => "executor admission",
+            Self::Setup => "request setup",
+            Self::Environment => "environment build",
+            Self::GitPolicy => "Git policy discovery",
+            Self::Profile => "sandbox profile build",
+            Self::TaskDirectory => "task directory creation",
+            Self::ControlFiles => "task and control-file creation",
+            Self::SpawnPreparation => "spawn preparation",
+        }
+    }
+}
+
+const STARTUP_STEP_COUNT: usize = BashStartupStep::ALL.len();
+
+#[derive(Clone, Copy)]
+struct StartupSteps {
+    completed: [std::time::Duration; STARTUP_STEP_COUNT],
+    seen: u16,
+    current: BashStartupStep,
+    entered_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BashStartupStepSnapshot {
+    completed: [std::time::Duration; STARTUP_STEP_COUNT],
+    seen: u16,
+    current: BashStartupStep,
+    running_for: std::time::Duration,
+}
+
+impl StartupSteps {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            completed: [std::time::Duration::ZERO; STARTUP_STEP_COUNT],
+            seen: 1 << BashStartupStep::Admission.index(),
+            current: BashStartupStep::Admission,
+            entered_at: started_at,
+        }
+    }
+
+    fn enter(&mut self, step: BashStartupStep, now: std::time::Instant) {
+        if self.current == step {
+            return;
+        }
+        let index = self.current.index();
+        self.completed[index] += now.saturating_duration_since(self.entered_at);
+        self.current = step;
+        self.entered_at = now;
+        self.seen |= 1 << step.index();
+    }
+
+    fn snapshot(self, now: std::time::Instant) -> BashStartupStepSnapshot {
+        BashStartupStepSnapshot {
+            completed: self.completed,
+            seen: self.seen,
+            current: self.current,
+            running_for: now.saturating_duration_since(self.entered_at),
+        }
+    }
+}
+
+impl BashStartupStepSnapshot {
+    pub(crate) fn current(self) -> BashStartupStep {
+        self.current
+    }
+
+    pub(crate) fn format_steps(self) -> String {
+        use std::fmt::Write as _;
+
+        let mut formatted = String::with_capacity(128);
+        for step in BashStartupStep::ALL {
+            if self.seen & (1 << step.index()) == 0 {
+                continue;
+            }
+            if !formatted.is_empty() {
+                formatted.push(',');
+            }
+            let elapsed = self.completed[step.index()]
+                + if step == self.current {
+                    self.running_for
+                } else {
+                    std::time::Duration::ZERO
+                };
+            let _ = write!(formatted, "{}:{}ms", step.label(), elapsed.as_millis());
+            if step == self.current {
+                formatted.push_str("(running)");
+            }
+        }
+        formatted
+    }
 }
 
 #[cfg(feature = "test-timing-hooks")]
@@ -89,10 +234,19 @@ pub(crate) enum StartupOutcome {
 }
 
 impl SpawnReceipt {
+    #[cfg(test)]
     pub(crate) fn new(deadline: std::time::Instant) -> Self {
+        Self::new_with_start_time(deadline, std::time::Instant::now())
+    }
+
+    pub(crate) fn new_with_start_time(
+        deadline: std::time::Instant,
+        startup_started_at: std::time::Instant,
+    ) -> Self {
         Self {
             state: std::sync::Mutex::new(SpawnReceiptState::Pending),
             deadline,
+            startup_steps: std::sync::Mutex::new(StartupSteps::new(startup_started_at)),
             #[cfg(feature = "test-timing-hooks")]
             startup_clock_for_test: match std::env::var("AFT_TEST_SUBC_BASH_STARTUP_CLOCK")
                 .as_deref()
@@ -102,6 +256,29 @@ impl SpawnReceipt {
                 _ => None,
             },
         }
+    }
+
+    pub(crate) fn enter_startup_step(&self, step: BashStartupStep) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*state, SpawnReceiptState::Pending)
+            || std::time::Instant::now() >= self.deadline
+        {
+            return;
+        }
+        self.startup_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enter(step, std::time::Instant::now());
+    }
+
+    pub(crate) fn startup_step_snapshot(&self) -> BashStartupStepSnapshot {
+        self.startup_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(std::time::Instant::now())
     }
 
     #[cfg(feature = "test-timing-hooks")]
@@ -223,10 +400,19 @@ pub(crate) fn with_spawn_receipt<T>(
     run()
 }
 
+pub(crate) fn enter_bash_startup_step(step: BashStartupStep) {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        if let Some(receipt) = slot.borrow().as_ref() {
+            receipt.enter_startup_step(step);
+        }
+    });
+}
+
 /// Called only after the starting record and every control/output file exist,
 /// immediately before process creation. Once committed, the caller can always
 /// get the task id, including while running-record persistence is blocked.
 pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
+    enter_bash_startup_step(BashStartupStep::SpawnPreparation);
     CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
         Some(receipt) => receipt.commit(SpawnReceiptState::Committed(task_id.into())),
         None => Ok(()),
@@ -238,6 +424,7 @@ pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
 /// is fenced exactly like process creation: once the deadline has refused the
 /// startup, the rewrite must not run.
 pub(crate) fn commit_spawn_receipt_inline() -> Result<(), String> {
+    enter_bash_startup_step(BashStartupStep::SpawnPreparation);
     CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
         Some(receipt) => receipt.commit(SpawnReceiptState::CommittedInline),
         None => Ok(()),
@@ -847,6 +1034,7 @@ pub(crate) fn spawn(
         .or_else(|| std::env::current_dir().ok())
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
+    enter_bash_startup_step(BashStartupStep::Environment);
     let mut env = env.unwrap_or_default();
     let config = ctx.config();
     let child_storage_root = self::storage_dir(config.storage_dir.as_deref());
@@ -904,6 +1092,7 @@ pub(crate) fn spawn(
     let (spawn_plan, unregistered_task) = if native_sandbox_enforced(ctx, &principal)
         && host_escalation.is_none()
     {
+        enter_bash_startup_step(BashStartupStep::TaskDirectory);
         let task = match persistence::allocate_task_layout(&storage_dir, session_id) {
             Ok(task) => task,
             Err(error) => {
@@ -916,6 +1105,7 @@ pub(crate) fn spawn(
                 );
             }
         };
+        enter_bash_startup_step(BashStartupStep::Profile);
         let plan = resolve_sandbox_spawn(
             ctx,
             &principal,
@@ -928,7 +1118,9 @@ pub(crate) fn spawn(
             (plan, Some(task))
         } else {
             let root = project_root.as_deref().unwrap_or(&workdir);
+            enter_bash_startup_step(BashStartupStep::Environment);
             let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
+            enter_bash_startup_step(BashStartupStep::ControlFiles);
             match crate::sandbox_spawn::prepare_task_payload(
                 &task,
                 command.as_bytes(),
@@ -950,6 +1142,7 @@ pub(crate) fn spawn(
             }
         }
     } else {
+        enter_bash_startup_step(BashStartupStep::Profile);
         (
             resolve_sandbox_spawn(
                 ctx,
@@ -962,6 +1155,8 @@ pub(crate) fn spawn(
             None,
         )
     };
+    #[cfg(not(unix))]
+    enter_bash_startup_step(BashStartupStep::Profile);
     #[cfg(not(unix))]
     let spawn_plan = resolve_sandbox_spawn(
         ctx,

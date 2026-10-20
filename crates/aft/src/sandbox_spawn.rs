@@ -3355,6 +3355,18 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
 
 #[cfg(unix)]
 fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
+    crate::bash_background::enter_bash_startup_step(
+        crate::bash_background::BashStartupStep::GitPolicy,
+    );
+    let result = resolve_git_policy_inner(project_root);
+    crate::bash_background::enter_bash_startup_step(
+        crate::bash_background::BashStartupStep::Profile,
+    );
+    result
+}
+
+#[cfg(unix)]
+fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
     let environment = git_policy_environment(project_root);
     let worker = worker_jail_active();
     let Some(key) = git_policy_cache_key(project_root, &environment, worker) else {

@@ -16,9 +16,13 @@
 //! so any rewrite gives the file a new identity and a new modification time.
 //! Checking those takes a few `stat` calls and opens nothing. Conditions that
 //! can change without any file in the store changing are evaluated again
-//! every visit: the end of the modification grace, and the age and
-//! missing-worktree tests that retire an abandoned completion. Running tasks,
-//! and anything the sweep failed to read, are never remembered at all.
+//! every visit: the end of the modification grace, the age and
+//! missing-worktree tests that retire an abandoned completion, whether a
+//! running task's recorded process is still alive, and whether a registry in
+//! this process still owns a finished task whose scratch folder it is
+//! removing. None of those checks opens a file. A running task whose process
+//! the sweep found dead, and anything the sweep failed to read, are never
+//! remembered at all.
 //!
 //! The memory lives in the daemon process, keyed by canonical storage root,
 //! next to the walk position kept by `gc_cursor`. A restart starts both from
@@ -115,6 +119,14 @@ pub(crate) enum Wait {
         project_root: Option<Arc<Path>>,
         workdir: Arc<Path>,
     },
+    /// It is still running: a recorded process (the child or its group
+    /// leader) was alive. Only that process exiting, or a metadata write,
+    /// can change the verdict.
+    RecordedProcess { pids: Vec<u32>, started_at: u64 },
+    /// It is finished, but a registry in this process still owns it while
+    /// its scratch folder is being removed. Only that ownership ending, or a
+    /// metadata write, can change the verdict.
+    ScratchOwner { session_id: Arc<str> },
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +183,12 @@ impl Verdict {
                 project_root,
                 workdir,
             } => !abandonment_due(*finished_at, project_root.as_deref(), workdir, now_ms),
+            Wait::RecordedProcess { pids, started_at } => pids
+                .iter()
+                .any(|pid| super::process::is_recorded_process_alive(*pid, *started_at)),
+            Wait::ScratchOwner { session_id } => {
+                super::registry::task_db_write_order_is_live(session_id, task_id)
+            }
         }
     }
 }
@@ -300,7 +318,8 @@ impl GcMemo {
     /// True when the task was judged not deletable earlier and nothing it was
     /// judged on has changed. Opens nothing: at most two `stat` calls, plus
     /// two for the worktree checks of an undelivered result old enough to be
-    /// abandoned. A verdict that no longer holds is forgotten.
+    /// abandoned, or a probe of a running task's recorded process. A verdict
+    /// that no longer holds is forgotten.
     pub(crate) fn still_waiting(
         &self,
         session_dir: &Path,
@@ -344,6 +363,34 @@ impl GcMemo {
             finished_at: input.finished_at,
             project_root: input.project_root.map(|root| state.intern(root)),
             workdir: state.intern(input.workdir),
+        });
+    }
+
+    /// Remembers a running task whose recorded process was alive.
+    pub(crate) fn remember_recorded_process(
+        &self,
+        session_dir: &Path,
+        task_id: &str,
+        evidence: Evidence,
+        pids: Vec<u32>,
+        started_at: u64,
+    ) {
+        self.remember(session_dir, task_id, evidence, |_| Wait::RecordedProcess {
+            pids,
+            started_at,
+        });
+    }
+
+    /// Remembers a finished task kept while a registry owns its scratch removal.
+    pub(crate) fn remember_scratch_owner(
+        &self,
+        session_dir: &Path,
+        task_id: &str,
+        evidence: Evidence,
+        session_id: &str,
+    ) {
+        self.remember(session_dir, task_id, evidence, |_| Wait::ScratchOwner {
+            session_id: Arc::from(session_id),
         });
     }
 

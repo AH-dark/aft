@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ignore::gitignore::Gitignore;
 
 pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
@@ -40,6 +40,14 @@ const WATCHER_DROPPED_CANDIDATE_LOG_LIMIT: usize = 3;
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often the watcher thread retries handing held events to a dispatch
+/// channel that was full. It sleeps on its raw-event channel in between, so a
+/// consumer that has stopped draining (an unbound root) costs no CPU here.
+const DISPATCH_BACKLOG_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+/// Most changed paths the watcher thread holds while the dispatch channel is
+/// full. Beyond this they are replaced by one rescan request, the same
+/// recovery the operating system's own event overflow takes.
+const WATCHER_DISPATCH_BACKLOG_MAX_PATHS: usize = 16 * WATCHER_MAX_BATCH_PATHS;
 const WATCHER_ATTRIBUTION_RING_CAPACITY: usize = 512;
 const WATCHER_OVERFLOW_PREFIX_LIMIT: usize = 5;
 const WATCHER_OBSERVED_EXCLUSION_LIMIT: usize = 32;
@@ -2224,8 +2232,23 @@ struct WatcherFilterThread {
     content_only_paths: BTreeSet<PathBuf>,
     recent_paths: VecDeque<(PathBuf, Instant)>,
     flush_deadline: Option<Instant>,
+    /// Events the dispatch channel had no room for, oldest first. Changed
+    /// paths are merged into one event while they wait; see `hold_event`.
+    backlog: VecDeque<WatcherDispatchEvent>,
     #[cfg(test)]
     delay_before_rescan_for_test: Duration,
+}
+
+/// What happened to an event handed to the dispatch channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    /// It is in the channel.
+    Sent,
+    /// The channel was full (or older events still wait), so the watcher
+    /// thread holds it and retries later.
+    Held,
+    /// The consumer is gone or shutdown was requested; the thread should stop.
+    Closed,
 }
 
 impl WatcherFilterThread {
@@ -2246,6 +2269,7 @@ impl WatcherFilterThread {
             content_only_paths: BTreeSet::new(),
             recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
+            backlog: VecDeque::new(),
             #[cfg(test)]
             delay_before_rescan_for_test: Duration::ZERO,
         }
@@ -2257,10 +2281,13 @@ impl WatcherFilterThread {
                 self.flush_pending();
                 return;
             }
+            if !self.retry_backlog() {
+                return;
+            }
             if self.project_root_was_deleted() {
                 self.raw_paths.clear();
                 self.content_only_paths.clear();
-                let _ = self.send_dispatch(WatcherDispatchEvent::RootDeleted);
+                let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
                 return;
             }
             if self.flush_deadline_reached() {
@@ -2294,7 +2321,8 @@ impl WatcherFilterThread {
                             signal.request();
                         }
                         if !during_rescan
-                            && !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason))
+                            && self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason))
+                                == Dispatch::Closed
                         {
                             return;
                         }
@@ -2315,7 +2343,8 @@ impl WatcherFilterThread {
                     }
                 }
                 Ok(Err(error)) => {
-                    let _ = self.send_dispatch(WatcherDispatchEvent::Error(error.to_string()));
+                    let _ =
+                        self.send_dispatch_final(WatcherDispatchEvent::Error(error.to_string()));
                     return;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2325,7 +2354,7 @@ impl WatcherFilterThread {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if !self.shutdown.load(Ordering::SeqCst) {
-                        let _ = self.send_dispatch(WatcherDispatchEvent::Error(
+                        let _ = self.send_dispatch_final(WatcherDispatchEvent::Error(
                             "watcher channel disconnected".to_string(),
                         ));
                     }
@@ -2565,12 +2594,15 @@ impl WatcherFilterThread {
     }
 
     fn next_recv_timeout(&self) -> Duration {
-        let root_check = ROOT_DELETED_CHECK_INTERVAL;
+        let mut timeout = ROOT_DELETED_CHECK_INTERVAL;
+        if !self.backlog.is_empty() {
+            timeout = timeout.min(DISPATCH_BACKLOG_RETRY_INTERVAL);
+        }
         match self.flush_deadline {
             Some(deadline) => deadline
                 .saturating_duration_since(Instant::now())
-                .min(root_check),
-            None => root_check,
+                .min(timeout),
+            None => timeout,
         }
     }
 
@@ -2614,10 +2646,20 @@ impl WatcherFilterThread {
         let initial = filter_canonical_paths(&self.config, &self.matcher, raw_paths.clone());
         let filtered = if initial.ignore_file_changed {
             let observed_generation = self.matcher_generation.load(Ordering::SeqCst);
-            if !self.send_dispatch(WatcherDispatchEvent::IgnoreRulesChanged {
+            match self.send_dispatch(WatcherDispatchEvent::IgnoreRulesChanged {
                 paths: initial.ignore_file_paths.into_iter().collect(),
             }) {
-                return false;
+                Dispatch::Closed => return false,
+                // The consumer has not taken the events ahead of these rules,
+                // so it cannot acknowledge them before the deadline. A rescan
+                // held behind them covers this batch under the rebuilt
+                // matcher, so the batch itself need not wait.
+                Dispatch::Held => {
+                    return self.send_dispatch(WatcherDispatchEvent::RescanRequired(
+                        RescanReason::Unknown,
+                    )) != Dispatch::Closed;
+                }
+                Dispatch::Sent => {}
             }
             if !self.wait_for_gitignore_rebuild_until(observed_generation, deadline, pause) {
                 return false;
@@ -2629,7 +2671,8 @@ impl WatcherFilterThread {
                 self.content_only_paths.extend(content_only_paths);
                 self.flush_deadline = Some(Instant::now() + WATCHER_FLUSH_WINDOW);
                 return self
-                    .send_dispatch(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown));
+                    .send_dispatch(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+                    != Dispatch::Closed;
             }
             filter_canonical_paths(&self.config, &self.matcher, raw_paths)
         } else {
@@ -2652,7 +2695,7 @@ impl WatcherFilterThread {
         } else {
             WatcherDispatchEvent::Paths(paths)
         };
-        if !self.send_dispatch(event) {
+        if self.send_dispatch(event) == Dispatch::Closed {
             return false;
         }
         self.config.counters.note_paths_dispatched(path_count);
@@ -2660,7 +2703,7 @@ impl WatcherFilterThread {
     }
 
     fn wait_for_gitignore_rebuild_until(
-        &self,
+        &mut self,
         observed_generation: u64,
         deadline: Instant,
         mut pause: impl FnMut(),
@@ -2669,7 +2712,7 @@ impl WatcherFilterThread {
             && self.matcher_generation.load(Ordering::SeqCst) == observed_generation
         {
             if self.project_root_was_deleted() {
-                let _ = self.send_dispatch(WatcherDispatchEvent::RootDeleted);
+                let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
                 return false;
             }
             if Instant::now() >= deadline {
@@ -2680,24 +2723,192 @@ impl WatcherFilterThread {
         !self.shutdown.load(Ordering::SeqCst)
     }
 
-    fn send_dispatch(&self, event: WatcherDispatchEvent) -> bool {
-        let mut event = event;
+    /// Hands `event` to the dispatch channel without waiting. When the channel
+    /// is full, or older events are still held, the event joins the backlog
+    /// and the run loop retries it every `DISPATCH_BACKLOG_RETRY_INTERVAL`.
+    ///
+    /// Waiting for room here used to park this thread in the channel's send,
+    /// whose back-off spins and yields before each sleep: a consumer that had
+    /// stopped draining (a root with no bound session keeps its watcher but
+    /// runs no drains) kept the thread busy indefinitely, and raw events piled
+    /// up unread behind it.
+    fn send_dispatch(&mut self, event: WatcherDispatchEvent) -> Dispatch {
+        if self.shutdown.load(Ordering::SeqCst) || !self.retry_backlog() {
+            return Dispatch::Closed;
+        }
+        if self.backlog.is_empty() {
+            match self.dispatch_tx.try_send(event) {
+                Ok(()) => return Dispatch::Sent,
+                Err(TrySendError::Disconnected(_)) => return Dispatch::Closed,
+                Err(TrySendError::Full(returned)) => self.hold_event(returned),
+            }
+        } else {
+            self.hold_event(event);
+        }
+        self.config
+            .counters
+            .set_dispatch_backlog(self.backlog.len());
+        Dispatch::Held
+    }
+
+    /// Delivers the backlog and then `event`, waiting for room. Used for the
+    /// last event before the thread stops (root deleted, watcher failure),
+    /// which must not be left in a backlog nobody will retry. Waits by
+    /// sleeping, never in the channel's spinning send. Returns false if
+    /// shutdown was requested or the consumer is gone first.
+    fn send_dispatch_final(&mut self, event: WatcherDispatchEvent) -> bool {
+        self.backlog.push_back(event);
         loop {
-            match self
-                .dispatch_tx
-                .send_timeout(event, DISPATCH_SEND_POLL_INTERVAL)
-            {
-                Ok(()) => return true,
-                Err(SendTimeoutError::Timeout(returned)) => {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        return false;
-                    }
-                    event = returned;
+            if !self.retry_backlog() {
+                return false;
+            }
+            if self.backlog.is_empty() {
+                return true;
+            }
+            if self.shutdown.load(Ordering::SeqCst) {
+                return false;
+            }
+            thread::sleep(DISPATCH_SEND_POLL_INTERVAL);
+        }
+    }
+
+    /// Moves held events into the dispatch channel, oldest first, until it is
+    /// full. Returns false if the consumer is gone.
+    fn retry_backlog(&mut self) -> bool {
+        if self.backlog.is_empty() {
+            return true;
+        }
+        while let Some(event) = self.backlog.pop_front() {
+            match self.dispatch_tx.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(returned)) => {
+                    self.backlog.push_front(returned);
+                    break;
                 }
-                Err(SendTimeoutError::Disconnected(_)) => return false,
+                Err(TrySendError::Disconnected(_)) => {
+                    self.backlog.clear();
+                    self.config.counters.set_dispatch_backlog(0);
+                    return false;
+                }
+            }
+        }
+        self.config
+            .counters
+            .set_dispatch_backlog(self.backlog.len());
+        true
+    }
+
+    /// Adds an event to the backlog, merging it with what is already held so
+    /// the backlog stays small however long the channel stays full:
+    ///
+    /// - changed paths join the newest held path batch (a batch is
+    ///   content-only only if every merged batch was);
+    /// - a rescan request replaces every held path batch, and later path
+    ///   batches are dropped while it is held, because the rescan runs after
+    ///   them and reads the files as they are then;
+    /// - consecutive ignore-rule changes are merged into one.
+    ///
+    /// Order is otherwise kept. Held paths beyond
+    /// `WATCHER_DISPATCH_BACKLOG_MAX_PATHS` are replaced by a rescan request,
+    /// logged and counted as a buffer overflow.
+    fn hold_event(&mut self, event: WatcherDispatchEvent) {
+        let rescan_held = self
+            .backlog
+            .iter()
+            .any(|held| matches!(held, WatcherDispatchEvent::RescanRequired(_)));
+        match event {
+            WatcherDispatchEvent::Paths(paths) | WatcherDispatchEvent::ContentOnlyPaths(paths)
+                if rescan_held =>
+            {
+                drop(paths);
+            }
+            WatcherDispatchEvent::Paths(paths) => self.hold_paths(paths, false),
+            WatcherDispatchEvent::ContentOnlyPaths(paths) => self.hold_paths(paths, true),
+            WatcherDispatchEvent::RescanRequired(reason) => {
+                self.backlog.retain(|held| !is_path_batch(held));
+                if !rescan_held {
+                    self.backlog
+                        .push_back(WatcherDispatchEvent::RescanRequired(reason));
+                }
+            }
+            WatcherDispatchEvent::IgnoreRulesChanged { paths } => match self.backlog.back_mut() {
+                Some(WatcherDispatchEvent::IgnoreRulesChanged { paths: held }) => {
+                    merge_paths(held, paths);
+                }
+                _ => self
+                    .backlog
+                    .push_back(WatcherDispatchEvent::IgnoreRulesChanged { paths }),
+            },
+            event @ (WatcherDispatchEvent::RootDeleted | WatcherDispatchEvent::Error(_)) => {
+                self.backlog.push_back(event);
             }
         }
     }
+
+    fn hold_paths(&mut self, paths: Vec<PathBuf>, content_only: bool) {
+        match self.backlog.back_mut() {
+            Some(WatcherDispatchEvent::Paths(held)) => merge_paths(held, paths),
+            Some(held @ WatcherDispatchEvent::ContentOnlyPaths(_)) => {
+                let WatcherDispatchEvent::ContentOnlyPaths(held_paths) = held else {
+                    unreachable!()
+                };
+                let mut merged = std::mem::take(held_paths);
+                merge_paths(&mut merged, paths);
+                *held = if content_only {
+                    WatcherDispatchEvent::ContentOnlyPaths(merged)
+                } else {
+                    WatcherDispatchEvent::Paths(merged)
+                };
+            }
+            _ => self.backlog.push_back(if content_only {
+                WatcherDispatchEvent::ContentOnlyPaths(paths)
+            } else {
+                WatcherDispatchEvent::Paths(paths)
+            }),
+        }
+        let held_paths: usize = self
+            .backlog
+            .iter()
+            .map(|held| match held {
+                WatcherDispatchEvent::Paths(paths)
+                | WatcherDispatchEvent::ContentOnlyPaths(paths) => paths.len(),
+                _ => 0,
+            })
+            .sum();
+        if held_paths > WATCHER_DISPATCH_BACKLOG_MAX_PATHS {
+            // Too many to keep: fall back to the overflow recovery, a rescan,
+            // logged and counted like an operating-system event overflow. A
+            // rescan already running is told to run again instead.
+            let during_rescan = self.log_overflow(RescanReason::BufferOverflow);
+            self.backlog.retain(|held| !is_path_batch(held));
+            if !during_rescan {
+                self.backlog.push_back(WatcherDispatchEvent::RescanRequired(
+                    RescanReason::BufferOverflow,
+                ));
+            }
+        }
+    }
+}
+
+impl Drop for WatcherFilterThread {
+    fn drop(&mut self) {
+        // Held events end with the thread; stop reporting them as pending.
+        self.config.counters.set_dispatch_backlog(0);
+    }
+}
+
+fn is_path_batch(event: &WatcherDispatchEvent) -> bool {
+    matches!(
+        event,
+        WatcherDispatchEvent::Paths(_) | WatcherDispatchEvent::ContentOnlyPaths(_)
+    )
+}
+
+/// Adds `more` to `held`, keeping each path once.
+fn merge_paths(held: &mut Vec<PathBuf>, more: Vec<PathBuf>) {
+    held.extend(more);
+    held.sort_unstable();
+    held.dedup();
 }
 
 /// The gate file a test names in `AFT_TEST_WATCHER_INTAKE_GATE_FILE`, if any.
@@ -2902,7 +3113,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let generation = Arc::new(AtomicU64::new(1));
         let (tx, _rx) = crossbeam_channel::bounded(4);
-        let filter = WatcherFilterThread::new(
+        let mut filter = WatcherFilterThread::new(
             WatcherFilterConfig::new(root.path().to_path_buf(), None),
             Arc::new(std::sync::RwLock::new(None)),
             generation.clone(),
@@ -2946,6 +3157,228 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(filter.raw_paths.contains(&source));
         assert!(filter.flush_deadline.is_some());
+    }
+
+    /// A watcher thread whose dispatch channel is full, built over `root`.
+    /// The channel holds one `earlier.rs` batch that nobody receives.
+    fn filter_with_full_dispatch_channel(
+        root: &Path,
+    ) -> (
+        WatcherFilterThread,
+        crossbeam_channel::Receiver<WatcherDispatchEvent>,
+        Arc<AtomicBool>,
+    ) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.try_send(WatcherDispatchEvent::Paths(vec![root.join("earlier.rs")]))
+            .unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.to_path_buf(), None),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+            tx,
+            Arc::clone(&shutdown),
+        );
+        (filter, rx, shutdown)
+    }
+
+    /// Flushing into a full dispatch channel must not park the watcher thread
+    /// in the channel's send (whose back-off spins and yields): the batches
+    /// are held, merged into one, and handed on once the consumer catches up.
+    #[test]
+    fn watcher_full_dispatch_channel_holds_and_merges_batches_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+        let (mut filter, rx, shutdown) = filter_with_full_dispatch_channel(&root);
+        let ctx = crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        );
+        ctx.update_config(|config| config.project_root = Some(root.clone()));
+        *ctx.watcher_rx().lock() = Some(rx.clone());
+        let batches_root = root.clone();
+        let flusher = thread::spawn(move || {
+            for batch in [["a.rs", "b.rs"], ["b.rs", "c.rs"]] {
+                assert!(filter.push_raw_paths(batch.map(|name| batches_root.join(name)).to_vec()));
+                assert!(filter.flush_pending(), "the watcher thread stopped");
+            }
+            filter
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !flusher.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let finished = flusher.is_finished();
+        // Release a blocked flush so a failing run ends instead of hanging.
+        shutdown.store(true, Ordering::SeqCst);
+        let mut filter = flusher.join().unwrap();
+        assert!(
+            finished,
+            "flushing into a full dispatch channel blocked the watcher thread"
+        );
+        shutdown.store(false, Ordering::SeqCst);
+        let merged = WatcherDispatchEvent::Paths(
+            ["a.rs", "b.rs", "c.rs"]
+                .map(|name| root.join(name))
+                .to_vec(),
+        );
+        assert_eq!(filter.backlog, VecDeque::from([merged.clone()]));
+        assert_eq!(filter.config.counters.dispatch_backlog(), 1);
+
+        // The consumer catches up: the held batch follows the earlier one.
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WatcherDispatchEvent::Paths(vec![root.join("earlier.rs")])
+        );
+        assert!(rx.is_empty());
+        assert!(
+            ctx.watcher_query_has_pending_changes(),
+            "held events remain pending even after the channel empties"
+        );
+        assert!(filter.retry_backlog());
+        assert_eq!(filter.config.counters.dispatch_backlog(), 0);
+        assert!(
+            ctx.watcher_query_has_pending_changes(),
+            "dispatched events remain pending after the backlog clears"
+        );
+        assert_eq!(rx.try_recv().unwrap(), merged);
+        assert!(filter.backlog.is_empty());
+        assert_eq!(filter.config.counters.dispatch_backlog(), 0);
+        assert!(!ctx.watcher_query_has_pending_changes());
+    }
+
+    /// Held events keep their order and collapse instead of growing: a rescan
+    /// replaces the path batches before it and covers those after it, and
+    /// more held paths than the backlog keeps fall back to a rescan, logged as
+    /// a buffer overflow like any other watcher overflow.
+    #[test]
+    fn watcher_dispatch_backlog_collapses_into_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (mut filter, _rx, _shutdown) = filter_with_full_dispatch_channel(&root);
+        let batch = |count: usize, offset: usize| {
+            (offset..offset + count)
+                .map(|index| root.join(format!("file-{index}.rs")))
+                .collect::<Vec<_>>()
+        };
+
+        let ignore = WatcherDispatchEvent::IgnoreRulesChanged {
+            paths: vec![root.join(".gitignore")],
+        };
+        assert_eq!(filter.send_dispatch(ignore.clone()), Dispatch::Held);
+        assert_eq!(
+            filter.send_dispatch(WatcherDispatchEvent::ContentOnlyPaths(batch(2, 0))),
+            Dispatch::Held
+        );
+        assert_eq!(
+            filter.send_dispatch(WatcherDispatchEvent::RescanRequired(
+                RescanReason::UserDropped
+            )),
+            Dispatch::Held
+        );
+        assert_eq!(
+            filter.send_dispatch(WatcherDispatchEvent::Paths(batch(2, 2))),
+            Dispatch::Held
+        );
+        assert_eq!(
+            filter.backlog,
+            VecDeque::from([
+                ignore.clone(),
+                WatcherDispatchEvent::RescanRequired(RescanReason::UserDropped),
+            ]),
+            "a held rescan must cover the path batches around it"
+        );
+
+        let (mut filter, _rx, _shutdown) = filter_with_full_dispatch_channel(&root);
+        let mut held = 0;
+        while held <= WATCHER_DISPATCH_BACKLOG_MAX_PATHS {
+            let event = WatcherDispatchEvent::Paths(batch(WATCHER_MAX_BATCH_PATHS, held));
+            assert_eq!(filter.send_dispatch(event), Dispatch::Held);
+            held += WATCHER_MAX_BATCH_PATHS;
+            assert!(filter.backlog.len() <= 1, "held batches were not merged");
+        }
+        assert_eq!(
+            filter.backlog,
+            VecDeque::from([WatcherDispatchEvent::RescanRequired(
+                RescanReason::BufferOverflow
+            )]),
+            "an overflowing backlog must fall back to a rescan"
+        );
+        let root_label = format!("root={}", root.display());
+        assert!(
+            take_watcher_overflow_logs_for_test()
+                .iter()
+                .any(|line| line.contains("reason=buffer_overflow") && line.contains(&root_label)),
+            "the backlog overflow was not logged"
+        );
+    }
+
+    /// CPU time the calling thread has used.
+    #[cfg(unix)]
+    fn thread_cpu_time() -> Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
+            0
+        );
+        Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
+    /// The live shape of the problem: a root whose dispatch channel nobody
+    /// drains keeps receiving file events. The watcher thread must keep
+    /// taking raw events in (they used to pile up unread while it waited in
+    /// the channel's send) and must stay cheap while it waits.
+    #[cfg(unix)]
+    #[test]
+    fn watcher_full_dispatch_channel_keeps_intake_running_cheaply() {
+        const EVENTS: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (mut filter, _rx, shutdown) = filter_with_full_dispatch_channel(&root);
+        let counters = Arc::clone(&filter.config.counters);
+        let raw_before = counters.snapshot().raw_events_total;
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let cpu_start = thread_cpu_time();
+            filter.run(raw_rx);
+            thread_cpu_time() - cpu_start
+        });
+        let started = Instant::now();
+        for index in 0..EVENTS {
+            let path = root.join(format!("burst-{index}.rs"));
+            std::fs::write(&path, "fn f() {}\n").unwrap();
+            raw_tx
+                .send(Ok(
+                    notify::Event::new(EventKind::Create(CreateKind::File)).add_path(path)
+                ))
+                .unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Let the last flush window end, then give the thread time to idle.
+        thread::sleep(Duration::from_millis(1_000));
+        let taken_in = counters.snapshot().raw_events_total - raw_before;
+        let elapsed = started.elapsed();
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        let cpu = handle.join().unwrap();
+        eprintln!(
+            "full dispatch channel: {taken_in} of {EVENTS} raw events taken in; watcher thread CPU {:?} over {:?}",
+            cpu, elapsed
+        );
+        assert_eq!(
+            taken_in, EVENTS as u64,
+            "raw events piled up unread while the dispatch channel was full"
+        );
+        assert!(
+            cpu < elapsed / 4,
+            "the watcher thread stayed busy while the dispatch channel was full: {cpu:?} over {elapsed:?}"
+        );
     }
 
     use super::*;

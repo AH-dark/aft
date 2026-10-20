@@ -1164,7 +1164,10 @@ pub(super) fn submit_deferred_bash(
     .min(20_000);
     let startup_deadline =
         reply_budget.cap(startup_started_at + Duration::from_millis(startup_window));
-    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(startup_deadline));
+    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new_with_start_time(
+        startup_deadline,
+        startup_started_at,
+    ));
     let receipt_for_spawn = Arc::clone(&receipt);
     let admitted = Arc::new(AtomicBool::new(false));
     let admitted_for_spawn = Arc::clone(&admitted);
@@ -1214,6 +1217,9 @@ pub(super) fn submit_deferred_bash(
             Box::new(move |ctx| {
                 log_ctx::with_session(Some(session_for_spawn.clone()), || {
                     admitted_for_spawn.store(true, Ordering::Relaxed);
+                    receipt_for_spawn.enter_startup_step(
+                        crate::bash_background::BashStartupStep::Setup,
+                    );
                     if receipt_for_spawn.refused() {
                         return Response::error(
                             &request_id_for_spawn,
@@ -1696,7 +1702,8 @@ pub(super) fn submit_deferred_bash(
                 match settled {
                     Some(response) => response,
                     None => {
-                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed));
+                        let startup_steps = receipt.startup_step_snapshot();
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed), startup_steps.current());
                         capture_target = register_capture_target(&response);
                         let response = if blocking_intent && capture_deadline.is_some() {
                             if let Some(task_id) = response.data["task_id"].as_str().map(str::to_owned) {
@@ -1705,7 +1712,7 @@ pub(super) fn submit_deferred_bash(
                         } else {
                             await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, server_completion, Some(reply_budget.deadline)).await.unwrap_or(response)
                         };
-                        log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
+                        crate::slog_warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={} steps={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"), startup_steps.format_steps());
                         let result = (!cancel.connection.is_cancelled() && !cancel.route.is_cancelled() && claim.try_claim_for_wait_task()).then(|| bash_result_from_response(response, &format_context));
                         send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), result, false).await;
                         answered_startup = true;
@@ -2030,6 +2037,7 @@ fn startup_deadline_response(
     executor: &Executor,
     root: &ProjectRootId,
     admitted: bool,
+    slow_step: crate::bash_background::BashStartupStep,
 ) -> Response {
     use crate::bash_background::StartupOutcome;
     match outcome {
@@ -2073,7 +2081,7 @@ fn startup_deadline_response(
         StartupOutcome::Refused => Response::error(
             request_id,
             "bash_start_deadline",
-            startup_refusal_reason(executor, root, admitted),
+            startup_refusal_reason(executor, root, admitted, slow_step),
         ),
     }
 }
@@ -2081,15 +2089,23 @@ fn startup_deadline_response(
 /// Only called once the receipt is refused: process creation and in-process
 /// rewrites both commit through that receipt, and a refused receipt never
 /// commits, so every reason here can say the command was not started.
-fn startup_refusal_reason(executor: &Executor, root: &ProjectRootId, admitted: bool) -> String {
+fn startup_refusal_reason(
+    executor: &Executor,
+    root: &ProjectRootId,
+    admitted: bool,
+    slow_step: crate::bash_background::BashStartupStep,
+) -> String {
     if admitted {
-        return "bash startup exceeded its reply budget after executor admission (shell setup or control-file creation), before process creation committed; process creation is now refused, so the command was not started and will not start".into();
+        return format!(
+            "bash startup reply budget expired during {} before process creation committed; process creation is now refused, so the command was not started and will not start",
+            slow_step.description()
+        );
     }
     if let Some(writer) = executor
         .try_mutating_lane_snapshots()
         .and_then(|writers| writers.into_iter().find(|writer| &writer.root_id == root))
     {
-        return format!("bash startup deadline: queued behind root Mutating job {} ({}); command was not started", writer.request_id, writer.command);
+        return format!("bash startup deadline: queued behind root Mutating job {} ({}); slow startup step: {}; command was not started", writer.request_id, writer.command, slow_step.description());
     }
     if executor
         .try_dispatch_liveness_snapshot()
@@ -2097,9 +2113,9 @@ fn startup_refusal_reason(executor: &Executor, root: &ProjectRootId, admitted: b
             snapshot.running.interactive + snapshot.running.maintenance >= executor.pool_size()
         })
     {
-        return "bash startup deadline: executor workers saturated; command was not started".into();
+        return format!("bash startup deadline: executor workers saturated; slow startup step: {}; command was not started", slow_step.description());
     }
-    "bash startup deadline: queued for executor admission or scheduler lock; command was not started".into()
+    format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5743,6 +5759,9 @@ mod grant_path_tests {
     }
 
     fn held_before_spawn_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        crate::bash_background::enter_bash_startup_step(
+            crate::bash_background::BashStartupStep::Profile,
+        );
         hold_startup_checkpoint();
         running_bash_stub(req, ctx)
     }
@@ -5790,6 +5809,44 @@ mod grant_path_tests {
         assert!(
             !startup.call.dir.path().join("started-command").exists(),
             "a startup refusal must fence late process creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_deadline_warning_and_refusal_name_the_running_startup_step() {
+        let (message, lines) = crate::logging::capture_log_lines(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread test runtime");
+            runtime.block_on(async {
+                let (mut startup, done) = startup_case(held_before_spawn_stub, 80).await;
+                let response = done.response_for_test();
+                assert_eq!(response.data["code"], "bash_start_deadline");
+                let message = response.data["message"]
+                    .as_str()
+                    .expect("startup refusal message")
+                    .to_string();
+                startup.finish().await;
+                assert!(
+                    !startup.call.dir.path().join("started-command").exists(),
+                    "a refused startup must not start after the delayed step finishes"
+                );
+                message
+            })
+        });
+
+        assert!(message.contains("sandbox profile build"), "{message}");
+        let warning = lines
+            .iter()
+            .find(|line| line.contains("bash startup reply deadline"))
+            .expect("startup deadline warning was captured");
+        assert!(warning.starts_with("WARN "), "{warning}");
+        assert!(warning.contains("steps="), "{warning}");
+        assert!(
+            warning.contains("profile:") && warning.contains("(running)"),
+            "{warning}"
         );
     }
 
@@ -6496,6 +6553,7 @@ mod grant_path_tests {
                 &Executor::new(),
                 &root,
                 true,
+                receipt.startup_step_snapshot().current(),
             );
             assert_eq!(deadline_response.success, response.success);
             if offset < 0 {
