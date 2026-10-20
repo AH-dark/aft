@@ -444,6 +444,9 @@ struct DecodedFrame {
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
     confinement: Option<remote_policy::CarriedConfinement>,
+    /// Result of restoring launch grants for this frame; retain it so later
+    /// admission waits do not repeat restoration.
+    launch_restore: Option<Result<(), subc_protocol::ErrorBody>>,
 }
 
 impl DecodedFrame {
@@ -5185,7 +5188,7 @@ where
                 if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
                     dispatch_path_metrics.tool_received_decoded(&frame);
                 }
-                let DecodedFrame { frame, phase_trace, parsed_body, confinement } = frame;
+                let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore } = frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -5247,7 +5250,7 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
-                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement};
+                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
                                 Ok(()) => continue,
@@ -5324,7 +5327,7 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement };
+                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore };
                         // A codemode program's tool call runs with its head agent's
                         // access: every step below sees the head-derived identity.
                         let codemode_routes;
@@ -5375,6 +5378,18 @@ where
                         } else {
                             decoded
                         };
+                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                            match database_waits.restore_launch(decoded, routes_for_call, &executor) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else { decoded };
+                        if let Some(Err(error)) = decoded.launch_restore.as_ref() {
+                            if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error.clone()).await {
+                                break Err(error);
+                            }
+                            continue;
+                        }
                         let decoded = if !ledger_waited && !management_routes.contains(&route) {
                             match ledger_edge.defer(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {
                                 Ok(()) => continue,
@@ -6375,6 +6390,7 @@ where
                     let decoded = DecodedFrame {
                         parsed_body: Default::default(),
                         confinement: None,
+                        launch_restore: None,
                         frame,
                         phase_trace: PhaseTrace::new(received_at),
                     };
@@ -9115,44 +9131,6 @@ async fn handle_tool_call(
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
-    }
-
-    // Restore launch capabilities before any shell, deferred or plain call can
-    // perform its permission preflight. The catalog is not refetched on revival.
-    if let Some(key) = worker_preset
-        .then(|| access_grants::launch_key(&identity, "worker"))
-        .flatten()
-    {
-        if let Some(ctx) = executor.actor_context(&identity.root) {
-            let scope = crate::db::access_grants::ScopeKey::from_policy(&key);
-            if !ctx.launch_grants_materialized(&scope) {
-                let identity_for_restore = identity.clone();
-                let ctx_for_restore = Arc::clone(&ctx);
-                let restored = tokio::task::spawn_blocking(move || {
-                    access_grants::restore_launch(&identity_for_restore, &ctx_for_restore, "worker")
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    Err(subc_protocol::ErrorBody::new(
-                        "grants_unavailable",
-                        format!("launch grant restoration failed: {error}"),
-                    ))
-                });
-                match restored {
-                    Ok(
-                        crate::db::access_grants::LaunchRestore::Materialized
-                        | crate::db::access_grants::LaunchRestore::AlreadyMaterialized,
-                    ) => ctx.memoize_launch_grants(scope),
-                    Ok(crate::db::access_grants::LaunchRestore::NoParams) => {}
-                    Err(error) => {
-                        // Missing extra grants do not remove authority over the
-                        // worktree; ordinary access checks still guard outside paths.
-                        crate::slog_warn!("launch_grant_restore_failed: owner={} scope_ref={} epoch={} code={} error={}",
-                        scope.owner, scope.scope_ref, scope.epoch, error.code, error.message);
-                    }
-                }
-            }
-        }
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
@@ -18739,7 +18717,7 @@ mod tests {
             )
             .unwrap();
             let mut waits = persistence::DatabaseWaits::default();
-            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
             let decoded = match waits.defer(decoded, &routes, executor) {
                 Ok(()) => waits.next().await,
                 Err(decoded) => decoded,
@@ -19336,7 +19314,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut waits = persistence::DatabaseWaits::default();
-            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
                 serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()), };
             assert!(waits.defer(frame, &routes, &executor).is_ok());
@@ -19974,6 +19952,7 @@ mod admission_mechanism_tests {
         let mut decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

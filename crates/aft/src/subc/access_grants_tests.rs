@@ -1,6 +1,10 @@
 use super::*;
 use crate::access_policy::{AccessDecision, AccessDenial};
 
+#[cfg(unix)]
+#[path = "access_grants_restore_tests.rs"]
+mod slow_restore;
+
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
     let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
@@ -361,6 +365,11 @@ fn grants_revived_launch_symlink_changes_never_widen_authority() {
 }
 
 async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) {
+    let body = first_read_response(ctx, identity, preset).await;
+    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+}
+
+async fn first_read_response(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) -> Value {
     ctx.update_config(|config| config.project_root = Some(identity.project_root.clone()));
     let target = identity.project_root.join("first-call.txt");
     std::fs::write(&target, "first call").unwrap();
@@ -381,6 +390,22 @@ async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str)
         .unwrap(),
     )
     .unwrap();
+    let decoded = DecodedFrame {
+        parsed_body: Default::default(),
+        confinement: None,
+        launch_restore: None,
+        frame,
+        phase_trace: PhaseTrace::new(Instant::now()),
+    };
+    let mut waits = persistence::DatabaseWaits::default();
+    let decoded = match waits.restore_launch(decoded, &routes, &executor) {
+        Ok(()) => waits.next().await,
+        Err(decoded) => decoded,
+    };
+    if let Some(Err(error)) = decoded.launch_restore {
+        return serde_json::to_value(error).unwrap();
+    }
+    let frame = decoded.frame;
     let (writer, mut replies) = mpsc::channel(8);
     let (bash_tx, _bash_rx) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
@@ -427,7 +452,7 @@ async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str)
         .expect("first read must terminate")
         .unwrap();
     let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
-    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+    body
 }
 
 #[tokio::test]
@@ -460,7 +485,7 @@ async fn grants_revived_launch_first_call_restores_without_catalog() {
 }
 
 #[test]
-fn grants_revived_launch_failed_restore_continues_and_retries() {
+fn grants_revived_launch_failed_restore_refuses_and_retries() {
     let (_dir, ctx, head, worker) = fixture();
     let worker = at_epoch(&worker, 1);
     let target = head.project_root.join("shared");
@@ -479,7 +504,9 @@ fn grants_revived_launch_failed_restore_continues_and_retries() {
         .build()
         .unwrap();
     let (_, lines) = crate::logging::capture_log_lines(|| {
-        runtime.block_on(first_read(ctx.clone(), revived.clone(), "worker"))
+        let refused = runtime.block_on(first_read_response(ctx.clone(), revived.clone(), "worker"));
+        assert_eq!(refused["code"], "grants_unavailable");
+        assert_eq!(refused["detail"]["retryable"], true);
     });
     assert!(
         lines

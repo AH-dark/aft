@@ -12,6 +12,7 @@ pub(super) struct DatabaseWaits {
     tasks: tokio::task::JoinSet<DecodedFrame>,
     pending: HashMap<(RouteChannel, u64), (tokio::task::AbortHandle, AdmissionWait)>,
     confinement_reads: Arc<tokio::sync::Semaphore>,
+    launch_restores: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for DatabaseWaits {
@@ -20,6 +21,7 @@ impl Default for DatabaseWaits {
             tasks: Default::default(),
             pending: Default::default(),
             confinement_reads: Arc::new(tokio::sync::Semaphore::new(MAX_CONFINEMENT_READS)),
+            launch_restores: Arc::new(tokio::sync::Semaphore::new(MAX_CONFINEMENT_READS)),
         }
     }
 }
@@ -27,6 +29,100 @@ impl Default for DatabaseWaits {
 impl DatabaseWaits {
     pub(super) fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+
+    /// Restore a revived worker's launch authority before any tool preflight,
+    /// without blocking the shared reader while saved paths are checked on disk.
+    pub(super) fn restore_launch(
+        &mut self,
+        mut decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Executor,
+    ) -> Result<(), DecodedFrame> {
+        if decoded.launch_restore.is_some() {
+            return Err(decoded);
+        }
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes.get(&route) else {
+            return Err(decoded);
+        };
+        let Ok(body) = decoded.body() else {
+            return Err(decoded);
+        };
+        let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+        if body.get("preset").and_then(Value::as_str) != Some("worker")
+            || body
+                .get("op")
+                .and_then(Value::as_str)
+                .is_some_and(|op| op != "tool.call")
+            || tool_provider::recognized_operation(name)
+            || name == "bg_events"
+        {
+            return Err(decoded);
+        }
+        let Some(key) = access_grants::launch_key(identity, "worker") else {
+            return Err(decoded);
+        };
+        let Some(ctx) = executor.actor_context(&identity.root) else {
+            return Err(decoded);
+        };
+        let scope = crate::db::access_grants::ScopeKey::from_policy(&key);
+        if ctx.launch_grants_materialized(&scope) {
+            return Err(decoded);
+        }
+        let deadline = wait_deadline(&decoded, body.get("deadline_ms").and_then(Value::as_u64));
+        let admission = AdmissionWait::from_decoded(&decoded, name);
+        let permit = self.launch_restores.clone().try_acquire_owned();
+        if deadline <= Instant::now() || self.pending.len() >= MAX_WAITERS || permit.is_err() {
+            decoded.launch_restore = Some(Err(access_grants::restore_refusal(
+                &identity.project_root,
+                "admission_unavailable",
+                "deadline or restoration waiter limit reached",
+            )));
+            return Err(decoded);
+        }
+        let permit = permit.unwrap();
+        let identity = identity.clone();
+        let progress = Arc::new(StdMutex::new(identity.project_root.clone()));
+        let worker_progress = progress.clone();
+        let key = (route, decoded.frame.header.corr);
+        let handle = self.tasks.spawn(async move {
+            let worker_ctx = ctx.clone();
+            let result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                tokio::task::spawn_blocking(move || {
+                    // Retain the permit until even a timed-out database read
+                    // exits, so stalled requests cannot grow the blocking pool.
+                    let _permit = permit;
+                    access_grants::restore_launch_before(&identity, &worker_ctx, "worker", deadline, worker_progress)
+                }),
+            ).await;
+            let restored = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(access_grants::restore_refusal(
+                    &progress.lock().unwrap_or_else(|e| e.into_inner()), "worker_failed", error)),
+                Err(_) => Err(access_grants::restore_refusal(
+                    &progress.lock().unwrap_or_else(|e| e.into_inner()), "deadline_exceeded", "admission deadline exceeded")),
+            };
+            decoded.launch_restore = Some(match restored {
+                Ok(crate::db::access_grants::LaunchRestore::Materialized | crate::db::access_grants::LaunchRestore::AlreadyMaterialized) => {
+                    ctx.memoize_launch_grants(scope);
+                    Ok(())
+                }
+                Ok(crate::db::access_grants::LaunchRestore::NoParams) => Ok(()),
+                Err(mut error) => {
+                    crate::slog_warn!("launch_grant_restore_failed: owner={} scope_ref={} epoch={} code={} error={}",
+                        scope.owner, scope.scope_ref, scope.epoch, error.code, error.message);
+                    if error.detail.is_none() { error.detail = Some(json!({"retryable":true,"phase":"launch_grant_restore"})); }
+                    Err(error)
+                }
+            });
+            decoded
+        });
+        if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
+            old.abort();
+        }
+        Ok(())
     }
 
     /// Return the frame unchanged unless this is a persistence-dependent call
@@ -395,6 +491,7 @@ mod tests {
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -436,6 +533,7 @@ mod tests {
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1, Vec::new()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -467,6 +565,7 @@ mod tests {
         let frame = |name: &str, corr, deadline_ms| DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -567,6 +666,7 @@ mod tests {
         let frame = |channel: u16, corr, body: Value| DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -654,6 +754,7 @@ mod tests {
         let frame = |corr, body: Value| DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -756,6 +857,7 @@ mod tests {
         let frame = |corr| DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -823,6 +925,7 @@ mod tests {
         DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -1009,6 +1112,7 @@ mod tests {
         let frame = |name: &str, corr| DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
+            launch_restore: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

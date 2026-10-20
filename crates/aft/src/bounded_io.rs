@@ -1072,6 +1072,10 @@ pub(crate) use regression_tests::{stall_helper, stall_running_helper};
 pub(crate) fn stall_helper_if_requested(path: &Path) {
     regression_tests::before_helper(path);
 }
+#[cfg(all(test, unix))]
+pub(crate) fn stall_running_helper_if_requested(path: &Path) {
+    regression_tests::after_helper_start(path);
+}
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {

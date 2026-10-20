@@ -930,6 +930,59 @@ pub(crate) fn expand_home(path: &Path, home: &Path) -> PathBuf {
 /// Identity for policy comparisons only. Tool return paths retain their existing
 /// resolution contract, including the unchanged spelling when unrestricted.
 pub(crate) fn policy_path(path: &Path) -> PathBuf {
+    let bounded = BOUNDED_POLICY_PATHS.with(|slot| slot.borrow().clone());
+    if let Some(state) = bounded {
+        if state.error.borrow().is_none() {
+            *state.progress.lock().unwrap_or_else(|e| e.into_inner()) = path.to_path_buf();
+            match crate::bounded_io::run(path, None, |path| Ok(resolve_policy_path(&path))) {
+                Ok(path) => return path,
+                Err(error) => *state.error.borrow_mut() = Some(error),
+            }
+        }
+        // The enclosing resolution must reject this entire policy. Do not run
+        // more filesystem work after its first failure.
+        return crate::inspect::job::normalize_path(path);
+    }
+    resolve_policy_path(path)
+}
+
+struct BoundedPolicyPaths {
+    progress: std::sync::Arc<std::sync::Mutex<PathBuf>>,
+    error: std::cell::RefCell<Option<std::io::Error>>,
+}
+
+thread_local! {
+    static BOUNDED_POLICY_PATHS: std::cell::RefCell<Option<std::rc::Rc<BoundedPolicyPaths>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Resolve a complete policy with isolated filesystem probes, rejecting all of
+/// its derived authority if any probe fails. The caller supplies the I/O budget.
+pub(crate) fn with_bounded_policy_paths<T>(
+    progress: std::sync::Arc<std::sync::Mutex<PathBuf>>,
+    work: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    struct Restore(Option<std::rc::Rc<BoundedPolicyPaths>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOUNDED_POLICY_PATHS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let state = std::rc::Rc::new(BoundedPolicyPaths {
+        progress,
+        error: Default::default(),
+    });
+    let _restore = Restore(BOUNDED_POLICY_PATHS.with(|slot| slot.replace(Some(state.clone()))));
+    let value = work();
+    let error = state.error.borrow_mut().take();
+    match error {
+        Some(error) => Err(error),
+        None => Ok(value),
+    }
+}
+
+fn resolve_policy_path(path: &Path) -> PathBuf {
+    #[cfg(all(test, unix))]
+    crate::bounded_io::stall_running_helper_if_requested(path);
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {

@@ -631,11 +631,58 @@ fn merge_grant(grants: &mut Vec<AccessGrant>, grant: AccessGrant) {
 /// Revived workers do not fetch another catalog. Validate only saved launch
 /// entries against current head authority, dropping invalid siblings. Filesystem
 /// probes run unlocked; the install transaction rechecks all stored inputs.
+#[cfg(test)]
 pub(super) fn restore_launch(
     identity: &RouteIdentity,
     ctx: &AppContext,
     preset: &str,
 ) -> Result<store::LaunchRestore, subc_protocol::ErrorBody> {
+    restore_launch_before(
+        identity,
+        ctx,
+        preset,
+        Instant::now() + persistence::WAIT_BUDGET,
+        Arc::new(StdMutex::new(identity.project_root.clone())),
+    )
+}
+
+pub(super) fn restore_refusal(
+    path: &Path,
+    reason: &str,
+    message: impl std::fmt::Display,
+) -> subc_protocol::ErrorBody {
+    refusal(
+        "grants_unavailable",
+        format!(
+            "launch grant restoration for {}: {message}; retry after the path recovers",
+            path.display()
+        ),
+    )
+    .with_detail(
+        json!({"retryable":true,"path":path,"reason":reason,"phase":"launch_grant_restore"}),
+    )
+}
+
+pub(super) fn restore_launch_before(
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+    preset: &str,
+    deadline: Instant,
+    progress: Arc<StdMutex<PathBuf>>,
+) -> Result<store::LaunchRestore, subc_protocol::ErrorBody> {
+    let _budget = crate::bounded_io::enter(Some(
+        crate::bounded_io::Budget::after(deadline.saturating_duration_since(Instant::now()))
+            .capped(deadline),
+    ));
+    let expired = || {
+        (Instant::now() >= deadline).then(|| {
+            restore_refusal(
+                &progress.lock().unwrap_or_else(|e| e.into_inner()),
+                "deadline_exceeded",
+                "admission deadline exceeded",
+            )
+        })
+    };
     let Some(key) = launch_key(identity, preset) else {
         return Ok(store::LaunchRestore::NoParams);
     };
@@ -667,6 +714,9 @@ pub(super) fn restore_launch(
         register_on(&conn, identity, ctx)?;
     }
     loop {
+        if let Some(error) = expired() {
+            return Err(error);
+        }
         let (snapshot, raw) = {
             let conn = lock()?;
             (
@@ -677,52 +727,82 @@ pub(super) fn restore_launch(
         let Some(raw) = raw else {
             return Ok(store::LaunchRestore::NoParams);
         };
-        let head = snapshot
-            .clone()
-            .map(|policy| policy.resolve(&ctx.storage_dir()));
-        let entries = raw
-            .as_array()
-            .ok_or_else(|| unavailable(rusqlite::Error::InvalidQuery))?;
-        let mut grants = Vec::new();
-        let mut dropped = Vec::new();
-        for entry in entries {
-            match validate(&json!([entry]), head.as_ref(), head_key.as_ref()) {
-                Ok(valid) => {
-                    for grant in valid {
-                        // Launch paths are saved canonically. A symlink retarget
-                        // must not turn the same spelling into new authority.
-                        // Legacy noncanonical inputs fail closed on revival.
-                        if entry.get("path").and_then(Value::as_str).map(Path::new)
-                            != Some(grant.path.as_path())
-                        {
-                            dropped.push(format!("launch allow_paths dropped: path={} mode={} reason=\"launch_path_changed\"",
-                                entry["path"], entry["mode"]));
-                        } else {
-                            merge_grant(&mut grants, grant);
+        #[cfg(test)]
+        if snapshot.is_some() {
+            unlocked_hook::run(unlocked_hook::Point::Resolve);
+        }
+        let saved_head = snapshot.clone();
+        let saved_launch = raw.clone();
+        let saved_head_key = head_key.clone();
+        let storage = ctx.storage_dir();
+        let resolution_progress = progress.clone();
+        // Building the head policy also probes paths besides saved grants.
+        // Isolate the whole unlocked phase so those probes share the deadline.
+        let resolved = crate::bounded_io::run(&identity.project_root, None, move |_| {
+            crate::access_policy::with_bounded_policy_paths(resolution_progress, || -> Result<_, subc_protocol::ErrorBody> {
+                let head = saved_head
+                    .clone()
+                    .map(|policy| policy.resolve(&storage));
+                let entries = saved_launch
+                    .as_array()
+                    .ok_or_else(|| unavailable(rusqlite::Error::InvalidQuery))?;
+                let mut grants = Vec::new();
+                let mut dropped = Vec::new();
+                for entry in entries {
+                    match validate(&json!([entry]), head.as_ref(), saved_head_key.as_ref()) {
+                        Ok(valid) => {
+                            for grant in valid {
+                                // Launch paths are saved canonically. A symlink retarget
+                                // must not turn the same spelling into new authority.
+                                // Legacy noncanonical inputs fail closed on revival.
+                                if entry.get("path").and_then(Value::as_str).map(Path::new)
+                                    != Some(grant.path.as_path())
+                                {
+                                    dropped.push(format!("launch allow_paths dropped: path={} mode={} reason=\"launch_path_changed\"",
+                                        entry["path"], entry["mode"]));
+                                } else {
+                                    merge_grant(&mut grants, grant);
+                                }
+                            }
                         }
+                        Err(error) => dropped.push(format!(
+                            "launch allow_paths dropped: path={} mode={} reason={}",
+                            entry.get("path").unwrap_or(&Value::Null),
+                            entry.get("mode").unwrap_or(&Value::Null),
+                            error
+                                .detail
+                                .as_ref()
+                                .and_then(|d| d.get("reason"))
+                                .unwrap_or(&Value::Null),
+                        )),
                     }
                 }
-                Err(error) => dropped.push(format!(
-                    "launch allow_paths dropped: path={} mode={} reason={}",
-                    entry.get("path").unwrap_or(&Value::Null),
-                    entry.get("mode").unwrap_or(&Value::Null),
-                    error
-                        .detail
-                        .as_ref()
-                        .and_then(|d| d.get("reason"))
-                        .unwrap_or(&Value::Null),
-                )),
-            }
-        }
+                Ok((grants, dropped))
+            })
+        }).map_err(|error| restore_refusal(&progress.lock().unwrap_or_else(|e| e.into_inner()), crate::bounded_io::timeout_code(&error), error))?;
+        let (grants, dropped) = resolved?;
         let conn = lock()?;
+        if let Some(error) = expired() {
+            return Err(error);
+        }
         let mut changed = false;
+        let mut timed_out = None;
         let restored = store::restore_launch(&conn, &key, |conn, current_raw| {
             if *current_raw != raw || read_head(conn)? != snapshot {
                 changed = true;
                 return Err(rusqlite::Error::InvalidQuery);
             }
+            // A database wait or repeated snapshot changes cannot let an
+            // expired admission install grants after its caller was refused.
+            if let Some(error) = expired() {
+                timed_out = Some(error);
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             Ok(grants)
         });
+        if let Some(error) = timed_out {
+            return Err(error);
+        }
         if changed {
             continue;
         }
