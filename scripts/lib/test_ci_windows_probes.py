@@ -36,6 +36,11 @@ if "--list" in sys.argv:
     if not os.environ.get("FAKE_PROBE_MISSING"):
         print(sys.argv[-1] + ": test")
     sys.exit(int(os.environ.get("FAKE_PROBE_LIST_EXIT", "0")))
+if os.environ.get("FAKE_PROBE_HANG"):
+    import subprocess, time
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    pathlib.Path(__file__).with_suffix(".grandchild").write_text(str(child.pid))
+    time.sleep(60)
 sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
 ''')
         self.binary.chmod(0o755)
@@ -131,6 +136,26 @@ sys.exit(int(os.environ.get("FAKE_PROBE_EXIT", "0")))
             with self.assertRaises(subprocess.CalledProcessError):
                 probes.run_probe(self.binary, "tls")
         self.assertEqual(len(self.calls()), 1)
+
+    @unittest.skipIf(os.name == "nt", "the fake harness is a shebang script")
+    def test_hung_probe_and_its_grandchild_are_killed_at_the_limit(self):
+        import time
+        started = time.monotonic()
+        with patch.dict(os.environ, {"FAKE_PROBE_HANG": "1"}), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = probes.run_probe(self.binary, "tls", timeout_s=2)
+        self.assertEqual(code, probes.TIMEOUT_EXIT)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("did not finish within 2s", out.getvalue())
+        grandchild = int(self.binary.with_suffix(".grandchild").read_text())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the probe's grandchild outlived the timeout kill")
 
     def test_cli_reads_the_saved_metadata_and_propagates_test_failure(self):
         archive = self.archive()

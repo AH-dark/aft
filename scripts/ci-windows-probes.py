@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import platform
+import signal
 import subprocess
 import tarfile
 
@@ -16,6 +18,12 @@ PROBES = {
     "tls": "semantic_index::tests::platform_verifier_tls_client_subprocess",
     "backtrace": "logging::tests::panic_hook_preserves_default_backtrace_behavior_and_persists",
 }
+# nextest gave these probes a 10-minute slow-test kill when it ran them. A probe
+# whose spawned trust check hangs must end the step well before the archive
+# job's 25-minute limit, or no downstream shard ever receives the archive.
+PROBE_TIMEOUT_S = 600
+LIST_TIMEOUT_S = 120
+TIMEOUT_EXIT = 124
 
 
 def library_harness(metadata: dict) -> Path:
@@ -44,19 +52,48 @@ def archive_library_harness(archive_file: Path) -> Path:
     raise ValueError("nextest archive has no binaries metadata")
 
 
-def run_probe(binary: Path, probe: str) -> int:
+def kill_process_tree(process: subprocess.Popen) -> None:
+    # The probes spawn their own helper processes. Killing only the direct child
+    # would leave a hung grandchild holding the step open.
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+            capture_output=True, check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def run_bounded(command: list[str], cwd: Path, timeout_s: float) -> int:
+    if os.name == "nt":
+        process = subprocess.Popen(command, cwd=cwd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        process = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+    try:
+        return process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(process)
+        process.wait()
+        print(f"serial Windows probe did not finish within {timeout_s:g}s and was killed", flush=True)
+        return TIMEOUT_EXIT
+
+
+def run_probe(binary: Path, probe: str, timeout_s: float = PROBE_TIMEOUT_S) -> int:
     name = PROBES[probe]
     # Cargo normally runs library tests from their package directory. Preserve
     # that working directory while using nextest's exact already-linked binary.
     cwd = ROOT / "crates/aft"
     listing = subprocess.run(
         [str(binary), "--list", "--exact", name], cwd=cwd,
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, timeout=LIST_TIMEOUT_S,
     )
     if listing.stdout.splitlines().count(f"{name}: test") != 1:
         raise ValueError(f"serial probe is missing from the archive-built harness: {name}\n{listing.stdout}")
     print(f"Running serial Windows probe {name} from {binary}", flush=True)
-    return subprocess.run([str(binary), "--exact", name], cwd=cwd, check=False).returncode
+    return run_bounded([str(binary), "--exact", name], cwd, timeout_s)
 
 
 def main() -> int:
