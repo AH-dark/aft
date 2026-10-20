@@ -254,16 +254,20 @@ pub fn format_worker_wait_limit_message(
     task_id: &str,
     limit_ms: u64,
     ran_ms: u64,
-    tail: &str,
+    // `None` when the reply was built without reading the task's output (a
+    // reply prepared ahead of time so it needs no task lock). Saying "No output
+    // yet" there would be a false claim about a command that may have printed.
+    tail: Option<&str>,
     bash_watch_available: bool,
 ) -> String {
     let limit = format_wait_limit(limit_ms);
     let ran = format_seconds(ran_ms);
-    let tail = tail.trim_end();
-    let output = if tail.is_empty() {
-        "No output yet.".to_string()
-    } else {
-        format!("Recent output:\n{tail}")
+    let output = match tail.map(str::trim_end) {
+        None => format!(
+            "Its output was not read for this reply; use bash_status({{ taskId: \"{task_id}\" }}) to see it."
+        ),
+        Some("") => "No output yet.".to_string(),
+        Some(tail) => format!("Recent output:\n{tail}"),
     };
     let next_step = if bash_watch_available {
         format!(
@@ -739,7 +743,7 @@ pub(crate) fn promote_bash(
                             task_id,
                             wait_window_ms,
                             ran_ms,
-                            tail,
+                            Some(tail),
                             bash_watch_available,
                         )
                     ),
@@ -1606,15 +1610,23 @@ mod tests {
             "bash-cap",
             5_400_000,
             5_401_000,
-            "line 1\nline 2\n",
+            Some("line 1\nline 2\n"),
             true,
         );
         assert!(text.contains("It has run for 5401s"), "{text}");
         assert!(text.ends_with("Recent output:\nline 1\nline 2"), "{text}");
         assert!(
-            format_worker_wait_limit_message("bash-cap", 60_000, 60_000, "", true)
+            format_worker_wait_limit_message("bash-cap", 60_000, 60_000, Some(""), true)
                 .ends_with("No output yet.")
         );
+        let unread = format_worker_wait_limit_message("bash-cap", 60_000, 60_000, None, true);
+        assert!(
+            unread.ends_with(
+                "Its output was not read for this reply; use bash_status({ taskId: \"bash-cap\" }) to see it."
+            ),
+            "{unread}"
+        );
+        assert!(!unread.contains("No output yet"), "{unread}");
         assert!(text.contains("still running after 90 minutes"), "{text}");
         assert!(text.contains("bash.worker_wait_max_ms"), "{text}");
         assert!(text.contains("it was not killed"), "{text}");
@@ -1783,7 +1795,7 @@ mod tests {
             format_promotion_message("bash-123", None, 8_000, true, true),
             format_wait_detach_message("bash-123", true, true),
             format_module_drain_detach_message("bash-123", true, true),
-            format_worker_wait_limit_message("bash-123", 1_800_000, 1_800_000, "", true),
+            format_worker_wait_limit_message("bash-123", 1_800_000, 1_800_000, Some(""), true),
         ];
         for text in &worker {
             assert!(!text.contains("completion reminder"), "{text}");
@@ -1809,7 +1821,7 @@ mod tests {
             format_promotion_message("bash-1", None, 15_000, true, false),
             format_wait_detach_message("bash-1", true, false),
             format_module_drain_detach_message("bash-1", true, false),
-            format_worker_wait_limit_message("bash-1", 1_800_000, 1_800_000, "", false),
+            format_worker_wait_limit_message("bash-1", 1_800_000, 1_800_000, Some(""), false),
         ];
         for text in &without_watch {
             assert!(!text.contains("bash_watch"), "{text}");
@@ -1842,7 +1854,7 @@ mod tests {
             format_promotion_message("bash-1", None, 15_000, true, true),
             format_wait_detach_message("bash-1", true, true),
             format_module_drain_detach_message("bash-1", true, true),
-            format_worker_wait_limit_message("bash-1", 1_800_000, 1_800_000, "", true),
+            format_worker_wait_limit_message("bash-1", 1_800_000, 1_800_000, Some(""), true),
         ];
         for text in &with_watch {
             assert!(!text.contains("completion reminder"), "{text}");

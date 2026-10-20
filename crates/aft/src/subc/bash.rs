@@ -1548,7 +1548,7 @@ pub(super) fn submit_deferred_bash(
                             "output": format!(
                                 "{}\nKill deadline recorded at launch (worker waits may extend the default):{kill_note}",
                                 crate::commands::bash_orchestrate::format_worker_wait_limit_message(
-                                    &task_id, cap, cap, "",
+                                    &task_id, cap, cap, None,
                                     format_context_for_spawn.bash_watch_available.unwrap_or(worker_session),
                                 ),
                             ),
@@ -2037,7 +2037,7 @@ fn startup_deadline_response(
             let cap = blocking_cap_ms.unwrap();
             Response::success(request_id, json!({
                 "output": crate::commands::bash_orchestrate::format_worker_wait_limit_message(
-                    task_id, cap, cap, "", bash_watch_available,
+                    task_id, cap, cap, None, bash_watch_available,
                 ),
                 "duration_ms": cap,
                 "task_id": task_id,

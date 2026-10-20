@@ -5302,8 +5302,12 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
         // The wait cap starts at request receipt, not at shell startup. A slow
         // shell can legitimately hand back before producing its first output.
         // Check that output causally via status below, without moving the cap.
+        // When the reply watchdog wins, the reply was prepared without reading
+        // output and says so instead of claiming there is none.
         assert!(
-            text.contains("Recent output:\nstarted") || text.contains("No output yet."),
+            text.contains("Recent output:\nstarted")
+                || text.contains("No output yet.")
+                || text.contains("Its output was not read for this reply"),
             "{mode}: {text:?}"
         );
         let task_id = extract_bash_task_id(&text);

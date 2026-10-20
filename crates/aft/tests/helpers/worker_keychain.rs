@@ -163,17 +163,24 @@ async fn worker_jail_keychain_build_and_tls_compatibility() {
         assert!(reply.contains("1 passed"), "{profile}: {reply}");
         assert!(reply.contains("LINKED_BINARY_OK"), "{profile}: {reply}");
         assert!(reply.contains("TEST_2"), "{profile}: {reply}");
+        // The network half needs live GitHub and npm, so it is opt-in: an
+        // offline machine must not fail a sandbox test that has nothing to do
+        // with the network. The maintainer's native gate sets this variable.
+        if std::env::var_os("AFT_TEST_LIVE_NETWORK").is_none() {
+            continue;
+        }
         // Fetch into an independent repository: the linked main repository's
-        // shallow metadata is intentionally read-only to workers.
+        // shallow metadata is intentionally read-only to workers. Every request
+        // is bounded so a stalled network fails the test instead of hanging it.
         let reply = jail.bash(
-                "fetch_repo=$(mktemp -d \"$TMPDIR/https-fetch.XXXXXX\") && git init -q \"$fetch_repo\" && git -C \"$fetch_repo\" -c credential.helper= fetch --depth=1 https://github.com/octocat/Hello-World.git HEAD && echo FETCH_$((1+1))",
+                "fetch_repo=$(mktemp -d \"$TMPDIR/https-fetch.XXXXXX\") && git init -q \"$fetch_repo\" && git -C \"$fetch_repo\" -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --depth=1 https://github.com/octocat/Hello-World.git HEAD && echo FETCH_$((1+1))",
         ).await;
         assert!(reply.contains("FETCH_2"), "{profile}: {reply}");
         let reply = jail
-            .bash("curl -sSf https://github.com >/dev/null && echo CURL_$((1+1))")
+            .bash("curl -sSf --connect-timeout 15 --max-time 60 https://github.com >/dev/null && echo CURL_$((1+1))")
             .await;
         assert!(reply.contains("CURL_2"), "{profile}: {reply}");
-        let reply = jail.bash("bun --version && mkdir -p bun-probe && cd bun-probe && printf '%s' '{\"dependencies\":{\"is-number\":\"7.0.0\"}}' > package.json && bun install && bun -e 'if (!require(\"is-number\")(42)) process.exit(1)' && echo BUN_$((1+1))").await;
+        let reply = jail.bash("bun --version && mkdir -p bun-probe && cd bun-probe && printf '%s' '{\"dependencies\":{\"is-number\":\"7.0.0\"}}' > package.json && perl -e 'alarm shift; exec @ARGV' 120 bun install && bun -e 'if (!require(\"is-number\")(42)) process.exit(1)' && echo BUN_$((1+1))").await;
         assert!(reply.contains("BUN_2"), "{profile}: {reply}");
     }
 }
