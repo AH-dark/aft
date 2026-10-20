@@ -155,12 +155,8 @@ impl WireRestore {
     }
 
     async fn call(&mut self, corr: u64) {
-        self.call_tool(
-            corr,
-            "read",
-            json!({"filePath":self.target.join("probe.txt")}),
-        )
-        .await;
+        self.call_tool(corr, "read", json!({"path":self.target.join("probe.txt")}))
+            .await;
     }
 
     async fn call_tool(&mut self, corr: u64, name: &str, arguments: Value) {
@@ -221,7 +217,7 @@ async fn grants_stalled_restore_allows_checkout_read() {
     }
     let mut wire = WireRestore::new().await;
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call_tool(100, "read", json!({"filePath":"probe.txt"}))
+    wire.call_tool(100, "read", json!({"path":"probe.txt"}))
         .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
     let reply = wire.reply(100, Duration::from_secs(3)).await.unwrap();
@@ -254,7 +250,7 @@ async fn grants_stalled_restore_allows_independently_granted_read() {
         .unwrap();
     }
     let stall = crate::bounded_io::stall_running_helper(&wire.target);
-    wire.call_tool(100, "read", json!({"filePath":healthy.join("probe.txt")}))
+    wire.call_tool(100, "read", json!({"path":healthy.join("probe.txt")}))
         .await;
     stall.reached.recv_timeout(Duration::from_secs(5)).unwrap();
     let reply = wire.reply(100, Duration::from_secs(3)).await.unwrap();
