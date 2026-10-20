@@ -1831,6 +1831,7 @@ pub(super) struct HealthRollupCache {
     clock_ms: AtomicU64,
     /// Count of completed refresh attempts, including scheduler contention.
     refreshes: AtomicU64,
+    step_log_at_ms: AtomicU64,
     /// Generation of the newest published census.
     published_generation: AtomicU64,
     /// One more than the highest census generation that a contended refresh
@@ -1859,6 +1860,7 @@ impl HealthRollupCache {
             #[cfg(test)]
             clock_ms: AtomicU64::new(u64::MAX),
             refreshes: AtomicU64::new(0),
+            step_log_at_ms: AtomicU64::new(u64::MAX),
             published_generation: AtomicU64::new(0),
             stale_through_generation: AtomicU64::new(0),
             #[cfg(test)]
@@ -1894,6 +1896,16 @@ impl HealthRollupCache {
         // Start the reuse clock after that walk so its duration is not counted twice.
         *cached = Some((self.now_ms(), observation.clone()));
         observation
+    }
+
+    fn step_log_due(&self) -> bool {
+        let now = self.now_ms();
+        let last = self.step_log_at_ms.load(Ordering::Relaxed);
+        (last == u64::MAX || now.saturating_sub(last) >= 60_000)
+            && self
+                .step_log_at_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     fn retention_count(
@@ -2136,7 +2148,15 @@ impl HealthRollupCache {
     }
 
     pub(super) fn memory_census(&self) -> Value {
-        self.snapshot().0.memory_census.clone()
+        let (snapshot, age_ms) = self.snapshot();
+        let mut census = snapshot.memory_census.clone();
+        if let Some(tick) = census
+            .get_mut("health_rollup_tick")
+            .and_then(Value::as_object_mut)
+        {
+            tick.insert("age_ms".into(), json!(age_ms));
+        }
+        census
     }
 }
 
@@ -2496,9 +2516,55 @@ mod rollup_bench;
 
 macro_rules! rollup_mark {
     ($timer:ident, $step:literal) => {
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         $timer.mark($step);
     };
+}
+
+struct RollupStepTimer {
+    started: Instant,
+    previous: Instant,
+    steps: std::collections::BTreeMap<&'static str, (Duration, u64)>,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    cpu: rollup_bench::Timer,
+}
+
+impl RollupStepTimer {
+    fn new() -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            previous: started,
+            steps: Default::default(),
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            cpu: rollup_bench::Timer::new(),
+        }
+    }
+
+    fn mark(&mut self, step: &'static str) {
+        let now = Instant::now();
+        let entry = self.steps.entry(step).or_default();
+        entry.0 += now.duration_since(self.previous);
+        entry.1 += 1;
+        self.previous = now;
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        self.cpu.mark(step);
+    }
+
+    fn metrics(&self) -> Value {
+        // Elapsed time includes scheduler waits; the offline benchmark also
+        // measures thread CPU so host contention is distinguishable from work.
+        let steps = self
+            .steps
+            .iter()
+            .map(|(step, (elapsed, calls))| {
+                (
+                    (*step).to_owned(),
+                    json!({"elapsed_ms": elapsed.as_secs_f64() * 1000.0, "calls": calls}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({"elapsed_ms": self.started.elapsed().as_secs_f64() * 1000.0, "steps": steps})
+    }
 }
 
 fn build_health_diagnostic_rollup_from_actors(
@@ -2507,8 +2573,7 @@ fn build_health_diagnostic_rollup_from_actors(
     shared_app: &App,
     actor_entries: Vec<(ProjectRootId, Arc<AppContext>)>,
 ) -> HealthDiagnosticRollup {
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-    let mut timer = rollup_bench::Timer::new();
+    let mut timer = RollupStepTimer::new();
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
@@ -2916,6 +2981,13 @@ fn build_health_diagnostic_rollup_from_actors(
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
     rollup_mark!(timer, "metrics JSON assembly");
+    let tick = timer.metrics();
+    if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
+        log::debug!("health rollup tick: {tick}");
+    }
+    // Keep detailed timing outside the size-budgeted health reply: adding it
+    // there would displace root diagnostics. The uncapped census retains it.
+    memory_census["health_rollup_tick"] = tick;
     HealthDiagnosticRollup {
         status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
@@ -5285,6 +5357,73 @@ mod tests {
                 .all(|(successful, walks)| { *walks == if *successful { 1 } else { 0 } }),
             "memory walks did not match each attempt's census outcome: {walks_by_attempt:?}"
         );
+    }
+
+    #[test]
+    fn rollup_110_root_step_counters_keep_current_numbers_and_age() {
+        let executor = Executor::new();
+        let app = crate::context::App::default_shared();
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        let mut dirs = Vec::new();
+        let mut first = None;
+        for index in 0..110 {
+            let (dir, root) = test_root(&format!("rollup-counters-{index}"));
+            let ctx = test_ctx();
+            if index == 0 {
+                first = Some((root.clone(), Arc::clone(&ctx)));
+            }
+            assert!(executor.register_actor(root, ctx));
+            dirs.push(dir);
+        }
+        cache.refresh_for_test(&executor, &app);
+        let (root, ctx) = first.unwrap();
+        let label = root.as_path().display().to_string();
+        let before = cache.memory_census()["roots"][&label]["attributed_bytes"]
+            .as_u64()
+            .unwrap();
+        cache.clock_ms.store(3000, Ordering::Relaxed);
+        assert_eq!(cache.snapshot().1, Some(3000));
+        assert_eq!(cache.memory_census()["health_rollup_tick"]["age_ms"], 3000);
+        ctx.symbol_cache().write().unwrap().insert(
+            root.as_path().join("current.rs"),
+            SystemTime::UNIX_EPOCH,
+            12,
+            blake3::hash(b"current"),
+            Vec::new(),
+        );
+        cache.refresh_for_test(&executor, &app);
+        let (snapshot, age) = cache.snapshot();
+        assert_eq!(age, Some(0));
+        let tick = &snapshot.memory_census["health_rollup_tick"];
+        assert!(snapshot.metrics.get("health_rollup_tick").is_none());
+        assert_eq!(tick["steps"]["per-root memory census"]["calls"], 110);
+        assert_eq!(tick["steps"]["lifecycle OS probes"]["calls"], 1);
+        assert_eq!(tick["steps"].as_object().unwrap().len(), 14);
+        assert!(tick["elapsed_ms"].as_f64().unwrap() >= 0.0);
+        let census = cache.memory_census();
+        assert_eq!(census["health_rollup_tick"]["age_ms"], 0);
+        assert_eq!(census["roots"].as_object().unwrap().len(), 110);
+        assert!(
+            census["roots"][&label]["attributed_bytes"]
+                .as_u64()
+                .unwrap()
+                > before
+        );
+        assert!(census["roots"][&label]["memory_measured_age_ms"].is_u64());
+    }
+
+    #[test]
+    fn rollup_step_debug_log_is_due_once_per_minute() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        assert!(cache.step_log_due());
+        assert!(!cache.step_log_due());
+        cache.clock_ms.store(59_999, Ordering::Relaxed);
+        assert!(!cache.step_log_due());
+        cache.clock_ms.store(60_000, Ordering::Relaxed);
+        assert!(cache.step_log_due());
+        assert!(!cache.step_log_due());
     }
 
     /// The rollup asks every root for its memory every few seconds. While a
