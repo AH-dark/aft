@@ -27,16 +27,18 @@ const DEFAULT_MIN_HANG_WINDOW_MS = 60_000;
 
 /**
  * How long the child may write nothing at all (no reply, progress frame or
- * push frame) while it owes replies, before the hang watchdog kills it.
+ * push frame) while it owes a reply, before the hang watchdog kills it. The
+ * window starts at the oldest request sent since the child's last output.
  *
- * The window is twice the longest transport budget among the requests the
- * child has not answered yet, and never less than `minWindowMs`. A request
- * that is slow but healthy finishes within its own budget, and a request
- * queued behind it within roughly one more, so a child that stays silent for
- * twice the longest budget is treated as hung. (A deeper silent backlog can
- * still reach the window; any output resets it.) The floor keeps short budgets
- * (5 s status polls, 30 s defaults) from turning a slow disk or a cold index
- * into a kill. This is the only place the window is computed.
+ * The window is twice the longest transport budget among those unanswered
+ * requests and the calls still waiting, and never less than `minWindowMs`. A
+ * request that is slow but healthy finishes within its own budget, and a
+ * request queued behind it within roughly one more, so a child that stays
+ * silent for twice the longest budget is treated as hung. (A deeper silent
+ * backlog can still reach the window; any parsed stdout frame resets it.) The
+ * floor keeps
+ * short budgets (5 s status polls, 30 s defaults) from turning a slow disk or
+ * a cold index into a kill. This is the only place the window is computed.
  */
 export function hangWindowMs(
   budgetsMs: Iterable<number>,
@@ -228,6 +230,8 @@ interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
   timer: BridgeTimer;
+  /** Transport budget of this call; widens the hang watchdog's window while it waits. */
+  budgetMs: number;
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   onSettled?: () => void;
   command: string;
@@ -641,12 +645,13 @@ export class BinaryBridge implements AftProjectTransport {
   private configureWarningClients = new Map<string, unknown>();
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Updated after every successfully parsed stdout frame from the child. */
-  private lastChildActivityAt = 0;
   /**
-   * Requests written to the current child that it has not answered yet,
-   * including ones whose caller already timed out: the child still owes them
-   * a reply, and the hang watchdog measures its silence against them.
+   * Hang evidence: requests written to the current child since its last
+   * output that it has not answered. An entry stays after its caller timed
+   * out, because the child still owes the reply and its silence is what the
+   * watchdog judges. Any parsed stdout frame from the child clears the map
+   * (`clearHangEvidence`), and so does a new child (`resetHangWatchdog`); a
+   * caller's timeout never removes an entry.
    */
   private awaitingReply = new Map<
     string,
@@ -1288,6 +1293,7 @@ export class BinaryBridge implements AftProjectTransport {
           resolve,
           reject,
           timer,
+          budgetMs: effectiveTimeoutMs,
           onProgress: options?.onProgress,
           command,
           tool,
@@ -1768,7 +1774,6 @@ export class BinaryBridge implements AftProjectTransport {
     this.stdoutPending = [];
     this.stdoutPendingLength = 0;
     this.stderrBuffer = "";
-    this.lastChildActivityAt = 0;
     this.resetHangWatchdog();
     // Fresh spawn — clear the stderr ring so crash diagnostics only reflect
     // the current child's output, not output from prior restart cycles.
@@ -1890,7 +1895,8 @@ export class BinaryBridge implements AftProjectTransport {
   private processStdoutLine(line: string): void {
     try {
       const response = JSON.parse(line) as Record<string, unknown>;
-      this.lastChildActivityAt = this.clock.now();
+      // Any parsed frame proves the child is alive.
+      this.clearHangEvidence();
       if (response.type === "progress") {
         const requestId = response.request_id as string | undefined;
         const entry = requestId ? this.pending.get(requestId) : undefined;
@@ -1904,7 +1910,6 @@ export class BinaryBridge implements AftProjectTransport {
         const entry = requestId ? this.pending.get(requestId) : undefined;
         if (requestId && entry) {
           this.pending.delete(requestId);
-          this.noteReplyReceived(requestId);
           this.clock.clearTimeout(entry.timer);
           entry.onSettled?.();
           entry.resolve({
@@ -1950,7 +1955,6 @@ export class BinaryBridge implements AftProjectTransport {
         return;
       }
       const id = response.id as string | undefined;
-      if (id) this.noteReplyReceived(id);
       if (id && this.pending.has(id)) {
         const entry = this.pending.get(id);
         if (!entry) return;
@@ -2074,38 +2078,28 @@ export class BinaryBridge implements AftProjectTransport {
     tool: string,
     sessionId: string | undefined,
   ): void {
-    const now = this.clock.now();
-    // When no other caller is waiting, forget unanswered requests whose own
-    // silence window has fully passed: the child kept running long after them
-    // and nobody waits on their replies, so they are lost replies, not a
-    // hang. Without this, one dropped reply would make the next quiet request
-    // look silent since long ago. While callers are waiting they are kept, so
-    // a run of calls that each time out on a wedged child still adds up to
-    // one silence the watchdog can see.
-    if (this.pending.size <= 1) {
-      for (const [staleId, stale] of this.awaitingReply) {
-        if (now - stale.sentAt >= hangWindowMs([stale.budgetMs], this.hangWindowMinMs)) {
-          this.awaitingReply.delete(staleId);
-        }
-      }
-    }
-    this.awaitingReply.set(id, { sentAt: now, budgetMs, tool, sessionId });
-    this.armHangWatchdog();
-  }
-
-  /** The child answered `id` (on time or late); re-time the watchdog. */
-  private noteReplyReceived(id: string): void {
-    if (!this.awaitingReply.delete(id)) return;
-    // A reply can shrink the window (the longest budget may be gone), so the
-    // timer is re-armed rather than left at its old, later deadline.
-    this.clearHangWatchdogTimer();
+    this.awaitingReply.set(id, { sentAt: this.clock.now(), budgetMs, tool, sessionId });
     this.armHangWatchdog();
   }
 
   /**
-   * When the current child counts as hung: the silence window over the
-   * requests it still owes replies, measured from its last output or from the
-   * oldest of those requests, whichever is later. Null when it owes nothing.
+   * The child wrote a frame, so it is alive: forget the unanswered requests
+   * gathered as hang evidence since its previous output. A reply that never
+   * comes for one of them (a lost reply) therefore never counts against a
+   * child that keeps producing output.
+   */
+  private clearHangEvidence(): void {
+    if (this.awaitingReply.size === 0) return;
+    this.awaitingReply.clear();
+    this.clearHangWatchdogTimer();
+  }
+
+  /**
+   * When the current child counts as hung: the silence window measured from
+   * the oldest request sent since its last output that it has not answered.
+   * The window covers the budgets of those requests and of every call still
+   * waiting, so a slow request that is still within its budget widens it.
+   * Null when there is no such request.
    */
   private hangDeadline(): {
     deadline: number;
@@ -2124,13 +2118,13 @@ export class BinaryBridge implements AftProjectTransport {
         oldestId = id;
       }
     }
+    for (const entry of this.pending.values()) budgets.push(entry.budgetMs);
     const windowMs = hangWindowMs(budgets, this.hangWindowMinMs);
-    const silentSince = Math.max(this.lastChildActivityAt, oldestSentAt);
-    return { deadline: silentSince + windowMs, windowMs, silentSince, oldestId };
+    return { deadline: oldestSentAt + windowMs, windowMs, silentSince: oldestSentAt, oldestId };
   }
 
   private armHangWatchdog(): void {
-    if (this.hangWatchdogTimer || this.pending.size === 0) return;
+    if (this.hangWatchdogTimer) return;
     const hang = this.hangDeadline();
     if (!hang) return;
     const timer = this.clock.setTimeout(
@@ -2140,8 +2134,8 @@ export class BinaryBridge implements AftProjectTransport {
       },
       Math.max(0, hang.deadline - this.clock.now()),
     );
-    // Each waiting call has its own referenced timeout timer that keeps the
-    // host alive, so the watchdog timer does not need to.
+    // Waiting calls have their own referenced timeout timers that keep the
+    // host alive; an idle host must be able to exit with a hung child.
     (timer as { unref?: () => void }).unref?.();
     this.hangWatchdogTimer = timer;
   }
@@ -2158,16 +2152,24 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   /**
-   * Kill the child when it is hung: a caller is waiting, and no stdout frame
-   * (reply, progress or push frame, for any request) arrived during the whole
-   * silence window. Any such frame proves the child is alive, so a child that
-   * keeps answering other calls or streaming progress is never killed. After
-   * one watchdog restart it stands down until a tool succeeds (see
+   * Kill the child when it is hung: a request sent since its last output has
+   * gone unanswered for the whole silence window, and no parsed stdout frame of
+   * any kind (reply, progress, push frame, for any request) arrived in that
+   * time. Any such frame proves the child is alive and clears the evidence, so a child that
+   * keeps answering other calls or streaming progress is never killed.
+   *
+   * The kill happens at this tick even when no caller is waiting any more
+   * (every caller may already have timed out). Waiting for the next call
+   * instead would let that call run into the same silent child, and a child
+   * silent for a whole window while owing a reply is stuck, not idle. So the
+   * first call after the window starts a fresh child, and a call made inside
+   * the window waits at most until its end.
+   *
+   * After one watchdog restart it stands down until a tool succeeds (see
    * `timeoutRestartAwaitingRecovery`).
    */
   private checkForHang(): void {
-    // Nobody is waiting: killing would help no one. The next request re-arms.
-    if (this.pending.size === 0 || !this.isAlive()) return;
+    if (!this.isAlive()) return;
     const hang = this.hangDeadline();
     if (!hang) return;
     const now = this.clock.now();

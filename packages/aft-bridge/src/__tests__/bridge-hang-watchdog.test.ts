@@ -232,44 +232,46 @@ describe("request timeouts are isolated from other requests", () => {
 });
 
 describe("hang watchdog", () => {
-  test("a silent child with a waiting call is killed at the window; an edit gets the typed error and is not retried", async () => {
-    const { logger, logs } = recordingLogger();
-    const clock = new ManualClock();
-    const bridge = bridgeWithClock(clock, logger);
-    try {
-      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
-      const edit = await wedgeThen(bridge, clock, "edit");
+  for (const mutating of ["edit", "bash"] as const) {
+    test(`a silent child with a waiting call is killed at the window; ${mutating} gets the typed error and is not retried`, async () => {
+      const { logger, logs } = recordingLogger();
+      const clock = new ManualClock();
+      const bridge = bridgeWithClock(clock, logger);
+      try {
+        await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+        const call = await wedgeThen(bridge, clock, mutating);
 
-      const error = edit.error as
-        | (Error & { retryable?: boolean; outcomeUnknown?: boolean; tool?: string })
-        | undefined;
-      expect(error?.name).toBe("BridgeRestartedError");
-      expect(error?.retryable).toBe(true);
-      expect(error?.outcomeUnknown).toBe(true);
-      expect(error?.tool).toBe("edit");
-      expect(error?.message).toContain("inspect before repeating it");
-      expect(bridge.isAlive()).toBe(false);
+        const error = call.error as
+          | (Error & { retryable?: boolean; outcomeUnknown?: boolean; tool?: string })
+          | undefined;
+        expect(error?.name).toBe("BridgeRestartedError");
+        expect(error?.retryable).toBe(true);
+        expect(error?.outcomeUnknown).toBe(true);
+        expect(error?.tool).toBe(mutating);
+        expect(error?.message).toContain("inspect before repeating it");
+        expect(bridge.isAlive()).toBe(false);
 
-      // The edit reached only the killed child; nothing re-sent it.
-      expect(loggedRequests().filter(({ tool }) => tool === "edit")).toEqual([
-        expect.objectContaining({ generation: 1 }),
-      ]);
-      expect(readFileSync(join(workDir, "spawns"), "utf8").trim().split("\n")).toHaveLength(1);
+        // The call reached only the killed child; nothing re-sent it.
+        expect(loggedRequests().filter(({ tool }) => tool === mutating)).toEqual([
+          expect.objectContaining({ generation: 1 }),
+        ]);
+        expect(readFileSync(join(workDir, "spawns"), "utf8").trim().split("\n")).toHaveLength(1);
 
-      const killLog = logs.find(
-        ({ level, message }) =>
-          level === "error" && message.includes("Bridge killed after timeout of the hang watchdog"),
-      );
-      expect(killLog?.message).toContain("silent_ms=1000");
-      expect(killLog?.message).toContain(`hang_window_ms=${WINDOW_MS}`);
-      expect(killLog?.message).toContain('oldest_unanswered_tool="wedge"');
-      expect(killLog?.message).toContain('"tool":"edit","retry":false');
-      expect(killLog?.meta).toEqual({ sessionId: "wedge-session" });
-    } finally {
-      await bridge.shutdown();
-    }
-  });
-
+        const killLog = logs.find(
+          ({ level, message }) =>
+            level === "error" &&
+            message.includes("Bridge killed after timeout of the hang watchdog"),
+        );
+        expect(killLog?.message).toContain("silent_ms=1000");
+        expect(killLog?.message).toContain(`hang_window_ms=${WINDOW_MS}`);
+        expect(killLog?.message).toContain('oldest_unanswered_tool="wedge"');
+        expect(killLog?.message).toContain(`"tool":"${mutating}","retry":false`);
+        expect(killLog?.meta).toEqual({ sessionId: "wedge-session" });
+      } finally {
+        await bridge.shutdown();
+      }
+    });
+  }
   test("a read cut off by the watchdog is retried once and succeeds on the respawned child", async () => {
     const clock = new ManualClock();
     const bridge = bridgeWithClock(clock);
@@ -329,6 +331,96 @@ describe("hang watchdog", () => {
 
       expect(bridge.isAlive()).toBe(true);
       expect(internals.process.pid).toBe(pid);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+});
+
+/**
+ * With the default budgets (30 s per call, 60 s window), a child that goes
+ * completely silent while owing a reply is replaced within one window of the
+ * first unanswered request, even when every caller has already timed out.
+ */
+describe("hang watchdog with default budgets", () => {
+  function defaultBridge(clock: ManualClock): BinaryBridge {
+    return new BinaryBridge(cachedExecutable(FAKE_ENGINE), workDir, {
+      timeoutMs: 30_000,
+      maxRestarts: 0,
+      clock,
+    });
+  }
+
+  test("a silent child whose only caller timed out is replaced at 60 s, and a read retried at 70 s succeeds", async () => {
+    const clock = new ManualClock();
+    const bridge = defaultBridge(clock);
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      const first = settle(bridge.toolCall("s", "wedge", {}));
+      await waitForLogged("wedge", 1);
+      clock.advance(30_000);
+      expect(String(((await first).error as Error | undefined)?.message)).toContain(
+        "timed out after 30000ms",
+      );
+      // Nobody is waiting from here on; the child still owes the reply.
+      clock.advance(29_999);
+      expect(bridge.isAlive()).toBe(true);
+      clock.advance(1);
+      expect(bridge.isAlive()).toBe(false);
+
+      clock.advance(10_000);
+      const retry = await settle(bridge.toolCall("s", "read", {}));
+      expect(retry.error).toBeUndefined();
+      expect(retry.value).toMatchObject({ success: true, tool: "read", generation: 2 });
+      expect(bridge.isAlive()).toBe(true);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("a read retried inside the window waits only until the window ends, then succeeds on a fresh child", async () => {
+    const clock = new ManualClock();
+    const bridge = defaultBridge(clock);
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      const first = settle(bridge.toolCall("s", "wedge", {}));
+      await waitForLogged("wedge", 1);
+      clock.advance(30_000);
+      await first;
+      clock.advance(20_000);
+      const retry = settle(bridge.toolCall("s", "read", {}));
+      await waitForLogged("read", 1);
+      clock.advance(9_999);
+      expect(pendingCount(bridge)).toBe(1);
+      clock.advance(1);
+      const result = await retry;
+      expect(result.error).toBeUndefined();
+      expect(result.value).toMatchObject({ success: true, tool: "read", generation: 2 });
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("a child that answers something after the unanswered call is not killed", async () => {
+    const clock = new ManualClock();
+    const bridge = defaultBridge(clock);
+    const internals = bridge as unknown as { process: { pid?: number } };
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      const pid = internals.process.pid;
+      const first = settle(bridge.toolCall("s", "never", {}));
+      clock.advance(30_000);
+      await first;
+      clock.advance(10_000);
+      // Another call is answered at 40 s: the child is alive.
+      expect(await bridge.toolCall("other", "grep", {})).toMatchObject({ success: true });
+      clock.advance(200_000);
+      expect(bridge.isAlive()).toBe(true);
+      expect(internals.process.pid).toBe(pid);
+      expect(await bridge.toolCall("s", "read", {})).toMatchObject({
+        success: true,
+        generation: 1,
+      });
     } finally {
       await bridge.shutdown();
     }

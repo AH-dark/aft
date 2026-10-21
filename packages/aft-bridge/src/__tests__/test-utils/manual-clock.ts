@@ -3,8 +3,7 @@ import type { BridgeClock, BridgeTimer } from "../../bridge.js";
 /**
  * Bridge clock that only moves when a test calls `advance`, so request
  * deadlines and the hang watchdog fire at exact, load-independent points.
- * Starts far from zero because the bridge treats a zero timestamp as "the
- * child has not written anything yet".
+ * The starting time is arbitrary.
  */
 export class ManualClock implements BridgeClock {
   private current: number;

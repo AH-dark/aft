@@ -959,9 +959,11 @@ roadmap.
 budget for one request to the shared `aft` process. A request that runs out of
 it fails on its own, with a note that a timed-out edit may still have been
 applied; other requests and the shared process are not affected. Timeouts never
-restart the shared process. Its hang watchdog restarts it when requests are
-waiting and it has written nothing at all for twice the longest budget among
-the requests it has not answered (at least 60 seconds). A call to a read-only
+restart the shared process. Its hang watchdog restarts it when a request sent
+since the process last wrote a message has gone unanswered, with no message of
+any kind from the process, for twice the longest budget among those requests and the calls still
+waiting (at least 60 seconds). This happens even if every caller has already
+timed out, so the next call gets a fresh process. A call to a read-only
 tool (`read`, `outline`, `zoom`, `grep`, `glob`, `search`, `callgraph`,
 `inspect`) cut off by that restart is retried once, unless it was cancelled.
 
