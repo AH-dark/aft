@@ -54,17 +54,29 @@ fn resolve_with_fetch(
     ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
 
-/// A failed fetch keeps its typed code; a timeout also names its phase.
+/// A failed fetch keeps its typed code; a timeout also names its phase, and
+/// a failure repeated from memory says so and when a new fetch is possible.
 fn url_fetch_error_response(id: &str, error: &UrlFetchError) -> Response {
-    match error.phase() {
-        Some(phase) => Response::error_with_data(
-            id,
-            error.code(),
-            error.to_string(),
-            serde_json::json!({ "phase": phase.as_str() }),
-        ),
-        None => Response::error(id, error.code(), error.to_string()),
+    let mut data = serde_json::Map::new();
+    if let Some(phase) = error.phase() {
+        data.insert("phase".into(), phase.as_str().into());
     }
+    if let Some(retry_after) = error.retry_after() {
+        data.insert("cached".into(), true.into());
+        data.insert(
+            "retry_after_ms".into(),
+            (retry_after.as_millis() as u64).into(),
+        );
+    }
+    if data.is_empty() {
+        return Response::error(id, error.code(), error.to_string());
+    }
+    Response::error_with_data(
+        id,
+        error.code(),
+        error.to_string(),
+        serde_json::Value::Object(data),
+    )
 }
 
 #[cfg(test)]

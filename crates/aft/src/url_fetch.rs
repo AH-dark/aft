@@ -106,6 +106,10 @@ pub struct UrlFetchError {
     code: &'static str,
     message: String,
     phase: Option<FetchPhase>,
+    /// HTTP status of a server that answered with an error.
+    status: Option<u16>,
+    /// Set on a remembered failure: how long until a call fetches again.
+    retry_after: Option<Duration>,
 }
 
 impl UrlFetchError {
@@ -114,14 +118,23 @@ impl UrlFetchError {
             code: "url_fetch_failed",
             message: message.into(),
             phase: None,
+            status: None,
+            retry_after: None,
         }
     }
 
     fn timeout(phase: FetchPhase, message: impl Into<String>) -> Self {
         Self {
             code: "url_fetch_timeout",
-            message: message.into(),
             phase: Some(phase),
+            ..Self::new(message)
+        }
+    }
+
+    fn http_status(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::new(message)
         }
     }
 
@@ -134,6 +147,24 @@ impl UrlFetchError {
     /// The phase a timed-out fetch was in; `None` for other failures.
     pub fn phase(&self) -> Option<FetchPhase> {
         self.phase
+    }
+
+    /// For a failure repeated from memory instead of a new fetch, the time
+    /// until a call for the same URL fetches it again.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    /// Failures that would very likely repeat on an immediate retry, and
+    /// cost the retry the same wait: timeouts, server errors (5xx), and
+    /// client errors (4xx) other than 408 Request Timeout and 429 Too Many
+    /// Requests. Refusals by the SSRF check and other local errors are cheap
+    /// to reproduce and are not remembered.
+    fn worth_remembering(&self) -> bool {
+        self.code == "url_fetch_timeout"
+            || self
+                .status
+                .is_some_and(|status| status >= 400 && status != 408 && status != 429)
     }
 }
 
@@ -212,7 +243,121 @@ pub fn is_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+/// Fetch `url` into the URL cache under `storage_dir` and return the cached
+/// document's path. A failure worth remembering (see
+/// [`UrlFetchError::worth_remembering`]) is repeated for
+/// [`FAILURE_MEMORY`] without a new fetch, so an agent that retries a
+/// timed-out page gets its answer at once instead of waiting again.
 pub fn fetch_url_to_cache(
+    url: &str,
+    storage_dir: &Path,
+    options: UrlFetchOptions,
+) -> Result<PathBuf, UrlFetchError> {
+    let key = FailureKey::new(storage_dir, url, options.allow_private);
+    if let Some(remembered) = remembered_failure(&key) {
+        return Err(remembered);
+    }
+    let result = download_to_cache(url, storage_dir, options);
+    match &result {
+        Ok(_) => forget_failure(&key),
+        Err(error) if error.worth_remembering() => remember_failure(key, error),
+        Err(_) => {}
+    }
+    result
+}
+
+/// How long a remembered failure stands in for a new fetch of its URL.
+const FAILURE_MEMORY: Duration = Duration::from_secs(60);
+
+/// A remembered failure is specific to the cache it would have filled and to
+/// whether private addresses were allowed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FailureKey {
+    storage_dir: PathBuf,
+    url: String,
+    allow_private: bool,
+}
+
+impl FailureKey {
+    fn new(storage_dir: &Path, url: &str, allow_private: bool) -> Self {
+        Self {
+            storage_dir: storage_dir.to_path_buf(),
+            url: url.to_string(),
+            allow_private,
+        }
+    }
+}
+
+struct RememberedFailure {
+    error: UrlFetchError,
+    at: Instant,
+}
+
+/// Failures of the last [`FAILURE_MEMORY`]. Expired entries are dropped on
+/// every insert, so the map holds only failures from the last minute.
+fn failure_memory() -> &'static std::sync::Mutex<HashMap<FailureKey, RememberedFailure>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<FailureKey, RememberedFailure>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn remembered_failure(key: &FailureKey) -> Option<UrlFetchError> {
+    let failures = failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let remembered = failures.get(key)?;
+    let age = remembered.at.elapsed();
+    let retry_after = FAILURE_MEMORY
+        .checked_sub(age)
+        .filter(|left| !left.is_zero())?;
+    let mut error = remembered.error.clone();
+    error.message = format!(
+        "{} (cached failure from {}s ago; this URL is fetched again after {}s)",
+        error.message,
+        age.as_secs(),
+        retry_after.as_secs_f64().ceil() as u64
+    );
+    error.retry_after = Some(retry_after);
+    Some(error)
+}
+
+fn remember_failure(key: FailureKey, error: &UrlFetchError) {
+    let mut failures = failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    failures.retain(|_, remembered| remembered.at.elapsed() < FAILURE_MEMORY);
+    failures.insert(
+        key,
+        RememberedFailure {
+            error: error.clone(),
+            at: Instant::now(),
+        },
+    );
+}
+
+fn forget_failure(key: &FailureKey) {
+    failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
+/// Test hook: make one remembered failure `by` older.
+#[cfg(test)]
+fn age_remembered_failure(key: &FailureKey, by: Duration) {
+    if let Some(remembered) = failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(key)
+    {
+        remembered.at = remembered
+            .at
+            .checked_sub(by)
+            .expect("clock far enough along");
+    }
+}
+
+fn download_to_cache(
     url: &str,
     storage_dir: &Path,
     options: UrlFetchOptions,
@@ -239,11 +384,14 @@ pub fn fetch_url_to_cache(
 
     let response = fetch_with_redirects(&fetch_url, url, &options, &deadline, approved)?;
     if !response.status().is_success() {
-        return Err(UrlFetchError::new(format!(
-            "HTTP {} {} fetching {url}",
+        return Err(UrlFetchError::http_status(
             response.status().as_u16(),
-            response.status().canonical_reason().unwrap_or("")
-        )));
+            format!(
+                "HTTP {} {} fetching {url}",
+                response.status().as_u16(),
+                response.status().canonical_reason().unwrap_or("")
+            ),
+        ));
     }
 
     let content_type = response

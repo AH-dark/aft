@@ -330,3 +330,134 @@ fn connection_uses_the_addresses_the_ssrf_check_approved_without_a_second_lookup
     assert_eq!(addresses, vec![SocketAddr::new(approved_ip, 0)]);
     assert_eq!(lookups.load(Ordering::SeqCst), 1, "no second lookup");
 }
+
+/// Counts requests per path and answers each path with the status its name
+/// gives (`/503`, `/404`, ...); `/flaky` answers 503 once and 200 after.
+fn status_server() -> (SocketAddr, Arc<std::sync::Mutex<HashMap<String, usize>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+    let counter = Arc::clone(&seen);
+    let address = serve(move |path, mut stream| {
+        let count = {
+            let mut seen = counter.lock().unwrap();
+            let count = seen.entry(path.to_string()).or_default();
+            *count += 1;
+            *count
+        };
+        let status = match path.trim_start_matches('/') {
+            "flaky" if count > 1 => "200 OK",
+            "flaky" | "503" => "503 Service Unavailable",
+            "404" => "404 Not Found",
+            "408" => "408 Request Timeout",
+            "429" => "429 Too Many Requests",
+            _ => "200 OK",
+        };
+        let body = b"# Doc\n\n## Section\n\ntext\n";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+    });
+    (address, seen)
+}
+
+#[test]
+fn a_timed_out_url_fails_from_memory_without_a_new_fetch() {
+    let storage = tempfile::tempdir().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&connections);
+    let address = serve(move |_, _stream| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(SERVER_STALL);
+    });
+    let target = url(address, "/silent.md");
+    let (first, _) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    assert_eq!(first.unwrap_err().code(), "url_fetch_timeout");
+
+    let (second, elapsed) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    let error = second.expect_err("the remembered failure is repeated");
+    assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+    assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+    assert_eq!(error.phase(), Some(FetchPhase::Headers), "{error}");
+    assert!(error.to_string().contains("cached failure"), "{error}");
+    assert!(error.to_string().contains("fetched again after"), "{error}");
+    let retry_after = error.retry_after().expect("a remembered failure says when");
+    assert!(retry_after <= FAILURE_MEMORY && !retry_after.is_zero());
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "no second fetch");
+}
+
+#[test]
+fn server_errors_and_client_errors_other_than_408_and_429_are_remembered() {
+    let storage = tempfile::tempdir().unwrap();
+    let (address, seen) = status_server();
+    for path in ["/503", "/404", "/408", "/429"] {
+        for _ in 0..2 {
+            let (result, _) = fetch_within(
+                Duration::from_secs(3),
+                &url(address, path),
+                storage.path(),
+                local(),
+            );
+            assert!(result.is_err(), "{path}");
+        }
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.get("/503"), Some(&1), "{seen:?}");
+    assert_eq!(seen.get("/404"), Some(&1), "{seen:?}");
+    assert_eq!(seen.get("/408"), Some(&2), "{seen:?}");
+    assert_eq!(seen.get("/429"), Some(&2), "{seen:?}");
+}
+
+#[test]
+fn a_remembered_failure_expires_and_the_url_is_fetched_again() {
+    let storage = tempfile::tempdir().unwrap();
+    let (address, seen) = status_server();
+    let target = url(address, "/flaky");
+    let (first, _) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    assert!(first.unwrap_err().to_string().contains("HTTP 503"));
+
+    age_remembered_failure(
+        &FailureKey::new(storage.path(), &target, true),
+        FAILURE_MEMORY + Duration::from_secs(1),
+    );
+    let (second, _) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    second.expect("an expired failure no longer stands in for the fetch");
+    assert_eq!(seen.lock().unwrap().get("/flaky"), Some(&2));
+}
+
+#[test]
+fn outline_says_a_repeated_failure_is_cached_and_when_it_is_fetched_again() {
+    let storage = tempfile::tempdir().unwrap();
+    let (address, _) = status_server();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            url_fetch_allow_private: true,
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let req: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "failing-url",
+        "command": "outline",
+        "file": url(address, "/503"),
+    }))
+    .unwrap();
+    let first = crate::commands::outline::handle_outline(&req, &ctx);
+    assert_eq!(first.data["code"], "url_fetch_failed", "{:?}", first.data);
+    assert!(first.data.get("cached").is_none(), "{:?}", first.data);
+
+    let second = crate::commands::outline::handle_outline(&req, &ctx);
+    assert_eq!(second.data["code"], "url_fetch_failed", "{:?}", second.data);
+    assert_eq!(second.data["cached"], true, "{:?}", second.data);
+    assert!(
+        second.data["retry_after_ms"].as_u64().unwrap() <= 60_000,
+        "{:?}",
+        second.data
+    );
+    assert!(second.data["message"]
+        .as_str()
+        .unwrap()
+        .contains("cached failure"));
+}
