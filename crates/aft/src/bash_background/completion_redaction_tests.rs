@@ -901,6 +901,55 @@ fn bash_background_watch_masks_json_secret_crossing_line_breaks() {
     }
 }
 
+/// Output whose JSON secret value opens on the READY line and runs over
+/// `lines` raw-newline-separated lines before it closes.
+fn open_json_value_output(lines: usize) -> (String, String) {
+    let value = format!("{}\n", cyclic_credential(60)).repeat(lines);
+    let output = format!(
+        "{}\nREADY {{\"api_key\":\"{value}\"}}\ndone\n",
+        "x".repeat(20_000)
+    );
+    (output, value)
+}
+
+#[test]
+fn bash_background_watch_withholds_json_secret_value_open_past_read_window() {
+    // The value is longer than the preview reads after the match, so its
+    // closing quote, and the whole field, lie past the window's end while
+    // the capture continues.
+    let (output, value) = open_json_value_output(600);
+    assert!(value.len() > completion_preview::WATCH_PREVIEW_SOURCE_BYTES);
+    let context = restarted_ready_watch_context(&output);
+    assert!(
+        context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD),
+        "{context:?}"
+    );
+    assert_no_credential_window(&context, &value);
+}
+
+#[test]
+fn bash_background_watch_masks_json_secret_value_closing_inside_read_window() {
+    let (output, value) = open_json_value_output(20);
+    let context = restarted_ready_watch_context(&output);
+    assert_no_credential_window(&context, &value);
+    assert!(context.contains("READY"), "{context:?}");
+    assert!(context.contains(SECRET_PLACEHOLDER), "{context:?}");
+}
+
+#[test]
+fn bash_background_watch_withholds_match_on_line_longer_than_read_window() {
+    // No line break within the read window on either side of READY.
+    let context = restarted_ready_watch_context(&format!(
+        "start\n{} READY {}\nend\n",
+        "x".repeat(40_000),
+        "y".repeat(40_000)
+    ));
+    assert!(
+        context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD),
+        "{context:?}"
+    );
+}
+
 #[test]
 fn bash_background_watch_masks_private_key_body_after_begin_line() {
     let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
