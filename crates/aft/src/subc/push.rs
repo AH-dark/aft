@@ -1728,16 +1728,33 @@ mod tests {
     }
 
     #[test]
+    fn progress_frames_reach_no_route() {
+        let (_root_dir, root) = test_root("subc-progress-no-fanout-root");
+        let routes = HashMap::new();
+        let channels: HashSet<_> = (1..=4).map(|channel| route_key(channel, 1)).collect();
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), channels);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(8);
+        let metrics = DispatchPathMetrics::new();
+        let frame = progress_frame("request-1", ProgressKind::Stdout, "output");
+
+        assert_eq!(
+            fan_out_lossy_push_frame(&writer_tx, &metrics, &routes, &root_channels, &root, &frame),
+            FanOutResult::default()
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a progress frame must not be copied to the routes bound to its root"
+        );
+    }
+
+    #[test]
     fn lossy_fanout_shares_one_body_and_stamps_each_route_header() {
         const MATCHING_ROUTES: usize = 8;
 
         let (_root_dir, root) = test_root("subc-shared-lossy-body-root");
-        let frame = progress_frame(
-            "request-shared-body",
-            ProgressKind::Stdout,
-            &"x".repeat(4 * 1024),
-        );
-        let expected_body = serde_json::to_vec(&frame).expect("serialize progress Push frame");
+        let frame = status_frame(9);
+        let expected_body = serde_json::to_vec(&frame).expect("serialize status Push frame");
         let routes = HashMap::new();
         let expected_headers: HashSet<_> = (1..=MATCHING_ROUTES)
             .map(|channel| route_key(channel as u16, (channel * 10) as u32))
