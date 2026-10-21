@@ -365,7 +365,7 @@ pub async fn relay<T: RelayTransport>(
 
 /// Match the worker rule used for access grants: parented runs inherit worker
 /// policy, while an unparented run belongs to the head.
-fn worker_scope(stamp: &ScopeStamp) -> bool {
+pub(crate) fn worker_scope(stamp: &ScopeStamp) -> bool {
     use subc_protocol::scope::ScopeKind;
     use subc_protocol::Principal;
     stamp.owner_authorized

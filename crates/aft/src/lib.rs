@@ -104,6 +104,7 @@ pub mod gc;
 pub mod gh_shim;
 pub mod gh_shim_relay;
 pub mod gh_shim_ticket;
+pub(crate) mod gh_shim_worker_broker;
 pub(crate) mod git_probe;
 pub mod github_read;
 pub mod grep_executor;
