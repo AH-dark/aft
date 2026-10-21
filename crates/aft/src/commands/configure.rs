@@ -194,6 +194,65 @@ fn wait_on_configure_semantic_snapshot_gate_for_test(request_id: &str) {
 #[cfg(not(test))]
 fn wait_on_configure_semantic_snapshot_gate_for_test(_request_id: &str) {}
 
+/// Parks a configure of one root in its commit phase, right after the new
+/// configuration is published and before the cache root, artifact access and
+/// degraded reasons follow it. Tests use it to hold the window in which a
+/// reader admitted beside the configure would see a half-published root.
+#[cfg(test)]
+struct ConfigureCommitGate {
+    root: PathBuf,
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static CONFIGURE_COMMIT_GATE: std::sync::Mutex<Vec<ConfigureCommitGate>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a one-shot commit gate for the next configure of `root`. Returns a
+/// receiver that fires when that configure parks and a sender that releases
+/// it. Gates for other roots, used by tests running in parallel, are
+/// independent.
+#[cfg(test)]
+pub(crate) fn gate_configure_commit_for_test(
+    root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    CONFIGURE_COMMIT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ConfigureCommitGate {
+            root,
+            reached: reached_tx,
+            release: release_rx,
+        });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_configure_commit_gate_for_test(root: &Path) {
+    let gate = {
+        let mut gates = CONFIGURE_COMMIT_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates
+            .iter()
+            .position(|gate| gate.root == root)
+            .map(|index| gates.swap_remove(index))
+    };
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(60));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_configure_commit_gate_for_test(_root: &Path) {}
+
 #[cfg(test)]
 thread_local! {
     static SEMANTIC_REFRESH_RESTART_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -4044,6 +4103,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .set_search_paths(next_config.lsp_paths_extra.clone());
     ctx.begin_configure_ack_step("config_publish");
     ctx.set_config(next_config.clone());
+    wait_on_configure_commit_gate_for_test(&canonical_cache_root);
     ctx.begin_configure_ack_step("hashline");
     register_hashline_for_configure(
         ctx,
@@ -7153,9 +7213,10 @@ pub(crate) fn drain_standalone_configure_unit(
 ) -> bool {
     state.absorb_enqueued(ctx);
     drop_superseded_parked_continuations(ctx, state);
-    if state.jobs.is_empty() && crate::provisional_identity_retry::drain(ctx) {
-        // The retry replayed the bind; its tail is queued on the context and
-        // runs from the next unit, as it would after a bind request.
+    if state.jobs.is_empty() && crate::provisional_identity_retry::drain_inline(ctx) {
+        // The retry replayed the bind on this request thread, where the
+        // standalone loop runs every configure request. Its tail is queued on
+        // the context and runs from the next unit, as after a bind request.
         return true;
     }
     if !state.select_ready_job(ctx) {
@@ -7204,7 +7265,17 @@ pub(crate) fn drain_standalone_configure_unit(
     drain_deferred_configure_maintenance_unit(ctx, state)
 }
 
+/// Drain deferred configure work on the calling thread. For callers that
+/// also run configure requests on this thread (in-process embedders, the
+/// warmup command, tests): a bind the identity retry replays here runs on
+/// that same thread, serialized with their other configure requests. The
+/// attached daemon uses [`drain_deferred_configure_maintenance_yielding`]
+/// instead, which never replays a bind; the daemon submits the replay
+/// through the executor as a route bind.
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
+    if ctx.configure_tail_idle() {
+        crate::provisional_identity_retry::drain_inline(ctx);
+    }
     drain_configure_tail(ctx, false);
 }
 
@@ -7227,11 +7298,6 @@ pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) ->
 }
 
 fn drain_configure_tail(ctx: &AppContext, allow_step_aside: bool) -> bool {
-    // A bind replayed by the identity retry queues its own tail, which the
-    // loop below then drains like any bind's tail.
-    if ctx.configure_tail_idle() {
-        crate::provisional_identity_retry::drain(ctx);
-    }
     let mut state = ctx.take_parked_configure_tail().unwrap_or_default();
     drop_superseded_parked_continuations(ctx, &mut state);
     state.replay_retry_cutoff = Some(Instant::now());

@@ -1483,6 +1483,9 @@ struct MaintenanceCompletion {
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
     diagnostics_on_edit: Option<bool>,
+    /// A bind the identity retry found ready to replay; the loop submits it
+    /// as a route bind of this root.
+    identity_replay: Option<crate::provisional_identity_retry::PreparedReplay>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1516,6 +1519,8 @@ struct MaintenanceJobOutcome {
     /// The root's `lsp.diagnostics_on_edit` after a config reload, which the
     /// route loop keeps its own copy of for tool calls.
     diagnostics_on_edit: Option<bool>,
+    /// See [`MaintenanceCompletion::identity_replay`].
+    identity_replay: Option<crate::provisional_identity_retry::PreparedReplay>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5912,6 +5917,25 @@ where
                 if requiesce {
                     quiesce_unbound_root(&root_id, &mut live_roots, &executor);
                 }
+                if let Some(replay) = completion.identity_replay {
+                    // An unbound root does no indexing; its retry is dropped.
+                    let bound = live_roots
+                        .get(&root_id)
+                        .is_some_and(|meta| !meta.unbound_quiesced);
+                    if bound {
+                        let replayed = submit_identity_replay_bind(&executor, root_id.clone(), replay);
+                        tokio::spawn(async move {
+                            if let Ok(response) = replayed.await {
+                                if !response.success {
+                                    log::warn!(
+                                        "subc attach: identity retry bind did not complete: {}",
+                                        response.data
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
                 push::clear_stale_bg_wakes_for_empty_sessions(
                     &root_id,
                     &completion.empty_bg_sessions,
@@ -9936,6 +9960,41 @@ async fn handle_tool_call(
     Ok(())
 }
 
+/// The ConfigureTail maintenance job: drain the root's configure tail, then,
+/// once nothing of it is left, check the background identity retry. A retry
+/// that finds aft.db free is handed back to the loop as a bind to submit, and
+/// is never replayed inside this job: the job holds only the actor's read
+/// gate, while a configure that changes the root must run as its exclusive
+/// writer (see `crate::provisional_identity_retry`).
+fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
+    // Stepping aside leaves the rest parked on the context; the requeue (or
+    // the next tick's tail probe) resumes it once the waiting writer has run.
+    let stepped_aside = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+    runtime_drain::drain_configure_warning_events(ctx);
+    let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
+        .then(|| crate::provisional_identity_retry::poll(ctx))
+        .flatten();
+    MaintenanceJobOutcome {
+        requeue_kind: stepped_aside.then_some(MaintenanceDrainKind::ConfigureTail),
+        identity_replay,
+        ..MaintenanceJobOutcome::default()
+    }
+}
+
+/// Submit a replayed bind exactly as the loop submits a route bind, so the
+/// executor gives it a route bind's admission: a shared hold first, and the
+/// exclusive writer barrier once configure asks to change the root.
+fn submit_identity_replay_bind(
+    executor: &Executor,
+    root_id: ProjectRootId,
+    replay: crate::provisional_identity_retry::PreparedReplay,
+) -> oneshot::Receiver<Response> {
+    let request_id = replay.request_id();
+    executor
+        .submit_bind_cancellable_async(root_id, request_id, Arc::new(move |ctx| replay.run(ctx)))
+        .0
+}
+
 fn submit_maintenance_job(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
@@ -9972,6 +10031,7 @@ fn submit_maintenance_job(
                     unacked_bg_keys: None,
                     requeue_kind: drained.has_more.then_some(kind),
                     diagnostics_on_edit: None,
+                    identity_replay: None,
                 }
             }
             MaintenanceDrainKind::Lsp => {
@@ -9987,20 +10047,10 @@ fn submit_maintenance_job(
                     // partial batch needs an immediate continuation.
                     requeue_kind: (drained.has_more && drained.processed > 0).then_some(kind),
                     diagnostics_on_edit: None,
+                    identity_replay: None,
                 }
             }
-            MaintenanceDrainKind::ConfigureTail => {
-                // Stepping aside leaves the rest parked on the context; the
-                // requeue (or the next tick's tail probe) resumes it once the
-                // waiting writer has run.
-                let stepped_aside =
-                    runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
-                runtime_drain::drain_configure_warning_events(ctx);
-                MaintenanceJobOutcome {
-                    requeue_kind: stepped_aside.then_some(kind),
-                    ..MaintenanceJobOutcome::default()
-                }
-            }
+            MaintenanceDrainKind::ConfigureTail => run_configure_tail_maintenance(ctx),
             MaintenanceDrainKind::CompletionDrains => {
                 runtime_drain::drain_search_index_events(ctx);
                 runtime_drain::drain_callgraph_store_events(ctx);
@@ -10018,6 +10068,7 @@ fn submit_maintenance_job(
                     unacked_bg_keys: Some(ctx.bash_background().unacked_wake_keys()),
                     requeue_kind: None,
                     diagnostics_on_edit: None,
+                    identity_replay: None,
                 }
             }
             MaintenanceDrainKind::ConfigReload => {
@@ -10089,6 +10140,7 @@ fn submit_maintenance_job(
                 unacked_bg_keys: outcome.unacked_bg_keys,
                 requeue_kind: outcome.requeue_kind,
                 diagnostics_on_edit: outcome.diagnostics_on_edit,
+                identity_replay: outcome.identity_replay,
             },
         )
         .await;
@@ -18594,6 +18646,282 @@ mod tests {
                 )
                 .0
         }
+    }
+
+    /// What a reader can observe of a root's identity state.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct IdentityView {
+        indexes_on: bool,
+        provisional: bool,
+        key_cached: bool,
+    }
+
+    impl IdentityView {
+        fn of(ctx: &AppContext, root: &Path) -> Self {
+            let config = ctx.config();
+            Self {
+                indexes_on: config.indexes.trigram || config.indexes.callgraph,
+                provisional: ctx.artifact_identity_provisional(),
+                key_cached: ctx.cached_artifact_cache_key(root).is_some(),
+            }
+        }
+
+        /// Either the whole provisional state (indexes off, identity
+        /// provisional) or the whole settled state (indexes on, identity
+        /// settled, key published). Anything else is a half-published root.
+        fn consistent(self) -> bool {
+            (!self.indexes_on && self.provisional)
+                || (self.indexes_on && !self.provisional && self.key_cached)
+        }
+    }
+
+    /// One read from another session: the four read tools a route serves
+    /// while the root settles, with the identity state seen before and after.
+    fn identity_retry_read(
+        ctx: &AppContext,
+        root: &Path,
+        index: usize,
+    ) -> (Vec<IdentityView>, Vec<Response>) {
+        let file = root.join("module_1.rs");
+        let request = |command: &str, params: serde_json::Value| {
+            let mut value = params;
+            value["id"] = json!(format!("identity-retry-read-{command}-{index}"));
+            value["command"] = json!(command);
+            serde_json::from_value::<RawRequest>(value).unwrap()
+        };
+        let before = IdentityView::of(ctx, root);
+        let responses = vec![
+            crate::commands::grep::handle_grep(
+                &request("grep", json!({ "pattern": "function_1" })),
+                ctx,
+            ),
+            crate::commands::outline::handle_outline(
+                &request("outline", json!({ "file": file })),
+                ctx,
+            ),
+            crate::commands::semantic_search::handle_semantic_search(
+                &request(
+                    "semantic_search",
+                    json!({ "query": "function_1", "top_k": 3 }),
+                ),
+                ctx,
+            ),
+            crate::commands::callers::handle_callers(
+                &request("callers", json!({ "file": file, "symbol": "function_1" })),
+                ctx,
+            ),
+        ];
+        (vec![before, IdentityView::of(ctx, root)], responses)
+    }
+
+    /// A root whose bind found aft.db busy settles through the background
+    /// retry while another session keeps reading it, and no read observes a
+    /// half-published root: the replayed bind runs as the actor's exclusive
+    /// writer, exactly like a route bind that changes the root.
+    #[test]
+    fn identity_retry_replay_is_admitted_as_a_bind_so_reads_never_see_a_torn_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root_id = configured.root.clone();
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+
+        // Rollback-journal mode, so the exclusive transaction also blocks the
+        // bind's read of its legacy identity pin.
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-test",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": true },
+                    "views": { "enabled": false },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = configured
+            .submit_bind(&executor, bind)
+            .blocking_recv()
+            .expect("provisional bind completes");
+        assert!(bound.success, "{}", bound.data);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(!ctx.config().indexes.trigram);
+
+        // Another session reads the root throughout.
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let reader = {
+            let (executor, root_id, canonical_root, stop, reads) = (
+                Arc::clone(&executor),
+                root_id.clone(),
+                canonical_root.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&reads),
+            );
+            std::thread::spawn(move || {
+                let mut index = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    index += 1;
+                    let (root, sink) = (canonical_root.clone(), Arc::clone(&reads));
+                    let read = executor.submit(
+                        root_id.clone(),
+                        Lane::PureRead,
+                        format!("identity-retry-read-{index}"),
+                        Box::new(move |ctx| {
+                            sink.lock().push(identity_retry_read(ctx, &root, index));
+                            Response::success("read", json!({}))
+                        }),
+                    );
+                    let _ = read.recv_timeout(Duration::from_secs(60));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        // The configure-tail maintenance tick, as the module loop runs it, and
+        // the loop's submission of any replay that tick hands back.
+        let (commit_reached, commit_release) =
+            crate::commands::configure::gate_configure_commit_for_test(canonical_root.clone());
+        let replay_response = Arc::new(parking_lot::Mutex::new(None));
+        let pump = {
+            let (executor, root_id, stop, replay_response) = (
+                Arc::clone(&executor),
+                root_id.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&replay_response),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
+                    let tail = executor.submit_maintenance_async(
+                        root_id.clone(),
+                        Lane::MaintenanceCommit,
+                        "subc-maintenance-drain-configure-tail-identity-retry".to_string(),
+                        Box::new(move |ctx| {
+                            let _ = outcome_tx.send(run_configure_tail_maintenance(ctx));
+                            Response::success("tail", json!({}))
+                        }),
+                    );
+                    let _ = tail.blocking_recv();
+                    if let Ok(outcome) = outcome_rx.try_recv() {
+                        if let Some(replay) = outcome.identity_replay {
+                            let replayed =
+                                submit_identity_replay_bind(&executor, root_id.clone(), replay);
+                            *replay_response.lock() = replayed.blocking_recv().ok();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        // Let the retry see the busy database at least once, then free it.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(ctx.artifact_identity_provisional());
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        // The replayed bind is parked in its commit: configuration published,
+        // cache root, artifact access and degraded reasons not yet.
+        commit_reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the retry replays the bind once aft.db is free");
+        let gated_root = canonical_root.clone();
+        let gated_read = executor.submit(
+            root_id.clone(),
+            Lane::PureRead,
+            "identity-retry-gated-read".to_string(),
+            Box::new(move |ctx| {
+                let view = IdentityView::of(ctx, &gated_root);
+                Response::success(
+                    "gated",
+                    json!({
+                        "indexes_on": view.indexes_on,
+                        "provisional": view.provisional,
+                        "key_cached": view.key_cached,
+                    }),
+                )
+            }),
+        );
+        let during_commit = gated_read.recv_timeout(Duration::from_millis(500)).ok();
+        commit_release.send(()).unwrap();
+        let gated = during_commit.unwrap_or_else(|| {
+            gated_read
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the read runs once the replayed bind commits")
+        });
+        let gated_view = IdentityView {
+            indexes_on: gated.data["indexes_on"] == true,
+            provisional: gated.data["provisional"] == true,
+            key_cached: gated.data["key_cached"] == true,
+        };
+        assert!(
+            gated_view.consistent(),
+            "a read admitted while the replayed bind was committing saw a half-published root: {gated_view:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ctx.artifact_identity_provisional() {
+            assert!(Instant::now() < deadline, "{:?}", ctx.degraded_reasons());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A few more reads against the settled root.
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+        pump.join().unwrap();
+
+        let replayed = replay_response.lock().take();
+        assert!(
+            replayed.as_ref().is_some_and(|response| response.success),
+            "the replay ran through the bind submission: {replayed:?}"
+        );
+        let reads = std::mem::take(&mut *reads.lock());
+        assert!(!reads.is_empty());
+        for (views, responses) in &reads {
+            for view in views {
+                assert!(
+                    view.consistent(),
+                    "a read saw a half-published root: {view:?}"
+                );
+            }
+            for response in &responses[..3] {
+                assert!(
+                    response.success,
+                    "read failed while the root settled: {}",
+                    response.data
+                );
+            }
+            assert_ne!(
+                responses[3].data["code"], "internal_error",
+                "{}",
+                responses[3].data
+            );
+        }
+        assert!(reads.iter().any(|(views, _)| views[0].provisional));
+        assert!(reads.iter().any(|(views, _)| !views[1].provisional));
+        let config = ctx.config();
+        assert!(config.indexes.trigram && config.indexes.callgraph);
+        assert!(ctx.cached_artifact_cache_key(&canonical_root).is_some());
+        assert!(
+            crate::root_identity::read(&canonical_root, configured.storage.path())
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A [`ConfiguredRoot`] whose configure tail runs on the executor and is

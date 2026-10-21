@@ -13,9 +13,19 @@
 //! (the executor's maintenance lane under the attached daemon, the idle
 //! drain in the standalone loop) polls it with bounded backoff. Each due
 //! attempt first checks, without waiting, whether the pins are readable; once
-//! they are, it replays the same configure request. That replay is the bind
+//! they are, the same configure request is replayed. That replay is the bind
 //! the folder would otherwise need: it settles and saves the identity and
 //! enables the indexes exactly as a successful first bind does.
+//!
+//! The replay runs with the admission a bind of the root gets, never inside
+//! the maintenance job that noticed the free database. Configure publishes
+//! its new state in steps (configuration, then cache root and artifact
+//! access, then degraded reasons), so a reader admitted beside it could see
+//! indexes on while the identity still reads as provisional. A route bind
+//! that changes the root runs as the actor's exclusive writer, which no read
+//! overlaps; a maintenance job holds only the read gate. The attached daemon
+//! therefore submits the replay as a route bind, and the standalone loop runs
+//! it on its request thread, where it runs every configure request.
 //!
 //! The retry never outlives the bind it belongs to. A newer configure replaces
 //! it (re-arming only if that bind is provisional for the same reason), an
@@ -99,6 +109,7 @@ fn delay_before(attempts: u32, timing: Timing) -> Duration {
         .min(timing.max_delay)
 }
 
+#[derive(Clone)]
 struct PendingRetry {
     /// The configure request whose bind left the identity provisional.
     request: RawRequest,
@@ -138,7 +149,7 @@ impl RetrySlot {
 }
 
 /// Record what a finished configure means for the retry. Called for every
-/// configure, including a replay started by [`drain`].
+/// configure, including a replay prepared by [`poll`].
 pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, success: bool) {
     if !success {
         // A failed configure publishes nothing, so the bind the retry belongs
@@ -182,65 +193,163 @@ pub(crate) fn cancel(ctx: &AppContext) -> bool {
     ctx.provisional_identity_retry().0.lock().take().is_some()
 }
 
-/// Run one due retry attempt. Returns true when it replayed the bind, which
-/// queued that bind's configure tail on the context.
-///
-/// Runs only from the configure-tail maintenance drain, never from an
-/// interactive request.
-pub(crate) fn drain(ctx: &AppContext) -> bool {
-    let slot = ctx.provisional_identity_retry();
-    if !slot.is_due() {
-        return false;
-    }
-    let Some(mut retry) = slot.0.lock().take() else {
-        return false;
-    };
-    let root = ctx.canonical_cache_root_opt();
+/// Why `retry` is no longer safe to replay, if it is not. It may be replayed
+/// only for the configure generation that armed it, while the root is bound
+/// and its identity is still provisional because aft.db was busy. Otherwise
+/// the root is unbound, a newer configure superseded the retry, the root is
+/// missing, the identity is no longer provisional for that reason, or it has
+/// already settled and must not be keyed again.
+fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> {
     // A root with no bound route does no indexing.
     if ctx.subc_unbound_quiesced() {
-        return false;
+        return Some("unbound");
     }
-    // Only the bind that armed the retry may be replayed, and only while its
-    // identity is still provisional because aft.db was busy. Anything else
-    // means a newer configure owns the root, or the identity has settled and
-    // must not be keyed again.
-    let still_busy_provisional = ctx
+    if retry.generation != ctx.configure_generation() {
+        return Some("superseded");
+    }
+    if !ctx
         .degraded_reasons()
         .iter()
-        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON);
-    let settled = root
-        .as_deref()
-        .is_some_and(|root| ctx.cached_artifact_cache_key(root).is_some());
-    if retry.generation != ctx.configure_generation() || !still_busy_provisional || settled {
-        return false;
+        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON)
+    {
+        return Some("not_provisional");
     }
-    let Some(root) = root else {
-        return false;
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return Some("no_root");
     };
+    if ctx.cached_artifact_cache_key(&root).is_some() {
+        return Some("settled");
+    }
+    None
+}
+
+/// Run one due retry check. A retry that is no longer current is dropped.
+/// While aft.db is still busy the retry is rescheduled and this returns
+/// `None`. Once the pins are readable it returns the bind to replay, which
+/// the caller must run with the admission a bind of this root gets: the
+/// attached daemon submits it as a route bind
+/// ([`crate::executor::Executor::submit_bind_cancellable_async`]); the
+/// standalone loop runs it on its request thread, where it runs configure
+/// requests.
+///
+/// Called only from configure-tail maintenance, never from an interactive
+/// request.
+pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
+    let slot = ctx.provisional_identity_retry();
+    if !slot.is_due() {
+        return None;
+    }
+    let mut retry = slot.0.lock().take()?;
+    if stale_reason(ctx, &retry).is_some() {
+        return None;
+    }
+    let root = ctx.canonical_cache_root_opt()?;
     let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-    let timing = timing();
+    retry.attempts = retry.attempts.saturating_add(1);
     if !crate::root_identity::legacy_pins_readable(&root, &storage) {
-        retry.attempts = retry.attempts.saturating_add(1);
-        reschedule(ctx, &root, retry, timing);
-        return false;
+        reschedule(ctx, &root, retry, timing());
+        return None;
+    }
+    Some(PreparedReplay {
+        retry: std::sync::Arc::new(parking_lot::Mutex::new(Some(retry))),
+        root,
+    })
+}
+
+/// Poll and, when the database is free, replay the bind on this thread.
+/// Only for callers that run configure requests on the calling thread
+/// themselves (the standalone loop, in-process embedders and tests); the
+/// attached daemon uses [`poll`] and submits the replay as a bind.
+pub(crate) fn drain_inline(ctx: &AppContext) -> bool {
+    match poll(ctx) {
+        Some(replay) => {
+            replay.run(ctx);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A bind ready to be replayed because aft.db became readable. Cloning
+/// shares the one pending replay, so the executor may run it more than once
+/// (a shared-hold run that must rerun as an exclusive writer), and only the
+/// run that completes the configure settles the retry.
+#[derive(Clone)]
+pub(crate) struct PreparedReplay {
+    retry: std::sync::Arc<parking_lot::Mutex<Option<PendingRetry>>>,
+    root: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for PreparedReplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedReplay")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedReplay {
+    /// Executor request id. The `subc-bind-` prefix is what makes the
+    /// executor admit the job as a route bind.
+    pub(crate) fn request_id(&self) -> String {
+        format!("subc-bind-identity-retry-{}", self.root.display())
     }
 
-    let attempts = retry.attempts.saturating_add(1);
-    let response = crate::commands::configure::handle_configure(&retry.request, ctx);
+    /// Replay the bind. The checks in [`stale_reason`] run again here, at
+    /// admission, because a real bind, an unbind or a settle may have
+    /// happened since [`poll`] prepared it.
+    pub(crate) fn run(&self, ctx: &AppContext) -> crate::protocol::Response {
+        let id = self.request_id();
+        let Some(retry) = self.retry.lock().clone() else {
+            return skipped(id, "already_replayed");
+        };
+        if let Some(reason) = stale_reason(ctx, &retry) {
+            self.retry.lock().take();
+            return skipped(id, reason);
+        }
+        let response = crate::commands::configure::handle_configure(&retry.request, ctx);
+        if response.data["code"] == "configure_needs_exclusive" {
+            // A shared-hold run handed its worker back before changing the
+            // root; the executor runs this job again as an exclusive writer.
+            return response;
+        }
+        if let Some(retry) = self.retry.lock().take() {
+            finish_replay(ctx, &self.root, retry, &response);
+        }
+        response
+    }
+}
+
+fn skipped(id: String, reason: &str) -> crate::protocol::Response {
+    crate::protocol::Response::success(id, serde_json::json!({ "skipped": reason }))
+}
+
+/// Record the outcome of a replayed bind.
+fn finish_replay(
+    ctx: &AppContext,
+    root: &std::path::Path,
+    retry: PendingRetry,
+    response: &crate::protocol::Response,
+) {
+    let timing = timing();
+    let slot = ctx.provisional_identity_retry();
     let mut rearmed = slot.0.lock();
     match rearmed.take() {
-        // The database was taken again between the check and the replay:
-        // keep the original window and backoff instead of starting over.
+        // The database was taken again between the check and the replay, so
+        // the replay re-armed the retry: keep the original window and backoff
+        // instead of starting over.
         Some(mut next) => {
             next.armed_at = retry.armed_at;
-            next.attempts = attempts;
+            next.attempts = retry.attempts;
             drop(rearmed);
-            reschedule(ctx, &root, next, timing);
+            reschedule(ctx, root, next, timing);
         }
         None if response.success => {
             crate::slog_info!(
-                "identity settled for root={} after aft.db became free ({attempts} attempt(s), {} ms after bind); indexes enabled",
+                "identity settled for root={} after aft.db became free ({} attempt(s), {} ms after bind); indexes enabled",
                 root.display(),
+                retry.attempts,
                 retry.armed_at.elapsed().as_millis()
             );
         }
@@ -248,16 +357,14 @@ pub(crate) fn drain(ctx: &AppContext) -> bool {
             // The replay failed outright, so the provisional bind still
             // stands. Retry it on the same schedule.
             drop(rearmed);
-            retry.attempts = attempts;
             crate::slog_warn!(
                 "identity retry for root={} could not replay the bind: {}",
                 root.display(),
                 response.data
             );
-            reschedule(ctx, &root, retry, timing);
+            reschedule(ctx, root, retry, timing);
         }
     }
-    true
 }
 
 /// Store `retry` with its next attempt time, or give up once its window has
