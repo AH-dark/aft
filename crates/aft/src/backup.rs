@@ -1000,8 +1000,11 @@ impl BackupStore {
         self.clear_db_mirror_sync();
     }
 
-    /// Retry incomplete namespace repair on backup operations. Stale-session GC
-    /// and legacy-format maintenance run once per process/storage namespace.
+    /// Retry moving root backups from `<storage>/backups` into
+    /// `<storage>/<harness>/backups` on backup operations. Run stale-session GC and
+    /// permission tightening once per process/storage namespace. Once root repair
+    /// completes, move direct child directories with `meta.json` into the default
+    /// session namespace.
     ///
     /// Configure deliberately does not invoke this. Backup mutations or restores
     /// perform the maintenance; ordinary project binding does not enumerate the
@@ -1010,16 +1013,20 @@ impl BackupStore {
         let Some(storage_dir) = self.storage_dir.clone() else {
             return;
         };
-        self.repair_root_backups_if_needed();
+        let repair = self.repair_root_backups_if_needed();
         let key = (storage_dir, self.effective_storage_harness());
-        if !BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key) {
-            return;
+        let first_maintenance = BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key);
+        if first_maintenance {
+            self.record_disk_io_for_tests();
+            self.gc_stale_sessions(self.maintenance_ttl_hours);
         }
 
-        self.record_disk_io_for_tests();
-        self.gc_stale_sessions(self.maintenance_ttl_hours);
-        self.migrate_legacy_layout_if_needed();
-        self.tighten_permissions_if_needed();
+        if repair.leftovers == 0 && repair.failed == 0 {
+            self.migrate_legacy_layout_if_needed();
+        }
+        if first_maintenance {
+            self.tighten_permissions_if_needed();
+        }
     }
 
     /// Protect existing history at its directory boundary without walking file
@@ -7613,6 +7620,66 @@ mod tests {
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_root_repair_migrates_legacy_history_before_default_session_undo() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("restored.txt");
+        fs::write(&path, "current content").unwrap();
+        let key = canonicalize_key(&path);
+        let legacy_dir = storage
+            .path()
+            .join("backups")
+            .join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("0.bak"), "original content").unwrap();
+        fs::write(
+            legacy_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+
+        // The namespace lock is held, so repair is deferred. A later retry
+        // should move the legacy backup stack from the root backup directory into the harness directory.
+        let namespace_lock = backup_namespace_file(storage.path()).unwrap();
+        namespace_lock.lock().unwrap();
+        store.run_process_maintenance_once();
+        assert!(legacy_dir.exists(), "the busy namespace must defer repair");
+        drop(namespace_lock);
+
+        store.run_process_maintenance_once();
+        let default_session_dir = storage
+            .path()
+            .join("opencode/backups")
+            .join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let migrated_dir = default_session_dir.join(BackupStore::path_hash(&key));
+        assert!(migrated_dir.join("meta.json").exists());
+        assert!(!legacy_dir.exists());
+        let migrated_meta = fs::read_to_string(migrated_dir.join("meta.json")).unwrap();
+
+        // Re-running maintenance must not rewrite or duplicate migrated history.
+        store.run_process_maintenance_once();
+        assert_eq!(
+            fs::read_to_string(migrated_dir.join("meta.json")).unwrap(),
+            migrated_meta
+        );
+        assert_eq!(store.history(DEFAULT_SESSION_ID, &path).len(), 1);
+
+        store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original content");
+        assert!(store.history(DEFAULT_SESSION_ID, &path).is_empty());
     }
 
     #[test]
