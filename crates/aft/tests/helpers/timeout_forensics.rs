@@ -292,6 +292,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wait_for_process_stop_treats_unreaped_zombie_as_stopped() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut cleanup = ProcessCleanup(Some(pid));
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+
+        let stopped = wait_for_process_stop(pid, Instant::now() + Duration::from_millis(300));
+        let status = child.wait().unwrap();
+        cleanup.0 = None;
+
+        assert!(
+            stopped,
+            "a killed child may remain visible until it is reaped"
+        );
+        assert!(!status.success());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_kernel_stacks_also_try_userspace_collector() {
@@ -350,11 +371,43 @@ mod tests {
             {
                 return true;
             }
+            // macOS has no /proc state file, and kill(pid, 0) still succeeds
+            // for a zombie. Query the kernel's process state before treating
+            // the visible PID as a live sampler descendant.
+            #[cfg(target_os = "macos")]
+            if process_is_zombie(pid) {
+                return true;
+            }
             if Instant::now() >= deadline {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_is_zombie(pid: libc::pid_t) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer points to a proc_bsdinfo with its exact size.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read == size {
+            // SAFETY: the successful full-size query initialized the structure.
+            return unsafe { info.assume_init() }.pbi_status == libc::SZOMB;
+        }
+
+        // A failed state query may race with process exit; the next poll handles
+        // ESRCH (no such process). A failed query alone does not prove the
+        // process stopped.
+        false
     }
 
     #[test]
