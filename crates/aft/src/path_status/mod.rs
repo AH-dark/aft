@@ -47,6 +47,86 @@ pub struct PathSkip {
     pub reason: String,
 }
 
+/// What a complete view publication says the status ledger should hold once
+/// its generation is the one served.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatusIntent {
+    /// The generation the intent describes; new skip rows start at it.
+    pub generation: u64,
+    /// Every member of the generation.
+    pub members: std::collections::HashSet<Vec<u8>>,
+    /// Paths whose semantic work is still outstanding; they stay pending.
+    pub keep_pending: std::collections::BTreeSet<Vec<u8>>,
+    /// Skip outcomes for members read afresh: `Some` records a skip, `None`
+    /// removes one. Members reused unread keep their rows, since their
+    /// content, and so their outcome, did not change.
+    pub fresh_skips: std::collections::BTreeMap<Vec<u8>, Option<SkipReason>>,
+}
+
+/// The ledger rows a settlement writes: annotations to delete (with the state
+/// they were read in) and skips to record (`Some`) or delete (`None`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StatusChanges {
+    pub clear: Vec<(Vec<u8>, PathState)>,
+    pub skips: Vec<(Vec<u8>, Option<SkipReason>)>,
+}
+
+impl StatusChanges {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clear.is_empty() && self.skips.is_empty()
+    }
+}
+
+/// Compares the ledger with `intent`. It reads every annotation and skip
+/// row, which a settled view keeps few of, rather than probing each member.
+fn plan_settlement(
+    connection: &rusqlite::Connection,
+    intent: &StatusIntent,
+) -> Result<StatusChanges, PathStatusError> {
+    let mut changes = StatusChanges::default();
+    let mut annotations = connection.prepare_cached("SELECT rel_path, state FROM path_status")?;
+    for row in annotations.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (path, state) = row?;
+        let state = PathState::parse(&state).ok_or(PathStatusError::InvalidState(state))?;
+        let joined = !intent.keep_pending.contains(&path);
+        let settled = match state {
+            PathState::Pending => joined,
+            PathState::Failed => joined && intent.members.contains(&path),
+        };
+        if settled {
+            changes.clear.push((path, state));
+        }
+    }
+    let mut recorded = std::collections::BTreeMap::new();
+    let mut skips = connection.prepare_cached("SELECT rel_path, reason FROM path_skips")?;
+    for row in skips.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (path, reason) = row?;
+        recorded.insert(path, reason);
+    }
+    for (path, reason) in &recorded {
+        let outcome = intent.fresh_skips.get(path);
+        if !intent.members.contains(path) || outcome == Some(&None) {
+            changes.skips.push((path.clone(), None));
+        } else if let Some(Some(fresh)) = outcome {
+            if fresh.as_str() != reason {
+                changes.skips.push((path.clone(), Some(*fresh)));
+            }
+        }
+    }
+    for (path, outcome) in &intent.fresh_skips {
+        if let Some(reason) = outcome {
+            if !recorded.contains_key(path) && intent.members.contains(path) {
+                changes.skips.push((path.clone(), Some(*reason)));
+            }
+        }
+    }
+    Ok(changes)
+}
+
 const PATH_STATUS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS path_status (
     rel_path BLOB NOT NULL PRIMARY KEY,
@@ -284,8 +364,9 @@ impl PathStatusStore {
         Ok(())
     }
 
-    /// Clears completed paths together, preserving annotations for paths that
-    /// still have outstanding work.
+    /// Deletes the given paths' annotations in one transaction. Publications
+    /// use `settle`; tests use this to clear rows directly.
+    #[cfg(test)]
     pub(crate) fn clear_many<'a>(
         &mut self,
         paths: impl IntoIterator<Item = &'a [u8]>,
@@ -300,46 +381,6 @@ impl PathStatusStore {
         }
         transaction.commit()?;
         Ok(())
-    }
-
-    /// Removes every pending annotation except those for `keep`, in one
-    /// transaction, and returns how many were removed. Failed annotations are
-    /// left alone.
-    ///
-    /// A complete publication calls this with the paths that still have work
-    /// outstanding. Every other pending path has reached an end state by then:
-    /// it joined the generation, or it is not a member of it (deleted from the
-    /// checkout, excluded by the project content rules, or no longer in HEAD).
-    /// No later publication revisits a non-member, so an annotation left behind
-    /// for one would stay pending for the life of the view.
-    pub(crate) fn clear_pending_except(
-        &mut self,
-        keep: &std::collections::BTreeSet<Vec<u8>>,
-    ) -> Result<usize, PathStatusError> {
-        let transaction = self.connection.transaction()?;
-        let stale = {
-            let mut pending = transaction
-                .prepare_cached("SELECT rel_path FROM path_status WHERE state = 'pending'")?;
-            let rows = pending.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            let mut stale = Vec::new();
-            for row in rows {
-                let path = row?;
-                if !keep.contains(&path) {
-                    stale.push(path);
-                }
-            }
-            stale
-        };
-        {
-            let mut delete = transaction.prepare_cached(
-                "DELETE FROM path_status WHERE rel_path = ?1 AND state = 'pending'",
-            )?;
-            for path in &stale {
-                delete.execute(params![path])?;
-            }
-        }
-        transaction.commit()?;
-        Ok(stale.len())
     }
 
     pub fn status_for(&self, rel_path: &[u8]) -> Result<Option<PathStatus>, PathStatusError> {
@@ -461,72 +502,56 @@ impl PathStatusStore {
         })
     }
 
-    /// Records what a publication learned about members it read afresh: a
-    /// path with `Some(reason)` is skipped by a plane, a path with `None` is
-    /// not (any earlier skip is removed), all in one transaction. Members the
-    /// publication reused unread keep their rows, since their content, and so
-    /// their outcome, did not change.
-    pub(crate) fn record_skips<'a>(
-        &mut self,
-        rows: impl IntoIterator<Item = (&'a [u8], Option<SkipReason>)>,
-        since_generation: u64,
-    ) -> Result<(), PathStatusError> {
-        let generation = i64::try_from(since_generation)
-            .map_err(|_| PathStatusError::GenerationOutOfRange(since_generation))?;
-        let transaction = self.connection.transaction()?;
+    /// The rows `intent` would change, read without writing. Empty when the
+    /// ledger already says what `intent` says.
+    pub(crate) fn plan_settlement(
+        &self,
+        intent: &StatusIntent,
+    ) -> Result<StatusChanges, PathStatusError> {
+        plan_settlement(&self.connection, intent)
+    }
+
+    /// Brings the ledger in line with `intent` in one IMMEDIATE transaction,
+    /// writing only the rows that differ, and returns how many it wrote.
+    ///
+    /// Pending rows clear unless their path still has outstanding semantic
+    /// work: a member has joined the generation, and a path that is not a
+    /// member (deleted from the checkout, excluded by the project content
+    /// rules, no longer in HEAD) is never revisited by a later publication,
+    /// so a row left behind for it would stay pending for the life of the
+    /// view. Failed rows clear only for members that joined. Skips follow the
+    /// fresh outcomes, and skips of paths that are no longer members go.
+    pub(crate) fn settle(&mut self, intent: &StatusIntent) -> Result<usize, PathStatusError> {
+        let generation = i64::try_from(intent.generation)
+            .map_err(|_| PathStatusError::GenerationOutOfRange(intent.generation))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changes = plan_settlement(&transaction, intent)?;
         {
+            let mut clear = transaction
+                .prepare_cached("DELETE FROM path_status WHERE rel_path = ?1 AND state = ?2")?;
+            for (path, state) in &changes.clear {
+                clear.execute(params![path, state.as_str()])?;
+            }
             let mut upsert = transaction.prepare_cached(
                 "INSERT INTO path_skips (rel_path, reason, since_generation)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(rel_path) DO UPDATE SET
                      reason = excluded.reason,
-                     since_generation = CASE
-                         WHEN path_skips.reason = excluded.reason
-                             THEN path_skips.since_generation
-                         ELSE excluded.since_generation
-                     END",
+                     since_generation = excluded.since_generation",
             )?;
-            let mut delete =
+            let mut unskip =
                 transaction.prepare_cached("DELETE FROM path_skips WHERE rel_path = ?1")?;
-            for (path, reason) in rows {
+            for (path, reason) in &changes.skips {
                 match reason {
                     Some(reason) => upsert.execute(params![path, reason.as_str(), generation])?,
-                    None => delete.execute(params![path])?,
+                    None => unskip.execute(params![path])?,
                 };
             }
         }
         transaction.commit()?;
-        Ok(())
-    }
-
-    /// Removes skip rows for paths that are no longer view members, and
-    /// returns how many were removed.
-    pub(crate) fn retain_skips(
-        &mut self,
-        is_member: impl Fn(&[u8]) -> bool,
-    ) -> Result<usize, PathStatusError> {
-        let transaction = self.connection.transaction()?;
-        let stale = {
-            let mut skipped = transaction.prepare_cached("SELECT rel_path FROM path_skips")?;
-            let rows = skipped.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            let mut stale = Vec::new();
-            for row in rows {
-                let path = row?;
-                if !is_member(&path) {
-                    stale.push(path);
-                }
-            }
-            stale
-        };
-        {
-            let mut delete =
-                transaction.prepare_cached("DELETE FROM path_skips WHERE rel_path = ?1")?;
-            for path in &stale {
-                delete.execute(params![path])?;
-            }
-        }
-        transaction.commit()?;
-        Ok(stale.len())
+        Ok(changes.clear.len() + changes.skips.len())
     }
 
     fn upsert(
@@ -894,22 +919,48 @@ mod tests {
         assert!(store.status_for(b"pending").unwrap().is_some());
     }
 
+    fn intent(
+        generation: u64,
+        members: &[&[u8]],
+        keep_pending: &[&[u8]],
+        fresh_skips: &[(&[u8], Option<SkipReason>)],
+    ) -> StatusIntent {
+        StatusIntent {
+            generation,
+            members: members.iter().map(|path| path.to_vec()).collect(),
+            keep_pending: keep_pending.iter().map(|path| path.to_vec()).collect(),
+            fresh_skips: fresh_skips
+                .iter()
+                .map(|(path, reason)| (path.to_vec(), *reason))
+                .collect(),
+        }
+    }
+
     #[test]
-    fn clear_pending_except_settles_other_pending_rows_and_keeps_failures() {
+    fn settle_clears_other_pending_rows_and_keeps_waiting_paths_and_non_member_failures() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = super::PathStatusStore::open(directory.path()).unwrap();
-        for path in [b"deleted.png".as_slice(), b"excluded.db", b"waiting.rs"] {
+        for path in [
+            b"deleted.png".as_slice(),
+            b"excluded.db",
+            b"waiting.rs",
+            b"joined.rs",
+        ] {
             store.mark_pending(path, "scheduled", 1).unwrap();
         }
         store.mark_failed(b"broken.rs", "quarantined", 1).unwrap();
-        let keep = std::collections::BTreeSet::from([b"waiting.rs".to_vec()]);
+        store.mark_failed(b"fixed.rs", "quarantined", 1).unwrap();
+        let intent = intent(
+            2,
+            &[b"waiting.rs", b"joined.rs", b"fixed.rs"],
+            &[b"waiting.rs"],
+            &[],
+        );
 
-        assert_eq!(store.clear_pending_except(&keep).unwrap(), 2);
+        assert_eq!(store.settle(&intent).unwrap(), 4);
 
         let summary = store.summary().unwrap();
         assert_eq!((summary.pending_count, summary.failed_count), (1, 1));
-        assert!(store.status_for(b"deleted.png").unwrap().is_none());
-        assert!(store.status_for(b"excluded.db").unwrap().is_none());
         assert_eq!(
             store.status_for(b"waiting.rs").unwrap().unwrap().state,
             PathState::Pending
@@ -918,25 +969,28 @@ mod tests {
             store.status_for(b"broken.rs").unwrap().unwrap().state,
             PathState::Failed
         );
-        assert_eq!(store.clear_pending_except(&keep).unwrap(), 0);
+        // Settled once, the same intent writes nothing.
+        assert!(store.plan_settlement(&intent).unwrap().is_empty());
+        assert_eq!(store.settle(&intent).unwrap(), 0);
     }
 
     #[test]
     fn skips_are_counted_by_reason_apart_from_pending_and_failed() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = super::PathStatusStore::open(directory.path()).unwrap();
-        store.mark_pending(b"waiting.rs", "scheduled", 1).unwrap();
         let names = (0..7)
             .map(|index| format!("latin1_{index}.py").into_bytes())
             .collect::<Vec<_>>();
+        let mut members = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        members.push(b"waiting.rs");
+        let skipped = names
+            .iter()
+            .map(|name| (name.as_slice(), Some(SkipReason::NonUtf8Source)))
+            .collect::<Vec<_>>();
         store
-            .record_skips(
-                names
-                    .iter()
-                    .map(|name| (name.as_slice(), Some(SkipReason::NonUtf8Source))),
-                2,
-            )
+            .settle(&intent(2, &members, &[b"waiting.rs"], &skipped))
             .unwrap();
+        store.mark_pending(b"waiting.rs", "scheduled", 2).unwrap();
 
         let summary = store.summary().unwrap();
         assert_eq!((summary.pending_count, summary.failed_count), (1, 0));
@@ -947,20 +1001,34 @@ mod tests {
         assert_eq!(summary.skipped_sample.len(), SKIPPED_PATH_SAMPLE_CAP);
         assert_eq!(summary.skipped_sample[0].rel_path, b"latin1_0.py");
         assert_eq!(summary.skipped_sample[0].reason, "non_utf8_source");
-
-        // A fresh read that decodes clears the skip; a non-member's skip is
-        // removed by membership.
-        store
-            .record_skips([(b"latin1_0.py".as_slice(), None)], 3)
-            .unwrap();
         assert_eq!(
             store
-                .retain_skips(|path| path != b"latin1_1.py".as_slice())
-                .unwrap(),
-            1
+                .status_for(b"waiting.rs")
+                .unwrap()
+                .unwrap()
+                .since_generation,
+            2
         );
+
+        // A fresh read that decodes clears its skip; a path that left the
+        // generation loses its skip; reused members keep theirs. Exactly
+        // those two rows are written.
+        members.retain(|path| *path != b"latin1_1.py".as_slice());
+        let next = intent(3, &members, &[b"waiting.rs"], &[(b"latin1_0.py", None)]);
+        assert_eq!(
+            store.plan_settlement(&next).unwrap(),
+            StatusChanges {
+                clear: Vec::new(),
+                skips: vec![
+                    (b"latin1_0.py".to_vec(), None),
+                    (b"latin1_1.py".to_vec(), None)
+                ],
+            }
+        );
+        assert_eq!(store.settle(&next).unwrap(), 2);
         let summary = store.summary().unwrap();
         assert_eq!(summary.skipped_by_reason["non_utf8_source"], 5);
         assert_eq!(summary.skipped_sample[0].rel_path, b"latin1_2.py");
+        assert_eq!(summary.pending_count, 1);
     }
 }

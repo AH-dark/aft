@@ -2309,6 +2309,14 @@ pub(crate) struct PreparedViewUpdate {
     pub(crate) content_generation: u64,
 }
 
+impl PreparedViewUpdate {
+    /// Writes the path status a committed publication accepted. Call it after
+    /// releasing the commit barrier: it opens the view's status ledger.
+    pub(crate) fn settle_status(&mut self) -> crate::views::assembly::SettleOutcome {
+        self.assembly.settle_status()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
@@ -8646,7 +8654,9 @@ impl AppContext {
     ) -> Result<crate::views::assembly::AssemblyReport, String> {
         let mut prepared =
             self.prepare_view_paths(changed_paths, allow_semantic_blob_put, &mut |_| Ok(()))?;
-        self.commit_view_update(&mut prepared)
+        let report = self.commit_view_update(&mut prepared)?;
+        prepared.settle_status();
+        Ok(report)
     }
 
     pub(crate) fn prepare_view_paths(

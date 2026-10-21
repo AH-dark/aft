@@ -1401,3 +1401,38 @@ fn publication_waiting_for_the_epoch_write_gate_holds_no_cold_build_slot() {
         Some(fixture.initial.as_str())
     );
 }
+
+/// A publication writes path status only after it has left its commit
+/// barrier: the root actor's write gate and the job table are held only for
+/// the pointer swap, never for status writes into SQLite, which on a large
+/// checkout would make reads and other projects' publications wait.
+#[test]
+fn publication_status_writes_run_outside_the_commit_barrier() {
+    let fixture = Fixture::new();
+    let view_dir = fixture.view.view_dir().to_owned();
+    // A row the next publication settles, so it has status to write.
+    crate::path_status::PathStatusStore::open(&view_dir)
+        .unwrap()
+        .mark_pending(b"gone.rs", "view publication scheduled", 1)
+        .unwrap();
+    let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&writes);
+    crate::views::assembly::before_settle_write_for_test(&view_dir, move || {
+        seen.lock()
+            .unwrap()
+            .push(super::in_commit_barrier_for_test());
+    });
+    fixture.change("next");
+    fixture.schedule();
+    fixture.wait_idle();
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![false],
+        "status written inside the commit barrier, or not at all"
+    );
+    assert!(crate::path_status::PathStatusStore::open(&view_dir)
+        .unwrap()
+        .status_for(b"gone.rs")
+        .unwrap()
+        .is_none());
+}
