@@ -88,6 +88,10 @@ fn cpu_ns() -> u128 {
 fn payload_corpus_measurement() {
     let root = std::path::PathBuf::from(std::env::var_os("AFT_EXTRACT_CORPUS").unwrap());
     let output = std::path::PathBuf::from(std::env::var_os("AFT_EXTRACT_OUTPUT").unwrap());
+    measure_corpus(&root, &output);
+}
+
+fn measure_corpus(root: &Path, output: &Path) {
     std::fs::create_dir_all(&output).unwrap();
     let mut paths = ignore::WalkBuilder::new(&root)
         .hidden(false)
@@ -110,6 +114,11 @@ fn payload_corpus_measurement() {
         let blob = CallgraphBlob::extract(&source, &language, "corpus-measurement").unwrap();
         let extraction_cpu_ns = cpu_ns() - cpu_started;
         let extraction_ns = started.elapsed().as_nanos();
+        let mut legacy = serde_json::to_value(&blob).unwrap();
+        if let CallgraphBlob::Parse(parse) = &blob {
+            legacy["ast_nodes"] = serde_json::to_value(&parse.ast_nodes).unwrap();
+        }
+        let legacy = serde_json::to_vec(&legacy).unwrap();
         let encode_started = cpu_ns();
         let bytes = blob.to_bytes().unwrap();
         let encode_cpu_ns = cpu_ns() - encode_started;
@@ -125,7 +134,10 @@ fn payload_corpus_measurement() {
             parse.ast_nodes.clear();
         }
         assert_eq!(expected, decoded);
-        std::fs::write(output.join(format!("{index}.json")), &bytes).unwrap();
+        let legacy_payload = format!("{index}.legacy.json");
+        let slim_payload = format!("{index}.slim.json");
+        std::fs::write(output.join(&legacy_payload), &legacy).unwrap();
+        std::fs::write(output.join(&slim_payload), &bytes).unwrap();
         measurements.push(serde_json::json!({
             "path": path.strip_prefix(&root).unwrap(),
             "language": language,
@@ -134,6 +146,9 @@ fn payload_corpus_measurement() {
             "encode_cpu_ns": encode_cpu_ns,
             "decode_cpu_ns": decode_cpu_ns,
             "bytes": bytes.len(),
+            "legacy_bytes": legacy.len(),
+            "legacy_payload": legacy_payload,
+            "slim_payload": slim_payload,
         }));
     }
     std::fs::write(
@@ -142,4 +157,35 @@ fn payload_corpus_measurement() {
     )
     .unwrap();
     println!("measured {} supported files", paths.len());
+}
+
+#[test]
+fn payload_measurement_distinguishes_legacy_and_slim() {
+    let dir = tempfile::tempdir().unwrap();
+    let corpus = dir.path().join("corpus");
+    std::fs::create_dir(&corpus).unwrap();
+    std::fs::write(
+        corpus.join("fixture.ts"),
+        "export function run(x: C) { x.m(); helper(); }",
+    )
+    .unwrap();
+    let output = dir.path().join("output");
+    measure_corpus(&corpus, &output);
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("index.json")).unwrap()).unwrap();
+    let entry = &index[0];
+    let legacy = std::fs::read(output.join(entry["legacy_payload"].as_str().unwrap())).unwrap();
+    let slim = std::fs::read(output.join(entry["slim_payload"].as_str().unwrap())).unwrap();
+    println!("fixture legacy={} slim={} bytes", legacy.len(), slim.len());
+    assert!(
+        legacy.len() > slim.len(),
+        "legacy={} slim={}: measurement erased the AST-size difference",
+        legacy.len(),
+        slim.len()
+    );
+    let mut legacy: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+    let slim: serde_json::Value = serde_json::from_slice(&slim).unwrap();
+    let nodes = legacy.as_object_mut().unwrap().remove("ast_nodes").unwrap();
+    assert!(!nodes.as_array().unwrap().is_empty());
+    assert_eq!(legacy, slim, "only the AST index may differ");
 }
