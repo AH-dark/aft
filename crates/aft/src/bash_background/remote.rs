@@ -1604,6 +1604,19 @@ struct LocalFallback {
     linux_scope: bool,
 }
 
+/// How `attach_remote` ended when it did not fail.
+#[cfg(unix)]
+enum Attached {
+    /// Re-attached to the job; its records continue on this stream.
+    Stream(exec::RemoteStream),
+    /// `bash.kill_scope` paused the task's owner and was waiting for this
+    /// worker to send the runner's cancellation. The cancel result is now
+    /// recorded and the local task is already stopped, so the worker must end
+    /// here: another reconnect would only send the cancel again, and giving up
+    /// later would overwrite the recorded result with a recovery failure.
+    OwnerPauseSettled,
+}
+
 #[cfg(unix)]
 impl BgTaskRegistry {
     #[cfg(test)]
@@ -1875,6 +1888,8 @@ impl BgTaskRegistry {
                 if let Err(error) = result {
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
+                        #[cfg(test)]
+                        tests::note_remote_worker_exit(&task.task_id);
                         return;
                     }
                     let point = task
@@ -1903,6 +1918,8 @@ impl BgTaskRegistry {
                 // Refusals must be rendered from their settled terminal state,
                 // not raced against the worker that is still recording them.
                 task.remote_launch_ready.store(true, Ordering::Release);
+                #[cfg(test)]
+                tests::note_remote_worker_exit(&task.task_id);
             })
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -2102,8 +2119,13 @@ impl BgTaskRegistry {
             }
         } else {
             let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
-            self.attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+            match self
+                .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                 .await?
+            {
+                Attached::Stream(stream) => stream,
+                Attached::OwnerPauseSettled => return Ok(()),
+            }
         };
         let mut cancelled = false;
         loop {
@@ -2127,9 +2149,13 @@ impl BgTaskRegistry {
                     if self.finish_owner_pause_cancel(&task, result) {
                         return Ok(());
                     }
-                    stream = self
+                    stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
-                        .await?;
+                        .await?
+                    {
+                        Attached::Stream(stream) => stream,
+                        Attached::OwnerPauseSettled => return Ok(()),
+                    };
                     cancelled = true;
                 } else {
                     // Before the runner accepts the submission, there is no job
@@ -2265,9 +2291,13 @@ impl BgTaskRegistry {
                     // A known accepted job is recovered only by attach. Never
                     // convert a lost stream into another run or local fallback.
                     recovery.pause(point.job_id).await?;
-                    stream = self
+                    stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
-                        .await?;
+                        .await?
+                    {
+                        Attached::Stream(stream) => stream,
+                        Attached::OwnerPauseSettled => return Ok(()),
+                    };
                 }
             }
         }
@@ -2531,7 +2561,7 @@ impl BgTaskRegistry {
         root: &Path,
         task: &Arc<BgTask>,
         recovery: &mut ReattachBudget,
-    ) -> Result<exec::RemoteStream, String> {
+    ) -> Result<Attached, String> {
         point.attach_request().map_err(|e| e.to_string())?;
         loop {
             let cancel = task
@@ -2551,14 +2581,18 @@ impl BgTaskRegistry {
                             .map(|_| ())
                             .map_err(|e| e.to_string());
                         if self.finish_owner_pause_cancel(task, result) {
-                            return Err(exec::Error::Protocol("owner pause settled".into()));
+                            return Some(Attached::OwnerPauseSettled);
                         }
                     }
-                    client.attach(point.clone()).await
+                    client
+                        .attach(point.clone())
+                        .await
+                        .ok()
+                        .map(Attached::Stream)
                 })
                 .await?;
-            if let Ok(stream) = attempt {
-                return Ok(stream);
+            if let Some(attached) = attempt {
+                return Ok(attached);
             }
             // The route may have closed with the runner (a ck-motor restart).
             // Back off, then reconnect and attach again; never resubmit.

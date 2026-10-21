@@ -816,6 +816,12 @@ pub(crate) struct OutageDaemon {
     pub(crate) log: Arc<Mutex<Vec<Value>>>,
     /// Connections that asked for the catalog while the provider was away.
     pub(crate) refused_connects: Arc<tokio::sync::watch::Sender<usize>>,
+    /// Every authenticated connection, whether or not the provider was there.
+    pub(crate) connects: Arc<tokio::sync::watch::Sender<usize>>,
+    /// Catalog requests currently held by [`OutageDaemon::hold_next_connect`].
+    held_connects: Arc<tokio::sync::watch::Sender<usize>>,
+    hold_next: Arc<std::sync::atomic::AtomicBool>,
+    release_held: Arc<tokio::sync::Notify>,
     up: Arc<std::sync::atomic::AtomicBool>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
@@ -826,6 +832,29 @@ impl OutageDaemon {
     /// Bring the provider back, as when ck-motor finishes restarting.
     pub(crate) fn restore(&self) {
         self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hold the next connection's catalog request unanswered until
+    /// [`OutageDaemon::release_held_connect`], so a test can act while the
+    /// caller is in the middle of reconnecting. The held reply reports the
+    /// provider as it is at release time.
+    pub(crate) fn hold_next_connect(&self) {
+        self.hold_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Wait until a reconnect is held by [`OutageDaemon::hold_next_connect`].
+    pub(crate) async fn after_held_connect(&self) {
+        let mut held = self.held_connects.subscribe();
+        tokio::time::timeout(Duration::from_secs(30), held.wait_for(|n| *n >= 1))
+            .await
+            .expect("the caller must reconnect into the held catalog request")
+            .unwrap();
+    }
+
+    /// Answer the catalog request held by [`OutageDaemon::hold_next_connect`].
+    pub(crate) fn release_held_connect(&self) {
+        self.release_held.notify_one();
     }
 
     /// Wait until at least `count` connections found the provider away.
@@ -882,12 +911,22 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let log = Arc::new(Mutex::new(Vec::new()));
     let refused_connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let held_connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let hold_next = Arc::new(AtomicBool::new(false));
+    let release_held = Arc::new(tokio::sync::Notify::new());
     let up = Arc::new(AtomicBool::new(true));
     let (server_log, server_refused, server_up, server_key) = (
         log.clone(),
         refused_connects.clone(),
         up.clone(),
         key.clone(),
+    );
+    let (server_connects, server_held, server_hold_next, server_release) = (
+        connects.clone(),
+        held_connects.clone(),
+        hold_next.clone(),
+        release_held.clone(),
     );
     let server = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
@@ -900,6 +939,12 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                 server_refused.clone(),
                 server_up.clone(),
                 server_key.clone(),
+            );
+            let (connects, held, hold_next, release) = (
+                server_connects.clone(),
+                server_held.clone(),
+                server_hold_next.clone(),
+                server_release.clone(),
             );
             connections.spawn(async move {
                 if subc_transport::authenticate_server(
@@ -914,6 +959,7 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                 {
                     return;
                 }
+                connects.send_modify(|count| *count += 1);
                 let (mut reader, mut writer) = tokio::io::split(socket);
                 while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
                     let header = frame.header;
@@ -950,6 +996,11 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                         )),
                         FrameType::Request if header.channel == 0 => match body["op"].as_str() {
                             Some("catalog.list") => {
+                                if hold_next.swap(false, Ordering::SeqCst) {
+                                    held.send_modify(|count| *count += 1);
+                                    release.notified().await;
+                                    held.send_modify(|count| *count -= 1);
+                                }
                                 // A provider that is restarting is absent from the catalog.
                                 let modules = if up.load(Ordering::SeqCst) {
                                     json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":["exec-remote/v1"], "requires":[]}}])
@@ -1049,6 +1100,10 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
         connection,
         log,
         refused_connects,
+        connects,
+        held_connects,
+        hold_next,
+        release_held,
         up,
         server,
         _dir: dir,
