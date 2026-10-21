@@ -5995,7 +5995,11 @@ fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "categories");
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC_LOG", log.to_str().unwrap());
-    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-excluded", excluded.to_str().unwrap());
+    // The external root is outside the project, so the inspect is dispatched
+    // the way an OpenCode host's request is; without a host route the engine
+    // refuses outside paths before TypeScript is ever involved.
+    let response =
+        scoped_diagnostics_inspect_outside(&ctx, "ts-sync-excluded", excluded.to_str().unwrap());
     assert_eq!(response["complete"], false, "{response:#}");
     assert_eq!(response["scope_files"], 1, "{response:#}");
     assert_eq!(
@@ -6025,7 +6029,7 @@ fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
     // An included file exercises the same logger and successful server replies,
     // so an empty excluded-file log cannot pass because logging was disconnected.
     let included_response =
-        scoped_diagnostics_inspect(&ctx, "ts-sync-included", included.to_str().unwrap());
+        scoped_diagnostics_inspect_outside(&ctx, "ts-sync-included", included.to_str().unwrap());
     assert_eq!(
         included_response["summary"]["diagnostics"]["errors"], 1,
         "{included_response:#}"
