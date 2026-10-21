@@ -54,6 +54,38 @@ pub(crate) use gitignore_state::ignore_rules_fixture;
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
+
+thread_local! {
+    static REQUEST_PROGRESS_ORIGIN: std::cell::RefCell<Option<(String, crate::protocol::ProgressOrigin)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct ProgressOriginGuard(Option<(String, crate::protocol::ProgressOrigin)>);
+
+impl Drop for ProgressOriginGuard {
+    fn drop(&mut self) {
+        REQUEST_PROGRESS_ORIGIN.with(|origin| *origin.borrow_mut() = self.0.take());
+    }
+}
+
+/// Scope progress to the exact route generation that admitted a request. Handles
+/// captured inside the scope retain that destination when used on other threads.
+pub(crate) fn progress_origin_guard(
+    request_id: &str,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> ProgressOriginGuard {
+    ProgressOriginGuard(REQUEST_PROGRESS_ORIGIN.with(|origin| {
+        origin.borrow_mut().replace((
+            request_id.to_owned(),
+            crate::protocol::ProgressOrigin {
+                channel,
+                epoch,
+                corr,
+            },
+        ))
+    }))
+}
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
 /// `view_disk_limits_next_ms` while views are disabled: never due.
@@ -1078,7 +1110,7 @@ pub struct StatusEmitter {
 }
 
 enum PendingStatusSnapshot {
-    Ready(StatusPayload),
+    Ready(StatusPayload, Weak<AppContext>),
     Context(Weak<AppContext>),
 }
 
@@ -2312,8 +2344,13 @@ impl StatusEmitter {
     }
 
     pub fn signal(&self, snapshot: StatusPayload) {
+        let context = self
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(PendingStatusSnapshot::Ready(snapshot));
+            *latest = Some(PendingStatusSnapshot::Ready(snapshot, context));
         }
         let _ = self.notify.send(());
     }
@@ -2352,12 +2389,15 @@ fn status_debounce_loop(
             // emitter lock. Upgrade at emission so queued signals cannot keep a
             // retired actor (and its watchers/servers) alive.
             let snapshot = match snapshot {
-                PendingStatusSnapshot::Ready(snapshot) => snapshot,
+                PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
+                    Some(context) => crate::status_push::project(&context, snapshot),
+                    None => snapshot,
+                },
                 PendingStatusSnapshot::Context(context) => {
                     let Some(context) = context.upgrade() else {
                         continue;
                     };
-                    let Some(snapshot) = context.try_build_status_snapshot() else {
+                    let Some(snapshot) = context.try_build_status_push_snapshot() else {
                         // Keep the previous bar; the next producer signal retries.
                         continue;
                     };
@@ -4566,7 +4606,7 @@ impl AppContext {
         } else {
             // Stack-owned contexts are supported by the library API. Transport
             // roots register their owning Arc before serving any requests.
-            if let Some(snapshot) = self.try_build_status_snapshot() {
+            if let Some(snapshot) = self.try_build_status_push_snapshot() {
                 self.status_emitter().signal(snapshot);
             }
         }
@@ -5785,9 +5825,7 @@ impl AppContext {
     }
 
     pub fn emit_progress(&self, frame: ProgressFrame) {
-        let Ok(progress_sender) = self.progress_sender.lock().map(|sender| sender.clone()) else {
-            return;
-        };
+        let progress_sender = self.progress_sender_handle();
         if let Some(sender) = progress_sender.as_ref() {
             sender(PushFrame::Progress(frame));
         }
@@ -5822,10 +5860,20 @@ impl AppContext {
     /// configure has already returned, so configure latency stays sub-100 ms
     /// even on huge directories.
     pub fn progress_sender_handle(&self) -> Option<ProgressSender> {
-        self.progress_sender
+        let sender = self
+            .progress_sender
             .lock()
             .ok()
-            .and_then(|sender| sender.clone())
+            .and_then(|sender| sender.clone())?;
+        let origin = REQUEST_PROGRESS_ORIGIN.with(|origin| origin.borrow().clone());
+        Some(Arc::new(Box::new(move |mut frame| {
+            if let PushFrame::Progress(progress) = &mut frame {
+                progress.origin = origin.as_ref().and_then(|(request_id, route)| {
+                    (request_id == &progress.request_id).then_some(*route)
+                });
+            }
+            sender(frame);
+        })))
     }
 
     pub fn advance_configure_generation(&self) -> u64 {
@@ -18632,12 +18680,14 @@ mod status_emitter_tests {
             request_id: "ctx-a".to_string(),
             kind: crate::protocol::ProgressKind::Stdout,
             chunk: "a".to_string(),
+            origin: None,
         });
         ctx_b.emit_progress(ProgressFrame {
             frame_type: "progress",
             request_id: "ctx-b".to_string(),
             kind: crate::protocol::ProgressKind::Stdout,
             chunk: "b".to_string(),
+            origin: None,
         });
 
         match rx_a

@@ -1450,7 +1450,26 @@ class SubcTransport implements AftProjectTransport {
     // dropping it here would cap long tool executions at the subc client's
     // default unary deadline while the command keeps running module-side.
     const timeoutMs = options.transportTimeoutMs ?? options.timeoutMs;
-    const onProgress = (options as { onProgress?: RequestOptions["onProgress"] }).onProgress;
+    // subc-client delivers wire bodies; hosts use the same decoded callback
+    // shape as BinaryBridge, regardless of the route carrying the request.
+    const callback = options.onProgress;
+    const onProgress: RequestOptions["onProgress"] = callback
+      ? (body) => {
+          let frame: unknown;
+          try {
+            frame = JSON.parse(new TextDecoder().decode(body));
+          } catch {
+            return;
+          }
+          if (typeof frame !== "object" || frame === null) return;
+          const progress = frame as Record<string, unknown>;
+          if (progress.type !== "progress" || typeof progress.chunk !== "string") return;
+          callback({
+            kind: progress.kind === "stderr" ? "stderr" : "stdout",
+            text: progress.chunk,
+          });
+        }
+      : undefined;
     return { preview, timeoutMs, onProgress, abortSignal: options.abortSignal };
   }
 }

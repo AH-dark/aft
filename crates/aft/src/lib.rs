@@ -170,6 +170,7 @@ pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
 pub mod standing_roots;
+pub(crate) mod status_push;
 #[cfg(all(test, unix))]
 mod storage_permissions_tests;
 pub(crate) mod storage_retention;

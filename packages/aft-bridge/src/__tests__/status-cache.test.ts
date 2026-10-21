@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { BinaryBridge, type StatusSnapshot } from "../bridge.js";
 
 function makeBridge(): BinaryBridge {
@@ -14,6 +15,31 @@ function pushStatus(bridge: BinaryBridge, snapshot: StatusSnapshot): void {
 }
 
 describe("BinaryBridge status cache", () => {
+  test("root-local and compacted Rust status pushes stay fresh in cache and listeners", () => {
+    for (const name of ["projected", "compacted"]) {
+      const frame = JSON.parse(
+        readFileSync(
+          new URL(
+            `../../../../crates/aft/tests/fixtures/status_push_consumer_${name}.json`,
+            import.meta.url,
+          ),
+          "utf8",
+        ),
+      ) as { snapshot: StatusSnapshot };
+      const bridge = makeBridge();
+      const seen: StatusSnapshot[] = [];
+      bridge.subscribeStatus((snapshot) => seen.push(snapshot));
+      pushStatus(bridge, frame.snapshot);
+      expect(bridge.getCachedStatus()).toEqual(frame.snapshot);
+      expect(seen).toEqual([frame.snapshot]);
+      expect(bridge.getCachedStatus()?.semantic_index?.entries_done).toBe(40_000);
+      expect(bridge.getCachedStatus()?.runtime?.open_routes).toBe(90);
+      expect(frame.snapshot).toMatchObject({ push_details: { read: "status" } });
+      expect(frame.snapshot.memory).toBeUndefined();
+      expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThanOrEqual(16 * 1024);
+    }
+  });
+
   test("bridge_caches_status_snapshot_on_push_frame", () => {
     const bridge = makeBridge();
     const snapshot: StatusSnapshot = { version: "0.24.0", cache_role: "main" };

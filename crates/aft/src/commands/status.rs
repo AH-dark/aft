@@ -115,6 +115,11 @@ impl AppContext {
         Some(self.build_status_snapshot_with_counts(DEFAULT_SESSION_ID, counts))
     }
 
+    pub(crate) fn try_build_status_push_snapshot(&self) -> Option<StatusPayload> {
+        self.try_build_status_snapshot()
+            .map(|snapshot| crate::status_push::project(self, snapshot))
+    }
+
     fn build_status_snapshot_with_counts(
         &self,
         session_id: &str,

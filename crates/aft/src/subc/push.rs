@@ -60,6 +60,16 @@ fn frame_session(frame: &PushFrame) -> Option<&str> {
     }
 }
 
+fn root_broadcast_kind(frame: &PushFrame) -> Option<&'static str> {
+    match frame {
+        PushFrame::StatusChanged(status) if status.session_id.is_none() => Some("status_changed"),
+        PushFrame::ConfigureWarnings(warnings) if warnings.session_id.is_none() => {
+            Some("configure_warnings")
+        }
+        _ => None,
+    }
+}
+
 fn frame_is_reliable(frame: &PushFrame) -> bool {
     matches!(
         frame,
@@ -109,6 +119,20 @@ fn should_drop_lossy_push(completed_tasks: &CompletedTaskIds, frame: &PushFrame)
     long_running_task_id(frame).is_some_and(|task_id| completed_tasks.contains(task_id))
 }
 
+pub(super) fn routed_progress_job(
+    route: RouteChannel,
+    corr: u64,
+    request_id: &str,
+    job: crate::executor::ExecutorJob,
+) -> crate::executor::ExecutorJob {
+    let request_id = request_id.to_owned();
+    Box::new(move |ctx| {
+        let _progress =
+            crate::context::progress_origin_guard(&request_id, route.channel, route.epoch, corr);
+        job(ctx)
+    })
+}
+
 pub(super) fn progress_sender_for_root(
     push_senders: PushSenders,
     root_id: ProjectRootId,
@@ -151,6 +175,7 @@ impl From<&ProgressKind> for LossyProgressKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LossyPushKey {
     Progress {
+        origin: Option<crate::protocol::ProgressOrigin>,
         request_id: String,
         kind: LossyProgressKind,
     },
@@ -203,6 +228,7 @@ impl LossyOverflow {
 fn lossy_push_key(frame: &PushFrame) -> Option<LossyPushKey> {
     match frame {
         PushFrame::Progress(progress) => Some(LossyPushKey::Progress {
+            origin: progress.origin,
             request_id: progress.request_id.clone(),
             kind: LossyProgressKind::from(&progress.kind),
         }),
@@ -277,6 +303,7 @@ fn try_send_push_body(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
+    corr: u64,
     body: &[u8],
 ) -> PushSendOutcome {
     let push_frame = match Frame::build_with_version(
@@ -285,7 +312,7 @@ fn try_send_push_body(
         control_flags(),
         channel.channel,
         channel.epoch,
-        0,
+        corr,
         body.to_vec(),
     ) {
         Ok(frame) => frame,
@@ -356,7 +383,7 @@ fn try_send_push_frame(
             return PushSendOutcome::PermanentFailure;
         }
     };
-    try_send_push_body(writer_tx, metrics, channel, &body)
+    try_send_push_body(writer_tx, metrics, channel, 0, &body)
 }
 
 fn try_send_bg_stream_frame(
@@ -698,6 +725,22 @@ fn matching_route_channels(
         return Vec::new();
     };
 
+    if let PushFrame::Progress(progress) = frame {
+        let Some(origin) = progress.origin else {
+            return Vec::new();
+        };
+        let route = route_key(origin.channel, origin.epoch);
+        return if channels.contains(&route)
+            && routes
+                .get(&route)
+                .is_some_and(|identity| &identity.root == root)
+        {
+            vec![route]
+        } else {
+            Vec::new()
+        };
+    }
+
     let session = frame_session(frame);
     let bash_observation = frame_is_bash_observation(frame);
     channels
@@ -764,14 +807,27 @@ fn fan_out_lossy_push_frame(
         return FanOutResult::default();
     }
 
-    let body = match serde_json::to_vec(frame) {
-        Ok(body) => body,
-        Err(error) => {
-            log::warn!("subc attach: failed to serialize PushFrame for fan-out: {error}");
-            return FanOutResult {
-                matched_channels,
-                sent_frames: 0,
-            };
+    if let PushFrame::Progress(progress) = frame {
+        return FanOutResult {
+            matched_channels,
+            sent_frames: send_progress_chunks(writer_tx, metrics, matching_channels[0], progress),
+        };
+    }
+
+    let body = if let PushFrame::StatusChanged(status) = frame {
+        let body = crate::status_push::bounded_body(status);
+        metrics.record_status_push(root, &body, matched_channels);
+        body.bytes
+    } else {
+        match serde_json::to_vec(frame) {
+            Ok(body) => body,
+            Err(error) => {
+                log::warn!("subc attach: failed to serialize PushFrame for fan-out: {error}");
+                return FanOutResult {
+                    matched_channels,
+                    sent_frames: 0,
+                };
+            }
         }
     };
 
@@ -787,10 +843,74 @@ fn fan_out_lossy_push_frame(
         })
         .count();
 
+    if let Some(kind) =
+        root_broadcast_kind(frame).filter(|_| !matches!(frame, PushFrame::StatusChanged(_)))
+    {
+        metrics.record_root_broadcast(root, kind, body.len(), sent_frames);
+    }
+
     FanOutResult {
         matched_channels,
         sent_frames,
     }
+}
+
+/// Bound the complete JSON body, not just raw text: some control characters
+/// require six bytes in JSON. 16 KiB leaves ample room below a client's 4 MiB egress
+/// budget. Split only after latest-wins coalescing so parts of one update are
+/// not coalesced away. Writer backpressure still drops parts without waiting.
+const PROGRESS_BODY_MAX_BYTES: usize = 16 * 1024;
+
+fn send_progress_chunks(
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    route: RouteChannel,
+    progress: &crate::protocol::ProgressFrame,
+) -> usize {
+    let mut part =
+        crate::protocol::ProgressFrame::new(&progress.request_id, progress.kind.clone(), "");
+    let Ok(empty_body) = serde_json::to_vec(&part) else {
+        return 0;
+    };
+    let overhead = empty_body.len();
+    if overhead + 6 > PROGRESS_BODY_MAX_BYTES {
+        // The request ID leaves too little room for a worst-case JSON escape.
+        return 0;
+    }
+    let mut sent = 0;
+    let mut send = |chunk: &str| {
+        part.chunk.clear();
+        part.chunk.push_str(chunk);
+        if let Ok(body) = serde_json::to_vec(&part) {
+            if try_send_push_body(
+                writer_tx,
+                metrics,
+                route,
+                progress.origin.unwrap().corr,
+                &body,
+            ) == PushSendOutcome::Sent
+            {
+                sent += 1;
+            }
+        }
+    };
+    let mut start = 0;
+    let mut encoded_len = overhead;
+    for (offset, ch) in progress.chunk.char_indices() {
+        let len = match ch {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => ch.len_utf8(),
+        };
+        if encoded_len + len > PROGRESS_BODY_MAX_BYTES {
+            send(&progress.chunk[start..offset]);
+            start = offset;
+            encoded_len = overhead;
+        }
+        encoded_len += len;
+    }
+    send(&progress.chunk[start..]);
+    sent
 }
 
 fn fan_out_reliable_push_frame(
@@ -848,6 +968,14 @@ fn fan_out_reliable_push_frame(
                     key.harness,
                     key.session
                 );
+            }
+        }
+    }
+
+    if sent_frames > 0 {
+        if let Some(kind) = root_broadcast_kind(frame) {
+            if let Ok(body) = serde_json::to_vec(frame) {
+                metrics.record_root_broadcast(root, kind, body.len(), sent_frames);
             }
         }
     }
@@ -1028,6 +1156,116 @@ pub(super) fn drain_reliable_push_turn(
     (processed, deferred)
 }
 
+#[derive(Default)]
+pub(super) struct StatusPushes {
+    pending: HashMap<ProjectRootId, PendingStatus>,
+}
+
+struct PendingStatus {
+    frame: Option<crate::protocol::StatusChangedFrame>,
+    body: Option<Arc<Vec<u8>>>,
+    recipients: VecDeque<RouteChannel>,
+    cursor: Option<RouteChannel>,
+    session: Option<String>,
+}
+
+const STATUS_FANOUT_TURN_BYTES: usize = 1024 * 1024;
+
+impl StatusPushes {
+    fn queue(&mut self, root: ProjectRootId, frame: crate::protocol::StatusChangedFrame) {
+        // Keep the newest state and resume at the first recipient still waiting,
+        // rather than restarting every update at routes already served.
+        let cursor = self
+            .pending
+            .get(&root)
+            .and_then(|pending| pending.recipients.front().copied().or(pending.cursor));
+        let session = frame.session_id.clone();
+        self.pending.insert(
+            root,
+            PendingStatus {
+                frame: Some(frame),
+                body: None,
+                recipients: VecDeque::new(),
+                cursor,
+                session,
+            },
+        );
+    }
+
+    pub(super) fn drain_turn(
+        &mut self,
+        writer: &WriterSender,
+        metrics: &DispatchPathMetrics,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        roots: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    ) {
+        for (root, pending) in &mut self.pending {
+            if let Some(frame) = pending.frame.take() {
+                let envelope = PushFrame::StatusChanged(frame);
+                let mut recipients = matching_route_channels(routes, roots, root, &envelope);
+                recipients.sort_by_key(|route| (route.channel, route.epoch));
+                if let Some(cursor) = pending.cursor {
+                    let start = recipients.partition_point(|route| {
+                        (route.channel, route.epoch) < (cursor.channel, cursor.epoch)
+                    });
+                    let len = recipients.len();
+                    if len > 0 {
+                        recipients.rotate_left(start % len);
+                    }
+                }
+                if !recipients.is_empty() {
+                    let PushFrame::StatusChanged(frame) = envelope else {
+                        unreachable!()
+                    };
+                    let body = crate::status_push::bounded_body(&frame);
+                    metrics.record_status_push(root, &body, recipients.len());
+                    pending.body = Some(Arc::new(body.bytes));
+                    pending.recipients = recipients.into();
+                }
+            }
+            let Some(body) = pending.body.as_ref() else {
+                continue;
+            };
+            let wire_bytes = body.len() + subc_protocol::HEADER_LEN;
+            let mut spent = 0;
+            while let Some(channel) = pending.recipients.front().copied() {
+                let live = roots
+                    .get(root)
+                    .is_some_and(|channels| channels.contains(&channel))
+                    && routes.get(&channel).is_some_and(|identity| {
+                        &identity.root == root
+                            && pending
+                                .session
+                                .as_ref()
+                                .is_none_or(|session| &identity.session == session)
+                    });
+                if !live {
+                    pending.recipients.pop_front();
+                    continue;
+                }
+                if spent + wire_bytes > STATUS_FANOUT_TURN_BYTES {
+                    metrics
+                        .status_push_aggregate_limited_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                match try_send_shared_push_body(writer, metrics, channel, Arc::clone(body)) {
+                    PushSendOutcome::Sent => {
+                        spent += wire_bytes;
+                        pending.recipients.pop_front();
+                    }
+                    PushSendOutcome::Backpressure => break,
+                    PushSendOutcome::PermanentFailure => {
+                        pending.recipients.pop_front();
+                    }
+                }
+            }
+        }
+        self.pending
+            .retain(|_, pending| pending.frame.is_some() || !pending.recipients.is_empty());
+    }
+}
+
 pub(super) fn process_lossy_push_frame(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
@@ -1049,6 +1287,7 @@ pub(super) fn process_lossy_push_frame(
     let _ = fan_out_lossy_push_frame(writer_tx, metrics, routes, root_channels, &root, &frame);
 }
 
+#[cfg(test)]
 pub(super) fn process_lossy_push_batch(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
@@ -1077,26 +1316,464 @@ pub(super) fn process_lossy_push_envelope_batch(
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     completed_tasks: &CompletedTaskIds,
     mut batch: Vec<LossyPushEnvelope>,
+    statuses: &mut StatusPushes,
 ) {
     batch.sort_by_key(|(order, _, _)| *order);
     let batch = batch
         .into_iter()
         .map(|(_, root, frame)| (root, frame))
         .collect();
-    process_lossy_push_batch(
-        writer_tx,
-        metrics,
-        routes,
-        root_channels,
-        completed_tasks,
-        batch,
-    );
+    for (root, frame) in coalesce_push_batch(batch) {
+        match frame {
+            PushFrame::StatusChanged(status) => statuses.queue(root, status),
+            frame => process_lossy_push_frame(
+                writer_tx,
+                metrics,
+                routes,
+                root_channels,
+                completed_tasks,
+                root,
+                frame,
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::protocol::{ConfigureWarningsFrame, StatusChangedFrame};
+
+    #[cfg(unix)]
+    fn busy_status(error_bytes: usize, done: usize) -> StatusChangedFrame {
+        let fixture = crate::bash_background::push_projection_fixture::busy_root();
+        let mut snapshot =
+            crate::status_push::project(&fixture.ctx, fixture.ctx.build_status_snapshot());
+        snapshot["semantic_index"]["error"] = json!("e".repeat(error_bytes));
+        snapshot["semantic_index"]["entries_done"] = json!(done);
+        StatusChangedFrame::new(None, snapshot)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_serialized_backstop_preserves_fresh_counts() {
+        let (_dir, root) = test_root("status-byte-backstop");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut frame = busy_status(100_000, 41_234);
+        frame.snapshot["storage_refusals"]=json!((0..8).map(|i|json!({"code":"unsupported_persisted_format","store":"search_index","path":format!("/root/cache-{i}"),"found":99,"supported":1,"message":"unreadable artifact"})).collect::<Vec<_>>());
+        frame.snapshot["storage_refusals_total"] = json!(19);
+        frame.snapshot["storage_refusals_omitted"] = json!(11);
+        frame.snapshot["storage_refusals_unattributed"] = json!(7);
+        frame.snapshot["degraded"] = json!(true);
+        let metrics = DispatchPathMetrics::new();
+        let first = crate::status_push::bounded_body(&frame);
+        assert_eq!(
+            first.bytes,
+            crate::status_push::bounded_body(&frame).bytes,
+            "compaction must be deterministic"
+        );
+        fan_out_lossy_push_frame(
+            &tx,
+            &metrics,
+            &routes,
+            &roots,
+            &root,
+            &PushFrame::StatusChanged(frame),
+        );
+        let body = rx.try_recv().expect("an oversized status must still emit");
+        assert!(
+            body.body().len() <= 16 * 1024,
+            "complete status body exceeds 16 KiB: {}",
+            body.body().len()
+        );
+        let value: Value = serde_json::from_slice(body.body()).unwrap();
+        assert_eq!(value["snapshot"]["semantic_index"]["entries_done"], 41_234);
+        assert_eq!(value["snapshot"]["storage_refusals_total"], 19);
+        assert_eq!(value["snapshot"]["storage_refusals_omitted"], 19);
+        assert_eq!(value["snapshot"]["storage_refusals_unattributed"], 7);
+        assert_eq!(value["snapshot"]["degraded"], true);
+        assert_eq!(value["snapshot"]["push_details"]["omitted"], true);
+        assert_eq!(value["snapshot"]["push_details"]["read"], "status");
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["writer"]["status_push_compacted_total"],
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_forty_five_and_ninety_recipients_obey_turn_budget() {
+        for count in [45, 90] {
+            let (_dir, root) = test_root("status-turn-budget");
+            let (routes, roots) = progress_routes(&root, count);
+            let (tx, mut rx) = mpsc::channel(256);
+            let mut pending = StatusPushes::default();
+            let frame = busy_status(12 * 1024, 42_000);
+            assert!(
+                serde_json::to_vec(&frame).unwrap().len() <= 16 * 1024,
+                "fixture must exercise the aggregate bound without invoking the body cap"
+            );
+            pending.queue(root.clone(), frame);
+            let metrics = DispatchPathMetrics::new();
+            let mut seen = HashSet::new();
+            for _ in 0..4 {
+                pending.drain_turn(&tx, &metrics, &routes, &roots);
+                let mut wire_bytes = 0;
+                while let Ok(frame) = rx.try_recv() {
+                    wire_bytes += frame.body().len() + subc_protocol::HEADER_LEN;
+                    assert!(
+                        seen.insert(frame.header.channel),
+                        "no route deduplication or duplicate delivery"
+                    );
+                }
+                assert!(
+                    wire_bytes <= 1024 * 1024,
+                    "{count} recipients exceeded 1 MiB in one turn: {wire_bytes}"
+                );
+                if pending.pending.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                seen.len(),
+                usize::from(count),
+                "every route must receive the fresh state, including deferred recipients"
+            );
+            assert!(pending.pending.is_empty());
+            let limited = metrics.snapshot(&HashMap::new())["writer"]
+                ["status_push_aggregate_limited_total"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                limited > 0,
+                count == 90,
+                "aggregate backstop must be visible in health"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_full_writer_retains_only_latest_pending_state() {
+        let (_dir, root) = test_root("status-pending-latest");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        let metrics = DispatchPathMetrics::new();
+        let blocker = Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        assert!(try_enqueue_writer_frame(&tx, &metrics, blocker).is_enqueued());
+        let mut pending = StatusPushes::default();
+        pending.queue(root.clone(), busy_status(0, 1));
+        pending.queue(root.clone(), busy_status(0, 2));
+        pending.drain_turn(&tx, &metrics, &routes, &roots);
+        assert_eq!(
+            pending.pending.len(),
+            1,
+            "full writer must retain latest status rather than dropping it"
+        );
+        assert_eq!(rx.try_recv().unwrap().header.ty, FrameType::Ping);
+        pending.queue(root, busy_status(0, 3));
+        pending.drain_turn(&tx, &metrics, &routes, &roots);
+        let frame = rx.try_recv().unwrap();
+        let value: Value = serde_json::from_slice(frame.body()).unwrap();
+        assert_eq!(value["snapshot"]["semantic_index"]["entries_done"], 3);
+        assert!(pending.pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_backstop_counts_json_escaping_not_raw_text() {
+        let mut frame = busy_status(0, 43_210);
+        frame.snapshot["semantic_index"]["error"] = json!("\u{0000}".repeat(12_000));
+        let body = crate::status_push::bounded_body(&frame);
+        assert!(
+            body.compacted,
+            "a raw string below 16 KiB can exceed the serialized budget"
+        );
+        assert!(body.bytes.len() <= 16 * 1024);
+        let decoded: Value = serde_json::from_slice(&body.bytes).unwrap();
+        assert_eq!(
+            decoded["snapshot"]["semantic_index"]["entries_done"],
+            43_210
+        );
+        assert_eq!(decoded["snapshot"]["push_details"]["read"], "status");
+    }
+    const TEST_PROGRESS_BODY_LIMIT: usize = 16 * 1024;
+
+    fn originated_progress(chunk: &str) -> PushFrame {
+        let ctx = AppContext::from_app(App::default_shared(), Config::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            tx.send(frame).unwrap();
+        }))));
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let job = routed_progress_job(
+            route_key(1, 7),
+            44,
+            "request-a",
+            Box::new(move |ctx| {
+                handle_tx
+                    .send(ctx.progress_sender_handle().unwrap())
+                    .unwrap();
+                Response::success("request-a", json!({}))
+            }),
+        );
+        job(&ctx);
+        let handle = handle_rx.recv().unwrap();
+        let frame = progress_frame("request-a", ProgressKind::Stdout, chunk);
+        std::thread::spawn(move || handle(frame)).join().unwrap();
+        rx.recv().unwrap()
+    }
+
+    fn progress_routes(
+        root: &ProjectRootId,
+        count: u16,
+    ) -> (
+        HashMap<RouteChannel, RouteIdentity>,
+        HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    ) {
+        // Even routes sharing a session must not receive each other's output.
+        let routes: HashMap<_, _> = (1..=count)
+            .map(|channel| (route_key(channel, 7), route_identity(root, "same-session")))
+            .collect();
+        let roots = HashMap::from([(root.clone(), routes.keys().copied().collect())]);
+        (routes, roots)
+    }
+
+    #[test]
+    fn progress_routing_only_origin_receives_output() {
+        let (_dir, root) = test_root("subc-progress-origin");
+        let (routes, roots) = progress_routes(&root, 2);
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = fan_out_lossy_push_frame(
+            &tx,
+            &DispatchPathMetrics::new(),
+            &routes,
+            &roots,
+            &root,
+            &originated_progress("private output"),
+        );
+        assert_eq!(
+            result.sent_frames, 1,
+            "progress must not broadcast to sibling routes"
+        );
+        assert_eq!(
+            result.matched_channels, 1,
+            "only the originating route may match"
+        );
+        let frame = rx.try_recv().unwrap();
+        assert_eq!(frame.header.channel, 1);
+        assert_eq!(frame.header.epoch, 7);
+        assert_eq!(
+            frame.header.corr, 44,
+            "subc-client correlates progress with the pending request"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn progress_routing_caps_frames_without_losing_bytes() {
+        let (_dir, root) = test_root("subc-progress-cap");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(128);
+        // Include six-byte JSON escapes and multibyte UTF-8 boundary crossings.
+        let chunk = "abc\u{0000}\n\"\\🦀".repeat(10_000);
+        process_lossy_push_batch(
+            &tx,
+            &DispatchPathMetrics::new(),
+            &routes,
+            &roots,
+            &CompletedTaskIds::default(),
+            vec![(root, originated_progress(&chunk))],
+        );
+        let mut received = String::new();
+        let mut frames = 0;
+        while let Ok(frame) = rx.try_recv() {
+            assert!(
+                frame.body().len() <= TEST_PROGRESS_BODY_LIMIT,
+                "progress body {} exceeds 16 KiB",
+                frame.body().len()
+            );
+            let body: Value = serde_json::from_slice(frame.body()).unwrap();
+            assert_eq!(body["request_id"], "request-a");
+            assert_eq!(body["kind"], "stdout");
+            assert!(body.get("origin").is_none());
+            received.push_str(body["chunk"].as_str().unwrap());
+            frames += 1;
+        }
+        assert!(frames > 1);
+        assert_eq!(received, chunk);
+    }
+
+    #[test]
+    fn progress_routing_fifty_routes_write_one_copy() {
+        let (_dir, root) = test_root("subc-progress-fifty");
+        let (routes, roots) = progress_routes(&root, 50);
+        let (tx, mut rx) = mpsc::channel(256);
+        let chunk = "x".repeat(98_068);
+        process_lossy_push_batch(
+            &tx,
+            &DispatchPathMetrics::new(),
+            &routes,
+            &roots,
+            &CompletedTaskIds::default(),
+            vec![(root, originated_progress(&chunk))],
+        );
+        let mut output_bytes = 0;
+        let mut wire_body_bytes = 0;
+        let mut frames = 0;
+        while let Ok(frame) = rx.try_recv() {
+            let body: Value = serde_json::from_slice(frame.body()).unwrap();
+            assert_eq!(frame.header.channel, 1);
+            output_bytes += body["chunk"].as_str().unwrap().len();
+            wire_body_bytes += frame.body().len();
+            frames += 1;
+        }
+        assert_eq!(
+            output_bytes,
+            chunk.len(),
+            "one command must write only its own bytes"
+        );
+        assert!(wire_body_bytes <= chunk.len() + frames * 128);
+    }
+
+    #[test]
+    fn progress_routing_drops_unscoped_detached_and_reused_channel() {
+        let (_dir, root) = test_root("subc-progress-gone");
+        let (mut routes, mut roots) = progress_routes(&root, 2);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metrics = DispatchPathMetrics::new();
+        let unscoped = progress_frame("request-a", ProgressKind::Stdout, "unscoped");
+        assert_eq!(
+            fan_out_lossy_push_frame(&tx, &metrics, &routes, &roots, &root, &unscoped).sent_frames,
+            0
+        );
+        routes.remove(&route_key(1, 7));
+        assert_eq!(
+            fan_out_lossy_push_frame(
+                &tx,
+                &metrics,
+                &routes,
+                &roots,
+                &root,
+                &originated_progress("gone")
+            )
+            .sent_frames,
+            0
+        );
+        routes.insert(route_key(1, 8), route_identity(&root, "same-session"));
+        roots.get_mut(&root).unwrap().insert(route_key(1, 8));
+        assert_eq!(
+            fan_out_lossy_push_frame(
+                &tx,
+                &metrics,
+                &routes,
+                &roots,
+                &root,
+                &originated_progress("old epoch")
+            )
+            .sent_frames,
+            0
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn progress_routing_coalesces_latest_per_route_and_request() {
+        let (_dir, root) = test_root("subc-progress-route-keys");
+        let a = originated_progress("old a");
+        let mut b = originated_progress("b");
+        if let PushFrame::Progress(progress) = &mut b {
+            progress.origin.as_mut().unwrap().channel = 2;
+        }
+        let batch = coalesce_push_batch(vec![
+            (root.clone(), a),
+            (root.clone(), b),
+            (root, originated_progress("new a")),
+        ]);
+        let chunks: Vec<_> = batch
+            .iter()
+            .map(|(_, frame)| match frame {
+                PushFrame::Progress(progress) => progress.chunk.as_str(),
+                _ => panic!("expected progress"),
+            })
+            .collect();
+        assert_eq!(chunks, ["b", "new a"]);
+    }
+
+    #[test]
+    fn root_broadcast_pressure_counts_large_status_and_warnings() {
+        let (_dir, root) = test_root("subc-broadcast-pressure");
+        let (routes, roots) = progress_routes(&root, 50);
+        let (tx, _rx) = mpsc::channel(128);
+        let metrics = DispatchPathMetrics::new();
+        let status = PushFrame::StatusChanged(StatusChangedFrame::new(
+            None,
+            json!({"detail": "x".repeat(30_000)}),
+        ));
+        let warnings = PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new(
+            "/repo",
+            vec![json!({"hint": "x".repeat(30_000)})],
+        ));
+        let result = fan_out_lossy_push_frame(&tx, &metrics, &routes, &roots, &root, &status);
+        assert_eq!(result.sent_frames, 50);
+        let result = fan_out_reliable_push_frame(
+            &tx,
+            &metrics,
+            &routes,
+            &roots,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &root,
+            &warnings,
+            None,
+        );
+        assert_eq!(result.sent_frames, 50);
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["writer"]["root_broadcast_over_1mib_total"],
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "manual serialized-size audit allocates two 64 MiB payloads"]
+    fn root_broadcast_body_size_audit() {
+        let ctx = test_ctx();
+        let status = StatusChangedFrame::new(None, ctx.build_status_snapshot());
+        let warnings = ConfigureWarningsFrame::new(
+            "/repo",
+            vec![json!({
+                "kind": "formatter_not_installed", "tool": "biome", "hint": "Install biome."
+            })],
+        );
+        println!(
+            "fresh_context_status_bytes={} single_warning_bytes={}",
+            serde_json::to_vec(&status).unwrap().len(),
+            serde_json::to_vec(&warnings).unwrap().len()
+        );
+        let mut large_status = StatusChangedFrame::new(None, json!({"detail": ""}));
+        let mut large_warnings = ConfigureWarningsFrame::new("/repo", vec![json!({"hint": ""})]);
+        let status_overhead = serde_json::to_vec(&large_status).unwrap().len();
+        let warning_overhead = serde_json::to_vec(&large_warnings).unwrap().len();
+        large_status.snapshot["detail"] = json!("x".repeat(64 * 1024 * 1024 - status_overhead));
+        large_warnings.warnings[0]["hint"] = json!("x".repeat(64 * 1024 * 1024 - warning_overhead));
+        for (kind, body) in [
+            ("status_changed", serde_json::to_vec(&large_status).unwrap()),
+            (
+                "configure_warnings",
+                serde_json::to_vec(&large_warnings).unwrap(),
+            ),
+        ] {
+            assert_eq!(body.len(), 64 * 1024 * 1024);
+            println!(
+                "{kind}_constructed_body_bytes={} fifty_route_body_bytes={}",
+                body.len(),
+                body.len() * 50
+            );
+        }
+    }
 
     #[tokio::test]
     async fn bg_stream_end_waits_for_writer_capacity_instead_of_dropping() {
@@ -1723,12 +2400,11 @@ mod tests {
         const MATCHING_ROUTES: usize = 8;
 
         let (_root_dir, root) = test_root("subc-shared-lossy-body-root");
-        let frame = progress_frame(
-            "request-shared-body",
-            ProgressKind::Stdout,
-            &"x".repeat(4 * 1024),
-        );
-        let expected_body = serde_json::to_vec(&frame).expect("serialize progress Push frame");
+        let frame = PushFrame::StatusChanged(StatusChangedFrame::new(
+            None,
+            json!({"detail": "x".repeat(4 * 1024)}),
+        ));
+        let expected_body = serde_json::to_vec(&frame).expect("serialize status Push frame");
         let routes = HashMap::new();
         let expected_headers: HashSet<_> = (1..=MATCHING_ROUTES)
             .map(|channel| route_key(channel as u16, (channel * 10) as u32))

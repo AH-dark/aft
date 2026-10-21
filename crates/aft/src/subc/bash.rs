@@ -1251,6 +1251,9 @@ pub(super) fn submit_deferred_bash(
             submit_request_id,
             "bash",
             Box::new(move |ctx| {
+                let _progress = crate::context::progress_origin_guard(
+                    &request_id_for_spawn, route.channel, route.epoch, corr,
+                );
                 log_ctx::with_session(Some(session_for_spawn.clone()), || {
                     admitted_for_spawn.store(true, Ordering::Relaxed);
                     receipt_for_spawn.enter_startup_step(
