@@ -165,14 +165,15 @@ fn body_only_rust_edit_selects_nothing_through_the_module_domain() {
     assert!(seeded.module_domain_callers >= 5, "{seeded:?}");
     assert!(seeded.module_domain_traces >= 5, "{seeded:?}");
 
+    // The counted work comes first, so a regression names what it costs.
     let stats = transition(&f, "body-only");
-    assert!(!stats.module_digest_changed, "{stats:?}");
-    assert!(!stats.module_digest_full, "{stats:?}");
     assert_eq!(stats.module_domain_callers, 0, "{stats:?}");
     assert_eq!(stats.module_domain_traces, 0, "{stats:?}");
     assert!(stats.selected_callers <= 1, "{stats:?}");
     assert_eq!(stats.dispatch_type_target_traces, 0, "{stats:?}");
     assert_eq!(stats.module_digest_decoded_blobs, 1, "{stats:?}");
+    assert!(!stats.module_digest_changed, "{stats:?}");
+    assert!(!stats.module_digest_full, "{stats:?}");
 }
 
 #[test]
@@ -205,10 +206,10 @@ fn typescript_only_edit_decodes_no_blob_to_decide_seeding() {
     let seeded = transition_always_seeded(&f, "typescript-always-seeded");
     assert!(seeded.module_domain_callers >= 5, "{seeded:?}");
     let stats = transition(&f, "typescript");
-    assert!(!stats.module_digest_changed, "{stats:?}");
-    assert_eq!(stats.module_digest_decoded_blobs, 0, "{stats:?}");
     assert_eq!(stats.module_domain_callers, 0, "{stats:?}");
     assert_eq!(stats.module_domain_traces, 0, "{stats:?}");
+    assert_eq!(stats.module_digest_decoded_blobs, 0, "{stats:?}");
+    assert!(!stats.module_digest_changed, "{stats:?}");
 }
 
 /// `src/p/q.rs` is declared by `src/r.rs` through `#[path]`; adding `mod q;`
