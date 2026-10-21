@@ -1493,6 +1493,8 @@ thread_local! {
 
 mod dead_code_projection;
 #[cfg(test)]
+mod dispatch_narrowing_tests;
+#[cfg(test)]
 mod incremental_parity;
 
 #[cfg(test)]
@@ -4080,6 +4082,12 @@ pub struct IncrementalStats {
     /// Inputs skipped because their bytes are not valid UTF-8; see
     /// [`ColdBuildStats::undecodable_files`].
     pub undecodable_files: Vec<String>,
+    /// Caller files whose method-dispatch edges this refresh recomputed.
+    pub dispatch_callers_recomputed: BTreeSet<String>,
+    /// Rows the path-form dispatch lookup returned: unresolved calls stored
+    /// as `Type::method` (or `a.method`, `a->method`) whose last segment names
+    /// a method whose candidates changed.
+    pub dispatch_path_form_rows_examined: usize,
 }
 
 /// What [`CallGraphStore::reconcile_with_disk`] examined and what differs.
@@ -7356,8 +7364,8 @@ impl CallGraphStore {
         }
 
         // Method-dispatch edges are chosen among every same-named method in
-        // the store, so a method that appears, disappears or moves (a node id
-        // encodes its position) can change the edge of a caller in any file.
+        // the store, so a method that appears, disappears, or changes its
+        // scoped name or kind can change the edge of a caller in any file.
         let mut dispatch_names = DispatchNames::default();
         for rel_path in touched_callers.iter().chain(deleted.iter()) {
             let new_nodes = if deleted.contains(rel_path) {
@@ -7369,7 +7377,7 @@ impl CallGraphStore {
             };
             dispatch_names.extend(
                 rel_path,
-                changed_dispatch_candidate_names(&conn, rel_path, new_nodes)?,
+                changed_dispatch_candidates(&conn, rel_path, new_nodes)?,
             );
         }
 
@@ -7442,16 +7450,17 @@ impl CallGraphStore {
         // writes do not change projection inputs, so only deletions invalidate
         // the retained snapshot on this path.
         if caller_extracts.is_empty() {
+            let mut dispatch_selection = DispatchCallerSelection::default();
             if !deleted.is_empty() {
                 let started = Instant::now();
-                let dispatch_callers = dispatch_callers_to_recompute(
+                dispatch_selection =
+                    dispatch_callers_to_recompute(&tx, &BTreeSet::new(), &dispatch_names)?;
+                refresh_method_dispatch_edges(
                     &tx,
-                    &BTreeSet::new(),
-                    &deleted,
-                    &dispatch_names,
+                    &self.project_root,
+                    &dispatch_selection.callers,
                 )?;
-                refresh_method_dispatch_edges(&tx, &self.project_root, &dispatch_callers)?;
-                projection_callers.extend(dispatch_callers);
+                projection_callers.extend(dispatch_selection.callers.iter().cloned());
                 profile.method_dispatch += started.elapsed();
                 dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
             } else {
@@ -7485,6 +7494,8 @@ impl CallGraphStore {
                         .collect(),
                     resolution_importers: resolution_importers.into_iter().collect(),
                     undecodable_files,
+                    dispatch_callers_recomputed: dispatch_selection.callers,
+                    dispatch_path_form_rows_examined: dispatch_selection.path_form_rows_examined,
                 },
                 profile,
             ));
@@ -7612,16 +7623,10 @@ impl CallGraphStore {
         // whose candidate methods changed get their dispatch edges recomputed.
         let mut dispatch_roots = own_refresh.clone();
         dispatch_roots.extend(dispatch_status_changed);
-        let mut changed_node_files = own_refresh.clone();
-        changed_node_files.extend(deleted.iter().cloned());
-        let dispatch_callers = dispatch_callers_to_recompute(
-            &tx,
-            &dispatch_roots,
-            &changed_node_files,
-            &dispatch_names,
-        )?;
-        refresh_method_dispatch_edges(&tx, &self.project_root, &dispatch_callers)?;
-        projection_callers.extend(dispatch_callers);
+        let dispatch_selection =
+            dispatch_callers_to_recompute(&tx, &dispatch_roots, &dispatch_names)?;
+        refresh_method_dispatch_edges(&tx, &self.project_root, &dispatch_selection.callers)?;
+        projection_callers.extend(dispatch_selection.callers.iter().cloned());
         profile.method_dispatch += started.elapsed();
 
         // Freshness metadata is not an input to the projection. Only changed
@@ -7656,6 +7661,8 @@ impl CallGraphStore {
                     .collect(),
                 resolution_importers: resolution_importers.into_iter().collect(),
                 undecodable_files,
+                dispatch_callers_recomputed: dispatch_selection.callers,
+                dispatch_path_form_rows_examined: dispatch_selection.path_form_rows_examined,
             },
             profile,
         ))
@@ -17459,43 +17466,59 @@ fn insert_method_dispatch_edge(
 
 /// Method names whose dispatch candidates changed in a refresh. `path_form`
 /// holds the ones that came from non-JS/TS files, whose callers can store a
-/// whole path as a call's short name.
+/// whole path as a call's short name. `stored_node_ids` are the stored node
+/// ids of the candidates under those names in the files where they changed:
+/// a dispatch edge pointing at one of them may now point elsewhere.
 #[derive(Debug, Default)]
 struct DispatchNames {
     all: BTreeSet<String>,
     path_form: BTreeSet<String>,
+    stored_node_ids: BTreeSet<String>,
 }
 
 impl DispatchNames {
-    fn extend(&mut self, rel_path: &str, names: BTreeSet<String>) {
+    fn extend(&mut self, rel_path: &str, changed: ChangedDispatchCandidates) {
         let js_family = Path::new(rel_path)
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| JS_TS_EXTENSIONS.contains(&ext));
         if !js_family {
-            self.path_form.extend(names.iter().cloned());
+            self.path_form.extend(changed.names.iter().cloned());
         }
-        self.all.extend(names);
+        self.all.extend(changed.names);
+        self.stored_node_ids.extend(changed.stored_node_ids);
     }
+}
+
+/// What [`changed_dispatch_candidates`] found for one file.
+#[derive(Debug, Default)]
+struct ChangedDispatchCandidates {
+    /// Names whose candidates in the file differ between the stored rows and
+    /// the new extract.
+    names: BTreeSet<String>,
+    /// Stored node ids of the file's candidates under those names.
+    stored_node_ids: BTreeSet<String>,
 }
 
 /// Names under which `rel_path` offers a different set of method-dispatch
 /// candidates in `new_nodes` (None when the file is being deleted) than in its
-/// stored rows. Name matching chooses by candidate file, scoped name and kind
-/// (and how many share them), so a method that only moved within its file is
-/// not listed; the edges that point at its old node id are found through their
-/// target file instead.
-fn changed_dispatch_candidate_names(
+/// stored rows, with the stored node ids of the candidates under those names.
+/// A dispatch edge depends only on the candidates sharing its method name:
+/// their node id, file, scoped name and kind, and how many there are. Node ids
+/// do not encode positions, so a method that only moved within its file is
+/// not listed and its callers keep their edges.
+fn changed_dispatch_candidates(
     conn: &Connection,
     rel_path: &str,
     new_nodes: Option<&[NodeRecord]>,
-) -> Result<BTreeSet<String>> {
+) -> Result<ChangedDispatchCandidates> {
+    type Candidate = (String, String, String);
     fn by_name(
-        rows: impl Iterator<Item = (String, String, String)>,
-    ) -> BTreeMap<String, Vec<(String, String)>> {
-        let mut grouped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        for (name, scoped_name, kind) in rows {
-            grouped.entry(name).or_default().push((scoped_name, kind));
+        rows: impl Iterator<Item = (String, Candidate)>,
+    ) -> BTreeMap<String, Vec<Candidate>> {
+        let mut grouped: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
+        for (name, candidate) in rows {
+            grouped.entry(name).or_default().push(candidate);
         }
         for candidates in grouped.values_mut() {
             candidates.sort();
@@ -17503,7 +17526,7 @@ fn changed_dispatch_candidate_names(
         grouped
     }
     let mut statement = conn.prepare_cached(
-        "SELECT name, scoped_name, kind FROM nodes
+        "SELECT name, scoped_name, kind, id FROM nodes
          WHERE file_path = ?1 AND kind IN ('method', 'function', 'kernel')",
     )?;
     let stored = by_name(
@@ -17511,8 +17534,11 @@ fn changed_dispatch_candidate_names(
             .query_map(params![rel_path], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -17526,17 +17552,25 @@ fn changed_dispatch_candidate_names(
             .map(|node| {
                 (
                     node.name.clone(),
-                    node.scoped_name.clone(),
-                    node.kind.clone(),
+                    (node.scoped_name.clone(), node.kind.clone(), node.id.clone()),
                 )
             }),
     );
-    Ok(stored
-        .keys()
-        .chain(current.keys())
-        .filter(|name| stored.get(*name) != current.get(*name))
-        .cloned()
-        .collect())
+    let mut changed = ChangedDispatchCandidates::default();
+    for name in stored.keys().chain(current.keys()) {
+        let before = stored.get(name);
+        if before == current.get(name) {
+            continue;
+        }
+        changed.names.insert(name.clone());
+        changed.stored_node_ids.extend(
+            before
+                .into_iter()
+                .flatten()
+                .map(|(_, _, node_id)| node_id.clone()),
+        );
+    }
+    Ok(changed)
 }
 
 /// Ids of `rel_path`'s unresolved calls, the only refs that get
@@ -17551,23 +17585,35 @@ fn unresolved_call_ref_ids(tx: &Transaction<'_>, rel_path: &str) -> Result<BTree
     Ok(ids)
 }
 
-/// Caller files whose method-dispatch edges a refresh must recompute: `roots`,
-/// callers holding a dispatch edge into a file whose nodes changed, and
-/// callers with an unresolved call named after a changed candidate method.
+/// The callers a refresh recomputes method-dispatch edges for, and the work
+/// spent finding the path-form ones.
+#[derive(Debug, Default)]
+struct DispatchCallerSelection {
+    callers: BTreeSet<String>,
+    /// Rows the path-form lookup returned, before any filtering in Rust.
+    path_form_rows_examined: usize,
+}
+
+/// Caller files whose method-dispatch edges a refresh must recompute: `roots`
+/// (rewritten files and callers whose set of unresolved calls changed),
+/// callers holding a name-match or type-match edge into a candidate whose
+/// method name had its candidates changed, and callers with an unresolved
+/// call named after such a method.
 fn dispatch_callers_to_recompute(
     tx: &Transaction<'_>,
     roots: &BTreeSet<String>,
-    changed_node_files: &BTreeSet<String>,
     changed_names: &DispatchNames,
-) -> Result<BTreeSet<String>> {
+) -> Result<DispatchCallerSelection> {
     let mut callers = roots.clone();
+    // The edges still name the stored node ids: rewriting a file's nodes does
+    // not delete the dispatch edges pointing at them.
     let mut by_target = tx.prepare_cached(
         "SELECT DISTINCT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id
-         WHERE e.target_file = ?1 AND e.provenance IN (?2, ?3)",
+         WHERE e.target_node = ?1 AND e.kind = 'call' AND e.provenance IN (?2, ?3)",
     )?;
-    for file in changed_node_files {
+    for node_id in &changed_names.stored_node_ids {
         for row in by_target.query_map(
-            params![file, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH],
+            params![node_id, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH],
             |row| row.get::<_, String>(0),
         )? {
             callers.insert(row?);
@@ -17584,27 +17630,16 @@ fn dispatch_callers_to_recompute(
             callers.insert(row?);
         }
     }
-    if !changed_names.path_form.is_empty() {
-        // Rust (and other non-JS) calls can store a whole path as their short
-        // name (`Type::method`); match those on the last segment, as name
-        // matching does. JS/TS short names are the bare member name, so a
-        // change in a JS/TS file never needs this scan.
-        let mut unresolved = tx.prepare_cached(
-            "SELECT caller_file, short_name FROM refs
-             WHERE kind = 'call' AND status = 'unresolved'
-               AND (short_name GLOB '*::*' OR short_name GLOB '*.*' OR short_name GLOB '*->*')",
-        )?;
-        let rows = unresolved.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (caller_file, short_name) = row?;
-            if changed_names
-                .path_form
-                .contains(callee_last_segment(&short_name))
-            {
-                callers.insert(caller_file);
-            }
+    // Rust (and other non-JS) calls can store a whole path as their short name
+    // (`Type::method`); match those on the last segment, as name matching
+    // does. JS/TS short names are the bare member name, so a change in a JS/TS
+    // file never needs this lookup.
+    let mut path_form_rows_examined = 0usize;
+    let mut by_last_segment = tx.prepare_cached(PATH_FORM_DISPATCH_CALLERS_SQL)?;
+    for name in &changed_names.path_form {
+        for row in by_last_segment.query_map(params![name], |row| row.get::<_, String>(0))? {
+            path_form_rows_examined += 1;
+            callers.insert(row?);
         }
     }
     // A deleted caller's refs and edges are already gone.
@@ -17615,8 +17650,25 @@ fn dispatch_callers_to_recompute(
             present.insert(caller);
         }
     }
-    Ok(present)
+    Ok(DispatchCallerSelection {
+        callers: present,
+        path_form_rows_examined,
+    })
 }
+
+/// Unresolved path-form calls (`Type::method`, `value.method`, `ptr->method`)
+/// whose last segment is `?1`. The equality on `callee_last_segment` runs on
+/// the partial index `idx_refs_unresolved_last_segment`, whose `WHERE` the
+/// `kind` and `status` terms repeat. Without statistics SQLite rates the
+/// `kind` index as just as selective and walks every call row, so the index is
+/// named explicitly; schema setup always creates it, and preparing the lookup
+/// fails rather than scanning `refs` if it is missing. Bare calls with that
+/// short name are already found by the short-name lookup, so
+/// `short_name <> ?1` leaves them out.
+const PATH_FORM_DISPATCH_CALLERS_SQL: &str = "SELECT caller_file
+     FROM refs INDEXED BY idx_refs_unresolved_last_segment
+     WHERE callee_last_segment = ?1 AND kind = 'call' AND status = 'unresolved'
+       AND short_name <> ?1";
 
 /// Recomputes the method-dispatch edges of `caller_files`, in the same bounded
 /// chunks the cold build uses, so the source cache stays small.
