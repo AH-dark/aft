@@ -259,6 +259,46 @@ impl PathStatusStore {
         Ok(())
     }
 
+    /// Removes every pending annotation except those for `keep`, in one
+    /// transaction, and returns how many were removed. Failed annotations are
+    /// left alone.
+    ///
+    /// A complete publication calls this with the paths that still have work
+    /// outstanding. Every other pending path has reached an end state by then:
+    /// it joined the generation, or it is not a member of it (deleted from the
+    /// checkout, excluded by the project content rules, or no longer in HEAD).
+    /// No later publication revisits a non-member, so an annotation left behind
+    /// for one would stay pending for the life of the view.
+    pub(crate) fn clear_pending_except(
+        &mut self,
+        keep: &std::collections::BTreeSet<Vec<u8>>,
+    ) -> Result<usize, PathStatusError> {
+        let transaction = self.connection.transaction()?;
+        let stale = {
+            let mut pending = transaction
+                .prepare_cached("SELECT rel_path FROM path_status WHERE state = 'pending'")?;
+            let rows = pending.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut stale = Vec::new();
+            for row in rows {
+                let path = row?;
+                if !keep.contains(&path) {
+                    stale.push(path);
+                }
+            }
+            stale
+        };
+        {
+            let mut delete = transaction.prepare_cached(
+                "DELETE FROM path_status WHERE rel_path = ?1 AND state = 'pending'",
+            )?;
+            for path in &stale {
+                delete.execute(params![path])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(stale.len())
+    }
+
     pub fn status_for(&self, rel_path: &[u8]) -> Result<Option<PathStatus>, PathStatusError> {
         let row = self
             .connection
@@ -711,5 +751,32 @@ mod tests {
         assert!(store.status_for(b"a").unwrap().is_none());
         assert!(store.status_for(b"b").unwrap().is_none());
         assert!(store.status_for(b"pending").unwrap().is_some());
+    }
+
+    #[test]
+    fn clear_pending_except_settles_other_pending_rows_and_keeps_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        for path in [b"deleted.png".as_slice(), b"excluded.db", b"waiting.rs"] {
+            store.mark_pending(path, "scheduled", 1).unwrap();
+        }
+        store.mark_failed(b"broken.rs", "quarantined", 1).unwrap();
+        let keep = std::collections::BTreeSet::from([b"waiting.rs".to_vec()]);
+
+        assert_eq!(store.clear_pending_except(&keep).unwrap(), 2);
+
+        let summary = store.summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (1, 1));
+        assert!(store.status_for(b"deleted.png").unwrap().is_none());
+        assert!(store.status_for(b"excluded.db").unwrap().is_none());
+        assert_eq!(
+            store.status_for(b"waiting.rs").unwrap().unwrap().state,
+            PathState::Pending
+        );
+        assert_eq!(
+            store.status_for(b"broken.rs").unwrap().unwrap().state,
+            PathState::Failed
+        );
+        assert_eq!(store.clear_pending_except(&keep).unwrap(), 0);
     }
 }

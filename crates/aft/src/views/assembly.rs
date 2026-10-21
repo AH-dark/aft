@@ -596,6 +596,22 @@ pub fn prepare_checkout_deferring(
                 .filter(|path| !semantic_pending_paths.contains(*path)),
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    // Clearing candidates is not enough: configure schedules every HEAD path
+    // pending, and the loop above skips HEAD paths that are not view members
+    // (deleted from the checkout, excluded by the project content rules). Paths
+    // that left HEAD since they were scheduled are not visited at all. None of
+    // them is revisited by a later publication, so settle every pending
+    // annotation whose path has no outstanding semantic work.
+    let settled_non_members = status
+        .clear_pending_except(&semantic_pending_paths)
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    if settled_non_members > 0 {
+        crate::slog_info!(
+            "content-addressed view publication settled {} pending path(s) that are not view members root={}",
+            settled_non_members,
+            request.project_root.display()
+        );
+    }
     timing.phase("path_status");
     prepared.report.pending_paths = semantic_pending_paths;
 
