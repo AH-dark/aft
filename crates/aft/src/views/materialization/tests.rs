@@ -244,6 +244,16 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             dispatch_type_target_files: 0,
             dispatch_type_target_decoded_blobs: 0,
             dispatch_full: false,
+            dispatch_type_target_traces: 0,
+            // The three changed paths and the one dependent caller.
+            selected_callers: 4,
+            // A TypeScript-only diff cannot change the Rust module index, so
+            // the digest decodes nothing and the domain is not seeded.
+            module_digest_changed: false,
+            module_digest_full: false,
+            module_digest_decoded_blobs: 0,
+            module_domain_callers: 0,
+            module_domain_traces: 0,
         }
     );
     assert_eq!(stats.graph_rows_written(), 13);
@@ -1375,6 +1385,9 @@ fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_calle
 
 #[path = "fact_tests.rs"]
 mod fact_tests;
+
+#[path = "module_digest_tests.rs"]
+mod module_digest_tests;
 
 #[test]
 fn memoized_bindings_keep_callers_and_reference_kinds_distinct() {
