@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import { watchClock, watchTimeoutSteer } from "@cortexkit/aft-bridge";
+import {
+  BridgeTransportUnavailableError,
+  watchClock,
+  watchTimeoutSteer,
+} from "@cortexkit/aft-bridge";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { __resetSyncWatchAbortForTests, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import { resolveSessionId } from "../tools/_shared.js";
@@ -509,5 +513,28 @@ describe("Pi tool_call caller role", () => {
     } as never);
     expect(options[0]?.workerSession).toBe(true);
     expect(options[1]).not.toHaveProperty("workerSession");
+  });
+
+  test("a runon tool_call with a down module returns a safe typed refusal", async () => {
+    const { callToolCall } = await import("../tools/_shared.js");
+    const bridge = {
+      toolCall: async () => {
+        throw new BridgeTransportUnavailableError("transport down");
+      },
+    } as unknown as Parameters<typeof callToolCall>[0];
+
+    let refusal: unknown;
+    try {
+      await callToolCall(bridge, "bash", { command: "uname -m", runon: "linux" }, {
+        cwd: process.cwd(),
+        hasUI: false,
+      } as never);
+    } catch (error) {
+      refusal = error;
+    }
+
+    expect(refusal).toMatchObject({ code: "aft_module_unavailable", kind: "not_sent" });
+    expect((refusal as Error).message).toContain("runon has no host fallback");
+    expect((refusal as Error).message).toContain("safe to retry");
   });
 });

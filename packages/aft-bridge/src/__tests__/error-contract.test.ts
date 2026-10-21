@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type RouteHandle,
+  SocketClosedError,
   SocketTimeoutError,
   StaleRouteHandleError,
   SubcCallError,
@@ -25,6 +26,7 @@ import {
   isRouteOpenReloadWindowError,
   isSubcFrameReadTimeoutError,
   SHELL_TIMEOUT_UNKNOWN_DISPOSITION,
+  SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION,
   SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
   SUBC_MODULE_RESTART_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
@@ -390,14 +392,59 @@ describe("adaptToolError", () => {
     expect(occurrences).toBe(1);
   });
 
-  test("a differently-coded SubcError is left alone — GOODBYE never borrows other codes", () => {
-    // module_reloading is proven-not-forwarded and retryable; it must not be
-    // dressed up as an unknown outcome.
+  test("a dispatched bash connection close names an available task and forbids reruns", () => {
+    const original = Object.assign(new SocketClosedError("subc closed the connection"), {
+      kind: "outcome_unknown" as const,
+      taskId: "bash-known-task",
+    });
+
+    const adapted = adaptToolError("bash", original) as Error;
+
+    expect(adapted).toBe(original);
+    expect(adapted.message).toContain("The command may have run or may still be running");
+    expect(adapted.message).toContain("AFT keeps commands running when the connection drops");
+    expect(adapted.message).toContain("a completion notice will follow if it ran");
+    expect(adapted.message).toContain("task ID bash-known-task");
+    expect(adapted.message).toContain("Do not rerun it");
+    expect(adapted.message).not.toContain("Re-run the command.");
+  });
+
+  test("a dispatched non-bash connection close gets the generic unknown-outcome guidance", () => {
+    const original = Object.assign(new SocketClosedError("subc closed the connection"), {
+      kind: "outcome_unknown" as const,
+    });
+
+    const adapted = adaptToolError("read", original) as Error;
+
+    expect(adapted).toBe(original);
+    expect(adapted.message).toContain(SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION);
+  });
+
+  test("a subc-wrapped socket close is classified by SocketClosedError, not prose", () => {
+    const original = new SubcCallError(
+      "outcome_unknown",
+      "unrelated wording",
+      undefined,
+      new SocketClosedError("different socket wording"),
+    );
+
+    const adapted = adaptToolError("read", original) as Error;
+
+    expect(adapted).toBe(original);
+    expect(adapted.message).toContain(SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION);
+  });
+
+  test("a module-reloading refusal stays typed as pre-dispatch and safe to retry", () => {
+    // When the module is reloading, the daemon rejects the bind before sending
+    // the request to the AFT module. Keep this as a typed safe-to-retry refusal,
+    // not guidance for a reply lost after dispatch.
     const coded = new SubcError("route closed by subc (GOODBYE)", "module_reloading");
 
     const adapted = adaptToolError("write", coded);
 
-    expect(adapted).toBe(coded);
+    expect(adapted).toMatchObject({ code: "aft_module_unavailable", kind: "not_sent" });
+    expect((adapted as Error).message).toContain("safe to retry");
+    expect((adapted as Error).message).not.toContain("outcome is UNKNOWN");
     expect(coded.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
   });
 

@@ -9,6 +9,7 @@ import {
   isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
   maybeAppendGrepSearchHint,
+  refuseAftModuleOptionWithoutFallback,
   runBashHostFallback,
   runningTaskStatusHint,
   sleep,
@@ -740,18 +741,21 @@ export function createBashTool(
         );
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
-        if (!bashCfg.host_fallback || fallbackCause === undefined) throw error;
+        if (fallbackCause === undefined) throw error;
         if (!backgroundDisabled && rawRequestedBackground) {
-          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
-        }
-        if (requestedPty) {
-          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
-        }
-        if (runon !== undefined) {
-          throw new Error(
-            `${BASH_HOST_FALLBACK_REFUSAL}; runon is unsupported, and the command was not run locally.`,
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "background:true",
+            BASH_HOST_FALLBACK_REFUSAL,
           );
         }
+        if (requestedPty) {
+          throw refuseAftModuleOptionWithoutFallback(error, "pty:true", BASH_HOST_FALLBACK_REFUSAL);
+        }
+        if (runon !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
+        }
+        if (!bashCfg.host_fallback) throw error;
 
         const projectRoot = projectRootFor(context);
         const pattern = bashHostFallbackAskPattern(command, projectRoot, fallbackCause);

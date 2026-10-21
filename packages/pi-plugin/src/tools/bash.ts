@@ -16,6 +16,7 @@ import {
   maxWatchTimeoutMs,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
+  refuseAftModuleOptionWithoutFallback,
   resolveWatchTimeoutMs,
   runBashHostFallback,
   runningTaskStatusHint,
@@ -904,18 +905,28 @@ export function registerBashTool(
         );
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
-        if (isPowerShell || !bashCfg.host_fallback || fallbackCause === undefined) throw error;
-        if (!backgroundDisabled && rawRequestedBackground) {
-          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
-        }
-        if (requestedPty) {
-          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
-        }
-        if (params.runon !== undefined) {
-          throw new Error(
-            `${BASH_HOST_FALLBACK_REFUSAL}; runon is unsupported, and the command was not run locally.`,
+        if (fallbackCause === undefined) throw error;
+        if (isPowerShell) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "PowerShell",
+            BASH_HOST_FALLBACK_REFUSAL,
           );
         }
+        if (!backgroundDisabled && rawRequestedBackground) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "background:true",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
+        }
+        if (requestedPty) {
+          throw refuseAftModuleOptionWithoutFallback(error, "pty:true", BASH_HOST_FALLBACK_REFUSAL);
+        }
+        if (params.runon !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
+        }
+        if (!bashCfg.host_fallback) throw error;
         if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
           throw new BridgeError(
             "Permission denied: host fallback execution requires an interactive UI.",

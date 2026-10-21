@@ -9,8 +9,7 @@ export const BASH_HOST_FALLBACK_BANNER =
   "[AFT host fallback - module transport down; no rewrites/compression/background]";
 export const BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES = 100 * 1024;
 export const BASH_HOST_FALLBACK_MAX_TIMEOUT_MS = 10 * 60 * 1000;
-export const BASH_HOST_FALLBACK_REFUSAL =
-  "AFT transport is down; only foreground execution is available in host fallback";
+export const BASH_HOST_FALLBACK_REFUSAL = "AFT module connection is down";
 
 /**
  * The bash `runon` argument's description. It is paid in every prompt that

@@ -32,6 +32,7 @@ import {
   type RouteScope,
   type RouteTarget,
   routeCloseReason,
+  SocketClosedError,
   SocketTimeoutError,
   StaleRouteHandleError,
   SubcCallError,
@@ -250,6 +251,18 @@ export function isSocketDeathError(error: unknown, depth = 0): boolean {
       : false;
   }
   return isConsumerReconnectTransient(error) || isSubcClientClosedError(error);
+}
+
+/**
+ * A raw request rejection may already be a typed SubcCallError with the socket
+ * close in its cause. Older clients and test doubles can surface the socket
+ * error directly after the request is pending, so mark that shape as unknown.
+ */
+function connectionClosedAfterDispatch(error: unknown): unknown {
+  if (!(error instanceof SocketClosedError)) return error;
+  return Object.assign(error, {
+    kind: "outcome_unknown" as const,
+  });
 }
 
 /**
@@ -2567,7 +2580,11 @@ export class SubcTransportPool implements AftTransportPool {
           return reply;
         } catch (requestError) {
           const error = frameReadTimeoutError(
-            routeClosedMidCallError(requestError, routeAndEntry.entry, record),
+            routeClosedMidCallError(
+              connectionClosedAfterDispatch(requestError),
+              routeAndEntry.entry,
+              record,
+            ),
           );
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           const ownsRoute = this.isCurrentSession(key, record) && this.client === client;

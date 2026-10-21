@@ -28,14 +28,17 @@ import type {
 import {
   adaptToolError,
   asCanonicalRootPath,
+  BASH_HOST_FALLBACK_REFUSAL,
   canonicalizeProjectRoot,
   decodeFileUrl,
   HOST_TOOL_NAMES_FIELD,
   isBashTransportDeadError,
+  refuseAftModuleOptionWithoutFallback,
   timeoutForCommand,
   WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
+
 import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
@@ -381,6 +384,23 @@ export async function callToolCall(
       ? await ctx.pool.toolCallForCanonicalRoot(root, runtime.sessionID, name, rawArgs, opts)
       : await ctx.pool.getBridge(root).toolCall(runtime.sessionID, name, rawArgs, opts);
   } catch (error) {
+    const noFallbackOption =
+      name === "bash"
+        ? rawArgs.runon !== undefined
+          ? "runon"
+          : rawArgs.pty === true
+            ? "pty:true"
+            : rawArgs.background === true
+              ? "background:true"
+              : undefined
+        : undefined;
+    if (noFallbackOption && isBashTransportDeadError(error)) {
+      throw refuseAftModuleOptionWithoutFallback(
+        error,
+        noFallbackOption,
+        BASH_HOST_FALLBACK_REFUSAL,
+      );
+    }
     throw adaptToolError(name, error);
   } finally {
     markBridgeEnd();
