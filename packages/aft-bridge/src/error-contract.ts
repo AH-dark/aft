@@ -195,18 +195,31 @@ function isSubcConnectionClosedMidCallError(
 ): error is Error & { kind: "outcome_unknown" } {
   if (!(error instanceof Error)) return false;
   const fields = error as Error & { kind?: unknown };
-  if (error instanceof SocketClosedError) return fields.kind === "outcome_unknown";
-  return (
-    error instanceof SubcCallError &&
-    error.kind === "outcome_unknown" &&
-    hasSocketClosedCause(error.cause)
-  );
+  if (fields.kind !== "outcome_unknown") return false;
+  if (error instanceof SocketClosedError) return true;
+  if (error instanceof SubcError) return error.closeReason === "connection_lost";
+  if (error instanceof SubcCallError) {
+    return error.closeReason === "connection_lost" || hasConnectionLossCause(error);
+  }
+  return hasConnectionLossCause(error);
 }
 
-function hasSocketClosedCause(error: unknown, depth = 0): boolean {
+const CONNECTION_LOSS_ERROR_CODES = new Set(["ECONNABORTED", "ECONNRESET", "EPIPE"]);
+
+function hasConnectionLossCause(error: unknown, depth = 0): boolean {
   if (error instanceof SocketClosedError) return true;
+  if (error instanceof SubcError && error.closeReason === "connection_lost") return true;
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    CONNECTION_LOSS_ERROR_CODES.has(error.code)
+  ) {
+    return true;
+  }
   if (!(error instanceof Error) || depth >= 4 || error.cause === undefined) return false;
-  return hasSocketClosedCause(error.cause, depth + 1);
+  return hasConnectionLossCause(error.cause, depth + 1);
 }
 
 /**

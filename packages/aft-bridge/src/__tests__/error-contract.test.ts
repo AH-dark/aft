@@ -434,6 +434,45 @@ describe("adaptToolError", () => {
     expect(adapted.message).toContain(SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION);
   });
 
+  test("a connection_lost SubcError gets guidance from its typed close reason", () => {
+    const original = Object.assign(
+      new SubcError("unrelated wording", "ECONNRESET", undefined, "connection_lost"),
+      { kind: "outcome_unknown" as const },
+    );
+
+    const adapted = adaptToolError("read", original) as Error;
+
+    expect(adapted).toBe(original);
+    expect(adapted.message).toContain(SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION);
+  });
+
+  test("a dispatched reset code gets guidance without matching error prose", () => {
+    const original = Object.assign(new Error("unrelated wording"), {
+      code: "ECONNRESET",
+      kind: "outcome_unknown" as const,
+    });
+
+    const adapted = adaptToolError("read", original) as Error;
+
+    expect(adapted).toBe(original);
+    expect(adapted.message).toContain(SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION);
+  });
+
+  test("an explicit not_sent call stays a safe-to-retry refusal", () => {
+    const original = new SubcCallError(
+      "not_sent",
+      "request was refused before writing",
+      "ECONNRESET",
+      new SocketClosedError("subc connection closed"),
+    );
+
+    const adapted = adaptToolError("read", original) as Error & { kind?: unknown };
+
+    expect(adapted).toMatchObject({ kind: "not_sent" });
+    expect(adapted.message).toContain("safe to retry");
+    expect(adapted.message).not.toContain("outcome is UNKNOWN");
+  });
+
   test("a module-reloading refusal stays typed as pre-dispatch and safe to retry", () => {
     // When the module is reloading, the daemon rejects the bind before sending
     // the request to the AFT module. Keep this as a typed safe-to-retry refusal,
