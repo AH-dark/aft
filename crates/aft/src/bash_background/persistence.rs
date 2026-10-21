@@ -3708,7 +3708,10 @@ mod tests {
 
         let mut replacement_error = None;
         let mut other_error = None;
-        for _ in 0..3_000 {
+        let read_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut plain_reads = 0;
+        while replacement_error.is_none() && std::time::Instant::now() < read_deadline {
+            plain_reads += 1;
             if let Err(error) = read_task(&path) {
                 if error.kind() == io::ErrorKind::Interrupted
                     && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED)
@@ -3721,7 +3724,7 @@ mod tests {
         }
 
         let mut retry_error = None;
-        for _ in 0..3_000 {
+        for _ in 0..plain_reads.max(3_000) {
             if let Err(error) = read_task_retrying_replacement_for_test(&path) {
                 retry_error.get_or_insert_with(|| error.to_string());
             }
