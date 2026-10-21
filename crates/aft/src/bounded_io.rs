@@ -22,13 +22,18 @@ pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
 /// request and a tool call wait equally long for a helper to be scheduled.
 pub(crate) const MUTATION_BUDGET: Duration = Duration::from_secs(25);
 const MAX_IO_THREADS: usize = 64;
+const IO_POOL_SIZE: usize = 8;
 static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
-static HELPERS: LazyLock<Arc<Limiter>> = LazyLock::new(|| Arc::new(Limiter::new(MAX_IO_THREADS)));
+static HELPERS: LazyLock<Arc<Limiter>> = LazyLock::new(|| Limiter::new(IO_POOL_SIZE));
+#[cfg(test)]
+static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 #[derive(Default)]
 struct Measurements {
-    spawns: AtomicUsize,
+    dispatches: AtomicUsize,
     round_trips: AtomicUsize,
+    directory_probes: AtomicUsize,
+    traversal_probes: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +163,7 @@ impl Budget {
     #[cfg(test)]
     pub(crate) fn measurements(&self) -> (usize, usize) {
         (
-            self.measurements.spawns.load(Ordering::Relaxed),
+            self.measurements.dispatches.load(Ordering::Relaxed),
             self.measurements.round_trips.load(Ordering::Relaxed),
         )
     }
@@ -462,48 +467,207 @@ pub(crate) fn command(
     finish_response(response)
 }
 
+type IoJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct Worker {
+    sender: std::sync::mpsc::Sender<IoJob>,
+    retired: Arc<AtomicBool>,
+}
+#[derive(Default)]
+struct PoolState {
+    idle: Vec<Worker>,
+    usable: usize,
+    live: usize,
+    abandoned: usize,
+    spawned: u64,
+    retired_total: u64,
+    replacements: u64,
+    queue_timeouts: u64,
+    cap_hits: u64,
+}
 struct Limiter {
-    live: Mutex<usize>,
+    state: Mutex<PoolState>,
     available: Condvar,
     max: usize,
+    max_live: usize,
+    create: std::sync::mpsc::SyncSender<()>,
 }
 impl Limiter {
-    fn new(max: usize) -> Self {
-        Self {
-            live: Mutex::new(0),
-            available: Condvar::new(),
-            max,
+    fn new(max: usize) -> Arc<Self> {
+        Self::with_limits(max, MAX_IO_THREADS)
+    }
+    fn with_limits(max: usize, max_live: usize) -> Arc<Self> {
+        assert!(max > 0 && max <= max_live);
+        let (create, requests) = std::sync::mpsc::sync_channel(1);
+        Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
+            let pool = weak.clone();
+            // Creating a worker can stall, for example on Windows DLL
+            // initialization. After this one-time factory startup, admission
+            // callers only enqueue creation requests and wait to their deadline;
+            // worker creation never holds the pool state lock.
+            let _ = std::thread::Builder::new()
+                .name("aft-filesystem-probe-factory".into())
+                .spawn(move || {
+                    while requests.recv().is_ok() {
+                        let Some(pool) = pool.upgrade() else { break };
+                        pool.create_worker();
+                    }
+                });
+            Self {
+                state: Mutex::new(PoolState::default()),
+                available: Condvar::new(),
+                max,
+                max_live,
+                create,
+            }
+        })
+    }
+    fn create_worker(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.idle.is_empty() || state.usable >= self.max || state.live >= self.max_live {
+                return;
+            }
+            state.live += 1;
+            state.usable += 1;
         }
+        let (sender, receiver) = std::sync::mpsc::channel::<IoJob>();
+        let retired = Arc::new(AtomicBool::new(false));
+        let worker_retired = Arc::clone(&retired);
+        let pool = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("aft-filesystem-probe".into())
+            .spawn(move || {
+                let _exit = WorkerExit {
+                    pool,
+                    retired: worker_retired,
+                };
+                while let Ok(job) = receiver.recv() {
+                    // A panicking job disconnects its result channel. Keep this
+                    // worker alive until its caller retires it and closes sender.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            });
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if spawned.is_ok() {
+            #[cfg(test)]
+            THREAD_SPAWNS.fetch_add(1, Ordering::Relaxed);
+            state.replacements += u64::from(state.retired_total > state.replacements);
+            state.spawned += 1;
+            state.idle.push(Worker { sender, retired });
+        } else {
+            state.live -= 1;
+            state.usable -= 1;
+        }
+        self.available.notify_all();
     }
     fn acquire(self: &Arc<Self>, at: Instant) -> Option<Permit> {
-        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        while *live >= self.max {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counted_cap = false;
+        loop {
             let remaining = at.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                state.queue_timeouts += 1;
                 return None;
             }
-            live = self
+            if let Some(worker) = state.idle.pop() {
+                return Some(Permit {
+                    pool: Arc::clone(self),
+                    worker: Some(worker),
+                    reusable: true,
+                });
+            }
+            if state.usable < self.max && state.live < self.max_live {
+                if matches!(
+                    self.create.try_send(()),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_))
+                ) {
+                    return None;
+                }
+            }
+            if state.live >= self.max_live && !counted_cap {
+                state.cap_hits += 1;
+                counted_cap = true;
+            }
+            state = self
                 .available
-                .wait_timeout(live, remaining)
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        if Instant::now() >= at {
-            return None;
-        }
-        *live += 1;
-        Some(Permit(Arc::clone(self)))
+    }
+    fn health(&self) -> serde_json::Value {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        serde_json::json!({
+            "pool_size": self.max,
+            "thread_cap": self.max_live,
+            "live": state.live,
+            "idle": state.idle.len(),
+            "usable": state.usable,
+            "abandoned": state.abandoned,
+            "spawned_total": state.spawned,
+            "abandoned_total": state.retired_total,
+            "replacements_total": state.replacements,
+            "cap_hits_total": state.cap_hits,
+            "queue_timeouts_total": state.queue_timeouts,
+        })
     }
 }
-struct Permit(Arc<Limiter>);
+pub(crate) fn helper_health() -> serde_json::Value {
+    HELPERS.health()
+}
+struct WorkerExit {
+    pool: std::sync::Weak<Limiter>,
+    retired: Arc<AtomicBool>,
+}
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.live -= 1;
+            if self.retired.load(Ordering::Relaxed) {
+                state.abandoned -= 1;
+            }
+            pool.available.notify_all();
+        }
+    }
+}
+struct Permit {
+    pool: Arc<Limiter>,
+    worker: Option<Worker>,
+    reusable: bool,
+}
+impl Permit {
+    fn send(&mut self, job: IoJob) -> io::Result<()> {
+        self.reusable = false;
+        self.worker
+            .as_ref()
+            .unwrap()
+            .sender
+            .send(job)
+            .map_err(|_| io::Error::other("filesystem helper stopped"))
+    }
+}
 impl Drop for Permit {
     fn drop(&mut self) {
-        *self.0.live.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        self.0.available.notify_one();
+        let worker = self.worker.take().unwrap();
+        let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.reusable {
+            state.idle.push(worker);
+        } else {
+            // A timed-out job cannot be cancelled inside the OS. Remove its
+            // healthy slot, but count its thread against the hard cap until it
+            // actually exits. Closing the sender makes a late return exit.
+            worker.retired.store(true, Ordering::Relaxed);
+            state.usable -= 1;
+            state.abandoned += 1;
+            state.retired_total += 1;
+        }
+        self.pool.available.notify_all();
     }
 }
-/// Spawn only for boundary probes, whole walks, or reads on risky filesystems.
-/// A stuck call retains its limiter permit, never executor/root ownership.
+/// Isolate boundary probes, whole walks, and reads on risky filesystems.
+/// Stuck helpers retain the submitted job closure and its owned captures.
 pub(crate) fn run<T: Send + 'static>(
     path: &Path,
     at: Option<Instant>,
@@ -592,7 +756,7 @@ fn run_with_timeout<T: Send + 'static>(
         }
         return work(path.to_path_buf());
     }
-    let Some(permit) = limiter.acquire(queue_deadline) else {
+    let Some(mut permit) = limiter.acquire(queue_deadline) else {
         return Err(failure(path, "read_io_queue_timeout", "no filesystem helper slot became available before the deadline; this call did not start"));
     };
     let owned = path.to_path_buf();
@@ -607,10 +771,7 @@ fn run_with_timeout<T: Send + 'static>(
     if let Some(counts) = &measurements {
         counts.round_trips.fetch_add(1, Ordering::Relaxed);
     }
-    std::thread::Builder::new()
-        .name("aft-filesystem-probe".into())
-        .spawn(move || {
-            let _permit = permit;
+    permit.send(Box::new(move || {
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             let result = crate::context::confinement::inherit(confinement, || with_budget(budget, || {
@@ -632,21 +793,30 @@ fn run_with_timeout<T: Send + 'static>(
                 state.deadline = at;
                 helper_probe.ready.notify_all();
                 drop(state);
-                HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
+                struct DeadlineScope(Option<Instant>);
+                impl Drop for DeadlineScope {
+                    fn drop(&mut self) {
+                        HELPER_DEADLINE.with(|deadline| deadline.set(self.0));
+                    }
+                }
+                let _deadline = DeadlineScope(HELPER_DEADLINE.with(|deadline| deadline.replace(Some(at))));
                 #[cfg(test)]
                 regression_tests::after_helper_start(&owned);
                 work(owned)
             }));
             let _ = tx.send(result);
-        })?;
+        }))?;
     #[cfg(test)]
     if let Some(counts) = &measurements {
-        counts.spawns.fetch_add(1, Ordering::Relaxed);
+        counts.dispatches.fetch_add(1, Ordering::Relaxed);
     }
     let mut wait_until = queue_deadline.min(queued + access_budget);
     loop {
         match rx.recv_timeout(wait_until.saturating_duration_since(Instant::now())) {
-            Ok(result) => return result,
+            Ok(result) => {
+                permit.reusable = true;
+                return result;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let state = probe.state.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(started) = state.started else {
@@ -719,6 +889,11 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
         }
     };
     let access = if owner {
+        #[cfg(test)]
+        budget
+            .measurements
+            .directory_probes
+            .fetch_add(1, Ordering::Relaxed);
         let result = run_with_timeout(
             path,
             at,
@@ -872,6 +1047,13 @@ fn run_traversal<T: Send + 'static>(
     path: &Path,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
+    #[cfg(test)]
+    if let Some(budget) = current() {
+        budget
+            .measurements
+            .traversal_probes
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let (result, traversable) = run(path, None, move |path| {
         let parent = traversal_parent(&path).map(Path::to_path_buf);
         let result = work(path)?;
@@ -1263,8 +1445,161 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("read_blocked"));
     }
     #[test]
+    fn sequential_probes_reuse_helper_threads() {
+        let limiter = Limiter::new(4);
+        let budget = Budget::after(Duration::from_secs(5));
+        let mut threads = HashSet::new();
+        with_budget(Some(budget.clone()), || {
+            for _ in 0..40 {
+                threads.insert(
+                    run_with_limiter(Path::new("healthy"), None, limiter.clone(), |_| {
+                        Ok(std::thread::current().id())
+                    })
+                    .unwrap(),
+                );
+            }
+        });
+        assert!(
+            threads.len() <= 4,
+            "spawned {} helpers for 40 sequential probes",
+            threads.len()
+        );
+    }
+
+    #[test]
+    fn timed_out_helper_is_replaced_without_delaying_later_probes() {
+        let limiter = Limiter::new(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let first_pool = limiter.clone();
+        let first = std::thread::spawn(move || {
+            run_with_limiter(
+                Path::new("blocked"),
+                Some(Instant::now() + Duration::from_millis(150)),
+                first_pool,
+                move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let blocked = first.join().unwrap().unwrap_err();
+        let before = Instant::now();
+        let later = run_with_limiter(
+            Path::new("healthy"),
+            Some(before + Duration::from_millis(150)),
+            limiter.clone(),
+            |_| Ok(42),
+        );
+        let health = limiter.health();
+        release_tx.send(()).unwrap();
+        assert_eq!(timeout_code(&blocked), "read_blocked");
+        assert_eq!(
+            later.unwrap(),
+            42,
+            "a timed-out helper must not retain the healthy slot"
+        );
+        assert!(before.elapsed() < Duration::from_millis(300));
+        assert_eq!(health["abandoned"], 1);
+        assert_eq!(health["replacements_total"], 1);
+        assert_eq!(health["spawned_total"], 2);
+    }
+
+    #[test]
+    fn abandoned_helper_cap_bounds_threads_and_recovers_after_release() {
+        let pool = Limiter::with_limits(1, 2);
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (release, blocked) = std::sync::mpsc::channel();
+            releases.push(release);
+            let error = run_with_limiter(
+                Path::new("blocked"),
+                Some(Instant::now() + Duration::from_millis(200)),
+                pool.clone(),
+                move |_| {
+                    blocked.recv().unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(timeout_code(&error), "read_blocked");
+        }
+        let fired = Arc::new(AtomicBool::new(false));
+        let work_fired = fired.clone();
+        let before = Instant::now();
+        let error = run_with_limiter(
+            Path::new("queued"),
+            Some(before + Duration::from_millis(80)),
+            pool.clone(),
+            move |_| {
+                work_fired.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        let health = pool.health();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        assert_eq!(timeout_code(&error), "read_io_queue_timeout");
+        assert!(!fired.load(Ordering::Relaxed));
+        assert!(before.elapsed() < Duration::from_millis(300));
+        assert_eq!(health["live"], 2);
+        assert_eq!(health["abandoned"], 2);
+        assert_eq!(health["spawned_total"], 2);
+        assert_eq!(health["replacements_total"], 1);
+        assert_eq!(health["cap_hits_total"], 1);
+        assert_eq!(health["queue_timeouts_total"], 1);
+        run_with_limiter(
+            Path::new("recovered"),
+            Some(Instant::now() + Duration::from_secs(2)),
+            pool,
+            |_| Ok(()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reused_helper_resets_deadline_and_request_context() {
+        let pool = Limiter::new(1);
+        let first = Budget::after(IO_BUDGET);
+        let first_id = first.id;
+        with_budget(Some(first), || {
+            run_with_limiter(Path::new("first"), None, pool.clone(), move |_| {
+                assert_eq!(current().unwrap().id, first_id);
+                assert!(HELPER_DEADLINE.with(|at| at.get()).is_some());
+                Ok(())
+            })
+        })
+        .unwrap();
+        let mut permit = pool.acquire(Instant::now() + IO_BUDGET).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        permit
+            .send(Box::new(move || {
+                tx.send((
+                    current().is_none(),
+                    HELPER_DEADLINE.with(|at| at.get()).is_none(),
+                ))
+                .unwrap();
+            }))
+            .unwrap();
+        let (request_cleared, deadline_cleared) = rx.recv_timeout(IO_BUDGET).unwrap();
+        permit.reusable = true;
+        assert!(
+            request_cleared,
+            "a reused helper retained the previous request"
+        );
+        assert!(
+            deadline_cleared,
+            "a reused helper retained the previous deadline"
+        );
+    }
+
+    #[test]
     fn saturation_waits_for_a_healthy_helper_instead_of_claiming_blocked_access() {
-        let limiter = Arc::new(Limiter::new(1));
+        let limiter = Limiter::new(1);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let first_limiter = Arc::clone(&limiter);
@@ -1291,7 +1626,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn saturation_deadline_is_queue_timeout_not_read_blocked() {
-        let limiter = Arc::new(Limiter::new(1));
+        let limiter = Limiter::new(1);
         let permit = limiter
             .acquire(Instant::now() + Duration::from_secs(1))
             .unwrap();

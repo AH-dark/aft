@@ -406,7 +406,7 @@ fn unscheduled_helper_is_queue_timeout_and_never_runs_late() {
         run_with_limiter(
             &path,
             Some(Instant::now() + Duration::from_millis(80)),
-            Arc::new(Limiter::new(1)),
+            Limiter::new(1),
             move |_| {
                 let _dropped = dropped;
                 work_fired.fetch_add(1, Ordering::Relaxed);
@@ -434,7 +434,7 @@ fn unscheduled_helper_is_queue_timeout_and_never_runs_late() {
 
 #[test]
 fn saturated_limiter_is_queue_timeout_and_does_not_start_work() {
-    let limiter = Arc::new(Limiter::new(1));
+    let limiter = Limiter::new(1);
     let _permit = limiter.acquire(Instant::now() + IO_BUDGET).unwrap();
     let fired = Arc::new(AtomicUsize::new(0));
     let work_fired = Arc::clone(&fired);
@@ -479,7 +479,7 @@ fn queued_time_does_not_consume_running_access_budget() {
                     run_with_timeout(
                         &path,
                         None,
-                        Arc::new(Limiter::new(1)),
+                        Limiter::new(1),
                         Duration::from_secs(1),
                         None,
                         move |_| {
@@ -520,7 +520,7 @@ fn running_access_keeps_shorter_request_deadline() {
             run_with_timeout(
                 Path::new("running-past-request"),
                 None,
-                Arc::new(Limiter::new(1)),
+                Limiter::new(1),
                 Duration::from_secs(1),
                 None,
                 move |_| {
@@ -566,7 +566,7 @@ fn queued_time_without_request_budget_does_not_consume_running_access_budget() {
             .send(run_with_timeout(
                 &path,
                 None,
-                Arc::new(Limiter::new(1)),
+                Limiter::new(1),
                 Duration::from_secs(1),
                 None,
                 move |_| {
@@ -724,17 +724,12 @@ fn running_helper_timeout_has_only_native_platform_hint() {
     let (started_tx, started_rx) = channel();
     let (finished_tx, finished_rx) = channel();
     let caller = std::thread::spawn(move || {
-        run_with_limiter(
-            Path::new("running"),
-            None,
-            Arc::new(Limiter::new(1)),
-            move |_| {
-                started_tx.send(()).unwrap();
-                let _ = release_rx.recv();
-                finished_tx.send(()).unwrap();
-                Ok(())
-            },
-        )
+        run_with_limiter(Path::new("running"), None, Limiter::new(1), move |_| {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            finished_tx.send(()).unwrap();
+            Ok(())
+        })
     });
     let started = started_rx.recv_timeout(IO_BUDGET);
     let error = caller.join().unwrap().unwrap_err();
@@ -864,4 +859,73 @@ fn read_admission_keeps_the_queue_cap_outside_mutations() {
     drop(gate);
     assert_eq!(timeout_code(&error), "read_io_queue_timeout", "{error}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+/// A fixed, in-process read/grep/edit workload, excluding context construction.
+/// Process CPU includes helper creation and teardown, not just filesystem calls.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "manual performance measurement"]
+fn probe_pool_workload() {
+    fn cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+            0
+        );
+        let usage = unsafe { usage.assume_init() };
+        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..3)
+        .map(|n| fixture.path().join(format!("root-{n}")))
+        .collect();
+    let contexts: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            for directory in 0..4 {
+                let path = root.join(format!("src-{directory}"));
+                std::fs::create_dir_all(&path).unwrap();
+                for file in 0..8 {
+                    std::fs::write(path.join(format!("file-{file}.txt")), "needle alpha\n")
+                        .unwrap();
+                }
+            }
+            delete_context(root)
+        })
+        .collect();
+    let spawns = THREAD_SPAWNS.load(Ordering::Relaxed);
+    let cpu = cpu_seconds();
+    let wall = Instant::now();
+    let mut totals = [[0usize; 4]; 3];
+    for iteration in 0..100 {
+        for (root, ctx) in roots.iter().zip(&contexts) {
+            let file = root.join("src-0/file-0.txt");
+            for (kind, params) in [
+                serde_json::json!({"command": "read", "file": file}),
+                serde_json::json!({"command": "grep", "path": root, "pattern": "needle"}),
+                serde_json::json!({"command": "edit_match", "file": file, "match": if iteration % 2 == 0 {"alpha"} else {"beta"}, "replacement": if iteration % 2 == 0 {"beta"} else {"alpha"}}),
+            ].into_iter().enumerate() {
+                let mut params = params;
+                params["id"] = serde_json::json!("probe-load");
+                let request: RawRequest = serde_json::from_value(params).unwrap();
+                let budget = Budget::after(Duration::from_secs(25));
+                let response = with_budget(Some(budget.clone()), || command(&request, ctx, |req, ctx| match kind {
+                    0 => crate::commands::read::handle_read(req, ctx),
+                    1 => crate::commands::grep::handle_grep(req, ctx),
+                    _ => crate::commands::edit_match::handle_edit_match(req, ctx),
+                }));
+                assert!(response.success, "{}: {:?}", request.command, response);
+                totals[kind][0] += 1;
+                totals[kind][1] += budget.measurements.directory_probes.load(Ordering::Relaxed);
+                totals[kind][2] += budget.measurements.traversal_probes.load(Ordering::Relaxed);
+                totals[kind][3] += budget.measurements.round_trips.load(Ordering::Relaxed);
+            }
+        }
+    }
+    let wall = wall.elapsed().as_secs_f64();
+    let cpu = cpu_seconds() - cpu;
+    let spawns = THREAD_SPAWNS.load(Ordering::Relaxed) - spawns;
+    let probes: usize = totals.iter().map(|row| row[3]).sum();
+    println!("PROBE_LOAD calls/directory/traversal/dispatch={totals:?} wall_s={wall:.6} cpu_s={cpu:.6} spawns={spawns} threads_per_s={:.3} cpu_us_per_probe={:.3}", spawns as f64 / wall, cpu * 1_000_000.0 / probes as f64);
 }

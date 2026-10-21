@@ -3163,6 +3163,10 @@ fn build_health_report_with_indexing(
         crate::process_io::ProcessIoSnapshot::capture().to_value(),
     );
     metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
+    metrics.insert(
+        "filesystem_helpers".to_string(),
+        crate::bounded_io::helper_health(),
+    );
     // Routes the fleet status dial stopped reopening after a terminal refusal,
     // each naming its target, session and refusal code. An empty list means
     // no route is stopped.
@@ -7206,6 +7210,36 @@ mod tests {
         for io in [&census["process_io"], &census["process"]["process_io"]] {
             assert!(io["available"].is_boolean(), "{census}");
             assert!(io["sampled_at_ms"].is_u64(), "{census}");
+        }
+    }
+
+    #[test]
+    fn health_report_carries_filesystem_helper_limits_and_replacements() {
+        let report = test_health_report(
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+        let metrics = report.metrics.expect("health metrics");
+        let helpers = &metrics["filesystem_helpers"];
+        assert_eq!(helpers["pool_size"], 8);
+        assert_eq!(helpers["thread_cap"], 64);
+        for field in [
+            "live",
+            "idle",
+            "usable",
+            "abandoned",
+            "spawned_total",
+            "abandoned_total",
+            "replacements_total",
+            "cap_hits_total",
+            "queue_timeouts_total",
+        ] {
+            assert!(
+                helpers[field].is_u64(),
+                "missing helper health field: {field}"
+            );
         }
     }
 
