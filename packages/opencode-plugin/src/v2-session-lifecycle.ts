@@ -48,6 +48,14 @@ function sessionDeleted(client: unknown, sessionID: string): boolean {
   );
 }
 
+/**
+ * True once the host has deleted this session in this Location. Wake routes
+ * use it to drop a late completion without recreating per-session state.
+ */
+export function v2SessionDeleted(client: unknown, sessionID: string): boolean {
+  return sessionDeleted(client, sessionID);
+}
+
 function rememberDeleted(client: object, sessionID: string): void {
   let deleted = deletedSessions.get(client);
   if (!deleted) {
