@@ -227,14 +227,14 @@ impl CheckoutSemantic {
         let mutex_wait = mutex_started.elapsed();
         self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = self.installed();
-        // A first load or a large batch of unreconciled edits takes cold
-        // admission before reconciling (see `needs_cold_reconcile`). A few
+        // A first load, or unreconciled edits that are many or large, takes
+        // cold admission before reconciling (see `needs_cold_reconcile`). A few
         // edits reconcile on the preparation lane, and a queue within both
         // SMALL_PREPARATION limits then prepares there too. Such a fill takes a
         // cold slot only at its first missing vector, so one that only reuses
         // stored vectors never queues behind cold builds.
         let mut queue_setup = Duration::ZERO;
-        let cold_reconcile = needs_cold_reconcile(&snapshot);
+        let cold_reconcile = needs_cold_reconcile(&snapshot, &self.root);
         admit(!cold_reconcile).map_err(RefreshError::classify)?;
         crate::cold_build_limiter::progress::stage("preparing");
         let reconcile_started = Instant::now();
@@ -484,17 +484,54 @@ fn needs_reload(snapshot: &Snapshot) -> bool {
 
 /// Whether reconciling `snapshot` needs a cold-build slot. A reconcile walks
 /// the whole checkout and reads what changed. The first load (an empty
-/// generation) seeds and reads every member file, and more unreconciled paths
-/// than the small-preparation file bound can mean a branch switch or a large
-/// generated change. A few edits cost a stat walk and a few reads; the
-/// preparation limiter caps how many such small reconciles run at once.
-fn needs_cold_reconcile(snapshot: &Snapshot) -> bool {
-    snapshot.generation().name() == "empty"
-        || snapshot
-            .pending_intent()
-            .chain(snapshot.live_entries().map(|(path, _)| path))
-            .nth(SMALL_PREPARATION_FILES)
-            .is_some()
+/// generation) seeds and reads every member file. More unreconciled paths than
+/// the small-preparation file bound can mean a branch switch or a large
+/// generated change, and changed files larger in total than the
+/// small-preparation byte bound cost a large read even when they are few. Only
+/// a few small edits reconcile on the preparation lane, which caps how many
+/// such reconciles run at once.
+///
+/// The byte total comes from `stat` alone, before anything is read. The probe
+/// states at most the file bound's worth of paths and checks elapsed time
+/// against [`RECONCILE_SIZE_PROBE_DEADLINE`] between `stat` calls and after
+/// the scan; it cannot interrupt a call already in progress. A probe found past
+/// its deadline, a path that cannot be stated, or a changed path that is not a
+/// regular file counts as large. A changed path that no longer exists counts
+/// as zero bytes, because the reconcile has nothing of it to read.
+fn needs_cold_reconcile(snapshot: &Snapshot, root: &Path) -> bool {
+    if snapshot.generation().name() == "empty" {
+        return true;
+    }
+    let started = Instant::now();
+    let mut changed = std::collections::BTreeSet::new();
+    let mut bytes = 0u64;
+    for path in snapshot
+        .pending_intent()
+        .chain(snapshot.live_entries().map(|(path, _)| path))
+    {
+        if !changed.insert(path) {
+            continue;
+        }
+        if changed.len() > SMALL_PREPARATION_FILES
+            || started.elapsed() > RECONCILE_SIZE_PROBE_DEADLINE
+        {
+            return true;
+        }
+        let Ok(relative) = super::segment_store::rel_path_to_os(path) else {
+            return true;
+        };
+        let size = match std::fs::metadata(root.join(relative)) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return true,
+        };
+        bytes = bytes.saturating_add(size);
+        if bytes > SMALL_PREPARATION_BYTES {
+            return true;
+        }
+    }
+    started.elapsed() > RECONCILE_SIZE_PROBE_DEADLINE
 }
 
 /// Wakes the fill worker after an AFT write lands under the checkout root.
@@ -804,6 +841,12 @@ const LIMITER_KIND: &str = "semantic view fill";
 // Count the entire queue, not just one budgeted round.
 const SMALL_PREPARATION_FILES: usize = 32;
 const SMALL_PREPARATION_BYTES: u64 = 256 * 1024;
+/// Elapsed-time limit for `needs_cold_reconcile`'s `stat` probe, checked
+/// between calls and after the scan. Past it, the changed files count as large
+/// and the fill asks for cold admission. At most `SMALL_PREPARATION_FILES`
+/// paths are stated, so this only trips on a slow filesystem; a single stalled
+/// call still runs to completion before the check.
+const RECONCILE_SIZE_PROBE_DEADLINE: Duration = Duration::from_millis(250);
 const PREPARATION_KIND: &str = "semantic view preparation";
 const PREPARATION_LIMIT: usize = 4;
 

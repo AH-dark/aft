@@ -1742,6 +1742,55 @@ fn many_unreconciled_edits_take_cold_slot_before_reconciling() {
     );
 }
 
+/// One edited file larger than the small-preparation byte bound takes a
+/// cold-build slot before the reconcile reads it, even though it is a single
+/// path. A small edit still reconciles on the preparation lane; see
+/// `unreconciled_reuse_only_edit_completes_with_cold_cap_held`.
+#[test]
+fn large_unreconciled_edit_takes_cold_slot_before_reconciling() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("large.rs");
+    std::fs::write(&path, "pub fn large_edit() {}\n").unwrap();
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    refresh(&runtime, &model);
+    let padding = "// padding\n".repeat((SMALL_PREPARATION_BYTES as usize) / 11 + 1);
+    std::fs::write(&path, format!("pub fn large_edit() {{}}\n{padding}")).unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > SMALL_PREPARATION_BYTES);
+    runtime.driver().record_absolute_change(&path);
+    assert!(super::needs_reload(&runtime.installed()));
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let held = limiter.try_acquire().unwrap();
+    runtime.driver().take_reconcile_work();
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        let model = Arc::clone(&model);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| model.embed(texts),
+            )
+        })
+    };
+    let queued = wait_for_fill_queue(&limiter);
+    let work_while_held = runtime.driver().take_reconcile_work();
+    drop(held);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    assert_eq!(
+        work_while_held.walks, 0,
+        "a large edit was reconciled on the preparation lane while every cold slot was held: \
+         {work_while_held:?}"
+    );
+    assert!(queued, "a large edit bypassed cold admission");
+}
+
 /// A fill that leaves work for another budgeted round releases its cold-build
 /// slot between rounds. When another request is queued by then, the fill's next
 /// round queues behind it instead of retaking the slot it just freed.
