@@ -196,7 +196,9 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<ReaderFloor, FloorError> {
 /// the per-store maximum. Never lowers any store and never drops a store name
 /// this build does not know. Writes nothing when the floor already covers the
 /// requirements. Refuses (without writing) when the existing floor cannot be
-/// interpreted.
+/// interpreted. A covered v3 request re-syncs the storage-root directory: a
+/// previous raise may have renamed the floor but failed to sync that rename.
+/// Covered legacy requests keep their existing no-sync behavior.
 pub fn raise(
     storage_root: &Path,
     requirements: &[(PersistedStore, u32)],
@@ -223,17 +225,29 @@ pub fn raise(
         let entry = next.stores.entry(store.name().to_string()).or_insert(0);
         *entry = (*entry).max(u64::from(*version));
     }
+    let strict = requirements.iter().any(|(store, _)| {
+        matches!(
+            store,
+            PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store
+        )
+    });
     if current.as_ref() == Some(&next) {
+        if strict {
+            sync_dir(storage_root, strict).map_err(|error| FloorError::Io {
+                path: storage_root.to_path_buf(),
+                error,
+            })?;
+        }
         return Ok(next);
     }
-    write_atomic(&path, &next)?;
+    write_atomic(&path, &next, strict)?;
     Ok(next)
 }
 
 /// Raise the floor for `store` to `version`, then run `write`. The floor is
-/// durable before the first byte of the new format exists, so a crash after
-/// the raise leaves the floor ahead of the data, never behind it. If raising
-/// fails, `write` does not run.
+/// installed before the first byte of the new format exists. Directory sync
+/// is required for v3 stores but remains best-effort for legacy stores. If
+/// raising fails, `write` does not run.
 pub fn publish_with_floor<T>(
     storage_root: &Path,
     store: PersistedStore,
@@ -244,7 +258,28 @@ pub fn publish_with_floor<T>(
     Ok(write())
 }
 
-fn write_atomic(path: &Path, floor: &ReaderFloor) -> Result<(), FloorError> {
+/// Raise both v3 floor domains together, then run the publication closure.
+/// The caller supplies each store's required format version. Every v3 writer
+/// must use this boundary, even for a root whose floor already covers it.
+/// Before creating any v3 file, the closure must notify its durability observer
+/// at `V3FloorRaised`, the point where both floor domains are durable.
+pub fn publish_v3_with_floor<T>(
+    storage_root: &Path,
+    registry_version: u32,
+    store_version: u32,
+    write: impl FnOnce() -> T,
+) -> Result<T, FloorError> {
+    raise(
+        storage_root,
+        &[
+            (PersistedStore::ViewsV3Registry, registry_version),
+            (PersistedStore::ViewsV3Store, store_version),
+        ],
+    )?;
+    Ok(write())
+}
+
+fn write_atomic(path: &Path, floor: &ReaderFloor, strict: bool) -> Result<(), FloorError> {
     let io_error = |error: io::Error| FloorError::Io {
         path: path.to_path_buf(),
         error,
@@ -268,7 +303,7 @@ fn write_atomic(path: &Path, floor: &ReaderFloor) -> Result<(), FloorError> {
         #[cfg(test)]
         tests::crash_before_rename_hook(&tmp)?;
         fs::rename(&tmp, path)?;
-        sync_dir(dir);
+        sync_dir(dir, strict)?;
         Ok(())
     })();
     if result.is_err() {
@@ -277,13 +312,16 @@ fn write_atomic(path: &Path, floor: &ReaderFloor) -> Result<(), FloorError> {
     result.map_err(io_error)
 }
 
-#[cfg(unix)]
-fn sync_dir(dir: &Path) {
-    let _ = crate::durability::sync_dir(dir);
+fn sync_dir(dir: &Path, strict: bool) -> io::Result<()> {
+    let result = crate::durability::sync_dir(dir);
+    // Legacy floor writers ignore every directory-sync error. Only v3 writers
+    // require directory durability before their publication closure may run.
+    if strict {
+        result
+    } else {
+        Ok(())
+    }
 }
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) {}
 
 #[cfg(not(test))]
 fn prepare_allowed(_storage_root: &Path) -> bool {
@@ -453,6 +491,12 @@ fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     if floor_interpretable {
         let baseline = PersistedStore::ALL
             .into_iter()
+            .filter(|store| {
+                !matches!(
+                    store,
+                    PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store
+                )
+            })
             .map(|store| (store, store.written()))
             .collect::<Vec<_>>();
         if let Err(error) = raise(storage_root, &baseline) {
@@ -524,6 +568,157 @@ pub(crate) mod tests {
             Some(u64::from(version))
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn covered_legacy_raise_performs_no_directory_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let requirements = [(PersistedStore::SearchIndex, 4)];
+        raise(root.path(), &requirements).unwrap();
+        let before = fs::read(floor_path(root.path())).unwrap();
+        crate::durability::take();
+        raise(root.path(), &requirements).unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_raise_ignores_eio_directory_sync_failure() {
+        let root = tempfile::tempdir().unwrap();
+        fail_directory_sync(root.path(), Some(libc::EIO));
+        let result = raise(root.path(), &[(PersistedStore::SearchIndex, 4)]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            read(root.path())
+                .unwrap()
+                .unwrap()
+                .get(PersistedStore::SearchIndex),
+            Some(4)
+        );
+        assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+        fail_directory_sync(root.path(), Some(libc::EIO));
+        let mut wrote = false;
+        publish_with_floor(root.path(), PersistedStore::SearchIndex, 5, || wrote = true).unwrap();
+        assert!(wrote);
+        assert_eq!(
+            read(root.path())
+                .unwrap()
+                .unwrap()
+                .get(PersistedStore::SearchIndex),
+            Some(5)
+        );
+        assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_floor_write_propagates_directory_sync_failure() {
+        let root = tempfile::tempdir().unwrap();
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(root.path().to_path_buf());
+        });
+        let mut wrote = false;
+        let result = publish_v3_with_floor(root.path(), 1, 1, || {
+            wrote = true;
+        });
+        assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+        assert!(!wrote, "a failed floor sync must prevent publication");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn covered_v3_floor_resyncs_without_rewriting_and_propagates_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let requirements = [(PersistedStore::ViewsV3Store, 1)];
+        raise(root.path(), &requirements).unwrap();
+        let before = fs::read(floor_path(root.path())).unwrap();
+        let stamp = fs::metadata(floor_path(root.path()))
+            .unwrap()
+            .modified()
+            .unwrap();
+        crate::durability::take();
+        raise(root.path(), &requirements).unwrap();
+        assert_eq!(
+            crate::durability::take(),
+            vec![(
+                crate::durability::EventKind::DirectorySync,
+                root.path().to_path_buf()
+            )]
+        );
+        assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
+        assert_eq!(
+            fs::metadata(floor_path(root.path()))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp
+        );
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(root.path().to_path_buf());
+        });
+        let result = raise(root.path(), &requirements);
+        assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+    }
+
+    #[test]
+    fn uninterpretable_floor_is_untouched_by_raise() {
+        for bytes in [b"not json".as_slice(), br#"{"floor_schema":2,"stores":{}}"#] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(floor_path(root.path()), bytes).unwrap();
+            let result = raise(root.path(), &[(PersistedStore::SearchIndex, 4)]);
+            assert!(matches!(
+                result,
+                Err(FloorError::Unparseable { .. } | FloorError::NewerSchema { .. })
+            ));
+            assert_eq!(fs::read(floor_path(root.path())).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    fn fail_directory_sync(root: &Path, errno: Option<i32>) {
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(root.to_path_buf());
+        });
+        crate::durability::FAIL_DIRECTORY_SYNC_ERRNO.with(|slot| slot.set(errno));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_directory_sync_keeps_old_store_publication_compatible() {
+        for errno in [libc::EINVAL, libc::ENOTSUP] {
+            let root = tempfile::tempdir().unwrap();
+            fail_directory_sync(root.path(), Some(errno));
+            assert!(prepare_uncached(root.path()).is_empty());
+            assert!(read(root.path()).unwrap().is_some());
+            assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+            assert_eq!(
+                crate::durability::FAIL_DIRECTORY_SYNC_ERRNO.with(|slot| slot.get()),
+                None
+            );
+            let next = PersistedStore::SearchIndex.written() + 1;
+            fail_directory_sync(root.path(), Some(errno));
+            let mut wrote = false;
+            publish_with_floor(root.path(), PersistedStore::SearchIndex, next, || {
+                wrote = true
+            })
+            .unwrap();
+            assert!(wrote);
+            assert_eq!(
+                read(root.path())
+                    .unwrap()
+                    .unwrap()
+                    .get(PersistedStore::SearchIndex),
+                Some(u64::from(next))
+            );
+            assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+            assert_eq!(
+                crate::durability::FAIL_DIRECTORY_SYNC_ERRNO.with(|slot| slot.get()),
+                None
+            );
+        }
+    }
     use std::cell::RefCell;
 
     thread_local! {
@@ -555,10 +750,175 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         assert!(prepare_uncached(root.path()).is_empty());
         let floor = read(root.path()).unwrap().expect("baseline floor written");
-        assert_eq!(floor.stores, current_versions());
+        let mut expected = current_versions();
+        expected.remove("views_v3_registry");
+        expected.remove("views_v3_store");
+        assert_eq!(floor.stores, expected);
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(floor_path(root.path())).unwrap()).unwrap();
         assert_eq!(raw["floor_schema"], FLOOR_SCHEMA);
+    }
+
+    #[test]
+    fn v3_registration_is_advertised_but_not_prepared() {
+        let formats = persisted_format::formats_json();
+        for name in ["views_v3_registry", "views_v3_store"] {
+            assert_eq!(formats["stores"][name], 1, "{name}");
+            let store = PersistedStore::from_name(name).expect("registered store");
+            assert!(PersistedStore::ALL.contains(&store));
+            assert_eq!(store.supported(), 1);
+            assert_eq!(store.written(), 1);
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(prepare_uncached(root.path()).is_empty());
+        let floor = read(root.path()).unwrap().unwrap();
+        assert!(!floor.stores.contains_key("views_v3_registry"));
+        assert!(!floor.stores.contains_key("views_v3_store"));
+        let before = fs::read(floor_path(root.path())).unwrap();
+        assert!(prepare_uncached(root.path()).is_empty());
+        assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
+        assert!(!root.path().join("blobs/v3").exists());
+    }
+
+    #[test]
+    fn v3_store_above_supported_is_a_named_floor_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        write_floor(
+            root.path(),
+            serde_json::json!({
+                "floor_schema": 1, "stores": {"views_v3_store": 2}
+            }),
+        );
+        let refusals = prepare_uncached(root.path());
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].store.name(), "views_v3_store");
+        assert_eq!(refusals[0].source, persisted_format::RefusalSource::Floor);
+        assert_eq!(refusals[0].found, 2);
+        assert!(refusals[0].to_string().contains("views_v3_store"));
+        assert_eq!(
+            read(root.path()).unwrap().unwrap().stores["views_v3_store"],
+            2
+        );
+    }
+
+    #[test]
+    fn v3_publication_raises_both_domains_once_before_any_v3_file() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(prepare_uncached(root.path()).is_empty());
+        let mut expected = read(root.path()).unwrap().unwrap().stores;
+        expected.insert("views_v3_registry".into(), 1);
+        expected.insert("views_v3_store".into(), 1);
+        crate::durability::take();
+        let value = publish_v3_with_floor(root.path(), 1, 1, || {
+            assert!(!root.path().join("blobs/v3").exists());
+            assert_eq!(read(root.path()).unwrap().unwrap().stores, expected);
+            42
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        let events = crate::durability::take();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(kind, path)| {
+                    *kind == crate::durability::EventKind::FileSync
+                        && *path == floor_path(root.path())
+                })
+                .count(),
+            1,
+            "both requirements must be raised in one atomic write: {events:?}"
+        );
+    }
+
+    #[test]
+    fn v3_publication_uses_both_supplied_versions_and_preserves_other_stores() {
+        let root = tempfile::tempdir().unwrap();
+        write_floor(
+            root.path(),
+            serde_json::json!({
+                "floor_schema": 1,
+                "stores": {"views_v3_registry": 3, "views_v3_store": 1, "future_store": 8}
+            }),
+        );
+        publish_v3_with_floor(root.path(), 2, 4, || {
+            assert_eq!(
+                read(root.path()).unwrap().unwrap().stores,
+                BTreeMap::from([
+                    ("views_v3_registry".into(), 3),
+                    ("views_v3_store".into(), 4),
+                    ("future_store".into(), 8)
+                ])
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_failed_sync_skips_closure_and_covered_retry_resyncs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writes = 0;
+        for _ in 0..2 {
+            fail_directory_sync(root.path(), None);
+            let result = publish_v3_with_floor(root.path(), 1, 1, || writes += 1);
+            assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
+            assert_eq!(writes, 0);
+            assert!(!root.path().join("blobs/v3").exists());
+            let floor = read(root.path()).unwrap().unwrap();
+            assert_eq!(
+                floor.stores,
+                BTreeMap::from([
+                    ("views_v3_registry".into(), 1),
+                    ("views_v3_store".into(), 1)
+                ])
+            );
+        }
+        let before = fs::read(floor_path(root.path())).unwrap();
+        crate::durability::take();
+        publish_v3_with_floor(root.path(), 1, 1, || {
+            assert!(!root.path().join("blobs/v3").exists());
+            writes += 1;
+        })
+        .unwrap();
+        assert_eq!(writes, 1);
+        assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
+        assert_eq!(
+            crate::durability::take(),
+            vec![(
+                crate::durability::EventKind::DirectorySync,
+                root.path().to_path_buf()
+            )]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_unsupported_directory_sync_is_strict_for_either_domain() {
+        for errno in [libc::EINVAL, libc::ENOTSUP] {
+            let root = tempfile::tempdir().unwrap();
+            for _ in 0..2 {
+                fail_directory_sync(root.path(), Some(errno));
+                let mut wrote = false;
+                let result = publish_v3_with_floor(root.path(), 1, 1, || wrote = true);
+                assert!(
+                    matches!(result, Err(FloorError::Io { ref error, .. }) if error.raw_os_error() == Some(errno)),
+                    "{result:?}"
+                );
+                assert!(!wrote);
+                assert!(!root.path().join("blobs/v3").exists());
+            }
+            for store in [
+                PersistedStore::ViewsV3Registry,
+                PersistedStore::ViewsV3Store,
+            ] {
+                fail_directory_sync(root.path(), Some(errno));
+                let result = raise(root.path(), &[(store, 2)]);
+                assert!(
+                    matches!(result, Err(FloorError::Io { ref error, .. }) if error.raw_os_error() == Some(errno)),
+                    "{result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -566,9 +926,16 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         write_floor(
             root.path(),
-            serde_json::json!({"floor_schema": 1, "stores": {"search": 9, "future_store": 3}}),
+            serde_json::json!({"floor_schema": 1, "stores": {"search": 9, "semantic": 2, "future_store": 3}}),
         );
-        let floor = raise(root.path(), &[(PersistedStore::SearchIndex, 4)]).unwrap();
+        let floor = raise(
+            root.path(),
+            &[
+                (PersistedStore::SearchIndex, 4),
+                (PersistedStore::SemanticIndex, 5),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             floor.stores["search"], 9,
             "a lower requirement must not lower the floor"
@@ -577,8 +944,11 @@ pub(crate) mod tests {
             floor.stores["future_store"], 3,
             "unknown stores must be preserved"
         );
+        assert_eq!(floor.stores["semantic"], 5);
         let floor = raise(root.path(), &[(PersistedStore::SearchIndex, 11)]).unwrap();
         assert_eq!(floor.stores["search"], 11);
+        assert_eq!(floor.stores["future_store"], 3);
+        assert_eq!(floor.stores["semantic"], 5);
         assert_eq!(read(root.path()).unwrap().unwrap().stores["search"], 11);
     }
 
