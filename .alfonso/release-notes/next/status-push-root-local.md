@@ -1,0 +1,1 @@
+- Project status updates now carry only that project's details and are size-capped, so a busy project with many sessions no longer overflows the daemon connection; command output progress stays with the request that produced it.
