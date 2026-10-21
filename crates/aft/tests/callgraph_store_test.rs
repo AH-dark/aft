@@ -616,13 +616,14 @@ export function caller() { used(); }
     }
     assert_no_dangling_caller_nodes(store.sqlite_path());
 
-    // Adding `extra` above `used` moves `used`, so the caller's `used()` call
-    // is re-resolved and the caller becomes a dependency caller of this edit.
+    // Changing the target's kind changes its identity and selects its incoming
+    // caller for resolution. The stored caller ID was corrupted above, so the
+    // refresh must also promote that caller and repair its owned node rows.
     let target = root.join("src/target.ts");
     write_file(
         &target,
         "export function extra() { return 2; }
-export function used() { return 1; }
+export class used {}
 ",
     );
     bump_mtime(&target);
