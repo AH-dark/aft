@@ -216,3 +216,25 @@ pub(super) fn configure(base: &Path, command: &mut Command) {
         .env_remove("AFT_GH_READ_CAPABILITY_FILE")
         .stderr(std::fs::File::create(base.join("daemon.log")).unwrap());
 }
+
+/// On classic V1 routes, a successful bash reply carries terminal state even
+/// for background:true. Tests identify running tasks through the daemon's
+/// private-temp-to-task-metadata association instead of awaiting an early reply.
+pub(super) fn observe_task(temp: &Path) -> (String, PathBuf) {
+    let name = temp
+        .file_name()
+        .expect("private temp name")
+        .to_string_lossy();
+    let owner = temp.with_file_name(format!("{name}.owner"));
+    let io = PathBuf::from(
+        std::fs::read_to_string(&owner)
+            .unwrap_or_else(|error| panic!("task temp association {}: {error}", owner.display())),
+    );
+    assert_eq!(io.file_name().unwrap(), "io");
+    let task_dir = io.parent().unwrap();
+    let metadata = task_dir.join("control/metadata.json");
+    let task = aft::bash_background::persistence::read_task(&metadata).unwrap();
+    assert_eq!(task.sandbox_temp_dir.as_deref(), Some(temp));
+    assert_eq!(task_dir.file_name().unwrap(), task.task_id.as_str());
+    (task.task_id, metadata)
+}

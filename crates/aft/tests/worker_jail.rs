@@ -77,6 +77,7 @@ struct Jail {
     child: Child,
     stream: TcpStream,
     next_corr: u64,
+    pending_frames: std::collections::VecDeque<Frame>,
     read_holder: std::sync::Arc<std::sync::Mutex<worker_gh_read::ReadHolder>>,
     read_router: tokio::task::JoinHandle<()>,
 }
@@ -438,6 +439,7 @@ impl Jail {
             child,
             stream,
             next_corr: 100,
+            pending_frames: std::collections::VecDeque::new(),
             read_holder,
             read_router,
         };
@@ -538,7 +540,7 @@ impl Jail {
         )
         .await
         .unwrap();
-        let ack = next_frame(&mut self.stream).await;
+        let ack = self.reply_frame(0, corr).await;
         assert_eq!(ack.header.corr, corr);
         let response: ModuleControlResponse =
             serde_json::from_slice(&ack.body).unwrap_or_else(|error| {
@@ -554,6 +556,23 @@ impl Jail {
             if let Some(scope) = scope {
                 holder.binds.insert(session, scope);
             }
+        }
+    }
+
+    async fn reply_frame(&mut self, channel: u16, corr: u64) -> Frame {
+        if let Some(index) = self
+            .pending_frames
+            .iter()
+            .position(|frame| frame.header.channel == channel && frame.header.corr == corr)
+        {
+            return self.pending_frames.remove(index).unwrap();
+        }
+        loop {
+            let frame = next_frame(&mut self.stream).await;
+            if frame.header.channel == channel && frame.header.corr == corr {
+                return frame;
+            }
+            self.pending_frames.push_back(frame);
         }
     }
 
@@ -579,12 +598,7 @@ impl Jail {
             )
             .await
             .unwrap();
-            let frame = loop {
-                let frame = next_frame(&mut self.stream).await;
-                if frame.header.channel == channel && frame.header.corr == corr {
-                    break frame;
-                }
-            };
+            let frame = self.reply_frame(channel, corr).await;
             assert_eq!(
                 frame.header.ty,
                 FrameType::Response,
@@ -596,6 +610,12 @@ impl Jail {
 
     async fn submit_tool(&mut self, name: &str, arguments: Value) -> u64 {
         self.submit_tool_on_channel(1, name, arguments).await
+    }
+
+    async fn submit_held_bash(&mut self, arguments: Value) -> u64 {
+        let warm = self.tool_reply("bash", json!({"command":"true"})).await;
+        assert_eq!(warm["structuredContent"]["exit_code"], 0, "{warm}");
+        self.submit_tool("bash", arguments).await
     }
 
     async fn submit_tool_on_channel(&mut self, channel: u16, name: &str, arguments: Value) -> u64 {
@@ -632,12 +652,7 @@ impl Jail {
             let corr = self
                 .submit_tool_on_channel(channel, name, arguments.clone())
                 .await;
-            let frame = loop {
-                let frame = next_frame(&mut self.stream).await;
-                if frame.header.channel == channel && frame.header.corr == corr {
-                    break frame;
-                }
-            };
+            let frame = self.reply_frame(channel, corr).await;
             let text = String::from_utf8_lossy(&frame.body).into_owned();
             if text.contains("database_initializing")
                 || text.contains("Project persistence is still initializing")
@@ -2557,10 +2572,20 @@ async fn worker_jail_temp_denies_other_task_directory() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert!(first.join("sentinel").is_file());
+    let alias = jail.worktree.join("other-task-temp-alias");
+    std::os::unix::fs::symlink(&first, &alias).unwrap();
     let script = r#"import errno, os, pathlib, sys
 own = pathlib.Path(os.environ['TMPDIR'])
 assert own != pathlib.Path(sys.argv[1])
 (own / 'positive-control').write_text('allowed')
+assert (own / 'positive-control').read_text() == 'allowed'
+for candidate in [pathlib.Path(sys.argv[1]) / 'sentinel', pathlib.Path(sys.argv[2]) / 'sentinel']:
+    try:
+        candidate.read_bytes()
+    except OSError as e:
+        assert e.errno in (errno.EPERM, errno.EACCES), e
+    else:
+        raise AssertionError('other task directory was readable')
 try:
     (pathlib.Path(sys.argv[1]) / 'sentinel').write_text('tampered')
 except OSError as e:
@@ -2571,9 +2596,10 @@ else:
 "#;
     let reply = jail
         .bash(&format!(
-            "python3 -B -c {} {}",
+            "python3 -B -c {} {} {}",
             quote(Path::new(script)),
-            quote(&first)
+            quote(&first),
+            quote(&alias)
         ))
         .await;
     assert!(reply.contains("OTHER_TASK_DENIED"), "{reply}");
@@ -2599,9 +2625,10 @@ else:
     );
     let reply = jail
         .bash(&format!(
-            "python3 -B -c {} {}",
+            "python3 -B -c {} {} {}",
             quote(Path::new(script)),
-            quote(&first)
+            quote(&first),
+            quote(&alias)
         ))
         .await;
     assert!(reply.contains("OTHER_TASK_DENIED"), "{reply}");
@@ -2609,6 +2636,27 @@ else:
         std::fs::read_to_string(first.join("sentinel")).unwrap(),
         "original"
     );
+    let read = jail
+        .tool_reply("read", json!({"path":first.join("sentinel")}))
+        .await;
+    assert_ne!(
+        read["isError"], true,
+        "session-owned retained scratch stays available to AFT read: {read}"
+    );
+    assert!(read.to_string().contains("original"), "{read}");
+    jail.bind_grant_head().await;
+    let head = jail
+        .tool_reply_on_channel(
+            2,
+            "bash",
+            json!({"command":format!("cat {}", quote(&first.join("sentinel")))}),
+        )
+        .await;
+    assert_eq!(
+        head["structuredContent"]["exit_code"], 0,
+        "head shell access stays unchanged: {head}"
+    );
+    assert!(head.to_string().contains("original"), "{head}");
 }
 
 #[tokio::test]
@@ -2846,7 +2894,9 @@ async fn wait_test_file(path: &Path) -> String {
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if let Ok(text) = std::fs::read_to_string(path) {
-                return text;
+                if !text.is_empty() {
+                    return text;
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2882,7 +2932,7 @@ async fn worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied(
     let command = format!(
         r#"set -eu
 for denied in {} {} {} {} {}; do
-  if cat "$denied" >/dev/null 2>&1; then echo 'CREDENTIAL FLOOR OPEN'; exit 93; fi
+  if cat "$denied" >/dev/null 2>&1; then echo "CREDENTIAL FLOOR OPEN: $denied"; exit 93; fi
 done
 {}
 test -z "${{AFT_GH_SHIM_TICKET+x}}"
@@ -2905,10 +2955,7 @@ echo TWO_READS_OK
         .tool_reply("bash", json!({"command":command,"timeout":300_000}))
         .await;
     let reply = response.to_string();
-    assert_eq!(
-        response["structuredContent"]["data"]["exit_code"], 0,
-        "{reply}"
-    );
+    assert_eq!(response["structuredContent"]["exit_code"], 0, "{reply}");
     assert!(reply.contains("CREDENTIALS_DENIED"), "{reply}");
     assert!(reply.contains("TWO_READS_OK"), "{reply}");
     assert!(reply.matches("worker-bound-read").count() >= 2, "{reply}");
@@ -2921,7 +2968,7 @@ echo TWO_READS_OK
     }
     assert!(!jail.worktree.join("native-gh.log").exists());
     let trace = std::fs::read_to_string(jail.base.join("daemon.log")).unwrap();
-    let task_id = response["structuredContent"]["data"]["task_id"]
+    let task_id = response["structuredContent"]["task_id"]
         .as_str()
         .expect("command task id");
     assert!(
@@ -2940,11 +2987,8 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     let go = jail.worktree.join("broker-go");
     let outcome = jail.worktree.join("broker-outcome");
     let command = format!("echo ready > {}; while ! test -f {}; do sleep 0.02; done; gh api repos/cortexkit/aft > /dev/null 2>&1; echo $? > {}", quote(&ready), quote(&go), quote(&outcome));
-    let _started = jail
-        .tool_reply(
-            "bash",
-            json!({"command":command,"background":true,"timeout":30_000}),
-        )
+    let corr = jail
+        .submit_held_bash(json!({"command":command,"background":true,"timeout":30_000}))
         .await;
     wait_test_file(&ready).await;
     let mut scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
@@ -2971,6 +3015,12 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     .await;
     std::fs::write(go, "go").unwrap();
     assert_ne!(wait_test_file(&outcome).await.trim(), "0");
+    let finished = jail.reply_frame(1, corr).await;
+    let finished: Value = serde_json::from_slice(&finished.body).unwrap();
+    assert_eq!(
+        finished["structuredContent"]["exit_code"], 0,
+        "the probe itself must complete: {finished}"
+    );
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(
         jail.read_holder.lock().unwrap().dials.is_empty(),
@@ -3046,12 +3096,20 @@ async fn worker_gh_read_t11_cross_command_capability_file_and_socket_isolation()
     let mut jail = gh_read_jail().await;
     let paths = jail.worktree.join("broker-a-paths");
     let finish = jail.worktree.join("broker-a-finish");
-    let _started = jail.tool_reply("bash", json!({"command":format!(
+    let corr = jail.submit_held_bash(json!({"command":format!(
         "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}; while ! test -f {}; do sleep 0.02; done",
         quote(&paths), quote(&finish)),"background":true,"timeout":30_000})).await;
     let paths = wait_test_file(&paths).await;
     let parts: Vec<_> = paths.lines().collect();
     assert_eq!(parts.len(), 3);
+    let (first_task, _) = worker_gh_read::observe_task(Path::new(parts[1]).parent().unwrap());
+    let status = jail
+        .tool_reply("bash_status", json!({"taskId":first_task}))
+        .await;
+    assert_eq!(
+        status["structuredContent"]["status"], "running",
+        "probe a live capability, not only retained scratch: {status}"
+    );
     let other_root = jail.base.join("other-repo");
     git(
         &other_root,
@@ -3062,6 +3120,8 @@ async fn worker_gh_read_t11_cross_command_capability_file_and_socket_isolation()
             "https://github.com/cortexkit/common-auth.git",
         ],
     );
+    let alias = other_root.join("foreign-broker-alias.sock");
+    std::os::unix::fs::symlink(parts[0], &alias).unwrap();
     let mut other_scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
     other_scope.scope_ref = "other-worker-scope".into();
     jail.bind(ModuleControlRequest::RouteBind {
@@ -3089,31 +3149,59 @@ async fn worker_gh_read_t11_cross_command_capability_file_and_socket_isolation()
 if cat {} >/dev/null 2>&1; then echo CAPABILITY_STOLEN; exit 95; fi
 if gh api repos/cortexkit/aft >/dev/null 2>&1; then echo FOREIGN_REPOSITORY_ALLOWED; exit 96; fi
 if AFT_GH_READ_SOCKET={} gh api repos/cortexkit/common-auth >/dev/null 2>&1; then echo WRONG_BROKER_ALLOWED; exit 97; fi
-python3 - {} <<'PY'
-import socket, sys
-s = socket.socket(socket.AF_UNIX)
-try:
- s.connect(sys.argv[1]); print('CROSS_CONNECT_ALLOWED')
-except OSError:
- print('CROSS_CONNECT_DENIED')
+python3 - {} {} <<'PY'
+import json, os, socket, struct, sys
+with open(os.environ['AFT_GH_READ_CAPABILITY_FILE']) as f:
+ capability = f.read()
+own = socket.socket(socket.AF_UNIX); own.settimeout(5); own.connect(os.environ['AFT_GH_READ_SOCKET'])
+request = json.dumps(dict(capability=capability, operation=dict(op='gh_shim.session_context'))).encode()
+own.sendall(struct.pack('!I', len(request)) + request)
+header = own.recv(4); size = struct.unpack('!I', header)[0]; body = b''
+while len(body) < size:
+ part = own.recv(size - len(body))
+ assert part
+ body += part
+context = json.loads(body)
+assert context['status'] == 'ok' and context['data']['repository'] == 'cortexkit/common-auth'
+print('OWN_CONTEXT_OK'); own.close()
+for label, path in [('CROSS', sys.argv[1]), ('ALIAS', sys.argv[2])]:
+ s = socket.socket(socket.AF_UNIX)
+ try:
+  s.connect(path); print(label + '_CONNECT_ALLOWED')
+ except OSError:
+  print(label + '_CONNECT_DENIED')
+ finally:
+  s.close()
 PY
 printf 'ISOLATION_OK\n'
 "#,
         quote(Path::new(parts[1])),
         quote(Path::new(parts[0])),
-        quote(Path::new(parts[0]))
+        quote(Path::new(parts[0])),
+        quote(&alias)
     );
     let output = jail
         .tool_reply_on_channel(2, "bash", json!({"command":probe,"timeout":30_000}))
         .await
         .to_string();
     assert!(output.contains("ISOLATION_OK"), "{output}");
+    assert!(output.contains("OWN_CONTEXT_OK"), "{output}");
     #[cfg(target_os = "macos")]
-    assert!(output.contains("CROSS_CONNECT_DENIED"), "{output}");
+    assert!(
+        output.contains("CROSS_CONNECT_DENIED") && output.contains("ALIAS_CONNECT_DENIED"),
+        "{output}"
+    );
     #[cfg(target_os = "linux")]
     assert!(
         output.contains("CROSS_CONNECT_ALLOWED"),
         "Landlock pathname AF_UNIX measurement changed: {output}"
+    );
+    let status = jail
+        .tool_reply("bash_status", json!({"taskId":first_task}))
+        .await;
+    assert_eq!(
+        status["structuredContent"]["status"], "running",
+        "the foreign listener must still belong to a live command: {status}"
     );
     // The launch environment contains only capability-file/socket paths, never
     // the bearer. Cross-command file denial is the Linux isolation boundary.
@@ -3130,6 +3218,9 @@ printf 'ISOLATION_OK\n'
         .unwrap();
     assert!(!String::from_utf8_lossy(&environment.stdout).contains(&capability));
     std::fs::write(finish, "finish").unwrap();
+    let finished = jail.reply_frame(1, corr).await;
+    let finished: Value = serde_json::from_slice(&finished.body).unwrap();
+    assert_eq!(finished["structuredContent"]["exit_code"], 0, "{finished}");
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(!other_root.join("native-gh.log").exists());
 }
@@ -3227,13 +3318,14 @@ async fn gh_shim_router_host_scope_dials_require_the_live_bind() {
 #[tokio::test]
 async fn worker_gh_read_t10_retained_descendants_fail_after_end_cancel_timeout_and_restart() {
     assert!(native_available());
-    for mode in ["end", "cancel", "timeout", "promote", "restart"] {
+    for mode in ["end", "cancel", "timeout", "restart"] {
         let mut jail = gh_read_jail().await;
         let ready = jail.worktree.join("descendant-ready");
         let go = jail.worktree.join("descendant-go");
         let outcome = jail.worktree.join("descendant-outcome");
         let finish = jail.worktree.join("parent-finish");
-        let promoted = jail.worktree.join("promoted-read");
+        let parent_done = jail.worktree.join("parent-finished");
+
         let mut command = format!(
             r#"set -eu
 gh api repos/cortexkit/aft >/dev/null
@@ -3249,7 +3341,7 @@ fd = os.open('/dev/null', os.O_RDWR)
 for n in range(3): os.dup2(fd, n)
 if fd > 2: os.close(fd)
 ready, go, outcome = sys.argv[1:]
-with open(ready, 'w') as f: f.write(endpoint)
+with open(ready, 'w') as f: f.write(endpoint + chr(10) + os.environ['TMPDIR'])
 stop = time.monotonic() + 60
 while not os.path.exists(go):
  if time.monotonic() > stop: os._exit(9)
@@ -3278,34 +3370,22 @@ PY
         );
         if mode != "end" {
             command.push_str(&format!(
-                "while ! test -f {}; do sleep .02; done\n",
-                quote(&finish)
+                "while ! test -f {}; do sleep .02; done; echo finished > {}\n",
+                quote(&finish),
+                quote(&parent_done)
             ));
         }
-        if mode == "promote" {
-            command.push_str(&format!(
-                "gh api repos/cortexkit/aft > {}\n",
-                quote(&promoted)
-            ));
-        }
-        let response = jail.tool_reply("bash", json!({"command":command,"background":mode != "promote","timeout":if mode == "timeout" {5000} else {30_000}})).await;
-        let task = response["structuredContent"]["data"]["task_id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{mode}: {response}"));
-        let socket = wait_test_file(&ready).await;
+
+        let corr = jail.submit_held_bash(json!({"command":command,"background":true,"timeout":if mode == "timeout" {5000} else {30_000}})).await;
+        let witness = wait_test_file(&ready).await;
+        let mut paths = witness.lines();
+        let socket = paths.next().expect("published broker socket");
+        let temp = paths.next().expect("published command temp");
+        let (task, _) = worker_gh_read::observe_task(Path::new(temp));
         if mode == "cancel" {
             let _ = jail.tool_reply("bash_kill", json!({"taskId":task})).await;
         }
-        if mode == "promote" {
-            assert!(
-                response.to_string().contains("background"),
-                "foreground command must be promoted: {response}"
-            );
-            std::fs::write(&finish, "finish").unwrap();
-            assert!(wait_test_file(&promoted)
-                .await
-                .contains("worker-bound-read"));
-        }
+
         if mode == "restart" {
             jail.child.kill().unwrap();
             jail.child.wait().unwrap();
@@ -3319,10 +3399,19 @@ PY
             })
             .await
             .unwrap_or_else(|_| panic!("{mode}: broker socket survived terminal state"));
+            let finished = jail.reply_frame(1, corr).await;
+            let finished: Value = serde_json::from_slice(&finished.body).unwrap();
+            assert_eq!(finished["structuredContent"]["task_id"], task, "{finished}");
+            if mode == "end" {
+                assert_eq!(finished["structuredContent"]["exit_code"], 0, "{finished}");
+            }
         }
         std::fs::write(&go, "go").unwrap();
         assert_eq!(wait_test_file(&outcome).await, "REPLAY_DENIED", "{mode}");
         std::fs::write(&finish, "finish").unwrap();
+        if mode == "restart" {
+            wait_test_file(&parent_done).await;
+        }
         assert!(!jail.worktree.join("native-gh.log").exists(), "{mode}");
     }
 }
@@ -3366,10 +3455,10 @@ async fn worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply() {
     let hold = std::sync::Arc::new(tokio::sync::Notify::new());
     jail.read_holder.lock().unwrap().hold_reads = Some(hold.clone());
     let output = jail.worktree.join("inflight-read-output");
-    let response = jail.tool_reply("bash", json!({"command":format!("gh api repos/cortexkit/aft > {}", quote(&output)),"background":true,"timeout":30_000})).await;
-    let task = response["structuredContent"]["data"]["task_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{response}"));
+    let ready = jail.worktree.join("inflight-read-ready");
+    let corr = jail.submit_held_bash(json!({"command":format!("printf '%s' \"$TMPDIR\" > {}; gh api repos/cortexkit/aft > {}", quote(&ready), quote(&output)),"background":true,"timeout":30_000})).await;
+    let temp = wait_test_file(&ready).await;
+    let (task, _) = worker_gh_read::observe_task(Path::new(&temp));
     tokio::time::timeout(Duration::from_secs(10), async {
         while jail.read_holder.lock().unwrap().calls.is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3379,6 +3468,18 @@ async fn worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply() {
     .expect("the upstream read must be reached before cancellation");
     let killed = jail.tool_reply("bash_kill", json!({"taskId":task})).await;
     assert_ne!(killed["isError"], true, "{killed}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = jail.tool_reply("bash_status", json!({"taskId":task})).await;
+            assert_ne!(status["isError"], true, "{status}");
+            if status["structuredContent"]["status"] == "killed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the issued kill must reach terminal state before upstream release");
     hold.notify_one();
     let status = jail.tool_reply("bash_status", json!({"taskId":task})).await;
     assert!(!status.to_string().contains("worker-bound-read"));
@@ -3386,5 +3487,120 @@ async fn worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply() {
         .unwrap_or_default()
         .contains("worker-bound-read"));
     assert_eq!(jail.read_holder.lock().unwrap().calls.len(), 1);
+    let finished = jail.reply_frame(1, corr).await;
+    let finished: Value = serde_json::from_slice(&finished.body).unwrap();
+    assert_eq!(finished["structuredContent"]["task_id"], task, "{finished}");
+    assert!(!jail.worktree.join("native-gh.log").exists());
+}
+
+#[tokio::test]
+async fn gh_shim_router_host_v1_background_reply_is_terminal_and_flat() {
+    let mut jail = Jail::start().await;
+    jail.bind_grant_head().await;
+    let ready = jail.base.join("v1-ready");
+    let release = jail.base.join("v1-release");
+    let warm = jail
+        .tool_reply_on_channel(2, "bash", json!({"command":"true"}))
+        .await;
+    assert_eq!(warm["structuredContent"]["exit_code"], 0, "{warm}");
+    let corr = jail.submit_tool_on_channel(2, "bash", json!({"command":format!("echo ready > {}; while ! test -f {}; do sleep .02; done", quote(&ready), quote(&release)),"background":true,"timeout":10_000})).await;
+    wait_test_file(&ready).await;
+    let pending = jail.reply_frame(2, corr);
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "V1 must not send an early background launch response"
+    );
+    std::fs::write(release, "release").unwrap();
+    let frame = pending.await;
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(reply["structuredContent"]["status"], "completed", "{reply}");
+    assert_eq!(reply["structuredContent"]["exit_code"], 0, "{reply}");
+    assert!(reply["structuredContent"]["task_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("bash-"));
+    assert!(reply["structuredContent"].get("data").is_none());
+}
+
+#[tokio::test]
+async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
+    assert!(native_available());
+    let mut jail = gh_read_jail().await;
+    let ready = jail.worktree.join("promotion-ready");
+    let release = jail.worktree.join("promotion-release");
+    let output = jail.worktree.join("promotion-read");
+    jail.submit_held_bash(json!({"command":format!("gh api repos/cortexkit/aft >/dev/null; printf '%s' \"$TMPDIR\" > {}; while ! test -f {}; do sleep .02; done; gh api repos/cortexkit/aft > {}", quote(&ready), quote(&release), quote(&output)),"background":false,"timeout":30_000})).await;
+    let temp = wait_test_file(&ready).await;
+    let (task, metadata) = worker_gh_read::observe_task(Path::new(&temp));
+    assert!(
+        !aft::bash_background::persistence::read_task(&metadata)
+            .unwrap()
+            .notify_on_completion,
+        "start as a foreground command"
+    );
+    let scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
+    jail.bind(ModuleControlRequest::RouteBind {
+        route_channel: 2,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".into(),
+        },
+        identity: BindIdentity::new(&jail.worktree, "runner", "worker-session"),
+        principal: Some(Principal::Reserved {
+            module_id: "broca".into(),
+        }),
+        consumer_capabilities: None,
+        admission_facts: None,
+        scope: Some(scope),
+        role_versions: Some(std::collections::BTreeMap::from([(
+            "tool-provider".into(),
+            "v1".into(),
+        )])),
+        call_mode: None,
+    })
+    .await;
+    // Detaching the route's foreground wait promotes its running bash command
+    // to a background task without ending the scope. The replacement route
+    // retains that scope for subsequent broker reads.
+    write_frame(
+        &mut jail.stream,
+        &Frame::build(FrameType::Goodbye, flags(), 1, 1, 0, vec![]).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !aft::bash_background::persistence::read_task(&metadata)
+            .unwrap()
+            .notify_on_completion
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("route wait detachment must really promote the foreground command");
+    let status = jail
+        .tool_reply_on_channel(2, "bash_status", json!({"taskId":task}))
+        .await;
+    assert_eq!(status["structuredContent"]["status"], "running", "{status}");
+    std::fs::write(release, "release").unwrap();
+    let body = wait_test_file(&output).await;
+    assert!(body.contains("worker-bound-read"), "{body}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while Path::new(&temp)
+            .with_file_name(format!(
+                "{}.gh-read.sock",
+                Path::new(&temp).file_name().unwrap().to_string_lossy()
+            ))
+            .exists()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the promoted command still revokes its grant at terminal state");
+    assert_eq!(jail.read_holder.lock().unwrap().calls.len(), 2);
     assert!(!jail.worktree.join("native-gh.log").exists());
 }
