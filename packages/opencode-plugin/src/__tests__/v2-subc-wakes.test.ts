@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import {
   trackBgTask,
 } from "../bg-notifications.js";
 import { makeServerEffect } from "../entry/server-runtime.mjs";
+import * as logger from "../logger.js";
 import { __resetV2WakeRoutesForTests, type V2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import type { V2SessionSyntheticInput } from "../wakes/session-delivery.js";
 import { recoverV2SubcSessions } from "../wakes/subc-recovery.js";
@@ -435,6 +436,85 @@ test("OC2 subc recovery is root-scoped, recent, and capped at twenty newest host
   expect(restored).not.toContain("s0");
   expect(restored).not.toContain("s1");
   expect(restored).not.toContain("s20");
+});
+
+test("OC2 subc recovery continues after a rejected restore and wakes the next session", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+  const runtime = await start(root, module);
+  const warnings = spyOn(logger, "warn").mockImplementation(() => {});
+  const attempts: string[] = [];
+  const recent = ["unavailable", "s"].map((id) => ({
+    id,
+    location: { directory: root },
+    time: { updated: DateTime.makeUnsafe(Date.now()) },
+  }));
+  const wakes = runtime.consumer.subcWakes(() => runtime.pool, root);
+  try {
+    await Effect.runPromise(
+      recoverV2SubcSessions(
+        {
+          session: { list: () => Effect.succeed({ data: recent }) },
+        },
+        root,
+        async (sessionID) => {
+          attempts.push(sessionID);
+          if (sessionID === "unavailable") throw new Error("restore unavailable");
+          await wakes.restoreSession(sessionID);
+        },
+      ),
+    );
+    await until(() => module.events.includes("bash_ack_completions:s"));
+    expect(attempts).toEqual(["unavailable", "s"]);
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(runtime.synthetic[0]?.sessionID).toBe("s");
+    expect(module.pending.has(module.key(root, "s"))).toBe(false);
+    expect(
+      warnings.mock.calls.some(
+        ([message]) =>
+          String(message).includes("session recovery failed:") &&
+          String(message).includes("restore unavailable"),
+      ),
+    ).toBe(true);
+  } finally {
+    warnings.mockRestore();
+    await runtime.stop();
+  }
+});
+
+test("OC2 subc recovery ignores host-listed sessions from another directory without subscribing or draining", async () => {
+  const root = workspace();
+  const foreign = workspace();
+  const module = new ModuleDouble();
+  module.pending.set(module.key(foreign, "foreign"), {
+    bg_completions: [completion("foreign-task")],
+  });
+  module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+  const recent = [
+    { id: "foreign", directory: foreign },
+    { id: "s", directory: root },
+  ].map(({ id, directory }) => ({
+    id,
+    location: { directory },
+    time: { updated: DateTime.makeUnsafe(Date.now()) },
+  }));
+  const runtime = await start(root, module, recent);
+  try {
+    await until(() => module.events.includes("bash_ack_completions:s"));
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(runtime.synthetic[0]?.sessionID).toBe("s");
+    expect(
+      module.clients
+        .flatMap((client) => client.subscriptions)
+        .some((sub) => sub.session === "foreign"),
+    ).toBe(false);
+    expect(module.events).not.toContain("bash_drain_completions:foreign");
+    expect(module.events).not.toContain("bash_ack_completions:foreign");
+    expect(module.pending.has(module.key(foreign, "foreign"))).toBe(true);
+  } finally {
+    await runtime.stop();
+  }
 });
 
 test("OC2 subc admission reservation fences a concurrent in-turn completion drain", async () => {

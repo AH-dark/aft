@@ -35,7 +35,11 @@ export function recoverV2SubcSessions(
         DateTime.toEpochMillis(session.time.updated) < cutoff
       )
         continue;
-      yield* Effect.promise(() => restoreSession(session.id)).pipe(
+      // A rejected restore must fail only this session, not stop recovery of later sessions.
+      yield* Effect.tryPromise({
+        try: () => restoreSession(session.id),
+        catch: (error) => error,
+      }).pipe(
         Effect.catch((error) =>
           Effect.sync(() => warn(`[bash_completion] session recovery failed: ${String(error)}`)),
         ),
