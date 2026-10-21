@@ -2866,6 +2866,7 @@ fn configure_retention_timeout_is_retryable_and_names_lock() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("publication round"));
     assert!(!storage.path().join("retention/roots").exists());
     crate::storage_retention::record_bind(storage.path(), &root, "0123456789abcdef").unwrap();
     assert!(storage.path().join("retention/roots").is_dir());

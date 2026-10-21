@@ -1,1 +1,1 @@
-- Parallel checkout bindings now have a bounded retention-lock queue budget and report retryable, named lock timeouts instead of losing indexes under contention.
+- Concurrent checkout binds now batch durable retention-record writes in one process, reducing contention while preserving bounded, retryable lock timeouts.

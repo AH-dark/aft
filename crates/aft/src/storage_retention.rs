@@ -6,9 +6,9 @@
 //! an old payload mtime as proof that a root has not recently been bound.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, ReadDir};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicU64, Arc, Mutex, OnceLock};
+use std::sync::{atomic::AtomicU64, Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -298,10 +298,6 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 /// Called before cache acquisition, on every configure, even a same-key rebind.
 pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io::Result<()> {
-    // This is a queue budget, not a limit on one lock holder. A session can
-    // publish dozens of checkout bindings at once, each requiring durable I/O.
-    // Only binds get the longer wait; pin and cleanup admissions keep their
-    // existing bounds instead of waiting for the full bind queue budget.
     record_bind_until(
         storage,
         root,
@@ -310,17 +306,32 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
     )
 }
 
-const BIND_QUEUE_WAIT: Duration = Duration::from_secs(60);
+// Budget one active publication plus this caller's publication, allowing five
+// seconds for each and two seconds for collection/scheduling overhead. All
+// checks use the caller's original deadline, avoiding a separate, shorter
+// publication timeout.
+const BIND_ROUND_ALLOWANCE: Duration = Duration::from_secs(5);
+const BIND_QUEUE_WAIT: Duration = Duration::from_secs(2 * BIND_ROUND_ALLOWANCE.as_secs() + 2);
+const BIND_COLLECT: Duration = Duration::from_millis(10);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BindLockError {
     pub(crate) path: PathBuf,
     pub(crate) waited: Duration,
-    source: crate::fs_lock::AcquireError,
+    publication: bool,
+    source: Arc<crate::fs_lock::AcquireError>,
 }
 
 impl std::fmt::Display for BindLockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.publication {
+            return write!(
+                f,
+                "retention binding publication round for {} exceeded its deadline after {}ms",
+                self.path.display(),
+                self.waited.as_millis()
+            );
+        }
         write!(
             f,
             "retention binding waited {}ms for {}: {}",
@@ -333,8 +344,135 @@ impl std::fmt::Display for BindLockError {
 
 impl std::error::Error for BindLockError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_ref())
     }
+}
+
+#[derive(Clone, Debug)]
+struct BindRoundError(Arc<io::Error>);
+
+impl BindRoundError {
+    fn into_io(self) -> io::Error {
+        if let Some(wait) = self
+            .0
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<BindLockError>())
+        {
+            io::Error::new(self.0.kind(), wait.clone())
+        } else {
+            io::Error::new(self.0.kind(), self)
+        }
+    }
+}
+
+impl std::fmt::Display for BindRoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for BindRoundError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+type BindResult = Result<(), BindRoundError>;
+
+struct PendingBind {
+    binding: Binding,
+    deadline: Instant,
+    result: Mutex<Option<BindResult>>,
+}
+
+#[derive(Default)]
+struct BindQueueState {
+    active: bool,
+    pending: Vec<Arc<PendingBind>>,
+}
+
+#[derive(Default)]
+struct BindQueue {
+    state: Mutex<BindQueueState>,
+    changed: Condvar,
+}
+
+fn bind_queue(storage: &Path) -> io::Result<Arc<BindQueue>> {
+    static QUEUES: OnceLock<Mutex<HashMap<PathBuf, Weak<BindQueue>>>> = OnceLock::new();
+    let key = fs::canonicalize(storage)?;
+    let mut queues = QUEUES.get_or_init(Default::default).lock().unwrap();
+    queues.retain(|_, queue| queue.strong_count() != 0);
+    if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
+        return Ok(queue);
+    }
+    let queue = Arc::new(BindQueue::default());
+    queues.insert(key, Arc::downgrade(&queue));
+    Ok(queue)
+}
+
+// Always hand leadership back after one snapshot. Otherwise a continuous stream
+// of new roots could keep the leader inside record_bind after its own success.
+struct BindLeader<'a> {
+    queue: &'a BindQueue,
+    members: Vec<Arc<PendingBind>>,
+    result: BindResult,
+}
+
+impl Drop for BindLeader<'_> {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap();
+        for member in &self.members {
+            let mut result = member.result.lock().unwrap();
+            if result.is_none() {
+                *result = Some(self.result.clone());
+            }
+        }
+        state.active = false;
+        self.queue.changed.notify_all();
+    }
+}
+
+fn bind_timeout(path: &Path, started: Instant) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        BindLockError {
+            path: path.to_path_buf(),
+            waited: started.elapsed(),
+            publication: true,
+            source: Arc::new(crate::fs_lock::AcquireError::Timeout),
+        },
+    )
+}
+
+fn bind_lock_error(
+    path: &Path,
+    started: Instant,
+    source: crate::fs_lock::AcquireError,
+) -> io::Error {
+    let kind = match &source {
+        crate::fs_lock::AcquireError::Timeout => io::ErrorKind::TimedOut,
+        crate::fs_lock::AcquireError::Io(error) => error.kind(),
+    };
+    io::Error::new(
+        kind,
+        BindLockError {
+            path: path.to_path_buf(),
+            waited: started.elapsed(),
+            publication: false,
+            source: Arc::new(source),
+        },
+    )
+}
+
+// Every lock needed by one publication round must share this absolute deadline;
+// a fresh timeout for each preceding admission lock would extend the round.
+fn bind_lock_until(
+    path: &Path,
+    deadline: Instant,
+    started: Instant,
+) -> io::Result<crate::fs_lock::LockGuard> {
+    crate::fs_lock::try_acquire_until(path, deadline)
+        .map_err(|source| bind_lock_error(path, started, source))
 }
 
 pub(crate) fn record_bind_until(
@@ -348,47 +486,217 @@ pub(crate) fn record_bind_until(
     let started = Instant::now();
     fs::create_dir_all(storage.join("retention"))?;
     let path = storage.join("retention/sweep.lock");
-    // Use one absolute deadline, including filesystem preparation. Never renew
-    // it on a busy poll or admit a binding without the sweep barrier.
-    let _barrier = crate::fs_lock::try_acquire_until(&path, deadline).map_err(|source| {
-        let kind = match &source {
-            crate::fs_lock::AcquireError::Timeout => io::ErrorKind::TimedOut,
-            crate::fs_lock::AcquireError::Io(error) => error.kind(),
-        };
-        io::Error::new(
-            kind,
-            BindLockError {
-                path,
-                waited: started.elapsed(),
-                source,
-            },
-        )
-    })?;
-    #[cfg(test)]
-    test_hook(root, "bind-acquired");
     let root = fs::canonicalize(root)?;
-    let scope = crate::path_identity::project_scope_key(&root);
-    let binding = Binding {
-        volume: volume_anchor(&root),
-        stable_volume: Some(VolumeIdentity {
-            uuid: volume_uuid(&root),
-            boot_id: boot_id(),
-        }),
-        linked_worktree: linked_worktree_at_bind(&root),
-        root,
-        artifact_key: artifact_key.to_owned(),
-        last_bound_ms: crate::pins::now_ms(),
-    };
-    atomic_json(
-        &storage
-            .join("retention/roots")
-            .join(format!("{scope}.json")),
-        &binding,
-    )?;
-    clear_unknown_observation(storage, artifact_key)?;
-    drop(_barrier);
+    let member = Arc::new(PendingBind {
+        binding: Binding {
+            volume: volume_anchor(&root),
+            stable_volume: Some(VolumeIdentity {
+                uuid: volume_uuid(&root),
+                boot_id: boot_id(),
+            }),
+            linked_worktree: linked_worktree_at_bind(&root),
+            root,
+            artifact_key: artifact_key.to_owned(),
+            last_bound_ms: crate::pins::now_ms(),
+        },
+        deadline,
+        result: Mutex::new(None),
+    });
+    if Instant::now() >= deadline {
+        return Err(bind_timeout(&path, started));
+    }
+    let queue = bind_queue(storage)?;
+    {
+        let mut state = queue.state.lock().unwrap();
+        state.pending.push(member.clone());
+        queue.changed.notify_all();
+    }
     #[cfg(test)]
-    test_hook(&binding.root, "bind-released");
+    test_hook(storage, "bind-enqueued");
+    let mut state = queue.state.lock().unwrap();
+    loop {
+        if let Some(result) = member.result.lock().unwrap().clone() {
+            return result.map_err(BindRoundError::into_io);
+        }
+        if Instant::now() >= deadline {
+            let error = BindRoundError(Arc::new(bind_timeout(&path, started)));
+            *member.result.lock().unwrap() = Some(Err(error.clone()));
+            return Err(error.into_io());
+        }
+        if !state.active {
+            state.active = true;
+            drop(state);
+            let mut leader = BindLeader {
+                queue: &queue,
+                members: Vec::new(),
+                result: Err(BindRoundError(Arc::new(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "retention binding publication leader stopped",
+                )))),
+            };
+            let round_started = Instant::now();
+            #[cfg(test)]
+            test_hook(storage, "bind-round-collecting");
+            state = queue.state.lock().unwrap();
+            let collect_until = (round_started + BIND_COLLECT).min(deadline);
+            while Instant::now() < collect_until {
+                let remaining = collect_until.saturating_duration_since(Instant::now());
+                state = queue.changed.wait_timeout(state, remaining).unwrap().0;
+            }
+            leader.members = std::mem::take(&mut state.pending);
+            drop(state);
+            let round_deadline = leader
+                .members
+                .iter()
+                .map(|member| member.deadline)
+                .fold(deadline, Instant::min);
+            let admission = bind_lock_until(&path, round_deadline, round_started);
+            state = queue.state.lock().unwrap();
+            // Include arrivals during cross-process admission, then freeze the
+            // publication snapshot. Later arrivals belong to the next round.
+            leader.members.append(&mut state.pending);
+            drop(state);
+            let round_deadline = leader
+                .members
+                .iter()
+                .map(|member| member.deadline)
+                .fold(round_deadline, Instant::min);
+            leader.result = admission
+                .and_then(|barrier| {
+                    publish_bind_round(
+                        storage,
+                        &leader.members,
+                        round_started,
+                        round_deadline,
+                        barrier,
+                    )
+                })
+                .map_err(|error| BindRoundError(Arc::new(error)));
+            drop(leader);
+            state = queue.state.lock().unwrap();
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            state = queue.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+}
+
+struct StagedBinding {
+    temporary: PathBuf,
+    destination: PathBuf,
+}
+
+impl Drop for StagedBinding {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+fn publish_bind_round(
+    storage: &Path,
+    members: &[Arc<PendingBind>],
+    started: Instant,
+    deadline: Instant,
+    barrier: crate::fs_lock::LockGuard,
+) -> io::Result<()> {
+    let lock_path = storage.join("retention/sweep.lock");
+    #[cfg(test)]
+    for member in members {
+        test_hook(&member.binding.root, "bind-acquired");
+    }
+    #[cfg(test)]
+    test_hook(storage, "bind-round-acquired");
+    let check_deadline = || {
+        if Instant::now() >= deadline {
+            Err(bind_timeout(&lock_path, started))
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    let directory = storage.join("retention/roots");
+    crate::backup::create_private_durable_dir(&directory)?;
+    let mut staged = Vec::new();
+    for member in members {
+        check_deadline()?;
+        let mut binding = member.binding.clone();
+        binding.last_bound_ms = crate::pins::now_ms();
+        let scope = crate::path_identity::project_scope_key(&binding.root);
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let temporary = directory.join(format!(".bind-{:032x}.tmp", u128::from_ne_bytes(random)));
+        #[cfg(test)]
+        crate::durability::before_temp_create(&temporary);
+        let mut file = crate::private_storage::options()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        staged.push(StagedBinding {
+            temporary,
+            destination: directory.join(format!("{scope}.json")),
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(
+                crate::private_storage::FILE_MODE,
+            ))?;
+        }
+        file.write_all(&serde_json::to_vec(&binding).map_err(io::Error::other)?)?;
+        // Do not hold one open handle per queued root: another configure may
+        // need file descriptors for its identity probes while this round runs.
+        drop(file);
+    }
+    #[cfg(test)]
+    test_hook(storage, "bind-round-staged");
+    // Each data file needs its own sync; syncing a directory cannot flush file
+    // contents. Group the shared directory commit instead of doing it per root.
+    for binding in &staged {
+        check_deadline()?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&binding.temporary)?;
+        crate::durability::sync_file(&file, &binding.destination)?;
+    }
+    for binding in &staged {
+        check_deadline()?;
+        crate::fs_lock::rename_over(&binding.temporary, &binding.destination)?;
+        crate::durability::record(
+            crate::durability::EventKind::AtomicReplace,
+            &binding.destination,
+        );
+    }
+    crate::durability::sync_dir(&directory)?;
+    #[cfg(test)]
+    test_hook(storage, "bind-round-durable");
+
+    let mut cleared = false;
+    let keys: HashSet<_> = members
+        .iter()
+        .map(|member| member.binding.artifact_key.as_str())
+        .filter(|key| key_valid(key))
+        .collect();
+    let observations = storage.join("retention/unknown");
+    for key in keys {
+        check_deadline()?;
+        match fs::remove_file(observations.join(format!("{key}.json"))) {
+            Ok(()) => cleared = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if cleared {
+        crate::durability::sync_dir(&observations)?;
+    }
+    check_deadline()?;
+    // A late failure can leave complete records that keep caches from cleanup
+    // until the bindings reach ordinary expiry. No record_bind caller gets success
+    // until every file and shared directory commit has succeeded.
+    drop(barrier);
+    #[cfg(test)]
+    for member in members {
+        test_hook(&member.binding.root, "bind-released");
+    }
     Ok(())
 }
 
@@ -2774,12 +3082,27 @@ mod storage_retention_tests {
 
     #[test]
     fn record_bind_parallel_queue_survives_slow_publish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier, Mutex};
         const BINDS: usize = 64;
         for delay in [Duration::ZERO, Duration::from_millis(100)] {
             let temp = tempfile::tempdir().unwrap();
             let ready = Arc::new(Barrier::new(BINDS));
             let measurements = Arc::new(Mutex::new(Vec::new()));
+            let completion_waits = Arc::new(Mutex::new(Vec::new()));
+            let acquisitions = Arc::new(AtomicUsize::new(0));
+            let rounds = Arc::new(AtomicUsize::new(0));
+            let round_count = rounds.clone();
+            let _round_hook = observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| {
+                    if step == "bind-round-acquired" {
+                        round_count.fetch_add(1, Ordering::SeqCst);
+                        // Model one slow protected section, not one delay per root.
+                        std::thread::sleep(delay);
+                    }
+                }),
+            );
             let mut hooks = Vec::new();
             let mut roots = Vec::new();
             for index in 0..BINDS {
@@ -2794,8 +3117,6 @@ mod storage_retention_tests {
                         "bind-waiting" => phases.lock().unwrap().0 = Instant::now(),
                         "bind-acquired" => {
                             phases.lock().unwrap().1 = Instant::now();
-                            // Model slow durable writes without generating CPU load.
-                            std::thread::sleep(delay);
                         }
                         "bind-released" => {
                             let (waiting, acquired) = *phases.lock().unwrap();
@@ -2809,19 +3130,30 @@ mod storage_retention_tests {
                 ));
                 roots.push(root);
             }
+            let wall_started = Instant::now();
             let results = std::thread::scope(|scope| {
                 let workers: Vec<_> = roots
                     .iter()
                     .map(|root| {
                         let ready = &ready;
+                        let acquisitions = &acquisitions;
+                        let completion_waits = &completion_waits;
                         let storage = temp.path();
                         scope.spawn(move || {
                             ready.wait();
-                            record_bind(
+                            crate::fs_lock::io_ledger::take();
+                            let started = Instant::now();
+                            let result = record_bind(
                                 storage,
                                 root,
                                 &crate::path_identity::project_scope_key(root),
-                            )
+                            );
+                            completion_waits.lock().unwrap().push(started.elapsed());
+                            acquisitions.fetch_add(
+                                crate::fs_lock::io_ledger::take().acquisitions as usize,
+                                Ordering::SeqCst,
+                            );
+                            result
                         })
                     })
                     .collect();
@@ -2833,11 +3165,15 @@ mod storage_retention_tests {
             let mut measurements = measurements.lock().unwrap().clone();
             measurements.sort_by_key(|(wait, _)| *wait);
             eprintln!(
-                "record_bind queue: binds={BINDS} delay={delay:?} published={} wait[min/p50/max]={:?}/{:?}/{:?} hold[max]={:?} errors={:?}",
+                "record_bind queue: binds={BINDS} delay={delay:?} rounds={} lock_acquisitions={} wall={:?} published={} wait[min/p50/max]={:?}/{:?}/{:?} max_binder_wait={:?} hold[max]={:?} errors={:?}",
+                rounds.load(Ordering::SeqCst),
+                acquisitions.load(Ordering::SeqCst),
+                wall_started.elapsed(),
                 measurements.len(),
                 measurements.first().map(|m| m.0),
                 measurements.get(measurements.len() / 2).map(|m| m.0),
                 measurements.last().map(|m| m.0),
+                completion_waits.lock().unwrap().iter().copied().max(),
                 measurements.iter().map(|m| m.1).max(),
                 results.iter().filter_map(|r| r.as_ref().err()).collect::<Vec<_>>()
             );
@@ -2851,6 +3187,404 @@ mod storage_retention_tests {
                 assert_eq!(binding.artifact_key, scope);
             }
         }
+    }
+
+    #[test]
+    fn record_bind_group_commit_coalesces_sixty_four_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BINDS: usize = 64;
+        #[cfg(target_os = "linux")]
+        {
+            const CHILD: &str = "AFT_BIND_LOW_FD_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                    0
+                );
+                limit.rlim_cur = 64.min(limit.rlim_max);
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            } else {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "storage_retention::storage_retention_tests::record_bind_group_commit_coalesces_sixty_four_callers", "--nocapture"])
+                    .env(CHILD, "1").output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "64 binders exceeded the file-handle budget: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("retention/roots");
+        crate::backup::create_private_durable_dir(&directory).unwrap();
+        let roots: Vec<_> = (0..BINDS)
+            .map(|index| {
+                let root = temp.path().join(format!("checkout-{index}"));
+                fs::create_dir(&root).unwrap();
+                fs::canonicalize(root).unwrap()
+            })
+            .collect();
+        let arrivals = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+        let directory_syncs = Arc::new(AtomicUsize::new(0));
+        let file_syncs = Arc::new(AtomicUsize::new(0));
+        let _hook = {
+            let arrivals = arrivals.clone();
+            let directory_syncs = directory_syncs.clone();
+            let file_syncs = file_syncs.clone();
+            let directory = directory.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "bind-enqueued" => {
+                        *arrivals.0.lock().unwrap() += 1;
+                        arrivals.1.notify_all();
+                    }
+                    "bind-round-collecting" => {
+                        let count = arrivals.0.lock().unwrap();
+                        let (count, timeout) = arrivals
+                            .1
+                            .wait_timeout_while(count, Duration::from_secs(20), |count| {
+                                *count < BINDS
+                            })
+                            .unwrap();
+                        assert!(!timeout.timed_out(), "only {count} callers enqueued");
+                        crate::durability::take();
+                    }
+                    "bind-round-staged" => {
+                        assert_eq!(
+                            fs::read_dir(&directory)
+                                .unwrap()
+                                .filter(|entry| {
+                                    entry
+                                        .as_ref()
+                                        .unwrap()
+                                        .path()
+                                        .extension()
+                                        .is_some_and(|ext| ext == "json")
+                                })
+                                .count(),
+                            0,
+                            "a final record appeared before staging completed"
+                        );
+                    }
+                    "bind-round-durable" => {
+                        let events = crate::durability::take();
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|(kind, path)| {
+                                    *kind == crate::durability::EventKind::FileSync
+                                        && path.parent() == Some(directory.as_path())
+                                })
+                                .count(),
+                            BINDS,
+                            "round lost durable file syncs"
+                        );
+                        let last_file_sync = events
+                            .iter()
+                            .rposition(|(kind, path)| {
+                                *kind == crate::durability::EventKind::FileSync
+                                    && path.parent() == Some(directory.as_path())
+                            })
+                            .unwrap();
+                        let first_replace = events
+                            .iter()
+                            .position(|(kind, path)| {
+                                *kind == crate::durability::EventKind::AtomicReplace
+                                    && path.parent() == Some(directory.as_path())
+                            })
+                            .unwrap();
+                        assert!(
+                            last_file_sync < first_replace,
+                            "a rename preceded the round's file syncs"
+                        );
+                        #[cfg(unix)]
+                        {
+                            let last_replace = events
+                                .iter()
+                                .rposition(|(kind, path)| {
+                                    *kind == crate::durability::EventKind::AtomicReplace
+                                        && path.parent() == Some(directory.as_path())
+                                })
+                                .unwrap();
+                            let directory_sync = events
+                                .iter()
+                                .position(|(kind, path)| {
+                                    *kind == crate::durability::EventKind::DirectorySync
+                                        && path == &directory
+                                })
+                                .unwrap();
+                            assert!(last_replace < directory_sync);
+                        }
+                        for (kind, path) in events {
+                            if kind == crate::durability::EventKind::DirectorySync
+                                && path == directory
+                            {
+                                directory_syncs.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if kind == crate::durability::EventKind::FileSync
+                                && path.parent() == Some(directory.as_path())
+                            {
+                                file_syncs.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let ready = std::sync::Barrier::new(BINDS);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = roots
+                .iter()
+                .map(|root| {
+                    let ready = &ready;
+                    let acquisitions = &acquisitions;
+                    let storage = temp.path();
+                    scope.spawn(move || {
+                        ready.wait();
+                        crate::fs_lock::io_ledger::take();
+                        let result = record_bind(
+                            storage,
+                            root,
+                            &crate::path_identity::project_scope_key(root),
+                        );
+                        acquisitions.fetch_add(
+                            crate::fs_lock::io_ledger::take().acquisitions as usize,
+                            Ordering::SeqCst,
+                        );
+                        result
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            acquisitions.load(Ordering::SeqCst),
+            1,
+            "binds were not coalesced"
+        );
+        assert_eq!(file_syncs.load(Ordering::SeqCst), BINDS);
+        #[cfg(unix)]
+        assert_eq!(
+            directory_syncs.load(Ordering::SeqCst),
+            1,
+            "directory synced per binding"
+        );
+        for root in roots {
+            let key = crate::path_identity::project_scope_key(&root);
+            let path = directory.join(format!("{key}.json"));
+            let binding: Binding = read_json(&path).unwrap();
+            assert_eq!(binding.root, root);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn record_bind_failed_group_retry_is_idempotent_and_extra_records_expire() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("retention/roots");
+        let roots: Vec<_> = (0..2)
+            .map(|index| {
+                let root = temp.path().join(format!("checkout-{index}"));
+                fs::create_dir(&root).unwrap();
+                let root = fs::canonicalize(root).unwrap();
+                cache(
+                    temp.path(),
+                    "views",
+                    &crate::path_identity::project_scope_key(&root),
+                );
+                root
+            })
+            .collect();
+        let arrivals = Arc::new((Mutex::new(0), Condvar::new()));
+        let inject = Arc::new(AtomicBool::new(true));
+        let _hook = {
+            let arrivals = arrivals.clone();
+            let directory = directory.clone();
+            let inject = inject.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "bind-enqueued" => {
+                        *arrivals.0.lock().unwrap() += 1;
+                        arrivals.1.notify_all();
+                    }
+                    "bind-round-collecting" if inject.load(Ordering::SeqCst) => {
+                        let (count, timeout) = arrivals
+                            .1
+                            .wait_timeout_while(
+                                arrivals.0.lock().unwrap(),
+                                Duration::from_secs(10),
+                                |count| *count < 2,
+                            )
+                            .unwrap();
+                        assert!(!timeout.timed_out(), "only {count} binds enqueued");
+                    }
+                    "bind-round-staged" if inject.swap(false, Ordering::SeqCst) => {
+                        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+                            *slot.borrow_mut() = Some(directory.clone());
+                        });
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let errors = std::thread::scope(|scope| {
+            let workers: Vec<_> = roots
+                .iter()
+                .map(|root| {
+                    let storage = temp.path();
+                    scope.spawn(move || {
+                        record_bind(
+                            storage,
+                            root,
+                            &crate::path_identity::project_scope_key(root),
+                        )
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap().unwrap_err())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(errors[0].kind(), errors[1].kind());
+        assert_eq!(errors[0].to_string(), errors[1].to_string());
+        assert!(errors[0]
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), roots.len());
+        for (index, root) in roots.iter().enumerate() {
+            let key = crate::path_identity::project_scope_key(root);
+            let path = directory.join(format!("{key}.json"));
+            let before: Binding = read_json(&path).unwrap();
+            if index == 0 {
+                record_bind(temp.path(), root, &key).unwrap();
+            }
+            let after: Binding = read_json(&path).unwrap();
+            assert_eq!(before.root, after.root);
+            assert_eq!(before.artifact_key, after.artifact_key);
+            assert!(after.last_bound_ms >= before.last_bound_ms);
+            fs::remove_dir(root).unwrap();
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), roots.len());
+        assert_eq!(run_pass_entry_bound(temp.path()).removed_roots, 0);
+        for root in &roots {
+            let key = crate::path_identity::project_scope_key(root);
+            let path = directory.join(format!("{key}.json"));
+            let mut binding: Binding = read_json(&path).unwrap();
+            binding.last_bound_ms = 0;
+            atomic_json(&path, &binding).unwrap();
+        }
+        let report = run_pass_entry_bound(temp.path());
+        assert_eq!(report.removed_roots, 2, "{report:?}");
+        run_pass_entry_bound(temp.path());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn record_bind_arriving_during_publication_uses_next_round() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let key = crate::path_identity::project_scope_key(&fs::canonicalize(&second).unwrap());
+        let second_record = temp.path().join(format!("retention/roots/{key}.json"));
+        let (admitted, admission) = mpsc::channel();
+        let (enqueued, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = Mutex::new(resumed);
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let _hook = {
+            let rounds = rounds.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    "bind-round-acquired" => {
+                        if rounds.fetch_add(1, Ordering::SeqCst) == 0 {
+                            admitted.send(()).unwrap();
+                            resumed
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10))
+                                .unwrap();
+                        }
+                    }
+                    "bind-enqueued" => {
+                        enqueued.send(()).unwrap();
+                    }
+                    "bind-round-durable" if rounds.load(Ordering::SeqCst) == 1 => {
+                        assert!(
+                            !second_record.exists(),
+                            "late bind entered a publishing snapshot"
+                        );
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| record_bind(temp.path(), &first, "0123456789abcdef"));
+            admission.recv_timeout(Duration::from_secs(10)).unwrap();
+            arrival.recv_timeout(Duration::from_secs(10)).unwrap();
+            let two = scope.spawn(|| record_bind(temp.path(), &second, "fedcba9876543210"));
+            arrival.recv_timeout(Duration::from_secs(10)).unwrap();
+            resume.send(()).unwrap();
+            one.join().unwrap().unwrap();
+            two.join().unwrap().unwrap();
+        });
+        assert_eq!(rounds.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn record_bind_lock_chain_preserves_one_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        let pending_path = temp.path().join("retention/bind-pending.lock");
+        let sweep_path = temp.path().join("retention/sweep.lock");
+        let _sweep = crate::fs_lock::try_acquire(&sweep_path, Duration::ZERO).unwrap();
+        let clock = crate::fs_lock::retry_clock::Guard::install(Duration::from_millis(40));
+        let started = crate::fs_lock::acquisition_now();
+        let deadline = started + Duration::from_millis(100);
+        let _pending = bind_lock_until(&pending_path, deadline, started).unwrap();
+        let error = match bind_lock_until(&sweep_path, deadline, started) {
+            Ok(_) => panic!("admitted through an occupied sweep lock"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let wait = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<BindLockError>()
+            .unwrap();
+        assert_eq!(wait.path, sweep_path);
+        let (elapsed, sleeps, _) = clock.observations();
+        assert_eq!(
+            elapsed,
+            Duration::from_millis(100),
+            "lock chain renewed its budget"
+        );
+        assert_eq!(sleeps, vec![Duration::from_millis(60)]);
     }
 
     #[test]
