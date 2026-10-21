@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use htmd::{
     element_handler::{HandlerResult, Handlers},
@@ -29,6 +29,17 @@ const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(30_000);
 const BODY_CHUNK_TIMEOUT: Duration = Duration::from_millis(15_000);
 const MAX_REDIRECTS: usize = 5;
+
+/// Longest one URL fetch may take, whatever budget the call has left. Every
+/// phase (name lookup, connect, response headers, body) shares this one
+/// deadline, so redirects and retries cannot multiply it.
+const URL_FETCH_CEILING: Duration = Duration::from_secs(20);
+/// Time kept back from the call's budget so that converting, caching and
+/// rendering the fetched document still fit before the call's own deadline.
+const URL_FETCH_RETURN_MARGIN: Duration = Duration::from_secs(1);
+/// A transient failure is retried only when the backoff plus at least this
+/// much time for the next attempt still fit before the fetch deadline.
+const MIN_USEFUL_ATTEMPT: Duration = Duration::from_secs(1);
 
 /// Retry budget for transient connect/transport failures only. Agents
 /// shouldn't have to retry manually for a single TCP/TLS hiccup. We cap
@@ -62,16 +73,107 @@ pub struct UrlFetchOptions {
     pub atomic_write_observer: Option<Arc<dyn Fn(&Path, &Path) + Send + Sync>>,
 }
 
+/// The part of a fetch that was running when its deadline or a stall limit
+/// stopped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPhase {
+    Dns,
+    Connect,
+    Headers,
+    Body,
+}
+
+impl FetchPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::Connect => "connect",
+            Self::Headers => "headers",
+            Self::Body => "body",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UrlFetchError {
+    code: &'static str,
     message: String,
+    phase: Option<FetchPhase>,
 }
 
 impl UrlFetchError {
     fn new(message: impl Into<String>) -> Self {
         Self {
+            code: "url_fetch_failed",
             message: message.into(),
+            phase: None,
         }
+    }
+
+    fn timeout(phase: FetchPhase, message: impl Into<String>) -> Self {
+        Self {
+            code: "url_fetch_timeout",
+            message: message.into(),
+            phase: Some(phase),
+        }
+    }
+
+    /// Response error code: `url_fetch_timeout` when a deadline or stall
+    /// limit stopped the fetch, otherwise `url_fetch_failed`.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The phase a timed-out fetch was in; `None` for other failures.
+    pub fn phase(&self) -> Option<FetchPhase> {
+        self.phase
+    }
+}
+
+/// One deadline for a whole fetch, taken from the call's filesystem budget
+/// (less a margin for the reply) and capped at [`URL_FETCH_CEILING`]. A call
+/// with no budget gets the ceiling.
+#[derive(Debug, Clone, Copy)]
+struct FetchDeadline {
+    at: Instant,
+    allowed: Duration,
+}
+
+impl FetchDeadline {
+    fn for_current_call() -> Self {
+        let now = Instant::now();
+        let ceiling = now + URL_FETCH_CEILING;
+        let at = match crate::bounded_io::current() {
+            Some(budget) => budget
+                .deadline
+                .checked_sub(URL_FETCH_RETURN_MARGIN)
+                .unwrap_or(now)
+                .clamp(now, ceiling),
+            None => ceiling,
+        };
+        Self {
+            at,
+            allowed: at.saturating_duration_since(now),
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        self.at.saturating_duration_since(Instant::now())
+    }
+
+    fn expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    fn timeout_error(&self, phase: FetchPhase, url: &str) -> UrlFetchError {
+        UrlFetchError::timeout(
+            phase,
+            format!(
+                "URL fetch timed out in the {} phase: the {}ms fetch deadline elapsed fetching {url}",
+                phase.as_str(),
+                self.allowed.as_millis()
+            ),
+        )
     }
 }
 
@@ -109,6 +211,7 @@ pub fn fetch_url_to_cache(
     options: UrlFetchOptions,
 ) -> Result<PathBuf, UrlFetchError> {
     let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
+    let deadline = FetchDeadline::for_current_call();
     let fetch_url = rewrite_url_for_fetch(&parsed);
     validate_public_url(&fetch_url, &options)?;
 
@@ -126,7 +229,7 @@ pub fn fetch_url_to_cache(
         return Ok(cached);
     }
 
-    let response = fetch_with_redirects(&fetch_url, url, &options)?;
+    let response = fetch_with_redirects(&fetch_url, url, &options, &deadline)?;
     if !response.status().is_success() {
         return Err(UrlFetchError::new(format!(
             "HTTP {} {} fetching {url}",
@@ -149,7 +252,7 @@ pub fn fetch_url_to_cache(
         })?;
 
     let total_bytes = response.content_length();
-    let (mut body, download_truncated) = read_response_body(response, url)?;
+    let (mut body, download_truncated) = read_response_body(response, url, &deadline)?;
     let downloaded_bytes = body.len();
     // A byte ceiling can bisect the final UTF-8 character. Do not turn an
     // otherwise valid document prefix into an unreadable cache entry.
@@ -480,13 +583,14 @@ fn fetch_with_redirects(
     start_url: &Url,
     original_url: &str,
     options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
 ) -> Result<HttpResponse, UrlFetchError> {
     let client = build_client(options)?;
     let mut current_url = start_url.clone();
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_public_url(&current_url, options)?;
-        let response = send_with_transient_retries(&client, &current_url)?;
+        let response = send_with_transient_retries(&client, &current_url, deadline)?;
 
         if !response.status().is_redirection() {
             return Ok(response);
@@ -528,44 +632,81 @@ fn fetch_with_redirects(
 /// reqwest still surfaces as Err, or a TLS handshake fault that doesn't read
 /// as `is_connect`), the original error is returned immediately so the user
 /// sees the real failure without an artificial 800ms-plus delay.
+///
+/// Every attempt is limited to the time left before `deadline`, and a retry
+/// runs only when its backoff plus [`MIN_USEFUL_ATTEMPT`] still fit, so
+/// retries can never stretch a fetch past its deadline.
 fn send_with_transient_retries(
     client: &Client,
     target: &Url,
+    deadline: &FetchDeadline,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let mut last_error: Option<reqwest::Error> = None;
-    for attempt in 0..=TRANSIENT_RETRY_ATTEMPTS {
+    let mut attempt = 0;
+    loop {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(deadline.timeout_error(FetchPhase::Connect, target.as_str()));
+        }
+        // A per-request timeout replaces reqwest's default 30 s, which would
+        // otherwise let one silent server hold each attempt for 30 s.
         let result = client
             .get(target.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
+            .timeout(remaining)
             .send();
-        match result {
+        let error = match result {
             Ok(response) => return Ok(response),
-            Err(error) => {
-                if attempt < TRANSIENT_RETRY_ATTEMPTS && is_transient_reqwest_error(&error) {
-                    thread::sleep(Duration::from_millis(TRANSIENT_RETRY_BACKOFFS_MS[attempt]));
-                    last_error = Some(error);
-                    continue;
-                }
-                return Err(UrlFetchError::new(format!(
-                    "Failed to fetch {}: {}",
-                    target.as_str(),
-                    reqwest_error_detail(&error)
-                )));
-            }
+            Err(error) => error,
+        };
+        let backoff = TRANSIENT_RETRY_BACKOFFS_MS
+            .get(attempt)
+            .map(|ms| Duration::from_millis(*ms))
+            .filter(|backoff| {
+                is_transient_reqwest_error(&error)
+                    && *backoff + MIN_USEFUL_ATTEMPT <= deadline.remaining()
+            });
+        if let Some(backoff) = backoff {
+            thread::sleep(backoff);
+            attempt += 1;
+            continue;
         }
+        if error.is_timeout() {
+            return Err(request_timeout_error(&error, deadline, target));
+        }
+        return Err(UrlFetchError::new(format!(
+            "Failed to fetch {}: {}",
+            target.as_str(),
+            reqwest_error_detail(&error)
+        )));
     }
-    // Loop fell through after the last allowed retry exhausted — surface the
-    // most recent transient error rather than swallowing it.
-    Err(UrlFetchError::new(format!(
-        "Failed to fetch {} after {} retries: {}",
-        target.as_str(),
-        TRANSIENT_RETRY_ATTEMPTS,
-        last_error
-            .as_ref()
-            .map(reqwest_error_detail)
-            .unwrap_or_else(|| "unknown transient error".to_string())
-    )))
+}
+
+/// Name the phase a timed-out request was in. reqwest marks a timeout that
+/// stopped connection setup as a connect error; any other request timeout
+/// fired while waiting for the response headers.
+fn request_timeout_error(
+    error: &reqwest::Error,
+    deadline: &FetchDeadline,
+    target: &Url,
+) -> UrlFetchError {
+    let phase = if error.is_connect() {
+        FetchPhase::Connect
+    } else {
+        FetchPhase::Headers
+    };
+    if deadline.expired() {
+        return deadline.timeout_error(phase, target.as_str());
+    }
+    UrlFetchError::timeout(
+        phase,
+        format!(
+            "URL fetch timed out in the {} phase fetching {}: {}",
+            phase.as_str(),
+            target.as_str(),
+            reqwest_error_detail(error)
+        ),
+    )
 }
 
 /// Classify a reqwest error as transient (worth a quick retry) vs terminal.
@@ -1185,7 +1326,15 @@ enum BodyReadEvent {
     Error(io::ErrorKind, String),
 }
 
-fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, bool), UrlFetchError> {
+/// Read at most [`MAX_RESPONSE_BYTES`] (plus one lookahead byte) of the body.
+/// Two limits stop a slow body: no data for [`BODY_CHUNK_TIMEOUT`], and the
+/// fetch deadline, which also stops a server that sends a little data just
+/// often enough to avoid the stall limit.
+fn read_response_body(
+    response: HttpResponse,
+    url: &str,
+    deadline: &FetchDeadline,
+) -> Result<(Vec<u8>, bool), UrlFetchError> {
     // Bound the producer, not just its consumer: an unbounded channel can
     // queue the entire response before the caller notices the byte ceiling.
     let (tx, rx) = mpsc::sync_channel(1);
@@ -1217,8 +1366,19 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
 
     let mut chunks = Vec::new();
     let mut total = 0u64;
+    let slow_body_error = || {
+        if deadline.expired() {
+            deadline.timeout_error(FetchPhase::Body, url)
+        } else {
+            body_stall_error(url)
+        }
+    };
     loop {
-        match rx.recv_timeout(BODY_CHUNK_TIMEOUT) {
+        let wait = BODY_CHUNK_TIMEOUT.min(deadline.remaining());
+        if wait.is_zero() {
+            return Err(deadline.timeout_error(FetchPhase::Body, url));
+        }
+        match rx.recv_timeout(wait) {
             Ok(BodyReadEvent::Chunk(chunk)) => {
                 let remaining = (MAX_RESPONSE_BYTES - total) as usize;
                 chunks.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
@@ -1229,14 +1389,14 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
             }
             Ok(BodyReadEvent::Done) => return Ok((chunks, false)),
             Ok(BodyReadEvent::Error(kind, _message)) if is_body_stall_kind(kind) => {
-                return Err(body_stall_error(url));
+                return Err(slow_body_error());
             }
             Ok(BodyReadEvent::Error(_, message)) => {
                 return Err(UrlFetchError::new(format!(
                     "Failed to read response body for {url}: {message}"
                 )));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(body_stall_error(url)),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(slow_body_error()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(UrlFetchError::new(format!(
                     "Failed to read response body for {url}: body reader stopped unexpectedly"
@@ -1247,10 +1407,13 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
 }
 
 fn body_stall_error(url: &str) -> UrlFetchError {
-    UrlFetchError::new(format!(
-        "Body read stalled (no data for {}ms) fetching {url}",
-        BODY_CHUNK_TIMEOUT.as_millis()
-    ))
+    UrlFetchError::timeout(
+        FetchPhase::Body,
+        format!(
+            "Body read stalled (no data for {}ms) fetching {url}",
+            BODY_CHUNK_TIMEOUT.as_millis()
+        ),
+    )
 }
 
 fn is_body_stall_kind(kind: io::ErrorKind) -> bool {
@@ -1738,3 +1901,7 @@ mod tests {
         assert_eq!(code_fence_for("``` and ````"), "`````");
     }
 }
+
+#[cfg(test)]
+#[path = "url_fetch_deadline_tests.rs"]
+mod deadline_tests;

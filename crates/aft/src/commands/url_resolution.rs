@@ -39,9 +39,22 @@ fn resolve_with_fetch(
                 ..Default::default()
             },
         )
-        .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
+        .map_err(|error| url_fetch_error_response(&req.id, &error));
     }
     ctx.validate_read_path(&req.id, req.session(), Path::new(file))
+}
+
+/// A failed fetch keeps its typed code; a timeout also names its phase.
+fn url_fetch_error_response(id: &str, error: &UrlFetchError) -> Response {
+    match error.phase() {
+        Some(phase) => Response::error_with_data(
+            id,
+            error.code(),
+            error.to_string(),
+            serde_json::json!({ "phase": phase.as_str() }),
+        ),
+        None => Response::error(id, error.code(), error.to_string()),
+    }
 }
 
 #[cfg(test)]
