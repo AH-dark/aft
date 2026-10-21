@@ -857,7 +857,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         file: "commands/inspect.rs",
         enclosing_item: "incomplete_analysis_reason",
         location_or_primitive: "commands::inspect::MAX_PARSE_FAILURE_FILES",
-        reason: "an incomplete-analysis explanation previews five parse-failure paths and says `+N more`; this is a coverage gap, not a findings page. The full failure count stays visible and scope can narrow the affected files; the preview never changes completeness",
+        reason: "an incomplete-analysis explanation previews five parse-failure paths with their parse reasons and says `+N more`; this is a coverage gap, not a findings page. The full failure count and structured parse_errors stay visible and scope can narrow the affected files; the preview never changes completeness",
     },
 ];
 

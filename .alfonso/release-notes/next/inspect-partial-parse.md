@@ -1,0 +1,1 @@
+Inspect keeps dead-code and unused-export findings from successfully parsed files when other files have syntax errors, with incomplete coverage, named parse reasons, and a warning about references from unparsed files.
