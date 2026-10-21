@@ -1,6 +1,7 @@
-//! Deadline behaviour of URL fetches against local servers that stall in one
-//! phase. Each test runs the fetch under a short call budget, the same way a
-//! tool call does, and checks the typed timeout and how long it took.
+//! URL fetches against local test servers: deadlines for servers that stall
+//! in one phase, remembered failures, and reuse of the document cache. Most
+//! tests run the fetch under a short call budget, the same way a tool call
+//! does, and check the typed timeout and how long it took.
 
 use super::*;
 use std::net::{TcpListener, TcpStream};
@@ -540,4 +541,35 @@ fn a_retry_stopped_by_the_deadline_while_connecting_is_named_the_connect_phase()
             && elapsed < URL_FETCH_CEILING + Duration::from_secs(2),
         "{elapsed:?}"
     );
+}
+
+#[test]
+fn a_cached_html_page_is_served_from_the_cache_without_a_new_fetch() {
+    let storage = tempfile::tempdir().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    let address = serve(move |_, mut stream| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let body = b"<html><body><h2>Heading 1</h2><p>text</p></body></html>";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+    });
+    let target = url(address, "/guide/page.html");
+    let (first, _) = fetch_within(Duration::from_secs(5), &target, storage.path(), local());
+    let first = first.expect("first fetch");
+    let modified = fs::metadata(&first).unwrap().modified().unwrap();
+    let (second, _) = fetch_within(Duration::from_secs(5), &target, storage.path(), local());
+    let second = second.expect("cached copy");
+    assert_eq!(first, second);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the page was fetched again"
+    );
+    // An unchanged file keeps the parsed symbols of the last call valid.
+    assert_eq!(fs::metadata(&second).unwrap().modified().unwrap(), modified);
 }

@@ -729,7 +729,11 @@ fn fresh_cached_path(
 
     let content_type = meta.content_type.as_str();
     let current = resolve_fetch_extension(url, content_type);
-    let expected_ext = current.map(|(ext, _)| ext);
+    // An HTML page is stored converted to Markdown, so a URL whose path ends
+    // in .html or .htm finds its cached copy under .md. Comparing against
+    // .html would miss the cache on every call and fetch, convert and
+    // re-parse the whole page again.
+    let expected_ext = current.map(|(ext, _)| if ext == ".html" { ".md" } else { ext });
     if expected_ext != Some(meta.extension.as_str()) {
         return Ok(None);
     }
