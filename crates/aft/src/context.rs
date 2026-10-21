@@ -6747,6 +6747,23 @@ impl AppContext {
         key
     }
 
+    /// The artifact key for `canonical_root`, or `None` when it is this
+    /// context's bound root and its last bind left the identity provisional.
+    ///
+    /// A provisional root has no key yet, and deriving one asks Git again on
+    /// every call: nothing caches a failed Git answer, so a root whose Git
+    /// identity is unreadable (for example a dubious-ownership refusal) costs
+    /// three Git attempts and their retry sleeps each time. Readers that poll,
+    /// such as standing-root maintenance, use this instead of
+    /// [`Self::memoized_artifact_cache_key`] and handle the provisional root
+    /// without a key.
+    pub(crate) fn settled_artifact_cache_key(&self, canonical_root: &Path) -> Option<String> {
+        if self.bound_identity_unsettled(canonical_root) {
+            return None;
+        }
+        Some(self.memoized_artifact_cache_key(canonical_root))
+    }
+
     /// True when `root` is this context's bound root and its last bind left
     /// the identity provisional.
     fn bound_identity_unsettled(&self, root: &Path) -> bool {

@@ -4,7 +4,8 @@
 //! requests `tick` on a worker from its existing maintenance timer arm. Every
 //! root pass uses the existing executor's coalescable maintenance lane.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -284,11 +285,11 @@ impl StandingActor {
             return;
         };
         ctx.begin_configure_ack_step("session_cache_key");
-        let session_key = ctx.memoized_artifact_cache_key(&session_root);
+        let session_claim = SessionClaim::of(ctx, &session_root);
         ctx.begin_configure_ack_step("revoke_and_checkpoint");
         for entry in entries
             .into_iter()
-            .filter(|entry| entry.artifact_key == session_key)
+            .filter(|entry| session_claim.covers(entry))
         {
             match self.roots.begin_case_a_bind(&entry.literal_path) {
                 Ok(_) => {
@@ -340,7 +341,7 @@ impl StandingActor {
         self.retire_removed_actors(&report.removed);
         let contended = self.resume_entries_without_bound_session(&report.active_entries);
         for entry in report.active_entries {
-            if !contended.contains(&entry.artifact_key) {
+            if !contended.iter().any(|claim| claim.covers(&entry)) {
                 self.submit_entry_pass(entry, &snapshot);
             }
         }
@@ -366,8 +367,8 @@ impl StandingActor {
     fn resume_entries_without_bound_session(
         &self,
         entries: &[StandingRootEntry],
-    ) -> HashSet<String> {
-        let mut contended = HashSet::new();
+    ) -> Vec<SessionClaim> {
+        let mut contended = Vec::new();
         if entries.is_empty() {
             return contended;
         }
@@ -379,10 +380,10 @@ impl StandingActor {
                 let root = ctx
                     .canonical_cache_root_opt()
                     .or_else(|| ctx.config().project_root.clone())?;
-                let key = ctx.memoized_artifact_cache_key(&root);
+                let claim = SessionClaim::of(&ctx, &root);
                 match ctx.try_subc_unbound_quiesced() {
                     Some(true) => None,
-                    Some(false) => Some(key),
+                    Some(false) => Some(claim),
                     None => {
                         // A busy session may still own this artifact family.
                         // Do not resume it or wait under standing reconciliation:
@@ -391,14 +392,14 @@ impl StandingActor {
                             "standing roots skipping {} this pass: root lifecycle admission busy",
                             root_id.as_path().display()
                         );
-                        contended.insert(key.clone());
-                        Some(key)
+                        contended.push(claim.clone());
+                        Some(claim)
                     }
                 }
             })
             .collect::<Vec<_>>();
         for entry in entries {
-            if !sessions.contains(&entry.artifact_key) {
+            if !sessions.iter().any(|claim| claim.covers(entry)) {
                 // No session can prove any standing kind fresh after unbind, so
                 // resume marks the whole selected set strict before its next pass.
                 if let Err(error) = self.roots.resume_after_session(&entry.literal_path, &[]) {
@@ -550,6 +551,45 @@ impl StandingActor {
             .lock()
             .insert(entry.literal_path.clone(), (root_id.clone(), true));
         Some(root_id)
+    }
+}
+
+/// The standing entries a bound session takes over from standing maintenance:
+/// its bind pauses them (`begin_session_bind`), and standing maintenance does
+/// not resume them while the session stays bound.
+#[derive(Clone, Debug)]
+enum SessionClaim {
+    /// Every standing entry with the session's artifact key, whatever its
+    /// path: a sibling clone of the same repository shares the family.
+    Key(String),
+    /// A session whose last bind left its identity provisional has no key
+    /// yet. That bind published no key and turned its indexes off, so it
+    /// reads and writes no shared artifact family; it claims only the
+    /// standing entry for its own folder, which it takes over once its
+    /// identity settles.
+    ///
+    /// Deriving a key here instead would ask Git on every maintenance tick
+    /// (no failed Git answer is cached), and would claim the wrong entries
+    /// anyway: the key Git alone gives can differ from the settled key, and
+    /// from the key the standing entry for the same folder resolved, which
+    /// may keep an older path or repository pin.
+    Root(PathBuf),
+}
+
+impl SessionClaim {
+    fn of(ctx: &AppContext, root: &Path) -> Self {
+        match ctx.settled_artifact_cache_key(root) {
+            Some(key) => Self::Key(key),
+            // Spelled as the standing resolver spells `resolved_target`.
+            None => Self::Root(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())),
+        }
+    }
+
+    fn covers(&self, entry: &StandingRootEntry) -> bool {
+        match self {
+            Self::Key(key) => entry.artifact_key == *key,
+            Self::Root(root) => entry.resolved_target == *root,
+        }
     }
 }
 
@@ -989,6 +1029,67 @@ mod tests {
         assert!(
             actor.roots.admit_build(&literal).is_none(),
             "the bind's publication revocation must remain in force"
+        );
+    }
+
+    /// A session whose last bind left its identity provisional has no
+    /// artifact key, so it claims the standing entry for its own folder by
+    /// path: its bind pauses that entry, and maintenance ticks keep it paused
+    /// while the session stays bound, without deriving a key for the session.
+    #[test]
+    fn provisional_session_keeps_the_standing_entry_for_its_folder_paused() {
+        use crate::config::{IndexConfig, IndexRootConfig};
+
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let literal = canonical.to_string_lossy().into_owned();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(canonical.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                index: IndexConfig {
+                    roots: vec![IndexRootConfig {
+                        path: literal.clone(),
+                        indexes: vec![IndexKind::Search],
+                    }],
+                },
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(canonical.clone());
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_degraded_reasons(vec![format!(
+            "{}: stubbed unreadable repository",
+            crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON
+        )]);
+        assert!(ctx.artifact_identity_provisional());
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(
+            ProjectRootId::from_path(&canonical).unwrap(),
+            Arc::clone(&ctx),
+        );
+        let actor = StandingActor::new(ctx.app(), Arc::clone(&executor))
+            .with_startup_storage_dir(storage.path());
+
+        actor.begin_session_bind(&ctx);
+        assert_eq!(actor.roots.entries().len(), 1);
+        assert!(
+            actor.roots.admit_build(&literal).is_none(),
+            "the bind pauses the standing entry for the session's folder"
+        );
+        for _ in 0..4 {
+            actor.tick();
+        }
+        assert!(
+            actor.roots.admit_build(&literal).is_none(),
+            "maintenance resumed the standing entry of a bound provisional session's folder"
+        );
+        assert_eq!(
+            ctx.artifact_cache_key_derivation_count_for_test(),
+            0,
+            "no key is derived for a provisional session"
         );
     }
 

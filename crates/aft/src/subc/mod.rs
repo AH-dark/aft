@@ -19024,11 +19024,11 @@ mod tests {
         );
     }
 
-    /// A standing-roots pass derives the artifact key of every session actor,
-    /// including one whose bind left the identity provisional because aft.db
-    /// was busy. When that pass runs after aft.db frees but before the
-    /// retry's next attempt, the retry must still settle the root and turn
-    /// its indexes on.
+    /// A standing-roots pass over every session actor meets one whose bind
+    /// left the identity provisional because aft.db was busy. When that pass
+    /// runs after aft.db frees but before the retry's next attempt, the retry
+    /// must still settle the root and turn its indexes on, and the pass must
+    /// leave no key cached for the provisional root.
     #[test]
     fn standing_pass_over_a_provisional_session_keeps_its_identity_retry() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -19088,9 +19088,10 @@ mod tests {
                         .with_startup_storage_dir(configured.storage.path());
                 let derivations = ctx.artifact_cache_key_derivation_count_for_test();
                 standing.tick();
-                assert!(
-                    ctx.artifact_cache_key_derivation_count_for_test() > derivations,
-                    "the standing pass must derive the provisional session's key"
+                assert_eq!(
+                    ctx.artifact_cache_key_derivation_count_for_test(),
+                    derivations,
+                    "the standing pass claims a provisional session by its folder, not a key"
                 );
                 let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
 
@@ -19109,6 +19110,87 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// A session whose Git identity is unreadable (here every root-commit
+    /// probe for its folder fails, as a dubious-ownership refusal does) stays
+    /// provisional until its next bind, while standing maintenance for
+    /// another folder keeps ticking. Neither the bind's standing step nor
+    /// any tick may ask Git about the session's folder: nothing caches a
+    /// failed Git answer, so every ask costs three Git attempts and their
+    /// retry sleeps, and it delays maintenance of the other folder.
+    #[test]
+    fn standing_ticks_over_an_unreadable_git_session_ask_git_nothing() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let standing_dir = tempfile::tempdir().unwrap();
+        std::fs::write(standing_dir.path().join("lib.rs"), "pub fn standing() {}\n").unwrap();
+        let standing_root = std::fs::canonicalize(standing_dir.path()).unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Its sender is dropped at once, so no probe attempt is held.
+        let (_, release) = std::sync::mpsc::channel();
+        let _probe =
+            crate::search_index::force_git_root_commit_probe_held_transient_for_paths_for_test(
+                vec![canonical_root.clone()],
+                Arc::clone(&attempts),
+                release,
+            );
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-unreadable-git-standing",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "unreadable-git-standing-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": false },
+                    "index": { "roots": [{ "path": standing_root, "indexes": ["search"] }] },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = crate::commands::configure::handle_configure(&bind, &ctx);
+        assert!(bound.success, "{}", bound.data);
+        let reason = ctx
+            .artifact_identity_provisional_reason()
+            .expect("an unreadable Git identity leaves the bind provisional");
+        assert!(
+            reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON),
+            "{reason}"
+        );
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        assert!(
+            attempts.load(Ordering::SeqCst) > 0,
+            "the bind asks Git through the stubbed probe"
+        );
+
+        let standing = super::standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
+            .with_startup_storage_dir(configured.storage.path());
+        let before = attempts.load(Ordering::SeqCst);
+        standing.begin_session_bind(&ctx);
+        for _ in 0..8 {
+            standing.tick();
+        }
+        assert!(
+            executor
+                .actor_context(&ProjectRootId::from_path(&standing_root).unwrap())
+                .is_some(),
+            "the ticks reached the standing passes, which run after the session check"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst) - before,
+            0,
+            "standing maintenance asked Git about a session folder whose Git identity is unreadable"
+        );
+        assert!(ctx.artifact_identity_provisional());
     }
     /// loop's tick does, until the identity retry hands back a bind to replay.
     fn pump_until_identity_replay(
