@@ -109,6 +109,8 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
+ "tower-layer",
+ "tower-service",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",

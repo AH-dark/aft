@@ -461,3 +461,83 @@ fn outline_says_a_repeated_failure_is_cached_and_when_it_is_fetched_again() {
         .unwrap()
         .contains("cached failure"));
 }
+
+#[test]
+fn a_silent_server_gets_the_headers_limit_and_no_retry() {
+    let storage = tempfile::tempdir().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&connections);
+    let address = serve(move |_, _stream| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(SERVER_STALL);
+    });
+    // The budget leaves the full 20 s ceiling, so the 15 s headers limit is
+    // what ends the wait.
+    let (result, elapsed) = fetch_within(
+        Duration::from_secs(30),
+        &url(address, "/silent.md"),
+        storage.path(),
+        local(),
+    );
+    let error = result.expect_err("a silent server must fail");
+    assert_eq!(error.phase(), Some(FetchPhase::Headers), "{error}");
+    assert!(error.to_string().contains("15000ms limit"), "{error}");
+    assert!(
+        elapsed >= HEADERS_TIMEOUT && elapsed < URL_FETCH_CEILING,
+        "{elapsed:?}"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_stalled_connect_ends_at_the_connect_limit() {
+    let storage = tempfile::tempdir().unwrap();
+    let address = serve(|_, _stream| thread::sleep(SERVER_STALL));
+    let options = UrlFetchOptions {
+        connect_delay: Some(SERVER_STALL),
+        ..local()
+    };
+    // An 11 s fetch deadline: the 10 s connect limit ends the first attempt,
+    // and the second does not fit in what is left.
+    let (result, elapsed) = fetch_within(
+        Duration::from_secs(12),
+        &url(address, "/unreachable.md"),
+        storage.path(),
+        options,
+    );
+    let error = result.expect_err("a connect that never finishes must fail");
+    assert_eq!(error.phase(), Some(FetchPhase::Connect), "{error}");
+    assert!(error.to_string().contains("10000ms limit"), "{error}");
+    assert!(
+        elapsed >= CONNECT_TIMEOUT && elapsed < Duration::from_secs(11),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn a_retry_stopped_by_the_deadline_while_connecting_is_named_the_connect_phase() {
+    let storage = tempfile::tempdir().unwrap();
+    let address = serve(|_, _stream| thread::sleep(SERVER_STALL));
+    let options = UrlFetchOptions {
+        connect_delay: Some(SERVER_STALL),
+        ..local()
+    };
+    let (result, elapsed) = fetch_within(
+        Duration::from_secs(30),
+        &url(address, "/unreachable.md"),
+        storage.path(),
+        options,
+    );
+    let error = result.expect_err("a connect that never finishes must fail");
+    // The first attempt ends at the 10 s connect limit and is retried; the
+    // retry has less than 10 s left, so the fetch deadline ends it while it
+    // is still connecting, and it must still be named the connect phase.
+    assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+    assert_eq!(error.phase(), Some(FetchPhase::Connect), "{error}");
+    assert!(error.to_string().contains("fetch deadline"), "{error}");
+    assert!(
+        elapsed >= URL_FETCH_CEILING - Duration::from_millis(500)
+            && elapsed < URL_FETCH_CEILING + Duration::from_secs(2),
+        "{elapsed:?}"
+    );
+}

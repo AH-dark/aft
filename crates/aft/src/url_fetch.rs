@@ -26,7 +26,13 @@ use crate::parser::detect_language;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(30_000);
+/// Longest a request may take to set up its connection (name lookup, TCP
+/// and TLS), within the fetch deadline.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(10_000);
+/// Longest a request may wait for the response headers, counted from the
+/// start of the request, within the fetch deadline. reqwest applies the same
+/// limit to each later read of the body.
+const HEADERS_TIMEOUT: Duration = Duration::from_millis(15_000);
 const BODY_CHUNK_TIMEOUT: Duration = Duration::from_millis(15_000);
 const MAX_REDIRECTS: usize = 5;
 
@@ -75,6 +81,10 @@ pub struct UrlFetchOptions {
     /// so a test can stall or redirect name resolution without a network.
     #[doc(hidden)]
     pub lookup_override: Option<HostLookup>,
+    /// Test hook: holds every connection attempt this long before it starts
+    /// connecting, standing in for a host that does not answer the connect.
+    #[doc(hidden)]
+    pub connect_delay: Option<Duration>,
 }
 
 /// A host name lookup: the host's addresses, or the lookup's error.
@@ -813,26 +823,30 @@ fn send_with_transient_retries(
             .get(target.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
-            .timeout(remaining)
+            .timeout(remaining.min(HEADERS_TIMEOUT))
             .send();
         let error = match result {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
+        let phase = error
+            .is_timeout()
+            .then(|| timed_out_phase(&error, progress));
+        // A server that accepted the request and stayed silent until the
+        // headers limit is not a passing connection fault; retrying it would
+        // only spend the rest of the deadline the same way.
+        let retryable = is_transient_reqwest_error(&error) && phase != Some(FetchPhase::Headers);
         let backoff = TRANSIENT_RETRY_BACKOFFS_MS
             .get(attempt)
             .map(|ms| Duration::from_millis(*ms))
-            .filter(|backoff| {
-                is_transient_reqwest_error(&error)
-                    && *backoff + MIN_USEFUL_ATTEMPT <= deadline.remaining()
-            });
+            .filter(|backoff| retryable && *backoff + MIN_USEFUL_ATTEMPT <= deadline.remaining());
         if let Some(backoff) = backoff {
             thread::sleep(backoff);
             attempt += 1;
             continue;
         }
-        if error.is_timeout() {
-            return Err(request_timeout_error(&error, deadline, target, progress));
+        if let Some(phase) = phase {
+            return Err(request_timeout_error(&error, phase, deadline, target));
         }
         return Err(UrlFetchError::new(format!(
             "Failed to fetch {}: {}",
@@ -842,31 +856,38 @@ fn send_with_transient_retries(
     }
 }
 
-/// Name the phase a timed-out request was in. A lookup still running in the
-/// resolver means the name lookup; reqwest marks a timeout that stopped
-/// connection setup as a connect error; any other request timeout fired
-/// while waiting for the response headers.
-fn request_timeout_error(
-    error: &reqwest::Error,
-    deadline: &FetchDeadline,
-    target: &Url,
-    progress: &ConnectProgress,
-) -> UrlFetchError {
-    let phase = if progress.lookup_pending() {
+/// Name the phase a timed-out request was in: a name lookup still running in
+/// the resolver, then connection setup still running (or reported by reqwest
+/// as the cause), and otherwise the wait for the response headers.
+fn timed_out_phase(error: &reqwest::Error, progress: &ConnectProgress) -> FetchPhase {
+    if progress.lookup_pending() {
         FetchPhase::Dns
-    } else if error.is_connect() {
+    } else if progress.connect_pending() || error.is_connect() {
         FetchPhase::Connect
     } else {
         FetchPhase::Headers
-    };
+    }
+}
+
+fn request_timeout_error(
+    error: &reqwest::Error,
+    phase: FetchPhase,
+    deadline: &FetchDeadline,
+    target: &Url,
+) -> UrlFetchError {
     if deadline.expired() {
         return deadline.timeout_error(phase, target.as_str());
     }
+    let limit = match phase {
+        FetchPhase::Dns | FetchPhase::Connect => CONNECT_TIMEOUT,
+        FetchPhase::Headers | FetchPhase::Body => HEADERS_TIMEOUT,
+    };
     UrlFetchError::timeout(
         phase,
         format!(
-            "URL fetch timed out in the {} phase fetching {}: {}",
+            "URL fetch timed out in the {} phase after the {}ms limit fetching {}: {}",
             phase.as_str(),
+            limit.as_millis(),
             target.as_str(),
             reqwest_error_detail(error)
         ),
@@ -895,11 +916,15 @@ fn build_client(
         approved,
         connect_overrides: options.connect_overrides.clone(),
         lookup_override: options.lookup_override.clone(),
-        progress,
+        progress: Arc::clone(&progress),
     };
     let builder = Client::builder()
         .redirect(Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
+        .connector_layer(TrackConnect {
+            progress,
+            delay: options.connect_delay,
+        })
         .dns_resolver(Arc::new(resolver));
 
     let tls_config = crate::platform_tls::client_config().map_err(|error| {
@@ -948,6 +973,7 @@ struct ConnectProgress(std::sync::Mutex<AttemptProgress>);
 struct AttemptProgress {
     attempt: u64,
     lookup_pending: bool,
+    connect_pending: bool,
 }
 
 impl ConnectProgress {
@@ -961,6 +987,25 @@ impl ConnectProgress {
         let mut state = self.state();
         state.attempt += 1;
         state.lookup_pending = false;
+        state.connect_pending = false;
+    }
+
+    /// Returns the attempt the connection belongs to.
+    fn connect_started(&self) -> u64 {
+        let mut state = self.state();
+        state.connect_pending = true;
+        state.attempt
+    }
+
+    fn connected(&self, attempt: u64) {
+        let mut state = self.state();
+        if state.attempt == attempt {
+            state.connect_pending = false;
+        }
+    }
+
+    fn connect_pending(&self) -> bool {
+        self.state().connect_pending
     }
 
     /// Returns the attempt the lookup belongs to.
@@ -979,6 +1024,71 @@ impl ConnectProgress {
 
     fn lookup_pending(&self) -> bool {
         self.state().lookup_pending
+    }
+}
+
+/// Connector layer that records when a request starts and finishes setting
+/// up its connection, so a timeout can tell a stalled connect from a server
+/// that accepted the connection and never answered.
+#[derive(Clone)]
+struct TrackConnect {
+    progress: Arc<ConnectProgress>,
+    delay: Option<Duration>,
+}
+
+impl<S> tower_layer::Layer<S> for TrackConnect {
+    type Service = TrackedConnector<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrackedConnector {
+            inner,
+            progress: Arc::clone(&self.progress),
+            delay: self.delay,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TrackedConnector<S> {
+    inner: S,
+    progress: Arc<ConnectProgress>,
+    delay: Option<Duration>,
+}
+
+impl<S, Target> tower_service::Service<Target> for TrackedConnector<S>
+where
+    S: tower_service::Service<Target>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: Target) -> Self::Future {
+        let attempt = self.progress.connect_started();
+        let progress = Arc::clone(&self.progress);
+        let delay = self.delay;
+        let connecting = self.inner.call(target);
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let connection = connecting.await;
+            if connection.is_ok() {
+                progress.connected(attempt);
+            }
+            connection
+        })
     }
 }
 
