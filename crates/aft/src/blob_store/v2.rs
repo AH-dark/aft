@@ -1292,8 +1292,9 @@ fn shared_inner(
 /// RESTART and TRUNCATE would instead wait on the busy handler for other
 /// connections, up to the store's busy timeout, and RESTART and TRUNCATE
 /// also wait for every reader to finish so the log can start over. The
-/// copy is bounded by the log, which SQLite's own checkpoints keep near
-/// 1,000 frames.
+/// copy is bounded by the log's current frame count: SQLite checkpoints on
+/// its own at 1,000 frames, but a checkpoint a reader kept from finishing
+/// can leave the log larger than that.
 fn checkpoint_after_reclaim(
     inner: &StoreInner,
     connection: &rusqlite::Connection,
