@@ -1,6 +1,206 @@
 use super::*;
 use crate::log_redact::SECRET_PLACEHOLDER;
 
+#[test]
+fn bash_background_restart_hex_watch_redaction_is_bounded_and_unlocked() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    let fixture = tempfile::tempdir().unwrap();
+    let original = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&original, &fixture, "cmd", "", "", false);
+    let mut bytes = vec![b'a'; 100 * 1024 * 1024 - 1];
+    let end = bytes.len();
+    // Watch previews mask whole lines; a 100 MiB line would be withheld before
+    // any hashing. A line break keeps the READY line within the mask cap while
+    // its hex run still reaches well past the ticket.
+    bytes[end - 2048] = b'\n';
+    bytes[end - 38..end - 6].copy_from_slice(TICKET.as_bytes());
+    bytes[end - 6..].copy_from_slice(b" READY");
+    std::fs::write(&task.paths.stdout, &bytes).unwrap();
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.completion_has_env_secrets = Some(true);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
+    metadata.notify_on_completion = false;
+    metadata.completion_delivered = true;
+    metadata.completion_ticket_digest = Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    let registry = BgTaskRegistry::default();
+    registry
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let recovered = registry.task(&id).unwrap();
+    {
+        let mut watches = registry.inner.watch_registry.lock().unwrap();
+        watches
+            .register(id.clone(), WatchPattern::Substring("READY".into()), true)
+            .unwrap();
+        watches.set_file_cursor(&format!("{id}:stdout"), (end - 1024) as u64);
+    }
+    let probe_registry = registry.clone();
+    let hashes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_hashes = hashes.clone();
+    crate::log_redact::TICKET_HASH_PROBE.with(|probe| {
+        *probe.borrow_mut() = Some(Box::new(move || {
+            assert!(
+                probe_registry.inner.watch_registry.try_lock().is_ok(),
+                "ticket redaction holds watch_registry"
+            );
+            assert!(
+                probe_hashes.fetch_add(1, Ordering::SeqCst) < 4096,
+                "ticket hash budget exceeded"
+            );
+        }));
+    });
+    let (_, unrelated) =
+        tests::insert_terminal_piped_task(&registry, &fixture, "true", "", "", false);
+    {
+        let mut state = unrelated.lock_state().unwrap();
+        state.metadata.status = BgTaskStatus::Running;
+        state.metadata.notify_on_completion = false;
+        state.child_exit_observed = true;
+    }
+    std::fs::write(&unrelated.paths.exit, "0\n").unwrap();
+    {
+        let mut tasks = registry.inner.watchdog_tasks.lock().unwrap();
+        tasks.insert(id.clone(), recovered.clone());
+        tasks.insert(unrelated.task_id.clone(), unrelated.clone());
+    }
+    let started = Instant::now();
+    super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut HashMap::new());
+    crate::log_redact::TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+    assert!(hashes.load(Ordering::SeqCst) > 0);
+    assert_eq!(registry.active_watch_count(&id), 0);
+    assert_eq!(unrelated.snapshot(0).info.status, BgTaskStatus::Completed);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "unrelated exit stalled behind watch rendering"
+    );
+}
+
+#[test]
+fn bash_background_watch_ticket_straddling_context_edge_is_masked() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    const MD5: &str = "fedcba9876543210fedcba9876543210";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&registry, &fixture, "cmd", "", "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest =
+        Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    for offset in [1, 16, 31] {
+        let text = format!(
+            "{TICKET}{}READY {MD5} {}{TICKET}",
+            "x".repeat(100 - offset),
+            "x".repeat(500 - MD5.len() - 2 - offset)
+        );
+        let start = text.find("READY").unwrap();
+        let (matched, context) =
+            registry.render_watch_preview(&id, text.as_bytes(), start..start + 5);
+        assert_eq!(matched, "READY");
+        assert!(context.contains(MD5));
+        assert!(
+            !context.contains(&TICKET[..16]),
+            "ticket prefix survived: {context}"
+        );
+        assert!(
+            !context.contains(&TICKET[16..]),
+            "ticket suffix survived: {context}"
+        );
+    }
+}
+
+#[test]
+fn bash_background_ticket_budget_withholds_previews_and_keeps_pointers() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let output = format!("{} {TICKET}\n", "a".repeat(9000));
+    let (id, task) =
+        tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &output, "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest =
+        Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    let (matched, context) = registry.render_watch_preview(&id, output.as_bytes(), 0..output.len());
+    assert_eq!(matched, SECRET_PLACEHOLDER);
+    assert!(context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+    let completion = registry.completion_snapshot_for_task(&task).unwrap();
+    assert!(completion.output_truncated);
+    assert!(completion
+        .output_preview
+        .starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+    assert!(completion
+        .output_preview
+        .contains(&task.paths.stdout.display().to_string()));
+    assert!(!completion.output_preview.contains(TICKET));
+    let mut assembled = output;
+    registry.mask_completion_text(&id, &mut assembled);
+    assert!(assembled.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+    assert!(assembled.contains(&task.paths.stdout.display().to_string()));
+    assert!(!assembled.contains(TICKET));
+}
+
+#[test]
+fn bash_background_completion_ticket_tail_uses_intact_halo() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    const MD5: &str = "fedcba9876543210fedcba9876543210";
+    for compressed in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let raw = format!(
+            "{}\n{TICKET} {}\nmd5 {MD5}\n",
+            "x\n".repeat(40_000),
+            "y".repeat(540)
+        );
+        let (_, task) =
+            tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &raw, "", compressed);
+        task.lock_state().unwrap().metadata.completion_ticket_digest =
+            Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_count = count.clone();
+        crate::log_redact::TICKET_HASH_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                assert!(
+                    probe_count.fetch_add(1, Ordering::SeqCst) < 8192,
+                    "completion hashed unrendered capture"
+                );
+            }))
+        });
+        let preview = registry
+            .completion_snapshot_for_task(&task)
+            .unwrap()
+            .output_preview;
+        crate::log_redact::TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+        assert!(
+            !preview.contains("withheld"),
+            "bounded tail was withheld (compressed={compressed}): {preview}"
+        );
+        assert!(preview.contains(MD5));
+        assert!(!preview.contains(&TICKET[..16]));
+        assert!(!preview.contains(&TICKET[16..]));
+        assert!(count.load(Ordering::SeqCst) > 0);
+    }
+}
+
+#[test]
+fn bash_background_ticket_budget_preserves_long_masked_classifier_line() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let raw = format!(
+        "{}{{\"api_key\":\"{}\"}}\n",
+        "x".repeat(30_000),
+        "Z".repeat(40_000)
+    );
+    let (_, task) = tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &raw, "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest = Some(
+        blake3::hash(b"0123456789abcdef0123456789abcdef")
+            .to_hex()
+            .to_string(),
+    );
+    let preview = registry
+        .completion_snapshot_for_task(&task)
+        .unwrap()
+        .output_preview;
+    assert!(preview.contains(SECRET_PLACEHOLDER));
+    assert!(!preview.contains(&"Z".repeat(64)));
+    assert!(!preview.contains("withheld"));
+}
+
 fn fixture_preview(input: &str, compressed: bool, failed: bool) -> String {
     let fixture = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
@@ -41,13 +241,108 @@ fn bash_background_completion_uses_the_selected_child_environment() {
         shell_path: PathBuf::from("bash"),
         environment: std::collections::BTreeMap::from([("SERVICE_TOKEN".into(), actual.into())]),
     };
-    let secrets = crate::sandbox_spawn::completion_secret_values(
+    let secrets = crate::sandbox_spawn::completion_secrets(
         &plan,
         &HashMap::from([("SERVICE_TOKEN".into(), not_passed.into())]),
     );
     assert_eq!(
-        secrets.redact(&format!("{actual} {not_passed}")),
+        secrets.values.redact(&format!("{actual} {not_passed}")),
         format!("{SECRET_PLACEHOLDER} {not_passed}")
+    );
+    assert!(secrets.has_non_ticket_secrets);
+}
+
+#[test]
+fn bash_background_completion_ignores_a_planned_ticket_when_counting_other_secrets() {
+    let plan = SpawnPlan::Host {
+        shell_path: PathBuf::from("bash"),
+        environment: std::collections::BTreeMap::from([(
+            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+            "0123456789abcdef0123456789abcdef".into(),
+        )]),
+    };
+    let secrets = crate::sandbox_spawn::completion_secrets(&plan, &HashMap::new());
+    assert!(!secrets.has_non_ticket_secrets);
+    assert!(secrets.ticket_digest.is_none());
+    assert!(secrets.values.is_empty());
+}
+
+#[test]
+fn bash_background_completion_replay_shows_ticket_only_output_and_masks_ticket() {
+    const TICKET: &str = "0123456789abcdef0123456789abcdef";
+    const MD5_SHAPED: &str = "fedcba9876543210fedcba9876543210";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let raw_output = format!("ticket={TICKET} md5={MD5_SHAPED}\n");
+    let (task_id, task) = tests::insert_terminal_piped_task(
+        &registry,
+        &fixture,
+        "printf ticket",
+        &raw_output,
+        "",
+        false,
+    );
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.completion_has_env_secrets = Some(true);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(false);
+        state.metadata.completion_ticket_digest =
+            Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+        crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+
+    let restarted = BgTaskRegistry::default();
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let replayed = restarted.task(&task_id).unwrap();
+    let completion = restarted.completion_snapshot_for_task(&replayed).unwrap();
+    assert_eq!(
+        completion.output_preview,
+        format!("ticket=<REDACTED_SECRET> md5={MD5_SHAPED}\n")
+    );
+    assert!(!completion.output_preview.contains(TICKET));
+    let (match_text, context) =
+        restarted.render_watch_preview(&task_id, raw_output.as_bytes(), 7..(7 + TICKET.len()));
+    assert_eq!(match_text, "<REDACTED_SECRET>");
+    assert!(!context.contains(TICKET));
+    assert!(context.contains(MD5_SHAPED));
+}
+
+#[test]
+fn bash_background_completion_digest_redacts_embedded_ticket_windows_only() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    const MD5_SHAPED: &str = "fedcba9876543210fedcba9876543210";
+    let digest = blake3::hash(TICKET.as_bytes()).to_hex().to_string();
+
+    let surrounded_by_underscores = format!("prefix_{TICKET}_suffix");
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(&surrounded_by_underscores, Some(&digest)).unwrap(),
+        "prefix_<REDACTED_SECRET>_suffix"
+    );
+
+    let longer_hex_run = format!("a{TICKET}b");
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(&longer_hex_run, Some(&digest)).unwrap(),
+        "a<REDACTED_SECRET>b"
+    );
+    let mut match_range = 1..(1 + TICKET.len());
+    let redacted_range = crate::log_redact::redact_ticket_digest_range(
+        &longer_hex_run,
+        &mut match_range,
+        Some(&digest),
+    )
+    .unwrap();
+    assert_eq!(redacted_range.get(match_range), Some("<REDACTED_SECRET>"));
+    let adjacent_tickets = format!("{TICKET}{TICKET}");
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(&adjacent_tickets, Some(&digest)).unwrap(),
+        "<REDACTED_SECRET><REDACTED_SECRET>"
+    );
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(MD5_SHAPED, Some(&digest)).unwrap(),
+        MD5_SHAPED
     );
 }
 
@@ -193,6 +488,53 @@ fn bash_background_completion_masks_per_call_env_values() {
 }
 
 #[test]
+fn bash_background_completion_rebuilds_preview_after_long_env_secret_masking() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let secret = "S".repeat(40_000);
+    let raw_output = format!("{}\n{secret}\n", "x".repeat(30_000));
+    let (_, task) = tests::insert_terminal_piped_task(
+        &registry,
+        &fixture,
+        "printf output",
+        &raw_output,
+        "",
+        false,
+    );
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.completion_has_env_secrets = Some(true);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(true);
+        crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+    *task.completion_secrets.lock().unwrap() =
+        Some(crate::log_redact::SecretValues::from_environment([(
+            std::ffi::OsStr::new("DEPLOY_TOKEN"),
+            std::ffi::OsStr::new(&secret),
+        )]));
+
+    let live_preview = registry
+        .completion_snapshot_for_task(&task)
+        .unwrap()
+        .output_preview;
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    let restarted = BgTaskRegistry::default();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let replayed = restarted.task(&task.task_id).unwrap();
+    let restarted_preview = restarted
+        .completion_snapshot_for_task(&replayed)
+        .unwrap()
+        .output_preview;
+
+    for (state, preview) in [("live", live_preview), ("restarted", restarted_preview)] {
+        assert!(preview.contains(SECRET_PLACEHOLDER), "{state}: {preview:?}");
+        assert!(!preview.contains(&"S".repeat(64)), "{state}: {preview:?}");
+    }
+}
+
+#[test]
 fn bash_background_completion_replay_withholds_output_and_keeps_pointers() {
     let fixture = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
@@ -204,10 +546,23 @@ fn bash_background_completion_replay_withholds_output_and_keeps_pointers() {
         "",
         false,
     );
-    let metadata: PersistedTask =
+    let mut metadata: PersistedTask =
         serde_json::from_str(&std::fs::read_to_string(&task.paths.json).unwrap()).unwrap();
-    assert_eq!(metadata.completion_has_env_secrets, None);
-    assert!(metadata.completion_preview.is_none());
+    // Older metadata could report no secrets because its check did not include
+    // AFT's ticket.
+    metadata.completion_has_env_secrets = Some(false);
+    metadata.completion_preview = Some(
+        crate::bash_background::persistence::PersistedCompletionPreview {
+            output_preview: "opaque deployment credential\\n".to_string(),
+            output_truncated: false,
+            bash_output_list_envelope: None,
+        },
+    );
+    crate::bash_background::persistence::write_task(&task.paths.json, &metadata).unwrap();
+    assert_eq!(metadata.completion_has_env_secrets, Some(false));
+    assert_eq!(metadata.completion_has_non_ticket_env_secrets, None);
+    assert_eq!(metadata.completion_ticket_digest, None);
+    assert!(metadata.completion_preview.is_some());
     let replayed = BgTaskRegistry::default();
     replayed
         .insert_rehydrated_task(metadata, task.paths.clone(), true)
@@ -232,11 +587,14 @@ fn bash_background_watch_matches_raw_token_but_masks_pushed_and_persisted_text()
     for (needle, prefix) in [(token.as_str(), 0), ("ghp_", 64 * 1024 - 7), ("READY", 0)] {
         let fixture = tempfile::tempdir().unwrap();
         let (registry, _db, frames) = tests::registry_with_db_and_frames(fixture.path());
-        let text = format!(
-            "{} {token}\nREADY {} {token}\n",
-            "x".repeat(prefix),
-            "x".repeat(490)
-        );
+        // Same byte offsets, but a line break keeps the token's line within
+        // the watch preview's mask cap so the context is masked, not withheld.
+        let prefix = if prefix > 200 {
+            format!("{}\n{}", "x".repeat(prefix - 101), "x".repeat(100))
+        } else {
+            "x".repeat(prefix)
+        };
+        let text = format!("{prefix} {token}\nREADY {} {token}\n", "x".repeat(490));
         let (id, task) =
             tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &text, "", false);
         registry.ensure_task_row(&task);
@@ -286,7 +644,9 @@ fn assert_watch_preview_for_bytes(bytes: &[u8], expected: &str) {
 
 #[test]
 fn bash_background_watch_preview_handles_split_four_byte_character() {
-    let text = format!("{}READY😀", "a".repeat(65_530));
+    // The line break keeps the READY line within the watch preview's mask cap;
+    // the emoji still straddles the 64 KiB scan chunk boundary.
+    let text = format!("{}\n{}READY😀", "a".repeat(65_000), "a".repeat(529));
     assert_watch_preview_for_bytes(text.as_bytes(), "READY😀");
 }
 
@@ -303,6 +663,9 @@ fn bash_background_watch_preview_handles_random_multibyte_scan_cuts() {
                 bytes.extend_from_slice(&[0xff, 0xe2, 0x82]);
             }
             bytes.resize(64 * 1024 - "READY".len() - cut, b'a');
+            // Keep the READY line within the watch preview's mask cap.
+            let line_break = bytes.len() - 100;
+            bytes[line_break] = b'\n';
             bytes.extend_from_slice(format!("READY{character}\nTAIL").as_bytes());
             assert_watch_preview_for_bytes(&bytes, &format!("READY{character}"));
         }
@@ -433,4 +796,198 @@ fn bash_background_watch_preview_bounds_arbitrary_bytes_and_ranges() {
         let (matched, _) = registry.render_watch_preview(&id, &bytes, start..end);
         assert!(String::from_utf8_lossy(&bytes).contains(&matched));
     }
+}
+
+/// Restart `output`'s terminal task into a fresh registry, as after a daemon
+/// restart that kept only the ticket digest, register a once watch for READY,
+/// and return the pushed and persisted context.
+fn restarted_ready_watch_context(output: &str) -> String {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    let fixture = tempfile::tempdir().unwrap();
+    let original = BgTaskRegistry::default();
+    let (id, task) =
+        tests::insert_terminal_piped_task(&original, &fixture, "cmd", output, "", false);
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.completion_has_env_secrets = Some(true);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
+    metadata.completion_ticket_digest = Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    let (registry, _db, frames) = tests::registry_with_db_and_frames(fixture.path());
+    registry
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let restarted = registry.task(&id).unwrap();
+    registry.ensure_task_row(&restarted);
+    registry
+        .register_watch(id, WatchPattern::Substring("READY".into()), true)
+        .unwrap();
+    let pushed = tests::pattern_match_frames(&frames);
+    assert_eq!(pushed.len(), 1, "READY watch did not fire");
+    let persisted = registry.pending_pattern_matches_for_session("session");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].context, pushed[0].context);
+    pushed[0].context.clone()
+}
+
+/// A value no byte window of which may appear in a preview: every 8-byte
+/// window of the cyclic alphabet occurs within its first 33 bytes.
+fn cyclic_credential(len: usize) -> String {
+    (0..len).map(|i| (b'A' + (i % 26) as u8) as char).collect()
+}
+
+fn assert_no_credential_window(context: &str, value: &str) {
+    for start in 0..26 {
+        let window = &value[start..start + 8];
+        assert!(
+            !context.contains(window),
+            "credential bytes {window:?} leaked: {context:?}"
+        );
+    }
+}
+
+#[test]
+fn bash_background_restart_watch_masks_json_secret_whose_label_precedes_context() {
+    let value = cyclic_credential(4000);
+    // The 100-character context before READY starts inside the value, far
+    // after the "api_key" label that identifies it.
+    let context = restarted_ready_watch_context(&format!("{{\"api_key\":\"{value}\"}} READY\n"));
+    assert_no_credential_window(&context, &value);
+    assert!(context.contains(SECRET_PLACEHOLDER), "{context:?}");
+    assert!(context.contains("READY"), "{context:?}");
+}
+
+#[test]
+fn bash_background_restart_watch_masks_header_secret_whose_name_precedes_context() {
+    let value = cyclic_credential(4000);
+    // Only the whole line shows the header name that marks the value secret.
+    let context = restarted_ready_watch_context(&format!(
+        "start\nAuthorization: Bearer {value} READY\nend\n"
+    ));
+    assert_no_credential_window(&context, &value);
+    assert!(context.contains(SECRET_PLACEHOLDER), "{context:?}");
+    assert!(context.contains("READY"), "{context:?}");
+}
+
+#[test]
+fn bash_background_restart_watch_withholds_credential_line_past_mask_cap() {
+    let value = cyclic_credential(completion_preview::WATCH_PREVIEW_LINE_CAP_BYTES + 100);
+    // The 500-character context after READY ends inside the value; its whole
+    // line is larger than the mask cap.
+    let context = restarted_ready_watch_context(&format!(
+        "first line\nREADY {{\"api_key\":\"{value}\"}}\nlast line\n"
+    ));
+    assert!(
+        context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD),
+        "{context:?}"
+    );
+    assert_no_credential_window(&context, &value);
+}
+
+#[test]
+fn bash_background_watch_masks_json_secret_crossing_line_breaks() {
+    let value = cyclic_credential(300);
+    for output in [
+        // Label and value on separate lines, as pretty-printed JSON.
+        format!("{{\n  \"api_key\":\n    \"{value}\"\n}}\nREADY\n"),
+        // A raw newline inside the value, ending on the READY line.
+        format!(
+            "{{\"password\":\"{}\n{}\"}} READY\n",
+            &value[..150],
+            &value[150..]
+        ),
+    ] {
+        let context = restarted_ready_watch_context(&format!("{}\n{output}", "x".repeat(20_000)));
+        assert_no_credential_window(&context, &value);
+        assert!(context.contains("READY"), "{context:?}");
+    }
+}
+
+/// Output whose JSON secret value opens on the READY line and runs over
+/// `lines` raw-newline-separated lines before it closes.
+fn open_json_value_output(lines: usize) -> (String, String) {
+    let value = format!("{}\n", cyclic_credential(60)).repeat(lines);
+    let output = format!(
+        "{}\nREADY {{\"api_key\":\"{value}\"}}\ndone\n",
+        "x".repeat(20_000)
+    );
+    (output, value)
+}
+
+#[test]
+fn bash_background_watch_withholds_json_secret_value_open_past_read_window() {
+    // The value is longer than the preview reads after the match, so its
+    // closing quote, and the whole field, lie past the window's end while
+    // the capture continues.
+    let (output, value) = open_json_value_output(600);
+    assert!(value.len() > completion_preview::WATCH_PREVIEW_SOURCE_BYTES);
+    let context = restarted_ready_watch_context(&output);
+    assert!(
+        context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD),
+        "{context:?}"
+    );
+    assert_no_credential_window(&context, &value);
+}
+
+#[test]
+fn bash_background_watch_masks_json_secret_value_closing_inside_read_window() {
+    let (output, value) = open_json_value_output(20);
+    let context = restarted_ready_watch_context(&output);
+    assert_no_credential_window(&context, &value);
+    assert!(context.contains("READY"), "{context:?}");
+    assert!(context.contains(SECRET_PLACEHOLDER), "{context:?}");
+}
+
+#[test]
+fn bash_background_watch_withholds_match_on_line_longer_than_read_window() {
+    // No line break within the read window on either side of READY.
+    let context = restarted_ready_watch_context(&format!(
+        "start\n{} READY {}\nend\n",
+        "x".repeat(40_000),
+        "y".repeat(40_000)
+    ));
+    assert!(
+        context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD),
+        "{context:?}"
+    );
+}
+
+#[test]
+fn bash_background_watch_masks_private_key_body_after_begin_line() {
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+    let output = format!(
+        "{}\n-----BEGIN PRIVATE KEY-----\n{}{body}\nREADY\n-----END PRIVATE KEY-----\n",
+        "x".repeat(20_000),
+        format!("{body}\n").repeat(60)
+    );
+    let context = restarted_ready_watch_context(&output);
+    assert!(!context.contains(&body[..16]), "{context:?}");
+}
+
+#[test]
+fn bash_background_watch_omits_key_body_without_visible_begin_line() {
+    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj";
+    // The BEGIN line lies farther back than the preview reads, so the body
+    // lines before READY cannot be shown; READY's own line can.
+    let output = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}READY\n",
+        format!("{body}\n").repeat(1000)
+    );
+    let context = restarted_ready_watch_context(&output);
+    assert!(!context.contains(&body[..16]), "{context:?}");
+    assert_eq!(context, "READY\n");
+}
+
+#[test]
+fn bash_background_completion_repeated_hex_edged_lines_keep_preview() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (_, task) =
+        tests::insert_terminal_piped_task(&registry, &fixture, "cmd", "done\ndone\n", "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest =
+        Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    let preview = registry
+        .completion_snapshot_for_task(&task)
+        .unwrap()
+        .output_preview;
+    assert_eq!(preview, "done\ndone\n");
 }

@@ -47,10 +47,14 @@ static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 static API_KEY_HEADER: LazyLock<Regex> =
     LazyLock::new(|| compile(r"(?i)\b(x-api-key[^\S\r\n]*:[^\S\r\n]*)[^\s<>]+"));
 static SECRET_JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
-    compile(
-        r#"(?i)("(?:password|passwd|pwd|api[_-]?key|apikey|x-api-key|aws_secret_access_key|awsSecretAccessKey|secret_access_key)"\s*:\s*")((?:\\.|[^"\\])+)(")"#,
-    )
+    compile(&format!(
+        r#"(?i)("(?:{JSON_SECRET_LABELS})"\s*:\s*")((?:\\.|[^"\\])+)(")"#
+    ))
 });
+/// The opening of a [`SECRET_JSON_FIELD`] value, up to and including its quote.
+static SECRET_JSON_OPENING: LazyLock<Regex> =
+    LazyLock::new(|| compile(&format!(r#"(?i)"(?:{JSON_SECRET_LABELS})"\s*:\s*""#)));
+const JSON_SECRET_LABELS: &str = "password|passwd|pwd|api[_-]?key|apikey|x-api-key|aws_secret_access_key|awsSecretAccessKey|secret_access_key";
 static AWS_SECRET_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     compile(
         r#"(?i)\b((?:aws_secret_access_key|secret_access_key)[^\S\r\n]*[=:][^\S\r\n]*)[^\s"'<>]+"#,
@@ -90,6 +94,125 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     redact_with_range(text, None)
+}
+
+// Separate limits bound byte scanning and expensive candidate hashes. Long
+// non-hex verdict lines need no hashes and can still retain their placeholders.
+pub(crate) const TICKET_REDACTION_BYTES: usize = 50 * 1024;
+pub(crate) const TICKET_REDACTION_WINDOWS: usize = 8 * 1024;
+pub(crate) const TICKET_HALO_BYTES: usize = 31;
+
+#[derive(Debug)]
+pub(crate) struct TicketRedactionBudgetExceeded;
+
+/// Redact only a 32-hex candidate whose BLAKE3 digest matches this task's stored
+/// ticket digest. This keeps ordinary hashes and identifiers unchanged in previews.
+pub(crate) fn redact_ticket_digest<'a>(
+    text: &'a str,
+    digest: Option<&str>,
+) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
+    redact_ticket_digest_with_range(text, None, digest)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TICKET_HASH_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Range-aware form used when a watch match is anchored in captured output.
+pub(crate) fn redact_ticket_digest_range<'a>(
+    text: &'a str,
+    range: &mut std::ops::Range<usize>,
+    digest: Option<&str>,
+) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
+    redact_ticket_digest_with_range(text, Some(range), digest)
+}
+
+fn redact_ticket_digest_with_range<'a>(
+    text: &'a str,
+    mut range: Option<&mut std::ops::Range<usize>>,
+    digest: Option<&str>,
+) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
+    let Some(digest) = digest else {
+        return Ok(Cow::Borrowed(text));
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(Cow::Borrowed(text));
+    }
+    // Refuse before hashing any candidate. A caller must withhold the rendered
+    // region rather than fall back to the unmasked input on budget exhaustion.
+    if text.len() > TICKET_REDACTION_BYTES || ticket_digest_windows(text) > TICKET_REDACTION_WINDOWS
+    {
+        return Err(TicketRedactionBudgetExceeded);
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() < 32 {
+        return Ok(Cow::Borrowed(text));
+    }
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !bytes[cursor].is_ascii_hexdigit() {
+            cursor += 1;
+            continue;
+        }
+        let run_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
+            cursor += 1;
+        }
+        let run_end = cursor;
+        if run_end - run_start < 32 {
+            continue;
+        }
+        for start in run_start..=(run_end - 32) {
+            let end = start + 32;
+            let candidate = &text[start..end];
+            #[cfg(test)]
+            TICKET_HASH_PROBE.with(|probe| {
+                if let Some(probe) = probe.borrow_mut().as_mut() {
+                    probe();
+                }
+            });
+            if blake3::hash(candidate.as_bytes()).to_hex().as_str() != digest {
+                continue;
+            }
+            if let Some(previous) = spans.last_mut() {
+                if start < previous.end {
+                    previous.end = previous.end.max(end);
+                    continue;
+                }
+            }
+            spans.push(start..end);
+        }
+    }
+    if spans.is_empty() {
+        return Ok(Cow::Borrowed(text));
+    }
+    let mut masked = String::with_capacity(text.len());
+    let mut copied = 0;
+    for span in spans {
+        masked.push_str(&text[copied..span.start]);
+        let replacement_start = masked.len();
+        masked.push_str(SECRET_PLACEHOLDER);
+        if let Some(range) = range.as_deref_mut() {
+            map_redacted_range(
+                range,
+                replacement_start,
+                replacement_start + span.len(),
+                SECRET_PLACEHOLDER.len(),
+            );
+        }
+        copied = span.end;
+    }
+    masked.push_str(&text[copied..]);
+    Ok(Cow::Owned(masked))
+}
+
+pub(crate) fn ticket_digest_windows(text: &str) -> usize {
+    text.as_bytes()
+        .split(|byte| !byte.is_ascii_hexdigit())
+        .map(|run| run.len().saturating_sub(31))
+        .sum()
 }
 
 fn redact_with_range<'a>(
@@ -196,6 +319,9 @@ pub(crate) struct SecretValues(Vec<String>);
 
 /// Whether an environment variable name marks its value as a completion secret.
 pub fn is_secret_environment_key(key: &str) -> bool {
+    if key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV) {
+        return true;
+    }
     // Git's numbered config variables carry a setting NAME in GIT_CONFIG_KEY_<n>
     // (AFT itself injects core.hooksPath this way). The name is not a secret,
     // and dropping it alone while GIT_CONFIG_COUNT and GIT_CONFIG_VALUE_<n>
@@ -220,8 +346,26 @@ pub fn is_secret_environment_key(key: &str) -> bool {
 }
 
 impl SecretValues {
+    pub(crate) fn longest_value_len(&self) -> usize {
+        self.0.iter().map(String::len).max().unwrap_or(0)
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Byte ranges in `text` of every occurrence of a value that contains a
+    /// newline. Only these occurrences can cross a cut made at a newline.
+    pub(crate) fn cross_line_spans(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut spans = Vec::new();
+        for value in self.0.iter().filter(|value| value.contains('\n')) {
+            let mut start = 0;
+            while let Some(offset) = text[start..].find(value.as_str()) {
+                let from = start + offset;
+                spans.push(from..from + value.len());
+                start = from + text[from..].chars().next().unwrap().len_utf8();
+            }
+        }
+        spans
     }
 
     pub(crate) fn from_environment<'a>(
@@ -298,6 +442,95 @@ fn needs_github_token_scan(text: &str) -> bool {
     ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
         .iter()
         .any(|prefix| text.contains(prefix))
+}
+
+// How far a match can reach. A caller that masks a slice of a larger capture
+// (a watch preview) cuts that slice at newlines. The cut is safe for a pattern
+// only if none of its matches can contain a newline:
+// - AUTHORIZATION_HEADER, API_KEY_HEADER and AWS_SECRET_FIELD separate their
+//   parts with `[^\S\r\n]` (spaces and tabs only) and their values exclude `\s`;
+// - SLACK_TOKEN, GITHUB_PAT, GITHUB_TOKEN, SK_API_KEY, JWT and
+//   AWS_ACCESS_KEY_ID consist of letters, digits, `_`, `-` and `.` only;
+// - URL_USERINFO, CREDENTIAL_QUERY and KEY_QUERY values exclude `\s`.
+// Two patterns can cross a newline, and the functions below report them:
+// - SECRET_JSON_FIELD allows `\s*` (including newlines) around its colon and a
+//   raw newline inside the quoted value;
+// - PRIVATE_KEY (`(?s)`) runs from its BEGIN line to the END line, or to the end
+//   of the text when no END line follows.
+// Exact credential values (see SecretValues) cross a newline only when the
+// value itself contains one.
+
+/// Byte ranges of the masked JSON secret fields in `text`. A field can span
+/// lines, so a slice cut at a newline may hold only part of one.
+pub(crate) fn json_secret_field_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    if !text.contains('"') {
+        return Vec::new();
+    }
+    SECRET_JSON_FIELD
+        .find_iter(text)
+        .map(|found| found.range())
+        .collect()
+}
+
+/// Byte ranges of the masked private-key blocks in `text`. A block ends at its
+/// END line or, without one, at the end of `text`.
+pub(crate) fn private_key_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    if !text.contains("PRIVATE KEY-----") {
+        return Vec::new();
+    }
+    PRIVATE_KEY
+        .find_iter(text)
+        .map(|found| found.range())
+        .collect()
+}
+
+/// Whether `text` holds a private-key BEGIN or END line. Without one, `text`
+/// alone cannot tell whether it starts inside a key block.
+pub(crate) fn has_private_key_marker(text: &str) -> bool {
+    text.contains("PRIVATE KEY-----")
+}
+
+/// Whether `line` has the shape of a PEM private-key body line: 40 to 76
+/// base64 characters mixing upper case, lower case and digits. Lower-case hex
+/// digests and ordinary words do not qualify; a mixed-case hex string can.
+pub(crate) fn looks_like_private_key_body(line: &str) -> bool {
+    let line = line.trim_end_matches('\r');
+    (40..=76).contains(&line.len())
+        && line
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        && line.bytes().any(|byte| byte.is_ascii_uppercase())
+        && line.bytes().any(|byte| byte.is_ascii_lowercase())
+        && line.bytes().any(|byte| byte.is_ascii_digit())
+}
+
+/// Whether a JSON secret value that opens before byte `before` is still open
+/// at the end of `text`. Its closing quote, and so the match, may lie past the
+/// end of `text`; masking `text` alone would then show the value.
+pub(crate) fn json_secret_value_open_at_end(text: &str, before: usize) -> bool {
+    if !text.contains('"') {
+        return false;
+    }
+    SECRET_JSON_OPENING
+        .find_iter(text)
+        .take_while(|opening| opening.start() < before)
+        .any(|opening| {
+            // Mirror the value grammar `(?:\\.|[^"\\])+`: a backslash escapes
+            // any character except a newline, and an unescaped quote closes it.
+            let mut chars = text[opening.end()..].chars();
+            loop {
+                match chars.next() {
+                    None => return true,
+                    Some('"') => return false,
+                    Some('\\') => match chars.next() {
+                        None => return true,
+                        Some('\n') => return false,
+                        Some(_) => {}
+                    },
+                    Some(_) => {}
+                }
+            }
+        })
 }
 
 /// Byte-level entry point for the log sink. Invalid UTF-8 is decoded with
@@ -428,6 +661,108 @@ fn map_redacted_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_json_fields_and_private_keys_match_across_a_newline() {
+        let line_anchored: [(&str, &Regex); 12] = [
+            ("AUTHORIZATION_HEADER", &AUTHORIZATION_HEADER),
+            ("API_KEY_HEADER", &API_KEY_HEADER),
+            ("AWS_SECRET_FIELD", &AWS_SECRET_FIELD),
+            ("SLACK_TOKEN", &SLACK_TOKEN),
+            ("GITHUB_PAT", &GITHUB_PAT),
+            ("GITHUB_TOKEN", &GITHUB_TOKEN),
+            ("SK_API_KEY", &SK_API_KEY),
+            ("JWT", &JWT),
+            ("AWS_ACCESS_KEY_ID", &AWS_ACCESS_KEY_ID),
+            ("URL_USERINFO", &URL_USERINFO),
+            ("CREDENTIAL_QUERY", &CREDENTIAL_QUERY),
+            ("KEY_QUERY", &KEY_QUERY),
+        ];
+        let samples = [
+            "Authorization: Bearer opaque-auth-value".to_string(),
+            "Proxy-Authorization:\tBasic dXNlcjpwYXNz==".to_string(),
+            "x-api-key: opaque-api-key-value".to_string(),
+            "aws_secret_access_key = abc/def+ghi".to_string(),
+            "xoxb-12345-slack-token".to_string(),
+            "github_pat_11ABCDEFG0123456789_abcdef".to_string(),
+            format!("ghp_{}", "a".repeat(36)),
+            "sk-abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
+            "eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl".to_string(),
+            "AKIAABCDEFGHIJKLMNOP".to_string(),
+            "https://user:password@example.com/path".to_string(),
+            "https://e.com/p?access_token=opaque&key=AbCdEfGh12345678Zz".to_string(),
+        ];
+        for sample in &samples {
+            for (cut, _) in sample.char_indices().skip(1) {
+                let text = format!("{}\n{}", &sample[..cut], &sample[cut..]);
+                for (name, pattern) in line_anchored {
+                    for found in pattern.find_iter(&text) {
+                        assert!(
+                            !found.as_str().contains('\n'),
+                            "{name} crossed a newline in {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // The two exceptions, which watch previews widen their region for.
+        assert!(SECRET_JSON_FIELD.is_match("{\"api_key\":\n  \"value\"}"));
+        assert!(SECRET_JSON_FIELD.is_match("{\"api_key\":\"first\nsecond\"}"));
+        assert!(PRIVATE_KEY.is_match("-----BEGIN PRIVATE KEY-----\nbody\n"));
+    }
+
+    #[test]
+    fn json_secret_value_open_at_end_follows_the_value_grammar() {
+        let opening = "{\"api_key\": \"";
+        let open = |text: &str| json_secret_value_open_at_end(text, text.len());
+        assert!(open(&format!("{opening}abc\ndef")));
+        assert!(open(&format!("{opening}abc\\")));
+        assert!(!open(&format!("{opening}abc\\\"def\" more")));
+        // A backslash before a newline ends the value without a match.
+        assert!(!open(&format!("{opening}abc\\\ndef")));
+        // Openings at or after `before` are outside the caller's region.
+        assert!(!json_secret_value_open_at_end(
+            &format!("x {opening}abc"),
+            1
+        ));
+    }
+
+    #[test]
+    fn ticket_digest_budget_refuses_before_hashing() {
+        let digest = blake3::hash(b"0123456789abcdef0123456789abcdef")
+            .to_hex()
+            .to_string();
+        TICKET_HASH_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(|| panic!("over-budget input was hashed")))
+        });
+        assert!(
+            redact_ticket_digest(&"a".repeat(TICKET_REDACTION_WINDOWS + 32), Some(&digest))
+                .is_err()
+        );
+        TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+    }
+
+    #[test]
+    fn ticket_digest_hashes_only_complete_hex_windows() {
+        let digest = blake3::hash(b"0123456789abcdef0123456789abcdef")
+            .to_hex()
+            .to_string();
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let probe_count = count.clone();
+        TICKET_HASH_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || probe_count.set(probe_count.get() + 1)))
+        });
+        let text = format!(
+            "{} {} {} {}",
+            "a".repeat(31),
+            "g".repeat(1024),
+            "a".repeat(32),
+            "F".repeat(33)
+        );
+        assert_eq!(redact_ticket_digest(&text, Some(&digest)).unwrap(), text);
+        TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+        assert_eq!(count.get(), 3);
+    }
 
     #[test]
     fn completion_exact_env_values_are_case_sensitive_and_overlap_safe() {

@@ -39,6 +39,151 @@ pub struct CappedText {
     pub truncated: bool,
 }
 
+/// Where one run of a capped text came from: copied unchanged from a byte range
+/// of the input, or written by the cap itself (a truncation marker, a recovery
+/// marker, a summary line, or a separating newline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapPiece {
+    Input(std::ops::Range<usize>),
+    Inserted(String),
+}
+
+/// A capped text together with the provenance of every byte in it. Completion
+/// previews mask AFT's ticket by its position in the source, so they need to
+/// know which input bytes a displayed line was copied from, not just its text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PiecedText {
+    pub(crate) text: String,
+    pub(crate) pieces: Vec<CapPiece>,
+}
+
+impl PiecedText {
+    pub(crate) fn whole(input: &str) -> Self {
+        let mut text = Self::default();
+        text.copy(input, 0..input.len());
+        text
+    }
+
+    pub(crate) fn inserted(text: &str) -> Self {
+        let mut pieced = Self::default();
+        pieced.insert(text);
+        pieced
+    }
+
+    pub(crate) fn copy(&mut self, input: &str, range: std::ops::Range<usize>) {
+        self.text.push_str(&input[range.clone()]);
+        push_piece(&mut self.pieces, CapPiece::Input(range));
+    }
+
+    pub(crate) fn insert(&mut self, text: &str) {
+        self.text.push_str(text);
+        push_piece(&mut self.pieces, CapPiece::Inserted(text.to_string()));
+    }
+
+    /// Append another pieced text whose input ranges refer to the same input.
+    fn append(&mut self, other: PiecedText) {
+        self.text.push_str(&other.text);
+        for piece in other.pieces {
+            push_piece(&mut self.pieces, piece);
+        }
+    }
+
+    /// Keep only the first `len` bytes (a char boundary of `text`).
+    fn truncate(&mut self, len: usize) {
+        self.text.truncate(len);
+        let mut kept = 0;
+        let mut pieces = Vec::new();
+        for piece in std::mem::take(&mut self.pieces) {
+            if kept >= len {
+                break;
+            }
+            let room = len - kept;
+            let piece = match piece {
+                CapPiece::Input(range) if range.len() > room => {
+                    CapPiece::Input(range.start..range.start + room)
+                }
+                CapPiece::Inserted(text) if text.len() > room => {
+                    CapPiece::Inserted(text[..room].to_string())
+                }
+                piece => piece,
+            };
+            kept += piece_len(&piece);
+            pieces.push(piece);
+        }
+        self.pieces = pieces;
+    }
+
+    /// `self` was capped from `inner.text`. Re-express its copied ranges in
+    /// terms of `inner`'s own input, so they point at the original bytes.
+    pub(crate) fn through(self, inner: &PiecedText) -> PiecedText {
+        let mut pieces = Vec::new();
+        for piece in self.pieces {
+            let range = match piece {
+                CapPiece::Input(range) => range,
+                inserted => {
+                    push_piece(&mut pieces, inserted);
+                    continue;
+                }
+            };
+            let mut offset = 0;
+            for inner_piece in &inner.pieces {
+                let len = piece_len(inner_piece);
+                let from = range.start.max(offset);
+                let to = range.end.min(offset + len);
+                if from < to {
+                    let local = from - offset..to - offset;
+                    push_piece(
+                        &mut pieces,
+                        match inner_piece {
+                            CapPiece::Input(source) => CapPiece::Input(
+                                source.start + local.start..source.start + local.end,
+                            ),
+                            CapPiece::Inserted(text) => CapPiece::Inserted(text[local].to_string()),
+                        },
+                    );
+                }
+                offset += len;
+            }
+        }
+        PiecedText {
+            text: self.text,
+            pieces,
+        }
+    }
+
+    fn into_capped(self, truncated: bool) -> CappedText {
+        CappedText {
+            text: self.text,
+            truncated,
+        }
+    }
+}
+
+fn piece_len(piece: &CapPiece) -> usize {
+    match piece {
+        CapPiece::Input(range) => range.len(),
+        CapPiece::Inserted(text) => text.len(),
+    }
+}
+
+fn push_piece(pieces: &mut Vec<CapPiece>, piece: CapPiece) {
+    if piece_len(&piece) == 0 {
+        return;
+    }
+    match (pieces.last_mut(), piece) {
+        (Some(CapPiece::Input(last)), CapPiece::Input(range)) if last.end == range.start => {
+            last.end = range.end;
+        }
+        (Some(CapPiece::Inserted(last)), CapPiece::Inserted(text)) => last.push_str(&text),
+        (_, piece) => pieces.push(piece),
+    }
+}
+
+/// Byte offset of `line` inside `input`; `line` must be a subslice of it.
+fn offset_in(input: &str, line: &str) -> usize {
+    line.as_ptr() as usize - input.as_ptr() as usize
+}
+
 pub fn cap_final_output(input: &str) -> CappedText {
     cap_final_output_preserving(input, None, &[])
 }
@@ -54,29 +199,33 @@ pub(crate) fn cap_final_output_preserving(
     marker: Option<&str>,
     final_lines: &[String],
 ) -> CappedText {
-    cap_test_verdict(
+    let (pieced, truncated) = cap_preserving_pieces(
         input,
         FINAL_OUTPUT_CAP_BYTES,
         FINAL_OUTPUT_HEAD_BYTES,
         FINAL_OUTPUT_TAIL_BYTES,
         marker,
         final_lines,
-    )
-    .unwrap_or_else(|| match marker {
-        Some(marker) => cap_head_tail_with_marker(
-            input,
-            FINAL_OUTPUT_CAP_BYTES,
-            FINAL_OUTPUT_HEAD_BYTES,
-            FINAL_OUTPUT_TAIL_BYTES,
-            marker,
-        ),
-        None => cap_head_tail(
-            input,
-            FINAL_OUTPUT_CAP_BYTES,
-            FINAL_OUTPUT_HEAD_BYTES,
-            FINAL_OUTPUT_TAIL_BYTES,
-        ),
-    })
+    );
+    pieced.into_capped(truncated)
+}
+
+fn cap_preserving_pieces(
+    input: &str,
+    threshold: usize,
+    keep_head: usize,
+    keep_tail: usize,
+    marker: Option<&str>,
+    final_lines: &[String],
+) -> (PiecedText, bool) {
+    cap_test_verdict(input, threshold, keep_head, keep_tail, marker, final_lines)
+        .map(|pieced| (pieced, true))
+        .unwrap_or_else(|| match marker {
+            Some(marker) => {
+                cap_head_tail_with_marker_pieces(input, threshold, keep_head, keep_tail, marker)
+            }
+            None => cap_head_tail_pieces(input, threshold, keep_head, keep_tail),
+        })
 }
 
 /// Byte threshold under which a completion preview is passed through uncapped.
@@ -116,13 +265,21 @@ pub(crate) fn cap_completion_output_preserving(
     exit_ok: bool,
     final_lines: &[String],
 ) -> CappedText {
+    let (pieced, truncated) =
+        cap_completion_output_preserving_pieces(input, marker, exit_ok, final_lines);
+    pieced.into_capped(truncated)
+}
+
+/// [`cap_completion_output_preserving`] that also reports which input bytes
+/// each run of the capped text was copied from.
+pub(crate) fn cap_completion_output_preserving_pieces(
+    input: &str,
+    marker: Option<&str>,
+    exit_ok: bool,
+    final_lines: &[String],
+) -> (PiecedText, bool) {
     let (threshold, head, tail) = completion_caps(exit_ok);
-    cap_test_verdict(input, threshold, head, tail, marker, final_lines).unwrap_or_else(|| {
-        match marker {
-            Some(marker) => cap_head_tail_with_marker(input, threshold, head, tail, marker),
-            None => cap_head_tail(input, threshold, head, tail),
-        }
-    })
+    cap_preserving_pieces(input, threshold, head, tail, marker, final_lines)
 }
 
 /// Reserve the runner's verdict before spending bytes on ordinary head/tail
@@ -139,7 +296,7 @@ fn cap_test_verdict(
     keep_tail: usize,
     marker: Option<&str>,
     final_lines: &[String],
-) -> Option<CappedText> {
+) -> Option<PiecedText> {
     if input.len() + marker.map_or(0, |marker| marker.len() + 1) <= threshold {
         return None;
     }
@@ -184,31 +341,44 @@ fn cap_test_verdict(
             *is_empty = false;
         }
     }
-    let mut context = Vec::new();
-    let mut essentials = Vec::new();
+    // Each kept line is copied from the input; the empty-target summary and
+    // the joining newlines are written by the cap.
+    let mut context = PiecedText::default();
+    let mut essentials = PiecedText::default();
+    let (mut context_lines, mut essential_lines) = (0, 0);
     let mut counted_empty = false;
     for (index, line) in lines.iter().enumerate() {
-        if required[index] {
-            essentials.push((*line).to_string());
-        } else if empty[index] {
-            if !counted_empty {
-                essentials.push(format!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out ({empty_count} empty test targets)"));
+        let line_range = offset_in(input, line)..offset_in(input, line) + line.len();
+        if required[index] || empty[index] {
+            if empty[index] && counted_empty {
+                continue;
+            }
+            if essential_lines > 0 {
+                essentials.insert("\n");
+            }
+            essential_lines += 1;
+            if required[index] {
+                essentials.copy(input, line_range);
+            } else {
+                essentials.insert(&format!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out ({empty_count} empty test targets)"));
                 counted_empty = true;
             }
         } else {
-            context.push(*line);
+            if context_lines > 0 {
+                context.insert("\n");
+            }
+            context_lines += 1;
+            context.copy(input, line_range);
         }
     }
-    let essentials = essentials.join("\n");
-    let context = context.join("\n");
     let marker = marker.unwrap_or("[truncated output; full output unavailable]");
-    let available = threshold.saturating_sub(essentials.len() + marker.len() + 2);
+    let available = threshold.saturating_sub(essentials.text.len() + marker.len() + 2);
     // Keep the familiar head plus up to twenty final context lines, bounded by
     // the compressor tail window. Mandatory verdict lines do not spend that
     // window, and the actual last command line is already in essentials.
     let mut tail_bytes = 0;
     let mut tail_lines = 0;
-    for line in context.lines().rev() {
+    for line in context.text.lines().rev() {
         let bytes = line.len() + 1;
         if tail_lines == crate::compress::line_cut::TAIL_WINDOW_LINES
             || tail_bytes + bytes > keep_tail.min(crate::compress::line_cut::TAIL_WINDOW_BYTES)
@@ -218,17 +388,18 @@ fn cap_test_verdict(
         tail_bytes += bytes;
         tail_lines += 1;
     }
-    let capped = cap_head_tail_with_marker(
-        &context,
+    let (capped, _) = cap_head_tail_with_marker_pieces(
+        &context.text,
         available + marker.len() + 1,
         keep_head.min(available),
         tail_bytes.min(available),
         marker,
     );
-    Some(CappedText {
-        text: format!("{}\n{essentials}", capped.text.trim_end()),
-        truncated: true,
-    })
+    let mut capped = capped.through(&context);
+    capped.truncate(capped.text.trim_end().len());
+    capped.insert("\n");
+    capped.append(essentials);
+    Some(capped)
 }
 
 pub fn cap_head_tail(
@@ -237,21 +408,25 @@ pub fn cap_head_tail(
     keep_head: usize,
     keep_tail: usize,
 ) -> CappedText {
+    let (pieced, truncated) = cap_head_tail_pieces(input, threshold_bytes, keep_head, keep_tail);
+    pieced.into_capped(truncated)
+}
+
+fn cap_head_tail_pieces(
+    input: &str,
+    threshold_bytes: usize,
+    keep_head: usize,
+    keep_tail: usize,
+) -> (PiecedText, bool) {
     if input.len() <= threshold_bytes {
-        return CappedText {
-            text: input.to_string(),
-            truncated: false,
-        };
+        return (PiecedText::whole(input), false);
     }
 
     let head_end = floor_char_boundary(input, keep_head.min(input.len()));
     let mut tail_start = ceil_char_boundary(input, input.len().saturating_sub(keep_tail));
 
     if head_end >= tail_start {
-        return CappedText {
-            text: input.to_string(),
-            truncated: false,
-        };
+        return (PiecedText::whole(input), false);
     }
 
     let marker_prefix_len = if head_end == 0 || input[..head_end].ends_with('\n') {
@@ -272,33 +447,25 @@ pub fn cap_head_tail(
         }
         tail_start = adjusted_tail_start;
         if head_end >= tail_start {
-            return CappedText {
-                text: input.to_string(),
-                truncated: false,
-            };
+            return (PiecedText::whole(input), false);
         }
     }
 
     let truncated_bytes = tail_start - head_end;
-    let mut output = String::with_capacity(threshold_bytes.min(input.len()));
-    output.push_str(&input[..head_end]);
+    let mut output = PiecedText::default();
+    output.copy(input, 0..head_end);
     // Only insert a separator newline when there IS a head that doesn't end
     // with one — mirroring marker_prefix_len above. With keep_head == 0 the
     // old `!output.ends_with('\n')` check pushed an unbudgeted leading
     // newline (empty string never ends with '\n'), overshooting the
     // threshold by one byte.
-    if head_end > 0 && !output.ends_with('\n') {
-        output.push('\n');
+    if head_end > 0 && !output.text.ends_with('\n') {
+        output.insert("\n");
     }
-    output.push_str("...<truncated ");
-    output.push_str(&truncated_bytes.to_string());
-    output.push_str(" bytes>...\n");
-    output.push_str(&input[tail_start..]);
+    output.insert(&format!("...<truncated {truncated_bytes} bytes>...\n"));
+    output.copy(input, tail_start..input.len());
 
-    CappedText {
-        text: output,
-        truncated: true,
-    }
+    (output, true)
 }
 
 pub fn cap_head_tail_with_marker(
@@ -308,16 +475,25 @@ pub fn cap_head_tail_with_marker(
     keep_tail: usize,
     marker: &str,
 ) -> CappedText {
+    let (pieced, truncated) =
+        cap_head_tail_with_marker_pieces(input, threshold_bytes, keep_head, keep_tail, marker);
+    pieced.into_capped(truncated)
+}
+
+fn cap_head_tail_with_marker_pieces(
+    input: &str,
+    threshold_bytes: usize,
+    keep_head: usize,
+    keep_tail: usize,
+    marker: &str,
+) -> (PiecedText, bool) {
     if marker.is_empty() {
-        return cap_head_tail(input, threshold_bytes, keep_head, keep_tail);
+        return cap_head_tail_pieces(input, threshold_bytes, keep_head, keep_tail);
     }
     if input.len() <= threshold_bytes {
         let with_marker = append_marker_line(input, marker);
-        if with_marker.len() <= threshold_bytes {
-            return CappedText {
-                text: with_marker,
-                truncated: true,
-            };
+        if with_marker.text.len() <= threshold_bytes {
+            return (with_marker, true);
         }
     }
 
@@ -368,10 +544,10 @@ pub fn cap_head_tail_with_marker(
         threshold_bytes.saturating_sub(marker.len() + 1),
     );
 
-    CappedText {
-        text: marker_capped_output(input, head_end, tail_start, marker, threshold_bytes),
-        truncated: true,
-    }
+    (
+        marker_capped_output(input, head_end, tail_start, marker, threshold_bytes),
+        true,
+    )
 }
 
 /// Move a head/tail byte cut onto line boundaries.
@@ -420,13 +596,14 @@ fn snap_cut_to_lines(
     (head.min(tail), tail)
 }
 
-fn append_marker_line(input: &str, marker: &str) -> String {
+fn append_marker_line(input: &str, marker: &str) -> PiecedText {
     if input.is_empty() {
-        return marker.to_string();
+        return PiecedText::inserted(marker);
     }
-    let mut output = input.trim_end().to_string();
-    output.push('\n');
-    output.push_str(marker);
+    let mut output = PiecedText::default();
+    output.copy(input, 0..input.trim_end().len());
+    output.insert("\n");
+    output.insert(marker);
     output
 }
 
@@ -436,9 +613,9 @@ fn marker_capped_output(
     tail_start: usize,
     marker: &str,
     threshold_bytes: usize,
-) -> String {
+) -> PiecedText {
     let output = marker_output(input, head_end, tail_start, marker);
-    if output.len() <= threshold_bytes {
+    if output.text.len() <= threshold_bytes {
         return output;
     }
 
@@ -447,7 +624,7 @@ fn marker_capped_output(
     let tail_budget = threshold_bytes.saturating_sub(head_end + separator_len + marker_line_len);
     let adjusted_tail_start = ceil_char_boundary(input, input.len().saturating_sub(tail_budget));
     let output = marker_output(input, head_end, tail_start.max(adjusted_tail_start), marker);
-    if output.len() <= threshold_bytes {
+    if output.text.len() <= threshold_bytes {
         return output;
     }
 
@@ -456,23 +633,23 @@ fn marker_capped_output(
     let tail_budget = threshold_bytes.saturating_sub(marker_line_len);
     let adjusted_tail_start = ceil_char_boundary(input, input.len().saturating_sub(tail_budget));
     let output = marker_output(input, 0, adjusted_tail_start, marker);
-    if output.len() <= threshold_bytes {
+    if output.text.len() <= threshold_bytes {
         return output;
     }
 
-    marker[..floor_char_boundary(marker, threshold_bytes.min(marker.len()))].to_string()
+    PiecedText::inserted(&marker[..floor_char_boundary(marker, threshold_bytes.min(marker.len()))])
 }
 
-fn marker_output(input: &str, head_end: usize, tail_start: usize, marker: &str) -> String {
-    let mut output = String::new();
-    output.push_str(&input[..head_end]);
-    if head_end > 0 && !output.ends_with('\n') {
-        output.push('\n');
+fn marker_output(input: &str, head_end: usize, tail_start: usize, marker: &str) -> PiecedText {
+    let mut output = PiecedText::default();
+    output.copy(input, 0..head_end);
+    if head_end > 0 && !output.text.ends_with('\n') {
+        output.insert("\n");
     }
-    output.push_str(marker);
+    output.insert(marker);
     if tail_start < input.len() {
-        output.push('\n');
-        output.push_str(&input[tail_start..]);
+        output.insert("\n");
+        output.copy(input, tail_start..input.len());
     }
     output
 }
@@ -512,6 +689,47 @@ pub fn retained_json_output_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_pieces_rebuild_the_capped_text_from_input_ranges() {
+        let cargo = format!(
+            "{}running 3 tests\ntest a ... ok\ntest b ... FAILED\n\nfailures:\n    b\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\n     Running unittests src/empty.rs\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\nerror: test failed\n",
+            "   Compiling crate v0.1.0\n".repeat(200)
+        );
+        let inputs = [
+            "short\n".to_string(),
+            format!("{}\n", "x".repeat(10_000)),
+            format!("{}tail line\n", "line of output\n".repeat(500)),
+            format!("{}final\r\n", "crlf line\r\n".repeat(400)),
+            format!("{}\n\n\n{}", "a".repeat(700), "b".repeat(3000)),
+            cargo,
+        ];
+        for input in &inputs {
+            let last = input.trim_end().lines().last().unwrap().to_string();
+            for exit_ok in [true, false] {
+                for marker in [None, Some("[full output: read /tmp/stdout]")] {
+                    for final_lines in [Vec::new(), vec![last.clone()]] {
+                        let (pieced, truncated) = cap_completion_output_preserving_pieces(
+                            input,
+                            marker,
+                            exit_ok,
+                            &final_lines,
+                        );
+                        let rebuilt: String = pieced
+                            .pieces
+                            .iter()
+                            .map(|piece| match piece {
+                                CapPiece::Input(range) => &input[range.clone()],
+                                CapPiece::Inserted(text) => text.as_str(),
+                            })
+                            .collect();
+                        assert_eq!(rebuilt, pieced.text);
+                        assert!(truncated || pieced.text == *input);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn retained_json_pointer_does_not_claim_full_output() {

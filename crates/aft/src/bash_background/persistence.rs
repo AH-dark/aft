@@ -654,10 +654,20 @@ pub struct PersistedTask {
     pub notify_on_completion: bool,
     #[serde(default = "default_compressed")]
     pub compressed: bool,
-    /// Only an explicit false permits rendering new output after a restart
-    /// without the task's in-memory environment credential values.
+    /// Whether the child environment held any completion secret, including
+    /// AFT's memory-only gh-shim ticket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_has_env_secrets: Option<bool>,
+    /// Whether completion secrets include values other than AFT's revoked-on-
+    /// restart gh-shim ticket. On older records this field is absent, so the
+    /// completion preview remains withheld unless `completion_has_env_secrets`
+    /// explicitly says the child environment held no secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_has_non_ticket_env_secrets: Option<bool>,
+    /// BLAKE3 digest of this task's AFT gh-shim ticket; the ticket itself is
+    /// never persisted. Used only to redact that exact value from replay output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_ticket_digest: Option<String>,
     /// Fully rendered, credential-masked notice text, saved before delivery so
     /// replay never needs the original environment values to reproduce it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -775,6 +785,8 @@ impl PersistedTask {
             notify_on_completion,
             compressed,
             completion_has_env_secrets: None,
+            completion_has_non_ticket_env_secrets: None,
+            completion_ticket_digest: None,
             completion_preview: None,
             pty_rows: None,
             pty_cols: None,
@@ -797,6 +809,22 @@ impl PersistedTask {
 
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    pub(crate) fn has_safe_completion_redaction_after_restart(&self) -> bool {
+        if self.completion_has_non_ticket_env_secrets != Some(false) {
+            return false;
+        }
+        match self.completion_has_env_secrets {
+            Some(false) => true,
+            Some(true) => self
+                .completion_ticket_digest
+                .as_deref()
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+            None => false,
+        }
     }
 
     pub fn mark_running(&mut self, child_pid: u32, pgid: i32) {
@@ -911,6 +939,8 @@ impl From<BashTaskRow> for PersistedTask {
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
             completion_has_env_secrets: None,
+            completion_has_non_ticket_env_secrets: None,
+            completion_ticket_digest: None,
             completion_preview: None,
             pty_rows: None,
             pty_cols: None,

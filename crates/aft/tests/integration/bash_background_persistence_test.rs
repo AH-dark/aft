@@ -506,6 +506,7 @@ fn fake_task(
     }
     // This synthetic task has no child environment credentials.
     metadata.completion_has_env_secrets = Some(false);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
     metadata.completion_delivered = completion_delivered;
     write_task(&paths.json, &metadata).unwrap();
     fs::write(&paths.stdout, "stdout").unwrap();
@@ -3407,6 +3408,101 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
 }
 
 #[test]
+fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-ticket");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let ticket_path = project.path().join("seen-ticket");
+    let command = format!(
+        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
+        shell_quote_path(&ticket_path),
+        shell_quote_path(&release),
+    );
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let id = spawn_redaction_task(&mut owner, &command, json!({}));
+    wait_for_status(&mut owner, SESSION, &id, "running");
+    wait_for_path(&ticket_path);
+    let ticket = fs::read_to_string(&ticket_path).unwrap();
+    assert_eq!(ticket.len(), 32, "the child must receive its AFT ticket");
+    assert!(ticket.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let persisted = read_json(storage.path(), SESSION, &id);
+    assert_eq!(persisted["completion_has_env_secrets"], true);
+    assert_eq!(persisted["completion_has_non_ticket_env_secrets"], false);
+    assert_eq!(
+        persisted["completion_ticket_digest"],
+        blake3::hash(ticket.as_bytes()).to_hex().to_string()
+    );
+    assert!(!persisted.to_string().contains(&ticket));
+    sigkill_aft(owner);
+
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    drop(release_guard);
+    wait_for_status(&mut restored, SESSION, &id, "completed");
+    let drained = drain(&mut restored, SESSION);
+    let completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == id)
+        .unwrap();
+    let preview = completion["output_preview"].as_str().unwrap();
+    assert_eq!(
+        preview,
+        "ticket=<REDACTED_SECRET> md5=0123456789abcdef0123456789abcdef\n"
+    );
+    assert!(!preview.contains(&ticket));
+    assert!(!preview.contains("secret values aren't available after the daemon restarted"));
+    assert!(restored.shutdown().success());
+}
+
+#[test]
+fn redaction_replay_rebuilds_long_classifier_secret_after_preview_cut() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-long-classifier-secret");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s' \"$LONG_PREFIX\"; printf '{{\"api_key\":\"%s\"}}\\n' \"$LONG_VALUE\"",
+        shell_quote_path(&release),
+    );
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let id = spawn_redaction_task(
+        &mut owner,
+        &command,
+        json!({
+            "LONG_PREFIX": "x".repeat(30_000),
+            "LONG_VALUE": "Z".repeat(40_000),
+        }),
+    );
+    wait_for_status(&mut owner, SESSION, &id, "running");
+    let persisted = read_json(storage.path(), SESSION, &id);
+    assert_eq!(persisted["completion_has_non_ticket_env_secrets"], false);
+    assert!(persisted["completion_ticket_digest"].as_str().is_some());
+    sigkill_aft(owner);
+
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    drop(release_guard);
+    wait_for_status(&mut restored, SESSION, &id, "completed");
+    let drained = drain(&mut restored, SESSION);
+    let completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == id)
+        .unwrap();
+    let preview = completion["output_preview"].as_str().unwrap();
+    assert!(preview.contains("<REDACTED_SECRET>"), "{completion}");
+    assert!(!preview.contains(&"Z".repeat(64)), "{completion}");
+    assert!(!preview.contains("secret values aren't available after the daemon restarted"));
+    assert!(restored.shutdown().success());
+}
+
+#[test]
 fn redaction_replay_withholds_new_secret_output() {
     const SECRET: &str = "opaque post-restart credential";
     let project = tempfile::tempdir().unwrap();
@@ -3421,6 +3517,11 @@ fn redaction_replay_withholds_new_secret_output() {
     );
     let id = spawn_redaction_task(&mut owner, &command, json!({"DEPLOY_tOkEn": SECRET}));
     let watched = spawn_redaction_task(&mut owner, &command, json!({"DEPLOY_tOkEn": SECRET}));
+    assert_eq!(
+        read_json(storage.path(), SESSION, &id)["completion_has_non_ticket_env_secrets"],
+        true,
+        "caller-provided credential values still require withholding after restart"
+    );
     let registered = owner.send(
         &json!({
             "id": "watch-after-restart", "session_id": SESSION, "command": "bash_notify",
@@ -3504,7 +3605,7 @@ fn redaction_replay_withholds_output_from_inherited_secret_environment() {
 }
 
 #[test]
-fn redaction_replay_shows_new_output_without_env_secrets() {
+fn redaction_replay_shows_new_output_with_only_revoked_ticket() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-ordinary");
@@ -3519,8 +3620,12 @@ fn redaction_replay_shows_new_output_without_env_secrets() {
     wait_for_status(&mut owner, SESSION, &id, "running");
     let persisted = read_json(storage.path(), SESSION, &id);
     assert_eq!(
-        persisted["completion_has_env_secrets"], false,
-        "the task has no secret-named values in its daemon or request environment"
+        persisted["completion_has_env_secrets"], true,
+        "the child receives AFT's memory-only ticket"
+    );
+    assert_eq!(
+        persisted["completion_has_non_ticket_env_secrets"], false,
+        "the ordinary task has no other secret environment values"
     );
     sigkill_aft(owner);
     let mut restored = AftProcess::spawn();
