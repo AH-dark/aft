@@ -111,6 +111,41 @@ fn bash_background_completion_replay_shows_ticket_only_output_and_masks_ticket()
 }
 
 #[test]
+fn bash_background_completion_digest_redacts_embedded_ticket_windows_only() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    const MD5_SHAPED: &str = "fedcba9876543210fedcba9876543210";
+    let digest = blake3::hash(TICKET.as_bytes()).to_hex().to_string();
+
+    let surrounded_by_underscores = format!("prefix_{TICKET}_suffix");
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(&surrounded_by_underscores, Some(&digest)),
+        "prefix_<REDACTED_SECRET>_suffix"
+    );
+
+    let longer_hex_run = format!("a{TICKET}b");
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(&longer_hex_run, Some(&digest)),
+        "a<REDACTED_SECRET>b"
+    );
+    let mut match_range = 1..(1 + TICKET.len());
+    let redacted_range = crate::log_redact::redact_ticket_digest_range(
+        &longer_hex_run,
+        &mut match_range,
+        Some(&digest),
+    );
+    assert_eq!(redacted_range.get(match_range), Some("<REDACTED_SECRET>"));
+    let adjacent_tickets = format!("{TICKET}{TICKET}");
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(&adjacent_tickets, Some(&digest)),
+        "<REDACTED_SECRET><REDACTED_SECRET>"
+    );
+    assert_eq!(
+        crate::log_redact::redact_ticket_digest(MD5_SHAPED, Some(&digest)),
+        MD5_SHAPED
+    );
+}
+
+#[test]
 fn bash_background_completion_redacts_credentials_not_status_or_artifacts() {
     let fixture = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
@@ -249,6 +284,53 @@ fn bash_background_completion_masks_per_call_env_values() {
     assert!(!std::fs::read_to_string(&task.paths.json)
         .unwrap()
         .contains(value));
+}
+
+#[test]
+fn bash_background_completion_rebuilds_preview_after_long_env_secret_masking() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let secret = "S".repeat(40_000);
+    let raw_output = format!("{}\n{secret}\n", "x".repeat(30_000));
+    let (_, task) = tests::insert_terminal_piped_task(
+        &registry,
+        &fixture,
+        "printf output",
+        &raw_output,
+        "",
+        false,
+    );
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.completion_has_env_secrets = Some(true);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(true);
+        crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+    *task.completion_secrets.lock().unwrap() =
+        Some(crate::log_redact::SecretValues::from_environment([(
+            std::ffi::OsStr::new("DEPLOY_TOKEN"),
+            std::ffi::OsStr::new(&secret),
+        )]));
+
+    let live_preview = registry
+        .completion_snapshot_for_task(&task)
+        .unwrap()
+        .output_preview;
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    let restarted = BgTaskRegistry::default();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let replayed = restarted.task(&task.task_id).unwrap();
+    let restarted_preview = restarted
+        .completion_snapshot_for_task(&replayed)
+        .unwrap()
+        .output_preview;
+
+    for (state, preview) in [("live", live_preview), ("restarted", restarted_preview)] {
+        assert!(preview.contains(SECRET_PLACEHOLDER), "{state}: {preview:?}");
+        assert!(!preview.contains(&"S".repeat(64)), "{state}: {preview:?}");
+    }
 }
 
 #[test]

@@ -3459,6 +3459,50 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
 }
 
 #[test]
+fn redaction_replay_rebuilds_long_classifier_secret_after_preview_cut() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-long-classifier-secret");
+    let release_guard = ReleaseOnDrop::new(release.clone());
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s' \"$LONG_PREFIX\"; printf '{{\"api_key\":\"%s\"}}\\n' \"$LONG_VALUE\"",
+        shell_quote_path(&release),
+    );
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let id = spawn_redaction_task(
+        &mut owner,
+        &command,
+        json!({
+            "LONG_PREFIX": "x".repeat(30_000),
+            "LONG_VALUE": "Z".repeat(40_000),
+        }),
+    );
+    wait_for_status(&mut owner, SESSION, &id, "running");
+    let persisted = read_json(storage.path(), SESSION, &id);
+    assert_eq!(persisted["completion_has_non_ticket_env_secrets"], false);
+    assert!(persisted["completion_ticket_digest"].as_str().is_some());
+    sigkill_aft(owner);
+
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+    drop(release_guard);
+    wait_for_status(&mut restored, SESSION, &id, "completed");
+    let drained = drain(&mut restored, SESSION);
+    let completion = drained["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|completion| completion["task_id"] == id)
+        .unwrap();
+    let preview = completion["output_preview"].as_str().unwrap();
+    assert!(preview.contains("<REDACTED_SECRET>"), "{completion}");
+    assert!(!preview.contains(&"Z".repeat(64)), "{completion}");
+    assert!(!preview.contains("secret values aren't available after the daemon restarted"));
+    assert!(restored.shutdown().success());
+}
+
+#[test]
 fn redaction_replay_withholds_new_secret_output() {
     const SECRET: &str = "opaque post-restart credential";
     let project = tempfile::tempdir().unwrap();

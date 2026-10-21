@@ -149,10 +149,12 @@ impl BgTaskRegistry {
         let mut raw = combine_streams(&stdout, &stderr);
         normalize_piped_display_output(&mut raw);
         let masked_values = secrets.redact(&raw);
+        let secret_redaction_changed = matches!(&masked_values, Cow::Owned(_));
         let masked = crate::log_redact::redact_ticket_digest(
             &masked_values,
             metadata.completion_ticket_digest.as_deref(),
         );
+        let ticket_redaction_changed = matches!(&masked, Cow::Owned(_));
         let mut safe_cache = cache.clone();
         if let Some(recovery) = &mut safe_cache.recovery {
             for line in &mut recovery.final_lines {
@@ -164,7 +166,8 @@ impl BgTaskRegistry {
                 .into_owned();
             }
         }
-        if let Cow::Owned(masked) = masked {
+        if secret_redaction_changed || ticket_redaction_changed {
+            let masked = masked.into_owned();
             // Re-render only credential-bearing output. Ordinary completions
             // reuse the terminal cache and never invoke the compressor twice.
             let body = if cache.kind == TerminalOutputKind::Compressed {
@@ -239,9 +242,11 @@ impl BgTaskRegistry {
             Some(secrets) => secrets.redact(text),
             None => aft_redactor(text),
         };
+        let secret_redaction_changed = matches!(&masked, Cow::Owned(_));
         let masked = crate::log_redact::redact_ticket_digest(&masked, ticket_digest.as_deref());
-        if let Cow::Owned(masked) = masked {
-            *text = masked;
+        let ticket_redaction_changed = matches!(&masked, Cow::Owned(_));
+        if secret_redaction_changed || ticket_redaction_changed {
+            *text = masked.into_owned();
         }
     }
 }

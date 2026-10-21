@@ -66,7 +66,6 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 static GITHUB_PAT: LazyLock<Regex> = LazyLock::new(|| compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"));
 static GITHUB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"));
-static HEX_32_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| compile(r"\b[0-9a-fA-F]{32}\b"));
 static SK_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
     compile(r"\bsk-(?:live-[A-Za-z0-9][A-Za-z0-9_-]{7,}|[A-Za-z0-9][A-Za-z0-9_-]{19,})\b")
 });
@@ -110,28 +109,70 @@ pub(crate) fn redact_ticket_digest_range<'a>(
 
 fn redact_ticket_digest_with_range<'a>(
     text: &'a str,
-    range: Option<&mut std::ops::Range<usize>>,
+    mut range: Option<&mut std::ops::Range<usize>>,
     digest: Option<&str>,
 ) -> Cow<'a, str> {
     let Some(digest) = digest else {
         return Cow::Borrowed(text);
     };
-    if text.len() < 32 {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Cow::Borrowed(text);
     }
-    replace_in(
-        Cow::Borrowed(text),
-        range,
-        &HEX_32_CANDIDATE,
-        |captures: &Captures<'_>| {
-            let candidate = captures.get(0).unwrap().as_str();
-            if blake3::hash(candidate.as_bytes()).to_hex().as_str() == digest {
-                SECRET_PLACEHOLDER.to_string()
-            } else {
-                candidate.to_string()
+    let bytes = text.as_bytes();
+    if bytes.len() < 32 {
+        return Cow::Borrowed(text);
+    }
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !bytes[cursor].is_ascii_hexdigit() {
+            cursor += 1;
+            continue;
+        }
+        let run_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
+            cursor += 1;
+        }
+        let run_end = cursor;
+        if run_end - run_start < 32 {
+            continue;
+        }
+        for start in run_start..=(run_end - 32) {
+            let end = start + 32;
+            let candidate = &text[start..end];
+            if blake3::hash(candidate.as_bytes()).to_hex().as_str() != digest {
+                continue;
             }
-        },
-    )
+            if let Some(previous) = spans.last_mut() {
+                if start < previous.end {
+                    previous.end = previous.end.max(end);
+                    continue;
+                }
+            }
+            spans.push(start..end);
+        }
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut masked = String::with_capacity(text.len());
+    let mut copied = 0;
+    for span in spans {
+        masked.push_str(&text[copied..span.start]);
+        let replacement_start = masked.len();
+        masked.push_str(SECRET_PLACEHOLDER);
+        if let Some(range) = range.as_deref_mut() {
+            map_redacted_range(
+                range,
+                replacement_start,
+                replacement_start + span.len(),
+                SECRET_PLACEHOLDER.len(),
+            );
+        }
+        copied = span.end;
+    }
+    masked.push_str(&text[copied..]);
+    Cow::Owned(masked)
 }
 
 fn redact_with_range<'a>(
