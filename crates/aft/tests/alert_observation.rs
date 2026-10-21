@@ -242,6 +242,7 @@ fn post_edit_acceptance_keeps_clean_snapshot_and_omits_unversioned_report() {
         version: Some(1),
         stale: false,
         provisional: false,
+        from_document_pull: false,
     };
     let accepted = LspManager::post_edit_outcome_for_entry_for_test(
         server.clone(),

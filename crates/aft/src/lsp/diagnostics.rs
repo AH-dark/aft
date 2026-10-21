@@ -68,6 +68,8 @@ pub struct DiagnosticEntry {
     /// Rust workspace/check state or an enabled work-done completion barrier.
     /// Provisional diagnostics are leads, not authoritative counts.
     pub provisional: bool,
+    /// A document pull, rather than an asynchronous push, certified this entry.
+    pub from_document_pull: bool,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -315,6 +317,7 @@ impl DiagnosticsStore {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.generation = self.generation.wrapping_add(1);
+        let from_document_pull = result_id.is_some();
         let entry = DiagnosticEntry {
             diagnostics,
             epoch: self.next_epoch,
@@ -322,6 +325,7 @@ impl DiagnosticsStore {
             version,
             stale: false,
             provisional,
+            from_document_pull,
         };
 
         self.last_publish_at_for_file
@@ -841,6 +845,26 @@ impl DiagnosticsStore {
 
     pub(crate) fn current_epoch(&self) -> u64 {
         self.next_epoch
+    }
+
+    pub(crate) fn mark_document_pull(&mut self, key: &ServerKey, file: &Path) {
+        if let Some(entry) = self.entries.get_mut(&(key.clone(), file.to_path_buf())) {
+            entry.from_document_pull = true;
+        }
+    }
+
+    pub(crate) fn invalidate_document_pulls(&mut self, key: &ServerKey) {
+        let mut changed = false;
+        for ((server, _), entry) in &mut self.entries {
+            if server == key && entry.from_document_pull {
+                entry.stale = true;
+                entry.result_id = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     pub(crate) fn has_provisional_report_for_server(&self, key: &ServerKey) -> bool {

@@ -420,6 +420,14 @@ pub enum ServerState {
 /// Events sent from background reader threads into the main loop.
 #[derive(Debug, Clone)]
 pub enum LspEvent {
+    /// A manager-owned document pull completed; the epoch prevents a later
+    /// replacement from being accepted as this pull's observation.
+    DocumentDiagnosticsPulled {
+        server_kind: ServerKind,
+        root: PathBuf,
+        file: PathBuf,
+        epoch: u64,
+    },
     /// Server sent a notification (e.g. publishDiagnostics).
     Notification {
         server_kind: ServerKind,
@@ -913,6 +921,9 @@ pub struct LspClient {
     /// `None` until `initialize()` succeeds; conservative defaults thereafter
     /// when the server doesn't advertise diagnosticProvider.
     diagnostic_caps: Option<ServerDiagnosticCapabilities>,
+    diagnostic_registrations: Arc<Mutex<super::diagnostic_registration::DiagnosticRegistrations>>,
+    allow_diagnostic_registration: Arc<AtomicBool>,
+    pull_diagnostics_disabled: bool,
     /// Rust-analyzer's workspace analysis has reached quiescence. Other server
     /// kinds do not use the experimental server-status signal and start
     /// authoritative by default.
@@ -1196,6 +1207,12 @@ impl LspClient {
         };
         let pending = Arc::new(Mutex::new(PendingMap::new()));
         let watched_file_registrations = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostic_registrations = Arc::new(Mutex::new(
+            super::diagnostic_registration::DiagnosticRegistrations::default(),
+        ));
+        let allow_diagnostic_registration = Arc::new(AtomicBool::new(false));
+        let reader_diagnostic_registrations = Arc::clone(&diagnostic_registrations);
+        let reader_allow_diagnostic_registration = Arc::clone(&allow_diagnostic_registration);
         let reader_pending = Arc::clone(&pending);
         let reader_writer = writer.clone();
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
@@ -1250,6 +1267,12 @@ impl LspClient {
                             &method,
                             params.as_ref(),
                         );
+                        if method == "client/unregisterCapability" {
+                            reader_diagnostic_registrations
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .record(&method, params.as_ref());
+                        }
                         // Auto-respond to server requests to prevent deadlocks.
                         // Server requests (like client/registerCapability,
                         // window/workDoneProgress/create) block the server until
@@ -1271,7 +1294,17 @@ impl LspClient {
                         let response =
                             super::jsonrpc::OutgoingResponse::success(id.clone(), response_value);
                         if let Ok(payload) = serde_json::to_string(&response) {
-                            reader_writer.send_response(payload);
+                            // The FIFO writer must queue registration acknowledgement
+                            // before any caller can queue a diagnostic pull.
+                            if reader_writer.send_response(payload)
+                                && reader_allow_diagnostic_registration.load(Ordering::SeqCst)
+                                && method == "client/registerCapability"
+                            {
+                                reader_diagnostic_registrations
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .record(&method, params.as_ref());
+                            }
                         }
                         // Also forward as event for any interested handlers
                         let _ = event_tx.send(LspEvent::ServerRequest {
@@ -1313,6 +1346,9 @@ impl LspClient {
             pending,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
+            diagnostic_registrations,
+            allow_diagnostic_registration,
+            pull_diagnostics_disabled: false,
             rust_analyzer_quiescent,
             rust_analyzer_failure: None,
             analysis_progress: WorkDoneAnalysis::default(),
@@ -1446,6 +1482,19 @@ impl LspClient {
             ]
         });
         let (checks_on_save, checks_on_load) = rust_check_triggers(initialization_options.as_ref());
+        self.pull_diagnostics_disabled = self.uses_analysis_progress()
+            && initialization_options
+                .as_ref()
+                .and_then(|options| options.get("disablePullDiagnostics"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        let dynamic_diagnostics = self.uses_analysis_progress() && !self.pull_diagnostics_disabled;
+        self.allow_diagnostic_registration
+            .store(dynamic_diagnostics, Ordering::SeqCst);
+        params_value["capabilities"]["textDocument"]["diagnostic"]["dynamicRegistration"] =
+            json!(dynamic_diagnostics);
+        params_value["capabilities"]["workspace"]["diagnostic"]["refreshSupport"] =
+            json!(dynamic_diagnostics);
         if let Some(initialization_options) = initialization_options {
             params_value["initializationOptions"] = initialization_options;
         }
@@ -1507,15 +1556,81 @@ impl LspClient {
     /// Diagnostic capabilities advertised by the server. Returns `None` until
     /// `initialize()` has succeeded; returns `Some` with conservative defaults
     /// (all `false`) when the server didn't advertise diagnosticProvider.
-    pub fn diagnostic_capabilities(&self) -> Option<&ServerDiagnosticCapabilities> {
-        self.diagnostic_caps.as_ref()
+    pub fn diagnostic_capabilities(&self) -> Option<ServerDiagnosticCapabilities> {
+        self.diagnostic_capabilities_inner(None)
+    }
+
+    pub(crate) fn diagnostic_capabilities_for_file(
+        &self,
+        file: &Path,
+    ) -> Option<ServerDiagnosticCapabilities> {
+        self.diagnostic_capabilities_inner(Some(file))
+    }
+
+    fn diagnostic_capabilities_inner(
+        &self,
+        file: Option<&Path>,
+    ) -> Option<ServerDiagnosticCapabilities> {
+        let static_caps = self.diagnostic_caps.clone()?;
+        if self.pull_diagnostics_disabled {
+            return Some(ServerDiagnosticCapabilities::default());
+        }
+        if static_caps.pull_diagnostics {
+            return Some(static_caps);
+        }
+        self.diagnostic_registrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .capabilities(&self.root, file)
+            .or(Some(static_caps))
+    }
+
+    pub(crate) fn uses_document_pull(&self, file: Option<&Path>) -> bool {
+        self.diagnostic_capabilities_inner(file)
+            .is_some_and(|caps| caps.pull_diagnostics)
+    }
+
+    pub(crate) fn start_document_diagnostic_request(
+        &mut self,
+        file: &Path,
+        mut params: super::pull_params::AftDocumentDiagnosticParams,
+    ) -> Result<(PendingLspRequest, bool), LspError> {
+        let registrations = Arc::clone(&self.diagnostic_registrations);
+        let registrations = registrations.lock().unwrap_or_else(|p| p.into_inner());
+        let caps = if self.pull_diagnostics_disabled {
+            None
+        } else {
+            self.diagnostic_caps
+                .clone()
+                .filter(|caps| caps.pull_diagnostics)
+                .or_else(|| registrations.capabilities(&self.root, Some(file)))
+        }
+        .ok_or_else(|| {
+            LspError::ServerNotReady("document diagnostics are not registered for this file".into())
+        })?;
+        if params.identifier != caps.identifier {
+            params.previous_result_id = None;
+        }
+        params.identifier = caps.identifier;
+        let used_previous = params.previous_result_id.is_some();
+        // Keep registration stable through FIFO enqueue: unregistration cannot
+        // be acknowledged ahead of a request authorized by the old registration.
+        let request =
+            self.start_request::<super::pull_params::AftDocumentDiagnosticRequest>(params)?;
+        drop(registrations);
+        Ok((request, used_previous))
     }
 
     /// Whether this server is still analyzing: Rust uses workspace/check state;
     /// enabled background-analysis producers use their work-done progress.
     pub fn diagnostics_are_provisional(&self) -> bool {
         self.is_unresponsive()
-            || (self.uses_analysis_progress() && self.analysis_progress.pending())
+            || (self.uses_analysis_progress()
+                && if self.uses_document_pull(None) {
+                    self.analysis_progress.running()
+                } else {
+                    self.analysis_progress.pending()
+                })
             || (matches!(&self.kind, ServerKind::Rust)
                 && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some()))
     }
@@ -1526,8 +1641,13 @@ impl LspClient {
     }
 
     pub(crate) fn analysis_progress_authority(&self) -> Option<&'static str> {
-        self.uses_analysis_progress()
-            .then(|| self.analysis_progress.authority())
+        self.uses_analysis_progress().then(|| {
+            if self.uses_document_pull(None) {
+                "document_pull"
+            } else {
+                self.analysis_progress.authority()
+            }
+        })
     }
 
     pub(crate) fn record_analysis_progress(&mut self, params: &Value, diagnostics_epoch: u64) {
@@ -1547,11 +1667,12 @@ impl LspClient {
         published_at: Option<Instant>,
     ) -> bool {
         !self.uses_analysis_progress()
-            || self.analysis_progress.certifies(
-                &crate::inspect::job::normalize_path(file),
-                epoch,
-                published_at,
-            )
+            || (!self.uses_document_pull(Some(file))
+                && self.analysis_progress.certifies(
+                    &crate::inspect::job::normalize_path(file),
+                    epoch,
+                    published_at,
+                ))
     }
 
     pub(crate) fn has_analysis_progress(&self) -> bool {
@@ -1606,6 +1727,10 @@ impl LspClient {
             return;
         };
         let file = crate::inspect::job::normalize_path(&file);
+        if self.uses_document_pull(Some(&file)) {
+            self.analysis_progress.opens.remove(&file);
+            return;
+        }
         match method {
             "textDocument/didOpen" | "textDocument/didChange" => {
                 self.analysis_progress.opened(file)

@@ -475,6 +475,35 @@ pub(crate) fn run_diagnostics_category(
     collection.sort_and_dedup();
 
     if let Some((candidates, _)) = &scoped {
+        // A registered document pull certifies only its own scoped file. Other
+        // open files may still have workspace progress; that cannot downgrade
+        // successful file pulls or certify any unrequested file.
+        {
+            let lsp = ctx.lsp();
+            for key in expected_producers {
+                if lsp.analysis_progress_authority(key) != Some("document_pull") {
+                    continue;
+                }
+                let files = candidates
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        producer_keys_for_file(file, &snapshot.config, &snapshot.project_root)
+                            .contains(key)
+                    })
+                    .collect::<Vec<_>>();
+                if !files.is_empty()
+                    && files
+                        .iter()
+                        .all(|file| lsp.analysis_progress_certifies_file(key, file))
+                {
+                    let producer = (server_id(key), key.root.clone());
+                    collection.indexing_gaps.remove(&producer);
+                    collection.servers_pending.remove(&producer);
+                }
+            }
+            collection.producers_settled = collection.servers_pending.is_empty();
+        }
         collection.apply_scope(scope);
         collection.scope_walk_truncated = !candidates.walk_complete;
         collection.record_scope_coverage_gaps(ctx, snapshot, &candidates.files, sweep.as_ref());
@@ -1379,7 +1408,7 @@ impl DiagnosticsCollection {
                 *authority = serde_json::json!([]);
             }
             authority.as_array_mut().unwrap().push(serde_json::json!({
-                "root": display_root(snapshot, &root), "rule": rule, "no_progress_grace_ms": 2000,
+                "root": display_root(snapshot, &root), "rule": rule, "no_progress_grace_ms": if rule == "document_pull" { 0 } else { 2000 },
             }));
         }
         payload

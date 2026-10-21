@@ -2380,6 +2380,7 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
         version: Some(4),
         stale: false,
         provisional: false,
+        from_document_pull: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -2416,6 +2417,7 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
         version: None,
         stale: false,
         provisional: false,
+        from_document_pull: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -2731,6 +2733,7 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
         version: Some(1),
         stale: false,
         provisional: true,
+        from_document_pull: false,
     };
 
     let outcome = LspManager::post_edit_outcome_for_entry_for_test(

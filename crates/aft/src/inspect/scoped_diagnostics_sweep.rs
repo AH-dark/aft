@@ -101,6 +101,7 @@ pub(crate) struct ScopedSweep {
     pub(crate) still_checking: HashSet<ServerKey>,
     /// Documents this sweep opened, to close once diagnostics are read.
     opened: Vec<(PathBuf, Vec<ServerKey>)>,
+    pull_pause: Option<crate::lsp::manager::BackgroundDocumentPullPause>,
 }
 
 impl ScopedSweep {
@@ -198,6 +199,27 @@ pub(crate) fn sweep_scoped_files(
         .map(|(file, _)| file.clone())
         .chain(sweep.not_examined.keys().cloned())
         .collect();
+    if selected.iter().flat_map(|(_, keys)| keys).any(|key| {
+        matches!(key.kind, ServerKind::Python)
+            || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+    }) {
+        let mut pause = ctx.lsp().pause_background_document_pulls();
+        let idle = pause.wait_until_idle(deadline);
+        sweep.pull_pause = Some(pause);
+        if !idle {
+            for (file, keys) in &selected {
+                sweep.unanswered.insert(
+                    file.clone(),
+                    (
+                        keys[0].clone(),
+                        "background document diagnostics are still in flight; retry aft_inspect"
+                            .into(),
+                    ),
+                );
+            }
+            return sweep;
+        }
+    }
     // A check an earlier request expected and that never began is asked for
     // again now, so it can run while the files are opened.
     {
@@ -207,8 +229,10 @@ pub(crate) fn sweep_scoped_files(
         }
     }
 
-    // Open the files and start their pulls a window at a time, then collect
-    // the replies. A server answers pulls concurrently, so waiting for one
+    // Deliver all document bodies before starting expensive analysis requests.
+    // Otherwise a server busy analyzing an earlier pull can stop reading stdin
+    // and make a later large didOpen exceed the bounded transport write budget.
+    // A server answers pulls concurrently, so waiting for one
     // reply before sending the next request made a scope of a few hundred
     // files spend the whole budget on round trips. The manager lock is taken
     // per step and never held while a server works on a pull, so other
@@ -216,101 +240,112 @@ pub(crate) fn sweep_scoped_files(
     let mut waiting: Vec<(PathBuf, ServerKey, Option<u64>)> = Vec::new();
     let mut pulled: Vec<(PathBuf, ServerKey, Vec<StoredDiagnostic>)> = Vec::new();
     let mut retry_pulls: Vec<(PathBuf, ServerKey, Option<u64>, String)> = Vec::new();
-    for window in selected.chunks(PULL_WINDOW) {
-        let mut in_flight = Vec::new();
-        let mut typescript_in_flight = Vec::new();
-        for (file, keys) in window {
-            if Instant::now() >= deadline || cancellation_requested() {
+    let mut late_registrations = HashSet::new();
+    let mut to_pull = Vec::new();
+    for (file, keys) in &selected {
+        if Instant::now() >= deadline || cancellation_requested() {
+            for key in keys {
+                sweep
+                    .unanswered
+                    .insert(file.clone(), (key.clone(), NO_PUBLISH_REASON.to_string()));
+            }
+            continue;
+        }
+        let mut lsp = ctx.lsp();
+        let before = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    lsp.diagnostic_epoch(key, file),
+                    lsp.document_is_open_in(key, file),
+                )
+            })
+            .collect::<Vec<_>>();
+        let opened = match lsp.open_document_for_servers(file, keys) {
+            Ok(opened) => opened,
+            Err(err) => {
                 for key in keys {
-                    sweep
-                        .unanswered
-                        .insert(file.clone(), (key.clone(), NO_PUBLISH_REASON.to_string()));
+                    sweep.unanswered.insert(
+                        file.clone(),
+                        (
+                            key.clone(),
+                            format!("could not open the file for analysis: {err}"),
+                        ),
+                    );
                 }
                 continue;
             }
-            let mut lsp = ctx.lsp();
-            let before = keys
-                .iter()
-                .map(|key| {
-                    (
-                        key.clone(),
-                        lsp.diagnostic_epoch(key, file),
-                        lsp.document_is_open_in(key, file),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let opened = match lsp.open_document_for_servers(file, keys) {
-                Ok(opened) => opened,
-                Err(err) => {
-                    for key in keys {
-                        sweep.unanswered.insert(
-                            file.clone(),
-                            (
-                                key.clone(),
-                                format!("could not open the file for analysis: {err}"),
-                            ),
-                        );
-                    }
-                    continue;
-                }
-            };
-            if !opened.is_empty() {
-                sweep.opened.push((file.clone(), opened));
+        };
+        if !opened.is_empty() {
+            sweep.opened.push((file.clone(), opened));
+        }
+        for (key, epoch_before, was_open) in before {
+            if !lsp.has_client(&key) {
+                continue;
             }
-            for (key, epoch_before, was_open) in before {
-                if !lsp.has_client(&key) {
-                    continue;
+            // A document that was already open is analyzed continuously
+            // (an edit opened it, for example); its current report is
+            // live and is read as it stands. rust-analyzer answering
+            // pulls is the exception: it analyzes a document only when
+            // asked, so its stored report can predate an edit to another
+            // file (removing a struct field the document still sets, for
+            // example) and is asked for again. A document opened now needs
+            // a report newer than whatever was stored before (a `cargo
+            // check` result, or an older analysis).
+            let pulls = lsp.server_supports_pull_for_file(&key, file);
+            if key.kind == ServerKind::TypeScript && !pulls {
+                to_pull.push((file.clone(), key, epoch_before));
+                continue;
+            }
+            let repull_open = pulls
+                && (matches!(key.kind, ServerKind::Rust | ServerKind::Python)
+                    || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright"));
+            if was_open && !repull_open && lsp.has_diagnostic_report_for_server_file(&key, file) {
+                continue;
+            }
+            if !pulls {
+                if matches!(key.kind, ServerKind::Python) || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright") {
+                    late_registrations.insert((file.clone(), key.clone()));
                 }
-                // A document that was already open is analyzed continuously
-                // (an edit opened it, for example); its current report is
-                // live and is read as it stands. rust-analyzer answering
-                // pulls is the exception: it analyzes a document only when
-                // asked, so its stored report can predate an edit to another
-                // file (removing a struct field the document still sets, for
-                // example) and is asked for again. A document opened now needs
-                // a report newer than whatever was stored before (a `cargo
-                // check` result, or an older analysis).
-                let pulls = lsp.server_supports_pull(&key);
-                if key.kind == ServerKind::TypeScript && !pulls {
-                    match lsp.begin_scoped_typescript_diagnostics(&key, file, deadline) {
-                        Ok(request) => typescript_in_flight.push((file.clone(), key, request)),
-                        Err(error) => {
-                            sweep
-                                .typescript_reports
-                                .insert(file.clone(), (key, Err(error.into())));
-                        }
+                waiting.push((file.clone(), key, epoch_before));
+                continue;
+            }
+            // A pull sent before rust-analyzer processes a watched-file
+            // change can succeed with the old native analysis, not only
+            // be cancelled. Request it after the current compiler check
+            // settles, when the analyzer has processed the change/save.
+            if key.kind == ServerKind::Rust && lsp.rust_check_state(&key) != RustCheckState::Current
+            {
+                retry_pulls.push((
+                    file.clone(),
+                    key,
+                    epoch_before,
+                    "native analysis is waiting for the current cargo check".to_string(),
+                ));
+                continue;
+            }
+            to_pull.push((file.clone(), key, epoch_before));
+        }
+    }
+    for window in to_pull.chunks(PULL_WINDOW) {
+        let mut in_flight = Vec::new();
+        let mut typescript_in_flight = Vec::new();
+        for (file, key, epoch_before) in window {
+            let mut lsp = ctx.lsp();
+            if key.kind == ServerKind::TypeScript && !lsp.server_supports_pull_for_file(key, file) {
+                match lsp.begin_scoped_typescript_diagnostics(key, file, deadline) {
+                    Ok(request) => typescript_in_flight.push((file.clone(), key.clone(), request)),
+                    Err(error) => {
+                        sweep.typescript_reports.insert(file.clone(), (key.clone(), Err(error.into())));
                     }
-                    continue;
                 }
-                let repull_open = pulls && key.kind == ServerKind::Rust;
-                if was_open && !repull_open && lsp.has_diagnostic_report_for_server_file(&key, file)
-                {
-                    continue;
-                }
-                if !pulls {
-                    waiting.push((file.clone(), key, epoch_before));
-                    continue;
-                }
-                // A pull sent before rust-analyzer processes a watched-file
-                // change can succeed with the old native analysis, not only
-                // be cancelled. Request it after the current compiler check
-                // settles, when the analyzer has processed the change/save.
-                if key.kind == ServerKind::Rust
-                    && lsp.rust_check_state(&key) != RustCheckState::Current
-                {
-                    retry_pulls.push((
-                        file.clone(),
-                        key,
-                        epoch_before,
-                        "native analysis is waiting for the current cargo check".to_string(),
-                    ));
-                    continue;
-                }
-                match lsp.begin_document_pull(&key, file, deadline) {
-                    Ok(pull) => in_flight.push((file.clone(), key, epoch_before, pull)),
-                    Err(err) => {
-                        retry_pulls.push((file.clone(), key, epoch_before, err.to_string()))
-                    }
+                continue;
+            }
+            match lsp.begin_document_pull(key, file, deadline) {
+                Ok(pull) => in_flight.push((file.clone(), key.clone(), *epoch_before, pull)),
+                Err(error) => {
+                    retry_pulls.push((file.clone(), key.clone(), *epoch_before, error.to_string()))
                 }
             }
         }
@@ -365,10 +400,16 @@ pub(crate) fn sweep_scoped_files(
         .filter(|key| key.kind == ServerKind::Rust)
         .collect::<Vec<_>>();
     loop {
-        let (checking, unreported, analysis_pending) = {
+        let (checking, unreported, analysis_pending, newly_registered) = {
             let mut lsp = ctx.lsp();
             lsp.drain_events();
+            let mut newly_registered = Vec::new();
             waiting.retain(|(file, key, before)| {
+                if late_registrations.contains(&(file.clone(), key.clone())) && lsp.server_supports_pull_for_file(key, file) {
+                    late_registrations.remove(&(file.clone(), key.clone()));
+                    newly_registered.push((file.clone(), key.clone(), *before));
+                    return false;
+                }
                 lsp.has_client(key)
                     && (!lsp.analysis_progress_certifies_file(key, file)
                         || !lsp
@@ -394,8 +435,23 @@ pub(crate) fn sweep_scoped_files(
                 })
                 .cloned()
                 .collect::<HashSet<_>>();
-            (checking, unreported, analysis_pending)
+            (checking, unreported, analysis_pending, newly_registered)
         };
+        if !newly_registered.is_empty() {
+            // Registration may arrive after didOpen. Background refresh is
+            // paused for this scope, so issue only these newly registered file
+            // pulls here rather than waiting for a push that pull mode stopped.
+            for (file, key, before) in newly_registered {
+                match pull_unlocked(ctx, &key, &file, deadline) {
+                    Ok((PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged, diagnostics)) => {
+                        if let Some(diagnostics) = diagnostics { pulled.push((file, key, diagnostics)); }
+                    }
+                    Ok((_, _)) => retry_pulls.push((file, key, before, "document pull not ready after registration".into())),
+                    Err(error) => retry_pulls.push((file, key, before, error.to_string())),
+                }
+            }
+            continue;
+        }
         if waiting.is_empty() && checking.is_empty() && analysis_pending.is_empty() {
             sweep.still_checking = unreported.into_iter().collect();
             break;

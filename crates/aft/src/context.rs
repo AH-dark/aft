@@ -4987,6 +4987,10 @@ impl AppContext {
         };
         #[cfg(test)]
         let context = context.with_test_checkpoint_store();
+        context
+            .lsp_manager
+            .lock()
+            .enable_background_document_pulls(Arc::downgrade(&context.lsp_manager));
         crate::logging::sync_storage_root(context.storage_dir());
         context
     }

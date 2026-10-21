@@ -13,7 +13,7 @@ const CONTENT_HASH_SIZE_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 /// resync the LSP server before issuing diagnostic requests. Without this,
 /// `ensure_file_open` would skip already-open files and return diagnostics
 /// computed from stale in-memory content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentEntry {
     /// Monotonically increasing LSP version, starts at 0.
     pub version: i32,
