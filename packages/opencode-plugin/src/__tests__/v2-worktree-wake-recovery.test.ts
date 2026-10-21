@@ -3,6 +3,7 @@ import { Effect } from "effect";
 
 import { makeServerEffect } from "../entry/server-runtime.mjs";
 import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
+import { drainEntry } from "./helpers/drain-wire.js";
 
 afterEach(__resetV2WakeRoutesForTests);
 
@@ -38,7 +39,7 @@ test("V2 linked-worktree restart recovers missed matches and completions from th
         return {
           success: true,
           pending_matches: root === worktree && pending ? [match] : [],
-          bg_completions: root === worktree && completed ? [completion] : [],
+          bg_completions: root === worktree && completed ? [drainEntry(completion)] : [],
         };
       }
       if (command === "bash_ack_completions" && root === worktree) {

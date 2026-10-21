@@ -241,6 +241,29 @@ pub(crate) fn test_hook(path: &Path, step: &str) {
     }
 }
 
+/// Publication-round hooks (`bind-pending`, `bind-protected`, ...) fire on the
+/// canonical root a binding records. A hook registered under another spelling
+/// of the same checkout, such as a macOS temp path below the `/var` symlink or
+/// a Windows path without its `\\?\` verbatim prefix, would never run, and its
+/// test would wait out a channel timeout far from the cause. Remove such a
+/// hook, which drops and disconnects any channel it holds so the waiting test
+/// fails at once, and panic naming both spellings.
+#[cfg(test)]
+fn reject_noncanonical_root_hook(spelled: &Path, canonical: &Path) {
+    if spelled == canonical {
+        return;
+    }
+    let removed = test_hooks().lock().unwrap().remove(spelled);
+    if let Some(hook) = removed {
+        drop(hook);
+        panic!(
+            "retention bind test hook registered on {} but publication hooks fire on its canonical root {}",
+            spelled.display(),
+            canonical.display()
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn allow_next_scheduled_pass_for_test(storage: &Path) {
     let mut states = states().lock().unwrap();
@@ -533,7 +556,10 @@ pub(crate) fn record_bind_until(
     let started = Instant::now();
     fs::create_dir_all(storage.join("retention"))?;
     let path = storage.join("retention/sweep.lock");
-    let root = fs::canonicalize(root)?;
+    let spelled_root = root;
+    let root = fs::canonicalize(spelled_root)?;
+    #[cfg(test)]
+    reject_noncanonical_root_hook(spelled_root, &root);
     let member = Arc::new(PendingBind {
         binding: Binding {
             volume: volume_anchor(&root),
@@ -6039,6 +6065,11 @@ mod storage_retention_tests {
         let (temp, _, _, _) = due_cache_fixture();
         let root = temp.path().join("new-checkout");
         fs::create_dir(&root).unwrap();
+        // A publication round fires its per-root hooks with the canonical root
+        // it records. Temp paths are not canonical on macOS (/var is a symlink
+        // to /private/var) or Windows (canonical form is \\?\ verbatim), so a
+        // hook keyed by the spelled path would never run there.
+        let root = fs::canonicalize(root).unwrap();
         let (sweep, release) =
             paused_pass_with_budget(temp.path(), temp.path(), "due-admitted", NO_TIME_BOUND);
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6092,6 +6123,9 @@ mod storage_retention_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("checkout");
         fs::create_dir(&root).unwrap();
+        // Per-root publication hooks are keyed by the canonical root; see
+        // retention_bind_interrupts_admitted_history_reread.
+        let root = fs::canonicalize(root).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -6120,6 +6154,41 @@ mod storage_retention_tests {
         assert!(
             legacy.is_err(),
             "new binding bypassed the legacy retention lock"
+        );
+    }
+
+    #[test]
+    fn retention_bind_hook_on_noncanonical_root_fails_loudly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        // A `..` component makes this spelling differ from the canonical root
+        // on every platform, as /var and \\?\ spellings do on macOS and Windows.
+        let spelled = root.join("..").join("checkout");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = observe_test_hook(
+            &spelled,
+            Arc::new(move |step| {
+                if step == "bind-protected" {
+                    let _ = entered_tx.send(());
+                }
+            }),
+        );
+        let storage = temp.path().to_path_buf();
+        let bind = std::thread::spawn(move || record_bind(&storage, &spelled, "fedcba9876543210"));
+        let panic = bind
+            .join()
+            .expect_err("a hook keyed by a non-canonical root must fail the bind");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("publication hooks fire on its canonical root"),
+            "{message}"
+        );
+        // The hook was dropped, so a test waiting on its channel fails at once
+        // instead of waiting out its timeout.
+        assert_eq!(
+            entered_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
         );
     }
 

@@ -77,7 +77,6 @@ async function rig(parentID?: string) {
             task.status === "completed"
               ? [
                   {
-                    session_id: "session-v2",
                     task_id: task.id,
                     status: "completed",
                     command: "server",

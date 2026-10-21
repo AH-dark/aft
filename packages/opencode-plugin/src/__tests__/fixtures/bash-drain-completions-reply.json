@@ -1,0 +1,1 @@
+{"id":"3","success":true,"bg_completions":[{"task_id":"bash-aee42e9795d9d03f","status":"completed","exit_code":0,"command":"sleep 1; echo done","output_preview":"done\n","original_tokens":2,"compressed_tokens":2,"live_descendants":[]}],"pending_matches":[]}

@@ -7963,6 +7963,21 @@ fn walk_applicable_area_uncached(
     entry_limit: usize,
     mode: crate::lsp::roots::RootPathMode,
 ) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
+    // In WalkEntry mode every server key inherits the walk root's spelling,
+    // because entries below it are not resolved again. `walk_applicable_area`
+    // normalizes the roots first. A Windows verbatim (`\\?\C:\...`) root here
+    // would key language servers by a path that per-file resolution never
+    // returns, which could start a second server for the same checkout.
+    debug_assert!(
+        !is_windows_verbatim(project_root)
+            && !config
+                .project_root
+                .as_deref()
+                .is_some_and(is_windows_verbatim),
+        "applicability walk roots must be in canonicalize_normalized form: {} (config root {:?})",
+        project_root.display(),
+        config.project_root
+    );
     if !project_root.is_dir() {
         return Err(ApplicabilityResolutionError::RootUnreadable {
             root: project_root.to_path_buf(),
@@ -8072,6 +8087,15 @@ fn walk_applicable_area_uncached(
         candidates,
         markers,
     })
+}
+
+/// True for a Windows extended-length path (`\\?\C:\...`, `\\?\UNC\...`), the
+/// form `fs::canonicalize` returns there. Always false on other platforms.
+fn is_windows_verbatim(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    )
 }
 
 /// Test hook: hold the applicability walk so a test can prove that configure
