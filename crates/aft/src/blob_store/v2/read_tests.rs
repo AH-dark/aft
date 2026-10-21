@@ -261,10 +261,12 @@ fn payload_totals_stay_exact_and_epoch_updates_fire_no_trigger() {
     let old = FamilyKey::new(FamilyPlane::Semantic, [3; 32]);
     let before = total_changes_of(&connection());
     assert!(store.delete_if_unreferenced_since(&old, epoch).unwrap());
+    // The row, the totals row, and the deletion count of the store's
+    // deletion epoch.
     assert_eq!(
         total_changes_of(&connection()) - before,
-        2,
-        "a delete updates the totals row"
+        3,
+        "a delete updates the totals row and the deletion count"
     );
     assert_totals_exact(&store, &check, "a delete");
 
@@ -943,4 +945,110 @@ fn touch_preserves_newer_epochs_and_reports_missing_and_duplicate_keys() {
         store.get(&present).unwrap().as_deref(),
         Some(&b"payload"[..])
     );
+}
+
+#[test]
+fn deletion_epoch_counts_each_deleted_row_from_any_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "deletions"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let start = store.deletion_epoch().unwrap().expect("set up on open");
+    let keys = (1u8..=4)
+        .map(|byte| FamilyKey::new(FamilyPlane::Semantic, [byte; 32]))
+        .collect::<Vec<_>>();
+    for key in &keys {
+        store.put_or_touch(key, b"payload").unwrap();
+    }
+    // Inserts, reuse and epoch touches delete nothing.
+    store.put_or_touch(&keys[0], b"payload").unwrap();
+    let epoch = store.raise_epoch(5).unwrap();
+    store.touch(&keys).unwrap();
+    assert_eq!(store.deletion_epoch().unwrap(), Some(start));
+    let count =
+        |epoch: DeletionEpoch| u64::from_le_bytes(epoch.to_bytes()[16..].try_into().unwrap());
+    assert!(store
+        .delete_if_unreferenced_since(&keys[0], epoch + 1)
+        .unwrap());
+    // A refused conditional delete removes no row and counts nothing.
+    assert!(!store.delete_if_unreferenced_since(&keys[1], 0).unwrap());
+    assert_eq!(
+        count(store.deletion_epoch().unwrap().unwrap()),
+        count(start) + 1
+    );
+    // v0.61.0's delete statement, run by a connection that knows nothing of
+    // the counter, is counted by the trigger in the store's schema.
+    let other = rusqlite::Connection::open(store.path()).unwrap();
+    assert_eq!(
+        other
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key = ?1 AND ref_epoch < ?2",
+                params![keys[1].as_bytes().as_slice(), i64::MAX],
+            )
+            .unwrap(),
+        1
+    );
+    // So is a delete of several rows in one statement, once per row.
+    other
+        .execute(
+            "DELETE FROM blob_payloads WHERE full_key IN (?1, ?2)",
+            params![keys[2].as_bytes().as_slice(), keys[3].as_bytes().as_slice()],
+        )
+        .unwrap();
+    let after = store.deletion_epoch().unwrap().unwrap();
+    assert_eq!(count(after), count(start) + 4);
+    assert_eq!(after.to_bytes()[..16], start.to_bytes()[..16]);
+    // A DELETE with no WHERE, which SQLite runs as a truncation only when
+    // the table has no delete trigger, is counted row by row too.
+    for byte in 5u8..=7 {
+        store
+            .put_or_touch(
+                &FamilyKey::new(FamilyPlane::Semantic, [byte; 32]),
+                b"payload",
+            )
+            .unwrap();
+    }
+    other.execute("DELETE FROM blob_payloads", []).unwrap();
+    assert_eq!(
+        count(store.deletion_epoch().unwrap().unwrap()),
+        count(start) + 7
+    );
+    let integrity: String = other
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+#[test]
+fn damaged_deletion_epoch_reads_as_none_and_rebuilds_under_a_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "damaged-deletions"),
+        FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let original = store.deletion_epoch().unwrap().unwrap();
+    let other = rusqlite::Connection::open(store.path()).unwrap();
+    for damage in [
+        "DROP TRIGGER payload_deletions_count",
+        "UPDATE payload_deletions SET count = -1",
+        "UPDATE payload_deletions SET generation = X'00'",
+        "UPDATE payload_deletions SET generation = 'text'",
+        "DELETE FROM payload_deletions",
+        "DROP TABLE payload_deletions",
+    ] {
+        store.rebuild_deletion_epoch_for_test();
+        assert!(store.deletion_epoch().unwrap().is_some());
+        other.execute_batch(damage).unwrap();
+        assert_eq!(store.deletion_epoch().unwrap(), None, "{damage}");
+    }
+    // A rebuilt counter never repeats an earlier value, even from count 0.
+    store.rebuild_deletion_epoch_for_test();
+    let rebuilt = store.deletion_epoch().unwrap().unwrap();
+    assert_ne!(rebuilt.to_bytes()[..16], original.to_bytes()[..16]);
+    // Setup keeps a valid counter it finds.
+    set_up_deletion_epoch(&mut lock(&store.inner.connection)).unwrap();
+    assert_eq!(store.deletion_epoch().unwrap(), Some(rebuilt));
 }

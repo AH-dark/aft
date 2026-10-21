@@ -458,63 +458,117 @@ impl FamilyStore {
     /// key) must already be durable; see `pins::Protection`.
     pub fn put_or_touch(&self, key: &FamilyKey, payload: &[u8]) -> StoreResult<PutOrTouch> {
         self.ensure_plane(key)?;
-        let digest = blake3::hash(payload);
         let mut connection = lock(&self.inner.connection);
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let quarantined = tx
-            .query_row(
-                "SELECT 1 FROM blob_quarantine WHERE full_key = ?1",
-                params![key.as_bytes().as_slice()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if quarantined {
-            tx.commit()?;
-            return Ok(PutOrTouch::Quarantined);
-        }
-        let epoch = read_epoch(&tx)?;
-        let existing: Option<(Vec<u8>, i64)> = tx
-            .query_row(
-                "SELECT payload_digest, ref_epoch FROM blob_payloads WHERE full_key = ?1",
-                params![key.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let outcome = match existing {
-            Some((stored, ref_epoch)) if stored.as_slice() == digest.as_bytes() => {
-                // Rewriting an unchanged epoch can rebuild payload overflow pages.
-                // Still compare the digest before accepting any reuse.
-                if ref_epoch < epoch as i64 {
-                    tx.execute(
-                        "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
-                        params![key.as_bytes().as_slice(), epoch as i64],
-                    )?;
-                }
-                PutOrTouch::Reused { ref_epoch: epoch }
-            }
-            Some(_) => return Err(StoreError::ConflictingPayload(*key)),
-            None => {
-                tx.execute(
-                    "INSERT INTO blob_payloads
-                     (full_key, payload, payload_digest, payload_schema, ref_epoch, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        key.as_bytes().as_slice(),
-                        payload,
-                        digest.as_bytes().as_slice(),
-                        i64::from(self.inner.plane.payload_schema()),
-                        epoch as i64,
-                        now_ms() as i64,
-                    ],
-                )?;
-                PutOrTouch::Inserted { ref_epoch: epoch }
-            }
-        };
+        let outcome = put_or_touch_in(&tx, self.inner.plane, key, payload)?;
         tx.commit()?;
         Ok(outcome)
     }
 
+    /// Reads the store's deletion epoch and, in the same write transaction,
+    /// stores the payload `build` names for it, like [`Self::put_or_touch`].
+    /// No row can be deleted between the read and the put. Returns `None`,
+    /// storing nothing, when the store has no valid deletion epoch or `build`
+    /// declines.
+    pub(crate) fn put_at_deletion_epoch(
+        &self,
+        build: impl FnOnce(&DeletionEpoch) -> Option<(FamilyKey, Vec<u8>)>,
+    ) -> StoreResult<Option<PutOrTouch>> {
+        let mut connection = lock(&self.inner.connection);
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(epoch) = deletion_epoch(&tx)? else {
+            return Ok(None);
+        };
+        let Some((key, payload)) = build(&epoch) else {
+            return Ok(None);
+        };
+        self.ensure_plane(&key)?;
+        let outcome = put_or_touch_in(&tx, self.inner.plane, &key, &payload)?;
+        tx.commit()?;
+        Ok(Some(outcome))
+    }
+
+    /// The store's current deletion epoch; see [`DeletionEpoch`].
+    pub fn deletion_epoch(&self) -> StoreResult<Option<DeletionEpoch>> {
+        read_deletion_epoch(&self.inner)
+    }
+
+    /// Replaces the store's deletion epoch counter with a fresh one under a
+    /// new generation, as setup does for a missing or damaged counter.
+    #[cfg(test)]
+    pub(crate) fn rebuild_deletion_epoch_for_test(&self) {
+        let mut connection = lock(&self.inner.connection);
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        replace_deletion_epoch(&tx).unwrap();
+        tx.commit().unwrap();
+    }
+}
+
+/// [`FamilyStore::put_or_touch`] inside the caller's IMMEDIATE transaction.
+/// A conflicting payload returns an error and the caller's transaction rolls
+/// back when dropped.
+fn put_or_touch_in(
+    tx: &rusqlite::Transaction<'_>,
+    plane: FamilyPlane,
+    key: &FamilyKey,
+    payload: &[u8],
+) -> StoreResult<PutOrTouch> {
+    let digest = blake3::hash(payload);
+    let quarantined = tx
+        .query_row(
+            "SELECT 1 FROM blob_quarantine WHERE full_key = ?1",
+            params![key.as_bytes().as_slice()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if quarantined {
+        return Ok(PutOrTouch::Quarantined);
+    }
+    let epoch = read_epoch(tx)?;
+    let existing: Option<(Vec<u8>, i64)> = tx
+        .query_row(
+            "SELECT payload_digest, ref_epoch FROM blob_payloads WHERE full_key = ?1",
+            params![key.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let outcome = match existing {
+        Some((stored, ref_epoch)) if stored.as_slice() == digest.as_bytes() => {
+            // Rewriting an unchanged epoch can rebuild payload overflow pages.
+            // Still compare the digest before accepting any reuse.
+            if ref_epoch < epoch as i64 {
+                tx.execute(
+                    "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
+                    params![key.as_bytes().as_slice(), epoch as i64],
+                )?;
+            }
+            PutOrTouch::Reused { ref_epoch: epoch }
+        }
+        Some(_) => return Err(StoreError::ConflictingPayload(*key)),
+        None => {
+            tx.execute(
+                "INSERT INTO blob_payloads
+                     (full_key, payload, payload_digest, payload_schema, ref_epoch, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    key.as_bytes().as_slice(),
+                    payload,
+                    digest.as_bytes().as_slice(),
+                    i64::from(plane.payload_schema()),
+                    epoch as i64,
+                    now_ms() as i64,
+                ],
+            )?;
+            PutOrTouch::Inserted { ref_epoch: epoch }
+        }
+    };
+    Ok(outcome)
+}
+
+impl FamilyStore {
     /// Stamps the current epoch on stored keys and reports missing keys. A
     /// covering-index read avoids opening a writer when every epoch is current.
     pub fn touch(&self, keys: &[FamilyKey]) -> StoreResult<TouchReport> {
@@ -1109,6 +1163,144 @@ fn set_up_payload_totals(
     tx.commit()
 }
 
+/// A count of the rows ever deleted from `blob_payloads`, kept in a one-row
+/// table by a SQLite trigger. The trigger lives in the store's schema, so it
+/// also counts deletes by AFT releases that predate it (their GC and
+/// disk-limit SQL). No AFT write path rewrites the payload of an existing
+/// key: `put_or_touch` inserts only an absent key and otherwise updates only
+/// `ref_epoch`, so a row can change its payload only by being deleted and
+/// inserted again, and every such change moves this count.
+///
+/// The row also holds a random generation, drawn whenever the counter is
+/// (re)created, so a counter rebuilt after damage never repeats an earlier
+/// (generation, count) pair. A value read from a store therefore names one
+/// state of "which rows were ever deleted", and something recorded at one
+/// value is known to hold only while the store still reads that value.
+///
+/// The counter is set up when a writer first opens the store. Any missing or
+/// altered part reads as no epoch, which callers treat as "nothing can be
+/// vouched for", never as an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct DeletionEpoch {
+    generation: [u8; 16],
+    count: u64,
+}
+
+impl DeletionEpoch {
+    /// The generation then the count, little-endian: the bytes a key that
+    /// depends on this epoch hashes.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..16].copy_from_slice(&self.generation);
+        bytes[16..].copy_from_slice(&self.count.to_le_bytes());
+        bytes
+    }
+}
+
+const DELETIONS_TABLE: (&str, &str) = (
+    "payload_deletions",
+    "CREATE TABLE payload_deletions (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation BLOB NOT NULL,
+    count INTEGER NOT NULL
+)",
+);
+const DELETIONS_SEED_SQL: &str =
+    "INSERT INTO payload_deletions (singleton, generation, count) VALUES (1, randomblob(16), 0)";
+const DELETIONS_TRIGGER: (&str, &str) = (
+    "payload_deletions_count",
+    "CREATE TRIGGER payload_deletions_count AFTER DELETE ON blob_payloads BEGIN
+    UPDATE payload_deletions SET count = count + 1 WHERE singleton = 1;
+END",
+);
+
+/// The deletion epoch, or `None` unless the table and the trigger exist with
+/// their exact text and the table holds exactly one well-formed row. Callers
+/// read it inside a transaction so the schema and the row come from one
+/// snapshot.
+fn deletion_epoch(connection: &rusqlite::Connection) -> StoreResult<Option<DeletionEpoch>> {
+    let mut statement = connection.prepare(
+        "SELECT name, sql FROM sqlite_schema
+         WHERE (type = 'table' AND name = ?1) OR (type = 'trigger' AND name = ?2)",
+    )?;
+    let schema = statement
+        .query_map(params![DELETIONS_TABLE.0, DELETIONS_TRIGGER.0], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let exact = |(name, sql): (&str, &str)| {
+        schema
+            .iter()
+            .any(|(found, text)| found == name && text.as_deref() == Some(sql))
+    };
+    if !exact(DELETIONS_TABLE) || !exact(DELETIONS_TRIGGER) {
+        return Ok(None);
+    }
+    let rows = connection
+        .prepare("SELECT singleton, generation, count FROM payload_deletions LIMIT 2")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>();
+    // A value of the wrong type is damage, not a store error.
+    let Ok(rows) = rows else {
+        return Ok(None);
+    };
+    Ok(match rows.as_slice() {
+        [(1, generation, count)] if *count >= 0 => <[u8; 16]>::try_from(generation.as_slice())
+            .ok()
+            .map(|generation| DeletionEpoch {
+                generation,
+                count: *count as u64,
+            }),
+        _ => None,
+    })
+}
+
+fn read_deletion_epoch(inner: &StoreInner) -> StoreResult<Option<DeletionEpoch>> {
+    let mut connection = lock(&inner.connection);
+    let tx = connection.transaction()?;
+    let epoch = deletion_epoch(&tx)?;
+    tx.commit()?;
+    Ok(epoch)
+}
+
+/// Drops whatever deletion counter the store has and creates a fresh one
+/// with a new generation, inside the caller's IMMEDIATE transaction.
+fn replace_deletion_epoch(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {}", DELETIONS_TRIGGER.0))?;
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {}", DELETIONS_TABLE.0))?;
+    tx.execute_batch(DELETIONS_TABLE.1)?;
+    tx.execute(DELETIONS_SEED_SQL, [])?;
+    tx.execute_batch(DELETIONS_TRIGGER.1)
+}
+
+/// Sets up the deletion counter when it is missing or damaged, in one
+/// IMMEDIATE transaction that checks again under the write lock, so a
+/// counter another process just created is kept. Failure only leaves the
+/// store without an epoch; the caller does not report it.
+fn set_up_deletion_epoch(connection: &mut rusqlite::Connection) -> StoreResult<()> {
+    let present = {
+        let tx = connection.transaction()?;
+        let present = deletion_epoch(&tx)?.is_some();
+        tx.commit()?;
+        present
+    };
+    if present {
+        return Ok(());
+    }
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if deletion_epoch(&tx)?.is_none() {
+        replace_deletion_epoch(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl FamilyStoreReader {
     /// Opens an existing store read-only. A store that does not exist is
     /// reported as `None`; a reader never creates one.
@@ -1137,10 +1329,44 @@ impl FamilyStoreReader {
         contains(&self.inner, key)
     }
 
-    /// The keys of `keys` that are stored, probed in key order through the
-    /// payload-free membership index so each index page is visited once.
-    pub fn contains_many(&self, keys: &[FamilyKey]) -> StoreResult<HashSet<FamilyKey>> {
-        contains_many(&self.inner, keys)
+    /// The store's current deletion epoch; see [`DeletionEpoch`].
+    pub fn deletion_epoch(&self) -> StoreResult<Option<DeletionEpoch>> {
+        read_deletion_epoch(&self.inner)
+    }
+
+    /// In one read transaction: reads the store's deletion epoch, asks `keys`
+    /// which keys to probe for it, and returns the epoch with the probed keys
+    /// that are stored. Keys are probed in key order through the payload-free
+    /// membership index, so each index page is visited once. `None` when the
+    /// store has no valid deletion epoch.
+    pub(crate) fn contains_many_at_deletion_epoch(
+        &self,
+        keys: impl FnOnce(&DeletionEpoch) -> Vec<FamilyKey>,
+    ) -> StoreResult<Option<(DeletionEpoch, HashSet<FamilyKey>)>> {
+        let mut connection = lock(&self.inner.connection);
+        let tx = connection.transaction()?;
+        let Some(epoch) = deletion_epoch(&tx)? else {
+            return Ok(None);
+        };
+        let mut sorted = keys(&epoch)
+            .into_iter()
+            .filter(|key| key.plane() == self.inner.plane)
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut present = HashSet::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
+            )?;
+            for key in sorted {
+                if statement.exists(params![key.as_bytes().as_slice()])? {
+                    present.insert(key);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(Some((epoch, present)))
     }
 
     pub fn usage(&self) -> StoreResult<StoreUsage> {
@@ -1275,6 +1501,14 @@ fn ensure_schema(inner: &StoreInner) -> StoreResult<()> {
     )?;
     check_meta(&tx, inner.plane)?;
     tx.commit()?;
+    // Without the counter nothing is vouched for by deletion epoch, so a
+    // failed setup costs only that; it never fails the open.
+    if let Err(error) = set_up_deletion_epoch(&mut connection) {
+        log::debug!(
+            "family store {} has no deletion epoch: {error}",
+            inner.path.display()
+        );
+    }
     *ready = true;
     Ok(())
 }
@@ -1354,26 +1588,6 @@ fn get(inner: &StoreInner, key: &FamilyKey) -> StoreResult<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(payload))
-}
-
-fn contains_many(inner: &StoreInner, keys: &[FamilyKey]) -> StoreResult<HashSet<FamilyKey>> {
-    let mut sorted = keys
-        .iter()
-        .filter(|key| key.plane() == inner.plane)
-        .copied()
-        .collect::<Vec<_>>();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let connection = lock(&inner.connection);
-    let mut statement = connection
-        .prepare("SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1")?;
-    let mut present = HashSet::new();
-    for key in sorted {
-        if statement.exists(params![key.as_bytes().as_slice()])? {
-            present.insert(key);
-        }
-    }
-    Ok(present)
 }
 
 fn contains(inner: &StoreInner, key: &FamilyKey) -> StoreResult<bool> {

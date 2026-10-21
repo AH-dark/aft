@@ -445,14 +445,13 @@ fn payload_gets(reads: &crate::blob_store::v2::read_tests::ReadCounts) -> usize 
 fn large_payload_and_marker(checkout: &Checkout, source: &str) -> (Vec<u8>, FamilyKey) {
     use crate::views::semantic_arena::ChunkNaming;
     let producer = checkout.plane.semantic_producer();
-    let payload = checkout
-        .owner
-        .open_store(FamilyPlane::Semantic)
-        .unwrap()
+    let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+    let payload = store
         .get(&producer.key(source.as_bytes(), &large_rel_path()))
         .unwrap()
         .unwrap();
-    let marker = producer.verified_run_marker(&payload);
+    let epoch = store.deletion_epoch().unwrap().unwrap();
+    let marker = producer.verified_run_marker(&blake3::hash(&payload), &epoch);
     (payload, marker)
 }
 
@@ -653,7 +652,7 @@ fn restart_seeding_stops_at_the_chunk_key_cap_without_evicting() {
     let arena = checkout.plane.arena("family");
     let free = 10;
     let held = (0..MAX_CHUNK_KEYS - free)
-        .map(|index| arena.remember_chunk(chunk_test_key(index), vec![index as f32]))
+        .map(|index| arena.remember_chunk(chunk_test_key(index), vec![index as f32], None))
         .collect::<Vec<_>>();
     checkout.load();
     assert_eq!(arena.seeded_chunks(), free as u64);
@@ -712,7 +711,13 @@ fn verified_run_markers_work_with_v0_61_store_sql() {
         .unwrap();
     assert_eq!(digest.as_slice(), blake3::hash(&payload).as_bytes());
     assert_eq!(payload_schema, schema(run_key.as_bytes().as_slice()));
-    assert_eq!(payload, verified_run_marker_payload(&run_payload));
+    assert_eq!(
+        payload,
+        verified_run_marker_payload(
+            &blake3::hash(&run_payload),
+            &store.deletion_epoch().unwrap().unwrap()
+        )
+    );
     // ...and no decoder accepts it as vectors.
     assert!(crate::semantic_index::SemanticVectors::decode_view_payload(
         &payload,
@@ -785,7 +790,9 @@ fn verified_run_markers_work_with_v0_61_store_sql() {
         .unwrap();
     assert_eq!(rows as usize, listed.len());
 
-    // GC's conditional delete removes it like any other row.
+    // GC's conditional delete removes it like any other row, and the
+    // deletion trigger counts that v0.61.0 delete.
+    let before = store.deletion_epoch().unwrap().unwrap();
     assert_eq!(
         connection
             .execute(
@@ -795,12 +802,137 @@ fn verified_run_markers_work_with_v0_61_store_sql() {
             .unwrap(),
         1
     );
+    let after = store.deletion_epoch().unwrap().unwrap();
+    assert_ne!(before, after, "a v0.61.0 delete did not move the deletion epoch");
+    assert_eq!(after.to_bytes()[..16], before.to_bytes()[..16]);
+    assert_eq!(
+        u64::from_le_bytes(after.to_bytes()[16..].try_into().unwrap()),
+        u64::from_le_bytes(before.to_bytes()[16..].try_into().unwrap()) + 1
+    );
     let integrity: String = connection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();
     assert_eq!(integrity, "ok");
     assert!(!store.contains(&marker).unwrap());
     assert!(store.get(&run_key).unwrap().is_some());
+}
+
+/// Replaces the chunk row of `text` with different floats the way a GC
+/// delete followed by another process's put would.
+fn replace_chunk_row(store: &FamilyStore, producer: &SemanticProducer, text: &str) -> Vec<f32> {
+    let key = producer.chunk_key(text);
+    let epoch = store.raise_epoch(store.gc_epoch().unwrap() + 1).unwrap();
+    assert!(store.delete_if_unreferenced_since(&key, epoch + 1).unwrap());
+    let floats = vector("another-process", text);
+    store
+        .put_or_touch(
+            &key,
+            &encode_chunk_vector(&producer.chunk_identity(), text, &floats).unwrap(),
+        )
+        .unwrap();
+    floats
+}
+
+#[test]
+fn restart_after_a_chunk_row_is_replaced_seeds_nothing_and_reads_the_new_row() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let source = large_source();
+    write_tree(root.path(), &[("src/large.rs", &source)]);
+    let plane = new_plane(storage.path(), "model-a");
+    let checkout = ready_checkout(storage.path(), root.path(), &plane);
+    let (_, marker) = large_payload_and_marker(&checkout, &source);
+    let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+    assert!(store.contains(&marker).unwrap(), "the fill vouched for nothing");
+    let chunks = crate::semantic_index::chunk_view_file(
+        root.path(),
+        &Path::new("src").join("large.rs"),
+        source.as_bytes(),
+        plane.producer.caps,
+    )
+    .unwrap()
+    .unwrap();
+    let replaced = &chunks[7].embed_text;
+    let floats = replace_chunk_row(&store, &plane.producer, replaced);
+    // The old marker row survives; only the epoch says it no longer holds.
+    assert!(store.contains(&marker).unwrap());
+    drop(store);
+    drop(plane);
+    let checkout = restart(checkout, storage.path());
+    let shifted = format!("\n{source}");
+    let snapshot = edit_snapshot(&checkout, &shifted);
+    let arena = checkout.plane.arena("family");
+    assert_eq!(arena.seeded_chunks(), 0, "a marker from before the delete seeded");
+    let report = checkout.fill(&snapshot, &Model::default(), "model-a");
+    assert_eq!(report.embedded_texts, 0, "{report:?}");
+    assert_eq!(arena.chunk_row_reads().0, LARGE_DEFINITIONS as u64);
+    // The new file run carries the replacement row's floats, as every other
+    // reader of that chunk row gets them.
+    let producer = checkout.plane.semantic_producer();
+    let stored = checkout
+        .owner
+        .open_store(FamilyPlane::Semantic)
+        .unwrap()
+        .get(&producer.key(shifted.as_bytes(), &large_rel_path()))
+        .unwrap()
+        .unwrap();
+    let (run, digests) = crate::semantic_index::SemanticVectors::decode_view_payload_with_text_digests(
+        &stored,
+        &Path::new("src").join("large.rs"),
+        &producer.payload(),
+    )
+    .unwrap();
+    let position = digests
+        .iter()
+        .position(|digest| *digest == blake3::hash(replaced.as_bytes()))
+        .unwrap();
+    let vector = run.vectors().nth(position).unwrap();
+    assert_eq!(
+        vector.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        floats.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        "the fill reused floats from before the chunk row was replaced"
+    );
+}
+
+#[test]
+fn restart_with_a_damaged_deletion_epoch_seeds_nothing_and_still_fills() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let source = large_source();
+    write_tree(root.path(), &[("src/large.rs", &source)]);
+    let plane = new_plane(storage.path(), "model-a");
+    let checkout = ready_checkout(storage.path(), root.path(), &plane);
+    let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+    rusqlite::Connection::open(store.path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER payload_deletions_count")
+        .unwrap();
+    assert_eq!(store.deletion_epoch().unwrap(), None);
+    drop(plane);
+    // Keeping the store open across the restart keeps this process from
+    // setting the counter up again, so the restarted fill sees the damage.
+    let checkout = restart(checkout, storage.path());
+    let shifted = format!("\n{source}");
+    let snapshot = edit_snapshot(&checkout, &shifted);
+    let arena = checkout.plane.arena("family");
+    assert_eq!(arena.seeded_chunks(), 0);
+    let report = checkout.fill(&snapshot, &Model::default(), "model-a");
+    assert_eq!(report.embedded_texts, 0, "{report:?}");
+    assert!(report.errors.is_empty() && report.store_errors.is_empty());
+    assert_canonical_blob(&checkout, &shifted);
+    // No marker can be written without an epoch either.
+    assert_eq!(
+        rusqlite::Connection::open(store.path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM blob_payloads WHERE substr(payload, 1, 29) = ?1",
+                [VERIFIED_RUN_DOMAIN],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "only the marker from before the damage may exist"
+    );
 }
 
 // Kept out of the normal suite: it fills a few thousand files. Run with
