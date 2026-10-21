@@ -1,1 +1,1 @@
-OpenCode edits now show focused diffs for large files, while genuinely expensive rewrites remain summarized.
+- OpenCode shows the diff for edits to files over 5,000 lines again; only very large rewrites are summarized.
