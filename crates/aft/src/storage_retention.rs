@@ -619,6 +619,8 @@ pub(crate) fn record_bind_until(
                 for member in &leader.members {
                     test_hook(&member.binding.root, "bind-pending");
                 }
+                #[cfg(test)]
+                test_hook(storage, "bind-round-pending");
                 bind_lock_until(&path, round_deadline, round_started)
                     .map(|barrier| (pending, barrier))
             });
@@ -4385,9 +4387,11 @@ mod storage_retention_tests {
                 worker.join().unwrap().unwrap();
             }
         });
+        // The group acquires one cooperative pending marker in addition to
+        // its single legacy-compatible sweep lock, never either lock per root.
         assert_eq!(
             acquisitions.load(Ordering::SeqCst),
-            1,
+            2,
             "binds were not coalesced"
         );
         assert_eq!(file_syncs.load(Ordering::SeqCst), BINDS);
@@ -5878,6 +5882,156 @@ mod storage_retention_tests {
         assert_eq!(retries, 0, "bind retried the busy sweep's lock");
         assert_eq!(report.removed_roots, retired_before_bind, "{report:?}");
         assert!(path.join("payload.bin").exists());
+    }
+
+    #[test]
+    fn retention_cleanup_yields_to_thirty_two_grouped_binds() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        const BINDS: usize = 32;
+        let (temp, _, _, cache) = due_cache_fixture();
+        let storage = temp.path();
+        let roots: Vec<_> = (0..BINDS)
+            .map(|index| {
+                let root = storage.join(format!("incoming-{index}"));
+                fs::create_dir(&root).unwrap();
+                fs::canonicalize(root).unwrap()
+            })
+            .collect();
+        let arrivals = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let acquisitions = AtomicUsize::new(0);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (resume_sweep_tx, resume_sweep_rx) = mpsc::channel();
+        let resume_sweep_rx = Mutex::new(resume_sweep_rx);
+        let (pending_tx, pending_rx) = mpsc::channel();
+        let (resume_bind_tx, resume_bind_rx) = mpsc::channel();
+        let resume_bind_rx = Mutex::new(resume_bind_rx);
+        let _hook = {
+            let admitted_once = AtomicBool::new(false);
+            let arrivals = arrivals.clone();
+            let rounds = rounds.clone();
+            observe_test_hook(
+                storage,
+                Arc::new(move |step| match step {
+                    "due-admitted" if !admitted_once.swap(true, Ordering::SeqCst) => {
+                        admitted_tx.send(()).unwrap();
+                        resume_sweep_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(20))
+                            .unwrap();
+                    }
+                    "bind-enqueued" => {
+                        *arrivals.0.lock().unwrap() += 1;
+                        arrivals.1.notify_all();
+                    }
+                    "bind-round-collecting" => {
+                        let count = arrivals.0.lock().unwrap();
+                        let (count, timeout) = arrivals
+                            .1
+                            .wait_timeout_while(count, Duration::from_secs(20), |count| {
+                                *count < BINDS
+                            })
+                            .unwrap();
+                        assert!(!timeout.timed_out(), "only {count} binds enqueued");
+                    }
+                    "bind-round-pending" => {
+                        pending_tx.send(()).unwrap();
+                        resume_bind_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(20))
+                            .unwrap();
+                    }
+                    "bind-round-admitted" => {
+                        rounds.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        let _history = {
+            let reads = reads.clone();
+            observe_test_hook(
+                &storage.join("retention"),
+                Arc::new(move |step| {
+                    if step == "admission-history" {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+        };
+
+        // Pause cleanup after admission, then keep all binders waiting before
+        // their admission until the entire cleanup pass has had a chance to yield.
+        let (pending_before, pending_after, sweep_released, report) = std::thread::scope(|scope| {
+            let sweep = scope
+                .spawn(|| run_pass_with_budget(storage, &|| false, &Instant::now, NO_TIME_BOUND));
+            admitted_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            let workers: Vec<_> = roots
+                .iter()
+                .map(|root| {
+                    let acquisitions = &acquisitions;
+                    scope.spawn(move || {
+                        crate::fs_lock::io_ledger::take();
+                        let result = record_bind(
+                            storage,
+                            root,
+                            &crate::path_identity::project_scope_key(root),
+                        );
+                        acquisitions.fetch_add(
+                            crate::fs_lock::io_ledger::take().acquisitions as usize,
+                            Ordering::SeqCst,
+                        );
+                        result
+                    })
+                })
+                .collect();
+            pending_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            let pending_before = bind_pending(storage);
+            resume_sweep_tx.send(()).unwrap();
+            let report = sweep.join().unwrap();
+            let pending_after = bind_pending(storage);
+            let sweep_released = !storage.join("retention/sweep.lock").exists();
+            resume_bind_tx.send(()).unwrap();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+            (pending_before, pending_after, sweep_released, report)
+        });
+
+        assert!(
+            pending_before && pending_after,
+            "round lost its pending marker"
+        );
+        assert!(
+            sweep_released,
+            "cleanup kept admission while binds were pending"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "cleanup reread history: {report:?}"
+        );
+        assert_eq!(report.removed_roots, 0, "cleanup did not yield: {report:?}");
+        assert!(cache.join("payload.bin").exists());
+        assert_eq!(rounds.load(Ordering::SeqCst), 1);
+        // Count actual filesystem acquisitions on binder threads, not just the
+        // round hook: one pending marker and one legacy-compatible sweep lock.
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 2);
+        assert!(
+            !bind_pending(storage),
+            "completed round stranded its marker"
+        );
+        for root in roots {
+            let key = crate::path_identity::project_scope_key(&root);
+            let binding: Binding =
+                read_json(&storage.join(format!("retention/roots/{key}.json"))).unwrap();
+            assert_eq!(binding.root, root);
+        }
     }
 
     #[test]
