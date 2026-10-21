@@ -823,9 +823,11 @@ of the rest) and a first page of 40 lines dealt round-robin across files, at mos
 several files match. Later pages hold up to
 100 lines and stop once their rows reach 50 KB. Lines longer than 500 characters are shown as a
 window around the match, marked `… [line truncated]`. Counts are exact: every match in scope is
-counted (up to 100,100 stored lines; past that the total is shown as a lower bound), and pages are
+counted (up to 100,100 stored lines; past that the total is shown as a lower bound and the stored
+lines are the first 100,100 by path and line, chosen the same way on every request), and pages are
 cut from one fixed order, so while the files do not change, following `offset` never repeats or
-skips a line. When rows are cut,
+skips a line. A search stopped by the walk's time or file limit says so, and another request may
+store different lines. When rows are cut,
 the reply ends with the standard trailer, for example
 `shown 40 of 1187 rows (cap) · narrow: offset, path, include`, or
 `shown 2 of 114 rows (kind) · narrow: path, include` when only counted lines were left out.

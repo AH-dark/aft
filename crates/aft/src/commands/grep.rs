@@ -6,7 +6,9 @@ use crate::file_kind::{ContentKind, FileKind, FileKindCache};
 use crate::grep_executor::{self, GrepParams};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{build_path_filters, GrepMatch, GrepResult, IndexStatus, WalkBound};
+use crate::search_index::{
+    build_path_filters, GrepMatch, GrepResult, GrepScanOrder, IndexStatus, WalkBound,
+};
 
 pub(crate) use crate::grep_executor::ripgrep_glob;
 
@@ -56,12 +58,28 @@ mod contract_tests {
     }
 }
 
-/// Test-only counters for the page layout: they let tests prove that its
-/// work grows with the rows involved, not with file sizes or with the
-/// number of files times the deepest file.
+/// Matching lines the engine keeps for one request: every row the offset
+/// limit can reach, plus one page.
+fn store_cap(project_root: &Path, page_size: usize) -> usize {
+    #[cfg(test)]
+    if let Some(cap) = work_probe::store_cap(project_root) {
+        return cap;
+    }
+    #[cfg(not(test))]
+    let _ = project_root;
+    MAX_GREP_OFFSET.saturating_add(page_size)
+}
+
+/// Test-only counters and overrides for the page layout: they let tests
+/// prove that its work grows with the rows involved, not with file sizes or
+/// with the number of files times the deepest file, and shrink the store cap
+/// so a capped search needs only a small fixture.
 #[cfg(test)]
 pub(crate) mod work_probe {
     use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
 
     thread_local! {
         /// Slots `round_robin_order` examined on this thread.
@@ -70,6 +88,23 @@ pub(crate) mod work_probe {
 
     pub(crate) fn visit_round_robin_slot() {
         ROUND_ROBIN_VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    static STORE_CAPS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+    /// Store cap for searches whose project root is `root`.
+    pub(crate) fn set_store_cap(root: &Path, cap: usize) {
+        if let Ok(mut caps) = STORE_CAPS.get_or_init(Default::default).lock() {
+            caps.insert(root.to_path_buf(), cap);
+        }
+    }
+
+    pub(crate) fn store_cap(root: &Path) -> Option<usize> {
+        STORE_CAPS
+            .get_or_init(Default::default)
+            .lock()
+            .ok()
+            .and_then(|caps| caps.get(root).copied())
     }
 }
 
@@ -123,7 +158,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // memory bounded for a pattern that matches nearly every line; it covers
     // the last page the offset limit can reach, and a search that passes it
     // reports its total as a lower bound.
-    let max_results = MAX_GREP_OFFSET.saturating_add(page_size);
+    let max_results = store_cap(&grep_executor::project_root(ctx), page_size);
 
     let compiled = match pattern_compile::compile(
         pattern,
@@ -192,6 +227,12 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         path_exclusion: None,
     };
+    // Past the store cap, which lines are kept must not depend on how
+    // parallel workers are scheduled, or two requests over unchanged files
+    // could store different lines and their pages would overlap or skip rows.
+    // A path-ordered scan keeps the first lines by path and line in one
+    // parallel pass (see `GrepScanOrder::Path`).
+    let order = GrepScanOrder::Path;
     // A parent folder session answers from its child repositories' indexes.
     // Child indexes intentionally omit ignored targets, just like the local
     // index. An explicitly named ignored root must use the direct walk instead.
@@ -200,13 +241,13 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters)
+        crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters, order)
     };
     let (result, phases, parent_gaps) = match parent_answer {
         Some(answer) => answer,
         None => {
-            let (result, phases) = grep_executor::execute_profiled_with_filters(
-                ctx, &compiled, &scope, &params, &filters,
+            let (result, phases) = grep_executor::execute_profiled_with_filters_in_order(
+                ctx, &compiled, &scope, &params, &filters, order,
             );
             (result, phases, Vec::new())
         }
@@ -1701,6 +1742,106 @@ mod tests {
             .iter()
             .enumerate()
             .all(|(position, &(file, round))| file == 0 && round == position + 1));
+    }
+
+    #[test]
+    fn capped_search_keeps_the_same_rows_whatever_order_files_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for index in 0..12 {
+            std::fs::write(
+                root.join(format!("part_{index:02}.txt")),
+                "needle\n".repeat(10),
+            )
+            .unwrap();
+        }
+        // 120 matches against a store cap of 50: which 50 are kept must not
+        // depend on the order the files reach the search.
+        work_probe::set_store_cap(&root, 50);
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let stored_rows = |reversed: bool| {
+            crate::grep_executor::scan_order_for_test::set(&root, reversed);
+            let req = serde_json::from_value(serde_json::json!({
+                "id": "capped-order", "command": "grep", "pattern": "needle",
+                "max_results": 1000,
+            }))
+            .unwrap();
+            let response = handle_grep(&req, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["truncated"], true, "{:?}", response.data);
+            response.data["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["file"].as_str().unwrap().to_string(),
+                        row["line"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let forward = stored_rows(false);
+        let reversed = stored_rows(true);
+        assert_eq!(forward.len(), 50);
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn path_ordered_indexed_scan_keeps_the_first_rows_by_path_on_any_thread_count() {
+        // 600 files (three batches) of 3 matches against a cap of 1,000: the
+        // kept rows must be the first 1,000 by path and line, however many
+        // threads finish the files of a batch in whatever order, and whatever
+        // order the index lists the candidate files in.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for index in 0..600 {
+            std::fs::write(root.join(format!("f{index:04}.txt")), "needle\n".repeat(3)).unwrap();
+        }
+        let index = crate::search_index::SearchIndex::build(&root);
+        let snapshot = index.snapshot();
+        let pattern = compiled_literal("needle");
+        let query = crate::search_index::decompose_grep_pattern(&pattern);
+        let filters = build_path_filters(&[], &[]).unwrap();
+        let every_row: Vec<(PathBuf, u32)> = (0..600)
+            .flat_map(|index| {
+                let file = root.join(format!("f{index:04}.txt"));
+                (1..=3).map(move |line| (file.clone(), line))
+            })
+            .collect();
+        let expected = &every_row[..1000];
+        for (threads, reversed) in [(1, false), (8, false), (1, true), (8, true)] {
+            crate::grep_executor::scan_order_for_test::set(&root, reversed);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let (result, _) = pool.install(|| {
+                snapshot.search_grep_profiled_with_filters_and_query_in_order(
+                    &pattern,
+                    &query,
+                    &filters,
+                    &root,
+                    1000,
+                    None,
+                    GrepScanOrder::Path,
+                )
+            });
+            assert!(result.truncated, "{threads} threads, reversed {reversed}");
+            let mut kept: Vec<(PathBuf, u32)> = result
+                .matches
+                .iter()
+                .map(|row| (row.file.clone(), row.line))
+                .collect();
+            kept.sort();
+            assert_eq!(kept, expected, "{threads} threads, reversed {reversed}");
+        }
     }
 
     #[test]

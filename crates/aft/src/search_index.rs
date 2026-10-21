@@ -1505,6 +1505,32 @@ struct QueryBuild {
 
 pub type GrepPathExclusion = fn(&Path, &Path) -> bool;
 
+/// Which matching lines a grep keeps once it passes its result cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrepScanOrder {
+    /// Files are searched in parallel and the first lines found are kept:
+    /// fast, but which lines are kept past the cap depends on scheduling.
+    #[default]
+    Arrival,
+    /// Files are sorted by path and searched in batches of
+    /// [`PATH_ORDER_BATCH_FILES`], in parallel within a batch. The scan stops
+    /// after the first batch that brings the kept lines to the cap, and the
+    /// kept lines are the first ones by path, then line. Whole batches finish
+    /// before the cut, so the same lines are kept whatever order files finish
+    /// in; only a scan stopped early (its deadline, cancellation, or a
+    /// caller's file limit) can keep different lines.
+    Path,
+}
+
+/// Files per batch of a path-ordered grep scan. Each batch ends in a barrier
+/// where the scan checks the cap, so a batch should hold many files per
+/// worker thread (one slow file then idles the others for only a small part
+/// of the batch) while a scan past the cap reads at most one batch of files
+/// it does not need. 256 is the batch the fallback walk already hands to its
+/// parallel search: 16 or more files per thread on machines with up to 16
+/// threads.
+pub(crate) const PATH_ORDER_BATCH_FILES: usize = 256;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PathFilters {
     includes: Option<GlobSet>,
@@ -3209,6 +3235,7 @@ impl SearchIndexSnapshot {
             path_exclusion,
             Some(max_files),
             budget,
+            GrepScanOrder::Arrival,
         )
         .0
     }
@@ -3265,6 +3292,30 @@ impl SearchIndexSnapshot {
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
+        self.search_grep_profiled_with_filters_and_query_in_order(
+            pattern,
+            query,
+            filters,
+            search_root,
+            max_results,
+            path_exclusion,
+            GrepScanOrder::Arrival,
+        )
+    }
+
+    /// [`Self::search_grep_profiled_with_filters_and_query`] with a choice
+    /// of which lines are kept past the result cap.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_grep_profiled_with_filters_and_query_in_order(
+        &self,
+        pattern: &CompiledPattern,
+        query: &RegexQuery,
+        filters: &PathFilters,
+        search_root: &Path,
+        max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
+        order: GrepScanOrder,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
         self.search_grep_profiled_with_filters_and_query_and_limits(
             pattern,
             query,
@@ -3274,6 +3325,7 @@ impl SearchIndexSnapshot {
             path_exclusion,
             None,
             INDEXED_GREP_SCAN_BUDGET,
+            order,
         )
     }
 
@@ -3292,6 +3344,7 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
         max_files: Option<usize>,
         scan_budget: Duration,
+        order: GrepScanOrder,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         self.search_grep_profiled_with_filters_and_query_and_limits_with_deadline(
             pattern,
@@ -3303,6 +3356,7 @@ impl SearchIndexSnapshot {
             max_files,
             scan_budget,
             || GrepScanDeadline::after_with_clock(scan_budget, Instant::now),
+            order,
         )
     }
 
@@ -3317,6 +3371,7 @@ impl SearchIndexSnapshot {
         max_files: Option<usize>,
         scan_budget: Duration,
         make_deadline: impl FnOnce() -> GrepScanDeadline,
+        order: GrepScanOrder,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
@@ -3333,7 +3388,7 @@ impl SearchIndexSnapshot {
         let trigram_lookup = trigram_started.elapsed();
 
         let candidate_filter_started = Instant::now();
-        let candidate_files: Vec<&FileEntry> = candidate_ids
+        let mut candidate_files: Vec<&FileEntry> = candidate_ids
             .into_iter()
             .filter_map(|file_id| self.files.get(file_id as usize))
             .filter(|file| !file.path.as_os_str().is_empty())
@@ -3343,6 +3398,15 @@ impl SearchIndexSnapshot {
             })
             .filter(|file| filters.matches(&self.project_root, &file.path))
             .collect();
+        // Tests hand the candidates over reversed to show a path-ordered
+        // scan does not depend on the order the index lists them in.
+        #[cfg(test)]
+        if crate::grep_executor::scan_order_for_test::get(&search_root) == Some(true) {
+            candidate_files.reverse();
+        }
+        if order == GrepScanOrder::Path {
+            candidate_files.sort_by(|left, right| left.path.cmp(&right.path));
+        }
         let candidate_count = candidate_files.len();
         let candidate_filter = candidate_filter_started.elapsed();
 
@@ -3366,7 +3430,76 @@ impl SearchIndexSnapshot {
         };
 
         let pread_started = Instant::now();
-        let mut matches = if candidate_files.len() > 10 {
+        let mut matches = if order == GrepScanOrder::Path {
+            // Path-ordered batches: each file keeps at most the lines still
+            // missing from the cap when its batch starts, which is all it can
+            // contribute to the first lines by path. Rows are appended in
+            // batch order, so `kept` stays sorted by path, then line.
+            let mut kept: Vec<SharedGrepMatch> = Vec::new();
+            let batches = candidate_files.chunks(PATH_ORDER_BATCH_FILES);
+            let batch_count = batches.len();
+            for (batch_index, batch) in batches.enumerate() {
+                if deadline.reached()
+                    || job_cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.cancel_requested_before_commit())
+                {
+                    engine_capped.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let remaining = max_results.saturating_sub(kept.len());
+                let per_file: Vec<Vec<SharedGrepMatch>> = batch
+                    .par_iter()
+                    .map_init(
+                        || crate::bounded_io::enter(io_budget.clone()),
+                        |_scope, file| {
+                            if !claim_verification() {
+                                truncated.store(true, Ordering::Relaxed);
+                                engine_capped.store(true, Ordering::Relaxed);
+                                return Vec::new();
+                            }
+                            let file_matches = AtomicUsize::new(0);
+                            let file_truncated = AtomicBool::new(false);
+                            let rows = search_candidate_file(
+                                file,
+                                &matcher,
+                                remaining,
+                                remaining,
+                                &file_matches,
+                                &files_searched,
+                                &files_with_matches,
+                                &bytes_verified,
+                                &file_truncated,
+                                &engine_capped,
+                                &missing_on_disk,
+                                None,
+                                job_cancellation.as_ref(),
+                                &deadline,
+                            );
+                            total_matches
+                                .fetch_add(file_matches.load(Ordering::Relaxed), Ordering::Relaxed);
+                            if file_truncated.load(Ordering::Relaxed) {
+                                truncated.store(true, Ordering::Relaxed);
+                            }
+                            rows
+                        },
+                    )
+                    .collect();
+                kept.extend(per_file.into_iter().flatten());
+                if kept.len() >= max_results {
+                    if kept.len() > max_results || batch_index + 1 < batch_count {
+                        // Later lines exist, or later files were not read.
+                        truncated.store(true, Ordering::Relaxed);
+                    }
+                    if batch_index + 1 < batch_count {
+                        engine_capped.store(true, Ordering::Relaxed);
+                    }
+                    kept.truncate(max_results);
+                    break;
+                }
+            }
+            kept
+        } else if candidate_files.len() > 10 {
             candidate_files
                 .par_iter()
                 .map_init(
@@ -13318,6 +13451,7 @@ mod tests {
                 None,
                 budget,
                 make_deadline,
+                GrepScanOrder::Arrival,
             )
             .0
     }
