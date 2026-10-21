@@ -118,7 +118,9 @@ function artifactReadTool(
         args.path ??
         args.target ??
         args.scope ??
-        (args.paths as unknown[] | undefined)?.[0];
+        (args.paths as unknown[] | undefined)?.[0] ??
+        // Zoom sends only a batch of { target, ... } entries.
+        (args.batch as Array<{ target?: unknown }> | undefined)?.[0]?.target;
       const target = String(Array.isArray(rawTarget) ? rawTarget[0] : rawTarget);
       if (!owned || tool === "write" || target !== artifact) {
         const ask = engineOutsideAsk(target, args);

@@ -1737,7 +1737,9 @@ describe("session-owned bash artifact reads", () => {
           params.path ??
           params.target ??
           params.scope ??
-          (params.paths as unknown[] | undefined)?.[0];
+          (params.paths as unknown[] | undefined)?.[0] ??
+          // Zoom sends only a batch of { target, ... } entries.
+          (params.batch as Array<{ target?: unknown }> | undefined)?.[0]?.target;
         const target = String(Array.isArray(rawTarget) ? rawTarget[0] : rawTarget);
         if (fail || command === "write" || !ownedPaths.has(target)) {
           const ask = engineOutsideAsk(target, params);
