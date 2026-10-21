@@ -6,6 +6,9 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchError, UrlFetchOptions};
 
+/// Filesystem time kept for reading back a document that was just fetched.
+const URL_DOCUMENT_READ_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(super) fn resolve_file_or_url(
     req: &RawRequest,
     ctx: &AppContext,
@@ -39,6 +42,13 @@ fn resolve_with_fetch(
                 ..Default::default()
             },
         )
+        .map(|path| {
+            // The document is now in AFT's own cache. A fetch that used up
+            // the call's budget must not be discarded by the reads that
+            // follow, so they get an ordinary access budget of their own.
+            crate::bounded_io::reserve_current(URL_DOCUMENT_READ_RESERVE);
+            path
+        })
         .map_err(|error| url_fetch_error_response(&req.id, &error));
     }
     ctx.validate_read_path(&req.id, req.session(), Path::new(file))
@@ -89,6 +99,36 @@ mod url_tests {
                 assert!(resolved.is_ok());
             }
         }
+    }
+
+    #[test]
+    fn a_fetch_that_outlives_the_call_budget_is_still_read_back() {
+        let storage = tempfile::tempdir().unwrap();
+        let document = storage.path().join("fetched.md");
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let req =
+            serde_json::from_value(serde_json::json!({"id": "slow-fetch", "command": "outline"}))
+                .unwrap();
+        let budget = std::time::Duration::from_millis(300);
+        let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(budget)));
+        let path = resolve_with_fetch(&req, &ctx, "https://example.com/doc.md", |_, _, _| {
+            // A download that completes only after the call's budget ran out.
+            std::thread::sleep(budget * 2);
+            std::fs::write(&document, "# Title\n").unwrap();
+            Ok(document.clone())
+        })
+        .expect("the fetch succeeded");
+        crate::bounded_io::metadata(&path).expect("the fetched document is still readable");
+        assert_eq!(
+            crate::bounded_io::read_to_string(&path).unwrap(),
+            "# Title\n"
+        );
     }
 
     #[test]

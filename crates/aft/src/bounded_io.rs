@@ -374,6 +374,18 @@ pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -
 pub(crate) fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
+/// Make sure the current request has at least `duration` left for
+/// filesystem access, moving its deadline later if less remains. This is for
+/// a request whose slow part has already succeeded and whose result is on
+/// local disk, such as a downloaded URL document: running out of budget
+/// while reading it back would throw that result away.
+pub(crate) fn reserve_current(duration: Duration) {
+    CURRENT.with(|current| {
+        if let Some(budget) = current.borrow_mut().as_mut() {
+            budget.deadline = budget.deadline.max(Instant::now() + duration);
+        }
+    });
+}
 fn deadline(at: Option<Instant>) -> Instant {
     request_deadline(at)
         .into_iter()
