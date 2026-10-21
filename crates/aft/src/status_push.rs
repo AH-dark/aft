@@ -525,7 +525,13 @@ mod tests {
             .as_object()
             .unwrap();
         assert_eq!(roots.len(), 1);
-        assert!(roots.contains_key(&fixture.root.display().to_string()));
+        // The census is keyed by the resolved root (on macOS /var resolves to
+        // /private/var), so compare against that form.
+        let resolved_root = std::fs::canonicalize(&fixture.root).unwrap();
+        assert!(
+            roots.contains_key(&resolved_root.display().to_string()),
+            "{roots:?}"
+        );
         for field in ["memory", "sqlite", "threads", "children", "fds"] {
             assert!(
                 frame.snapshot.get(field).is_none(),
