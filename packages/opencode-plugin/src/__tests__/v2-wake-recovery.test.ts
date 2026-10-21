@@ -4,6 +4,7 @@ import { Effect } from "effect";
 import { projectV2Tool } from "../tools/definitions/v2.js";
 import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import { V2SessionDelivery } from "../wakes/session-delivery.js";
+import { drainEntry } from "./helpers/drain-wire.js";
 
 afterEach(__resetV2WakeRoutesForTests);
 
@@ -61,7 +62,7 @@ test("V2 routing catches a failed synthetic admission and holds it for the next 
     send: async (command: string) => {
       sends.push(command);
       if (command === "bash_drain_completions")
-        return { success: true, bg_completions: [completion], pending_matches: [] };
+        return { success: true, bg_completions: [drainEntry(completion)], pending_matches: [] };
       return { success: true, acked_task_ids: [completion.task_id] };
     },
   };
@@ -102,7 +103,7 @@ test("V2 bash companions route held completions without launching bash", async (
       send: async (command: string) => {
         sends.push(command);
         if (command === "bash_drain_completions")
-          return { success: true, bg_completions: [completion], pending_matches: [] };
+          return { success: true, bg_completions: [drainEntry(completion)], pending_matches: [] };
         return { success: true, acked_task_ids: [completion.task_id] };
       },
     };
@@ -135,7 +136,7 @@ test("V2 routing withholds acknowledgement during a staged revert and retries af
     send: async (command: string) => {
       sends.push(command);
       if (command === "bash_drain_completions")
-        return { success: true, bg_completions: [completion], pending_matches: [] };
+        return { success: true, bg_completions: [drainEntry(completion)], pending_matches: [] };
       return { success: true, acked_task_ids: [completion.task_id] };
     },
   };
