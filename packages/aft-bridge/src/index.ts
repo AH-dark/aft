@@ -197,6 +197,7 @@ export type { EditSummaryInput } from "./edit-summary.js";
 export { formatEditSummary } from "./edit-summary.js";
 // --- host-neutral agent tool errors ---
 export {
+  AftModuleUnavailableError,
   AftToolError,
   type AftToolErrorCause,
   adaptToolError,
@@ -204,9 +205,12 @@ export {
   BASH_TRANSPORT_DISPOSITION,
   type BashHostFallbackCause,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
+  bashConnectionClosedDisposition,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
+  refuseAftModuleOptionWithoutFallback,
   SHELL_TIMEOUT_UNKNOWN_DISPOSITION,
+  SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION,
   SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
   shellTimeoutNotStartedDisposition,

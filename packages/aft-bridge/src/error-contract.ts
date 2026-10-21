@@ -8,6 +8,7 @@
 
 import {
   isConsumerReconnectTransient,
+  SocketClosedError,
   StaleRouteHandleError,
   SubcCallError,
   SubcError,
@@ -130,6 +131,38 @@ export const BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION =
 export const SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION =
   "The plugin closed this call's route while the call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
 
+/** Guidance for a dispatched tool call whose subc socket closed before its reply. */
+export const SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION =
+  "The AFT module connection closed while this request was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before retrying, and never blindly retry a mutation.";
+
+/** Bash keeps running inside AFT even after its caller loses the connection. */
+export function bashConnectionClosedDisposition(taskId?: string): string {
+  const taskFollowup = taskId
+    ? `Use bash_status or bash_watch with task ID ${taskId} to check it.`
+    : "If a task ID is available, use it with bash_status or bash_watch; otherwise wait for the completion notice.";
+  return `The command may have run or may still be running. AFT keeps commands running when the connection drops; a completion notice will follow if it ran. ${taskFollowup} Do not rerun it.`;
+}
+
+/** A typed refusal for calls that never reached the AFT module. */
+export class AftModuleUnavailableError extends SubcCallError {
+  constructor(message: string, cause: unknown) {
+    super("not_sent", message, "aft_module_unavailable", cause);
+    this.name = "AftModuleUnavailableError";
+  }
+}
+
+/** Build a refusal for a bash option the host fallback cannot reproduce. */
+export function refuseAftModuleOptionWithoutFallback(
+  error: unknown,
+  option: string,
+  refusalPrefix: string,
+): AftModuleUnavailableError {
+  return new AftModuleUnavailableError(
+    `${refusalPrefix}; ${option} has no host fallback. Nothing was started, so it is safe to retry after the AFT module connection is restored.`,
+    error,
+  );
+}
+
 /**
  * Agent-facing guidance for a bash call whose response frame timed out
  * mid-read (the frame header arrived, but the body never followed). The
@@ -155,6 +188,38 @@ export const SUBC_FRAME_READ_TIMEOUT_DISPOSITION =
  */
 function isRouteClosedMidCallError(error: unknown): boolean {
   return error instanceof SubcRouteClosedMidCallError || isLocalRouteCloseRejection(error);
+}
+
+function isSubcConnectionClosedMidCallError(
+  error: unknown,
+): error is Error & { kind: "outcome_unknown" } {
+  if (!(error instanceof Error)) return false;
+  const fields = error as Error & { kind?: unknown };
+  if (fields.kind !== "outcome_unknown") return false;
+  if (error instanceof SocketClosedError) return true;
+  if (error instanceof SubcError) return error.closeReason === "connection_lost";
+  if (error instanceof SubcCallError) {
+    return error.closeReason === "connection_lost" || hasConnectionLossCause(error);
+  }
+  return hasConnectionLossCause(error);
+}
+
+const CONNECTION_LOSS_ERROR_CODES = new Set(["ECONNABORTED", "ECONNRESET", "EPIPE"]);
+
+function hasConnectionLossCause(error: unknown, depth = 0): boolean {
+  if (error instanceof SocketClosedError) return true;
+  if (error instanceof SubcError && error.closeReason === "connection_lost") return true;
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    CONNECTION_LOSS_ERROR_CODES.has(error.code)
+  ) {
+    return true;
+  }
+  if (!(error instanceof Error) || depth >= 4 || error.cause === undefined) return false;
+  return hasConnectionLossCause(error.cause, depth + 1);
 }
 
 /**
@@ -278,6 +343,7 @@ export function classifyBashHostFallbackError(error: unknown): BashHostFallbackC
   if (!(error instanceof Error) || hasEngineResponse(error) || isRouteGoodbyeError(error)) {
     return undefined;
   }
+  if (isSubcConnectionClosedMidCallError(error)) return undefined;
   if (error instanceof BridgeTransportUnknownOutcomeError) return undefined;
   if (isRouteClosedMidCallError(error)) return undefined;
   if (isSubcFrameReadTimeoutError(error)) return undefined;
@@ -306,15 +372,14 @@ export function isBashTransportDeadError(error: unknown): error is Error {
 }
 
 /**
- * Append agent-facing recovery guidance without changing the original error
- * object, class, code, or retry behavior. Unknown-outcome errors append safety
- * guidance on every command; a shell call that timed out at the bridge gets
- * guidance built from what AFT answered after the deadline; proven bash
- * transport failures append re-run guidance. Commands matching none of these
- * retain their errors untouched.
+ * Attach recovery guidance to unknown outcomes without changing the error's
+ * class, code or retry behavior. A tool call that never reached the AFT module
+ * gets a typed, safe-to-retry refusal, since nothing ran; other errors keep the
+ * existing adaptation.
  */
 export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;
+  if (error instanceof AftModuleUnavailableError) return error;
 
   if (isSubcFrameReadTimeoutError(error)) {
     const typedError =
@@ -333,6 +398,19 @@ export function adaptToolError(command: string, error: unknown): unknown {
     error.message = error.message
       ? `${error.message} ${BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION}`
       : BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION;
+    return error;
+  }
+
+  // The request boundary marks a raw SocketClosedError only after client.request
+  // was called. Wrapped client errors retain that class in their cause; route-open
+  // failures remain unmarked because no tool request was sent.
+  if (isSubcConnectionClosedMidCallError(error)) {
+    const disposition =
+      command === "bash"
+        ? bashConnectionClosedDisposition(taskIdFromError(error))
+        : SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION;
+    if (error.message.includes(disposition)) return error;
+    error.message = error.message ? `${error.message} ${disposition}` : disposition;
     return error;
   }
 
@@ -368,10 +446,30 @@ export function adaptToolError(command: string, error: unknown): unknown {
     return error;
   }
 
+  if (command !== "bash" && isBashTransportDeadError(error)) {
+    return new AftModuleUnavailableError(
+      "The AFT module connection is down or unavailable; this AFT-backed option has no host fallback. Nothing was started, so it is safe to retry after the connection is restored.",
+      error,
+    );
+  }
+
   if (command !== "bash" || !isBashTransportDeadError(error)) return error;
   if (error.message.includes(BASH_TRANSPORT_DISPOSITION)) return error;
   error.message = error.message
     ? `${error.message} ${BASH_TRANSPORT_DISPOSITION}`
     : BASH_TRANSPORT_DISPOSITION;
   return error;
+}
+
+function taskIdFromError(error: Error): string | undefined {
+  for (
+    let current: unknown = error, depth = 0;
+    current instanceof Error && depth < 5;
+    current = current.cause, depth += 1
+  ) {
+    const fields = current as Error & { taskId?: unknown; task_id?: unknown };
+    const taskId = fields.taskId ?? fields.task_id;
+    if (typeof taskId === "string" && taskId.length > 0) return taskId;
+  }
+  return undefined;
 }

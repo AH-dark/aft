@@ -7,14 +7,14 @@
  */
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import type { BridgePool } from "@cortexkit/aft-bridge";
+import { type BridgePool, BridgeTransportUnavailableError } from "@cortexkit/aft-bridge";
 import { _resetSubagentCacheForTest, LOOKUP_TIMEOUT_MS } from "../shared/subagent-detect.js";
 import { callBridge, callToolCall } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 
-function harness(parentID: string | undefined, hang = false) {
+function harness(parentID: string | undefined, hang = false, toolCallError?: Error) {
   let lookups = 0;
   const sends: Array<Record<string, unknown>> = [];
   const toolCalls: Array<Record<string, unknown> | undefined> = [];
@@ -30,6 +30,7 @@ function harness(parentID: string | undefined, hang = false) {
       options?: Record<string, unknown>,
     ) => {
       toolCalls.push(options);
+      if (toolCallError) throw toolCallError;
       return { success: true, text: "ok" };
     },
   };
@@ -110,5 +111,28 @@ describe("host tool names on every bridge request", () => {
     await callToolCall(ctx, runtime("ses_names_v1"), "edit", { patch: "p" });
     expect(sends[0]).not.toHaveProperty("host_tool_names");
     expect(toolCalls[0]).not.toHaveProperty("hostToolNames");
+  });
+
+  test("a runon tool_call with a down module returns a safe typed refusal", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx } = harness(
+      undefined,
+      false,
+      new BridgeTransportUnavailableError("transport down"),
+    );
+
+    let refusal: unknown;
+    try {
+      await callToolCall(ctx, runtime("ses_remote_down"), "bash", {
+        command: "uname -m",
+        runon: "linux",
+      });
+    } catch (error) {
+      refusal = error;
+    }
+
+    expect(refusal).toMatchObject({ code: "aft_module_unavailable", kind: "not_sent" });
+    expect((refusal as Error).message).toContain("runon has no host fallback");
+    expect((refusal as Error).message).toContain("safe to retry");
   });
 });

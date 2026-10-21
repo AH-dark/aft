@@ -32,6 +32,7 @@ import {
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
   classifyBashHostFallbackError,
+  SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION,
   SUBC_MODULE_RESTART_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
 } from "../error-contract.js";
@@ -547,21 +548,41 @@ describe("a route the plugin closes under an in-flight call (real SubcClient, fa
     await waitFor(() => daemon.closedRoutes.includes(channel), "retired route deadline cleanup");
   });
 
-  test("connection loss on a retired route stays transport loss and reconnects promptly", async () => {
+  test("connection loss after dispatch carries bash and tool outcome guidance", async () => {
     const { pool, daemon } = await rig();
     const bridge = pool.getBridge(TEST_PROJECT_ROOT);
     const abort = new AbortController();
     const cancelled = bridge
       .send("read", { session_id: "lost" }, { abortSignal: abort.signal })
       .catch((error: unknown) => error);
-    const sibling = bridge.send("bash", { session_id: "lost" }).catch((error: unknown) => error);
-    await waitFor(() => daemon.requests.length === 2, "both loss requests");
+    const bash = bridge.send("bash", { session_id: "lost" }).catch((error: unknown) => error);
+    const tool = bridge.send("read", { session_id: "lost" }).catch((error: unknown) => error);
+    await waitFor(() => daemon.requests.length === 3, "all loss requests to reach the daemon");
+    expect(daemon.requests[1]?.name).toBe("bash");
+    expect(daemon.requests[2]?.name).toBe("read");
+
     abort.abort();
     expect(((await cancelled) as Error).name).toBe("AbortError");
     daemon.loseConnections();
-    const error = await sibling;
-    expect(error).not.toBeInstanceOf(SubcRouteClosedMidCallError);
-    expect((error as SubcError).closeReason).toBe("connection_lost");
+
+    const bashError = await bash;
+    expect(bashError).not.toBeInstanceOf(SubcRouteClosedMidCallError);
+    expect((bashError as SubcError).closeReason).toBe("connection_lost");
+    expect((bashError as { kind?: unknown }).kind).toBe("outcome_unknown");
+    const bashAdapted = adaptToolError("bash", bashError) as Error;
+    expect(bashAdapted.message).toContain("may still be running");
+    expect(bashAdapted.message).toContain("completion notice will follow");
+    expect(bashAdapted.message).toContain("Do not rerun it.");
+    expect(bashAdapted.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+
+    const toolError = await tool;
+    expect(toolError).not.toBeInstanceOf(SubcRouteClosedMidCallError);
+    expect((toolError as SubcError).closeReason).toBe("connection_lost");
+    expect((toolError as { kind?: unknown }).kind).toBe("outcome_unknown");
+    const toolAdapted = adaptToolError("read", toolError) as Error;
+    expect(toolAdapted.message).toContain(SUBC_CONNECTION_CLOSED_MID_CALL_DISPOSITION);
+    expect(toolAdapted.message).not.toContain("Nothing was started, so it is safe to retry");
+
     daemon.reply = LIVE_REPLY;
     expect(JSON.stringify(await bridge.send("read", { session_id: "lost" }))).toContain("live");
     expect(daemon.connections).toBe(2);

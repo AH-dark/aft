@@ -12,10 +12,12 @@ import type {
 } from "@cortexkit/aft-bridge";
 import {
   adaptToolError,
+  BASH_HOST_FALLBACK_REFUSAL,
   formatBridgeErrorMessage,
   isBashTransportDeadError,
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
+  refuseAftModuleOptionWithoutFallback,
   timeoutForCommand,
   WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
@@ -25,6 +27,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, type TSchema, Type } from "typebox";
+
 import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PiToolPresentation } from "../config.js";
@@ -329,6 +332,23 @@ export async function callToolCallForSession(
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
   } catch (error) {
+    const noFallbackOption =
+      name === "bash"
+        ? rawArgs.runon !== undefined
+          ? "runon"
+          : rawArgs.pty === true
+            ? "pty:true"
+            : rawArgs.background === true
+              ? "background:true"
+              : undefined
+        : undefined;
+    if (noFallbackOption && isBashTransportDeadError(error)) {
+      throw refuseAftModuleOptionWithoutFallback(
+        error,
+        noFallbackOption,
+        BASH_HOST_FALLBACK_REFUSAL,
+      );
+    }
     throw adaptToolError(name, error);
   }
   ingestBgCompletions(sessionId, response.bg_completions);

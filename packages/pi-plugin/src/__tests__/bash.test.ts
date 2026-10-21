@@ -468,6 +468,43 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("runon refuses a module-down transport without host fallback", async () => {
+    const tools = new Map<string, MockToolDef>();
+    let sends = 0;
+    const bridge = {
+      send: async () => {
+        sends += 1;
+        throw new BridgeTransportUnavailableError("transport down");
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { host_fallback: true, runon_enabled: true },
+      } as PluginContext["config"]),
+    );
+
+    let refusal: unknown;
+    try {
+      await tools
+        .get("bash")!
+        .execute("test-call", { command: "uname -m", runon: "linux" }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: false,
+        });
+    } catch (error) {
+      refusal = error;
+    }
+
+    expect(sends).toBe(1);
+    expect(refusal).toMatchObject({ code: "aft_module_unavailable", kind: "not_sent" });
+    expect((refusal as Error).message).toContain("AFT module connection is down");
+    expect((refusal as Error).message).toContain("runon has no host fallback");
+    expect((refusal as Error).message).toContain("safe to retry");
+  });
+
   test("runon launch transport covers capture without extending local budgets", async () => {
     const tools = new Map<string, MockToolDef>();
     const { bridge, calls } = makeTrackableMockBridge({

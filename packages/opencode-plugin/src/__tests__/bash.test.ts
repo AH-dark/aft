@@ -396,9 +396,16 @@ describe("OpenCode bash adapter", () => {
       } as PluginContext["config"],
     );
     for (const runon of ["linux", "linux,net"]) {
-      await expect(
-        dead.tool.execute({ command: "printf no", runon }, createMockSdkContext({})),
-      ).rejects.toThrow("runon is unsupported, and the command was not run locally");
+      let refusal: unknown;
+      try {
+        await dead.tool.execute({ command: "printf no", runon }, createMockSdkContext({}));
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toMatchObject({ code: "aft_module_unavailable", kind: "not_sent" });
+      expect((refusal as Error).message).toContain("AFT module connection is down");
+      expect((refusal as Error).message).toContain("runon has no host fallback");
+      expect((refusal as Error).message).toContain("safe to retry");
     }
   });
 
@@ -711,9 +718,7 @@ describe("OpenCode bash adapter", () => {
         { command: "printf should-not-run", background: true },
         createMockSdkContext({ ask }),
       ),
-    ).rejects.toThrow(
-      "AFT transport is down; only foreground execution is available in host fallback; background:true is unsupported",
-    );
+    ).rejects.toThrow("AFT module connection is down; background:true has no host fallback");
     expect(ask).not.toHaveBeenCalled();
   });
 

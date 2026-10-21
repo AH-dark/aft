@@ -32,6 +32,7 @@ import {
   type RouteScope,
   type RouteTarget,
   routeCloseReason,
+  SocketClosedError,
   SocketTimeoutError,
   StaleRouteHandleError,
   SubcCallError,
@@ -250,6 +251,58 @@ export function isSocketDeathError(error: unknown, depth = 0): boolean {
       : false;
   }
   return isConsumerReconnectTransient(error) || isSubcClientClosedError(error);
+}
+
+/** Typed system codes for a reset or broken connected socket. */
+const REQUEST_CONNECTION_LOSS_CODES = new Set(["ECONNABORTED", "ECONNRESET", "EPIPE"]);
+
+function hasRequestConnectionLossCode(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return typeof error.code === "string" && REQUEST_CONNECTION_LOSS_CODES.has(error.code);
+}
+
+function hasRequestConnectionLossEvidence(error: unknown, depth = 0): boolean {
+  if (error instanceof SocketClosedError) return true;
+  if (error instanceof SubcError && error.closeReason === "connection_lost") return true;
+  if (hasRequestConnectionLossCode(error)) return true;
+  if (
+    !(error instanceof SubcCallError) ||
+    error.kind !== "outcome_unknown" ||
+    depth >= 4 ||
+    error.cause === undefined ||
+    error.cause === error
+  ) {
+    return false;
+  }
+  return hasRequestConnectionLossEvidence(error.cause, depth + 1);
+}
+
+/**
+ * A raw request first checks `closedErr`, then records itself pending and starts
+ * `writeBorrowed` in the same synchronous send(). A later read-loop failure goes
+ * through fail(), which rejects route-pending requests as SubcError with
+ * closeReason="connection_lost". That proves the request write was attempted,
+ * but the raw request API does not expose whether the socket queued those bytes;
+ * the outcome must therefore stay unknown, not be retried.
+ *
+ * The timer path is different: it rejects with code="request_deadline" while
+ * leaving the shared socket potentially live. Read/body timeouts reach fail() and
+ * get the connection-lost close reason; a direct SocketTimeoutError from writing
+ * can be before or after queueing. The socket's queued/not-queued write wrappers
+ * are stripped by the raw write helper, so neither a bare timeout nor a bare
+ * SocketClosedError alone identifies the write state. The latter remains
+ * supported for older clients that rejected pending calls with that class.
+ * Explicit kind="not_sent" is authoritative and always wins over these shapes.
+ */
+function connectionClosedAfterDispatch(error: unknown): unknown {
+  if (error instanceof SubcCallError && error.kind === "not_sent") return error;
+  if (typeof error === "object" && error !== null && "kind" in error && error.kind === "not_sent") {
+    return error;
+  }
+  if (!hasRequestConnectionLossEvidence(error)) return error;
+  if (error instanceof SubcCallError) return error;
+  if (!(error instanceof Error)) return error;
+  return Object.assign(error, { kind: "outcome_unknown" as const });
 }
 
 /**
@@ -2567,7 +2620,11 @@ export class SubcTransportPool implements AftTransportPool {
           return reply;
         } catch (requestError) {
           const error = frameReadTimeoutError(
-            routeClosedMidCallError(requestError, routeAndEntry.entry, record),
+            routeClosedMidCallError(
+              connectionClosedAfterDispatch(requestError),
+              routeAndEntry.entry,
+              record,
+            ),
           );
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           const ownsRoute = this.isCurrentSession(key, record) && this.client === client;

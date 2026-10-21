@@ -10,6 +10,7 @@ import {
   SubcError,
 } from "@cortexkit/subc-client";
 import { getActiveLogger, setActiveLogger } from "../active-logger.js";
+import { adaptToolError } from "../error-contract.js";
 import type { Logger, LogMeta } from "../logger.js";
 import {
   __dispatchProbeCountForTests,
@@ -823,6 +824,72 @@ describe("SubcTransport Rd reconnect", () => {
     const result = await t.toolCall("s", "read", {});
     expect(result.text).toBe("recovered");
     expect(madeClients).toBe(2); // the dead client was dropped, a fresh one connected
+  });
+
+  test.each([
+    ["bash", { command: "uname -m", runon: "linux" }],
+    ["read", { target: "src/index.ts" }],
+  ] as const)("a socket closed after the %s request was written has unknown outcome", async (name, args) => {
+    let noteRequestWritten!: () => void;
+    const requestWritten = new Promise<void>((resolve) => {
+      noteRequestWritten = resolve;
+    });
+    let endSocket!: (error: Error) => void;
+    const client = new FakeClient(async () => {
+      // The fake records the request before this callback runs, so the socket
+      // error occurs after the request was sent.
+      noteRequestWritten();
+      return await new Promise<never>((_resolve, reject) => {
+        endSocket = reject;
+      });
+    });
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+    });
+    const call = pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", name, args);
+
+    await requestWritten;
+    expect(client.requests).toHaveLength(1);
+    endSocket(new SocketClosedError("subc closed the connection"));
+
+    let rejection: unknown;
+    try {
+      await call;
+    } catch (error) {
+      rejection = adaptToolError(name, error);
+    }
+
+    expect(rejection).toBeInstanceOf(SocketClosedError);
+    expect(rejection).toMatchObject({ kind: "outcome_unknown" });
+    if (name === "bash") {
+      expect((rejection as Error).message).toContain("AFT keeps commands running");
+      expect((rejection as Error).message).toContain("Do not rerun");
+    }
+  });
+
+  test("a closed transport before route open is a typed refusal and sends no request", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true }));
+    client.routeOpenError = new SocketClosedError("subc closed the connection");
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+    });
+
+    let refusal: unknown;
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", { target: "src/index.ts" });
+    } catch (error) {
+      refusal = adaptToolError("read", error);
+    }
+
+    expect(client.requests).toHaveLength(0);
+    expect(refusal).toMatchObject({ code: "aft_module_unavailable", kind: "not_sent" });
+    expect((refusal as Error).message).toContain("AFT module connection is down");
+    expect((refusal as Error).message).toContain("no host fallback");
+    expect((refusal as Error).message).toContain("safe to retry");
   });
 
   test.each([
