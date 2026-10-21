@@ -2018,7 +2018,11 @@ impl BgTaskRegistry {
                 Ok(c) => break c,
                 Err(error) => {
                     if retry_request.is_some() {
-                        return self.refuse_remote_before_dispatch(&task, &error);
+                        self.refuse_remote_before_dispatch(&task, &error)?;
+                        // A pause that landed while reconnecting already ended
+                        // the task; the refusal changed nothing.
+                        self.settle_owner_pause_without_resubmit(&task);
+                        return Ok(());
                     }
                     if let Some((_, fallback)) = initial.take() {
                         return if remote.explicit_runon {
@@ -2335,13 +2339,15 @@ impl BgTaskRegistry {
                 (remote, now)
             };
             if remote.cancel_requested {
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                self.cancel_draining_retry(task);
                 return Ok(None);
             }
             #[cfg(test)]
             if tests::stop_draining_worker(root) {
                 return Ok(None);
             }
+            #[cfg(test)]
+            tests::draining_gate(root, tests::DrainingGate::BeforeBudgetCheck).await;
             let retry = remote.retry.as_ref().unwrap();
             let first = retry.first_refusal_at_ms.unwrap();
             let elapsed = now.saturating_sub(first);
@@ -2354,9 +2360,11 @@ impl BgTaskRegistry {
                 else {
                     return Err("draining refusal absent".into());
                 };
-                return self
-                    .refuse_remote_executor(task, "runner_draining", refusal_detail.as_deref())
-                    .map(|_| None);
+                self.refuse_remote_executor(task, "runner_draining", refusal_detail.as_deref())?;
+                // An owner pause that landed after the cancellation check above
+                // already ended the task, so the refusal changed nothing.
+                self.settle_owner_pause_without_resubmit(task);
+                return Ok(None);
             }
             if now >= retry.next_retry_at_ms.unwrap_or(now) {
                 return restore_retry_request(task, &retry.request_digest).map(Some);
@@ -2386,6 +2394,8 @@ impl BgTaskRegistry {
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2396,7 +2406,7 @@ impl BgTaskRegistry {
                 .ok_or("remote record absent")?;
             if remote.cancel_requested {
                 drop(state);
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                self.cancel_draining_retry(task);
                 return Ok(None);
             }
             // Clear the no-start proof before dispatch. A crash after this write
@@ -3029,6 +3039,33 @@ impl BgTaskRegistry {
         self.record_remote_cancel(task)?;
         self.remote_terminal(task, Verdict::Cancelled, None);
         Ok(())
+    }
+
+    /// Stop a draining retry that has a cancellation intent instead of
+    /// resubmitting it. The runner refused the job, so there is no runner job
+    /// to cancel: for an owner pause, withholding the resubmission is the
+    /// whole cancellation, and it is recorded as sent.
+    fn cancel_draining_retry(&self, task: &Arc<BgTask>) {
+        if !self.finish_owner_pause_cancel(task, Ok(())) {
+            self.remote_terminal(task, Verdict::Cancelled, None);
+        }
+    }
+
+    /// A draining-retry worker that stops without resubmitting is the last
+    /// thing that can record an owner pause's cancellation outcome, which
+    /// `bash.kill_scope` waits for. Record it as sent unless the worker
+    /// recorded one already; a task that was not paused is left alone.
+    fn settle_owner_pause_without_resubmit(&self, task: &Arc<BgTask>) {
+        let unsettled = task.state.lock().is_ok_and(|state| {
+            state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.owner_pause_cancel.is_none())
+        });
+        if unsettled {
+            self.finish_owner_pause_cancel(task, Ok(()));
+        }
     }
 
     // A pause ends AFT's local task even if the runner cannot be reached. Store
