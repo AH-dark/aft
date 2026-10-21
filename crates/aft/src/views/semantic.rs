@@ -1411,12 +1411,20 @@ enum VectorSource {
 
 /// File names whose content decides walker membership. When one of them
 /// differs from the snapshot, the snapshot's membership is not trusted.
-const IGNORE_FILE_NAMES: [&str; 3] = [".gitignore", ".aftignore", ".ignore"];
+const IGNORE_FILE_NAMES: [&str; 3] = super::live_delta::IGNORE_FILE_NAMES;
 
 /// Whether an ignore file on disk differs from what `snapshot` recorded, so
 /// its membership may be out of date. It reads only the ignore files, which
 /// lets the first query after an ignore edit notice it even before the
 /// watcher's reconcile has reached the snapshot.
+///
+/// Member ignore files are compared with their member content. A root ignore
+/// file that is not a member is compared with the record of root ignore files
+/// the membership walk ran under: one that ignores itself (a root `.aftignore`
+/// ending in `/.aftignore`) is never a member, yet it is no change while its
+/// bytes match that record. A snapshot without such a record treats a
+/// non-member root ignore file on disk as added, unless the snapshot has a
+/// live entry for it.
 fn ignore_rules_changed(
     root: &Path,
     snapshot: &Snapshot,
@@ -1442,14 +1450,22 @@ fn ignore_rules_changed(
         .iter()
         .filter(|(path, _)| is_ignore_file(path))
         .any(|(path, disk)| on_disk(path) != *disk);
-    let root_added = IGNORE_FILE_NAMES.iter().any(|name| {
-        RelPath::new(name.as_bytes().to_vec()).is_ok_and(|path| {
-            !members.contains_key(&path)
-                && !matches!(snapshot.source(&path), Source::Live(_))
-                && root.join(name).is_file()
-        })
+    let root_changed = IGNORE_FILE_NAMES.iter().any(|name| {
+        let Ok(path) = RelPath::new(name.as_bytes().to_vec()) else {
+            return false;
+        };
+        if members.contains_key(&path) {
+            return false;
+        }
+        match snapshot.root_ignore_files() {
+            Some(recorded) => {
+                super::live_delta::root_ignore_file_state(root, name)
+                    != recorded.get(&path).copied().unwrap_or(DiskState::Absent)
+            }
+            None => !matches!(snapshot.source(&path), Source::Live(_)) && root.join(name).is_file(),
+        }
     });
-    recorded_changed || root_added
+    recorded_changed || root_changed
 }
 
 /// Current walker membership of `root`, paths only.
@@ -2803,6 +2819,62 @@ mod tests {
         checkout.fill(&snapshot, &Model::default(), "model-a");
         checkout.load();
         checkout
+    }
+
+    /// A root `.aftignore` that ignores itself is never a walked member, yet
+    /// its rules decided membership. While its bytes match what the walk
+    /// read, queries are vouched and complete; an edit to it is still noticed
+    /// by the first query, before any reconcile.
+    #[test]
+    fn self_ignoring_root_ignore_file_vouches_until_it_changes() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(
+            root.path(),
+            &[
+                (
+                    "src/kept.rs",
+                    "pub fn kept_item(value: u32) -> u32 {\n    value\n}\n",
+                ),
+                (
+                    "src/later.rs",
+                    "pub fn later_item(value: u32) -> u32 {\n    value\n}\n",
+                ),
+                ("src/hidden.rs", "pub fn hidden_item() {}\n"),
+                (".aftignore", "src/hidden.rs\n/.aftignore\n"),
+            ],
+        );
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = ready_checkout(storage.path(), root.path(), &plane);
+        let snapshot = checkout.installed();
+        let ignore_file = RelPath::new(b".aftignore".to_vec()).unwrap();
+        assert!(!snapshot.membership().contains_key(&ignore_file));
+
+        let query = checkout.query(&snapshot, "model-a", "kept item value");
+        assert!(
+            !query.unvouched,
+            "self-ignoring ignore file counted as changed"
+        );
+        assert!(query.complete(), "{query:?}");
+
+        // Still self-ignoring, now also excluding a file the snapshot scores.
+        write_tree(
+            root.path(),
+            &[(".aftignore", "src/hidden.rs\nsrc/later.rs\n/.aftignore\n")],
+        );
+        let early = checkout.query(&snapshot, "model-a", "later item value");
+        assert!(early.unvouched, "ignore edit went unnoticed");
+        assert!(
+            rows(root.path(), &early.results)
+                .iter()
+                .all(|row| !row.0.ends_with("later.rs")),
+            "scored a file the edited rules exclude"
+        );
+
+        // Once membership is walked again under the edited rules, vouched.
+        checkout.load();
+        let settled = checkout.query(&checkout.installed(), "model-a", "kept item value");
+        assert!(!settled.unvouched, "{settled:?}");
     }
 
     #[test]

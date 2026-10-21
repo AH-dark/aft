@@ -187,12 +187,22 @@ impl SiblingLoader {
         base: Arc<OpenGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
         for _ in 0..3 {
+            // Read before the walk, so an ignore edit racing the walk shows up
+            // as a difference from this record rather than being recorded as
+            // the rules the walk applied.
+            let ignore_files = match access {
+                ViewAccess::Owner(owner) => {
+                    Some(super::live_delta::root_ignore_files(owner.root()))
+                }
+                _ => None,
+            };
             let checkout = self.driver.reconcile(access)?;
             if self.driver.revision(access) != checkout.revision {
                 continue;
             }
             let mut delta = super::snapshot::LiveDelta::new(Arc::clone(&base));
             delta.bump_epoch();
+            delta.record_root_ignore_files(ignore_files);
             // Full walker membership replaces seed membership, including ignored
             // sibling paths and files deleted in this checkout.
             for (path, _) in base.manifest().entries() {
@@ -271,6 +281,8 @@ impl SiblingLoader {
             let members = snapshot.membership();
             let mut delta = super::snapshot::LiveDelta::new(Arc::clone(&own));
             delta.bump_epoch();
+            // The membership is the reconciled one, so are its ignore rules.
+            delta.record_root_ignore_files(snapshot.root_ignore_files().cloned());
             for (path, _) in own.manifest().entries() {
                 if !members.contains_key(path) {
                     delta.apply(
@@ -1055,6 +1067,8 @@ impl CheckoutDriver {
             delta.record_intent(pending.clone());
         }
         delta.record_intent(path);
+        // Membership is unchanged, so are the ignore rules it was walked under.
+        delta.record_root_ignore_files(installed.snapshot.root_ignore_files().cloned());
         installed.snapshot = delta.snapshot();
     }
 

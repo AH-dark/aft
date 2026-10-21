@@ -175,7 +175,13 @@ pub struct LiveDelta {
     intent: Arc<BTreeMap<RelPath, u64>>,
     intent_version: u64,
     watcher: WatcherState,
+    root_ignore_files: Option<Arc<RootIgnoreFiles>>,
 }
+
+/// The disk state of each root ignore file (see
+/// `live_delta::IGNORE_FILE_NAMES`), present or absent, as read just
+/// before the walk that decided a snapshot's membership.
+pub type RootIgnoreFiles = BTreeMap<RelPath, DiskState>;
 
 /// The delta as a builder read it at version `v`.
 #[derive(Clone, Debug)]
@@ -227,7 +233,15 @@ impl LiveDelta {
             intent: Arc::new(BTreeMap::new()),
             intent_version: 0,
             watcher: WatcherState::Healthy,
+            root_ignore_files: None,
         }
+    }
+
+    /// Records the root ignore files the latest full membership walk ran
+    /// under. The record covers every root ignore file, including one that
+    /// ignores itself and so is never a member: it still decides membership.
+    pub fn record_root_ignore_files(&mut self, files: Option<RootIgnoreFiles>) {
+        self.root_ignore_files = files.map(Arc::new);
     }
 
     pub fn base(&self) -> &Arc<OpenGeneration> {
@@ -345,6 +359,7 @@ impl LiveDelta {
                 entries: Arc::clone(&self.entries),
                 intent: Arc::clone(&self.intent),
                 watcher: self.watcher,
+                root_ignore_files: self.root_ignore_files.clone(),
             }),
         }
     }
@@ -617,6 +632,7 @@ struct SnapshotInner {
     entries: Arc<Entries>,
     intent: Arc<BTreeMap<RelPath, u64>>,
     watcher: WatcherState,
+    root_ignore_files: Option<Arc<RootIgnoreFiles>>,
 }
 
 /// Where a path's answer comes from in one snapshot. Exactly one source per
@@ -653,6 +669,13 @@ impl Snapshot {
 
     pub fn watcher(&self) -> WatcherState {
         self.inner.watcher
+    }
+
+    /// The root ignore files the walk behind this snapshot's membership ran
+    /// under, or `None` when no walk recorded them (a snapshot taken without
+    /// walking the checkout, such as a read-only load).
+    pub fn root_ignore_files(&self) -> Option<&RootIgnoreFiles> {
+        self.inner.root_ignore_files.as_deref()
     }
 
     /// Paths with an acknowledged AFT write that the delta had not applied as
