@@ -378,6 +378,29 @@ fn drift_refusal_is_cleared_after_valid_replacement_and_never_becomes_floor() {
     assert!(UnsupportedPersistedFormat::is_refusal_message(&old));
 }
 
+#[cfg(unix)]
+#[test]
+fn drift_refusal_covers_an_unresolved_symlinked_storage_parent() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let target = root.path().join("target");
+    let alias = root.path().join("storage-alias");
+    fs::create_dir_all(target.join("nested")).unwrap();
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let storage = alias.join("nested").join("..");
+    seed(&storage, A);
+    let path = db(&storage, A);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE VIEW extra AS SELECT 1")
+        .unwrap();
+    let refusal = LedgerReader::open_existing(&storage, A).err().unwrap();
+    let recorded = persisted_format::refusal_covering(PersistedStore::ViewsV3Registry, &path)
+        .expect("a production refusal must cover the caller's unresolved path");
+    assert_eq!(recorded.path, fs::canonicalize(&path).unwrap());
+    assert_eq!(refusal.to_string(), recorded.to_string());
+}
+
 fn child(storage: &Path, family: &str, mode: &str, control: &Path) -> std::process::Child {
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "blob_store::v3::tests::v3_child", "--nocapture"])

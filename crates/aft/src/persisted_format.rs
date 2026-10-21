@@ -325,9 +325,23 @@ impl std::error::Error for UnsupportedPersistedFormat {}
 
 #[derive(Debug, Clone)]
 struct Entry {
-    /// Paths at or below `scope` are covered by the refusal.
+    /// Comparison-only identity; the refusal retains its original path spelling.
     scope: PathBuf,
     refusal: UnsupportedPersistedFormat,
+}
+
+fn comparison_scope(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |root| root.join(path))
+    };
+    // The leaf can be absent after removal or before first publication. Resolve
+    // its existing parent before normalizing '..' and Windows verbatim prefixes.
+    let resolved = crate::production_storage::canonicalized_with(&absolute, &|path| {
+        std::fs::canonicalize(path).ok()
+    });
+    crate::inspect::job::normalize_path(&resolved)
 }
 
 fn registry() -> &'static Mutex<Vec<Entry>> {
@@ -348,6 +362,7 @@ fn with_registry<T>(f: impl FnOnce(&mut Vec<Entry>) -> T) -> T {
 /// store whose artifact is a directory of generations (the callgraph) uses
 /// that directory. Floor refusals use the storage root.
 pub fn record(refusal: &UnsupportedPersistedFormat, scope: &Path) {
+    let scope = comparison_scope(scope);
     let inserted = with_registry(|entries| {
         if let Some(existing) = entries
             .iter_mut()
@@ -358,7 +373,7 @@ pub fn record(refusal: &UnsupportedPersistedFormat, scope: &Path) {
             changed
         } else {
             entries.push(Entry {
-                scope: scope.to_path_buf(),
+                scope: scope.clone(),
                 refusal: refusal.clone(),
             });
             true
@@ -384,6 +399,7 @@ pub fn refuse(refusal: UnsupportedPersistedFormat) -> UnsupportedPersistedFormat
 /// wrote it, or removed by the operator). Floor refusals are retained until
 /// a persistence retry safely rechecks the floor file.
 pub fn clear(store: PersistedStore, scope: &Path) {
+    let scope = comparison_scope(scope);
     with_registry(|entries| {
         entries.retain(|entry| {
             !(entry.refusal.store == store
@@ -396,10 +412,11 @@ pub fn clear(store: PersistedStore, scope: &Path) {
 /// Replace only this root's floor evidence after a successful floor recheck.
 /// Artifact refusals still require their own format checks before clearing.
 pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersistedFormat]) {
+    let root = comparison_scope(root);
     with_registry(|entries| {
         entries.retain(|entry| entry.scope != root || entry.refusal.source.is_artifact());
         entries.extend(refusals.iter().map(|refusal| Entry {
-            scope: root.to_path_buf(),
+            scope: root.clone(),
             refusal: refusal.clone(),
         }));
     });
@@ -409,11 +426,12 @@ pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersist
 /// path is confirmed absent. Permission errors and unreadable paths are not
 /// evidence of removal, and a reader floor is never lowered by housekeeping.
 pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
+    let root = comparison_scope(root);
     with_registry(|entries| {
         entries.retain(|entry| {
             !(entry.refusal.store == store
                 && entry.refusal.source.is_artifact()
-                && entry.scope.starts_with(root)
+                && entry.scope.starts_with(&root)
                 && std::fs::symlink_metadata(&entry.refusal.path)
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
         })
@@ -424,6 +442,7 @@ pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
 /// recorded at or above `path`, or a floor refusal for the storage root that
 /// contains it.
 pub fn refusal_covering(store: PersistedStore, path: &Path) -> Option<UnsupportedPersistedFormat> {
+    let path = comparison_scope(path);
     with_registry(|entries| {
         entries
             .iter()
@@ -436,10 +455,11 @@ pub fn refusal_covering(store: PersistedStore, path: &Path) -> Option<Unsupporte
 /// surfaces use this to list what the storage root holds that this build
 /// cannot read.
 pub fn refusals_under(root: &Path) -> Vec<UnsupportedPersistedFormat> {
+    let root = comparison_scope(root);
     let mut found = with_registry(|entries| {
         entries
             .iter()
-            .filter(|entry| entry.scope.starts_with(root))
+            .filter(|entry| entry.scope.starts_with(&root))
             .map(|entry| entry.refusal.clone())
             .collect::<Vec<_>>()
     });
@@ -455,6 +475,7 @@ pub(crate) fn refusals_for_push(
     storage: &Path,
     artifact_key: Option<&str>,
 ) -> (Vec<UnsupportedPersistedFormat>, usize) {
+    let storage_key = comparison_scope(storage);
     let mut owned = Vec::new();
     let mut unattributed = 0;
     let mut refusals = refusals_under(storage);
@@ -477,7 +498,8 @@ pub(crate) fn refusals_for_push(
     refusals.dedup();
     for refusal in refusals {
         if refusal.source != RefusalSource::Artifact
-            || (refusal.store == PersistedStore::AftDb && refusal.path == storage.join("aft.db"))
+            || (refusal.store == PersistedStore::AftDb
+                && comparison_scope(&refusal.path) == storage_key.join("aft.db"))
         {
             owned.push(refusal);
             continue;
@@ -492,7 +514,7 @@ pub(crate) fn refusals_for_push(
         };
         if let Some(plane) = plane {
             if let Some(key) = artifact_key {
-                if refusal.path.starts_with(storage.join(plane).join(key)) {
+                if comparison_scope(&refusal.path).starts_with(storage_key.join(plane).join(key)) {
                     owned.push(refusal);
                 }
             } else {
@@ -515,12 +537,13 @@ pub fn gate(
     scope: &Path,
     found: Option<u64>,
 ) -> Result<(), UnsupportedPersistedFormat> {
+    let path_key = comparison_scope(path);
     let floor = with_registry(|entries| {
         entries
             .iter()
             .find(|entry| {
                 entry.refusal.store == store
-                    && path.starts_with(&entry.scope)
+                    && path_key.starts_with(&entry.scope)
                     && !entry.refusal.source.is_artifact()
             })
             .map(|entry| entry.refusal.clone())
@@ -583,6 +606,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refusal_comparisons_resolve_parent_aliases_without_rewriting_returned_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let alias = root.path().join("alias");
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/c", "mklink", "/J"])
+                .arg(&alias)
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "junction creation failed: {output:?}"
+            );
+        }
+        let unresolved = alias.join("nested").join("..").join("index/key/cache.bin");
+        let canonical_root = std::fs::canonicalize(&target).unwrap();
+        let resolved = canonical_root.join("index/key/cache.bin");
+        let store = PersistedStore::SearchIndex;
+        let refusal = UnsupportedPersistedFormat::incompatible(
+            store,
+            &resolved,
+            1,
+            IncompatibleReason::SchemaDrift,
+        );
+        record(&refusal, &resolved);
+        assert_eq!(refusal_covering(store, &unresolved), Some(refusal.clone()));
+        assert_eq!(refusals_under(&alias), vec![refusal.clone()]);
+        assert_eq!(
+            refusals_for_push(&alias, Some("key")),
+            (vec![refusal.clone()], 0)
+        );
+        assert_eq!(refusal_covering(store, &unresolved).unwrap().path, resolved);
+        clear(store, &unresolved);
+        assert!(refusal_covering(store, &resolved).is_none());
+
+        let artifact = UnsupportedPersistedFormat::artifact(store, &unresolved, 99);
+        record(&artifact, &unresolved);
+        assert_eq!(
+            refusals_for_push(&alias, Some("key")),
+            (vec![artifact.clone()], 0)
+        );
+        assert_eq!(refusals_for_push(&canonical_root, None), (vec![], 1));
+        assert_eq!(refusal_covering(store, &resolved), Some(artifact.clone()));
+        assert_eq!(refusal_covering(store, &resolved).unwrap().path, unresolved);
+        clear_missing_artifacts(store, &canonical_root);
+        assert!(refusal_covering(store, &resolved).is_none());
+
+        let floor =
+            UnsupportedPersistedFormat::floor(store, canonical_root.join("reader-floor.json"), 99);
+        record(&floor, &canonical_root);
+        assert_eq!(gate(store, &unresolved, &unresolved, Some(1)), Err(floor));
+        replace_floor_refusals(&alias, &[]);
+        assert!(refusal_covering(store, &unresolved).is_none());
+    }
+
+    #[test]
     fn push_refusal_source_order_preserves_existing_variants() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("aft.db");
@@ -598,7 +683,7 @@ mod tests {
                     UnsupportedPersistedFormat::artifact(PersistedStore::AftDb, &path, 99);
                 refusal.source = source;
                 entries.push(Entry {
-                    scope: root.path().join(format!("scope-{index}")),
+                    scope: comparison_scope(&root.path().join(format!("scope-{index}"))),
                     refusal,
                 });
             }
@@ -612,7 +697,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        with_registry(|entries| entries.retain(|entry| !entry.scope.starts_with(root.path())));
+        let root_key = comparison_scope(root.path());
+        with_registry(|entries| entries.retain(|entry| !entry.scope.starts_with(&root_key)));
     }
 
     #[test]
