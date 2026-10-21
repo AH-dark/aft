@@ -1,4 +1,4 @@
-use crate::commands::bash_status::format_unknown_task_message;
+use crate::commands::bash_status::format_unknown_polled_task_message;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde::Deserialize;
@@ -71,7 +71,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) if message.contains("not found") => Response::error(
             &req.id,
             "task_not_found",
-            format_unknown_task_message(&task_id),
+            format_unknown_polled_task_message(&task_id, req.host_tool_names().shell()),
         ),
         Err(message) => Response::error(&req.id, "kill_failed", message),
     }
@@ -198,5 +198,22 @@ mod tests {
         // wait clears the zombie either way).
         let _ = kill_target.kill();
         let _ = kill_target.wait();
+    }
+
+    #[test]
+    fn bash_kill_unknown_id_reply_is_one_line_naming_bash() {
+        let _storage_env = crate::test_env::without_storage_override();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = actor(&App::default_shared(), project.path(), storage.path());
+
+        let reply = handle(&kill_request("noop", "kill-session"), &ctx);
+        assert_eq!(reply.data["code"], "task_not_found", "{:?}", reply.data);
+        let message = reply.data["message"].as_str().unwrap();
+        assert_eq!(
+            message,
+            "background task not found: noop. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+        );
+        assert!(!message.contains('\n'), "{message:?}");
     }
 }

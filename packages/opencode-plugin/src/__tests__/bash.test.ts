@@ -1654,12 +1654,12 @@ describe("bash_status tool", () => {
       success: false,
       code: "not_found",
       message:
-        "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.",
+        "background task not found: bash-unknown. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.",
     }));
     await expect(
       statusTool.execute({ taskId: "bash-unknown" }, createMockSdkContext()),
     ).rejects.toThrow(
-      "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.",
+      "background task not found: bash-unknown. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.",
     );
   });
 

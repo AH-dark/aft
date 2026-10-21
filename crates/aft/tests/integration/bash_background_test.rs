@@ -1536,7 +1536,7 @@ fn background_status_unknown_task_returns_task_not_found() {
     assert_eq!(response["code"], "task_not_found");
     assert_eq!(
         response["message"],
-        "background task not found: missing-task. No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling."
+        "background task not found: missing-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
     );
 
     assert!(aft.shutdown().success());
