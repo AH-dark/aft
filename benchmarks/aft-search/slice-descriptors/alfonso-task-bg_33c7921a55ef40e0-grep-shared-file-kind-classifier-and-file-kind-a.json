@@ -1,0 +1,15 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "shared-file-kind-classifier"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/lib.rs, which only registers the new crates/aft/src/file_kind.rs module (a shared file-kind classifier used by inspect's generated-file check). No aft_search code calls the classifier: engine behavior, ranking, routing and every ranked row must remain byte-identical to the committed reference, and real-query-baseline.json and manifest.sha256 are unchanged."
+}
