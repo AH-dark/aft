@@ -9,6 +9,7 @@ import {
 } from "../bg-notifications.js";
 import { projectV2Tool } from "../tools/definitions/v2.js";
 import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
+import { drainEntry } from "./helpers/drain-wire.js";
 
 afterEach(() => {
   __resetBgNotificationStateForTests();
@@ -55,7 +56,7 @@ test("OpenCode 2 completion wake masks a printed GitHub credential", async () =>
         command === "bash_drain_completions"
           ? {
               success: true,
-              bg_completions: [{ ...completion, session_id: "s" }],
+              bg_completions: [drainEntry(completion)],
               pending_matches: [],
             }
           : { success: true, acked_task_ids: [completion.task_id] },

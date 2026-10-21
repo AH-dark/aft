@@ -5,6 +5,7 @@ import { Effect } from "effect";
 import type { PatternMatchEntry } from "../bg-notifications.js";
 import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import { V2SessionDelivery, type V2SessionSyntheticInput } from "../wakes/session-delivery.js";
+import { drainEntry } from "./helpers/drain-wire.js";
 
 afterEach(__resetV2WakeRoutesForTests);
 
@@ -59,7 +60,7 @@ function rig(kind: Kind, stage: Stage) {
         await pause("drain");
         return {
           success: true,
-          bg_completions: kind === "completion" && pending ? [frame] : [],
+          bg_completions: kind === "completion" && pending ? [drainEntry(frame)] : [],
           pending_matches: kind === "pattern" && pending ? [match] : [],
         };
       }

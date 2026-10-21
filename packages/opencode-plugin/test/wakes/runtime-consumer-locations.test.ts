@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { Effect } from "effect";
-
+import { drainEntry } from "../../src/__tests__/helpers/drain-wire.js";
 import * as logger from "../../src/logger.js";
 import { __resetV2WakeRoutesForTests } from "../../src/wakes/runtime-consumer.js";
 import type {
@@ -54,7 +54,11 @@ function recordingBridge(completions: ReturnType<typeof completion>[]) {
       send: async (command: string, params: unknown) => {
         sends.push({ command, params });
         if (command === "bash_drain_completions")
-          return { success: true, bg_completions: [...pending.values()], pending_matches: [] };
+          return {
+            success: true,
+            bg_completions: [...pending.values()].map(drainEntry),
+            pending_matches: [],
+          };
         const ids = (params as { task_ids?: string[] }).task_ids ?? [];
         return { success: true, acked_task_ids: ids.filter((id) => pending.delete(id)) };
       },

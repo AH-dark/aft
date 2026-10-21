@@ -277,6 +277,22 @@ function isCompletionEntry(value: unknown): value is BashCompletedPayload {
   );
 }
 
+/**
+ * One entry of a `bash_drain_completions` reply, as a completion of
+ * `sessionID`. The reply lists only the requested session's completions, and
+ * the daemon serializes each entry without `session_id`: only push frames carry
+ * it. A check that requires the field drops every drained completion, so a
+ * pushed completion would fail its replay check and never wake the session. An
+ * entry that names a different session is still refused.
+ */
+function drainedCompletion(value: unknown, sessionID: string): BashCompletedPayload | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const entry = value as Partial<BashCompletedPayload>;
+  if (entry.session_id !== undefined && entry.session_id !== sessionID) return undefined;
+  const completion = { ...entry, type: "bash_completed" as const, session_id: sessionID };
+  return isCompletionEntry(completion) ? completion : undefined;
+}
+
 export interface V2RuntimeConsumer extends V2ToolConsumers {
   readonly bridgeOptions: typeof sharedBridgeOptions;
   readonly transportOptions: typeof sharedTransportOptions;
@@ -508,11 +524,10 @@ export function createV2RuntimeConsumer(
             if (disposed) return;
           }
         }
-        for (const completion of Array.isArray(response.bg_completions)
-          ? response.bg_completions
-          : []) {
-          if (isCompletionEntry(completion) && completion.session_id === sessionID) {
-            await routeCompletion({ ...completion, type: "bash_completed" }, bridge);
+        for (const entry of Array.isArray(response.bg_completions) ? response.bg_completions : []) {
+          const completion = drainedCompletion(entry, sessionID);
+          if (completion) {
+            await routeCompletion(completion, bridge);
             if (disposed) return;
           }
         }
@@ -679,9 +694,7 @@ export function createV2RuntimeConsumer(
         if (
           !current.bg_completions.some(
             (entry) =>
-              isCompletionEntry(entry) &&
-              entry.session_id === completion.session_id &&
-              entry.task_id === completion.task_id,
+              drainedCompletion(entry, completion.session_id)?.task_id === completion.task_id,
           )
         ) {
           delivery.retireCompletion(wake);

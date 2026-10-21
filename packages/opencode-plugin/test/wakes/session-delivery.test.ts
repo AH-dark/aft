@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
-
+import { drainEntry } from "../../src/__tests__/helpers/drain-wire.js";
 import type { AftConfig } from "../../src/config.js";
 import { __resetSyncWatchAbortForTests, isSyncWatchAborted } from "../../src/sync-watch-abort.js";
 import { createV2RuntimeConsumer } from "../../src/wakes/runtime-consumer.js";
@@ -105,7 +105,7 @@ describe("V2 session delivery", () => {
         if (command === "bash_drain_completions")
           return {
             success: true,
-            bg_completions: pendingCompletion ? [completion] : [],
+            bg_completions: pendingCompletion ? [drainEntry(completion)] : [],
             pending_matches: [],
           };
         if (command === "bash_ack_completions") pendingCompletion = false;
@@ -256,7 +256,7 @@ describe("V2 completion wakes end the session's waits", () => {
         send: async (command: string, params: unknown) => {
           sends.push({ command, params });
           if (command === "bash_drain_completions")
-            return { success: true, bg_completions: [frame], pending_matches: [] };
+            return { success: true, bg_completions: [drainEntry(frame)], pending_matches: [] };
           return {
             success: true,
             detached: command === "bash_wait_detach",
