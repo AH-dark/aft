@@ -114,6 +114,82 @@ pub(crate) struct LogArgs {
 }
 
 impl Request {
+    /// Decode once at the worker boundary. Keep a slash-containing reference in
+    /// its one API segment; no other encoded separator or second decode is valid.
+    #[cfg(unix)]
+    pub(crate) fn canonicalize_worker_path(&mut self) -> Result<(), WorkerReadRefusal> {
+        let Self::Get { args, .. } = self else {
+            return Ok(());
+        };
+        let invalid = |message: &str| WorkerReadRefusal {
+            code: "worker_path_invalid",
+            key: None,
+            message: message.into(),
+        };
+        if args.path.is_empty() {
+            return Ok(());
+        }
+        let mut parts = Vec::new();
+        for part in args.path.split('/') {
+            let mut bytes = Vec::new();
+            let mut input = part.as_bytes().iter().copied();
+            while let Some(byte) = input.next() {
+                if byte == b'%' {
+                    let high = input.next().and_then(|byte| (byte as char).to_digit(16));
+                    let low = input.next().and_then(|byte| (byte as char).to_digit(16));
+                    let (Some(high), Some(low)) = (high, low) else {
+                        return Err(invalid("worker path has malformed percent encoding"));
+                    };
+                    bytes.push((high * 16 + low) as u8);
+                } else {
+                    bytes.push(byte);
+                }
+            }
+            let decoded = String::from_utf8(bytes)
+                .map_err(|_| invalid("worker path must decode as UTF-8"))?;
+            if decoded.contains('%') || decoded.chars().any(char::is_control) {
+                return Err(invalid(
+                    "worker path forbids double encoding and control characters",
+                ));
+            }
+            parts.push(decoded);
+        }
+        if parts[0].eq_ignore_ascii_case("graphql") {
+            return Err(WorkerReadRefusal {
+                code: "worker_graphql_not_supported",
+                key: None,
+                message: "worker reads do not support GraphQL paths".into(),
+            });
+        }
+        let names: Vec<_> = parts.iter().map(String::as_str).collect();
+        let reference = match names.as_slice() {
+            ["branches", _]
+            | ["branches", _, "protection"]
+            | ["branches", _, "protection", "required_status_checks"]
+            | ["commits", _]
+            | ["commits", _, "status" | "statuses" | "check-runs"] => Some(1),
+            ["releases", "tags", _] => Some(2),
+            _ => None,
+        };
+        for (index, part) in parts.iter().enumerate() {
+            if part.split('/').any(|part| matches!(part, "" | "." | ".."))
+                || (part.contains('/') && reference != Some(index))
+            {
+                return Err(invalid(
+                    "worker path separators and dot segments cannot change endpoint structure",
+                ));
+            }
+        }
+        let canonical = parts
+            .iter()
+            .map(|part| part.replace('/', "%2F"))
+            .collect::<Vec<_>>()
+            .join("/");
+        validate_path(&canonical).map_err(|message| invalid(&message))?;
+        args.path = canonical;
+        Ok(())
+    }
+
     /// Extra policy for the new worker broker only. Existing head/operator
     /// executor paths retain their query behavior and call validate instead.
     #[cfg(unix)]

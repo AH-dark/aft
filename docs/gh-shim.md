@@ -451,3 +451,11 @@ command can also consume another command's **pre-authentication** socket slots
 without learning its capability. Per-endpoint/global caps and short frame
 read deadlines bound the resources, but repeated connections can still starve
 reads. This is a known availability limit, not cross-command read authority.
+
+Worker GET paths are decoded exactly once before policy checks. Encoded GraphQL,
+malformed/double encoding, dot segments and control characters are refused. A
+slash-containing branch, commit or release-tag reference remains encoded as
+`%2F` in its designated single endpoint segment; other encoded slashes cannot
+change endpoint structure. AFT forwards the canonical checked path, not the
+caller's alternate spelling. This worker-only rule does not alter existing
+head/operator path behavior.
