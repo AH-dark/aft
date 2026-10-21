@@ -2,14 +2,15 @@
 
 /**
  * A request timeout settles only its own request; restarting a hung child is
- * the hang watchdog's job. The watchdog kills a child only when callers are
- * waiting and the child has written nothing for its silence window. Calls cut
- * off by that restart get a typed error, and read-only tools are retried once
- * on the respawned child while mutations are not.
+ * the hang watchdog's job. The watchdog acts only when the child owes a reply
+ * and has written nothing for its silence window: it then sends a `ping`, and
+ * kills the child only when that goes unanswered. Calls cut off by that
+ * restart get a typed error, and read-only tools are retried once on the
+ * respawned child while mutations are not.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BinaryBridge } from "../bridge.js";
@@ -41,8 +42,14 @@ afterEach(() => {
  *   like a dispatcher stuck in one handler. Later generations answer it.
  * - `never`: never answered, but later requests still are, like one stuck
  *   worker in an otherwise healthy engine.
+ * - `ping` (the hang watchdog's liveness probe): answered like anything
+ *   else, except that while a `hold-pongs` file exists the answer is held
+ *   until a `release-pong` file appears; once the answer is written to the
+ *   pipe, the engine creates `pong-written`.
  * - anything else: answered with `{ tool, generation }`, after `delay_ms`
- *   when the request carries one (without holding up later requests).
+ *   when the request carries one, or once the file named by `until_file`
+ *   exists in the working directory (without holding up later requests, and
+ *   even after a `wedge`).
  */
 const FAKE_ENGINE = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -75,9 +82,25 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (tool === "never") continue;
+    if (tool === "ping" && fs.existsSync(path.join(process.cwd(), "hold-pongs"))) {
+      const poll = setInterval(() => {
+        if (!fs.existsSync(path.join(process.cwd(), "release-pong"))) return;
+        clearInterval(poll);
+        process.stdout.write(JSON.stringify({ id: req.id, success: true, command: "pong" }) + "\\n", () =>
+          fs.writeFileSync(path.join(process.cwd(), "pong-written"), ""),
+        );
+      }, 5);
+      continue;
+    }
     const args = req.arguments || req.params || {};
     const reply = () => write({ id: req.id, success: true, tool, generation });
-    if (args.delay_ms > 0) setTimeout(reply, args.delay_ms);
+    if (args.until_file) {
+      const poll = setInterval(() => {
+        if (!fs.existsSync(path.join(process.cwd(), args.until_file))) return;
+        clearInterval(poll);
+        reply();
+      }, 5);
+    } else if (args.delay_ms > 0) setTimeout(reply, args.delay_ms);
     else reply();
   }
 });
@@ -85,6 +108,8 @@ process.stdin.on("data", (chunk) => {
 
 /** Silence-window floor for the watchdog tests; see `wedgeThen`. */
 const WINDOW_MS = 1_000;
+/** Liveness-probe timeout for the watchdog tests; see `wedgeThen`. */
+const PROBE_MS = 100;
 
 interface LoggedRequest {
   generation: number;
@@ -137,6 +162,7 @@ function bridgeWithClock(clock: ManualClock, logger?: Logger): BinaryBridge {
     timeoutMs: 5_000,
     maxRestarts: 0,
     hangWindowMinMs: WINDOW_MS,
+    hangProbeTimeoutMs: PROBE_MS,
     clock,
     ...(logger ? { logger } : {}),
   });
@@ -147,16 +173,41 @@ function pendingCount(bridge: BinaryBridge): number {
   return (bridge as unknown as { pending: Map<string, unknown> }).pending.size;
 }
 
+/** Whether the hang watchdog's liveness probe is waiting for its answer. */
+function probeInFlight(bridge: BinaryBridge): boolean {
+  return (bridge as unknown as { hangProbe: unknown }).hangProbe !== null;
+}
+
+/** Number of `ping` probes the fake engine of `generation` has received. */
+function pingsLogged(generation: number): number {
+  return loggedRequests().filter((r) => r.tool === "ping" && r.generation === generation).length;
+}
+
+/**
+ * Poll real time (not the bridge clock) until the bridge has handled the
+ * answer to its liveness probe.
+ */
+async function waitForProbeAnswered(bridge: BinaryBridge): Promise<void> {
+  const giveUpAt = Date.now() + 5_000;
+  while (probeInFlight(bridge)) {
+    if (Date.now() > giveUpAt) throw new Error("liveness probe never answered");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /**
  * Wedge the generation-1 engine with a call that times out on its own, then,
  * while the engine stays silent, start `tool` from another session so that it
- * is still waiting when the silence reaches the window. Time moves only
- * through the manual clock, so every step below happens at an exact instant.
+ * is still waiting when the silence reaches the window and the liveness probe
+ * goes unanswered. Time moves only through the manual clock, so every step
+ * below happens at an exact instant.
  *
- * Timeline from the wedge (W = WINDOW_MS = 1000 ms): the wedge times out at
- * 100 ms; `tool` is sent at 700 ms with a 500 ms budget, so it would wait until
- * 1200 ms; the window stays 1000 ms (twice 500 ms). At 999 ms nothing has
- * been killed; at 1000 ms the watchdog fires while `tool` is still waiting.
+ * Timeline from the wedge (WINDOW_MS = 1000 ms, PROBE_MS = 100 ms): the wedge
+ * times out at 100 ms; `tool` is sent at 700 ms with a 500 ms budget, so it
+ * would wait until 1200 ms; the window stays 1000 ms (twice 500 ms). At
+ * 999 ms nothing has happened; at 1000 ms the watchdog sends its `ping`, which
+ * the wedged engine never answers; at 1100 ms the probe times out and the
+ * child is killed while `tool` is still waiting.
  */
 async function wedgeThen(
   bridge: BinaryBridge,
@@ -172,6 +223,10 @@ async function wedgeThen(
   // log can show which generation saw it.
   await waitForLogged(tool, 1);
   clock.advance(299);
+  expect(probeInFlight(bridge)).toBe(false);
+  clock.advance(1);
+  await waitForLogged("ping", 1);
+  clock.advance(PROBE_MS - 1);
   expect(bridge.isAlive()).toBe(true);
   expect(pendingCount(bridge)).toBe(1);
   clock.advance(1);
@@ -263,8 +318,9 @@ describe("hang watchdog", () => {
             level === "error" &&
             message.includes("Bridge killed after timeout of the hang watchdog"),
         );
-        expect(killLog?.message).toContain("silent_ms=1000");
+        expect(killLog?.message).toContain(`silent_ms=${WINDOW_MS + PROBE_MS}`);
         expect(killLog?.message).toContain(`hang_window_ms=${WINDOW_MS}`);
+        expect(killLog?.message).toContain(`probe_timeout_ms=${PROBE_MS}`);
         expect(killLog?.message).toContain('oldest_unanswered_tool="wedge"');
         expect(killLog?.message).toContain(`"tool":"${mutating}","retry":false`);
         expect(killLog?.meta).toEqual({ sessionId: "wedge-session" });
@@ -339,20 +395,22 @@ describe("hang watchdog", () => {
 });
 
 /**
- * With the default budgets (30 s per call, 60 s window), a child that goes
- * completely silent while owing a reply is replaced within one window of the
- * first unanswered request, even when every caller has already timed out.
+ * With the default budgets (30 s per call, 60 s window, 5 s probe), a child
+ * that goes completely silent while owing a reply is replaced one window plus
+ * one probe timeout after its last output, even when every caller has already
+ * timed out. A child that answers the probe is kept.
  */
 describe("hang watchdog with default budgets", () => {
-  function defaultBridge(clock: ManualClock): BinaryBridge {
+  function defaultBridge(clock: ManualClock, logger?: Logger): BinaryBridge {
     return new BinaryBridge(cachedExecutable(FAKE_ENGINE), workDir, {
       timeoutMs: 30_000,
       maxRestarts: 0,
       clock,
+      ...(logger ? { logger } : {}),
     });
   }
 
-  test("a silent child whose only caller timed out is replaced at 60 s, and a read retried at 70 s succeeds", async () => {
+  test("a silent child whose only caller timed out is replaced at 65 s (window plus unanswered probe), and a read retried at 75 s succeeds", async () => {
     const clock = new ManualClock();
     const bridge = defaultBridge(clock);
     try {
@@ -365,6 +423,11 @@ describe("hang watchdog with default budgets", () => {
       );
       // Nobody is waiting from here on; the child still owes the reply.
       clock.advance(29_999);
+      expect(probeInFlight(bridge)).toBe(false);
+      clock.advance(1);
+      // At 60 s the watchdog probes; the wedged child never answers.
+      await waitForLogged("ping", 1);
+      clock.advance(4_999);
       expect(bridge.isAlive()).toBe(true);
       clock.advance(1);
       expect(bridge.isAlive()).toBe(false);
@@ -379,7 +442,7 @@ describe("hang watchdog with default budgets", () => {
     }
   });
 
-  test("a read retried inside the window waits only until the window ends, then succeeds on a fresh child", async () => {
+  test("a read retried inside the window waits only until the window and the probe end, then succeeds on a fresh child", async () => {
     const clock = new ManualClock();
     const bridge = defaultBridge(clock);
     try {
@@ -391,7 +454,9 @@ describe("hang watchdog with default budgets", () => {
       clock.advance(20_000);
       const retry = settle(bridge.toolCall("s", "read", {}));
       await waitForLogged("read", 1);
-      clock.advance(9_999);
+      clock.advance(10_000);
+      await waitForLogged("ping", 1);
+      clock.advance(4_999);
       expect(pendingCount(bridge)).toBe(1);
       clock.advance(1);
       const result = await retry;
@@ -415,7 +480,11 @@ describe("hang watchdog with default budgets", () => {
       clock.advance(10_000);
       // Another call is answered at 40 s: the child is alive.
       expect(await bridge.toolCall("other", "grep", {})).toMatchObject({ success: true });
-      clock.advance(200_000);
+      // At 100 s the watchdog probes; the engine's answer arrives in real
+      // time, so the clock waits for it before moving past the probe timeout.
+      clock.advance(60_000);
+      await waitForProbeAnswered(bridge);
+      clock.advance(140_000);
       expect(bridge.isAlive()).toBe(true);
       expect(internals.process.pid).toBe(pid);
       expect(await bridge.toolCall("s", "read", {})).toMatchObject({
@@ -426,23 +495,149 @@ describe("hang watchdog with default budgets", () => {
       await bridge.shutdown();
     }
   });
+
+  test("a child that answered one session and then froze on another's request is replaced one window plus the probe timeout after its last output, with no new request", async () => {
+    const clock = new ManualClock();
+    const bridge = defaultBridge(clock);
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      // Session A's read is answered only when the test releases it; session
+      // B's call, sent right after it, freezes the engine.
+      const a = settle(bridge.toolCall("A", "read", { until_file: "release-a" }));
+      await waitForLogged("read", 1);
+      const b = settle(bridge.toolCall("B", "wedge", {}));
+      await waitForLogged("wedge", 1);
+      clock.advance(20_000);
+      // A's reply is the child's last output, at 20 s.
+      writeFileSync(join(workDir, "release-a"), "");
+      expect((await a).value).toMatchObject({ success: true, tool: "read", generation: 1 });
+      clock.advance(10_000);
+      expect(String(((await b).error as Error | undefined)?.message)).toContain(
+        "timed out after 30000ms",
+      );
+
+      // Nobody is waiting; B's request is still unanswered. 80 s is one
+      // window after A's reply.
+      clock.advance(49_999);
+      expect(pingsLogged(1)).toBe(0);
+      clock.advance(1);
+      await waitForLogged("ping", 1);
+      clock.advance(4_999);
+      expect(bridge.isAlive()).toBe(true);
+      clock.advance(1);
+      expect(bridge.isAlive()).toBe(false);
+
+      const next = await settle(bridge.toolCall("A", "read", {}));
+      expect(next.value).toMatchObject({ success: true, tool: "read", generation: 2 });
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("a child that keeps answering one session while another's request stays unanswered is never probed; once quiet, its answered probe keeps it", async () => {
+    const { logger, logs } = recordingLogger();
+    const clock = new ManualClock();
+    const bridge = defaultBridge(clock, logger);
+    const internals = bridge as unknown as { process: { pid?: number } };
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      const pid = internals.process.pid;
+      // B's request is never answered; its caller times out at 30 s.
+      const b = settle(bridge.toolCall("B", "never", {}));
+      await waitForLogged("never", 1);
+      // A gets an answer every 5 s for 200 s, far past one window.
+      for (let i = 0; i < 40; i++) {
+        clock.advance(5_000);
+        expect(await bridge.toolCall("A", "grep", {})).toMatchObject({ success: true });
+      }
+      expect(String(((await b).error as Error | undefined)?.message)).toContain(
+        "timed out after 30000ms",
+      );
+      expect(pingsLogged(1)).toBe(0);
+      expect(bridge.isAlive()).toBe(true);
+      expect(internals.process.pid).toBe(pid);
+
+      // A stops at 200 s. One window later the watchdog probes, the engine
+      // answers, and B's abandoned request stops counting against the child.
+      clock.advance(59_999);
+      expect(pingsLogged(1)).toBe(0);
+      clock.advance(1);
+      await waitForProbeAnswered(bridge);
+      expect(pingsLogged(1)).toBe(1);
+      expect(
+        logs.some(({ message }) =>
+          message.includes("answered; child kept; dropped 1 unanswered request(s)"),
+        ),
+      ).toBe(true);
+      clock.advance(200_000);
+      expect(pingsLogged(1)).toBe(1);
+      expect(bridge.isAlive()).toBe(true);
+      expect(internals.process.pid).toBe(pid);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("a probe answered after its timeout does not undo the kill", async () => {
+    const { logger, logs } = recordingLogger();
+    const clock = new ManualClock();
+    const bridge = defaultBridge(clock, logger);
+    try {
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      writeFileSync(join(workDir, "hold-pongs"), "");
+      const first = settle(bridge.toolCall("s", "never", {}));
+      await waitForLogged("never", 1);
+      clock.advance(30_000);
+      await first;
+      clock.advance(30_000);
+      await waitForLogged("ping", 1);
+
+      // Let the engine write its answer into the pipe while this thread is
+      // blocked, so the bridge cannot read it before the probe times out.
+      writeFileSync(join(workDir, "release-pong"), "");
+      const blocker = new Int32Array(new SharedArrayBuffer(4));
+      const giveUpAt = Date.now() + 5_000;
+      while (!existsSync(join(workDir, "pong-written"))) {
+        if (Date.now() > giveUpAt) throw new Error("engine never wrote its probe answer");
+        Atomics.wait(blocker, 0, 0, 5);
+      }
+      clock.advance(5_000);
+      expect(bridge.isAlive()).toBe(false);
+
+      // The answer, already in the pipe, is now delivered and must change nothing.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(bridge.isAlive()).toBe(false);
+      expect(logs.some(({ message }) => message.includes("Bridge killed after timeout"))).toBe(
+        true,
+      );
+      expect(logs.some(({ message }) => message.includes("child kept"))).toBe(false);
+      expect(readFileSync(join(workDir, "spawns"), "utf8").trim().split("\n")).toHaveLength(1);
+
+      const next = await settle(bridge.toolCall("s", "read", {}));
+      expect(next.value).toMatchObject({ success: true, tool: "read", generation: 2 });
+    } finally {
+      await bridge.shutdown();
+    }
+  });
 });
 
 describe("pooled bridges", () => {
-  test("a pool passes its clock and hang window to the bridges it creates", async () => {
+  test("a pool passes its clock, hang window and probe timeout to the bridges it creates", async () => {
     const clock = new ManualClock();
     const pool = new BridgePool(cachedExecutable(FAKE_ENGINE), {
       idleTimeoutMs: Number.POSITIVE_INFINITY,
       timeoutMs: 5_000,
       maxRestarts: 0,
       hangWindowMinMs: WINDOW_MS,
+      hangProbeTimeoutMs: PROBE_MS,
       clock,
     });
     try {
       const bridge = pool.getBridge(workDir);
       await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
-      // Fires at exactly WINDOW_MS on the pool's manual clock (see wedgeThen);
-      // with the default 60 s window or the system clock it would not.
+      // Fires at exactly WINDOW_MS + PROBE_MS on the pool's manual clock (see
+      // wedgeThen); with the default 60 s window, the default 5 s probe or the
+      // system clock it would not.
       const edit = await wedgeThen(bridge, clock, "edit");
       expect((edit.error as Error | undefined)?.name).toBe("BridgeRestartedError");
       expect(bridge.isAlive()).toBe(false);

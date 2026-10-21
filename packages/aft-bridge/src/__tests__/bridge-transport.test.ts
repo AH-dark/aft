@@ -134,11 +134,14 @@ process.stdin.on("data", chunk => {
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1000,
       hangWindowMinMs: 1000,
+      hangProbeTimeoutMs: 100,
       maxRestarts: 0,
       clock,
     });
     // An unanswered call, then a second one still waiting when the child has
     // been silent for the 1000 ms window (sent at 700 ms, waiting until 1200).
+    // The engine ignores the watchdog's ping, so the probe times out at
+    // 1100 ms and the child is killed while the second call waits.
     // Time moves only through the manual clock, so this cannot race the load.
     const silentPair = async (): Promise<string> => {
       const first = bridge.send("silent", {}, { timeoutMs: 100 });
