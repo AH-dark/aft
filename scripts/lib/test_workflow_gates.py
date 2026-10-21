@@ -101,6 +101,23 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class LightPREventGateTests(unittest.TestCase):
+    def test_worker_read_landlock_is_required_and_emitted_for_every_main_event(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        required = (root / ".github/required-checks.txt").read_text().splitlines()
+        self.assertIn("Unit / Worker GitHub reads (required Landlock)", required)
+        workflow = workflow_gates.parse_workflow(str(root / ".github/workflows/tests.yml"))
+        for event in ("pull_request", "push"):
+            config = workflow["on"][event]
+            self.assertIn("main", config["branches"])
+            self.assertNotIn("paths", config)
+            self.assertNotIn("paths-ignore", config)
+        self.assertNotIn("if", workflow["jobs"]["unit"])
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        job = suite["jobs"]["worker-gh-read-landlock"]
+        self.assertEqual(job["name"], "Worker GitHub reads (required Landlock)")
+        self.assertNotIn("if", job)
+        self.assertEqual(str(job["env"]["AFT_REQUIRE_LANDLOCK"]), "1")
+
     def test_pr_exclusion_is_an_event_warning_not_a_dead_train_ref_gate(self) -> None:
         self.assertEqual(workflow_gates.classify("${{ github.event_name != 'pull_request' }}"), "warn")
 
@@ -109,13 +126,13 @@ class LightPREventGateTests(unittest.TestCase):
             "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
         ), "ref")
 
-    def test_prs_report_all_26_required_contexts_as_static_skipped_jobs(self) -> None:
+    def test_prs_report_all_27_required_contexts_including_the_live_worker_gate(self) -> None:
         root = Path(__file__).resolve().parents[2]
         required = {
             line for line in (root / ".github/required-checks.txt").read_text().splitlines()
             if line.startswith(("Unit / ", "E2E / "))
         }
-        self.assertEqual(len(required), 26)
+        self.assertEqual(len(required), 27)
         jobs = {}
         for caller, file in (("Unit", "_unit-suite.yml"), ("E2E", "_e2e-suite.yml")):
             suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / file))
@@ -127,6 +144,9 @@ class LightPREventGateTests(unittest.TestCase):
             with self.subTest(context=context):
                 self.assertIn(context, jobs)
                 self.assertNotIn("strategy", jobs[context])
+                if context == "Unit / Worker GitHub reads (required Landlock)":
+                    self.assertNotIn("if", jobs[context])
+                    continue
                 self.assertIn(jobs[context]["if"], (
                     "${{ github.event_name != 'pull_request' }}",
                     "${{ always() && github.event_name != 'pull_request' }}",
