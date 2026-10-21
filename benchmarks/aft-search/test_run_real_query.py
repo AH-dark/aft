@@ -426,18 +426,36 @@ class ViewsOptionTests(unittest.TestCase):
 
     def test_missing_views_work_counters_are_unavailable_not_zero(self) -> None:
         client = object.__new__(NdjsonClient)
-        with mock.patch.object(client, "call", return_value={"success": True, "report": {"metrics": {}}}):
-            self.assertEqual(client.views_work(), {"status": "unavailable"})
+        self.assertEqual(
+            client.views_work(),
+            {
+                "status": "unavailable",
+                "reason": "standalone_ndjson_status_and_health_digest_do_not_expose_metrics.views_work",
+            },
+        )
 
-    def test_views_work_counters_are_copied_from_health_metrics(self) -> None:
-        counters = {"dispatch_blobs_decoded": 3, "dispatch_files_resolved": 2}
+    def test_wait_ready_waits_for_pinned_quiescent_views_without_sleeping(self) -> None:
         client = object.__new__(NdjsonClient)
-        with mock.patch.object(
-            client,
-            "call",
-            return_value={"success": True, "report": {"metrics": {"views_work": counters}}},
+        client.views_enabled = True
+        statuses = [
+            {
+                "search_index": {"status": "ready"},
+                "semantic_index": {"status": "ready"},
+                "views": {"pinned": True, "pending_paths": 4, "failed_paths": 0},
+            },
+            {
+                "search_index": {"status": "ready"},
+                "semantic_index": {"status": "ready"},
+                "views": {"pinned": True, "pending_paths": 0, "failed_paths": 0},
+            },
+        ]
+        with (
+            mock.patch.object(client, "call", side_effect=statuses) as call,
+            mock.patch("run_real_query.time.sleep", side_effect=AssertionError("views readiness must not sleep")),
+            mock.patch("run_real_query.bench_rerank.settle", side_effect=AssertionError("views readiness uses status")),
         ):
-            self.assertEqual(client.views_work(), {"status": "available", "counters": counters})
+            client.wait_ready(5.0)
+        self.assertEqual(call.call_count, 2)
 
 
 class RealQueryRunnerTests(unittest.TestCase):

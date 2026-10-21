@@ -9,9 +9,9 @@ from typing import Any
 from search_quality_lib import (
     EVIDENCE_SHA, PAGE_SIZE, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
     aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
-    included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
-    read_tool_schema_blobs,
-    resolve_descriptor, row_metrics, sample_plan, sha256_bytes, sha256_file, split_rows_not_applicable, total_gate,
+    included_manifest_ids, invariance_requests, profile_requests, project_semantic_building_rows_not_applicable,
+    real_query_behavior_diff, read_tool_schema_blobs,
+    resolve_descriptor, row_metrics, sample_plan, semantic_building_rows_not_applicable, sha256_bytes, sha256_file, split_rows_not_applicable, total_gate,
     validate_manifest_maintenance_scores, validate_manifest_relabels, validate_profile_score, validate_scored_population,
 )
 
@@ -249,6 +249,7 @@ def run(args:argparse.Namespace)->int:
         included_manifest_ids(manifest)
         if not args.score: raise InputFault("missing_score")
         verify_score=read_json(Path(args.score)); validate_scored_population(manifest,verify_score); validate_profile_score(verify_score)
+        if semantic_building_rows_not_applicable(verify_score): raise InputFault("verify_rejects_semantic_building_not_applicable_score")
         receipt=BENCH/".bench"/"verify-receipt.json"; receipt.parent.mkdir(parents=True,exist_ok=True); receipt.write_bytes(canonical_json({"head":subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip(),"manifest_sha256":sha256_file(manifest_path),"reference_sha256":sha256_file(reference_path) if reference_path.is_file() else None,"model_id":verify_score.get("model_id",args.model_id),"profile":verify_score.get("profile")}))
         print("verify:green"); return 0
     if args.mode=="record-reference":
@@ -256,6 +257,7 @@ def run(args:argparse.Namespace)->int:
         included_manifest_ids(manifest)
         if not args.score: raise InputFault("missing_score")
         score=read_json(Path(args.score)); validate_scored_population(manifest,score); validate_profile_score(score)
+        if semantic_building_rows_not_applicable(score): raise InputFault("record_reference_rejects_semantic_building_not_applicable_score")
         recorded=dict(score); recorded.update({"schema":"aft-search-reference-v1","evidence_sha":EVIDENCE_SHA,"manifest_sha256":sha256_file(manifest_path)})
         reference_bytes=canonical_json(recorded)
         old_reference: dict[str,Any] | None = None
@@ -283,10 +285,21 @@ def run(args:argparse.Namespace)->int:
     sidecar=binding(reference_path,manifest_path,sidecar_path)
     if not args.score: raise InputFault("missing_score")
     score_path=Path(args.score); score=read_json(score_path); reference=read_json(reference_path)
-    diff_path=score_path.with_suffix(".diff.txt"); diff_path.write_text(real_query_behavior_diff(reference,score)); print(f"real_query_diff:{diff_path}")
+    comparison_reference, comparison_score, comparison_manifest = reference, score, manifest
+    semantic_not_applicable = semantic_building_rows_not_applicable(score)
+    if semantic_not_applicable:
+        if args.rebaseline:
+            raise InputFault("rebaseline_rejects_semantic_building_not_applicable_score")
+        validate_scored_population(manifest, score)
+        skip_summary = semantic_not_applicable
+        comparison_reference, comparison_score, comparison_manifest, _ = project_semantic_building_rows_not_applicable(
+            reference, score, manifest
+        )
+        print(f"semantic_building_rows_skipped:{','.join(skip_summary['rows'])}:{skip_summary['reason']}")
+    diff_path=score_path.with_suffix(".diff.txt"); diff_path.write_text(real_query_behavior_diff(comparison_reference,comparison_score)); print(f"real_query_diff:{diff_path}")
     # Recomputed from the score's own probe result, never read from a field
     # the score carries, so a score cannot excuse rows by claiming the skip.
-    not_applicable=split_rows_not_applicable(score)
+    not_applicable=split_rows_not_applicable(comparison_score)
     if not_applicable: print(f"split_rows_not_applicable:{','.join(not_applicable['rows'])}:{not_applicable['reason']}")
     path=descriptor_path(args.descriptor,args.branch); descriptor=read_json(path) if path else None
     paths=diff_paths(args.base_ref,args.head)
@@ -298,11 +311,11 @@ def run(args:argparse.Namespace)->int:
         if reference.get("profile")!="single_page" or score.get("profile")!="paged" or score.get("capability",{}).get("offset_declared") is not True or score.get("capability",{}).get("probe_pages_differ") is not True: raise InputFault("rebaseline_profile_capability")
         if {row.get("episode_id") for row in reference.get("rows",[])}!={row.get("episode_id") for row in score.get("rows",[])}: raise InputFault("rebaseline_identity_mismatch")
     evaluation_score = page_zero_evaluation_projection(
-        reference, score, manifest, descriptor
+        comparison_reference, comparison_score, comparison_manifest, descriptor
     )
-    if (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("model_id")!=reference.get("model_id"):
+    if (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and comparison_score.get("model_id")!=comparison_reference.get("model_id"):
         raise InputFault("corpus_vector_model_mismatch")
-    result=total_gate(reference,evaluation_score,manifest,descriptor,paths,schema_blobs=read_tool_schema_blobs(args.base_ref,args.head,paths,root=ROOT))
+    result=total_gate(comparison_reference,evaluation_score,comparison_manifest,descriptor,paths,schema_blobs=read_tool_schema_blobs(args.base_ref,args.head,paths,root=ROOT))
     for note in result.notes: print(note)
     for reason in result.reasons: print(reason,file=sys.stderr)
     if result.exit_code or not args.rebaseline: return result.exit_code
