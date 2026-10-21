@@ -1613,6 +1613,135 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
     );
 }
 
+/// Most fills in a running daemon are woken by an edit and start with that
+/// edit still unreconciled. This test leaves such an edit in place before
+/// `catch_up`. The edit only moved chunks whose vectors are stored, so the fill
+/// embeds nothing and must finish without queueing for a cold-build slot.
+#[test]
+fn unreconciled_reuse_only_edit_completes_with_cold_cap_held() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let source = "pub fn reused_after_edit() -> u8 { 1 }\n";
+    write_tree(root.path(), &[("file.rs", source)]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    refresh(&runtime, &model);
+    let embedded = model.texts();
+    let path = root.path().join("file.rs");
+    std::fs::write(&path, format!("\n\n{source}")).unwrap();
+    runtime.driver().record_absolute_change(&path);
+    assert!(
+        super::needs_reload(&runtime.installed()),
+        "the fixture must leave the edit unreconciled"
+    );
+    let schedule = fast_schedule(root.path());
+    let cold = Arc::clone(&schedule.limiter);
+    let held = schedule.limiter.try_acquire().unwrap();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        let model = Arc::clone(&model);
+        std::thread::spawn(move || {
+            let (outcome, lines) = crate::logging::capture_log_lines(|| {
+                catch_up(
+                    &weak,
+                    epoch,
+                    &runtime,
+                    &schedule,
+                    FillBudget::default(),
+                    &mut |texts| model.embed(texts),
+                )
+            });
+            tx.send((matches!(outcome, FillOutcome::Settled), lines))
+                .unwrap();
+        })
+    };
+    // Decide by what the fill does, not by how long it takes: it either
+    // finishes, or it queues on the held cold-build cap, which is the defect.
+    let completed = loop {
+        match rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(result) => break Some(result),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break None,
+        }
+        if !cold.census().queued.is_empty() {
+            slot.clear();
+            break None;
+        }
+    };
+    drop(held);
+    worker.join().unwrap();
+    let (settled, lines) =
+        completed.expect("reuse-only fill with an unreconciled edit waited for the cold-build cap");
+    assert!(settled);
+    assert_eq!(model.texts(), embedded, "the edit only moved stored chunks");
+    assert!(query(&runtime, "reused").complete());
+    let summary = lines
+        .iter()
+        .find(|line| line.contains("INFO semantic view fill"))
+        .unwrap();
+    assert!(
+        summary.contains("calls=0") && summary.contains("cold_admitted=false"),
+        "{summary}"
+    );
+}
+
+/// More unreconciled edits than the small-preparation file bound still take a
+/// cold-build slot before the reconcile starts, as a first load does.
+#[test]
+fn many_unreconciled_edits_take_cold_slot_before_reconciling() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let files: Vec<(std::path::PathBuf, String)> = (0..=SMALL_PREPARATION_FILES)
+        .map(|i| {
+            (
+                root.path().join(format!("file_{i}.rs")),
+                format!("pub fn edited_{i}() {{}}\n"),
+            )
+        })
+        .collect();
+    for (path, source) in &files {
+        std::fs::write(path, source).unwrap();
+    }
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    refresh(&runtime, &model);
+    for (path, source) in &files {
+        std::fs::write(path, format!("\n\n{source}")).unwrap();
+        runtime.driver().record_absolute_change(path);
+    }
+    assert!(super::needs_reload(&runtime.installed()));
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let held = limiter.try_acquire().unwrap();
+    runtime.driver().take_reconcile_work();
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        let model = Arc::clone(&model);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| model.embed(texts),
+            )
+        })
+    };
+    let queued = wait_for_fill_queue(&limiter);
+    let work_while_held = runtime.driver().take_reconcile_work();
+    drop(held);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    assert!(queued, "many unreconciled edits bypassed cold admission");
+    assert_eq!(
+        work_while_held.walks, 0,
+        "reconciled before cold admission: {work_while_held:?}"
+    );
+}
+
 fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {

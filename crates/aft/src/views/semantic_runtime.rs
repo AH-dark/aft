@@ -227,24 +227,15 @@ impl CheckoutSemantic {
         let mutex_wait = mutex_started.elapsed();
         self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = self.installed();
-        // Reconciliation can walk the entire tree, so an empty snapshot or one
-        // with unreconciled edits needs cold admission. Otherwise a queue within
-        // both SMALL_PREPARATION limits may prepare without a cold slot. Its
-        // in-memory size probe also uses the process-wide preparation limit.
+        // A first load or a large batch of unreconciled edits takes cold
+        // admission before reconciling (see `needs_cold_reconcile`). A few
+        // edits reconcile on the preparation lane, and a queue within both
+        // SMALL_PREPARATION limits then prepares there too. Such a fill takes a
+        // cold slot only at its first missing vector, so one that only reuses
+        // stored vectors never queues behind cold builds.
         let mut queue_setup = Duration::ZERO;
-        let small = if needs_reload(&snapshot) {
-            admit(false).map_err(RefreshError::classify)?;
-            false
-        } else {
-            admit(true).map_err(RefreshError::classify)?;
-            let probe_started = Instant::now();
-            let small = self.small_preparation(&snapshot);
-            queue_setup = probe_started.elapsed();
-            if !small {
-                admit(false).map_err(RefreshError::classify)?;
-            }
-            small
-        };
+        let cold_reconcile = needs_cold_reconcile(&snapshot);
+        admit(!cold_reconcile).map_err(RefreshError::classify)?;
         crate::cold_build_limiter::progress::stage("preparing");
         let reconcile_started = Instant::now();
         if needs_reload(&snapshot) {
@@ -257,6 +248,20 @@ impl CheckoutSemantic {
             };
         }
         let reconcile = reconcile_started.elapsed();
+        // The size probe runs on the reconciled snapshot, so it counts the
+        // work the edits actually left. It also runs under the process-wide
+        // preparation limit.
+        let small = if cold_reconcile {
+            false
+        } else {
+            let probe_started = Instant::now();
+            let small = self.small_preparation(&snapshot);
+            queue_setup = probe_started.elapsed();
+            if !small {
+                admit(false).map_err(RefreshError::classify)?;
+            }
+            small
+        };
         let driver = Arc::clone(&self.driver);
         let mut report = self
             .plane
@@ -475,6 +480,21 @@ fn needs_reload(snapshot: &Snapshot) -> bool {
     snapshot.generation().name() == "empty"
         || snapshot.pending_intent().next().is_some()
         || snapshot.live_entries().next().is_some()
+}
+
+/// Whether reconciling `snapshot` needs a cold-build slot. A reconcile walks
+/// the whole checkout and reads what changed. The first load (an empty
+/// generation) seeds and reads every member file, and more unreconciled paths
+/// than the small-preparation file bound can mean a branch switch or a large
+/// generated change. A few edits cost a stat walk and a few reads; the
+/// preparation limiter caps how many such small reconciles run at once.
+fn needs_cold_reconcile(snapshot: &Snapshot) -> bool {
+    snapshot.generation().name() == "empty"
+        || snapshot
+            .pending_intent()
+            .chain(snapshot.live_entries().map(|(path, _)| path))
+            .nth(SMALL_PREPARATION_FILES)
+            .is_some()
 }
 
 /// Wakes the fill worker after an AFT write lands under the checkout root.
