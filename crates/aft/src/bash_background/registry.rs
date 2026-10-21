@@ -7793,6 +7793,8 @@ impl BgTaskRegistry {
             return None;
         }
         state.metadata.timeout_ms = Some(wanted);
+        #[cfg(unix)]
+        crate::gh_shim_ticket::renew_worker_read_deadline(task_id, Instant::now() + window);
         let persisted = task.persisted_hard_kill_ms.load(Ordering::Relaxed);
         if wanted >= persisted.saturating_add(RENEWAL_PERSIST_STEP_MS) {
             match self.persist_task_locked(&task, &state.metadata, &mut db) {
