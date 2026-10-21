@@ -1,16 +1,25 @@
 import type {
   AftProjectTransport,
+  AftTransportFactoryOptions,
+  AftTransportPool,
   BashCompletedPayload,
   BashLongRunningPayload,
+  BgNudgeRef,
   BridgeOptions,
 } from "@cortexkit/aft-bridge";
+import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import { interruptBashWaitsForChatMessage } from "../bash-wait-detach.js";
 import {
+  consumeBgCompletion,
   formatLongRunningReminder,
+  formatPatternMatchReminder,
   formatSystemReminder,
+  handleSubcBgEventsNudge,
   holdBgCompletion,
+  markBgCompletionDelivered,
+  type PatternMatchEntry,
 } from "../bg-notifications.js";
 import type { AftConfig } from "../config.js";
 import { warn } from "../logger.js";
@@ -41,7 +50,12 @@ export interface V2WakeHostContext {
  */
 interface WakeRoute {
   /** Deliver one completion to its session and acknowledge it on `bridge` once admitted. */
-  completion(completion: BashCompletedPayload, bridge: AftProjectTransport): Promise<void>;
+  completion(
+    completion: BashCompletedPayload,
+    bridge: AftProjectTransport,
+    acknowledge?: boolean,
+  ): Promise<boolean | undefined>;
+  patternMatch?(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<boolean>;
   /** Record a status-only long-running reminder in its session. */
   longRunning(reminder: BashLongRunningPayload): Promise<void>;
 }
@@ -123,20 +137,20 @@ function warnUnroutedOnce(sessionID: string, message: string): void {
 async function routeCompletion(
   completion: BashCompletedPayload,
   bridge: AftProjectTransport,
-): Promise<void> {
+  acknowledge = true,
+): Promise<boolean> {
   const route = wakeRouteState().routes.get(completion.session_id);
   if (route) {
     try {
-      await route.completion(completion, bridge);
-      return;
+      return (await route.completion(completion, bridge, acknowledge)) === true;
     } catch (error) {
-      // The bridge pushes once. Keep a failed admission for the next prompt or
-      // companion call instead of dropping it or spinning in a retry loop.
+      // Keep a failed admission for the next session registration or subc nudge
+      // instead of dropping it or spinning in a retry loop.
       holdUnrouted(completion, bridge);
       warn(
         `[bash_completion] delivery of task ${completion.task_id} to session ${completion.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return;
+      return false;
     }
   }
 
@@ -147,6 +161,7 @@ async function routeCompletion(
     completion.session_id,
     `[bash_completion] no OpenCode Location has session ${completion.session_id} registered; completion of task ${completion.task_id} is held unacknowledged until the session registers`,
   );
+  return false;
 }
 
 async function routeLongRunning(
@@ -170,14 +185,15 @@ async function routeLongRunning(
  * completion that arrived while its Location was not registered (for example
  * during a Location reload) would stay pending and never wake the session.
  */
-function deliverUnrouted(sessionID: string): void {
+function deliverUnrouted(sessionID: string, replacementBridge?: AftProjectTransport): void {
   const state = wakeRouteState();
   state.warnedUnrouted.delete(sessionID);
   const held = state.unrouted.get(sessionID);
   if (!held) return;
   state.unrouted.delete(sessionID);
   for (const { completion, bridge } of held.values()) {
-    void routeCompletion(completion, bridge);
+    if (replacementBridge && bridge.getCwd() !== replacementBridge.getCwd()) continue;
+    void routeCompletion(completion, replacementBridge ?? bridge);
   }
 }
 
@@ -190,13 +206,23 @@ export function __resetV2WakeRoutesForTests(): void {
 }
 
 const sharedBridgeOptions: Pick<BridgeOptions, "onBashCompletion" | "onBashLongRunning"> = {
-  onBashCompletion: routeCompletion,
+  onBashCompletion: async (completion, bridge) => {
+    await routeCompletion(completion, bridge);
+  },
   onBashLongRunning: routeLongRunning,
 };
 
 export interface V2RuntimeConsumer extends V2ToolConsumers {
   readonly bridgeOptions: typeof sharedBridgeOptions;
   dispose(): void;
+  subcWakes(
+    getPool: () => AftTransportPool,
+    directory: string,
+  ): {
+    handlers: Pick<AftTransportFactoryOptions, "onBgEventsNudge" | "onBgEventsNudgeRef">;
+    drainSession(sessionID: string): Promise<void>;
+    restoreSession(sessionID: string): Promise<void>;
+  };
 }
 
 /**
@@ -207,9 +233,9 @@ export interface V2RuntimeConsumer extends V2ToolConsumers {
  * sync `bash_watch` for it, so the agent can act on the result instead of
  * sitting out the wait. OpenCode 2 admits the wake through
  * `session.synthetic`, which does not run the session `prompt` hook where AFT
- * makes that decision for typed messages, so the decision is made here: the
- * same shared one, applied to the wake as a synthetic part, which detaches
- * exactly when `bash.detach_on_user_message` is on.
+ * makes that decision for typed messages, so this code applies the shared
+ * detachment decision to the wake as a synthetic part. Waits detach only when
+ * `bash.detach_on_user_message` is on.
  *
  * The wait is asked to detach on the bridge that pushed the completion: a
  * session's background task and its waiting call run on the bridge of the
@@ -252,8 +278,10 @@ export function createV2RuntimeConsumer(
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
   const sessions = new Set<string>();
+  let disposed = false;
+  let subcPool: (() => AftTransportPool) | undefined;
   const route: WakeRoute = {
-    completion: async (completion, bridge) => {
+    completion: async (completion, bridge, acknowledge = true) => {
       if (await resolveIsSubagent(context, completion.session_id)) {
         await awaitV2ExecutionSettlement(context, completion.session_id);
       }
@@ -267,7 +295,7 @@ export function createV2RuntimeConsumer(
           v2SubagentStopped(context, completion.session_id),
         );
         forgetV2Watch(context, completion.session_id, completion.task_id);
-        return;
+        return false;
       }
       const text = formatSystemReminder([completion]);
       const admitted = await Effect.runPromise(
@@ -285,14 +313,53 @@ export function createV2RuntimeConsumer(
       );
       // A wake that was not admitted (a staged revert defers it) reaches the
       // agent later, so it must not end a wait now.
-      if (!admitted) return;
+      if (!admitted) return false;
       detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
 
-      await bridge.send("bash_ack_completions", {
-        session_id: completion.session_id,
-        task_ids: [completion.task_id],
-      });
+      if (acknowledge) {
+        if (subcPool) {
+          consumeBgCompletion(completion.session_id, completion.task_id);
+          await markBgCompletionDelivered(
+            {
+              ctx: { pool: subcPool() },
+              directory: bridge.getCwd(),
+              sessionID: completion.session_id,
+              resolvedBridge: bridge,
+            },
+            completion.task_id,
+          );
+        } else {
+          await bridge.send("bash_ack_completions", {
+            session_id: completion.session_id,
+            task_ids: [completion.task_id],
+          });
+        }
+      }
       forgetV2Watch(context, completion.session_id, completion.task_id);
+      return true;
+    },
+    patternMatch: async (match, bridge) => {
+      if (await resolveIsSubagent(context, match.session_id)) {
+        await awaitV2ExecutionSettlement(context, match.session_id);
+        if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return false;
+      }
+      const text = formatPatternMatchReminder([match]);
+      const admitted = await Effect.runPromise(
+        delivery.completion({
+          sessionID: match.session_id,
+          taskIDs: [match.task_id],
+          notificationID: `match\0${match.watch_id}\0${match.match_offset}`,
+          text,
+          metadata: {
+            source: "aft",
+            kind: "bash_pattern_match",
+            task_ids: [match.task_id],
+            watch_id: match.watch_id,
+          },
+        }),
+      );
+      if (admitted) detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
+      return admitted;
     },
     longRunning: (reminder) =>
       Effect.runPromise(
@@ -309,23 +376,78 @@ export function createV2RuntimeConsumer(
       ),
   };
 
-  const registerSession = (sessionID: string | undefined): void => {
-    if (!sessionID) return;
+  const registerSession = (sessionID: string | undefined, bridge?: AftProjectTransport): void => {
+    if (!sessionID || disposed) return;
     sessions.add(sessionID);
     const { routes } = wakeRouteState();
     routes.set(sessionID, route);
-    deliverUnrouted(sessionID);
+    deliverUnrouted(sessionID, bridge);
   };
 
   return {
     bridgeOptions: sharedBridgeOptions,
     registerSession,
+    subcWakes: (getPool, directory) => {
+      subcPool = getPool;
+      const root = canonicalizeProjectRoot(directory);
+      const drain = (
+        sessionID: string,
+        nudgeRef?: BgNudgeRef,
+        resolvedBridge?: AftProjectTransport,
+      ) => {
+        if (disposed) return Promise.resolve();
+        return handleSubcBgEventsNudge({
+          ctx: { pool: getPool() },
+          directory: root,
+          sessionID,
+          client: context,
+          nudgeRef,
+          resolvedBridge,
+          delivery: {
+            completion: (completion, bridge) =>
+              routeCompletion(
+                { ...completion, type: "bash_completed", session_id: sessionID },
+                bridge,
+                false,
+              ),
+            patternMatch: async (match, bridge) => {
+              if (match.session_id !== sessionID) return false;
+              return (
+                (await wakeRouteState().routes.get(sessionID)?.patternMatch?.(match, bridge)) ??
+                false
+              );
+            },
+          },
+        });
+      };
+      return {
+        handlers: {
+          onBgEventsNudge: (projectRoot, sessionID) => {
+            if (canonicalizeProjectRoot(projectRoot) === root) return drain(sessionID);
+          },
+          onBgEventsNudgeRef: (ref) => {
+            if (ref.canonicalRoot === root) return drain(ref.session, ref);
+          },
+        },
+        drainSession: (sessionID) => {
+          if (disposed) return Promise.resolve();
+          return drain(sessionID, undefined, getPool().getBridge(root));
+        },
+        restoreSession: async (sessionID) => {
+          if (disposed) return;
+          const bridge = getPool().getBridge(root);
+          registerSession(sessionID, bridge);
+          await drain(sessionID, undefined, bridge);
+        },
+      };
+    },
     onToolAbort: (sessionID) => noteV2ToolAbort(context, sessionID),
     executeBash: (execution) => {
       registerSession(execution.context.sessionID);
       return executeV2Bash(execution);
     },
     dispose: () => {
+      disposed = true;
       delivery.dispose();
       const { routes } = wakeRouteState();
       // Another Location may have registered the session since; leave its route.

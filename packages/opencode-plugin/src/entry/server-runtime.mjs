@@ -27,6 +27,7 @@ import { registerV2ToolHooks } from "../v2-tool-hooks.js";
 import { registerV2SessionLifecycle } from "../v2-session-lifecycle.js";
 import { registerV2WorkflowHints } from "../v2-workflow-hints.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
+import { recoverV2SubcSessions } from "../wakes/subc-recovery.js";
 import { buildHintsForRegisteredTools } from "../workflow-hints.js";
 import {
   buildAftToolDefinitions,
@@ -94,6 +95,9 @@ async function bootLocation(context, location, dependencies) {
   // Only a rejected configuration keeps AFT out of a project; there is no
   // config switch that turns it off.
   const isProjectEnabled = createProjectAcceptance(directory, dependencies);
+  const subcWakes = config.subc?.connection_file?.trim()
+    ? consumers.subcWakes?.(() => pool, directory)
+    : undefined;
   // getPool is only called on a version mismatch, after the pool exists.
   const pool = await dependencies.acquireBridge(canonicalDirectory, {
     harness: "opencode",
@@ -111,6 +115,7 @@ async function bootLocation(context, location, dependencies) {
     },
     configOverrides: environment.configOverrides,
     subcConnectionFile: config.subc?.connection_file,
+    ...subcWakes?.handlers,
   });
   environment.attach(pool);
   const toolContext = {
@@ -126,6 +131,7 @@ async function bootLocation(context, location, dependencies) {
     hostToolNames: V2_HOST_TOOL_NAMES,
     storageDir: environment.storageDir,
     isProjectEnabled,
+    drainBgNotifications: subcWakes?.drainSession,
   };
   const tools = dependencies.buildToolMap(
     toolContext,
@@ -152,7 +158,7 @@ async function bootLocation(context, location, dependencies) {
     },
     notify,
   });
-  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock };
+  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock, subcWakes };
 }
 
 /**
@@ -262,6 +268,13 @@ export function makeServerEffect(overrides = {}) {
         runtime.tools.bash?.description,
       );
       yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
+      if (runtime.subcWakes) {
+        yield* Effect.forkScoped(recoverV2SubcSessions(
+          context,
+          runtime.directory,
+          runtime.subcWakes.restoreSession,
+        ));
+      }
     });
   };
 }

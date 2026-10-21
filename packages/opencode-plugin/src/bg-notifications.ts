@@ -209,7 +209,7 @@ let wakeConfirmationWindowMs = DEFAULT_WAKE_CONFIRMATION_WINDOW_MS;
 let busyWakeDeferCeilingMs = BUSY_WAKE_DEFER_CEILING_MS;
 let lastWakeMessageTimestamp = 0;
 let wakeMessageCounter = 0;
-const subcNudgesInFlight = new Map<string, Promise<void>>();
+let subcNudgesInFlight = new WeakMap<PluginContext["pool"], Map<string, Promise<void>>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
 interface DeferredBusyWake {
   context: DrainContext & { client: unknown };
@@ -218,8 +218,13 @@ interface DeferredBusyWake {
 }
 const deferredBusyWakes = new Map<string, DeferredBusyWake>();
 
+export interface BgNotificationDelivery {
+  completion(completion: BgCompletion, bridge: AftProjectTransport): Promise<boolean>;
+  patternMatch(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<boolean>;
+}
+
 interface DrainContext {
-  ctx: PluginContext;
+  ctx: Pick<PluginContext, "pool">;
   directory: string;
   sessionID: string;
   /**
@@ -236,6 +241,8 @@ interface DrainContext {
   nudgeRef?: BgNudgeRef;
   /** Cached bridge so one nudge resolves drain and ack through one authority. */
   resolvedBridge?: AftProjectTransport;
+  /** Host-specific admission; drain, delivery reservations and ack stay shared. */
+  delivery?: BgNotificationDelivery;
 }
 
 interface OpenCodeSessionApi {
@@ -610,6 +617,9 @@ export async function appendInTurnBgCompletions(
     reminder_chars: reminder.length,
   });
   state.pendingCompletions = [];
+  for (const completion of deliveredCompletions) {
+    consumeBgCompletion(drainContext.sessionID, completion.task_id);
+  }
   state.heldWorkerCompletions = false;
   for (const completion of deliveredCompletions) {
     state.wakeDeferredTaskIds.delete(completion.task_id);
@@ -662,7 +672,14 @@ export function handleSubcBgEventsNudge(
   drainContext: DrainContext & { client: unknown },
 ): Promise<void> {
   const key = `${drainContext.directory}\u0000${drainContext.sessionID}`;
-  const inFlight = subcNudgesInFlight.get(key);
+  // A replacement Location has a new pool. It must not coalesce its initial
+  // drain into a request still finishing on the released Location's transport.
+  let poolNudges = subcNudgesInFlight.get(drainContext.ctx.pool);
+  if (!poolNudges) {
+    poolNudges = new Map();
+    subcNudgesInFlight.set(drainContext.ctx.pool, poolNudges);
+  }
+  const inFlight = poolNudges.get(key);
   if (inFlight) {
     logSubcNudgeLifecycle(
       drainContext,
@@ -674,9 +691,9 @@ export function handleSubcBgEventsNudge(
 
   logSubcNudgeLifecycle(drainContext, "handler-entry", "nudge handler entered");
   const handling = handleSubcBgEventsNudgeOnce(drainContext);
-  subcNudgesInFlight.set(key, handling);
+  poolNudges.set(key, handling);
   const clear = (): void => {
-    if (subcNudgesInFlight.get(key) === handling) subcNudgesInFlight.delete(key);
+    if (poolNudges.get(key) === handling) poolNudges.delete(key);
   };
   void handling.then(clear, clear);
   return handling;
@@ -690,8 +707,60 @@ async function handleSubcBgEventsNudgeOnce(
   bridgeForDrain(drainContext);
   const state = stateFor(drainContext.sessionID);
   state.wakeDeferredTaskIds.clear();
+  if (drainContext.delivery) {
+    await drainCompletions(drainContext);
+    await deliverDrainedNotifications(drainContext, drainContext.delivery);
+    return;
+  }
   rearmHardStoppedWake(state, drainContext);
   await triggerWakeIfPending(drainContext, false, true, true, true);
+}
+
+async function deliverDrainedNotifications(
+  drainContext: DrainContext,
+  delivery: BgNotificationDelivery,
+): Promise<void> {
+  const state = stateFor(drainContext.sessionID);
+  routeExplicitControlCompletions(state);
+  const completions = state.pendingCompletions.splice(0);
+  const matches = state.pendingPatternMatches.splice(0);
+  // Reserve before awaiting admission: an in-turn drain must not deliver the
+  // same notification while the host is still deciding whether to admit it.
+  const taskIds = [...new Set([...completions, ...matches].map((item) => item.task_id))];
+  markDelivering(state, taskIds);
+  const bridge = bridgeForDrain(drainContext);
+  const items = [...completions, ...matches];
+  for (const [index, item] of items.entries()) {
+    const isMatch = isPatternMatchEntry(item);
+    try {
+      if (!isMatch && state.consumedTaskIds.has(item.task_id)) continue;
+      const admitted = isMatch
+        ? await delivery.patternMatch(item, bridge)
+        : await delivery.completion(item, bridge);
+      if (!admitted) {
+        if (isMatch) queuePendingPatternMatch(state, item);
+        else if (!state.consumedTaskIds.has(item.task_id)) state.pendingCompletions.push(item);
+        continue;
+      }
+      if (!isMatch) consumeBgCompletion(drainContext.sessionID, item.task_id);
+      markDeliveredAwaitingAck(state, [item.task_id]);
+      const acked = await ackCompletions(drainContext, [
+        { task_id: item.task_id, status: "unknown", exit_code: null, command: "" },
+      ]);
+      if (acked) confirmAcked(state, [item.task_id]);
+    } catch (error) {
+      if (isMatch) queuePendingPatternMatch(state, item);
+      else state.pendingCompletions.push(item);
+      for (const remaining of items.slice(index + 1)) {
+        if (isPatternMatchEntry(remaining)) queuePendingPatternMatch(state, remaining);
+        else state.pendingCompletions.push(remaining);
+      }
+      clearDelivering(state, taskIds);
+      throw error;
+    } finally {
+      clearDelivering(state, [item.task_id]);
+    }
+  }
 }
 
 function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message: string): void {
@@ -1446,7 +1515,7 @@ export function __resetBgNotificationStateForTests(): void {
     for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
   }
   sessionBgStates.clear();
-  subcNudgesInFlight.clear();
+  subcNudgesInFlight = new WeakMap();
   subcNudgeLogState.clear();
   for (const deferred of deferredBusyWakes.values()) clearTimeout(deferred.timer);
   deferredBusyWakes.clear();

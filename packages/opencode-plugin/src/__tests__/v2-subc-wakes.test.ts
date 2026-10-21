@@ -1,0 +1,471 @@
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  type AftTransportFactoryOptions,
+  type AftTransportPool,
+  acquireBridge,
+  releaseBridge,
+  SubcTransportPool,
+} from "@cortexkit/aft-bridge";
+import type { BindIdentity, RouteHandle } from "@cortexkit/subc-client";
+import { DateTime, Effect, Exit, Scope } from "effect";
+import {
+  __resetBgNotificationStateForTests,
+  appendInTurnBgCompletions,
+  trackBgTask,
+} from "../bg-notifications.js";
+import { makeServerEffect } from "../entry/server-runtime.mjs";
+import { __resetV2WakeRoutesForTests, type V2RuntimeConsumer } from "../wakes/runtime-consumer.js";
+import type { V2SessionSyntheticInput } from "../wakes/session-delivery.js";
+import { recoverV2SubcSessions } from "../wakes/subc-recovery.js";
+
+const roots: string[] = [];
+afterEach(() => {
+  __resetV2WakeRoutesForTests();
+  __resetBgNotificationStateForTests();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function workspace() {
+  const root = mkdtempSync(join(tmpdir(), "aft-v2-subc-"));
+  roots.push(root);
+  return root;
+}
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
+async function until(predicate: () => boolean) {
+  for (let i = 0; i < 100 && !predicate(); i++) await tick();
+  expect(predicate()).toBe(true);
+}
+
+/** Only durable drain/ack carries notifications; the subscription is a payload-free hint. */
+class ModuleDouble {
+  pending = new Map<string, { bg_completions?: unknown[]; pending_matches?: unknown[] }>();
+  events: string[] = [];
+  clients: ReturnType<ModuleDouble["connect"]>[] = [];
+  admissionGate: Promise<void> | undefined;
+  key(root: string, session: string) {
+    return `${root}\0${session}`;
+  }
+  connect = () => {
+    const routes = new Map<number, BindIdentity>();
+    const subscriptions: Array<{
+      session: string;
+      root: string;
+      emit(): void;
+      unsubscribe(): void;
+    }> = [];
+    let channel = 0;
+    let closed = false;
+    const client = {
+      subscriptions,
+      routeOpen: async (_target: unknown, identity: BindIdentity) => {
+        if (closed) throw new Error("client closed");
+        routes.set(++channel, identity);
+        return { channel, epoch: channel } as RouteHandle;
+      },
+      request: async (route: RouteHandle, raw: unknown) => {
+        if (closed) throw new Error("client closed");
+        const identity = routes.get(route.channel)!;
+        const body = raw as { name: string; arguments: { task_ids?: string[] } };
+        const key = this.key(identity.project_root, identity.session);
+        this.events.push(`${body.name}:${identity.session}`);
+        if (body.name === "bash_drain_completions") {
+          const snapshot = { ...this.pending.get(key) };
+          return { structuredContent: { text: "", success: true, ...snapshot }, content: [] };
+        }
+        if (body.name === "bash_ack_completions") {
+          expect(this.events).toContain(`admitted:${identity.session}`);
+          const taskIds = new Set(body.arguments.task_ids);
+          const retained = {
+            bg_completions: this.pending
+              .get(key)
+              ?.bg_completions?.filter(
+                (item) => !taskIds.has((item as { task_id: string }).task_id),
+              ),
+            pending_matches: this.pending
+              .get(key)
+              ?.pending_matches?.filter(
+                (item) => !taskIds.has((item as { task_id: string }).task_id),
+              ),
+          };
+          if (retained.bg_completions?.length || retained.pending_matches?.length)
+            this.pending.set(key, retained);
+          else this.pending.delete(key);
+          return {
+            structuredContent: { text: "", success: true, acked_task_ids: body.arguments.task_ids },
+            content: [],
+          };
+        }
+        return { structuredContent: { success: true, text: "ok" }, content: [] };
+      },
+      subscribe: (route: RouteHandle, _body: unknown, onEvent: (event: Uint8Array) => void) => {
+        const identity = routes.get(route.channel)!;
+        let close!: () => void;
+        const closed = new Promise<void>((resolve) => {
+          close = resolve;
+        });
+        let active = true;
+        const sub = {
+          session: identity.session,
+          root: identity.project_root,
+          emit: () => {
+            if (!active) return;
+            this.events.push(`nudge:${identity.session}`);
+            onEvent(new TextEncoder().encode('{"op":"bg_events"}'));
+          },
+          unsubscribe: () => {
+            active = false;
+            close();
+          },
+          closed,
+        };
+        subscriptions.push(sub);
+        return sub;
+      },
+      closeRoute: () => {},
+      close: async () => {
+        closed = true;
+        for (const sub of subscriptions) sub.unsubscribe();
+      },
+    };
+    this.clients.push(client);
+    return client;
+  };
+  nudge(session: string) {
+    for (const client of this.clients) {
+      for (const sub of client.subscriptions) if (sub.session === session) sub.emit();
+    }
+  }
+}
+function completion(task = "task") {
+  return {
+    task_id: task,
+    status: "completed",
+    exit_code: 0,
+    command: "printf done",
+    output_preview: "done",
+  };
+}
+function match() {
+  return {
+    task_id: "watched",
+    session_id: "s",
+    watch_id: "watch",
+    match_text: "ready",
+    match_offset: 3,
+    context: "ready",
+    once: true,
+  };
+}
+
+async function start(root: string, module: ModuleDouble, recent: unknown[] = []) {
+  const synthetic: V2SessionSyntheticInput[] = [];
+  let pool!: AftTransportPool;
+  let consumer!: V2RuntimeConsumer;
+  const afterHooks: Array<(event: unknown) => Effect.Effect<unknown, unknown>> = [];
+  const listQueries: unknown[] = [];
+  const scope = await Effect.runPromise(Scope.make());
+  const context = {
+    location: { directory: root, project: { canonical: root } },
+    permission: { assert: () => Effect.void },
+    tool: {
+      hook: (name: string, handler: (event: unknown) => Effect.Effect<unknown, unknown>) =>
+        Effect.sync(() => {
+          if (name === "execute.after") afterHooks.push(handler);
+        }),
+    },
+    session: {
+      get: () => Effect.succeed({}),
+      prompt: () => Effect.void,
+      list: (input: unknown) =>
+        Effect.sync(() => {
+          listQueries.push(input);
+          return { data: recent, cursor: undefined };
+        }),
+      synthetic: (input: V2SessionSyntheticInput) =>
+        Effect.promise(async () => {
+          await module.admissionGate;
+          synthetic.push(input);
+          module.events.push(`admitted:${input.sessionID}`);
+        }),
+    },
+  };
+  const effect = makeServerEffect({
+    loadConfig: () => ({ subc: { connection_file: root } }),
+    configLoadErrors: () => [],
+    configLoadSources: () => [],
+    configLoadTexts: () => new Map(),
+    deliverLoadNotices: () => {},
+    migrateConfigLocations: () => [],
+    ensureStorageMigrated: async () => {},
+    ensureOnnxRuntime: async () => null,
+    startLspAutoInstall: () => null,
+    pushLspPaths: async () => {},
+    resolveStorageRoot: () => root,
+    buildConfigureParams: () => ({}),
+    resolveVersion: () => "0.61.0",
+    resolvePoolOptions: () => ({}),
+    acquireBridge: async (directory: string, options: AftTransportFactoryOptions) => {
+      pool = await acquireBridge(directory, options, {
+        createPool: async () =>
+          new SubcTransportPool({
+            harness: "opencode",
+            connectionFile: "unused",
+            connect: async () => module.connect(),
+            onBgEventsNudge: options.onBgEventsNudge,
+            onBgEventsNudgeRef: options.onBgEventsNudgeRef,
+          }),
+      });
+      return pool;
+    },
+    releaseBridge,
+    buildToolMap: () => ({}),
+    registerTools: (
+      _context: unknown,
+      _location: unknown,
+      _tools: unknown,
+      consumers: V2RuntimeConsumer,
+    ) =>
+      Effect.sync(() => {
+        consumer = consumers;
+      }),
+    registerRpc: () => Effect.succeed({ dispose: async () => {} }),
+    registerPromptHook: () => Effect.void,
+    registerWorkflowHints: () => Effect.void,
+    startLiveConfigReload: () => ({ stop: () => {} }),
+  });
+  await Effect.runPromise(effect(context).pipe(Effect.provideService(Scope.Scope, scope)));
+  return {
+    pool,
+    consumer,
+    synthetic,
+    listQueries,
+    toolAfter: async () => {
+      const event = {
+        status: "completed",
+        sessionID: "s",
+        tool: "read",
+        result: { content: "tool result" },
+      };
+      for (const hook of afterHooks) await Effect.runPromise(hook(event));
+      return event;
+    },
+    stop: () => Effect.runPromise(Scope.close(scope, Exit.succeed(undefined))),
+  };
+}
+
+test("OC2 subc idle completion drains after a payload-free nudge and acks only after admission", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const runtime = await start(root, module);
+  try {
+    runtime.consumer.registerSession?.("s");
+    await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+    await tick();
+    module.events.length = 0;
+    module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+    let admit!: () => void;
+    module.admissionGate = new Promise((resolve) => {
+      admit = resolve;
+    });
+    module.nudge("s");
+    await until(() => module.events.includes("bash_drain_completions:s"));
+    expect(module.events).not.toContain("bash_ack_completions:s");
+    admit();
+    await until(() => module.events.includes("bash_ack_completions:s"));
+    module.nudge("s");
+    await tick();
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(module.events.indexOf("nudge:s")).toBeLessThan(
+      module.events.indexOf("bash_drain_completions:s"),
+    );
+    expect(module.events.indexOf("admitted:s")).toBeLessThan(
+      module.events.indexOf("bash_ack_completions:s"),
+    );
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test("OC2 subc pattern match wakes once and is acknowledged", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const runtime = await start(root, module);
+  try {
+    runtime.consumer.registerSession?.("s");
+    await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+    await tick();
+    module.pending.set(module.key(root, "s"), { pending_matches: [match()] });
+    module.nudge("s");
+    await until(() => module.events.includes("bash_ack_completions:s"));
+    module.nudge("s");
+    await tick();
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(runtime.synthetic[0]?.text).toContain("ready");
+    expect(runtime.synthetic[0]?.metadata?.kind).toBe("bash_pattern_match");
+    module.pending.set(module.key(root, "s"), { bg_completions: [completion("watched")] });
+    module.nudge("s");
+    await until(() => runtime.synthetic.length === 2);
+    await until(() => !module.pending.has(module.key(root, "s")));
+    expect(runtime.synthetic[1]?.metadata?.kind).toBe("bash_completion");
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test("OC2 subc Location restart restores an idle recent session without a tool call", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const first = await start(root, module);
+  first.consumer.registerSession?.("s");
+  await first.pool.getBridge(root).send("status", { session_id: "s" });
+  await first.stop();
+  __resetV2WakeRoutesForTests();
+  __resetBgNotificationStateForTests();
+  module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+  const second = await start(root, module, [
+    { id: "s", location: { directory: root }, time: { updated: DateTime.makeUnsafe(Date.now()) } },
+  ]);
+  try {
+    await until(() => second.synthetic.length === 1);
+    await until(() => !module.pending.has(module.key(root, "s")));
+    expect(first.synthetic).toHaveLength(0);
+    expect(second.synthetic[0]?.sessionID).toBe("s");
+    expect(second.listQueries).toEqual([{ directory: root, order: "desc", limit: 20 }]);
+  } finally {
+    await second.stop();
+  }
+});
+
+test("OC2 subc nudge and tool-call drain racing admission deliver exactly once", async () => {
+  for (const nudgeFirst of [true, false]) {
+    const root = workspace();
+    const module = new ModuleDouble();
+    const runtime = await start(root, module);
+    try {
+      runtime.consumer.registerSession?.("s");
+      await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+      await tick();
+      module.events.length = 0;
+      module.pending.set(module.key(root, "s"), {
+        bg_completions: [completion(nudgeFirst ? "task-first" : "task-second")],
+      });
+      let admit!: () => void;
+      module.admissionGate = new Promise((resolve) => {
+        admit = resolve;
+      });
+      let toolCall: ReturnType<typeof runtime.toolAfter> | undefined;
+      if (nudgeFirst) module.nudge("s");
+      else toolCall = runtime.toolAfter();
+      await until(() => module.events.includes("bash_drain_completions:s"));
+      if (nudgeFirst) toolCall = runtime.toolAfter();
+      else module.nudge("s");
+      await tick();
+      expect(module.events).not.toContain("bash_ack_completions:s");
+      admit();
+      expect((await toolCall!).result.content).toBe("tool result");
+      await until(() => module.events.includes("bash_ack_completions:s"));
+      expect(runtime.synthetic).toHaveLength(1);
+      expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+    } finally {
+      await runtime.stop();
+    }
+  }
+});
+
+test("OC2 subc held completion is delivered once on the replacement Location transport", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const first = await start(root, module);
+  await first.pool.getBridge(root).send("status", { session_id: "s" });
+  await tick();
+  module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+  module.nudge("s");
+  await until(() => module.events.includes("bash_drain_completions:s"));
+  await tick();
+  expect(first.synthetic).toHaveLength(0);
+  expect(module.events).not.toContain("bash_ack_completions:s");
+  await first.stop();
+  const second = await start(root, module, [
+    { id: "s", location: { directory: root }, time: { updated: DateTime.makeUnsafe(Date.now()) } },
+  ]);
+  try {
+    await until(() => !module.pending.has(module.key(root, "s")));
+    expect(second.synthetic).toHaveLength(1);
+    module.nudge("s");
+    second.consumer.registerSession?.("s");
+    await tick();
+    expect(second.synthetic).toHaveLength(1);
+    expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+  } finally {
+    await second.stop();
+  }
+});
+
+test("OC2 subc recovery is root-scoped, recent, and capped at twenty newest host sessions", async () => {
+  const root = workspace();
+  const foreign = workspace();
+  const recent = Array.from({ length: 25 }, (_, i) => ({
+    id: `s${i}`,
+    location: { directory: i === 0 ? foreign : root },
+    time: { updated: DateTime.makeUnsafe(Date.now() - (i === 1 ? 25 * 3600_000 : i * 1000)) },
+  }));
+  const queries: unknown[] = [];
+  const restored: string[] = [];
+  await Effect.runPromise(
+    recoverV2SubcSessions(
+      {
+        session: {
+          list: (query: unknown) =>
+            Effect.sync(() => {
+              queries.push(query);
+              return { data: recent, cursor: undefined };
+            }),
+        },
+      },
+      root,
+      async (sessionID) => {
+        restored.push(sessionID);
+      },
+    ),
+  );
+  expect(queries).toEqual([{ directory: root, order: "desc", limit: 20 }]);
+  expect(restored).toHaveLength(18);
+  expect(restored).not.toContain("s0");
+  expect(restored).not.toContain("s1");
+  expect(restored).not.toContain("s20");
+});
+
+test("OC2 subc admission reservation fences a concurrent in-turn completion drain", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const runtime = await start(root, module);
+  let admit!: () => void;
+  try {
+    runtime.consumer.registerSession?.("s");
+    await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+    await tick();
+    module.events.length = 0;
+    module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+    module.admissionGate = new Promise((resolve) => {
+      admit = resolve;
+    });
+    module.nudge("s");
+    await until(() => module.events.includes("bash_drain_completions:s"));
+    trackBgTask("s", "task");
+    const output = { output: "tool result" };
+    await appendInTurnBgCompletions(
+      { ctx: { pool: runtime.pool } as never, directory: root, sessionID: "s" },
+      output,
+    );
+    expect(output.output).toBe("tool result");
+    expect(module.events).not.toContain("bash_ack_completions:s");
+    admit();
+    await until(() => module.events.includes("bash_ack_completions:s"));
+    expect(runtime.synthetic).toHaveLength(1);
+  } finally {
+    admit?.();
+    await runtime.stop();
+  }
+});

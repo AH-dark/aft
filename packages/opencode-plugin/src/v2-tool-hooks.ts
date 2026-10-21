@@ -72,7 +72,11 @@ function restoreShellDescription(
  */
 export function registerV2ToolHooks(
   context: unknown,
-  runtime: { hashlineEffective?: boolean; pool?: PluginContext["pool"] },
+  runtime: {
+    hashlineEffective?: boolean;
+    pool?: PluginContext["pool"];
+    drainBgNotifications?: (sessionID: string) => Promise<void>;
+  },
   registeredTools: ReadonlySet<string>,
   bashDescription?: string,
 ) {
@@ -83,6 +87,14 @@ export function registerV2ToolHooks(
     if (typeof host.tool?.hook === "function") {
       yield* host.tool.hook("execute.after", (event) =>
         Effect.promise(async () => {
+          if (
+            runtime.drainBgNotifications &&
+            event.status === "completed" &&
+            !hasHeldBgCompletions(event.sessionID)
+          ) {
+            await runtime.drainBgNotifications(event.sessionID);
+            if (!hasHeldBgCompletions(event.sessionID)) return;
+          }
           if (
             !runtime.pool ||
             event.status !== "completed" ||
