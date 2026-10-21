@@ -23,7 +23,6 @@ use crate::lsp::manager::PullFileOutcome;
 use crate::lsp::registry::{servers_for_file, ServerKind};
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
-use crate::lsp::typescript_diagnostics::CertificationFailure;
 
 /// The maximum number of scoped files one inspect opens for analysis. Opening a document
 /// makes the server hold and analyze it, so a scope over a whole large tree
@@ -73,16 +72,12 @@ pub(crate) fn producer_keys_for_file(
 /// cause and the summary can say how many files were examined.
 #[derive(Debug, Default)]
 pub(crate) struct ScopedSweep {
-    /// Keep certified TypeScript reports local to this inspect: later partial
-    /// pushes must not replace them, and these explicit requests must not change
-    /// the warm status bar's counts.
-    pub(crate) typescript_reports: HashMap<
-        PathBuf,
-        (
-            ServerKey,
-            Result<Vec<StoredDiagnostic>, CertificationFailure>,
-        ),
-    >,
+    /// Explicit per-file results take precedence over that server's previously
+    /// published diagnostics, even if the request failed. TypeScript results
+    /// are used only for this sweep; Python pulls also update the diagnostics
+    /// store used by status and alert consumers.
+    pub(crate) requested_reports:
+        HashMap<(PathBuf, ServerKey), Result<Vec<StoredDiagnostic>, String>>,
     /// Scoped files that at least one running producer handles.
     pub(crate) eligible: usize,
     /// The eligible files themselves, so the summary can count how many of
@@ -339,10 +334,26 @@ pub(crate) fn sweep_scoped_files(
                 match lsp.begin_scoped_typescript_diagnostics(key, file, deadline) {
                     Ok(request) => typescript_in_flight.push((file.clone(), key.clone(), request)),
                     Err(error) => {
-                        sweep.typescript_reports.insert(file.clone(), (key.clone(), Err(error.into())));
+                        sweep.requested_reports.insert(
+                            (file.clone(), key.clone()),
+                            Err(
+                                crate::lsp::typescript_diagnostics::CertificationFailure::from(
+                                    error,
+                                )
+                                .to_string(),
+                            ),
+                        );
                     }
                 }
                 continue;
+            }
+            if matches!(key.kind, ServerKind::Python)
+                || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+            {
+                sweep.requested_reports.insert(
+                    (file.clone(), key.clone()),
+                    Err("document diagnostics request has not completed; retry aft_inspect".into()),
+                );
             }
             match lsp.begin_document_pull(key, file, deadline) {
                 Ok(pull) => in_flight.push((file.clone(), key.clone(), *epoch_before, pull)),
@@ -354,7 +365,9 @@ pub(crate) fn sweep_scoped_files(
         for (file, key, request) in typescript_in_flight {
             let reply = request.wait();
             let result = ctx.lsp().finish_scoped_typescript_diagnostics(reply);
-            sweep.typescript_reports.insert(file, (key, result));
+            sweep
+                .requested_reports
+                .insert((file, key), result.map_err(|error| error.to_string()));
         }
         for (file, key, epoch_before, pull) in in_flight {
             let pull = pull.wait();
@@ -446,6 +459,10 @@ pub(crate) fn sweep_scoped_files(
             // paused for this scope, so issue only these newly registered file
             // pulls here rather than waiting for a push that pull mode stopped.
             for (file, key, before) in newly_registered {
+                sweep.requested_reports.insert(
+                    (file.clone(), key.clone()),
+                    Err("document diagnostics request has not completed; retry aft_inspect".into()),
+                );
                 match pull_unlocked(ctx, &key, &file, deadline) {
                     Ok((
                         PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged,
@@ -547,6 +564,22 @@ pub(crate) fn sweep_scoped_files(
         for (file, key, diagnostics) in pulled {
             if key.kind == ServerKind::Rust && lsp.has_client(&key) {
                 lsp.store_pull_push_union(&key, &file, diagnostics);
+            } else if sweep
+                .requested_reports
+                .contains_key(&(file.clone(), key.clone()))
+            {
+                sweep.requested_reports.insert((file, key), Ok(diagnostics));
+            }
+        }
+    }
+    for ((file, key), result) in &mut sweep.requested_reports {
+        if result.is_err() {
+            if let Some((_, reason)) = sweep
+                .unanswered
+                .get(file)
+                .filter(|(unanswered, _)| unanswered == key)
+            {
+                *result = Err(reason.clone());
             }
         }
     }
