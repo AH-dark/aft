@@ -18823,6 +18823,27 @@ mod tests {
         (vec![before, IdentityView::of(ctx, root)], responses)
     }
 
+    /// Whether a refused `semantic_search` is the ordinary answer of a root
+    /// whose identity has settled and whose trigram index was just switched on
+    /// and is still building. Every freshly enabled root answers this way until
+    /// its first trigram build lands, so it is not a torn root. It counts only
+    /// when the identity seen before and after the read is the same fully
+    /// settled state, and the refusal names exactly that state: trigram
+    /// building and semantic off, as this fixture configures them. A read that
+    /// straddled a change of identity, or a refusal for any other reason,
+    /// still fails the test.
+    fn settled_search_still_building(views: &[IdentityView], data: &serde_json::Value) -> bool {
+        let settled = IdentityView {
+            indexes_on: true,
+            provisional: false,
+            key_cached: true,
+        };
+        views.iter().all(|view| *view == settled)
+            && data["code"] == "search_lanes_unavailable"
+            && data["lanes"]["trigram"]["status"] == "building"
+            && data["lanes"]["semantic"]["status"] == "off"
+    }
+
     /// A root whose bind found aft.db busy settles through the background
     /// retry while another session keeps reading it, and no read observes a
     /// half-published root: the replayed bind runs as the actor's exclusive
@@ -19019,10 +19040,16 @@ mod tests {
                     "a read saw a half-published root: {view:?}"
                 );
             }
-            for response in &responses[..3] {
+            for (tool, response) in responses[..3].iter().enumerate() {
+                if !response.success
+                    && tool == 2
+                    && settled_search_still_building(views, &response.data)
+                {
+                    continue;
+                }
                 assert!(
                     response.success,
-                    "read failed while the root settled: {}",
+                    "read failed while the root settled: {views:?} {}",
                     response.data
                 );
             }
