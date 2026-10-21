@@ -1,11 +1,12 @@
-//! Views-off method-dispatch narrowing: which callers a refresh recomputes
-//! dispatch edges for, checked against a cold build of the edited tree with
-//! the every-table differential.
+//! Method-dispatch narrowing in `CallGraphStore` refreshes (the store used
+//! when index views are disabled): which callers a refresh recomputes
+//! dispatch edges for. Each edit is checked by comparing every table of the
+//! refreshed store with a cold build of the edited tree.
 
 use super::*;
 use std::fs;
 
-/// The hub file F. Its methods receive name-match and type-match edges from
+/// The hub file `hub.rs`. Its methods receive name-match and type-match edges from
 /// three caller files, path-form `Hub::build()` calls from two more files, and
 /// it holds a dispatch call of its own.
 const HUB_RS: &str = "pub struct Hub;
@@ -50,7 +51,7 @@ const HUB_TS: &str = "export class Box { open(): void {} }\nexport function help
 const TS_CALLER: &str = "import * as ns from './hub';\nexport function useIt(b: any): void { ns.helper(); b.open(); }\n";
 const TS_OTHER: &str = "export class Crate { helper(): void {} }\n";
 
-/// Writes the fixture: F, its callers, and unresolved path-form calls whose
+/// Writes the fixture: `hub.rs`, its callers, and unresolved path-form calls whose
 /// last segment is `probe` (`matching` of them) or `elsewhere` (`unrelated`).
 fn write_fixture(root: &Path, matching: usize, unrelated: usize) {
     fs::create_dir_all(root).unwrap();
@@ -179,7 +180,7 @@ fn fixture_has_the_dispatch_shape_the_edit_shapes_rely_on() {
     };
     assert!(dispatch_callers(PROVENANCE_NAME_MATCH) >= 3);
     assert!(dispatch_callers(PROVENANCE_TYPE_MATCH) >= 3);
-    // Unresolved `Hub::method` calls in two files besides F's callers.
+    // Unresolved `Hub::method` calls in two files besides the callers of `hub.rs`.
     assert_eq!(
         count(
             store,
@@ -188,7 +189,7 @@ fn fixture_has_the_dispatch_shape_the_edit_shapes_rely_on() {
         ),
         2
     );
-    // F's own dispatch call.
+    // `hub.rs`'s own dispatch call.
     assert_eq!(
         count(
             store,
@@ -286,8 +287,8 @@ fn s3_e_method_moved_between_two_types_in_the_file() {
 #[test]
 fn s3_f_deleted_file() {
     let fixture = Fixture::new(10, 1000);
-    // Deleting a module file also drops its `mod` declaration, as a crate
-    // that still builds would.
+    // Deleting `hub.rs` also removes its `mod hub;` declaration from
+    // `lib.rs`, as deleting a module file normally does.
     let path = fixture.root.join("hub.rs");
     fs::remove_file(&path).unwrap();
     let lib = edit(&fixture.root, "lib.rs", "mod hub; ", "");
@@ -434,7 +435,7 @@ fn host_load() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Views-off refresh phases for the probe edit on two Rust hub files of a real
+/// `CallGraphStore` refresh phases for the probe edit on two Rust hub files of a real
 /// repository. `AFT_S3_MEASURE_ROOT` names a git checkout whose tracked
 /// sources are copied; `AFT_S3_MEASURE_ROUNDS` (default 3) sets the edits per
 /// file. Each edit is undone with an unmeasured refresh before the next.
