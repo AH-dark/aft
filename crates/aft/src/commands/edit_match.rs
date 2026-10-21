@@ -1161,6 +1161,93 @@ mod tests {
 
     use super::{handle_edit_match, restore_glob_checkpoint};
 
+    /// A failed match with a 64 KiB or 256 KiB `match` against a large file
+    /// used to spend seconds in the whitespace-reflow pass, whose window scan
+    /// cost file lines × match lines. The pass now scans linearly: the reply
+    /// is the usual not-found message, the scan stays within two steps per
+    /// stripped byte, and the file is untouched. A 64 KiB reflowed match on the
+    /// same file still applies.
+    #[test]
+    fn large_match_reflow_search_is_linear_and_still_applies() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("big.rs");
+        let lines = (0..25_000)
+            .map(|index| format!("    let value_{index} = compute({index}, \"text\");\n"))
+            .collect::<Vec<_>>();
+        let source = lines.concat();
+        let stripped_bytes = source.chars().filter(|ch| !ch.is_whitespace()).count();
+        fs::write(&path, &source).unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let request = |id: &str, needle: &str, replacement: &str| -> RawRequest {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "command": "edit_match",
+                "file": path.display().to_string(),
+                "match": needle,
+                "replacement": replacement,
+            }))
+            .unwrap()
+        };
+        for kib in [64usize, 256] {
+            // Every other line changed, so no pass matches.
+            let mut needle = String::new();
+            for (offset, line) in lines[8_000..].iter().enumerate() {
+                if needle.len() >= kib * 1024 {
+                    break;
+                }
+                if offset % 2 == 0 {
+                    needle.push_str("// changed ");
+                }
+                needle.push_str(line);
+            }
+            crate::patch::matcher::REFLOW_SCAN_STEPS.with(|steps| steps.set(0));
+            let started = std::time::Instant::now();
+            let response = handle_edit_match(&request("large-miss", &needle, "x"), &ctx);
+            let elapsed = started.elapsed();
+            let steps = crate::patch::matcher::REFLOW_SCAN_STEPS.with(std::cell::Cell::get);
+            eprintln!("{kib} KiB failed match took {elapsed:?}");
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "match_not_found");
+            assert_eq!(
+                response.data["message"].as_str().unwrap(),
+                format!(
+                    "edit_match: '{needle}' not found in {}{}",
+                    path.display(),
+                    crate::fuzzy_match::render_edit_not_found_detail(&source, &needle, "x")
+                ),
+            );
+            assert!(
+                steps <= 2 * stripped_bytes,
+                "{steps} scan steps for {stripped_bytes} stripped bytes"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+
+        // Join each pair of lines in a 64 KiB region, as a formatter would.
+        let mut region_end = 8_000;
+        let mut region_bytes = 0;
+        while region_bytes < 64 * 1024 {
+            region_bytes += lines[region_end].len();
+            region_end += 1;
+        }
+        region_end += region_end % 2;
+        let reflowed = lines[8_000..region_end]
+            .chunks(2)
+            .map(|pair| {
+                pair.iter()
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let response = handle_edit_match(&request("large-reflow", &reflowed, "replaced();"), &ctx);
+        assert!(response.success, "{:?}", response.data);
+        let edited = fs::read_to_string(&path).unwrap();
+        assert!(edited.contains("compute(7999, \"text\");\n    replaced();\n"));
+        assert_eq!(edited.lines().count(), 25_000 - (region_end - 8_000) + 1);
+    }
+
     #[test]
     fn append_bytes_preserves_partial_write_count() {
         struct ShortWriter(Vec<u8>);
