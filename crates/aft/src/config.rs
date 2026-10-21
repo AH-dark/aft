@@ -1182,7 +1182,7 @@ mod tests {
             "{no_home}"
         );
 
-        // The index.roots wording is unchanged.
+        // The index.roots refusal keeps its own key name and exact text.
         assert_eq!(
             expand_index_root_path("relative/root", Some(&home)).unwrap_err(),
             "index.roots path must be absolute after ~ expansion: \"relative/root\""
