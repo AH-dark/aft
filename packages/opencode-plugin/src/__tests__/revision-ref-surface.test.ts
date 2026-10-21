@@ -40,7 +40,7 @@ function harness(config: Record<string, unknown>) {
     send: async () => ({ success: true }),
     toolCall: async (_session: string | undefined, name: string, rawArgs = {}) => {
       calls.push({ name, rawArgs });
-      return { success: true, text: `${name} reply` };
+      return { success: true, text: `${name} reply`, content_files: [] };
     },
   };
   const ctx = {

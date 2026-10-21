@@ -95,7 +95,7 @@ function createMockReadingHarness(
       rawArgs: Record<string, unknown> = {},
     ) => {
       toolCallCalls.push({ sessionId, name, rawArgs });
-      return await sendImpl(name, rawArgs);
+      return { content_files: [], ...(await sendImpl(name, rawArgs)) };
     },
   };
   const pool = {
@@ -142,6 +142,7 @@ describe("reading tool adapters", () => {
     const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
       text: serverText,
+      content_files: [],
       complete: false,
       walk_truncated: true,
       unchecked_files: ["src/overflow-1.ts"],
@@ -173,6 +174,7 @@ describe("reading tool adapters", () => {
     const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
       text: "external files",
+      content_files: [],
     }));
 
     await tools.aft_outline.execute(
@@ -205,6 +207,7 @@ describe("reading tool adapters", () => {
     const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
       text: "external files",
+      content_files: [],
     }));
 
     await tools.aft_outline.execute(

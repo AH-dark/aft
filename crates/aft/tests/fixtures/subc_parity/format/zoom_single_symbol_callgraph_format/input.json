@@ -31,7 +31,10 @@
           "line": 20
         }
       ]
-    }
+    },
+    "content_files": [
+      "<PROJECT_ROOT>/src/main.ts"
+    ]
   },
   "ctx": {
     "agent_args": {

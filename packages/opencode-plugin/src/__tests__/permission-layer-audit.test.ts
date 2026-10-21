@@ -129,7 +129,7 @@ function createHarness(
         ...(options?.preview ? { options: { preview: true } } : {}),
       });
       const response = await sendImpl(name, rawArgs, options);
-      return { text: "ok", ...response };
+      return { text: "ok", content_files: [], ...response };
     },
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;
@@ -1702,7 +1702,7 @@ describe("session-owned bash artifact reads", () => {
           if (fail) throw new Error("bridge closed");
           return { success: true, owned: ownedPaths.has(String(params.path)) };
         }
-        return { success: true, text: "task output" };
+        return { success: true, text: "task output", content_files: [] };
       },
     );
   }

@@ -36,6 +36,9 @@
           "message": "file not found: <PROJECT_ROOT>/missing.ts"
         }
       }
+    ],
+    "content_files": [
+      "<PROJECT_ROOT>/src/main.ts"
     ]
   },
   "ctx": {

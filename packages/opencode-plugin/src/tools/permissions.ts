@@ -237,12 +237,20 @@ export function workspacePattern(_context: ToolContext): string {
   return ".";
 }
 
-/** Use native read's project-relative resource and error wording for OC2 source tools. */
+/** Other OC2 source tools opt into read rules without changing their OC1 policy. */
 export async function assertV2ReadPermission(
   context: ToolContext,
   targetPath: string,
 ): Promise<string | undefined> {
   if ((context as ToolRuntime).hostVersion !== 2) return undefined;
+  return assertReadPermission(context, targetPath);
+}
+
+/** Use the read tool's permission path and denial message on both supported hosts. */
+export async function assertReadPermission(
+  context: ToolContext,
+  targetPath: string,
+): Promise<string | undefined> {
   try {
     await runAsk(
       context.ask({

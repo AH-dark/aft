@@ -35,6 +35,9 @@
           "message": "symbol 'missing' not found"
         }
       }
+    ],
+    "content_files": [
+      "<PROJECT_ROOT>/src/main.ts"
     ]
   },
   "ctx": {

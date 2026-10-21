@@ -136,7 +136,11 @@ pub(crate) fn cap_zoom_response(
             "one symbol, a smaller section, or a filtered URL",
         );
         if response.success {
-            response.data = serde_json::json!({"text": text, "content": text, "complete": false});
+            // Hosts authorize the source manifest before releasing text. Keep
+            // it and per-result metadata even when the visible aggregate is cut.
+            response.data["text"] = text.clone().into();
+            response.data["content"] = text.into();
+            response.data["complete"] = false.into();
         } else {
             response.data["message"] = text.into();
         }
@@ -329,6 +333,73 @@ mod tests {
         cap_text(&mut text, URL_OUTPUT_BYTES, "symbols");
         assert!(text.len() <= URL_OUTPUT_BYTES);
         assert!(text.ends_with("of 150000 bytes; narrow with symbols"));
+    }
+
+    fn assert_zoom_cap_preserves_metadata(mixed: bool) {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let url = "https://example.com/large.md";
+        let files = if mixed {
+            vec!["/project/allowed.ts"]
+        } else {
+            vec![]
+        };
+        let mut targets = vec![serde_json::json!({"file": url, "symbols": "Large"})];
+        if mixed {
+            targets.insert(
+                0,
+                serde_json::json!({"file": "/project/allowed.ts", "symbols": "visible"}),
+            );
+        }
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "capped-zoom", "command": "zoom",
+            "targets": targets,
+        }))
+        .unwrap();
+        let entries = serde_json::json!([{
+            "targetLabel": url, "name": "Large",
+            "response": {
+                "success": true, "name": "Large", "kind": "heading",
+                "content": "URL_CONTENT ".repeat(6000), "content_files": [],
+            },
+        }]);
+        let mut data = serde_json::json!({"targets": entries, "content_files": files});
+        if mixed {
+            data["targets"].as_array_mut().unwrap().insert(
+                0,
+                serde_json::json!({
+                    "targetLabel": "allowed.ts", "name": "visible",
+                    "response": {
+                        "success": true, "name": "visible", "kind": "function",
+                        "content": "export function visible() {}", "content_files": files,
+                    },
+                }),
+            );
+        }
+        let original_entries = data["targets"].clone();
+        let response = cap_zoom_response(&req, &ctx, Response::success("capped-zoom", data));
+        assert!(response.success);
+        let text = response.data["text"]
+            .as_str()
+            .expect("capped rendered text");
+        assert!(text.len() <= 50 * 1024, "{} bytes", text.len());
+        assert!(text.contains("URL_CONTENT"));
+        assert!(text.contains("truncated at"));
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["content_files"], serde_json::json!(files));
+        assert_eq!(response.data["targets"], original_entries);
+    }
+
+    #[test]
+    fn zoom_url_cap_preserves_source_manifests_and_metadata() {
+        assert_zoom_cap_preserves_metadata(false);
+    }
+
+    #[test]
+    fn zoom_mixed_cap_preserves_source_manifests_and_metadata() {
+        assert_zoom_cap_preserves_metadata(true);
     }
 
     #[test]

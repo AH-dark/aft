@@ -1,7 +1,7 @@
 const LINE_COUNT_BYTES: u64 = 1024 * 1024;
 const ENTRY_BUDGET: usize = 10_000;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -63,6 +63,7 @@ pub struct OutlineEntry {
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
+    super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
     response
 }
 
@@ -71,7 +72,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(reference) = crate::revision_read::requested_ref(req) {
         return handle_revision_outline(req, ctx, reference);
     }
-    let excluded = excluded_read_paths(req);
+    let excluded = excluded_read_paths(req, ctx);
 
     if req
         .params
@@ -243,7 +244,6 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         let mut response = super::url_output::json_preview(req, &source, None);
         super::url_output::disclose_download(&path, &mut response);
-        let complete = response.data["complete"].as_bool().unwrap_or(false);
         let mut text = response.data["content"]
             .as_str()
             .unwrap_or_default()
@@ -254,10 +254,11 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             super::url_output::URL_OUTPUT_BYTES,
             "a filtered URL",
         );
-        return Response::success(
-            &req.id,
-            serde_json::json!({"text": text, "complete": complete}),
-        );
+        // Formatting the preview must not discard its metadata. URL content
+        // does not contribute any local files to read authorization.
+        response.data["text"] = text.into();
+        response.data["content_files"] = serde_json::json!([]);
+        return response;
     }
 
     outline_single_file(req, ctx, path, file)
@@ -414,15 +415,40 @@ fn handle_revision_outline(req: &RawRequest, ctx: &AppContext, reference: &str) 
 
 /// Host adapters can re-render a held outline after applying their own read policy.
 /// This transport-only field is not part of the model-facing tool schema.
-fn excluded_read_paths(req: &RawRequest) -> HashSet<PathBuf> {
-    req.params
+fn excluded_read_paths(req: &RawRequest, ctx: &AppContext) -> HashSet<PathBuf> {
+    let mut excluded = HashSet::new();
+    for raw_path in req
+        .params
         .get("_exclude_read_paths")
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
-        .map(PathBuf::from)
-        .collect()
+    {
+        let path = PathBuf::from(raw_path);
+        excluded.insert(path.clone());
+        // Restricted reads can use a canonical path internally even when the
+        // host denied the file using the project-root path supplied by the caller.
+        if let Ok(canonical) = std::fs::canonicalize(ctx.resolve_relative_path(&path)) {
+            excluded.insert(crate::inspect::job::normalize_path(&canonical));
+        }
+    }
+    excluded
+}
+
+/// Read manifests spell a file beneath the project root with the configured
+/// root, after resolving symlinks, so a host's exclusion names that resolved
+/// file. A walk through a symlinked directory reaches the same file under
+/// another spelling, so exclusions must also match the walked file's canonical
+/// path.
+fn is_read_excluded(excluded: &HashSet<PathBuf>, path: &Path) -> bool {
+    if excluded.is_empty() {
+        return false;
+    }
+    excluded.contains(path)
+        || std::fs::canonicalize(path).is_ok_and(|canonical| {
+            excluded.contains(&crate::inspect::job::normalize_path(&canonical))
+        })
 }
 
 fn include_tests_param(req: &RawRequest) -> bool {
@@ -1392,7 +1418,7 @@ fn handle_outline_files_mode(
     let multiple_targets = targets.len() >= 2;
     let project_root = ctx.config().project_root.clone();
     let include_tests = include_tests_param(req);
-    let excluded = excluded_read_paths(req);
+    let excluded = excluded_read_paths(req, ctx);
 
     let mut file_entries = Vec::new();
     let mut directory_nodes = Vec::new();
@@ -1437,7 +1463,7 @@ fn handle_outline_files_mode(
         let mut discovery = discover_outline_files_for_files_mode(&dir_path);
         discovery
             .files
-            .retain(|file| !excluded.contains(Path::new(file)));
+            .retain(|file| !is_read_excluded(&excluded, Path::new(file)));
         entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
@@ -1551,7 +1577,9 @@ fn handle_outline_files_mode(
             OutlineTableRow::File(file_id) => Some(file_entries[*file_id].absolute_path.clone()),
             OutlineTableRow::Rollup(_) => None,
         })
-        .collect::<Vec<_>>();
+        // A read manifest is a set: sorted and without duplicates, whatever
+        // order the rows are displayed in.
+        .collect::<BTreeSet<_>>();
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut response_data = serde_json::json!({
         "text": text,
@@ -2351,7 +2379,7 @@ fn outline_many_files(
     let mut fallback_parser = FileParser::new();
 
     for (file, path) in files.iter().zip(paths) {
-        if excluded.contains(&path) {
+        if is_read_excluded(excluded, &path) {
             continue;
         }
         if crate::bounded_io::metadata(&path).is_err() {
@@ -3129,7 +3157,9 @@ struct RenderedOutline {
     truncated: bool,
     shown: usize,
     footer: String,
-    content_files: Vec<PathBuf>,
+    /// The files whose outlines were rendered, as a sorted set like every
+    /// other read manifest.
+    content_files: BTreeSet<PathBuf>,
 }
 
 fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool) -> String {
@@ -3170,7 +3200,7 @@ fn format_multi_file_tree(
     let mut output = String::new();
     let mut truncated = false;
     let mut files_shown = 0;
-    let mut content_files = Vec::new();
+    let mut content_files = BTreeSet::new();
     // Reserve the real list trailer, not a guessed number of bytes. Rendering
     // files atomically keeps every shown type's preview and exact remainder.
     let trailer_reserve =
@@ -3226,7 +3256,7 @@ fn format_multi_file_tree(
             break;
         }
         output.push_str(&file_output);
-        content_files.push(fo.absolute_path.clone());
+        content_files.insert(fo.absolute_path.clone());
 
         files_shown += 1;
         prev_parts = parts.iter().map(|s| *s).collect();
@@ -3320,8 +3350,17 @@ mod tests {
                 let response = handle_outline(&request, &ctx);
                 assert!(response.success);
                 let paths = response.data["content_files"].as_array().unwrap();
-                assert!(paths.contains(&serde_json::json!(allowed)));
-                assert_eq!(paths.contains(&serde_json::json!(denied)), !exclude);
+                assert!(
+                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                        &allowed
+                    )))
+                );
+                assert_eq!(
+                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                        &denied
+                    ))),
+                    !exclude
+                );
                 let text = response.data["text"].as_str().unwrap();
                 assert!(text.contains("allowed.ts"));
                 assert_eq!(text.contains("denied.ts"), !exclude);
@@ -3329,6 +3368,126 @@ mod tests {
                     assert_eq!(text.contains("secretSymbol"), !exclude);
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outline_manifest_uses_symlinked_project_root_spelling_and_sorts_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("project");
+        std::fs::create_dir(&real_root).unwrap();
+        let request_root = temp.path().join("project-alias");
+        symlink(&real_root, &request_root).unwrap();
+        let barrel = request_root.join("barrel.ts");
+        let secret = request_root.join("secret.ts");
+        std::fs::write(
+            &real_root.join("barrel.ts"),
+            "export function barrel() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &real_root.join("secret.ts"),
+            "export function secret() {}\n",
+        )
+        .unwrap();
+        // The manifest takes the spelling of the configured project root, not
+        // of the request: an alias root (like macOS `/var` for `/private/var`)
+        // keeps its alias, and a real root names the real files even when the
+        // request goes through the alias.
+        for configured_root in [&request_root, &real_root] {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(configured_root.clone()),
+                    restrict_to_project_root: true,
+                    ..crate::config::Config::default()
+                },
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "symlinked-outline-manifest", "command": "outline",
+                "files": [secret, barrel],
+            }))
+            .unwrap();
+
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            let manifest = response.data["content_files"].as_array().unwrap();
+            let expected: Vec<_> = [
+                configured_root.join("barrel.ts"),
+                configured_root.join("secret.ts"),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+            assert_eq!(response.data["content_files"], serde_json::json!(expected));
+            assert!(manifest
+                .windows(2)
+                .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outline_excludes_a_file_denied_at_its_real_location_when_walked_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        symlink(root.join("src"), root.join("a/link")).unwrap();
+        std::fs::write(root.join("src/ok.ts"), "export function okSymbol() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/secret.ts"),
+            "export function secretSymbol() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..crate::config::Config::default()
+            },
+        );
+        // The manifest names the walked file at `src/secret.ts`; a host that
+        // denies that path sends it back as the exclusion.
+        for params in [
+            serde_json::json!({"directory": root.join("a/link")}),
+            serde_json::json!({"files": [root.join("a/link/ok.ts"), root.join("a/link/secret.ts")]}),
+        ] {
+            let mut args = params;
+            args["id"] = serde_json::json!("symlinked-exclusion");
+            args["command"] = serde_json::json!("outline");
+            let request: RawRequest = serde_json::from_value(args.clone()).unwrap();
+            let unfiltered = handle_outline(&request, &ctx);
+            assert!(
+                unfiltered.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("secretSymbol"),
+                "{args}"
+            );
+            assert!(unfiltered.data["content_files"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(root.join("src/secret.ts"))));
+
+            args["_exclude_read_paths"] = serde_json::json!([root.join("src/secret.ts")]);
+            let request: RawRequest = serde_json::from_value(args.clone()).unwrap();
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success, "{args}: {:?}", response.data);
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains("okSymbol"), "{args}: {text}");
+            assert!(!text.contains("secretSymbol"), "{args}: {text}");
+            assert_eq!(
+                response.data["content_files"],
+                serde_json::json!([root.join("src/ok.ts")]),
+                "{args}"
+            );
         }
     }
 
@@ -3362,7 +3521,10 @@ mod tests {
             assert_eq!(response.data["files_shown"], 1);
             assert!(text.contains("a.ts"));
             assert!(!text.contains("z.ts"));
-            assert_eq!(response.data["content_files"], serde_json::json!([shown]));
+            assert_eq!(
+                response.data["content_files"],
+                serde_json::json!([crate::inspect::job::normalize_path(&shown)])
+            );
         }
     }
 
@@ -3396,6 +3558,66 @@ mod tests {
         assert!(!text.contains("hidden_"));
         assert_eq!(response.data["files_list_envelope"]["shown"], 1);
         assert_eq!(response.data["content_files"], serde_json::json!([shown]));
+    }
+
+    /// Both directory renderers display files in their own order (the table
+    /// lists a directory's own files before its subdirectories; the tree sorts
+    /// relative path text), but the read manifest is always sorted in `Path`
+    /// component order, before and after the response wrapper rewrites it.
+    #[test]
+    fn outline_content_files_are_sorted_whatever_the_display_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        for file in ["z.rs", "a-b.rs", "a/b.rs"] {
+            std::fs::write(root.join(file), "pub fn f() {}\n").unwrap();
+        }
+        let normalized = |value: &serde_json::Value| -> Vec<PathBuf> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|path| crate::inspect::job::normalize_path(Path::new(path.as_str().unwrap())))
+                .collect()
+        };
+        let root = crate::inspect::job::normalize_path(&root);
+        let expected: Vec<_> = ["a/b.rs", "a-b.rs", "z.rs"]
+            .into_iter()
+            .map(|file| crate::inspect::job::normalize_path(&root.join(file)))
+            .collect();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..crate::config::Config::default()
+            },
+        );
+        for files_mode in [true, false] {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "sorted-manifest", "command": "outline", "directory": root, "files": files_mode,
+            }))
+            .unwrap();
+            let inner = handle_outline_inner(&request, &ctx);
+            assert!(inner.success, "{files_mode}: {:?}", inner.data);
+            let text = inner.data["text"].as_str().unwrap();
+            let position = |needle: &str| text.find(needle).unwrap();
+            if files_mode {
+                assert!(position("z.rs") < position("a/b.rs"), "{text}");
+            } else {
+                assert!(position("a-b.rs") < position("a/"), "{text}");
+            }
+            assert_eq!(
+                normalized(&inner.data["content_files"]),
+                expected,
+                "{files_mode}"
+            );
+            let wrapped = handle_outline(&request, &ctx);
+            assert_eq!(
+                normalized(&wrapped.data["content_files"]),
+                expected,
+                "{files_mode}"
+            );
+        }
     }
 
     fn navigation_counts(
@@ -3749,15 +3971,18 @@ mod tests {
         ];
         let (_temp, files, ctx) = navigation_fixture();
         for (path, leaves) in files.iter().zip(cases) {
+            // Without a project root the manifest names the canonical file.
+            let manifest_path = crate::inspect::job::canonicalize_normalized(path);
             let symbols = ["alpha", "beta"].into_iter().zip(leaves).map(|(name, (range, content, before, after))| serde_json::json!({
                 "name":name, "response":{
                     "id":"zoom-golden", "success":true, "name":name, "kind":"function",
                     "range":{"start_line":range[0], "start_col":range[1], "end_line":range[2], "end_col":range[3]},
                     "content":content, "context_before":before, "context_after":after,
-                    "annotations":{"calls_out":[], "called_by":[]}
+                    "annotations":{"calls_out":[], "called_by":[]},
+                    "content_files":[&manifest_path]
                 }
             })).collect::<Vec<_>>();
-            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols});
+            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols, "content_files":[manifest_path]});
             let request = serde_json::from_value(serde_json::json!({"id":"zoom-golden", "command":"zoom", "file":path, "symbols":["alpha","beta"], "context_lines":3})).unwrap();
             for _ in 0..2 {
                 assert_eq!(

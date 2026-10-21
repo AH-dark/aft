@@ -4,9 +4,9 @@
     "success": true,
     "text": "only.rs       rust         1 syms       1 lines\nopen/kept.rs  rust         1 syms       1 lines\n.git          unknown      0 syms       1 lines\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)",
     "content_files": [
+      "<fixture>/pin/.git",
       "<fixture>/pin/only.rs",
-      "<fixture>/pin/open/kept.rs",
-      "<fixture>/pin/.git"
+      "<fixture>/pin/open/kept.rs"
     ],
     "files": [
       {

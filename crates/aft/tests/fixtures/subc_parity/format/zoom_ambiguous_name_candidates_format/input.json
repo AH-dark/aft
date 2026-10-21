@@ -26,6 +26,9 @@
         "kind": "method",
         "signature": "run(): Promise<void>"
       }
+    ],
+    "content_files": [
+      "<PROJECT_ROOT>/src/main.ts"
     ]
   },
   "ctx": {

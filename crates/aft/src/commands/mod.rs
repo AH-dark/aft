@@ -59,6 +59,7 @@ pub mod multi_path;
 pub mod organize_imports;
 pub mod outline;
 pub mod read;
+pub(crate) mod read_manifest;
 pub mod remove_import;
 pub mod restore_checkpoint;
 mod rollback_outcome;

@@ -2760,6 +2760,9 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
     let map_in = agent_args_map(args);
     let batch = map_in.get("batch").expect("normalized zoom batch");
     let mut out = Map::new();
+    if let Some(excluded) = map_in.get("_exclude_read_paths").and_then(Value::as_array) {
+        out.insert("_exclude_read_paths".into(), Value::Array(excluded.clone()));
+    }
     insert_revision(&mut out, &map_in)?;
     out.insert(
         "targets".to_string(),

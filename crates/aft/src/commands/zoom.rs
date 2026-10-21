@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -565,7 +565,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some(reference) = crate::revision_read::requested_ref(req) else {
-        return zoom_at(req, ctx, None);
+        return finalize_zoom_read_paths(req, ctx, zoom_at(req, ctx, None), None);
     };
     let has_url = ["file", "url"]
         .into_iter()
@@ -611,9 +611,116 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(session) => session,
         Err(refusal) => return refusal,
     };
-    let mut response = zoom_at(req, ctx, Some(&session));
+    let mut response =
+        finalize_zoom_read_paths(req, ctx, zoom_at(req, ctx, Some(&session)), Some(&session));
     session.annotate(&mut response);
     response
+}
+
+/// Keep file identities in structured data so hosts can hold text until every
+/// source is authorized. When a source is denied, replace the entire affected
+/// lookup with a permission error, including ambiguity signatures and member
+/// menus rather than only its body.
+fn finalize_zoom_read_paths(
+    req: &RawRequest,
+    ctx: &AppContext,
+    mut response: Response,
+    revision: Option<&RevisionSession>,
+) -> Response {
+    let excluded: HashSet<PathBuf> = req
+        .params
+        .get("_exclude_read_paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .collect();
+    let manifest_paths = super::read_manifest::ReadManifestPaths::for_context(ctx);
+    match finalize_zoom_read_data(
+        req,
+        ctx,
+        &mut response.data,
+        revision,
+        &excluded,
+        &manifest_paths,
+    ) {
+        Ok(_) => response,
+        Err(refusal) => refusal,
+    }
+}
+
+fn finalize_zoom_read_data(
+    req: &RawRequest,
+    ctx: &AppContext,
+    data: &mut serde_json::Value,
+    revision: Option<&RevisionSession>,
+    excluded: &HashSet<PathBuf>,
+    manifest_paths: &super::read_manifest::ReadManifestPaths,
+) -> Result<BTreeSet<PathBuf>, Response> {
+    let mut files = BTreeSet::new();
+    let mut refused = false;
+    for key in ["targets", "symbols"] {
+        if let Some(entries) = data.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+            for entry in entries {
+                if let Some(inner) = entry.get_mut("response") {
+                    match finalize_zoom_read_data(
+                        req,
+                        ctx,
+                        inner,
+                        revision,
+                        excluded,
+                        manifest_paths,
+                    ) {
+                        Ok(inner_files) => files.extend(inner_files),
+                        Err(refusal) => {
+                            *inner = serialize_zoom_target_response(req, refusal);
+                            refused = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if refused && data.get("complete").is_some() {
+        data["complete"] = false.into();
+    }
+    if let Some(paths) = data
+        .get("content_files")
+        .and_then(serde_json::Value::as_array)
+    {
+        for path in paths.iter().filter_map(serde_json::Value::as_str) {
+            let path = PathBuf::from(path);
+            files.insert(match revision {
+                Some(revision) => revision.logical_path(&path).ok_or_else(|| {
+                    Response::error(
+                        &req.id,
+                        "internal_error",
+                        "zoom: cannot identify a revision source file",
+                    )
+                })?,
+                None => path,
+            });
+        }
+    }
+    let manifest_files = manifest_paths.map_set(files.iter());
+    let excluded_manifest_files = manifest_paths.map_set(excluded.iter());
+    if let Some(denied) = manifest_files
+        .iter()
+        .find(|file| excluded_manifest_files.contains(*file))
+    {
+        return Err(Response::error(&req.id, "permission_denied", format!(
+            "permission_denied: read for {} is denied by this session's permission rules (not a user choice)",
+            denied.display(),
+        )));
+    }
+    // Followed files must also satisfy the server's read floor; a host's
+    // external-directory approval cannot override project confinement.
+    for file in &files {
+        ctx.validate_read_path(&req.id, req.session(), file)?;
+    }
+    data["content_files"] = serde_json::json!(manifest_files);
+    Ok(files)
 }
 
 /// A GitHub discussion is not a repository file and has no git revision.
@@ -823,6 +930,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
                         "end_col": end_col + 1,
                     },
                     "content": content,
+                    "content_files": if is_http_url(file) { vec![] } else { vec![path.clone()] },
                     "context_before": context_before,
                     "context_after": context_after,
                     "annotations": {
@@ -1299,6 +1407,7 @@ fn zoom_one_symbol(
     include_callgraph: bool,
     enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
 ) -> Response {
+    let mut content_files = BTreeSet::from([path.to_path_buf()]);
     let mut response = if is_http_url(_file) && detect_language(path) == Some(LangId::Json) {
         super::url_output::json_preview(req, source, Some(symbol_name))
     } else {
@@ -1313,6 +1422,7 @@ fn zoom_one_symbol(
             context_lines,
             include_callgraph,
             enrichments,
+            &mut content_files,
         )
     };
     if is_http_url(_file) {
@@ -1337,7 +1447,9 @@ fn zoom_one_symbol(
             }
         }
         super::url_output::disclose_download(path, &mut response);
+        content_files.clear();
     }
+    response.data["content_files"] = serde_json::json!(content_files);
     response
 }
 
@@ -1353,6 +1465,7 @@ fn zoom_one_symbol_inner(
     context_lines: usize,
     include_callgraph: bool,
     enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
+    content_files: &mut BTreeSet<PathBuf>,
 ) -> Response {
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
     // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
@@ -1387,6 +1500,11 @@ fn zoom_one_symbol_inner(
         matches
     };
 
+    content_files.extend(
+        matches
+            .iter()
+            .map(|candidate| PathBuf::from(&candidate.file)),
+    );
     if matches.len() > 1 {
         let suggestions = ambiguous_symbol_selectors(&matches);
         let content = render_ambiguous_symbol_menu(symbol_name, &matches, &suggestions);
@@ -2892,6 +3010,286 @@ mod tests {
 
     fn make_ctx() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn zoom_read_manifest_tracks_reexports_and_masks_only_affected_results() {
+        let root = tempfile::tempdir().unwrap();
+        // Without a project root, a manifest names each file at its canonical
+        // location, so build the fixture there.
+        let dir = crate::inspect::job::canonicalize_normalized(root.path());
+        let barrel = dir.join("barrel.ts");
+        let secret = dir.join("secret.ts");
+        let allowed = dir.join("allowed.ts");
+        std::fs::write(
+            &barrel,
+            "export { hidden } from './secret';\nexport function local() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &secret,
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &allowed,
+            "export function visible() { return 'PUBLIC_BODY'; }\n",
+        )
+        .unwrap();
+        let mut req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "read-manifest", "command": "zoom", "callgraph": true,
+            "targets": [
+                { "file": barrel, "symbols": ["hidden"] },
+                { "file": allowed, "symbols": ["visible"] },
+            ],
+        }))
+        .unwrap();
+        let ctx = make_ctx();
+        let response = handle_zoom(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        let manifest = &response.data["targets"][0]["response"]["content_files"];
+        let expected: BTreeSet<_> = [barrel.clone(), secret.clone()].into_iter().collect();
+        assert_eq!(*manifest, serde_json::json!(expected));
+        assert!(response.data["targets"][0]["response"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("PRIVATE_BODY"));
+
+        req.params["_exclude_read_paths"] = serde_json::json!([secret]);
+        let filtered = handle_zoom(&req, &ctx);
+        let denied = &filtered.data["targets"][0]["response"];
+        assert_eq!(denied["code"], "permission_denied");
+        assert!(denied["message"].as_str().unwrap().contains("secret.ts"));
+        assert!(denied.get("content").is_none());
+        assert!(!filtered.data.to_string().contains("PRIVATE_BODY"));
+        assert!(filtered.data["targets"][1]["response"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("PUBLIC_BODY"));
+        assert_eq!(filtered.data["content_files"], serde_json::json!([allowed]));
+
+        let mut direct =
+            make_zoom_request("same-file", barrel.to_str().unwrap(), "hidden local", None);
+        direct.params["_exclude_read_paths"] = serde_json::json!([secret]);
+        let same_file = handle_zoom(&direct, &ctx);
+        assert_eq!(same_file.data["complete"], false);
+        assert_eq!(
+            same_file.data["symbols"][0]["response"]["code"],
+            "permission_denied"
+        );
+        assert_eq!(same_file.data["symbols"][1]["response"]["success"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_uses_symlinked_project_root_spelling_and_sorts_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("project");
+        std::fs::create_dir(&real_root).unwrap();
+        let request_root = temp.path().join("project-alias");
+        symlink(&real_root, &request_root).unwrap();
+        std::fs::write(
+            &real_root.join("barrel.ts"),
+            "export { hidden } from './secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &real_root.join("secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+        // The manifest takes the spelling of the configured project root, not
+        // of the request: an alias root (like macOS `/var` for `/private/var`)
+        // keeps its alias, and a real root names the real files even when the
+        // request goes through the alias.
+        for configured_root in [&request_root, &real_root] {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(configured_root.clone()),
+                    restrict_to_project_root: true,
+                    ..Config::default()
+                },
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "symlinked-read-manifest", "command": "zoom",
+                "file": request_root.join("barrel.ts"), "symbol": "hidden",
+            }))
+            .unwrap();
+
+            let response = handle_zoom(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            let manifest = response.data["content_files"].as_array().unwrap();
+            let expected: Vec<_> = [
+                configured_root.join("barrel.ts"),
+                configured_root.join("secret.ts"),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+            assert_eq!(response.data["content_files"], serde_json::json!(expected));
+            assert!(manifest
+                .windows(2)
+                .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
+        }
+    }
+
+    /// Writes a barrel that re-exports `hidden` from a secret file and returns a
+    /// context bound to `root`. Permission rules name files relative to the
+    /// project root, so every manifest path must name the file it came from.
+    #[cfg(unix)]
+    fn symlinked_reexport_ctx(root: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                restrict_to_project_root: true,
+                ..Config::default()
+            },
+        )
+    }
+
+    /// Zooms `requested`, then repeats the zoom with `secret` excluded the way
+    /// a host does after a read-rule denial, and checks both manifests.
+    #[cfg(unix)]
+    fn assert_symlinked_reexport_manifest(
+        ctx: &AppContext,
+        requested: &Path,
+        barrel: &Path,
+        secret: &Path,
+    ) {
+        let mut request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "symlinked-reexport", "command": "zoom",
+            "file": requested, "symbol": "hidden",
+        }))
+        .unwrap();
+        let response = handle_zoom(&request, ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert!(response.data.to_string().contains("PRIVATE_BODY"));
+        let expected: BTreeSet<_> = [barrel.to_path_buf(), secret.to_path_buf()]
+            .into_iter()
+            .collect();
+        assert_eq!(response.data["content_files"], serde_json::json!(expected));
+
+        request.params["_exclude_read_paths"] = serde_json::json!([secret]);
+        let filtered = serde_json::to_value(handle_zoom(&request, ctx)).unwrap();
+        assert_eq!(filtered["code"], "permission_denied", "{filtered}");
+        assert!(!filtered.to_string().contains("PRIVATE_BODY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_names_reexport_source_through_deeper_symlink_at_real_location() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        // `a/link` sits one directory deeper than the `src` directory it names.
+        symlink(root.join("src"), root.join("a/link")).unwrap();
+        std::fs::write(
+            root.join("src/barrel.ts"),
+            "export { hidden } from './secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+
+        assert_symlinked_reexport_manifest(
+            &symlinked_reexport_ctx(&root),
+            &root.join("a/link/barrel.ts"),
+            &root.join("src/barrel.ts"),
+            &root.join("src/secret.ts"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_names_reexport_source_through_upward_symlink_at_real_location() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // `src/up` names the project root itself, so a request through it is
+        // one directory deeper than the file it reads.
+        symlink(&root, root.join("src/up")).unwrap();
+        std::fs::write(
+            root.join("barrel.ts"),
+            "export { hidden } from './src/secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+
+        assert_symlinked_reexport_manifest(
+            &symlinked_reexport_ctx(&root),
+            &root.join("src/up/barrel.ts"),
+            &root.join("barrel.ts"),
+            &root.join("src/secret.ts"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_names_sources_outside_the_project_root_canonically() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let real = temp.path().join("outside");
+        let alias = temp.path().join("outside-alias");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        std::fs::write(
+            real.join("barrel.ts"),
+            "export { hidden } from './secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            real.join("secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+        let canonical = crate::inspect::job::canonicalize_normalized(&real);
+
+        // Neither a missing project root nor a root that does not contain the
+        // sources may lend the request's alias spelling to the manifest.
+        for project_root in [None, Some(project)] {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: project_root.clone(),
+                    ..Config::default()
+                },
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "outside-root-manifest", "command": "zoom",
+                "file": alias.join("barrel.ts"), "symbol": "hidden",
+            }))
+            .unwrap();
+            let response = handle_zoom(&request, &ctx);
+            assert!(response.success, "{project_root:?}: {:?}", response.data);
+            let expected: BTreeSet<_> = [canonical.join("barrel.ts"), canonical.join("secret.ts")]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                response.data["content_files"],
+                serde_json::json!(expected),
+                "{project_root:?}"
+            );
+        }
     }
 
     #[test]

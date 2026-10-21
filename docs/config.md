@@ -569,6 +569,19 @@ Every enabled GitHub resource read fetches live data; a prior read never satisfi
 
 If no fallback copy exists, the live-fetch error is returned unchanged. Successful structured `gh` mutations invalidate matching fallback copies, and concurrent reads of the same resource share one in-flight live fetch.
 
+## OpenCode read rules and search permissions
+
+On OpenCode 1 and 2, `read` permission rules govern `read`, `aft_outline` and
+`aft_zoom`. Outline and zoom ask for each file whose content they return, including
+files read at a git revision. A single denied file is refused; batches leave out
+denied entries and report their permission errors while returning allowed entries.
+URL targets do not use file-read permission.
+
+`grep` and `aft_search` are governed by their own permissions. They can return
+matched lines from files denied by a `read` rule. Use path restrictions or deny
+rules on the search tools to keep secrets out of results; do not rely on a `read`
+deny to hide a file from search.
+
 ## OpenCode 2 permission prompts
 
 When OpenCode 2's rules resolve a tool call to "ask", AFT calls the host's in-process `permission.assert` and waits for its answer. Configured allow/deny decisions keep their fast path; edit requests still carry `metadata.diff` for the built-in diff view. Denials and feedback are returned as permission failures; rejecting without feedback ends the current step.

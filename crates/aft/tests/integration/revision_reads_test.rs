@@ -228,6 +228,11 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
     assert!(text.starts_with(&header("release", &fixture.v1)), "{text}");
     assert!(text.contains("only_in_v1"), "{text}");
     assert!(!text.contains("uncommitted"), "{text}");
+    // The manifest spells the source with the configured project root, which
+    // `fixture` already resolved to its plain (non-verbatim) canonical form.
+    let source = fixture.repo.join("src").join("lib.rs");
+    assert_eq!(outline["content_files"], json!([source]));
+    assert_no_verbatim_paths(&outline);
 
     let zoom = call(
         &mut aft,
@@ -240,6 +245,13 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
         "{text}"
     );
     assert!(text.contains("pub fn feature_flag() -> bool"), "{text}");
+    assert_eq!(zoom["content_files"], json!([source]));
+    assert_eq!(
+        zoom["targets"][0]["response"]["content_files"],
+        json!([source])
+    );
+    assert!(!text.contains("content_files"), "{text}");
+    assert_no_verbatim_paths(&zoom);
 
     // Every target of a batch is read at the one revision.
     let batch = call(
@@ -257,6 +269,23 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
     assert!(text.starts_with(&header("release", &fixture.v1)), "{text}");
     assert!(text.contains("\"tagged\""), "{text}");
     assert!(!text.contains("    99"), "{text}");
+    assert_eq!(batch["content_files"], json!([source]));
+    for entry in batch["targets"].as_array().unwrap() {
+        assert_eq!(entry["response"]["content_files"], json!([source]));
+    }
+    assert_no_verbatim_paths(&batch);
+}
+
+/// Hosts match read rules against `content_files`, and agents see these
+/// paths, so none may carry the Windows verbatim (`\\?\`) prefix that
+/// `fs::canonicalize` adds. Checks every string anywhere in `value`.
+fn assert_no_verbatim_paths(value: &Value) {
+    match value {
+        Value::String(text) => assert!(!text.starts_with(r"\\?\"), "verbatim path: {text}"),
+        Value::Array(items) => items.iter().for_each(assert_no_verbatim_paths),
+        Value::Object(fields) => fields.values().for_each(assert_no_verbatim_paths),
+        _ => {}
+    }
 }
 
 #[cfg(unix)]

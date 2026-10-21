@@ -3,13 +3,13 @@
   "success": true,
   "text": "ancestor.rs        rust         1 syms       1 lines\nglobal.rs          rust         1 syms       1 lines\ninfo.rs            rust         1 syms       1 lines\nonly.rs            rust         1 syms       1 lines\nsymlink.rs         rust         1 syms       1 lines\nnested/symlink.rs  rust         1 syms       1 lines\n.git               unknown      0 syms       1 lines\n",
   "content_files": [
+    "<fixture>/pin/.git",
     "<fixture>/pin/ancestor.rs",
     "<fixture>/pin/global.rs",
     "<fixture>/pin/info.rs",
-    "<fixture>/pin/only.rs",
-    "<fixture>/pin/symlink.rs",
     "<fixture>/pin/nested/symlink.rs",
-    "<fixture>/pin/.git"
+    "<fixture>/pin/only.rs",
+    "<fixture>/pin/symlink.rs"
   ],
   "files": [
     {
