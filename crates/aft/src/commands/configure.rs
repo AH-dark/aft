@@ -14098,16 +14098,12 @@ mod tests {
                     "{:?}",
                     ctx.degraded_reasons()
                 );
-                assert_eq!(
-                    ctx.cached_artifact_cache_key(&root),
-                    None,
-                    "a provisional bind keeps no key cached for its root"
-                );
+                let cached_after_bind = ctx.cached_artifact_cache_key(&root);
                 super::drain_deferred_configure_maintenance(&ctx);
 
                 // A standing-maintenance pass reads the key while aft.db is busy.
                 assert_eq!(ctx.memoized_artifact_cache_key(&root), git_key);
-                assert_eq!(ctx.cached_artifact_cache_key(&root), None);
+                let cached_after_pass = ctx.cached_artifact_cache_key(&root);
 
                 lock.execute_batch("ROLLBACK").unwrap();
                 drop(lock);
@@ -14130,6 +14126,14 @@ mod tests {
                     "the fixture must settle on a key the Git-only derivation does not produce"
                 );
                 assert_eq!(ctx.memoized_artifact_cache_key(&root), settled);
+                assert_eq!(
+                    cached_after_bind, None,
+                    "a provisional bind keeps no key cached for its root"
+                );
+                assert_eq!(
+                    cached_after_pass, None,
+                    "a read of a provisional root's key does not cache it"
+                );
             },
         );
     }

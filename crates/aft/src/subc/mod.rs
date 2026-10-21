@@ -19092,7 +19092,7 @@ mod tests {
                     ctx.artifact_cache_key_derivation_count_for_test() > derivations,
                     "the standing pass must derive the provisional session's key"
                 );
-                assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
+                let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
 
                 crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
                 assert!(
@@ -19103,6 +19103,10 @@ mod tests {
                 assert!(ctx.config().indexes.trigram);
                 assert!(!ctx.provisional_identity_retry().is_armed());
                 assert!(ctx.cached_artifact_cache_key(&canonical_root).is_some());
+                assert_eq!(
+                    cached_after_pass, None,
+                    "the pass must not cache a key for a provisional root"
+                );
             },
         );
     }
