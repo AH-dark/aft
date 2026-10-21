@@ -222,10 +222,33 @@ export class BridgeError extends Error {
 }
 
 const hostPermissionGrants = new WeakMap<object, readonly string[]>();
-const permissionOperations = new AsyncLocalStorage<Map<string, string[]>>();
+/** State private to one host `execute` call: preview continuations, and the
+ * call's own cancellation signal. */
+interface PermissionOperation {
+  continuations: Map<string, string[]>;
+  signal?: AbortSignal;
+}
+const permissionOperations = new AsyncLocalStorage<PermissionOperation>();
 
-export function withOutsidePermissionOperation<T>(run: () => T): T {
-  return permissionOperations.run(new Map(), run);
+/** Run one host `execute` call. `signal` is the call's own cancellation
+ * signal (the one Pi passes to `execute`); an outside-access prompt for the
+ * call stops on it as well as on the extension context's signal. */
+export function withOutsidePermissionOperation<T>(run: () => T, signal?: AbortSignal): T {
+  return permissionOperations.run({ continuations: new Map(), signal }, run);
+}
+
+/** Every signal that cancels this call: the extension context's and the
+ * signal passed to the running tool's `execute`. */
+function cancellationSignals(extCtx: ExtensionContext | undefined): AbortSignal[] {
+  const signals = [extCtx?.signal, permissionOperations.getStore()?.signal];
+  return signals.filter(
+    (signal, index): signal is AbortSignal =>
+      signal !== undefined && signals.indexOf(signal) === index,
+  );
+}
+
+function throwIfCancelled(signals: AbortSignal[]): void {
+  for (const signal of signals) signal.throwIfAborted();
 }
 
 function permissionOperation(tool: string, args: Record<string, unknown>): string {
@@ -258,12 +281,15 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
 ): Promise<T> {
   const { permissions_granted: _untrusted, ...clean } = args;
   const inherited = hostPermissionGrants.get(args) ?? [];
-  const continuations = permissionOperations.getStore();
+  const continuations = permissionOperations.getStore()?.continuations;
+  const signals = cancellationSignals(extCtx);
   const key = JSON.stringify([sessionId, permissionOperation(operation, clean)]);
   let granted = [...(continuations?.get(key) ?? [])];
   continuations?.delete(key);
   for (let round = 0; round < 32; round++) {
-    extCtx?.signal?.throwIfAborted();
+    // Before every send, including an approved retry: a call cancelled
+    // while it waited for an answer must not run.
+    throwIfCancelled(signals);
     const approvals = [...inherited, ...granted];
     const response = await send(
       approvals.length ? { ...clean, permissions_granted: approvals } : clean,
@@ -297,12 +323,14 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       );
     }
     for (const ask of asks) {
+      throwIfCancelled(signals);
       const approved = await extCtx.ui.confirm(
         "Allow outside access?",
         `${ask.operation ?? "access"}: ${ask.path ?? ""}`,
-        { signal: extCtx.signal },
+        { signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0] },
       );
-      extCtx.signal?.throwIfAborted();
+      // An answer that arrives after cancellation is ignored.
+      throwIfCancelled(signals);
       if (!approved)
         throw new BridgeError("Permission denied: outside access was denied.", "permission_denied");
       const id = ask.grant_id;

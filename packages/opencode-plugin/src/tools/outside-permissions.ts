@@ -3,6 +3,8 @@ import { classifyPermissionError, permissionRuleDenial, runAsk } from "./permiss
 
 type Runtime = Partial<Pick<ToolContext, "ask">> & {
   effectAbort?: AbortSignal;
+  /** OpenCode 1's per-call cancellation signal (`ToolContext.abort`). */
+  abort?: AbortSignal;
   hostVersion?: 2;
   sessionID?: string;
   messageID?: string;
@@ -66,8 +68,19 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   const prior = continuations.get(runtime);
   let granted = prior?.key === key ? [...prior.tokens] : [];
   continuations.delete(runtime);
+  // OpenCode 2 cancels through the Effect signal, OpenCode 1 through the
+  // call's own `abort`; either one stops an outside-access prompt.
+  const signals = [runtime.effectAbort, runtime.abort].filter(
+    (signal, index, all): signal is AbortSignal =>
+      signal !== undefined && all.indexOf(signal) === index,
+  );
+  const throwIfCancelled = () => {
+    for (const signal of signals) signal.throwIfAborted();
+  };
   for (let round = 0; round < 32; round++) {
-    if (round > 0) runtime.effectAbort?.throwIfAborted();
+    // Before an approved retry: a call cancelled while it waited for an
+    // answer must not run.
+    if (round > 0) throwIfCancelled();
     const approvals = [...inherited, ...granted];
     const response = await send(
       approvals.length ? { ...clean, permissions_granted: approvals } : clean,
@@ -107,6 +120,7 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
         "Permission denied: outside access requires a permission-capable OpenCode host.",
       );
     for (const ask of asks) {
+      throwIfCancelled();
       try {
         await runAsk(
           runtime.ask({
@@ -129,7 +143,8 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
             : failure.message,
         );
       }
-      runtime.effectAbort?.throwIfAborted();
+      // An answer that arrives after cancellation is ignored.
+      throwIfCancelled();
       if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
     }
   }

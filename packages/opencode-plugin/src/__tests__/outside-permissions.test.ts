@@ -226,6 +226,29 @@ describe("engine outside-access asks", () => {
     expect(await withOutsidePermissions({}, {}, async () => commandAsk)).toBe(commandAsk);
   });
 
+  test("OpenCode 1 cancellation while the prompt is pending never sends the approved write", async () => {
+    // OpenCode 1 cancels a call through its own ToolContext.abort; there is
+    // no Effect signal.
+    const call = new AbortController();
+    const send = mock(async (_args: Record<string, unknown>) => ask("write"));
+    await expect(
+      withOutsidePermissions(
+        {
+          abort: call.signal,
+          ask: async () => {
+            call.abort();
+          },
+        },
+        { path: "/outside/file", content: "late" },
+        send,
+        false,
+        "write",
+      ),
+    ).rejects.toThrow(/abort/i);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[0]).not.toHaveProperty("permissions_granted");
+  });
+
   test("cancellation during approval never sends the approved retry", async () => {
     const abort = new AbortController();
     const send = mock(async () => ask("cancelled"));

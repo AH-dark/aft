@@ -170,4 +170,52 @@ describe("engine outside-access asks", () => {
     ).rejects.toThrow();
     expect(send).toHaveBeenCalledTimes(1);
   });
+
+  test("cancelling the tool call while a confirmation is pending stops the approved write", async () => {
+    // The extension context has no signal of its own: only the signal Pi
+    // passes to this call's execute can cancel it.
+    const sends: Array<Record<string, unknown>> = [];
+    const bridge = {
+      toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
+        sends.push(structuredClone(args));
+        return sends.length === 1 ? ask("write") : { success: true, text: "written" };
+      },
+    } as unknown as AftProjectTransport;
+    const call = new AbortController();
+    const extCtx = context(async () => {
+      call.abort();
+      return true;
+    });
+    let registered: ToolDefinition | undefined;
+    const pi = bindToolRegistrationFunnel(
+      {
+        registerTool: (tool: ToolDefinition) => {
+          registered = tool;
+        },
+      } as unknown as ExtensionAPI,
+      { config: {} } as unknown as PluginContext,
+      "pi",
+    );
+    pi.registerTool({
+      name: "test_write",
+      label: "write",
+      description: "fixture",
+      parameters: Type.Object({}),
+      execute: async (_id, _params, _signal, _update, ctx) => {
+        const result = await callToolCallForSession(
+          bridge,
+          "write",
+          { path: "/outside/file", content: "late" },
+          "captured",
+          ctx,
+        );
+        return { content: [{ type: "text" as const, text: result.text }], details: {} };
+      },
+    });
+    if (!registered) throw new Error("tool not registered");
+    const outcome = registered.execute("call", {}, call.signal, undefined, extCtx);
+    await expect(outcome).rejects.toThrow(/abort/i);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).not.toHaveProperty("permissions_granted");
+  });
 });

@@ -64,6 +64,7 @@ import {
   resolveSessionId,
   textResult,
   withHostPermissionGrants,
+  withOutsidePermissionOperation,
 } from "./_shared.js";
 import { asString, collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
@@ -862,7 +863,11 @@ export function registerBashTool(
       let usedHostFallback = false;
       let response: Record<string, unknown>;
       try {
-        response = await callBashWithPermissionLoop(
+        // Pi registers this tool directly as well as through the funnel, so
+        // bind the call's own cancellation signal here: an outside-access
+        // prompt for this call stops on it.
+        response = await withOutsidePermissionOperation(() =>
+          callBashWithPermissionLoop(
           bridge,
           {
             command: bridgeCommand,
@@ -901,6 +906,8 @@ export function registerBashTool(
             },
           },
           isPowerShell ? "powershell" : "bash",
+          ),
+          signal,
         );
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);

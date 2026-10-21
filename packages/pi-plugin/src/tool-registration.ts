@@ -241,8 +241,9 @@ export function bindToolRegistrationFunnel(
     originalRegisterTool({
       ...prepared,
       execute(toolCallId, params, signal, onUpdate, context) {
-        return withOutsidePermissionOperation(() =>
-          prepared.execute(toolCallId, params, signal, onUpdate, context),
+        return withOutsidePermissionOperation(
+          () => prepared.execute(toolCallId, params, signal, onUpdate, context),
+          signal,
         );
       },
     } as ToolDefinition<TParams, TDetails, TState>);
