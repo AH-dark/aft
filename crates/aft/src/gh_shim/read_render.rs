@@ -1040,7 +1040,18 @@ fn select_fields(value: &Value, fields: &str) -> Value {
     Value::Object(selected)
 }
 
-// Windows jq can translate LF to CRLF in text mode; gh's --jq output uses LF everywhere.
+// Probe first so older Windows jq builds can use text-mode normalization.
+#[cfg(windows)]
+fn jq_supports_binary(executable: &Path) -> bool {
+    Command::new(executable)
+        .env_clear()
+        .args(["--binary", "--version"])
+        .output()
+        .is_ok_and(|result| result.status.success())
+}
+
+// Text-mode jq doubles CR before LF; removing only the extra CR preserves data CRLF.
+#[cfg(windows)]
 fn normalize_jq_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     for &byte in bytes {
@@ -1059,8 +1070,16 @@ fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Resul
         // credentials and network are not involved in rendering a JSON value.
         let executable = which::which("jq")
             .map_err(|error| failed(format!("--jq needs the local jq executable: {error}")))?;
-        let mut child = Command::new(executable)
-            .env_clear()
+        // On Windows, use jq's --binary mode when available; otherwise normalize its output.
+        #[cfg(windows)]
+        let binary_mode = jq_supports_binary(&executable);
+        let mut command = Command::new(executable);
+        command.env_clear();
+        #[cfg(windows)]
+        if binary_mode {
+            command.arg("--binary");
+        }
+        let mut child = command
             .args(["-r", "--", filter])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1082,10 +1101,14 @@ fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Resul
             return Err(failed(String::from_utf8_lossy(&result.stderr).into_owned()));
         }
         written.map_err(|error| failed(error.to_string()))?;
-        // Keep filter output byte-for-byte except for CR bytes paired with LF.
-        let stdout = normalize_jq_newlines(&result.stdout);
+        #[cfg(windows)]
+        let normalized_stdout = (!binary_mode).then(|| normalize_jq_newlines(&result.stdout));
+        #[cfg(windows)]
+        let stdout = normalized_stdout.as_deref().unwrap_or(&result.stdout);
+        #[cfg(not(windows))]
+        let stdout = result.stdout.as_slice();
         output
-            .write_all(&stdout)
+            .write_all(stdout)
             .map_err(|error| failed(error.to_string()))?;
     } else {
         output
@@ -1551,12 +1574,12 @@ impl<W: Write> Write for LogFormatter<'_, W> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod newline_tests {
     use super::normalize_jq_newlines;
 
     #[test]
-    fn jq_crlf_is_normalized_without_changing_other_bytes() {
-        assert_eq!(normalize_jq_newlines(b"A\r\nB\nC\r"), b"A\nB\nC\r");
+    fn text_mode_normalization_preserves_data_crlf() {
+        assert_eq!(normalize_jq_newlines(b"A\r\r\nB\r\n"), b"A\r\nB\n");
     }
 }

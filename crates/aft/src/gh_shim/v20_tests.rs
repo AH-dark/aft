@@ -59,20 +59,24 @@ impl Drop for TestJqPathGuard {
     }
 }
 
-fn write_crlf_jq_fixture(directory: &std::path::Path) {
+fn write_jq_fixture(directory: &std::path::Path) {
     #[cfg(windows)]
-    std::fs::write(
-        directory.join("jq.cmd"),
-        "@echo off\r\nmore >nul\r\necho A change\r\n",
-    )
-    .unwrap();
+    {
+        // Model text-mode jq output and an older jq that lacks the binary flag.
+        std::fs::write(directory.join("output.bin"), b"A\r\r\nB\r\n").unwrap();
+        std::fs::write(
+            directory.join("jq.cmd"),
+            "@echo off\r\nif \"%~1\"==\"--binary\" exit /b 2\r\nmore >nul\r\ntype \"%~dp0\\output.bin\"\r\n",
+        )
+        .unwrap();
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
         let jq = directory.join("jq");
-        std::fs::write(&jq, "#!/bin/sh\ncat >/dev/null\nprintf 'A change\\r\\n'\n").unwrap();
+        std::fs::write(&jq, "#!/bin/sh\ncat >/dev/null\nprintf 'A\\r\\nB\\n'\n").unwrap();
         let mut permissions = std::fs::metadata(&jq).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(jq, permissions).unwrap();
@@ -507,7 +511,7 @@ fn v20_signed_read_class_cannot_add_unknown_rows_or_change_v19_writes() {
 fn v20_native_json_aliases_and_jq_render_from_constrained_gets() {
     let _env_lock = crate::test_env::process_env_lock();
     let jq_dir = tempfile::tempdir().unwrap();
-    write_crlf_jq_fixture(jq_dir.path());
+    write_jq_fixture(jq_dir.path());
     let _jq_path = TestJqPathGuard::prepend(jq_dir.path());
 
     let (value, requests, _) = run_json(
@@ -566,11 +570,11 @@ fn v20_native_json_aliases_and_jq_render_from_constrained_gets() {
     let mut output = Vec::new();
     render::run(
         &plan,
-        &mut |_| Ok(reply(json!({"number":42,"title":"A change"}))),
+        &mut |_| Ok(reply(json!({"number":42,"title":"A\r\nB"}))),
         &mut output,
     )
     .unwrap();
-    assert_eq!(output, b"A change\n");
+    assert_eq!(output, b"A\r\nB\n");
 }
 
 #[test]
