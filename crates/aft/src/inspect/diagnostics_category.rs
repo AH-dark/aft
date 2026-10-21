@@ -314,6 +314,7 @@ pub(crate) fn run_diagnostics_category(
             scoped
                 .as_ref()
                 .map(|(candidates, _)| candidates.files.as_slice()),
+            sweep.as_ref(),
         )
     };
     collection.indexing_gaps = indexing_gaps
@@ -518,6 +519,7 @@ fn collect_warm_working_set(
     expected_producers: &[ServerKey],
     scope_producers: Option<&HashSet<ServerKey>>,
     scoped_files: Option<&[PathBuf]>,
+    sweep: Option<&ScopedSweep>,
 ) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
@@ -532,6 +534,11 @@ fn collect_warm_working_set(
                 .as_ref()
                 .is_some_and(|files| files.contains(&file))
     };
+    let replaced_by_typescript_request = |server: &ServerKey, file: &Path| {
+        sweep
+            .and_then(|sweep| sweep.typescript_reports.get(file))
+            .is_some_and(|(key, _)| key == server)
+    };
     {
         let mut lsp = ctx.lsp();
         // Live language-server diagnostics come from queued events and the
@@ -541,8 +548,10 @@ fn collect_warm_working_set(
         collection.server_ran = lsp.has_any_diagnostic_reports();
         collection.producer_reports = lsp
             .authoritative_diagnostic_reports()
-            .filter(|(_, file, _)| {
-                accepts_file(file) && !tsconfig_membership.should_skip_diagnostics(file)
+            .filter(|(server, file, _)| {
+                !replaced_by_typescript_request(server, file)
+                    && accepts_file(file)
+                    && !tsconfig_membership.should_skip_diagnostics(file)
             })
             .map(|(server, file, diagnostics)| {
                 (
@@ -638,13 +647,40 @@ fn collect_warm_working_set(
         collection.producers_settled =
             !producers.is_empty() && collection.servers_pending.is_empty();
         collection.diagnostics = lsp
-            .get_all_diagnostics_with_provisional()
-            .into_iter()
-            .map(|(diagnostic, provisional)| CollectedDiagnostic {
-                diagnostic: diagnostic.clone(),
-                provisional,
+            .current_diagnostic_reports()
+            .filter(|(server, file, _)| !replaced_by_typescript_request(server, file))
+            .flat_map(|(_, _, entry)| {
+                entry
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| CollectedDiagnostic {
+                        diagnostic: diagnostic.clone(),
+                        provisional: entry.provisional,
+                    })
             })
             .collect();
+    }
+
+    if let Some(sweep) = sweep {
+        for (file, (server, result)) in &sweep.typescript_reports {
+            if !accepts_file(file) || tsconfig_membership.should_skip_diagnostics(file) {
+                continue;
+            }
+            if let Ok(diagnostics) = result {
+                let rows = diagnostics
+                    .iter()
+                    .map(|diagnostic| CollectedDiagnostic {
+                        diagnostic: diagnostic.clone(),
+                        provisional: false,
+                    })
+                    .collect::<Vec<_>>();
+                collection.server_ran = true;
+                collection.diagnostics.extend(rows.clone());
+                collection
+                    .producer_reports
+                    .push((server_id(server), file.clone(), rows));
+            }
+        }
     }
 
     collection.diagnostics.retain(|diagnostic| {
@@ -948,6 +984,23 @@ impl DiagnosticsCollection {
             } else {
                 scoped_file_coverage(ctx, &snapshot.config, file)
             };
+            if let Some((key, result)) = sweep
+                .filter(|_| !matches!(coverage, ScopedFileCoverage::ExcludedByTsconfig))
+                .and_then(|sweep| sweep.typescript_reports.get(file))
+            {
+                if let Err(failure) = result {
+                    self.scope_coverage_gaps.push(ScopedCoverageGap {
+                        file: file.clone(),
+                        reason: "the reporting LSP server has not answered the diagnostics request for this file",
+                        cause: CoverageCause {
+                            producer: Some(server_id(key)), root: Some(key.root.clone()), reason: failure.to_string(),
+                        },
+                    });
+                }
+                // A successful synchronous answer certifies this file even if
+                // its last push was empty, partial, or has not arrived yet.
+                continue;
+            }
             // A report published while `cargo check` was still running lacks
             // the compiler's errors, so it cannot certify the file.
             let checking = sweep.and_then(|sweep| {
@@ -974,12 +1027,12 @@ impl DiagnosticsCollection {
                 });
                 continue;
             }
-            // In pull mode Rust pushes only compiler results. Even an
-            // authoritative push cannot answer a native analysis request that
-            // failed during this sweep, so preserve that file's obligation.
+            // Rust pushes in pull mode carry only compiler results, and
+            // TypeScript pushes can carry only syntax results. Neither answers
+            // an explicit diagnostics request that failed during this sweep.
             if let Some((key, reason)) = sweep
                 .and_then(|sweep| sweep.unanswered.get(file))
-                .filter(|(key, _)| key.kind == ServerKind::Rust)
+                .filter(|(key, _)| matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript))
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
                     file: file.clone(),
@@ -1596,7 +1649,8 @@ mod payload_count_tests {
             kind,
             root: PathBuf::from("/repo"),
         });
-        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None, None);
+        let collection =
+            super::collect_warm_working_set(&ctx, &snapshot(), &expected, None, None, None);
         assert!(!collection.is_complete());
         let payload = collection.into_payload(&snapshot());
         assert!(payload["errors"].is_null(), "{payload:#}");
@@ -1630,15 +1684,109 @@ mod payload_count_tests {
                 .publish_with_kind(ServerKind::Rust, file.clone(), vec![diagnostic]);
         }
         let files = [outside.clone()];
-        let scoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files));
+        let scoped =
+            super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files), None);
         assert_eq!(scoped.diagnostics.len(), 1);
         assert_eq!(scoped.diagnostics[0].diagnostic.file, outside);
         assert_eq!(scoped.producer_reports.len(), 1);
         assert_eq!(scoped.producer_reports[0].1, outside);
 
-        let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None);
+        let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None, None);
         assert!(unscoped.diagnostics.is_empty());
         assert!(unscoped.producer_reports.is_empty());
+    }
+
+    fn typescript_sync_exclusion_fixture() -> (
+        tempfile::TempDir,
+        crate::context::AppContext,
+        InspectSnapshot,
+        PathBuf,
+        PathBuf,
+        crate::inspect::scoped_diagnostics_sweep::ScopedSweep,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let configured = root.join("configured");
+        let external = root.join("external");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            external.join("tsconfig.json"),
+            r#"{"include":["included.ts"]}"#,
+        )
+        .unwrap();
+        let included = external.join("included.ts");
+        let excluded = external.join("excluded.ts");
+        let mut sweep = crate::inspect::scoped_diagnostics_sweep::ScopedSweep::default();
+        for file in [&included, &excluded] {
+            std::fs::write(file, "export const broken: number = \"wrong\";\n").unwrap();
+            let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
+            diagnostic.file = file.clone();
+            sweep.typescript_reports.insert(
+                file.clone(),
+                (
+                    ServerKey {
+                        kind: ServerKind::TypeScript,
+                        root: external.clone(),
+                    },
+                    Ok(vec![diagnostic]),
+                ),
+            );
+        }
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let snapshot = InspectSnapshot::new(
+            configured.clone(),
+            configured.join(".aft"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        (temp, ctx, snapshot, included, excluded, sweep)
+    }
+
+    #[test]
+    fn typescript_sync_excluded_external_report_keeps_exclusion_gap() {
+        let (_temp, ctx, snapshot, included, excluded, mut sweep) =
+            typescript_sync_exclusion_fixture();
+        sweep.typescript_reports.remove(&included);
+        let files = [excluded.clone()];
+        let mut collected =
+            super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
+        collected.record_scope_coverage_gaps(&ctx, &snapshot, &files, Some(&sweep));
+        assert_eq!(collected.scope_coverage_gaps.len(), 1);
+        assert_eq!(collected.scope_coverage_gaps[0].file, excluded);
+        assert_eq!(
+            collected.scope_coverage_gaps[0].reason,
+            "the file is excluded from diagnostics by its tsconfig"
+        );
+        assert!(collected.diagnostics.is_empty());
+        assert!(collected.producer_reports.is_empty());
+    }
+
+    #[test]
+    fn typescript_sync_membership_keeps_producer_counts_equal_to_diagnostic_totals() {
+        let (_temp, ctx, snapshot, included, excluded, sweep) = typescript_sync_exclusion_fixture();
+        let files = [included, excluded];
+        let collected =
+            super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
+        assert_eq!(collected.diagnostics.len(), 1);
+        assert_eq!(
+            collected
+                .producer_reports
+                .iter()
+                .map(|(_, _, rows)| rows.len())
+                .sum::<usize>(),
+            collected.diagnostics.len()
+        );
+        let payload = collected.into_payload(&snapshot);
+        assert_eq!(payload["errors"], 1, "{payload:#}");
+        assert_eq!(
+            payload["by_producer"]["typescript"]["errors"], payload["errors"],
+            "{payload:#}"
+        );
+        assert_eq!(payload["items"].as_array().unwrap().len(), 1, "{payload:#}");
     }
 
     #[test]

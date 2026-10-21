@@ -22,6 +22,8 @@ use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::PullFileOutcome;
 use crate::lsp::registry::{servers_for_file, ServerKind};
 use crate::lsp::roots::ServerKey;
+use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
+use crate::lsp::typescript_diagnostics::CertificationFailure;
 
 /// The maximum number of scoped files one inspect opens for analysis. Opening a document
 /// makes the server hold and analyze it, so a scope over a whole large tree
@@ -71,6 +73,16 @@ pub(crate) fn producer_keys_for_file(
 /// cause and the summary can say how many files were examined.
 #[derive(Debug, Default)]
 pub(crate) struct ScopedSweep {
+    /// Keep certified TypeScript reports local to this inspect: later partial
+    /// pushes must not replace them, and these explicit requests must not change
+    /// the warm status bar's counts.
+    pub(crate) typescript_reports: HashMap<
+        PathBuf,
+        (
+            ServerKey,
+            Result<Vec<StoredDiagnostic>, CertificationFailure>,
+        ),
+    >,
     /// Scoped files that at least one running producer handles.
     pub(crate) eligible: usize,
     /// The eligible files themselves, so the summary can count how many of
@@ -155,10 +167,15 @@ pub(crate) fn sweep_scoped_files(
 
     // The cap applies to the file iterator: files past it are only counted
     // and attributed, never opened.
+    let mut tsconfig_membership = TsconfigMembershipCache::new();
     let mut eligible = candidates.iter().filter_map(|file| {
         let keys = producer_keys_for_file(file, config, project_root)
             .into_iter()
-            .filter(|key| producers.contains(key))
+            .filter(|key| {
+                producers.contains(key)
+                    && (key.kind != ServerKind::TypeScript
+                        || !tsconfig_membership.should_skip_diagnostics(file))
+            })
             .collect::<Vec<_>>();
         (!keys.is_empty()).then(|| (file.clone(), keys))
     });
@@ -201,6 +218,7 @@ pub(crate) fn sweep_scoped_files(
     let mut retry_pulls: Vec<(PathBuf, ServerKey, Option<u64>, String)> = Vec::new();
     for window in selected.chunks(PULL_WINDOW) {
         let mut in_flight = Vec::new();
+        let mut typescript_in_flight = Vec::new();
         for (file, keys) in window {
             if Instant::now() >= deadline || cancellation_requested() {
                 for key in keys {
@@ -253,6 +271,17 @@ pub(crate) fn sweep_scoped_files(
                 // a report newer than whatever was stored before (a `cargo
                 // check` result, or an older analysis).
                 let pulls = lsp.server_supports_pull(&key);
+                if key.kind == ServerKind::TypeScript && !pulls {
+                    match lsp.begin_scoped_typescript_diagnostics(&key, file, deadline) {
+                        Ok(request) => typescript_in_flight.push((file.clone(), key, request)),
+                        Err(error) => {
+                            sweep
+                                .typescript_reports
+                                .insert(file.clone(), (key, Err(error.into())));
+                        }
+                    }
+                    continue;
+                }
                 let repull_open = pulls && key.kind == ServerKind::Rust;
                 if was_open && !repull_open && lsp.has_diagnostic_report_for_server_file(&key, file)
                 {
@@ -284,6 +313,11 @@ pub(crate) fn sweep_scoped_files(
                     }
                 }
             }
+        }
+        for (file, key, request) in typescript_in_flight {
+            let reply = request.wait();
+            let result = ctx.lsp().finish_scoped_typescript_diagnostics(reply);
+            sweep.typescript_reports.insert(file, (key, result));
         }
         for (file, key, epoch_before, pull) in in_flight {
             let pull = pull.wait();

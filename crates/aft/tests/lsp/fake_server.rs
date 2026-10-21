@@ -894,6 +894,65 @@ pub(crate) fn main() -> io::Result<()> {
                         write_response(&mut writer, id, Value::Null)?;
                     }
                 }
+                "workspace/executeCommand" => {
+                    let params = params.as_ref().unwrap();
+                    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_TYPESCRIPT_SYNC_LOG") {
+                        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                        writeln!(log, "{params}")?;
+                    }
+                    let args = &params["arguments"];
+                    let command = args[0].as_str().unwrap_or_default();
+                    let mode = std::env::var("AFT_FAKE_LSP_TYPESCRIPT_SYNC").unwrap_or_default();
+                    if mode == "timeout" {
+                        continue;
+                    }
+                    if mode == "unsupported" {
+                        write_json_message(&mut writer, &json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32601, "message": "unsupported command" }
+                        }))?;
+                        continue;
+                    }
+                    assert_eq!(params["command"], "typescript.tsserverRequest");
+                    assert_eq!(args[1]["includeLinePosition"], true);
+                    assert_eq!(args[2]["executionTarget"], 0);
+                    if mode == "malformed" {
+                        write_response(&mut writer, id, Value::Null)?;
+                        continue;
+                    }
+                    if mode == "categories" {
+                        let category = match command {
+                            "syntacticDiagnosticsSync" => "error",
+                            "semanticDiagnosticsSync" => "warning",
+                            "suggestionDiagnosticsSync" => "suggestion",
+                            _ => panic!("unexpected diagnostics command: {command}"),
+                        };
+                        write_response(&mut writer, id, json!({
+                            "type": "response", "command": command, "success": true,
+                            "body": [{ "startLocation": { "line": 1, "offset": 1 },
+                                "endLocation": { "line": 1, "offset": 3 },
+                                "category": category, "code": 1000, "message": command }]
+                        }))?;
+                        continue;
+                    }
+                    let diagnostics = if command == "semanticDiagnosticsSync" && mode != "clean" {
+                        opened_diagnostics().as_array().unwrap().iter().map(|d| json!({
+                            "startLocation": {
+                                "line": d["range"]["start"]["line"].as_u64().unwrap() + 1,
+                                "offset": d["range"]["start"]["character"].as_u64().unwrap() + 1
+                            },
+                            "endLocation": {
+                                "line": d["range"]["end"]["line"].as_u64().unwrap() + 1,
+                                "offset": d["range"]["end"]["character"].as_u64().unwrap() + 1
+                            },
+                            "message": d["message"], "code": d["code"], "source": d["source"],
+                            "category": if d["severity"] == 1 { "error" } else { "warning" }
+                        })).collect::<Vec<_>>()
+                    } else { Vec::new() };
+                    write_response(&mut writer, id, json!({
+                        "type": "response", "command": command, "success": true, "body": diagnostics
+                    }))?;
+                }
                 "rust-analyzer/reloadWorkspace" => {
                     // rust-analyzer answers once the reload is queued, then
                     // reports the load through server status.
@@ -1358,6 +1417,17 @@ pub(crate) fn main() -> io::Result<()> {
                         uri.clone(),
                         version.clone(),
                     )?;
+                    if std::env::var_os("AFT_FAKE_LSP_TYPESCRIPT_SYNC").is_some() {
+                        // TypeScript can publish syntax diagnostics before its
+                        // semantic pass. Only the explicit request certifies
+                        // that all diagnostic categories have been collected.
+                        write_publish_diagnostics(&mut writer, uri.clone(), json!([]))?;
+                        if std::env::var("AFT_FAKE_LSP_TYPESCRIPT_SYNC").as_deref() == Ok("empty_then_real") {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            write_publish_diagnostics(&mut writer, uri.clone(), opened_diagnostics())?;
+                        }
+                        continue;
+                    }
                     // AFT_FAKE_LSP_OPEN_PUBLISH_DELAY_MS=<ms>: publish an opened
                     // document's diagnostics late, as a server that analyzes
                     // in the background (tsserver) does.
