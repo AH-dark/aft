@@ -10,7 +10,7 @@ use rusqlite::OptionalExtension;
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
 use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome};
 use crate::callgraph_store::join::CallgraphBlob;
-use crate::path_status::PathStatusStore;
+use crate::path_status::{PathStatusStore, SkipReason};
 use crate::pins::AssemblyPin;
 
 use super::{
@@ -304,6 +304,7 @@ pub fn prepare_checkout_deferring(
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
     let mut pending_inputs = BTreeMap::new();
+    let mut fresh_skips = Vec::new();
     let mut candidates = Vec::with_capacity(head.len());
 
     for tracked in head {
@@ -416,6 +417,17 @@ pub fn prepare_checkout_deferring(
                     .transpose()?
                     .map_or((None, None), |(key, payload)| (Some(key), payload));
                 let callgraph_key = key.as_ref().map(FullKey::to_hex);
+                if language.is_some() {
+                    // Freshly read content decides whether the call graph
+                    // skips this member; reused members keep their record.
+                    let non_utf8 = request.callgraph
+                        && !resolution_input
+                        && std::str::from_utf8(&source).is_err();
+                    fresh_skips.push((
+                        tracked.rel_path.clone(),
+                        non_utf8.then_some(SkipReason::NonUtf8Source),
+                    ));
+                }
                 // Only a new payload can seed an alias. Cached or read-only
                 // candidates need neither their source bytes nor tracked row.
                 let needs_source = payload.is_some() && request.allow_blob_put;
@@ -612,6 +624,25 @@ pub fn prepare_checkout_deferring(
             request.project_root.display()
         );
     }
+    // Skips describe members of the generation, so they are recorded only
+    // when a complete generation is assembled, and dropped for paths that
+    // are no longer members.
+    status
+        .record_skips(
+            fresh_skips
+                .iter()
+                .map(|(path, reason)| (path.as_slice(), *reason)),
+            generation_number(&next_generation),
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let members = candidates
+        .iter()
+        .map(|candidate| candidate.path.as_bytes())
+        .collect::<std::collections::HashSet<_>>();
+    status
+        .retain_skips(|path| members.contains(path))
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    drop(members);
     timing.phase("path_status");
     prepared.report.pending_paths = semantic_pending_paths;
 
@@ -1459,9 +1490,12 @@ fn missing_callgraph_payload(
     let blob = if resolution_input {
         CallgraphBlob::config(source.to_vec(), crate::views::callgraph::PRODUCER)
     } else {
+        // A source that is not valid UTF-8 cannot be parsed. Failing here
+        // would fail the whole publication, so it gets the call graph of an
+        // empty file instead: no symbols, like the legacy call graph, which
+        // leaves unreadable files out. Assembly records the path as skipped.
         CallgraphBlob::extract(
-            std::str::from_utf8(source)
-                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
+            std::str::from_utf8(source).unwrap_or(""),
             language,
             crate::views::callgraph::PRODUCER,
         )

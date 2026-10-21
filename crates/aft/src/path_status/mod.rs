@@ -13,10 +13,49 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 /// Maximum paths included in a refresh-status response; counts include paths beyond this limit.
 pub const VISIBLE_PATH_CAP: usize = 20;
 
+/// Maximum skipped paths named in a status summary; the per-reason counts
+/// include paths beyond this limit.
+pub const SKIPPED_PATH_SAMPLE_CAP: usize = 5;
+
+/// Why a view member was published without one of its derived planes.
+///
+/// A skip is a terminal state, not a problem state: the path is in the
+/// generation, the view is complete, and no later work will change the
+/// outcome until the file's content changes. It is recorded so status can say
+/// which members a plane left out instead of hiding them. Skips live in their
+/// own table and never count as pending or failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum SkipReason {
+    /// The file is in a call-graph language but is not valid UTF-8, so the
+    /// parser cannot read it. It is published with an empty call graph, the
+    /// way the legacy call graph leaves such files out.
+    NonUtf8Source,
+}
+
+impl SkipReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NonUtf8Source => "non_utf8_source",
+        }
+    }
+}
+
+/// One skipped member named in a status summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathSkip {
+    pub rel_path: Vec<u8>,
+    pub reason: String,
+}
+
 const PATH_STATUS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS path_status (
     rel_path BLOB NOT NULL PRIMARY KEY,
     state TEXT NOT NULL CHECK(state IN ('pending', 'failed')),
+    reason TEXT NOT NULL,
+    since_generation INTEGER NOT NULL CHECK(since_generation >= 0)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS path_skips (
+    rel_path BLOB NOT NULL PRIMARY KEY,
     reason TEXT NOT NULL,
     since_generation INTEGER NOT NULL CHECK(since_generation >= 0)
 ) WITHOUT ROWID;
@@ -78,6 +117,10 @@ pub struct PathStatusSummary {
     pub pending_count: usize,
     pub failed_count: usize,
     pub paths: Vec<PathStatus>,
+    /// Skipped members by reason. Skips are not counted as pending or failed.
+    pub skipped_by_reason: std::collections::BTreeMap<String, usize>,
+    /// At most `SKIPPED_PATH_SAMPLE_CAP` skipped members, bytewise ordered.
+    pub skipped_sample: Vec<PathSkip>,
 }
 
 #[derive(Debug)]
@@ -383,11 +426,107 @@ impl PathStatusStore {
             .map(Self::decode_row)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut by_reason = self
+            .connection
+            .prepare("SELECT reason, COUNT(*) FROM path_skips GROUP BY reason ORDER BY reason")?;
+        let skipped_by_reason = by_reason
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .map(|row| {
+                let (reason, count) = row?;
+                let count = usize::try_from(count)
+                    .map_err(|_| PathStatusError::InvalidGeneration(count))?;
+                Ok((reason, count))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, PathStatusError>>()?;
+        let mut sample = self
+            .connection
+            .prepare("SELECT rel_path, reason FROM path_skips ORDER BY rel_path LIMIT ?1")?;
+        let skipped_sample = sample
+            .query_map(params![SKIPPED_PATH_SAMPLE_CAP as i64], |row| {
+                Ok(PathSkip {
+                    rel_path: row.get(0)?,
+                    reason: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(PathStatusSummary {
             pending_count,
             failed_count,
             paths,
+            skipped_by_reason,
+            skipped_sample,
         })
+    }
+
+    /// Records what a publication learned about members it read afresh: a
+    /// path with `Some(reason)` is skipped by a plane, a path with `None` is
+    /// not (any earlier skip is removed), all in one transaction. Members the
+    /// publication reused unread keep their rows, since their content, and so
+    /// their outcome, did not change.
+    pub(crate) fn record_skips<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = (&'a [u8], Option<SkipReason>)>,
+        since_generation: u64,
+    ) -> Result<(), PathStatusError> {
+        let generation = i64::try_from(since_generation)
+            .map_err(|_| PathStatusError::GenerationOutOfRange(since_generation))?;
+        let transaction = self.connection.transaction()?;
+        {
+            let mut upsert = transaction.prepare_cached(
+                "INSERT INTO path_skips (rel_path, reason, since_generation)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(rel_path) DO UPDATE SET
+                     reason = excluded.reason,
+                     since_generation = CASE
+                         WHEN path_skips.reason = excluded.reason
+                             THEN path_skips.since_generation
+                         ELSE excluded.since_generation
+                     END",
+            )?;
+            let mut delete =
+                transaction.prepare_cached("DELETE FROM path_skips WHERE rel_path = ?1")?;
+            for (path, reason) in rows {
+                match reason {
+                    Some(reason) => upsert.execute(params![path, reason.as_str(), generation])?,
+                    None => delete.execute(params![path])?,
+                };
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Removes skip rows for paths that are no longer view members, and
+    /// returns how many were removed.
+    pub(crate) fn retain_skips(
+        &mut self,
+        is_member: impl Fn(&[u8]) -> bool,
+    ) -> Result<usize, PathStatusError> {
+        let transaction = self.connection.transaction()?;
+        let stale = {
+            let mut skipped = transaction.prepare_cached("SELECT rel_path FROM path_skips")?;
+            let rows = skipped.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut stale = Vec::new();
+            for row in rows {
+                let path = row?;
+                if !is_member(&path) {
+                    stale.push(path);
+                }
+            }
+            stale
+        };
+        {
+            let mut delete =
+                transaction.prepare_cached("DELETE FROM path_skips WHERE rel_path = ?1")?;
+            for path in &stale {
+                delete.execute(params![path])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(stale.len())
     }
 
     fn upsert(
@@ -664,6 +803,8 @@ mod tests {
                 pending_count: 0,
                 failed_count: 0,
                 paths: Vec::new(),
+                skipped_by_reason: Default::default(),
+                skipped_sample: Vec::new(),
             }
         );
         for index in 0..25 {
@@ -778,5 +919,48 @@ mod tests {
             PathState::Failed
         );
         assert_eq!(store.clear_pending_except(&keep).unwrap(), 0);
+    }
+
+    #[test]
+    fn skips_are_counted_by_reason_apart_from_pending_and_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        store.mark_pending(b"waiting.rs", "scheduled", 1).unwrap();
+        let names = (0..7)
+            .map(|index| format!("latin1_{index}.py").into_bytes())
+            .collect::<Vec<_>>();
+        store
+            .record_skips(
+                names
+                    .iter()
+                    .map(|name| (name.as_slice(), Some(SkipReason::NonUtf8Source))),
+                2,
+            )
+            .unwrap();
+
+        let summary = store.summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (1, 0));
+        assert_eq!(
+            summary.skipped_by_reason,
+            std::collections::BTreeMap::from([("non_utf8_source".to_string(), 7)])
+        );
+        assert_eq!(summary.skipped_sample.len(), SKIPPED_PATH_SAMPLE_CAP);
+        assert_eq!(summary.skipped_sample[0].rel_path, b"latin1_0.py");
+        assert_eq!(summary.skipped_sample[0].reason, "non_utf8_source");
+
+        // A fresh read that decodes clears the skip; a non-member's skip is
+        // removed by membership.
+        store
+            .record_skips([(b"latin1_0.py".as_slice(), None)], 3)
+            .unwrap();
+        assert_eq!(
+            store
+                .retain_skips(|path| path != b"latin1_1.py".as_slice())
+                .unwrap(),
+            1
+        );
+        let summary = store.summary().unwrap();
+        assert_eq!(summary.skipped_by_reason["non_utf8_source"], 5);
+        assert_eq!(summary.skipped_sample[0].rel_path, b"latin1_2.py");
     }
 }

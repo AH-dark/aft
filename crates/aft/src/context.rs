@@ -884,9 +884,25 @@ pub struct ViewHealthSnapshot {
     pub pinned: bool,
     pub pending_paths: usize,
     pub failed_paths: usize,
+    /// Members published without one of their derived planes, by reason (for
+    /// example a source the call graph cannot decode). They count as neither
+    /// pending nor failed: the view is complete, and status names them so the
+    /// omission is visible.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped_paths: BTreeMap<String, usize>,
+    /// Up to `path_status::SKIPPED_PATH_SAMPLE_CAP` skipped members, bytewise
+    /// ordered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_path_sample: Vec<ViewSkippedPath>,
     /// Graph-changing publications that built `derived.sqlite` cold instead of
     /// patching the current generation, by reason, since this process started.
     pub cold_builds: crate::views::assembly::ColdBuildCounts,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ViewSkippedPath {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -8489,6 +8505,23 @@ impl AppContext {
                     status.pending_count
                 }),
             failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
+            skipped_paths: status
+                .as_ref()
+                .map(|status| status.skipped_by_reason.clone())
+                .unwrap_or_default(),
+            skipped_path_sample: status
+                .as_ref()
+                .map(|status| {
+                    status
+                        .skipped_sample
+                        .iter()
+                        .map(|skip| ViewSkippedPath {
+                            path: String::from_utf8_lossy(&skip.rel_path).into_owned(),
+                            reason: skip.reason.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             cold_builds: crate::views::assembly::cold_build_counts(&state.snapshot.view_dir),
         })
     }

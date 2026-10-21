@@ -11647,6 +11647,97 @@ mod tests {
         assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
     }
 
+    /// A tracked source in a call-graph language that is not valid UTF-8 can
+    /// never be parsed. It must not fail the publication (which would leave
+    /// every HEAD path pending forever): it joins the generation with an
+    /// empty call graph and is reported as skipped, apart from pending and
+    /// failed, while every other file keeps its call graph.
+    #[test]
+    fn views_publication_skips_a_non_utf8_callgraph_source_and_completes() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path();
+        // 0xe9 is "é" in Latin-1 and an invalid byte in UTF-8.
+        std::fs::write(root.join("latin1.py"), b"def caf\xe9():\n    pass\n").unwrap();
+        std::fs::write(root.join("util.py"), "def helper():\n    pass\n").unwrap();
+        init_git_fixture(root);
+        let canonical_root = std::fs::canonicalize(root).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": canonical_root,
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "views": { "enabled": true },
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let health = ctx.view_health_snapshot().expect("view health");
+        assert_eq!(health.generation, 1, "{health:?}");
+        assert!(health.pinned, "{health:?}");
+        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
+        assert_eq!(
+            health.skipped_paths,
+            std::collections::BTreeMap::from([("non_utf8_source".to_string(), 1)])
+        );
+        let status = serde_json::to_value(&health).unwrap();
+        assert_eq!(status["skipped_paths"]["non_utf8_source"], json!(1));
+        assert_eq!(
+            status["skipped_path_sample"],
+            json!([{ "path": "latin1.py", "reason": "non_utf8_source" }])
+        );
+        let view = ctx.view_runtime_snapshot().expect("view runtime");
+        let manifest = view.manifest.as_ref().expect("published manifest");
+        assert!(manifest
+            .entries()
+            .any(|(path, _)| path.as_bytes() == b"latin1.py"));
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                for (file, symbol) in [("tracked.rs", "tracked"), ("util.py", "helper")] {
+                    assert!(
+                        crate::callgraph_store::CallGraphRead::node_for(
+                            &store,
+                            Path::new(file),
+                            symbol,
+                        )
+                        .is_ok(),
+                        "{file}:{symbol} left the call graph"
+                    );
+                }
+            }
+            _ => panic!("expected view callgraph reader"),
+        }
+
+        // Once the file decodes, its skip is cleared by the next publication.
+        std::fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
+        ctx.publish_view_paths(BTreeSet::from([b"latin1.py".to_vec()]), true)
+            .unwrap();
+        // Read the ledger directly: status caches its summary between reads.
+        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
+            .unwrap()
+            .summary()
+            .unwrap();
+        assert!(ledger.skipped_by_reason.is_empty(), "{ledger:?}");
+        assert!(ledger.skipped_sample.is_empty(), "{ledger:?}");
+        assert_eq!((ledger.pending_count, ledger.failed_count), (0, 0));
+    }
+
     /// While a views-on root is unbound past the grace window its semantic
     /// lane embeds nothing; after the rebind it resumes on its own and embeds
     /// only what changed, reusing every stored vector.
