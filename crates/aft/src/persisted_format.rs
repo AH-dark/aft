@@ -335,6 +335,8 @@ struct Entry {
 struct StorageRoot {
     spelling: PathBuf,
     canonical: PathBuf,
+    /// Resolve parent aliases but keep the root's own link as a logical boundary.
+    boundary: Option<PathBuf>,
 }
 
 fn absolute_route(path: &Path) -> PathBuf {
@@ -349,6 +351,8 @@ fn absolute_route(path: &Path) -> PathBuf {
 }
 
 fn canonical_scope(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    CANONICAL_PROBES.with(|count| count.set(count.get() + 1));
     let absolute = absolute_route(path);
     let resolved = crate::production_storage::canonicalized_with(&absolute, &|path| {
         std::fs::canonicalize(path).ok()
@@ -363,6 +367,10 @@ fn storage_roots() -> &'static std::sync::RwLock<Vec<std::sync::Arc<StorageRoot>
 
 #[cfg(test)]
 thread_local! { static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static CANONICAL_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static BOUNDARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 fn storage_root(path: &Path) -> std::sync::Arc<StorageRoot> {
     let spelling = absolute_route(path);
@@ -378,26 +386,58 @@ fn storage_root(path: &Path) -> std::sync::Arc<StorageRoot> {
     // under the read lock without filesystem work or a write lock.
     #[cfg(test)]
     ROOT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
-    let candidate = std::sync::Arc::new(StorageRoot {
-        canonical: canonical_scope(path),
-        spelling,
-    });
+    let canonical = canonical_scope(path);
     let mut roots = storage_roots()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(root) = roots
-        .iter()
-        .find(|root| root.spelling == candidate.spelling)
-    {
+    if let Some(root) = roots.iter().find(|root| root.spelling == spelling) {
         return root.clone();
     }
     // Bound the optimization cache, not ownership evidence. Root-scoped
     // refusals retain their own identity, and explicit root queries still use
     // the uncached identity when the cache is full.
-    if roots.len() < 128 {
-        roots.push(candidate.clone());
+    if roots.len() >= 128 {
+        drop(roots);
+        let boundary = registered_boundary(&spelling).ok();
+        return std::sync::Arc::new(StorageRoot {
+            canonical,
+            spelling,
+            boundary,
+        });
+    }
+    let (boundary, warning) = match registered_boundary(&spelling) {
+        Ok(boundary) => (Some(boundary), None),
+        Err(error) => (None, Some(error)),
+    };
+    let candidate = std::sync::Arc::new(StorageRoot {
+        canonical,
+        spelling,
+        boundary,
+    });
+    roots.push(candidate.clone());
+    drop(roots);
+    // Publish missing metadata before logging; warm calls neither retry the
+    // failed probe nor emit another warning for this registration.
+    if let Some(error) = warning {
+        crate::slog_warn!(
+            "storage-root alias boundary unavailable for {}: {error}; retaining direct routes only",
+            candidate.spelling.display()
+        );
     }
     candidate
+}
+
+/// Resolve aliases above a declared root, leaving the root's own link lexical.
+/// New cached registrations and explicit uncached queries call this once when
+/// constructing their identity; warm registration never calls it.
+fn registered_boundary(spelling: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    BOUNDARY_READS.with(|count| count.set(count.get() + 1));
+    let observed = match (spelling.parent(), spelling.file_name()) {
+        (Some(parent), Some(leaf)) => std::fs::canonicalize(parent).map(|parent| parent.join(leaf)),
+        _ => std::fs::canonicalize(spelling),
+    };
+    observed.map(|boundary| crate::inspect::job::normalize_path(&boundary))
 }
 
 /// Cache an owner's root identity, never its cache-directory targets. Warm or
@@ -429,17 +469,57 @@ impl RouteProbe {
         }
     }
 
-    fn under(&self, root: &StorageRoot) -> Option<PathBuf> {
-        let finish = |prefix: &Path| {
-            let relative = self.path.strip_prefix(prefix).ok()?;
-            let key = crate::inspect::job::normalize_path(&root.canonical.join(relative));
-            key.starts_with(&root.canonical).then_some(key)
-        };
+    fn finish(&self, root: &StorageRoot, prefix: &Path) -> Option<PathBuf> {
+        let relative = self.path.strip_prefix(prefix).ok()?;
+        let key = crate::inspect::job::normalize_path(&root.canonical.join(relative));
+        key.starts_with(&root.canonical).then_some(key)
+    }
+
+    fn direct(&self, root: &StorageRoot) -> Option<PathBuf> {
         if self.path.starts_with(&root.spelling) {
-            return finish(&root.spelling);
+            return self.finish(root, &root.spelling);
         }
         if self.path.starts_with(&root.canonical) {
-            return finish(&root.canonical);
+            return self.finish(root, &root.canonical);
+        }
+        root.boundary
+            .as_ref()
+            .filter(|boundary| self.path.starts_with(boundary))
+            .and_then(|boundary| self.finish(root, boundary))
+    }
+
+    fn alias_could_outrank(
+        &self,
+        root: &StorageRoot,
+        selected_key: &Path,
+        remaining: usize,
+    ) -> bool {
+        let Some(boundary) = root.boundary.as_ref() else {
+            return false;
+        };
+        let normalized = crate::inspect::job::normalize_path(&self.path);
+        let spelling = crate::inspect::job::normalize_path(&root.spelling);
+        let could_outrank = [normalized.as_path(), selected_key]
+            .into_iter()
+            .any(|route| {
+                [
+                    spelling.as_path(),
+                    root.canonical.as_path(),
+                    boundary.as_path(),
+                ]
+                .into_iter()
+                .any(|prefix| {
+                    route
+                        .strip_prefix(prefix)
+                        .is_ok_and(|relative| relative.components().count() < remaining)
+                })
+            });
+        could_outrank
+    }
+
+    fn under(&self, root: &StorageRoot) -> Option<PathBuf> {
+        if let Some(key) = self.direct(root) {
+            return Some(key);
         }
         // Share ancestor probes across owner candidates, but never cache them
         // beyond this comparison. The matched prefix maps to the canonical root;
@@ -454,7 +534,7 @@ impl RouteProbe {
         });
         for (prefix, canonical) in prefixes {
             if *canonical == root.canonical {
-                return finish(prefix);
+                return self.finish(root, prefix);
             }
         }
         None
@@ -470,9 +550,39 @@ fn owning_route(
     roots: &[std::sync::Arc<StorageRoot>],
 ) -> Option<(std::sync::Arc<StorageRoot>, PathBuf)> {
     let probe = RouteProbe::new(path);
+    // A floor belongs to the logical namespace used to reach an artifact.
+    // Direct lexical matches decide ownership unless a registered boundary can
+    // be more specific on that normalized route. Thus /A/semantic -> /B remains
+    // A's cache link, while B's own direct paths use B; only a registered nested
+    // boundary may challenge A through aliases. With no direct owner, resolve
+    // aliases normally so spellings above a storage root still match.
     // A deeper owner leaves fewer components below its boundary. Measure that
     // distance on the normalized comparison key, not raw alias spelling or the
     // unrelated depth of a relocated root's canonical target.
+    let direct = roots
+        .iter()
+        .filter_map(|root| {
+            let key = probe.direct(root)?;
+            let remaining = key.strip_prefix(&root.canonical).ok()?.components().count();
+            Some((remaining, root.clone(), key))
+        })
+        .min_by_key(|(remaining, _, _)| *remaining);
+    if let Some(mut selected) = direct {
+        for root in roots {
+            if probe.direct(root).is_some()
+                || !probe.alias_could_outrank(root, &selected.2, selected.0)
+            {
+                continue;
+            }
+            if let Some(key) = probe.under(root) {
+                let remaining = key.strip_prefix(&root.canonical).ok()?.components().count();
+                if remaining < selected.0 {
+                    selected = (remaining, root.clone(), key);
+                }
+            }
+        }
+        return Some((selected.1, selected.2));
+    }
     roots
         .iter()
         .filter_map(|root| {
@@ -582,10 +692,11 @@ pub fn record(refusal: &UnsupportedPersistedFormat, scope: &Path) {
             )
         };
         if let Some(existing) = entries.iter_mut().find(|entry| {
+            if entry.refusal.store != refusal.store {
+                return false;
+            }
             let (owner, entry_key) = entry_route(entry, &roots);
-            entry.refusal.store == refusal.store
-                && same_owner(owner.as_ref(), root.as_ref())
-                && entry_key == key
+            same_owner(owner.as_ref(), root.as_ref()) && entry_key == key
         }) {
             let changed = existing.refusal != *refusal;
             existing.refusal = refusal.clone();
@@ -628,11 +739,11 @@ pub fn clear(store: PersistedStore, scope: &Path) {
             |(root, key)| (Some(root), key),
         );
         entries.retain(|entry| {
+            if entry.refusal.store != store || !entry.refusal.source.is_artifact() {
+                return true;
+            }
             let (entry_owner, entry_key) = entry_route(entry, &roots);
-            !(entry.refusal.store == store
-                && entry.refusal.source.is_artifact()
-                && same_owner(entry_owner.as_ref(), owner.as_ref())
-                && entry_key == key)
+            !(same_owner(entry_owner.as_ref(), owner.as_ref()) && entry_key == key)
         })
     });
 }
@@ -691,10 +802,11 @@ pub fn refusal_covering(store: PersistedStore, path: &Path) -> Option<Unsupporte
         entries
             .iter()
             .find(|entry| {
+                if entry.refusal.store != store {
+                    return false;
+                }
                 let (entry_owner, entry_key) = entry_route(entry, &roots);
-                entry.refusal.store == store
-                    && same_owner(entry_owner.as_ref(), owner.as_ref())
-                    && key.starts_with(entry_key)
+                same_owner(entry_owner.as_ref(), owner.as_ref()) && key.starts_with(entry_key)
             })
             .map(|entry| entry.refusal.clone())
     })
@@ -870,6 +982,210 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_owner_probe(test: &str) -> bool {
+        const CHILD: &str = "AFT_TEST_DIRECT_OWNER_PROBES";
+        if std::env::var(CHILD).as_deref() != Ok(test) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, test)
+                .env("RUSTC_WRAPPER", "")
+                .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated direct-owner probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"));
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn direct_owner_gate_and_clear_do_zero_canonicalization_with_unrelated_roots() {
+        if !isolated_owner_probe("persisted_format::tests::direct_owner_gate_and_clear_do_zero_canonicalization_with_unrelated_roots") { return; }
+        let fixture = tempfile::tempdir().unwrap();
+        let a = fixture.path().join("storage-a");
+        let b = fixture.path().join("storage-b");
+        std::fs::create_dir_all(a.join("semantic/key")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let path = a.join("semantic/key/cache.bin");
+        std::fs::write(&path, b"artifact").unwrap();
+        let roots = [storage_root(&a), storage_root(&b)];
+        let store = PersistedStore::SemanticIndex;
+        let floor = UnsupportedPersistedFormat::floor(store, a.join("reader-floor.json"), 99);
+        record(&floor, &a);
+        record(
+            &UnsupportedPersistedFormat::floor(
+                PersistedStore::AftDb,
+                b.join("reader-floor.json"),
+                99,
+            ),
+            &b,
+        );
+        record(
+            &UnsupportedPersistedFormat::artifact(store, &path, 99),
+            &path,
+        );
+        CANONICAL_PROBES.with(|count| count.set(0));
+        let _ = canonical_scope(&path);
+        CANONICAL_PROBES.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "the canonicalization probe counter must observe real resolution"
+            )
+        });
+        CANONICAL_PROBES.with(|count| count.set(0));
+        let (owner, _) = owning_route(&path, &roots).unwrap();
+        assert_eq!(owner.canonical, roots[0].canonical);
+        CANONICAL_PROBES.with(|count| assert_eq!(count.get(), 0, "an unrelated registered root must not trigger ancestor resolution for a direct owner"));
+        assert_eq!(gate(store, &path, &path, Some(1)), Err(floor.clone()));
+        CANONICAL_PROBES.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "a direct floor gate must stay on the lexical fast path"
+            )
+        });
+        clear(store, &path);
+        CANONICAL_PROBES.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "clearing a direct artifact must stay on the lexical fast path"
+            )
+        });
+        assert_eq!(refusal_covering(store, &path), Some(floor));
+        let missing = a.join("missing-parent/inner");
+        BOUNDARY_READS.with(|count| count.set(0));
+        let unavailable = storage_root(&missing);
+        assert!(unavailable.boundary.is_none());
+        BOUNDARY_READS.with(|count| assert_eq!(count.get(), 1));
+        let before = CANONICAL_PROBES.with(|count| count.get());
+        let same = storage_root(&missing);
+        assert!(std::sync::Arc::ptr_eq(&unavailable, &same));
+        register_storage_root(&missing);
+        BOUNDARY_READS.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "failed boundary metadata must not be retried on warm registration"
+            )
+        });
+        CANONICAL_PROBES.with(|count| assert_eq!(count.get(), before));
+        let indirect = RouteProbe::new(&missing.join("artifact"));
+        assert!(!indirect.alias_could_outrank(
+            &unavailable,
+            &a.join("missing-parent/inner/artifact"),
+            3
+        ));
+    }
+
+    #[test]
+    fn an_unregistered_link_to_an_unrelated_registered_root_keeps_its_logical_floor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let a = fixture.path().join("storage-a");
+        let b = fixture.path().join("storage-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(b.join("key")).unwrap();
+        directory_alias(&b, &a.join("semantic"));
+        let through_a = a.join("semantic/key/cache.bin");
+        let through_b = b.join("key/cache.bin");
+        std::fs::write(&through_b, b"artifact").unwrap();
+        let store = PersistedStore::SemanticIndex;
+        let a_floor = UnsupportedPersistedFormat::floor(store, a.join("reader-floor.json"), 99);
+        let b_floor = UnsupportedPersistedFormat::floor(store, b.join("reader-floor.json"), 100);
+        record(&a_floor, &a);
+        record(&b_floor, &b);
+        assert_eq!(
+            gate(store, &through_a, &through_a, Some(1)),
+            Err(a_floor.clone())
+        );
+        assert_eq!(
+            gate(store, &through_b, &through_b, Some(1)),
+            Err(b_floor.clone())
+        );
+        assert_eq!(refusal_covering(store, &through_a), Some(a_floor.clone()));
+        assert_eq!(refusal_covering(store, &through_b), Some(b_floor.clone()));
+        assert_eq!(refusals_under(&a), vec![a_floor]);
+        assert_eq!(refusals_under(&b), vec![b_floor]);
+    }
+
+    #[test]
+    fn a_more_specific_parent_alias_boundary_beats_a_direct_outer_match() {
+        let (fixture, outer, inner, artifact) = nested_storage_roots();
+        let alias_parent = fixture.path().join("another-parent-alias");
+        directory_alias(&std::fs::canonicalize(&outer).unwrap(), &alias_parent);
+        let alias_inner = alias_parent.join("inner");
+        let store = PersistedStore::SemanticIndex;
+        let outer_floor =
+            UnsupportedPersistedFormat::floor(store, outer.join("reader-floor.json"), 99);
+        let inner_floor =
+            UnsupportedPersistedFormat::floor(store, alias_inner.join("reader-floor.json"), 100);
+        record(&outer_floor, &outer);
+        record(&inner_floor, &alias_inner);
+        assert_eq!(
+            gate(store, &artifact, &artifact, Some(1)),
+            Err(inner_floor.clone())
+        );
+        assert_eq!(refusals_under(&inner), vec![inner_floor]);
+        assert_eq!(refusals_under(&outer), vec![outer_floor]);
+    }
+
+    #[test]
+    fn uncached_nested_floor_queries_do_no_resolution_after_their_explicit_root_probe() {
+        if !isolated_owner_probe("persisted_format::tests::uncached_nested_floor_queries_do_no_resolution_after_their_explicit_root_probe") { return; }
+        let (fixture, outer, inner, _artifact) = nested_storage_roots();
+        for index in 0..140 {
+            register_storage_root(&fixture.path().join(format!("registered-{index}")));
+        }
+        assert_eq!(storage_roots().read().unwrap().len(), 128);
+        let alias_parent = fixture.path().join("another-parent-alias");
+        directory_alias(&std::fs::canonicalize(&outer).unwrap(), &alias_parent);
+        let alias_inner = alias_parent.join("inner");
+        let direct_artifact = inner.join("semantic/key/cache.bin");
+        CANONICAL_PROBES.with(|count| count.set(0));
+        BOUNDARY_READS.with(|count| count.set(0));
+        register_storage_root(&outer);
+        register_storage_root(&alias_inner);
+        CANONICAL_PROBES.with(|count| assert_eq!(count.get(), 0));
+        BOUNDARY_READS.with(|count| assert_eq!(count.get(), 0));
+        let store = PersistedStore::SemanticIndex;
+        let outer_floor =
+            UnsupportedPersistedFormat::floor(store, outer.join("reader-floor.json"), 99);
+        let inner_floor =
+            UnsupportedPersistedFormat::floor(store, alias_inner.join("reader-floor.json"), 100);
+        record(&outer_floor, &outer);
+        record(&inner_floor, &alias_inner);
+        let before = (
+            CANONICAL_PROBES.with(|count| count.get()),
+            BOUNDARY_READS.with(|count| count.get()),
+        );
+        assert_eq!(
+            before,
+            (2, 2),
+            "each explicit uncached identity resolves its root and boundary once"
+        );
+        assert_eq!(
+            gate(store, &direct_artifact, &direct_artifact, Some(1)),
+            Err(inner_floor)
+        );
+        clear(store, &direct_artifact);
+        let after = (
+            CANONICAL_PROBES.with(|count| count.get()),
+            BOUNDARY_READS.with(|count| count.get()),
+        );
+        assert_eq!(
+            after, before,
+            "beyond-cap gate/clear must not add I/O after the explicit query probes"
+        );
+        assert_eq!(storage_roots().read().unwrap().len(), 128);
+    }
 
     #[test]
     fn cleanup_scope_does_not_become_a_storage_owner_or_bypass_its_floor() {
