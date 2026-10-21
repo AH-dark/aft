@@ -120,6 +120,16 @@ return metadata suitable for UI preview. Output is capped at 50KB.
 
 For symbol inspection with call-graph annotations, use `aft_zoom`.
 
+On OpenCode 1 and 2, `read` rules govern `read`, `aft_outline` and `aft_zoom`.
+Outline and zoom check each file whose content they return, including revision reads.
+A denied file is refused; in a batch it is left out with a permission error for that entry.
+URL targets are not file paths and do not ask for file-read permission.
+
+`grep` and `aft_search` use their own permissions, not `read` rules. They can return
+matched lines from files a `read` rule denies. To keep secrets out of search results,
+use path restrictions or deny rules on the search tools too; a `read` deny alone is
+not a search-results filter.
+
 #### Reading at a git revision (`ref`)
 
 With [`revision_reads`](config.md#reading-at-a-git-revision) enabled, `read`, `aft_outline` and

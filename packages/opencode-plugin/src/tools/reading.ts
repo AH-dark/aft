@@ -23,7 +23,7 @@ import type { V2DefinitionRuntime } from "./definitions/v2.js";
 import { revisionRefArgSchema, whenGhReadEnabled } from "./hoisted.js";
 import {
   assertExternalDirectoryPermission,
-  assertV2ReadPermission,
+  assertReadPermission,
   classifyPermissionError,
   permissionDeniedResponse,
   permissionRuleDenial,
@@ -187,25 +187,36 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         };
 
         const checkedReads = new Map<string, string | undefined>();
+        const deniedEntries: string[] = [];
         let directoryOutline = filesMode;
         if (Array.isArray(target)) {
           if (target.length === 0) {
             throw new Error("'target' must be a non-empty string or array of strings");
           }
-          const resolvedTargets = await Promise.all(
-            target.map((entry) => resolvePathArg(ctx, context, entry)),
-          );
-          directoryOutline ||= (
-            await Promise.all(resolvedTargets.map(permissionKindForPath))
-          ).includes("directory");
-          const permissionDenied = await assertPathReadPermissions(
-            ctx,
-            context,
-            resolvedTargets,
-            filesMode ? "directory" : "file",
-            checkedReads,
-          );
-          if (permissionDenied) return permissionDeniedResponse(permissionDenied, context);
+          const allowedTargets: string[] = [];
+          for (const entry of target) {
+            const resolvedTarget = await resolvePathArg(ctx, context, entry);
+            const kind = await permissionKindForPath(resolvedTarget);
+            directoryOutline ||= kind === "directory";
+            const denial = await assertPathReadPermissions(
+              ctx,
+              context,
+              resolvedTarget,
+              ref !== undefined ? "revision" : filesMode ? "directory" : "file",
+              checkedReads,
+            );
+            if (denial) {
+              if (
+                (context as ToolRuntime).hostVersion === 2 ||
+                denial !== permissionRuleDenial("read") ||
+                target.length === 1
+              )
+                return permissionDeniedResponse(denial, context);
+              deniedEntries.push(`${entry}: ${denial}`);
+            } else allowedTargets.push(entry);
+          }
+          if (!allowedTargets.length) return deniedEntries.join("\n");
+          rawArgs.target = allowedTargets;
         } else {
           if (typeof target !== "string" || target.length === 0) {
             throw new Error("'target' must be a non-empty string or array of strings");
@@ -220,12 +231,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           if (!hasUrl) {
             const resolvedTarget = await resolvePathArg(ctx, context, target);
             const kind = await permissionKindForPath(resolvedTarget);
-            directoryOutline ||= kind === "directory";
+            directoryOutline ||= ref === undefined && kind === "directory";
             const permissionDenied = await assertPathReadPermissions(
               ctx,
               context,
               resolvedTarget,
-              kind,
+              ref !== undefined ? "revision" : kind,
               checkedReads,
             );
             if (permissionDenied) return permissionDeniedResponse(permissionDenied, context);
@@ -233,6 +244,15 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         }
 
         const excluded = new Set<string>();
+        const withDenials = (text: string): string => {
+          const directoryDenials =
+            (context as ToolRuntime).hostVersion === 2
+              ? excluded.size
+                ? [`${excluded.size} files left out by read rules.`]
+                : []
+              : [...excluded].map((file) => `${file}: ${checkedReads.get(file)}`);
+          return [text, ...deniedEntries, ...directoryDenials].join("\n");
+        };
         for (let round = 0; round < MAX_OUTLINE_READ_ROUNDS; round++) {
           const response = await callToolCall(ctx, context, "outline", {
             ...rawArgs,
@@ -240,20 +260,17 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           });
           if (response.success === false)
             throw new Error((response.message as string) || "outline failed");
-          if ((context as ToolRuntime).hostVersion !== 2 || !directoryOutline) return response.text;
+          if (!directoryOutline) return withDenials(response.text);
           // Directory results are held until every contributing file is authorized.
           // Exclusions can reveal more rows under the output budget, so check each render.
           const contentFiles = response.content_files;
           if (!Array.isArray(contentFiles)) {
-            if (!directoryOutline) return response.text;
-            throw new Error(
-              "OpenCode 2 outline requires server content_files for read authorization",
-            );
+            throw new Error("Outline requires server content_files for read authorization");
           }
           const distinctFiles = new Set(contentFiles as string[]);
           const unchecked = [...distinctFiles].filter((file) => !checkedReads.has(file));
           const outcomes = await checkReadPaths(context, unchecked, (file, batchContext) =>
-            assertV2ReadPermission(batchContext, file),
+            assertReadPermission(batchContext, file),
           );
           for (const [file, denial] of outcomes) checkedReads.set(file, denial);
           let denied = 0;
@@ -272,10 +289,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               return permissionDeniedResponse(permissionRuleDenial("read"), context);
             continue;
           }
-          return (
-            response.text +
-            (excluded.size ? `\n${excluded.size} files left out by read rules.` : "")
-          );
+          return withDenials(response.text);
         }
         // A denied row can reveal another file on every render. At the limit,
         // discard the held output rather than return content that is not authorized.
@@ -303,7 +317,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         if (ref !== undefined && args.batch.some((entry) => isUrl(entry.target)))
           throw new Error("'ref' cannot be used with a URL target: a URL has no revision");
         // URLs are fetched by Rust. Authorize each distinct local file before
-        // dispatch, retaining rule denials as individual batch outcomes on V2.
+        // dispatch, retaining rule denials as individual batch outcomes.
         const localPaths = args.batch
           .map((entry) => entry.target)
           .filter((target) => target && !isGithubPathArg(target) && !isUrl(target));
@@ -315,13 +329,27 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const distinctFiles = [...new Set(resolved)];
         if ((context as ToolRuntime).hostVersion === 2) {
           const outcomes = await checkReadPaths(context, distinctFiles, (file, batchContext) =>
-            assertPathReadPermissions(ctx, batchContext, file),
+            assertPathReadPermissions(
+              ctx,
+              batchContext,
+              file,
+              ref !== undefined ? "revision" : "file",
+            ),
           );
           for (const [file, denial] of outcomes) if (denial) deniedPaths.set(file, denial);
         } else {
           for (const file of distinctFiles) {
-            const denial = await assertPathReadPermissions(ctx, context, file);
-            if (denial) return permissionDeniedResponse(denial, context);
+            const denial = await assertPathReadPermissions(
+              ctx,
+              context,
+              file,
+              ref !== undefined ? "revision" : "file",
+            );
+            if (denial) {
+              if (denial !== permissionRuleDenial("read"))
+                return permissionDeniedResponse(denial, context);
+              deniedPaths.set(file, denial);
+            }
           }
         }
         const allowed = args.batch.filter((entry) => {
@@ -410,6 +438,18 @@ async function checkReadPaths(
   files: string[],
   check: (file: string, context: ToolContext) => Promise<string | undefined>,
 ): Promise<Map<string, string | undefined>> {
+  // OC1 ask accepts one request and returns a Promise, with no cancellation
+  // channel for concurrent asks. Keep OC1 asks sequential instead of using OC2's adapter.
+  if ((context as ToolRuntime).hostVersion !== 2) {
+    const results = new Map<string, string | undefined>();
+    for (const file of files) {
+      context.abort.throwIfAborted();
+      const denial = await check(file, context);
+      if (denial && denial !== permissionRuleDenial("read")) throw new Error(denial);
+      results.set(file, denial);
+    }
+    return results;
+  }
   const controller = new AbortController();
   const ask = context.ask as V2DefinitionRuntime["ask"];
   const batchContext: ToolContext = {
@@ -473,7 +513,7 @@ async function assertPathReadPermissions(
   ctx: PluginContext,
   context: ToolContext,
   target: string | string[],
-  kind: "file" | "directory" = "file",
+  kind: "file" | "directory" | "revision" = "file",
   checkedReads = new Map<string, string | undefined>(),
 ): Promise<string | undefined> {
   const targets = Array.isArray(target) ? target : [target];
@@ -486,13 +526,17 @@ async function assertPathReadPermissions(
     checked.add(key);
 
     const denial = await assertExternalDirectoryPermission(ctx, context, resolvedPath, {
-      kind,
+      kind: kind === "directory" ? "directory" : "file",
       serverValidatedRead: true,
     });
     if (denial) return denial;
-    if (kind === "file" && (await permissionKindForPath(resolvedPath)) === "file") {
+    // A revision file need not be a file in the working tree anymore.
+    if (
+      kind === "revision" ||
+      (kind === "file" && (await permissionKindForPath(resolvedPath)) === "file")
+    ) {
       if (!checkedReads.has(resolvedPath))
-        checkedReads.set(resolvedPath, await assertV2ReadPermission(context, resolvedPath));
+        checkedReads.set(resolvedPath, await assertReadPermission(context, resolvedPath));
       const readDenial = checkedReads.get(resolvedPath);
       if (readDenial) return readDenial;
     }

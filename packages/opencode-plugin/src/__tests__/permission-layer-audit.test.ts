@@ -1702,7 +1702,7 @@ describe("session-owned bash artifact reads", () => {
           if (fail) throw new Error("bridge closed");
           return { success: true, owned: ownedPaths.has(String(params.path)) };
         }
-        return { success: true, text: "task output" };
+        return { success: true, text: "task output", content_files: [] };
       },
     );
   }
