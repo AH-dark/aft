@@ -211,6 +211,9 @@ fn linux_system_read_allow() -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn landlock_available() -> bool {
+    if std::env::var("AFT_PROBE_FORCE_NO_LANDLOCK").as_deref() == Ok("1") {
+        return false;
+    }
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         Command::new(AFT_BIN)
@@ -1690,9 +1693,7 @@ fn shell_cannot_write_saved_task_output() {
 #[test]
 fn launcher_closes_late_inherited_listener_above_marker_slots() {
     #[cfg(target_os = "linux")]
-    if !landlock_available() {
-        return;
-    }
+    skip_if_landlock_absent!();
     use std::os::unix::process::CommandExt;
     let mut fixture = ProbeFixture::new();
     let listener =
@@ -1775,4 +1776,29 @@ fn launcher_failure_marker_cannot_be_forged_by_jailed_exec() {
             "the supervisor's marker must remain unforgeable"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn launcher_fd_probe_required_mode_cannot_silently_skip() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "launcher_closes_late_inherited_listener_above_marker_slots",
+            "--nocapture",
+        ])
+        .env("AFT_REQUIRE_LANDLOCK", "1")
+        .env("AFT_PROBE_FORCE_NO_LANDLOCK", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "mandatory fd probe must fail when the backend is unavailable, not return success"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AFT_REQUIRE_LANDLOCK=1 but Landlock ABI is unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
