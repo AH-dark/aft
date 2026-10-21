@@ -167,7 +167,7 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "filePath": {
+      "path": {
         "description": "Path to file or directory (absolute or relative to project root)",
         "type": "string"
       },
@@ -197,7 +197,7 @@
       }
     },
     "required": [
-      "filePath"
+      "path"
     ],
     "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n"
   },
@@ -205,7 +205,7 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "filePath": {
+      "path": {
         "description": "Path to the file to write (absolute or relative to project root)",
         "type": "string"
       },
@@ -215,7 +215,7 @@
       }
     },
     "required": [
-      "filePath",
+      "path",
       "content"
     ],
     "description": "Write content to a file, creating it and parent directories automatically. Use `path` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments."
@@ -224,7 +224,7 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "filePath": {
+      "path": {
         "description": "Path to the file to edit (absolute or relative to project root)",
         "type": "string"
       },
@@ -286,7 +286,7 @@
       }
     },
     "required": [
-      "filePath"
+      "path"
     ],
     "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available."
   },

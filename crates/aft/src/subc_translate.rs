@@ -1649,19 +1649,14 @@ fn resolve_read_range(map_in: &Map<String, Value>) -> Result<ReadRange, Translat
     });
     if let (Some(start), Some(end)) = (start, end) {
         if start > end {
-            let (start_name, end_name) = (
-                if start_line.is_some() {
-                    "startLine"
-                } else {
-                    "offset"
-                },
-                "endLine",
-            );
+            let start_name = if start_line.is_some() {
+                "startLine"
+            } else {
+                "offset"
+            };
             return Err(TranslateError {
                 code: "invalid_range",
-                message: format!(
-                    "invalid_range: {start_name} {start} is after {end_name} {end}; no lines selected. Use a start line at or before the end line."
-                ),
+                message: crate::commands::read::inverted_range_message(start_name, start, end),
             });
         }
     }
@@ -4922,6 +4917,24 @@ mod placeholder_argument_tests {
             error.message.contains("startLine 245 is after endLine 145"),
             "{error:?}"
         );
+    }
+
+    /// Readers have sent `endLine` as a line count (startLine 232 with
+    /// endLine 125, startLine 615 with endLine 90). The refusal names the end
+    /// line that reading would take, so the retry needs no guesswork.
+    #[test]
+    fn inverted_range_refusal_reads_end_line_as_a_count() {
+        for (start, end, suggested) in [(232, 125, 356), (615, 90, 704)] {
+            let error = read(json!({"path": "a.ts", "startLine": start, "endLine": end}))
+                .expect_err("an inverted range is refused");
+            assert_eq!(error.code, "invalid_range");
+            assert!(
+                error.message.contains(&format!(
+                    "endLine is a line number, not a count: to read {end} lines from line {start}, use endLine={suggested} (or offset={start}, limit={end})"
+                )),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]
