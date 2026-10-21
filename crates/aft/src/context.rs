@@ -4102,6 +4102,9 @@ pub struct AppContext {
     /// next tail drain resumes it before anything newly enqueued.
     parked_configure_tail:
         parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
+    /// The background identity retry armed when aft.db was busy at this
+    /// root's bind. See [`crate::provisional_identity_retry`].
+    provisional_identity_retry: crate::provisional_identity_retry::RetrySlot,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     /// Only successful configure binds may populate this memo. Build-derived
     /// keys remain observable by status but cannot skip identity verification.
@@ -4824,6 +4827,7 @@ impl AppContext {
             database_open: parking_lot::Mutex::new(Default::default()),
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
+            provisional_identity_retry: Default::default(),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
@@ -6437,6 +6441,24 @@ impl AppContext {
                 .try_lock()
                 .is_none_or(|tail| tail.as_ref().is_some_and(|state| state.has_ready_job()))
             || !self.configure_warnings_rx.is_empty()
+            || self.provisional_identity_retry.is_due()
+    }
+
+    /// No configure-tail work is queued or parked. The background identity
+    /// retry replays a bind only then, so it never interleaves with a tail.
+    pub(crate) fn configure_tail_idle(&self) -> bool {
+        self.configure_maintenance_jobs.lock().is_empty()
+            && self
+                .parked_configure_tail
+                .lock()
+                .as_ref()
+                .is_none_or(|tail| tail.jobs_is_empty())
+    }
+
+    pub(crate) fn provisional_identity_retry(
+        &self,
+    ) -> &crate::provisional_identity_retry::RetrySlot {
+        &self.provisional_identity_retry
     }
 
     /// Hold the lock behind one maintenance probe for the duration of
@@ -8462,6 +8484,17 @@ impl AppContext {
         true
     }
 
+    /// Swap one degraded reason for another in place, keeping the order.
+    /// Returns whether `from` was present.
+    pub(crate) fn replace_degraded_reason(&self, from: &str, to: &str) -> bool {
+        let mut reasons = self.degraded_reasons.lock();
+        let Some(index) = reasons.iter().position(|reason| reason == from) else {
+            return false;
+        };
+        reasons[index] = to.to_string();
+        true
+    }
+
     /// Snapshot of current degraded-mode reasons. Order is stable
     /// (insertion order from `set_degraded_reasons`) so UI rendering and
     /// snapshot diffs are deterministic.
@@ -8492,8 +8525,10 @@ impl AppContext {
     }
 
     /// The bound root's artifact identity was provisional at its last bind
-    /// (aft.db was busy or Git was unreadable), so its index lanes are off
-    /// until the next bind.
+    /// (aft.db was busy or Git was unreadable), so its index lanes are off.
+    /// A busy aft.db is retried in the background
+    /// ([`crate::provisional_identity_retry`]); an unreadable Git identity
+    /// waits for the next bind.
     pub(crate) fn artifact_identity_provisional(&self) -> bool {
         self.artifact_identity_provisional_reason().is_some()
     }
@@ -8504,6 +8539,7 @@ impl AppContext {
             .iter()
             .find(|reason| {
                 reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_REASON
+                    || reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_EXHAUSTED_REASON
                     || reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON)
             })
             .cloned()

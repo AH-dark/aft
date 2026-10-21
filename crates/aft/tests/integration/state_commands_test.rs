@@ -560,7 +560,7 @@ fn entry_names(storage: &Path, folder: &str) -> Vec<String> {
 
 #[cfg(unix)]
 const PROVISIONAL_REASON: &str =
-    "identity provisional: aft.db was busy at bind; indexes stay off until this folder's next bind";
+    "identity provisional: aft.db was busy at bind; indexes start once the database is free";
 
 #[cfg(unix)]
 fn degraded_reasons(aft: &mut AftProcess) -> Vec<String> {
@@ -799,6 +799,40 @@ fn provisional_identity_with_a_path_pin_finalizes_to_the_path_key_at_the_next_bi
 #[test]
 fn provisional_identity_without_a_pin_finalizes_to_the_git_key_at_the_next_bind() {
     assert_eq!(provisional_bind_then_finalize(false), "git");
+}
+
+/// The bind that found aft.db busy is the only bind: once the database is
+/// free, the background retry settles the identity and builds the index.
+#[cfg(unix)]
+#[test]
+fn provisional_identity_settles_without_a_second_bind_once_aft_db_frees() {
+    let fixture = provisional_fixture(false);
+    let storage = fixture.storage.path();
+    let mut aft = configured_aft(&fixture.root, storage, "opencode");
+    assert!(
+        degraded_reasons(&mut aft).contains(&PROVISIONAL_REASON.to_string()),
+        "status must name the provisional identity"
+    );
+    fixture.lock.execute_batch("ROLLBACK").unwrap();
+    drop(fixture.lock);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let reasons = degraded_reasons(&mut aft);
+        if !reasons
+            .iter()
+            .any(|reason| reason.starts_with("identity provisional"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the identity never settled after aft.db became free: {reasons:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(wait_for_single_built_family(storage), "git");
+    assert!(aft.shutdown().success());
 }
 
 #[cfg(unix)]

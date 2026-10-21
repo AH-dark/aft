@@ -90,8 +90,10 @@ pub mod cause {
     pub const HOME_ROOT: &str = "home_root";
     /// The root is too broad for watching or project-wide indexing.
     pub const ROOT_TOO_BROAD: &str = "root_too_broad";
-    /// aft.db was busy when the root was bound, so its artifact identity is
-    /// not settled yet; indexes stay off until the root's next bind.
+    /// The root's artifact identity is not settled yet: aft.db was busy when
+    /// it was bound (retried in the background until the database is free),
+    /// or its Git identity was unreadable (retried at the root's next bind).
+    /// Indexes stay off until the identity settles.
     pub const IDENTITY_PROVISIONAL: &str = "identity_provisional";
     /// The configured embedding backend is currently unreachable.
     pub const SEMANTIC_BACKEND_UNAVAILABLE: &str = "semantic_backend_unavailable";

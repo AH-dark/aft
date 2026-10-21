@@ -352,13 +352,20 @@ fn legacy_pins(root: &Path, storage: &Path) -> LegacyPins {
                 .insert(root.to_path_buf())
             {
                 crate::slog_info!(
-                    "legacy pin unreadable (aft.db busy): identity provisional for root={}; indexes stay off until this folder's next bind; error={error}",
+                    "legacy pin unreadable (aft.db busy): identity provisional for root={}; indexes start once the database is free; error={error}",
                     root.display()
                 );
             }
             LegacyPins::Unreadable
         }
     }
+}
+
+/// Whether the older standing pins for `root` can be read right now without
+/// waiting on aft.db. A bind left provisional by a busy database polls this
+/// before it tries the whole bind again.
+pub(crate) fn legacy_pins_readable(root: &Path, storage: &Path) -> bool {
+    read_legacy_pins(&canonical_root(root), storage).is_ok()
 }
 
 fn read_legacy_pins(root: &Path, storage: &Path) -> io::Result<Vec<StandingPin>> {

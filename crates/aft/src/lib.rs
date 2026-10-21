@@ -152,6 +152,7 @@ pub mod process_io;
 pub(crate) mod production_storage;
 pub(crate) mod project_content;
 pub mod protocol;
+pub(crate) mod provisional_identity_retry;
 pub mod pty_render;
 pub mod query_shape;
 pub mod reader_floor;

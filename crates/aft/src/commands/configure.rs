@@ -3065,6 +3065,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
     let response = handle_configure_inner(req, ctx);
+    crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
     ctx.begin_configure_ack_step("finish_configure");
@@ -3894,7 +3895,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         // An unreadable legacy identity pin in aft.db or a failed Git probe
         // leaves the identity unsettled. Serve tools that do not need indexes,
         // but write no artifacts, ownership or retention records under a key
-        // the next bind may replace. Retry identity at that bind.
+        // the next bind may replace. A busy aft.db is retried in the
+        // background (`crate::provisional_identity_retry`); a failed Git probe
+        // waits for the next bind.
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
@@ -6829,6 +6832,8 @@ fn cancel_unbound_configure_jobs(
 }
 
 pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
+    // An unbound root does no indexing, so it stops retrying its identity too.
+    crate::provisional_identity_retry::cancel(ctx);
     let parked = ctx
         .take_parked_configure_tail()
         .map(|state| {
@@ -6948,6 +6953,10 @@ pub(crate) struct ConfigureMaintenanceState {
 }
 
 impl ConfigureMaintenanceState {
+    pub(crate) fn jobs_is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
     pub(crate) fn has_ready_job(&self) -> bool {
         let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
         self.jobs.iter().any(|continuation| {
@@ -7012,7 +7021,7 @@ pub(crate) fn standalone_configure_maintenance_pending(
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     state.absorb_enqueued(ctx);
-    state.has_ready_job()
+    state.has_ready_job() || (state.jobs.is_empty() && ctx.provisional_identity_retry().is_due())
 }
 
 /// Finish request-critical configure work before standalone dispatch resumes.
@@ -7144,6 +7153,11 @@ pub(crate) fn drain_standalone_configure_unit(
 ) -> bool {
     state.absorb_enqueued(ctx);
     drop_superseded_parked_continuations(ctx, state);
+    if state.jobs.is_empty() && crate::provisional_identity_retry::drain(ctx) {
+        // The retry replayed the bind; its tail is queued on the context and
+        // runs from the next unit, as it would after a bind request.
+        return true;
+    }
     if !state.select_ready_job(ctx) {
         return false;
     }
@@ -7213,6 +7227,11 @@ pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) ->
 }
 
 fn drain_configure_tail(ctx: &AppContext, allow_step_aside: bool) -> bool {
+    // A bind replayed by the identity retry queues its own tail, which the
+    // loop below then drains like any bind's tail.
+    if ctx.configure_tail_idle() {
+        crate::provisional_identity_retry::drain(ctx);
+    }
     let mut state = ctx.take_parked_configure_tail().unwrap_or_default();
     drop_superseded_parked_continuations(ctx, &mut state);
     state.replay_retry_cutoff = Some(Instant::now());
@@ -13827,6 +13846,208 @@ mod tests {
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
         assert!(!storage.join("callgraph").join(&path_key).exists());
+    }
+
+    /// Hold aft.db in an exclusive transaction. In rollback-journal mode this
+    /// also blocks readers, so the bind cannot read its legacy identity pin.
+    fn hold_aft_db_exclusively(storage: &std::path::Path) -> rusqlite::Connection {
+        std::fs::create_dir_all(storage).unwrap();
+        let lock = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        lock
+    }
+
+    fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                "views": { "enabled": false },
+            }))],
+        }))
+    }
+
+    /// A git checkout and its storage folder, with aft.db held busy.
+    fn busy_bind_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, rusqlite::Connection) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("repo");
+        init_git_fixture(&root);
+        let storage = base.join("storage");
+        let lock = hold_aft_db_exclusively(&storage);
+        (temp, root, storage, lock)
+    }
+
+    fn has_busy_provisional_reason(ctx: &AppContext) -> bool {
+        ctx.degraded_reasons()
+            .iter()
+            .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_REASON)
+    }
+
+    #[test]
+    fn busy_aft_db_at_first_bind_enables_indexes_once_the_database_frees() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let request = trigram_bind_request(&root, &storage);
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response = super::handle_configure(&request, &ctx);
+                assert!(response.success, "{}", response.data);
+                assert!(
+                    has_busy_provisional_reason(&ctx),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(!ctx.config().indexes.trigram);
+                // The bind's own tail runs first; a retry never interleaves with it.
+                super::drain_deferred_configure_maintenance(&ctx);
+
+                // While aft.db stays busy an attempt changes nothing.
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert_eq!(
+                    ctx.provisional_identity_retry().attempts_for_test(),
+                    Some(1)
+                );
+                assert!(!ctx.config().indexes.trigram);
+                assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+                assert_eq!(ctx.cached_artifact_cache_key(&root), None);
+
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                // No second bind: the next maintenance drain settles the root.
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert!(crate::root_identity::read(&root, &storage)
+                    .unwrap()
+                    .is_some());
+                assert!(ctx.cached_artifact_cache_key(&root).is_some());
+            },
+        );
+    }
+
+    #[test]
+    fn busy_aft_db_retry_gives_up_and_names_the_remedy() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::ZERO,
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                super::drain_deferred_configure_maintenance(&ctx);
+            },
+        );
+        let reasons = ctx.degraded_reasons();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_EXHAUSTED_REASON),
+            "{reasons:?}"
+        );
+        assert!(!has_busy_provisional_reason(&ctx), "{reasons:?}");
+        assert!(ctx.artifact_identity_provisional());
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        assert!(!ctx.config().indexes.trigram);
+        drop(lock);
+    }
+
+    #[test]
+    fn busy_aft_db_retry_stops_when_the_root_unbinds() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+
+                ctx.mark_subc_unbound();
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                super::drain_deferred_configure_maintenance(&ctx);
+            },
+        );
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        assert!(!ctx.config().indexes.trigram);
+        assert!(
+            has_busy_provisional_reason(&ctx),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+        assert_eq!(ctx.cached_artifact_cache_key(&root), None);
+    }
+
+    #[test]
+    fn quiescing_a_root_cancels_its_identity_retry() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let response = super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+        assert!(response.success, "{}", response.data);
+        assert!(ctx.provisional_identity_retry().is_armed());
+        super::cancel_deferred_configure_maintenance(&ctx);
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        drop(lock);
+    }
+
+    #[test]
+    fn dubious_ownership_identity_does_not_retry_in_the_background() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("create git marker");
+        let storage = temp.path().join("storage");
+        let _override =
+            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![root.clone()],
+                "fatal: detected dubious ownership in repository",
+            );
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                let reason = ctx.artifact_identity_provisional_reason().unwrap();
+                assert!(reason.contains("dubious ownership"), "{reason}");
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                let generation = ctx.configure_generation();
+                super::drain_deferred_configure_maintenance(&ctx);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert_eq!(
+                    ctx.configure_generation(),
+                    generation,
+                    "no bind may be replayed for an unreadable Git identity"
+                );
+            },
+        );
+        assert!(!ctx.config().indexes.trigram);
     }
 
     #[test]
