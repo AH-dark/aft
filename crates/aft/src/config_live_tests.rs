@@ -201,6 +201,19 @@ fn bash_env_updates_live_for_future_commands() {
 }
 
 #[test]
+fn bash_env_updates_live_while_cache_dir_waits_for_reconfigure() {
+    let published = Config::default();
+    let mut candidate = published.clone();
+    candidate.bash.env.insert("TZ".into(), "UTC".into());
+    candidate.cache_dir = Some("/cache/next".into());
+    let result = super::apply_live_config(&published, &candidate, &published);
+    assert_eq!(result.applied, vec!["bash.env"]);
+    assert_eq!(result.deferred, vec!["storage.cache_dir"]);
+    assert_eq!(result.next.bash.env["TZ"], "UTC");
+    assert_eq!(result.next.cache_dir, published.cache_dir);
+}
+
+#[test]
 fn user_file_edit_applies_live_too() {
     let fixture = Fixture::new(r#"{ "url_fetch_allow_private": false }"#, None);
     write(&fixture.user_path, r#"{ "url_fetch_allow_private": true }"#);

@@ -183,6 +183,30 @@ const CASES: ParityCase[] = [
   { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
   { name: "malformed_config_document", user: "{" },
   { name: "pi_malformed_config_document", harness: "pi", user: "{" },
+  ...(["opencode", "pi"] as const).map((harness) => ({
+    name: `cache_dir_bash_env_trust_${harness}`,
+    harness,
+    user: {
+      storage: { cache_dir: "/aft-cache" },
+      bash: { env: { TZ: "UTC" } },
+      harnesses: {
+        [harness]: {
+          storage: { cache_dir: "/ignored-cache" },
+          bash: { env: { TZ: "Etc/GMT" } },
+        },
+      },
+    },
+    project: {
+      storage: { cache_dir: "/evil-cache" },
+      bash: { env: { BASH_ENV: "/evil-startup" } },
+      harnesses: {
+        [harness]: {
+          storage: { cache_dir: "/evil-harness-cache" },
+          bash: { env: { TZ: "project" } },
+        },
+      },
+    },
+  })),
   ...(["opencode", "pi"] as const).flatMap((harness) => [
     { name: `cache_dir_unrelated_unknown_${harness}`, harness, user: { future_feature: true, format_on_edit: true } },
     { name: `cache_dir_unrelated_harness_unknown_${harness}`, harness, user: { harnesses: { [harness]: { future_option: true } } } },

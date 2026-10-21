@@ -802,14 +802,15 @@ pub fn resolve_config_for_harness(
         );
         if is_user {
             if let Some(blocked) = blocked_bash_env_key(&raw) {
+                let errors = vec![format!(
+                    "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
+                    tier.source
+                )];
                 return ResolveResult {
-                    config: Config::default(),
+                    config: rejected_cache_config(tiers, Config::default(), &errors),
                     dropped,
                     warnings,
-                    errors: vec![format!(
-                        "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
-                        tier.source
-                    )],
+                    errors,
                 };
             }
         }
@@ -3422,6 +3423,82 @@ mod tests {
             .dropped
             .iter()
             .any(|dropped| dropped.key == "storage.cache_dir"));
+    }
+
+    #[test]
+    fn cache_dir_and_bash_env_keep_distinct_harness_trust_rules() {
+        for harness in [
+            crate::harness::Harness::Opencode,
+            crate::harness::Harness::Pi,
+        ] {
+            let result = super::resolve_config_for_harness(
+                &[
+                    tier(
+                        "user",
+                        r#"{
+                        "storage":{"cache_dir":"/cache/base"},
+                        "bash":{"env":{"TZ":"UTC"}},
+                        "harnesses":{
+                            "opencode":{"storage":{"cache_dir":"/cache/override"},"bash":{"env":{"TZ":"Etc/GMT"}}},
+                            "pi":{"storage":{"cache_dir":"/cache/override"},"bash":{"env":{"TZ":"Etc/GMT"}}}
+                        }
+                    }"#,
+                    ),
+                    tier(
+                        "project",
+                        r#"{
+                        "storage":{"cache_dir":"/evil"},
+                        "bash":{"env":{"BASH_ENV":"/evil/startup"}},
+                        "harnesses":{
+                            "opencode":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}},
+                            "pi":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}}
+                        }
+                    }"#,
+                    ),
+                ],
+                Some(&harness),
+            );
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
+            assert_eq!(result.config.bash.env.len(), 1);
+            assert_eq!(result.config.bash.env["TZ"], "Etc/GMT");
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "bash.env" && drop.tier == "project"));
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "user"));
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "project"));
+        }
+    }
+
+    #[test]
+    fn cache_dir_stays_fenced_when_bash_env_rejects_the_user_config() {
+        for in_harness in [false, true] {
+            let mut document = serde_json::json!({"storage":{"cache_dir":"/cache/base"}});
+            let blocked = serde_json::json!({"env":{"BASH_ENV":"/evil/startup"}});
+            if in_harness {
+                document["harnesses"] = serde_json::json!({"pi":{"bash":blocked}});
+            } else {
+                document["bash"] = blocked;
+            }
+            let result = super::resolve_config_for_harness(
+                &[tier("user", &document.to_string())],
+                Some(&crate::harness::Harness::Pi),
+            );
+            assert!(result
+                .errors
+                .iter()
+                .any(|error| error.contains("blocked bash.env key BASH_ENV")));
+            assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
+            assert!(result.config.cache_config_unknown.is_some());
+            assert!(result.config.bash.env.is_empty());
+        }
     }
 
     #[test]

@@ -80,7 +80,9 @@ fn build() -> BusyRoot {
         entries_total: Some(52_000),
     };
     let family = crate::views::registry::FamilyRegistry::open(&storage, "push-fixture").unwrap();
-    let view = family.register_view("prefrontal", &root).unwrap();
+    let view = family
+        .register_view_with_storage(&storage, "prefrontal", &root)
+        .unwrap();
     let mut paths = crate::path_status::PathStatusStore::open(view.view_dir()).unwrap();
     for i in 0..20 {
         paths
