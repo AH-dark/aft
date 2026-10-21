@@ -546,6 +546,10 @@ fn scan_local_snapshot(cache_dir: &std::path::Path) -> Option<(PathBuf, PathBuf)
 fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf), String> {
     use hf_hub::api::sync::ApiBuilder;
 
+    // hf-hub creates missing folders with a recursive mkdir. Re-prove the
+    // cache root right before the hand-off so a vanished cache volume refuses
+    // the download instead of letting it land on the main disk.
+    crate::root_cache::prepare_third_party_cache_dir(cache_dir)?;
     slog_info!(
         "downloading all-MiniLM-L6-v2 ({}) to {}",
         MINILM_REPO,
@@ -574,6 +578,79 @@ mod tests {
     };
     use std::io::Write;
     use tokenizers::Tokenizer;
+
+    /// A cache volume that disappears after configure and leaves a writable
+    /// empty folder at its path must not receive the model download: hf-hub
+    /// would recreate the missing folders and put the model on the main disk.
+    #[test]
+    fn cache_root_model_download_refuses_a_replaced_cache_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let volume = temp.path().join("cache-volume");
+        std::fs::create_dir(&volume).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(volume.clone()),
+            ..Default::default()
+        };
+        let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+        assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
+        let models = config.semantic.local_cache_dir.clone().unwrap();
+        // Windows cannot remove a folder its open cache lease still holds.
+        drop(config);
+        std::fs::remove_dir_all(&volume).unwrap();
+        std::fs::create_dir(&volume).unwrap();
+
+        let error = super::resolve_model_files(Some(&models)).unwrap_err();
+
+        assert!(
+            error.starts_with(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&volume).unwrap().count(),
+            0,
+            "the download recreated folders on the replacement volume"
+        );
+        assert!(!storage.join("semantic").exists());
+    }
+
+    /// The same refusal on a real second filesystem: the cache folder on the
+    /// mounted volume is replaced by an empty folder at the same path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires AFT_TEST_CACHE_VOLUME on a real mounted second filesystem"]
+    fn macos_real_cache_volume_model_download_refuses_a_replaced_cache_root() {
+        let volume = std::fs::canonicalize(
+            std::env::var_os("AFT_TEST_CACHE_VOLUME").expect("set the mounted test volume"),
+        )
+        .unwrap();
+        let on_volume = tempfile::tempdir_in(&volume).unwrap();
+        let cache = on_volume.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let primary = tempfile::tempdir().unwrap();
+        let storage = primary.path().join("storage");
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(cache.clone()),
+            ..Default::default()
+        };
+        let warning = crate::root_cache::prepare_cache_root(&mut config);
+        assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
+        let models = config.semantic.local_cache_dir.clone().unwrap();
+        drop(config);
+        std::fs::remove_dir_all(&cache).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+
+        let error = super::resolve_model_files(Some(&models)).unwrap_err();
+
+        assert!(
+            error.starts_with(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+        assert!(!storage.join("semantic").exists());
+    }
 
     #[test]
     fn empty_fastembed_and_home_rungs_are_unset_with_an_injected_lookup() {

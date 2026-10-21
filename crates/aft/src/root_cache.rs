@@ -58,9 +58,9 @@ pub use location::{
 };
 pub(crate) use location::{
     cache_deletion_protections, check_cache_access, ensure_config_storage_lease, pin_cache_path,
-    pin_owned_cache_path, prepare_process_cache_root, refuse_durable_cache_write,
-    refuse_new_durable_cache_entry, register_durable_owner, retention_protections,
-    unavailable_code, unavailable_warning,
+    pin_owned_cache_path, prepare_process_cache_root, prepare_third_party_cache_dir,
+    refuse_durable_cache_write, refuse_new_durable_cache_entry, register_durable_owner,
+    retention_protections, unavailable_code, unavailable_warning,
 };
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);

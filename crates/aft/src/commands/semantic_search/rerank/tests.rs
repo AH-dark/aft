@@ -1965,3 +1965,45 @@ fn cache_root_onnx_backends_do_not_share_across_cache_paths() {
     assert!(!first.exists());
     assert!(!second.exists());
 }
+
+/// The reranker's cache lease only proves the cache context is alive. When
+/// the cache volume disappears and leaves a writable empty folder at its path,
+/// the model download must still refuse rather than let hf-hub recreate the
+/// folders and put the model on the main disk.
+#[test]
+fn cache_root_rerank_model_download_refuses_a_replaced_cache_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let volume = temp.path().join("cache-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let mut config = Config {
+        storage_dir: Some(storage.clone()),
+        cache_dir: Some(volume.clone()),
+        ..Default::default()
+    };
+    let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+    assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
+    let models = config.semantic.local_cache_dir.clone().unwrap();
+    // On Unix the lease stays alive, as it does for a running reranker whose
+    // context never retired. Windows cannot remove a folder the lease holds.
+    #[cfg(windows)]
+    drop(config);
+    #[cfg(not(windows))]
+    let _live_lease = config;
+    std::fs::remove_dir_all(&volume).unwrap();
+    std::fs::create_dir(&volume).unwrap();
+
+    let model = onnx::find_allowed_model(onnx::DEFAULT_MODEL).unwrap();
+    let error = onnx::provision_model_files_in(model, &models).unwrap_err();
+
+    assert!(
+        error.starts_with(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&volume).unwrap().count(),
+        0,
+        "the download recreated folders on the replacement volume"
+    );
+    assert!(!storage.join("semantic").exists());
+}

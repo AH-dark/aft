@@ -579,6 +579,39 @@ pub(crate) fn check_cache_access(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(access.root.path().to_path_buf()))
 }
 
+/// Prepare a folder that a third-party library will write into by pathname,
+/// such as the hf-hub model downloader. Those libraries create any missing
+/// folders themselves with a recursive mkdir, so if the cache volume vanished
+/// after configure and left a writable mount point behind, handing them the
+/// saved pathname would rebuild the cache path on the main disk. Call this
+/// immediately before the hand-off.
+///
+/// Under a configured cache root this applies the same admission AFT's own
+/// cache writes use: the root must still be the enrolled directory (same
+/// device and inode) and the missing folders below it are created through the
+/// pinned root, never recreating the root itself. Outside a cache root, a write
+/// on durable storage whose caches were moved to `storage.cache_dir` is
+/// refused. A refused root reports the `cache_dir_unavailable` reason.
+pub(crate) fn prepare_third_party_cache_dir(path: &Path) -> Result<(), String> {
+    let checked = (|| -> io::Result<()> {
+        if let Some(access) = pin_cache_path(path)? {
+            access.directory(true)?;
+            return Ok(());
+        }
+        refuse_durable_cache_write(path)
+    })();
+    checked.map_err(|error| {
+        let message = error.to_string();
+        if message.starts_with(CACHE_DIR_UNAVAILABLE)
+            || message.starts_with(CACHE_WRITE_ON_DURABLE_STORAGE)
+        {
+            message
+        } else {
+            format!("{CACHE_DIR_UNAVAILABLE}: {} ({message})", path.display())
+        }
+    })
+}
+
 pub const CACHE_WRITE_ON_DURABLE_STORAGE: &str = "cache_write_on_durable_storage";
 
 /// Spellings under which a durable root is recognised: as configured, and

@@ -3201,6 +3201,10 @@ fn prepared_cache_warning(
     })
 }
 
+/// Re-run the session's retained connect request after the standing probe saw
+/// its cache volume change state, with `prepared` carrying the fresh volume
+/// check. Unlike a connect it re-resolves no config file: the session keeps
+/// the configuration it is running with (see `handle_configure_inner`).
 pub(crate) fn handle_cache_recovery(
     req: &RawRequest,
     ctx: &AppContext,
@@ -3324,19 +3328,33 @@ fn handle_configure_inner(
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    // A cache recovery (`prepared` is set) re-runs this configure only to
+    // re-check the cache volume and restart what depends on it. It keeps the
+    // configuration the session is running with, including keys live reload
+    // applied since, and reads no config file: an edit live reload reported as
+    // deferred until the next connect must stay deferred. The running config
+    // already holds this request's resolved tiers, so nothing is re-resolved
+    // and the recorded config sources are left as they are.
+    let recovery = prepared.is_some();
     ctx.begin_configure_ack_step("tier_file_reads");
-    let (tiers, user_config_migration) =
+    let (tiers, user_config_migration) = if recovery {
+        (Vec::new(), None)
+    } else {
         match resolve_config_tiers_for_configure(params, &root_path, Some(&harness)) {
             Ok(read) => read,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
+        }
+    };
     ctx.begin_configure_ack_step("tier_merge");
-    let config_diagnostics =
+    let config_diagnostics = if recovery {
+        crate::config_resolve::ResolveDiagnostics::default()
+    } else {
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
             Some(&harness),
             &mut next_config,
-        );
+        )
+    };
     let config_dropped_keys = config_diagnostics.dropped;
     if !config_diagnostics.errors.is_empty() {
         // The whole candidate is rejected before anything is published or any
@@ -3351,12 +3369,16 @@ fn handle_configure_inner(
         );
     }
     ctx.begin_configure_ack_step("source_tracking");
-    crate::config_live::stage_configure_sources(crate::config_live::ConfigSources::from_configure(
-        parse_cortexkit_user_config_path(params).ok().flatten(),
-        &root_path,
-        &tiers,
-        &next_config,
-    ));
+    if !recovery {
+        crate::config_live::stage_configure_sources(
+            crate::config_live::ConfigSources::from_configure(
+                parse_cortexkit_user_config_path(params).ok().flatten(),
+                &root_path,
+                &tiers,
+                &next_config,
+            ),
+        );
+    }
     ctx.begin_configure_ack_step("validate_params");
     let mut configure_warnings = config_diagnostics
         .warnings

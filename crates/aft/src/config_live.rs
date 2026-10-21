@@ -297,24 +297,6 @@ impl ConfigLiveState {
         self.sources.lock().clone()
     }
 
-    pub(crate) fn recovery_tiers(&self) -> Result<Vec<ConfigTier>, String> {
-        let Some(sources) = self.sources() else {
-            return Ok(Vec::new());
-        };
-        let mut tiers = Vec::new();
-        for source in [&sources.user, &sources.project] {
-            match read_tier(source) {
-                TierRead::Use(source) => {
-                    if let Some(tier) = tier_for(&source) {
-                        tiers.push(tier);
-                    }
-                }
-                TierRead::Error(error) => return Err(error),
-            }
-        }
-        Ok(tiers)
-    }
-
     pub fn last_outcome(&self) -> Option<ReloadOutcome> {
         self.last_outcome.lock().clone()
     }

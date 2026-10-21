@@ -556,6 +556,12 @@ pub(crate) fn provision_model_files_in(
     }
 
     use hf_hub::api::sync::ApiBuilder;
+    // The context's cache lease only proves the cache context is alive, not
+    // that `cache_dir` still names its enrolled root. hf-hub creates missing
+    // folders with a recursive mkdir, so re-prove the root right before the
+    // hand-off; a vanished cache volume refuses instead of downloading onto
+    // the main disk.
+    crate::root_cache::prepare_third_party_cache_dir(cache_dir)?;
     crate::slog_info!(
         "downloading rerank model {} ({}@{}) to {}",
         model.name,
