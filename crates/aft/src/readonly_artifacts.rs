@@ -1196,6 +1196,140 @@ mod tests {
         .is_some());
     }
 
+    /// Bind a plain folder in storage A (path identity), then add Git and let
+    /// a session in storage B save a Git identity for the same folder.
+    /// Returns (project tempdir, root, path key in A, Git key in B, owner
+    /// context bound in A).
+    fn folder_with_path_identity_in_a_and_git_identity_in_b(
+        owner_storage: &Path,
+        other_storage: &Path,
+    ) -> (TempDir, PathBuf, String, String, crate::context::AppContext) {
+        let project = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn switched_needle() {}\n").unwrap();
+        let owner = borrowed_context(&root, owner_storage);
+        let path_key = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, owner_storage, None)
+            .unwrap()
+            .expect("settled path identity in storage A");
+        assert_eq!(
+            path_key,
+            crate::search_index::artifact_path_identity_key(&root)
+        );
+
+        init_git(&root);
+        commit_all(&root);
+        let other_session = borrowed_context(&root, other_storage);
+        let git_key = other_session
+            .memoized_artifact_cache_key_for_configure(&root, &root, other_storage, None)
+            .unwrap()
+            .expect("settled Git identity in storage B");
+        assert_ne!(git_key, path_key);
+        assert!(matches!(
+            crate::root_identity::read(&root, other_storage).unwrap(),
+            Some(crate::root_identity::Identity::Git { .. })
+        ));
+        (project, root, path_key, git_key, owner)
+    }
+
+    #[test]
+    fn configure_key_follows_saved_identity_of_new_storage_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage_a = tempfile::tempdir().unwrap();
+        let storage_b = tempfile::tempdir().unwrap();
+        let (_project, root, path_key, git_key, owner) =
+            folder_with_path_identity_in_a_and_git_identity_in_b(
+                storage_a.path(),
+                storage_b.path(),
+            );
+
+        // The owner's cache location moves to storage B. Configure must read
+        // B's saved Git identity, not reuse the path key chosen in storage A.
+        let configured = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage_b.path(), None)
+            .unwrap()
+            .expect("settled identity in storage B");
+        assert_eq!(configured, git_key);
+        assert_ne!(configured, path_key);
+        assert_eq!(
+            owner.cached_artifact_cache_key(&root),
+            Some(git_key.clone())
+        );
+
+        // An index built under the configure key is what a borrowed reader of
+        // storage B finds.
+        let cache_dir =
+            crate::search_index::resolve_cache_dir_with_key(&configured, Some(storage_b.path()));
+        let mut index = SearchIndex::build_with_limit_to_cache_dir(&root, 1_000_000, &cache_dir);
+        let head = index.stored_git_head().map(str::to_owned);
+        assert!(index.write_to_disk(&cache_dir, head.as_deref()));
+        assert_eq!(
+            owner
+                .memoized_readonly_artifact_cache_key(&root, storage_b.path())
+                .unwrap(),
+            configured
+        );
+        let borrower = borrowed_context(&root, storage_b.path());
+        with_borrowed_search_load_limits_for_test(10_000, Duration::from_secs(5), || {
+            for ctx in [&owner, &borrower] {
+                let index = cached_search_index(ctx, &root, storage_b.path());
+                assert_eq!(
+                    index
+                        .grep("switched_needle", true, &[], &[], &root, 10)
+                        .matches
+                        .len(),
+                    1
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn configure_key_is_byte_identical_for_an_unchanged_storage_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage_a = tempfile::tempdir().unwrap();
+        let storage_b = tempfile::tempdir().unwrap();
+        let (_project, root, path_key, git_key, owner) =
+            folder_with_path_identity_in_a_and_git_identity_in_b(
+                storage_a.path(),
+                storage_b.path(),
+            );
+
+        // A repeat bind in the same storage root is a memo hit with the same
+        // bytes, even though the folder is now a Git repository.
+        let derivations = owner.artifact_cache_key_derivation_count_for_test();
+        let again = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage_a.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.as_bytes(), path_key.as_bytes());
+        assert_eq!(
+            owner.artifact_cache_key_derivation_count_for_test(),
+            derivations
+        );
+
+        // Visiting storage B and returning to A keeps each root's own key.
+        let in_b = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage_b.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(in_b.as_bytes(), git_key.as_bytes());
+        let back_in_a = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage_a.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(back_in_a.as_bytes(), path_key.as_bytes());
+
+        // A fresh context resolves the same bytes from storage A's record.
+        let fresh = borrowed_context(&root, storage_a.path());
+        let fresh_key = fresh
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage_a.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh_key.as_bytes(), path_key.as_bytes());
+    }
+
     #[test]
     fn borrowed_readers_share_saved_path_identity_after_git_is_added() {
         let _git_env = crate::test_env::hermetic_git_env_guard();

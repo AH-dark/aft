@@ -4105,7 +4105,11 @@ pub struct AppContext {
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     /// Only successful configure binds may populate this memo. Build-derived
     /// keys remain observable by status but cannot skip identity verification.
-    configure_artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
+    /// Entries are keyed by (storage root, project path): each storage root
+    /// keeps its own saved identity record, so a reconfigure that moves the
+    /// cache location must read the new root's record instead of reusing the
+    /// key another storage root chose for the same folder.
+    configure_artifact_cache_keys: parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), String>>,
     readonly_artifact_cache_keys:
         parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), ReadonlyArtifactCacheKey>>,
     artifact_cache_key_derivations: AtomicU64,
@@ -6786,9 +6790,10 @@ impl AppContext {
             let waiting = Instant::now();
             let keys = self.configure_artifact_cache_keys.lock();
             timings.context_memo_wait += waiting.elapsed();
+            let storage = storage_root.to_path_buf();
             if let Some(key) = keys
-                .get(canonical_root)
-                .or_else(|| keys.get(raw_root))
+                .get(&(storage.clone(), canonical_root.to_path_buf()))
+                .or_else(|| keys.get(&(storage, raw_root.to_path_buf())))
                 .cloned()
             {
                 timings.context_cache_hit = true;
@@ -6812,8 +6817,14 @@ impl AppContext {
             .fetch_add(1, Ordering::SeqCst);
         let waiting = Instant::now();
         let mut verified = self.configure_artifact_cache_keys.lock();
-        verified.insert(canonical_root.to_path_buf(), key.clone());
-        verified.insert(raw_root.to_path_buf(), key.clone());
+        verified.insert(
+            (storage_root.to_path_buf(), canonical_root.to_path_buf()),
+            key.clone(),
+        );
+        verified.insert(
+            (storage_root.to_path_buf(), raw_root.to_path_buf()),
+            key.clone(),
+        );
         let mut keys = self.artifact_cache_keys.lock();
         timings.context_memo_wait += waiting.elapsed();
         keys.insert(canonical_root.to_path_buf(), key.clone());
