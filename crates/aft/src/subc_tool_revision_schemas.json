@@ -3,7 +3,7 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "filePath": {
+      "path": {
         "description": "Path to file or directory (absolute or relative to project root)",
         "type": "string"
       },
@@ -37,7 +37,7 @@
       }
     },
     "required": [
-      "filePath"
+      "path"
     ],
     "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nPass `ref` to read the file as it is at a git revision (branch, tag, SHA, HEAD~2); the reply's first line names the commit it resolved to.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n"
   },

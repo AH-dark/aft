@@ -645,9 +645,18 @@ fn inverted_range_error(id: &str, start_line: u64, end_line: u64) -> Response {
     Response::error(
         id,
         "invalid_range",
-        format!(
-            "invalid_range: startLine {start_line} is after endLine {end_line}; no lines selected. Use a start line at or before the end line."
-        ),
+        inverted_range_message("startLine", start_line, end_line),
+    )
+}
+
+/// The refusal text for a start line after the end line. The usual cause is
+/// an end line sent as a line count (`startLine: 232, endLine: 125` meaning
+/// "125 lines from 232"), so the message spells out the end line that
+/// reading would take, and the offset/limit form that takes a count.
+pub(crate) fn inverted_range_message(start_name: &str, start: u64, end: u64) -> String {
+    let count_end = start.saturating_add(end) - 1;
+    format!(
+        "invalid_range: {start_name} {start} is after endLine {end}; no lines selected. endLine is a line number, not a count: to read {end} lines from line {start}, use endLine={count_end} (or offset={start}, limit={end}). Otherwise use a start line at or before the end line."
     )
 }
 

@@ -283,7 +283,13 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
             _ => None,
         })
         .flatten()
-        .map(|tool| (tool.name, tool.schema, tool.description))
+        // The manifest's descriptions drop references to sibling tools, since a
+        // manifest consumer may take any subset; this catalog knows its exact
+        // tool set, so it starts from the full text and renders it for that set.
+        .map(|tool| {
+            let description = manifest::tool_description(&tool.name);
+            (tool.name, tool.schema, description)
+        })
         .collect();
     match preset {
         CatalogPreset::Head => {}
@@ -567,6 +573,244 @@ pub(super) fn catalog_for_confined_request(
     )
 }
 
+/// How a generated description spells a reference to another AFT tool. The
+/// catalog descriptions are generated from the OpenCode plugin's tools, which
+/// that plugin registers as `aft_<name>`; a catalog serves them as `<name>`
+/// (or `aft_outline` on a confined route), and may leave some out.
+const TOOL_REFERENCE_PREFIX: &str = "aft_";
+
+/// Rewrites every served description for the tool set this catalog serves.
+/// A reference to a served tool takes the name the tool is served under. A
+/// reference to a tool this catalog does not serve (the preset leaves it out,
+/// or the session disabled it) is removed together with the smallest stretch
+/// of text that still reads on its own without it: a parenthetical, then a
+/// `;` clause, then a sentence, then the whole line. A model must never be
+/// steered to a tool it was not offered, or by a name it cannot call.
+fn render_tool_references(tools: &mut [CatalogTool]) {
+    let served: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+    for tool in tools.iter_mut() {
+        if let Some(description) = tool.description.as_mut() {
+            if description.contains(TOOL_REFERENCE_PREFIX) {
+                *description = resolve_tool_references(description, &served);
+            }
+        }
+    }
+}
+
+/// One `aft_<name>` reference to an AFT tool, as a byte range of the text.
+struct ToolReference {
+    start: usize,
+    end: usize,
+    /// The name the tool is served under, or `None` when this catalog does
+    /// not serve it.
+    served: Option<String>,
+}
+
+/// Every reference in `text` to a tool AFT defines. `aft_` followed by any
+/// other name is ordinary text and is left alone.
+fn tool_references(text: &str, served: &[String]) -> Vec<ToolReference> {
+    let mut found = Vec::new();
+    for (start, _) in text.match_indices(TOOL_REFERENCE_PREFIX) {
+        let starts_word = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if !starts_word {
+            continue;
+        }
+        let name_start = start + TOOL_REFERENCE_PREFIX.len();
+        let end = text[name_start..]
+            .find(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+            .map_or(text.len(), |len| name_start + len);
+        let name = &text[name_start..end];
+        if !METADATA
+            .iter()
+            .chain(PRESET_ONLY_METADATA)
+            .any(|(known, _, _)| *known == name)
+        {
+            continue;
+        }
+        let spelled = &text[start..end];
+        found.push(ToolReference {
+            start,
+            end,
+            served: served
+                .iter()
+                .find(|served| served.as_str() == name || served.as_str() == spelled)
+                .cloned(),
+        });
+    }
+    found
+}
+
+fn names_absent_tool(text: &str, served: &[String]) -> bool {
+    tool_references(text, served)
+        .iter()
+        .any(|reference| reference.served.is_none())
+}
+
+/// [`render_tool_references`] for one description.
+pub(super) fn resolve_tool_references(text: &str, served: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    // Whether the line before was removed whole; a blank line right after it
+    // goes too when the text already ends in a blank line (or is still empty),
+    // so removing a paragraph leaves one paragraph break, not two.
+    let mut after_removed_line = false;
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        if after_removed_line && body.trim().is_empty() && (out.is_empty() || out.ends_with("\n\n"))
+        {
+            continue;
+        }
+        after_removed_line = false;
+        if !names_absent_tool(body, served) {
+            out.push_str(&rename_served_tools(body, served));
+            out.push_str(newline);
+            continue;
+        }
+        let kept = drop_absent_sentences(body, served);
+        let kept = kept.trim_end();
+        // A line left with only its indentation or list marker goes whole.
+        if kept
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | '•'))
+            .is_empty()
+        {
+            after_removed_line = true;
+            continue;
+        }
+        out.push_str(&rename_served_tools(kept, served));
+        out.push_str(newline);
+    }
+    // A removed last line leaves the line break (or blank line) before it.
+    if after_removed_line {
+        let kept = out.trim_end_matches('\n').len();
+        out.truncate(kept);
+        if text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `line` without the sentences, clauses or parentheticals that name a tool
+/// this catalog does not serve. A sentence ends at ". ".
+fn drop_absent_sentences(line: &str, served: &[String]) -> String {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    for (at, separator) in line.match_indices(". ") {
+        sentences.push(&line[start..at + separator.len()]);
+        start = at + separator.len();
+    }
+    if start < line.len() {
+        sentences.push(&line[start..]);
+    }
+    let mut out = String::with_capacity(line.len());
+    for sentence in sentences {
+        if !names_absent_tool(sentence, served) {
+            out.push_str(sentence);
+            continue;
+        }
+        let sentence = drop_absent_parentheticals(sentence, served);
+        if !names_absent_tool(&sentence, served) {
+            out.push_str(&sentence);
+        } else if let Some(kept) = drop_absent_clauses(&sentence, served) {
+            out.push_str(&kept);
+        }
+    }
+    out
+}
+
+/// `sentence` without each parenthetical that names an absent tool, and the
+/// space before it.
+fn drop_absent_parentheticals(sentence: &str, served: &[String]) -> String {
+    let mut sentence = sentence.to_string();
+    loop {
+        let Some(reference) = tool_references(&sentence, served)
+            .into_iter()
+            .find(|reference| reference.served.is_none())
+        else {
+            return sentence;
+        };
+        let open = sentence[..reference.start].rfind('(');
+        let close = sentence[reference.end..]
+            .find(')')
+            .map(|at| reference.end + at);
+        let (Some(open), Some(close)) = (open, close) else {
+            return sentence;
+        };
+        if sentence[open..reference.start].contains(')')
+            || sentence[reference.end..close].contains('(')
+        {
+            return sentence;
+        }
+        let from = if sentence[..open].ends_with(' ') {
+            open - 1
+        } else {
+            open
+        };
+        sentence.replace_range(from..=close, "");
+    }
+}
+
+/// `sentence` without its `;` clauses that name an absent tool, keeping the
+/// sentence's own ending; `None` when no clause is left.
+fn drop_absent_clauses(sentence: &str, served: &[String]) -> Option<String> {
+    let body = sentence.trim_end_matches(['.', ' ']);
+    let ending = &sentence[body.len()..];
+    let indent = &body[..body.len() - body.trim_start().len()];
+    let clauses: Vec<&str> = body.trim_start().split("; ").collect();
+    let kept: Vec<&str> = clauses
+        .iter()
+        .copied()
+        .filter(|clause| !names_absent_tool(clause, served))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut joined = kept.join("; ");
+    // The sentence now starts at what was a later clause. Capitalize it,
+    // unless it starts with a tool name, which keeps its own spelling.
+    if names_absent_tool(clauses[0], served) && !joined.starts_with(TOOL_REFERENCE_PREFIX) {
+        if let Some(first) = joined.chars().next() {
+            if first.is_ascii_lowercase() {
+                joined.replace_range(..1, &first.to_ascii_uppercase().to_string());
+            }
+        }
+    }
+    Some(format!("{indent}{joined}{ending}"))
+}
+
+/// `text` with each reference to a served tool spelled as it is served.
+fn rename_served_tools(text: &str, served: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for reference in tool_references(text, served) {
+        if let Some(name) = reference.served {
+            let before = &text[copied..reference.start];
+            // "an aft_safety checkpoint" becomes "a safety checkpoint".
+            let article = before
+                .strip_suffix("an ")
+                .or_else(|| before.strip_suffix("An "))
+                .filter(|rest| rest.is_empty() || rest.ends_with(' '));
+            match article {
+                Some(rest) if !name.starts_with(['a', 'e', 'i', 'o', 'u']) => {
+                    out.push_str(rest);
+                    out.push_str(&before[rest.len()..rest.len() + 1]);
+                    out.push(' ');
+                }
+                _ => out.push_str(before),
+            }
+            out.push_str(&name);
+            copied = reference.end;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// `offers` is the session's (`runon`, `revision_reads`) pair: which
 /// enabled-only arguments its catalog carries.
 fn render_catalog(
@@ -598,6 +842,9 @@ fn render_catalog(
             }
         }
     }
+    // Last, once the served names are final: every description names the
+    // tools of this catalog and no other.
+    render_tool_references(&mut answer.tools);
     // Every preset can settle a keyed call after its reply (a held shell
     // call, or a scoped call whose end was never observed), so every catalog
     // declares the session capability that lets a custodian pull those
@@ -2373,6 +2620,89 @@ fn ledger_refusal_result(
     }
 }
 
+/// The tools whose file argument the catalog once advertised as `filePath`.
+/// It now advertises the canonical `path`, but a runner keeps the catalog its
+/// session started with, so those sessions still send `filePath`.
+const LEGACY_FILE_PATH_TOOLS: [&str; 3] = ["read", "write", "edit"];
+
+/// A call's arguments as admission checks them: for a tool in
+/// [`LEGACY_FILE_PATH_TOOLS`], `filePath` is read as `path` (the command
+/// itself still accepts both spellings). Sending both is refused by name
+/// rather than picking one. `None` means the arguments are checked as sent.
+fn legacy_file_path_arguments(
+    name: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<Option<Value>, ErrorBody> {
+    if !LEGACY_FILE_PATH_TOOLS.contains(&name) || !arguments.contains_key("filePath") {
+        return Ok(None);
+    }
+    if arguments.contains_key("path") {
+        return Err(ErrorBody::new(
+            errors::INVALID_REQUEST,
+            "both `path` and `filePath` were sent; they name the same argument, so send only `path`",
+        )
+        .with_detail(json!({"field": "filePath", "conflicts_with": "path"})));
+    }
+    Ok(Some(Value::Object(
+        arguments
+            .iter()
+            .map(|(key, value)| {
+                let key = if key == "filePath" { "path" } else { key };
+                (key.to_string(), value.clone())
+            })
+            .collect(),
+    )))
+}
+
+/// The schema digests a [`LEGACY_FILE_PATH_TOOLS`] tool had while its catalog
+/// advertised `filePath`: the served schemas with `path` renamed back. A
+/// schema pin taken from that older catalog stays valid, because admission
+/// accepts `filePath` and the command behaves the same.
+fn legacy_file_path_digests(name: &str) -> &'static [String] {
+    static DIGESTS: LazyLock<HashMap<&'static str, Vec<String>>> = LazyLock::new(|| {
+        LEGACY_FILE_PATH_TOOLS
+            .iter()
+            .map(|name| {
+                let served = served_tools(CatalogPreset::Worker)
+                    .iter()
+                    .find(|tool| tool.catalog.name == *name)
+                    .expect("every legacy filePath tool is served");
+                let digests = [Some(&served.catalog), served.with_ref.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|tool| {
+                        let mut schema = tool.input_schema.clone();
+                        let object = schema.as_object_mut().expect("tool schemas are objects");
+                        if let Some(Value::Object(properties)) = object.get_mut("properties") {
+                            *properties = std::mem::take(properties)
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    let key = if key == "path" {
+                                        "filePath".into()
+                                    } else {
+                                        key
+                                    };
+                                    (key, value)
+                                })
+                                .collect();
+                        }
+                        if let Some(Value::Array(required)) = object.get_mut("required") {
+                            for entry in required {
+                                if entry == "path" {
+                                    *entry = json!("filePath");
+                                }
+                            }
+                        }
+                        schema_digest(&schema).expect("embedded schema has a structural digest")
+                    })
+                    .collect();
+                (*name, digests)
+            })
+            .collect()
+    });
+    DIGESTS.get(name).map_or(&[], Vec::as_slice)
+}
+
 /// [`admit`] for a call whose role is already resolved.
 fn admit_as(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
@@ -2448,6 +2778,7 @@ fn admit_as(
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
         if pin.schema_digest != tool.schema_digest
             && pin.schema_digest != served.catalog.schema_digest
+            && !legacy_file_path_digests(&call.name).contains(&pin.schema_digest)
         {
             return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
         }
@@ -2464,6 +2795,16 @@ fn admit_as(
         .arguments
         .as_object()
         .ok_or_else(|| errors::invalid_request("arguments", "arguments must be an object"))?;
+    let legacy = legacy_file_path_arguments(&call.name, arguments)?;
+    let (arguments, checked) = match &legacy {
+        Some(renamed) => (
+            renamed
+                .as_object()
+                .expect("renamed arguments are an object"),
+            renamed,
+        ),
+        None => (arguments, &call.arguments),
+    };
     let properties = tool
         .input_schema
         .get("properties")
@@ -2489,7 +2830,7 @@ fn admit_as(
         jsonschema::validator_for(&tool.input_schema)
             .expect("embedded schemas are valid JSON schemas")
     });
-    if let Some(error) = validator.iter_errors(&call.arguments).next() {
+    if let Some(error) = validator.iter_errors(checked).next() {
         let field = error.instance_path.to_string();
         return Err(errors::invalid_request(
             if field.is_empty() {
@@ -3398,6 +3739,184 @@ mod tests {
         }
         let reply = catalog(json!({"preset": "reader"}), &["aft_outline".into()], true).unwrap();
         assert!(!names(&reply).contains(&"outline".to_string()));
+    }
+
+    /// Every `aft_<tool>` reference left in a served description, with whether
+    /// the reply serves a tool under exactly that spelling.
+    fn unresolved_references(reply: &Value) -> Vec<String> {
+        let served = names(reply);
+        let mut unresolved = Vec::new();
+        for tool in reply["tools"].as_array().unwrap() {
+            let text = tool["description"].as_str().unwrap_or_default();
+            for reference in tool_references(text, &[]) {
+                let spelled = &text[reference.start..reference.end];
+                if !served.iter().any(|name| name == spelled) {
+                    unresolved.push(format!("{}: {spelled}", tool["name"]));
+                }
+            }
+        }
+        unresolved
+    }
+
+    #[test]
+    fn descriptions_name_only_tools_their_catalog_serves() {
+        let disabled_sets: [&[&str]; 4] = [
+            &[],
+            &["aft_callgraph", "aft_inspect"],
+            &["aft_zoom", "aft_search", "aft_safety"],
+            &["aft_outline"],
+        ];
+        for preset in CatalogPreset::ALL {
+            for disabled in disabled_sets {
+                let disabled: Vec<String> = disabled.iter().map(|name| name.to_string()).collect();
+                let reply = catalog(json!({"preset": preset.name()}), &disabled, true).unwrap();
+                assert_eq!(
+                    unresolved_references(&reply),
+                    Vec::<String>::new(),
+                    "{} disabled={disabled:?}",
+                    preset.name()
+                );
+            }
+        }
+        // A reader catalog may serve outline, search and zoom without
+        // callgraph; outline's description must not recommend callgraph then.
+        let reply = catalog(
+            json!({"preset": "reader"}),
+            &["aft_callgraph".into(), "aft_inspect".into()],
+            true,
+        )
+        .unwrap();
+        let outline = description(&reply, "outline");
+        assert!(!outline.contains("use callgraph"), "{outline}");
+        assert!(
+            outline.contains("prefer search + zoom on named symbols; use outline on a whole directory only for high-level structure mapping. zoom with `callgraph:true` gives one-level forward calls-out.\n"),
+            "{outline}"
+        );
+        // Every tool served: only the spelling changes.
+        let reply = catalog(json!({"preset": "reader"}), &[], true).unwrap();
+        assert!(description(&reply, "outline").contains(
+            "zoom with `callgraph:true` gives one-level forward calls-out; use callgraph only for reverse callers or multi-level traces."
+        ));
+    }
+
+    #[test]
+    fn absent_tool_references_drop_the_smallest_readable_unit() {
+        let served = ["zoom".to_string(), "outline".to_string()];
+        let cases = [
+            // A parenthetical goes with the space before it.
+            (
+                "Existing files are backed up (undo via aft_safety). Then more.",
+                "Existing files are backed up. Then more.",
+            ),
+            // A `;` clause goes; a sentence that starts later is capitalized.
+            (
+                "prefer aft_search here; use aft_outline there.",
+                "Use outline there.",
+            ),
+            (
+                "aft_zoom gives calls-out; use aft_callgraph for callers.",
+                "zoom gives calls-out.",
+            ),
+            // A sentence with no clause left goes, and so does a line left
+            // empty, without leaving a run of blank lines.
+            (
+                "First.\n\nCall `aft_inspect` afterward.\n\nLast.",
+                "First.\n\nLast.",
+            ),
+            (
+                "- Keep\n- Backs up (via aft_safety undo)\n",
+                "- Keep\n- Backs up\n",
+            ),
+            ("- Keep\n- Use aft_inspect\n", "- Keep\n"),
+            // `aft_` before a name AFT does not define is plain text.
+            ("See aft_unknown_tool.", "See aft_unknown_tool."),
+            // The article follows the served name.
+            (
+                "Consider an aft_zoom pass, then an aft_outline.",
+                "Consider a zoom pass, then an outline.",
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(resolve_tool_references(text, &served), expected, "{text}");
+        }
+    }
+
+    /// The catalog advertises `path` for read, write and edit, but a session
+    /// that started on the older catalog still sends `filePath`, possibly with
+    /// that catalog's schema pin.
+    #[test]
+    fn old_catalog_file_path_calls_are_admitted_and_both_spellings_refused() {
+        // The schema digests of the catalog that advertised `filePath`.
+        const OLD_DIGESTS: [(&str, &str); 3] = [
+            (
+                "read",
+                "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
+            ),
+            (
+                "write",
+                "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
+            ),
+            (
+                "edit",
+                "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
+            ),
+        ];
+        let arguments = |name: &str, key: &str| match name {
+            "read" => json!({key: "src/main.rs", "limit": 20}),
+            "write" => json!({key: "src/main.rs", "content": "x"}),
+            _ => json!({key: "src/main.rs", "edits": [{"oldString": "a", "newString": "b"}]}),
+        };
+        let reply = catalog(json!({}), &[], true).unwrap();
+        for (name, old_digest) in OLD_DIGESTS {
+            let entry = reply["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap();
+            assert!(entry["input_schema"]["properties"].get("path").is_some());
+            assert!(entry["input_schema"]["properties"]
+                .get("filePath")
+                .is_none());
+            assert_ne!(entry["schema_digest"], old_digest, "{name}");
+            assert!(
+                legacy_file_path_digests(name).contains(&old_digest.to_string()),
+                "{name}: {:?}",
+                legacy_file_path_digests(name)
+            );
+            for key in ["path", "filePath"] {
+                admit_plain(
+                    &call(name, arguments(name, key)),
+                    &[],
+                    true,
+                    "session",
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("{name} {key}: {error:?}"));
+            }
+            let mut pinned = call(name, arguments(name, "filePath"));
+            pinned.schema_pin = Some(SchemaPin::new(name, old_digest, 1).encode().unwrap());
+            admit_plain(&pinned, &[], true, "session", true)
+                .unwrap_or_else(|error| panic!("{name} old pin: {error:?}"));
+            let mut both = arguments(name, "path");
+            both["filePath"] = json!("src/main.rs");
+            let error = admit_plain(&call(name, both), &[], true, "session", true).unwrap_err();
+            assert_eq!(error.code, errors::INVALID_REQUEST, "{name}");
+            assert_eq!(
+                error.detail.unwrap(),
+                json!({"field": "filePath", "conflicts_with": "path"})
+            );
+        }
+        // Other tools take no `filePath`.
+        let error = admit_plain(
+            &call("grep", json!({"pattern": "x", "filePath": "src"})),
+            &[],
+            true,
+            "session",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["field"], "filePath");
     }
 
     #[test]

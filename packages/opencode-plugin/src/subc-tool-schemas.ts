@@ -129,6 +129,28 @@ function canonicalFileDescription(def: ToolDefinition): ToolDefinition {
   return { ...def, description: def.description.replaceAll("filePath", "path") };
 }
 
+/**
+ * The catalog schema of read, write or edit: the OpenCode tool's arguments with
+ * `filePath` renamed to the canonical `path`, in the same position. The
+ * OpenCode tools advertise `filePath` only because OpenCode's UI renders file
+ * headers from it; module catalog consumers have no such constraint, and the
+ * module still accepts `filePath` from callers that learned the old schema.
+ */
+function canonicalFileSchema(def: ToolDefinition): Record<string, unknown> {
+  const schema = argsToJsonSchema(canonicalFileDescription(def));
+  const properties = schema.properties as Record<string, unknown>;
+  if (!Object.hasOwn(properties, "filePath") || Object.hasOwn(properties, "path")) {
+    throw new Error("a canonical file tool must advertise filePath and not path");
+  }
+  schema.properties = Object.fromEntries(
+    Object.entries(properties).map(([name, value]) => [name === "filePath" ? "path" : name, value]),
+  );
+  if (Array.isArray(schema.required)) {
+    schema.required = schema.required.map((name) => (name === "filePath" ? "path" : name));
+  }
+  return schema;
+}
+
 function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
   const wrapped = z.object(def.args);
   const jsonSchema = z.toJSONSchema(wrapped, { io: "input" }) as Record<string, unknown>;
@@ -242,9 +264,9 @@ export function buildSubcToolSchemas(
     status: { ...STATUS_SCHEMA, description: STATUS_DESCRIPTION },
     bash: bashSchema,
     powershell: powershellSchema,
-    read: argsToJsonSchema(canonicalFileDescription(read)),
-    write: argsToJsonSchema(canonicalFileDescription(write)),
-    edit: argsToJsonSchema(canonicalFileDescription(edit)),
+    read: canonicalFileSchema(read),
+    write: canonicalFileSchema(write),
+    edit: canonicalFileSchema(edit),
     apply_patch: argsToJsonSchema(applyPatch),
     grep: argsToJsonSchema(grepTool),
     glob: argsToJsonSchema(globTool),

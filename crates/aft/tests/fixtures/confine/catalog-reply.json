@@ -1,10 +1,10 @@
 {
-  "generation": "f1852cee27f6b9eded37313cd40aaec99004e51c06766e78b03e4aa663ecffd8",
-  "catalog_digest": "f1852cee27f6b9eded37313cd40aaec99004e51c06766e78b03e4aa663ecffd8",
+  "generation": "f72880b5b1e716a415e4ade2b828fed5db049e80a8336389c008a0c9bb1df860",
+  "catalog_digest": "f72880b5b1e716a415e4ade2b828fed5db049e80a8336389c008a0c9bb1df860",
   "tools": [
     {
       "name": "read",
-      "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
+      "schema_digest": "f9ef88233ec21e9968187fd84526076c5853cb62d8397721b76ae8bd0a229f00",
       "semantics": 1,
       "modes": [
         "classic",
@@ -23,7 +23,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "filePath": {
+          "path": {
             "description": "Path to file or directory (absolute or relative to project root)",
             "type": "string"
           },
@@ -53,7 +53,7 @@
           }
         },
         "required": [
-          "filePath"
+          "path"
         ]
       }
     },
@@ -136,7 +136,7 @@
       "capabilities": [
         "code.outline/v1"
       ],
-      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nUse aft_outline on a whole directory only for high-level structure mapping.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
