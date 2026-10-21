@@ -648,6 +648,94 @@ artifact_read_tool_test!(
     "semantic_search",
     |path| json!({"path": path, "query": "artifact"})
 );
+
+#[test]
+fn artifact_read_search_plain_storage_matches_main_bytes() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_directory, ctx, artifact) = artifact_read_context();
+    assert_artifact_search_main_bytes(&ctx, &artifact);
+}
+
+fn assert_artifact_search_main_bytes(ctx: &AppContext, path: &Path) {
+    assert!(ctx
+        .bash_background()
+        .is_session_owned_artifact_path("policy-session", path));
+    let response = crate::commands::semantic_search::handle_semantic_search(
+        &request(
+            "semantic_search",
+            json!({"path": path, "query": "artifact"}),
+        ),
+        ctx,
+    );
+    assert_eq!(
+        response.data["code"], "not_a_git_root",
+        "{:?}",
+        response.data
+    );
+    // Pin the complete wire response from before plain-folder scans existed,
+    // including its message and the caller's original path spelling.
+    let message = serde_json::to_string(&format!(
+        "aft_search path must be the root of (or inside) another Git project to search: {}. To filter a subfolder of the current project, use grep or glob with path.",
+        path.display()
+    ))
+    .unwrap();
+    let expected = format!(
+        "{{\"id\":\"policy-test\",\"success\":false,\"code\":\"not_a_git_root\",\"message\":{message}}}"
+    );
+    assert_eq!(serde_json::to_vec(&response).unwrap(), expected.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_read_search_symlinked_storage_matches_main_bytes() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (directory, original, artifact) = artifact_read_context();
+    let alias = directory.path().join("parent-alias");
+    std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+    let storage = alias.join("storage");
+    let mut config = (*original.config()).clone();
+    config.storage_dir = Some(storage.clone());
+    // Even a project-root carve-out must not turn AFT storage into a plain scan.
+    config.project_root = Some(storage.clone());
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    ctx.bash_background()
+        .replay_session(&storage, "policy-session")
+        .unwrap();
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    let aliased_artifact = storage.join(
+        artifact
+            .strip_prefix(original.config().storage_dir.as_ref().unwrap())
+            .unwrap(),
+    );
+    assert_ne!(storage, crate::access_policy::policy_path(&storage));
+    assert!(ctx
+        .validate_read_path("policy-test", "policy-session", artifact.parent().unwrap())
+        .is_ok());
+
+    for path in [&artifact, &aliased_artifact] {
+        assert_artifact_search_main_bytes(&ctx, path);
+    }
+}
+
+#[test]
+fn access_policy_cached_plain_scan_root_rechecks_protection() {
+    let project = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let ctx = context(project.path(), &project.path().join("denied"));
+    let path = folder.path().to_str().unwrap();
+    assert!(ctx
+        .resolve_external_git_root(project.path(), path, |_| false)
+        .is_ok());
+    let result = ctx.resolve_external_git_root(project.path(), path, |_| true);
+    assert!(
+        matches!(
+            result,
+            Err(crate::readonly_artifacts::GitRootResolutionError::ProtectedScanRoot)
+        ),
+        "{result:?}"
+    );
+}
+
 artifact_read_tool_test!(
     artifact_read_callers,
     crate::commands::callers::handle_callers,

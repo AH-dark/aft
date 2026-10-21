@@ -8,5 +8,5 @@
   "fenced_files": [
     "crates/aft/src/commands/semantic_search/mod.rs"
   ],
-  "note": "aft_search scans a plain folder outside the project (issue #638). Only the refusal wording changes in fenced files; tool descriptions are byte-identical in this PR. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+  "note": "aft_search scans a plain folder outside the project (issue #638). Plain-scan admission refuses AFT storage and effective read-floor roots without widening exact artifact authorization; protected plain roots retain their pre-scan refusal response. Tool descriptions, query ranking and query routing are unchanged; benchmark rows must remain byte-identical."
 }

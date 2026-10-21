@@ -129,12 +129,14 @@ pub(crate) struct BorrowedArtifactGeneration {
 pub(crate) enum GitRootResolutionError {
     PathNotFound(PathBuf),
     NotAGitRoot,
+    ProtectedScanRoot,
     Other(String),
 }
 
 pub(crate) fn resolve_git_root_from_user_path(
     project_root: &Path,
     raw_path: &str,
+    scan_root_is_protected: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, GitRootResolutionError> {
     let account_home = crate::commands::configure::resolve_account_home_dir();
     let environment_home = home_dir();
@@ -143,6 +145,7 @@ pub(crate) fn resolve_git_root_from_user_path(
         raw_path,
         account_home.as_deref(),
         environment_home.as_deref(),
+        scan_root_is_protected,
     )
 }
 
@@ -151,6 +154,7 @@ fn resolve_git_root_from_user_path_with_homes(
     raw_path: &str,
     account_home: Option<&Path>,
     environment_home: Option<&Path>,
+    scan_root_is_protected: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, GitRootResolutionError> {
     let expanded = expand_tilde_with_home(raw_path, environment_home);
     let requested = if expanded.is_absolute() {
@@ -184,7 +188,11 @@ fn resolve_git_root_from_user_path_with_homes(
         Err(error) if error == "not_a_git_root" => {
             let account_home = account_home.or(environment_home);
             // A scan must use the same narrow-root policy as a watcher, even
-            // though it never starts a watcher or builds an index.
+            // though it never starts a watcher or builds an index. Exact-file
+            // authorization must not widen into a protected containing folder.
+            if scan_root_is_protected(&git_base) {
+                return Err(GitRootResolutionError::ProtectedScanRoot);
+            }
             if (!crate::developer_tools::git_usable()
                 && crate::git_probe::repository_marker_or_uncertainty_in_directory(&git_base))
                 || plain_scan_root_is_too_broad(&git_base, account_home, environment_home)
@@ -639,12 +647,52 @@ mod tests {
     fn plain_folder_resolves_to_its_own_scan_root() {
         let project = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
-        let root = resolve_git_root_from_user_path(project.path(), folder.path().to_str().unwrap())
-            .unwrap();
+        let root = resolve_git_root_from_user_path(
+            project.path(),
+            folder.path().to_str().unwrap(),
+            |_| false,
+        )
+        .unwrap();
         assert_eq!(
             root,
             crate::inspect::job::canonicalize_normalized(folder.path())
         );
+    }
+
+    #[test]
+    fn plain_folder_scan_root_refuses_access_floor() {
+        let project = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("artifact.stdout");
+        std::fs::write(&file, "artifact").unwrap();
+        let mut config = crate::config::Config::default();
+        config.sandbox.read_deny = vec![folder.path().to_path_buf()];
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &config,
+            &project.path().join("storage"),
+            vec![project.path().to_path_buf()],
+            project.path(),
+        );
+        for path in [folder.path(), file.as_path()] {
+            let result =
+                resolve_git_root_from_user_path(project.path(), &path.to_string_lossy(), |root| {
+                    assert_eq!(
+                        root,
+                        crate::inspect::job::canonicalize_normalized(folder.path())
+                    );
+                    policy.decide(
+                        crate::access_policy::AccessOperation::Read,
+                        &crate::access_policy::policy_path(root),
+                        false,
+                    ) == crate::access_policy::AccessDecision::Deny(
+                        crate::access_policy::AccessDenial::Floor,
+                    )
+                });
+            assert!(
+                matches!(result, Err(GitRootResolutionError::ProtectedScanRoot)),
+                "{result:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -655,7 +703,11 @@ mod tests {
         let bin = tempfile::tempdir().unwrap();
         let root =
             crate::git_probe::with_child_env_for_test(&[("PATH", bin.path().as_os_str())], || {
-                resolve_git_root_from_user_path(project.path(), folder.path().to_str().unwrap())
+                resolve_git_root_from_user_path(
+                    project.path(),
+                    folder.path().to_str().unwrap(),
+                    |_| false,
+                )
             })
             .unwrap();
         assert_eq!(
@@ -674,7 +726,11 @@ mod tests {
         let bin = tempfile::tempdir().unwrap();
         let error =
             crate::git_probe::with_child_env_for_test(&[("PATH", bin.path().as_os_str())], || {
-                resolve_git_root_from_user_path(project.path(), folder.path().to_str().unwrap())
+                resolve_git_root_from_user_path(
+                    project.path(),
+                    folder.path().to_str().unwrap(),
+                    |_| false,
+                )
             })
             .unwrap_err();
         assert!(
@@ -701,6 +757,7 @@ mod tests {
                             &root.to_string_lossy(),
                             Some(account_home.path()),
                             Some(environment_home.path()),
+                            |_| false,
                         ),
                         Err(GitRootResolutionError::NotAGitRoot)
                     ),
