@@ -19114,8 +19114,9 @@ mod tests {
 
     /// A session whose Git identity is unreadable (here every root-commit
     /// probe for its folder fails, as a dubious-ownership refusal does) stays
-    /// provisional until its next bind, while standing maintenance for
-    /// another folder keeps ticking. Neither the bind's standing step nor
+    /// provisional with no background retry; only a later bind tries the
+    /// identity again. Meanwhile standing maintenance for another folder
+    /// keeps ticking. Neither the bind's standing step nor
     /// any tick may ask Git about the session's folder: nothing caches a
     /// failed Git answer, so every ask costs three Git attempts and their
     /// retry sleeps, and it delays maintenance of the other folder.
