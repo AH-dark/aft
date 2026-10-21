@@ -1,0 +1,1 @@
+- Tools served through the CortexKit daemon describe each tool once, mention only tools the session actually has, and ask `read`, `write` and `edit` for `path` (`filePath` still works); a backwards `endLine` now says it is a line number, not a count.
