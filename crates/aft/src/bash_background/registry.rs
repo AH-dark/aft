@@ -893,6 +893,11 @@ pub(crate) struct ScopeKilledTask {
     pub task_id: String,
     pub session_id: String,
     pub remote: Option<ScopeRemoteCancel>,
+    /// The task was in no live project registry: an earlier module instance
+    /// saved it, and it was recovered from that saved record and stopped now
+    /// rather than left running until its project binds again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_saved_record: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -9428,6 +9433,70 @@ impl BgTaskRegistry {
         self.stop_scope_tasks(scope, true, Some(remote))
     }
 
+    /// Recover this scope's unfinished tasks that an earlier module instance
+    /// saved under `storage_root`, so that an owner's pause can stop them.
+    ///
+    /// After a module restart, saved tasks come back only when their project
+    /// binds and replays them, yet their processes (and runner jobs) keep
+    /// running meanwhile. Each task already held by a `live` registry is left
+    /// to that registry. Every other unfinished record stamped with this exact
+    /// scope is restored through the same rules a replay applies, into a
+    /// private registry per storage directory. The caller pauses the scope in
+    /// the returned registries and then detaches them.
+    ///
+    /// The storage root's own task directory (the layout before harness
+    /// namespaces) and every harness directory beneath it are searched.
+    /// Records that cannot be read are skipped, as replay skips them; a
+    /// record of this scope that cannot be restored is returned as an error.
+    pub(crate) fn recover_saved_scope_tasks(
+        storage_root: &Path,
+        scope: &subc_protocol::scope::ScopeStamp,
+        live: &[BgTaskRegistry],
+    ) -> (Vec<BgTaskRegistry>, Vec<String>) {
+        let mut storage_dirs = vec![storage_root.to_path_buf()];
+        if let Ok(entries) = fs::read_dir(storage_root) {
+            let mut harness_dirs = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("bash-tasks").is_dir())
+                .collect::<Vec<_>>();
+            harness_dirs.sort();
+            storage_dirs.extend(harness_dirs);
+        }
+        let mut recovered = Vec::new();
+        let mut errors = Vec::new();
+        for storage_dir in storage_dirs {
+            let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            for metadata in saved_scope_task_records(&storage_dir, scope) {
+                if live
+                    .iter()
+                    .chain(&recovered)
+                    .any(|other| other.task(&metadata.task_id).is_some())
+                {
+                    continue;
+                }
+                if let Err(error) = registry.recover_watch_task(
+                    &storage_dir,
+                    &metadata.session_id,
+                    &metadata.task_id,
+                    metadata.project_root.as_deref(),
+                    metadata.harness.as_deref(),
+                ) {
+                    errors.push(format!(
+                        "{}: saved task could not be recovered: {error}",
+                        metadata.task_id
+                    ));
+                }
+            }
+            if registry.task_arcs().is_empty() {
+                registry.detach();
+            } else {
+                recovered.push(registry);
+            }
+        }
+        (recovered, errors)
+    }
+
     pub(crate) fn wait_owner_pause_cancel(
         &self,
         task_id: &str,
@@ -9538,6 +9607,7 @@ impl BgTaskRegistry {
                             task_id: task.task_id.clone(),
                             session_id: task.session_id.clone(),
                             remote,
+                            from_saved_record: false,
                         });
                     }
                     Ok(_) => report.already_finished += 1,
@@ -12478,6 +12548,45 @@ fn session_recovery_key(storage_dir: &Path, session_id: &str) -> Option<String> 
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string)
+}
+
+/// Unfinished saved task records under `storage_dir` that carry exactly this
+/// scope stamp (owner, reference and epoch), from every session directory.
+fn saved_scope_task_records(
+    storage_dir: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> Vec<PersistedTask> {
+    let Ok(sessions) = fs::read_dir(storage_dir.join("bash-tasks")) else {
+        return Vec::new();
+    };
+    let mut session_dirs = sessions
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    session_dirs.sort();
+    let mut records = Vec::new();
+    for session_dir in session_dirs {
+        let Ok((task_ids, _invalid)) = discover_task_ids(&session_dir) else {
+            continue;
+        };
+        for task_id in task_ids {
+            let Ok(metadata) =
+                resolve_task_layout(&session_dir, &task_id).and_then(|task| read_task_at(&task))
+            else {
+                continue;
+            };
+            let same_scope = metadata.scope.as_ref().is_some_and(|stamp| {
+                stamp.owner == scope.owner
+                    && stamp.scope_ref == scope.scope_ref
+                    && stamp.scope_epoch == scope.scope_epoch
+            });
+            if same_scope && !metadata.is_terminal() && metadata.task_id == task_id {
+                records.push(metadata);
+            }
+        }
+    }
+    records
 }
 
 /// True when a validated open lost its race against an atomic replacement

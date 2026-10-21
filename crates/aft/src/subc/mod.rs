@@ -5532,6 +5532,7 @@ where
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
                                 management_routes.get(&route).and_then(Option::as_ref),
+                                storage_dir,
                             )
                             .await
                         } else {
@@ -7697,6 +7698,7 @@ async fn handle_control_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_management_request(
     tx: &WriterSender,
     frame: &Frame,
@@ -7707,6 +7709,7 @@ async fn handle_management_request(
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
     let operation = decoded
@@ -7733,7 +7736,15 @@ async fn handle_management_request(
                 .and_then(|v| v.get("params"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            spawn_bash_kill_scope(tx, frame, executor, metrics, principal.cloned(), params);
+            spawn_bash_kill_scope(
+                tx,
+                frame,
+                executor,
+                metrics,
+                principal.cloned(),
+                params,
+                storage_dir.to_path_buf(),
+            );
             return Ok(());
         }
         crate::backup::purge::BACKUPS_PURGE_OPERATION => {
@@ -8112,6 +8123,7 @@ fn spawn_bash_kill_scope(
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<Principal>,
     params: Value,
+    storage_dir: PathBuf,
 ) {
     let tx = tx.clone();
     let frame = frame.clone();
@@ -8126,10 +8138,13 @@ fn spawn_bash_kill_scope(
                 .iter()
                 .map(|ctx| ctx.bash_background().clone())
                 .collect::<Vec<_>>();
-            crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            // Projects not bound since the module started hold their saved
+            // tasks only on disk, under the module's storage root.
+            crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
                 params,
                 principal.as_ref(),
                 &registries,
+                Some(&storage_dir),
             )
         })
         .await
