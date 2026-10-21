@@ -1438,6 +1438,7 @@ const WATCHER_RESCAN_RERUN: u8 = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
+    overflow_ignore_evidence: AtomicU8,
     fsevents_stream_creations_total: AtomicU64,
     raw_events_total: AtomicU64,
     raw_events_since_last_rescan: AtomicU64,
@@ -1478,6 +1479,16 @@ pub(crate) struct WatcherRescanInterval {
 }
 
 impl WatcherCounters {
+    pub(crate) fn note_overflow_ignore_relevance(&self, relevant: bool) {
+        self.overflow_ignore_evidence
+            .fetch_or(if relevant { 3 } else { 1 }, Ordering::AcqRel);
+    }
+
+    pub(crate) fn take_overflow_ignore_relevance(&self) -> bool {
+        // No path evidence (including synthetic rescans) is conservative: lost
+        // events could include a changed ignore file.
+        self.overflow_ignore_evidence.swap(0, Ordering::AcqRel) != 1
+    }
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn note_fsevents_stream_creation(&self) {
         self.fsevents_stream_creations_total
@@ -1824,6 +1835,24 @@ enum DeletedRootCleanup {
     Complete(u64),
 }
 
+pub(crate) struct PreparedGitignoreRebuild {
+    inputs: gitignore_state::IgnoreInputSnapshot,
+    matcher: Option<Arc<ignore::gitignore::Gitignore>>,
+    change: IgnoreRuleChange,
+}
+
+#[cfg(test)]
+pub(crate) struct IgnoreRescanGate {
+    pub(crate) root: PathBuf,
+    pub(crate) reached: crossbeam_channel::Sender<()>,
+    pub(crate) release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) static IGNORE_RESCAN_GATE: std::sync::OnceLock<
+    parking_lot::Mutex<Option<IgnoreRescanGate>>,
+> = std::sync::OnceLock::new();
+
 #[derive(Debug)]
 pub(crate) struct WatcherDrainSliceState {
     pub(crate) configure_generation: u64,
@@ -1840,6 +1869,8 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) ignore_changed_paths: Vec<PathBuf>,
     pub(crate) ignore_changed_path_count: usize,
     pub(crate) rescan_required: bool,
+    pub(crate) rescan_ignore_checked: bool,
+    pub(crate) ignore_scan: Option<crossbeam_channel::Receiver<PreparedGitignoreRebuild>>,
     pub(crate) rescan_reason: crate::watcher_filter::RescanReason,
     pub(crate) status_changed: bool,
     pub(crate) scheduler_changed_path_count: usize,
@@ -2075,6 +2106,8 @@ impl WatcherDrainSliceState {
             ignore_changed_paths: Vec::new(),
             ignore_changed_path_count: 0,
             rescan_required: false,
+            rescan_ignore_checked: false,
+            ignore_scan: None,
             rescan_reason: crate::watcher_filter::RescanReason::Unknown,
             status_changed: false,
             scheduler_changed_path_count: 0,
@@ -3887,6 +3920,7 @@ pub struct AppContext {
     // probe again after repeated load disconnects.
     search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32, Option<Instant>)>,
     search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
+    pub(crate) search_corpus_refresh_lane: Arc<crate::runtime_drain::SearchCorpusRefreshLane>,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
@@ -4664,6 +4698,7 @@ impl AppContext {
             search_pending_install: Arc::default(),
             search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
+            search_corpus_refresh_lane: Arc::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager,
@@ -5505,6 +5540,66 @@ impl AppContext {
         changed_paths: &[PathBuf],
     ) -> IgnoreRuleChange {
         self.rebuild_gitignore_inner(Some(changed_paths))
+    }
+
+    pub(crate) fn start_gitignore_rescan(
+        &self,
+    ) -> crossbeam_channel::Receiver<PreparedGitignoreRebuild> {
+        let root = self
+            .config()
+            .project_root
+            .clone()
+            .expect("configured watcher root");
+        let common_dir = self.git_common_dir.lock().clone();
+        let previous = self.gitignore_inputs.lock().clone();
+        let old_matcher = self.gitignore();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            #[cfg(test)]
+            {
+                let mut slot = IGNORE_RESCAN_GATE.get_or_init(Default::default).lock();
+                let gate = if slot.as_ref().is_some_and(|gate| gate.root == root) {
+                    slot.take()
+                } else {
+                    None
+                };
+                drop(slot);
+                if let Some(gate) = gate {
+                    let _ = gate.reached.send(());
+                    let _ = gate.release.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            let inputs = gitignore_state::IgnoreInputSnapshot::collect(root, common_dir.as_deref());
+            let (matcher, change) = if inputs.has_same_effective_inputs(previous.as_ref()) {
+                (old_matcher, IgnoreRuleChange::Unchanged)
+            } else {
+                let matcher = inputs.build_matcher();
+                let change = inputs.classify_against(
+                    previous.as_ref(),
+                    old_matcher.as_deref(),
+                    matcher.as_deref(),
+                );
+                (matcher, change)
+            };
+            let _ = tx.send(PreparedGitignoreRebuild {
+                inputs,
+                matcher,
+                change,
+            });
+        });
+        rx
+    }
+
+    pub(crate) fn publish_gitignore_rescan(&self, prepared: PreparedGitignoreRebuild) {
+        if matches!(prepared.change, IgnoreRuleChange::Unchanged) {
+            self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.gitignore_matcher_rebuilds
+                .fetch_add(1, Ordering::SeqCst);
+            *self.gitignore_inputs.lock() = Some(prepared.inputs);
+            self.set_gitignore(prepared.matcher);
+        }
     }
 
     fn rebuild_gitignore_inner(&self, changed_paths: Option<&[PathBuf]>) -> IgnoreRuleChange {

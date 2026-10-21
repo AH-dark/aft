@@ -1,0 +1,1 @@
+- In a session folder that holds several Git repositories, AFT no longer floods its file watcher or rebuilds the search index over and over, and tool calls no longer wait behind the ignore-file scan (issue #645).

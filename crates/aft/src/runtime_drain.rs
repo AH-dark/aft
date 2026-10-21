@@ -2261,6 +2261,61 @@ pub fn spawn_search_corpus_refresh(
     });
 }
 
+type SearchRefreshJob = Box<dyn FnOnce(&std::sync::atomic::AtomicBool) + Send>;
+
+struct PendingSearchRefresh {
+    dirty: Option<SearchRefreshJob>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A root has one worker and one replaceable follow-up, not one thread per
+/// overflow. Replacing the follow-up also cancels the obsolete disk walk.
+#[derive(Default)]
+pub(crate) struct SearchCorpusRefreshLane {
+    roots: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, PendingSearchRefresh>>,
+    #[cfg(test)]
+    started: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, usize>>,
+}
+
+impl SearchCorpusRefreshLane {
+    fn submit(self: &Arc<Self>, root: PathBuf, job: SearchRefreshJob) {
+        let mut roots = self.roots.lock();
+        if let Some(active) = roots.get_mut(&root) {
+            active
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            active.dirty = Some(job);
+            return;
+        }
+        roots.insert(
+            root.clone(),
+            PendingSearchRefresh {
+                dirty: Some(job),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        drop(roots);
+        let lane = Arc::clone(self);
+        thread::spawn(move || loop {
+            let (job, cancel) = {
+                let mut roots = lane.roots.lock();
+                let active = roots.get_mut(&root).expect("refresh owns root lane");
+                let Some(job) = active.dirty.take() else {
+                    roots.remove(&root);
+                    return;
+                };
+                active.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                (job, Arc::clone(&active.cancel))
+            };
+            #[cfg(test)]
+            {
+                *lane.started.lock().entry(root.clone()).or_default() += 1;
+            }
+            job(&cancel);
+        });
+    }
+}
+
 fn spawn_search_corpus_refresh_admitted(
     ctx: &AppContext,
     root: std::path::PathBuf,
@@ -2295,61 +2350,80 @@ fn spawn_search_corpus_refresh_admitted(
     let persist_epoch = ctx.next_search_persist_epoch();
     let lifecycle = ctx.subc_lifecycle_admission();
     let cold_build_limiter = ctx.cold_build_limiter();
-    thread::spawn(move || {
-        let _terminal_guard = receiver_terminal_guard;
-        log_ctx::with_session(session_id, || {
-            let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
-                &cold_build_limiter,
-                "search corpus refresh",
-                || lifecycle.is_current(&generation_flag, generation),
-            ) else {
-                return;
-            };
-            if !lifecycle.is_current(&generation_flag, generation)
-                || persist_epoch_flag.current() != persist_epoch
-            {
-                return;
-            }
-            let cache_dir = aft::search_index::resolve_cache_dir_with_key(
-                &project_key,
-                config.storage_dir.as_deref(),
-            );
-            let cache_lock = if shared_artifacts_read_only {
-                None
-            } else {
-                match aft::search_index::CacheLock::acquire(&cache_dir, &root) {
-                    Ok(lock) => Some(lock),
-                    Err(error) => {
-                        aft::slog_warn!(
-                            "failed to acquire search cache lock for ignore refresh: {}",
-                            error
-                        );
-                        None
-                    }
+    ctx.search_corpus_refresh_lane.submit(
+        root.clone(),
+        Box::new(move |cancel| {
+            let _terminal_guard = receiver_terminal_guard;
+            log_ctx::with_session(session_id, || {
+                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                    &cold_build_limiter,
+                    "search corpus refresh",
+                    || {
+                        !cancel.load(std::sync::atomic::Ordering::Acquire)
+                            && lifecycle.is_current(&generation_flag, generation)
+                    },
+                ) else {
+                    return;
+                };
+                if !lifecycle.is_current(&generation_flag, generation)
+                    || persist_epoch_flag.current() != persist_epoch
+                {
+                    return;
                 }
-            };
-            let mut index = aft::search_index::SearchIndex::build_with_limit_to_cache_dir(
-                &root,
-                config.search_index_max_file_size,
-                &cache_dir,
-            );
-            wait_on_search_rebuild_publish_gate_for_test(&root);
-            // cache_lock is None for borrow-only roots, so ignore-refresh
-            // never writes cache.bin even when ram_overlay is on.
-            if cache_lock.is_some()
-                && content_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
-                    == content_generation
-            {
-                let _ = persist_epoch_flag.run_if_current(persist_epoch, || {
-                    let head = index.stored_git_head().map(str::to_owned);
-                    index.write_to_disk(&cache_dir, head.as_deref());
+                let cache_dir = aft::search_index::resolve_cache_dir_with_key(
+                    &project_key,
+                    config.storage_dir.as_deref(),
+                );
+                let cache_lock = if shared_artifacts_read_only {
+                    None
+                } else {
+                    match aft::search_index::CacheLock::acquire(&cache_dir, &root) {
+                        Ok(lock) => Some(lock),
+                        Err(error) => {
+                            aft::slog_warn!(
+                                "failed to acquire search cache lock for ignore refresh: {}",
+                                error
+                            );
+                            None
+                        }
+                    }
+                };
+                let keep_going = || {
+                    !cancel.load(std::sync::atomic::Ordering::Acquire)
+                        && lifecycle.is_current(&generation_flag, generation)
+                        && persist_epoch_flag.current() == persist_epoch
+                };
+                let Some(mut index) =
+                    aft::search_index::SearchIndex::build_with_limit_to_cache_dir_cancellable(
+                        &root,
+                        config.search_index_max_file_size,
+                        &cache_dir,
+                        &keep_going,
+                    )
+                else {
+                    return;
+                };
+                wait_on_search_rebuild_publish_gate_for_test(&root);
+                if !keep_going() {
+                    return;
+                }
+                // cache_lock is None for borrow-only roots, so ignore-refresh
+                // never writes cache.bin even when ram_overlay is on.
+                if cache_lock.is_some()
+                    && content_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        == content_generation
+                {
+                    let _ = persist_epoch_flag.run_if_current(persist_epoch, || {
+                        let head = index.stored_git_head().map(str::to_owned);
+                        index.write_to_disk(&cache_dir, head.as_deref());
+                    });
+                }
+                let _ = lifecycle.run_if_current(&generation_flag, generation, || {
+                    let _ = tx.send(index);
                 });
-            }
-            let _ = lifecycle.run_if_current(&generation_flag, generation, || {
-                let _ = tx.send(index);
             });
-        });
-    });
+        }),
+    );
 }
 
 pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
@@ -3565,7 +3639,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // changed paths, so any of them may have changed the
                     // installed TypeScript.
                     crate::lsp::typescript_project::clear_typescript_selection();
+                    if let Some(root) = ctx.canonical_cache_root_opt() {
+                        crate::cache_freshness::invalidate_verify_memo_strict(&root);
+                    }
                     state.rescan_required = true;
+                    state.rescan_ignore_checked = false;
                     state.rescan_reason = reason;
                     // The individual changes are gone, so any Tier-2 input
                     // may have changed: end automatic-retry pauses.
@@ -3578,6 +3656,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     dispatch_events_received += 1;
                     ctx.lsp_note_watcher_ignore_change();
+                    if state.rescan_required {
+                        state.rescan_ignore_checked = false;
+                    }
                     if !state.rescan_required {
                         let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
                         let change = ctx
@@ -3692,6 +3773,52 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     }
 
     if state.rescan_required {
+        if !state.rescan_ignore_checked && state.ignore_scan.is_none() {
+            state.rescan_ignore_checked = true;
+            if ctx.watcher_counters().take_overflow_ignore_relevance() {
+                if ctx.heavy_root_work_allowed() {
+                    state.ignore_scan = Some(ctx.start_gitignore_rescan());
+                } else {
+                    let _ = rebuild_gitignore_for_drain(ctx, &mut state, false, None);
+                }
+            }
+        }
+        if let Some(rx) = state.ignore_scan.as_ref() {
+            match rx.try_recv() {
+                Ok(prepared) => {
+                    state.ignore_scan = None;
+                    // Publication retires all parked queues together; only the
+                    // snapshot discovery and matcher construction run off-thread.
+                    let placeholder = WatcherDrainSliceState::new(
+                        state.configure_generation,
+                        state.configure_content_generation,
+                    );
+                    *ctx.watcher_drain_slice().lock() =
+                        Some(std::mem::replace(&mut state, placeholder));
+                    let published = ctx.run_if_subc_bound_generation(configure_generation, || {
+                        ctx.publish_gitignore_rescan(prepared)
+                    });
+                    state = ctx
+                        .watcher_drain_slice()
+                        .lock()
+                        .take()
+                        .expect("parked watcher continuation");
+                    if published.is_none() {
+                        state.rescan_ignore_checked = false;
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    state.ignore_scan = None;
+                    state.rescan_ignore_checked = false;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+            if state.ignore_scan.is_some() || !state.rescan_ignore_checked {
+                outcome.has_more = true;
+                *ctx.watcher_drain_slice().lock() = Some(state);
+                return outcome;
+            }
+        }
         crate::logging::note_watcher_overflow();
         let root = ctx
             .canonical_cache_root_opt()
@@ -3699,8 +3826,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
         let watcher_counters = ctx.watcher_counters();
         watcher_counters.start_rescan();
-        let mut rescan_reason = state.rescan_reason;
-        loop {
+        let rescan_reason = state.rescan_reason;
+        let deferred_rescan = {
             let interval = watcher_counters.begin_rescan(rescan_reason);
             wait_on_watcher_rescan_gate_for_test(ctx);
             let app = ctx.app();
@@ -3710,8 +3837,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 &watcher_counters,
                 db.as_ref(),
             );
-            let _ =
-                rebuild_gitignore_for_drain(ctx, &mut state, ctx.heavy_root_work_allowed(), None);
             let rss_before = watcher_rescan_rss_bytes();
             let rescan_started = Instant::now();
             state.status_changed |= refresh_project_after_watcher_rescan(ctx);
@@ -3725,11 +3850,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 rss_delta_bytes,
                 interval.raw_events,
             );
-            let Some(next_reason) = watcher_counters.finish_rescan_walk() else {
-                break;
-            };
-            rescan_reason = next_reason;
-        }
+            // At most one pass per dispatch slice. A loss during this pass is
+            // retained for the next slice, including its ignore-path evidence.
+            watcher_counters.finish_rescan_walk()
+        };
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
         if state.status_changed {
@@ -3745,7 +3869,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             .run_if_subc_bound_generation(configure_generation, || ())
             .is_some()
         {
-            state.rescan_required = false;
+            state.rescan_required = deferred_rescan.is_some();
+            state.rescan_ignore_checked = false;
+            if let Some(reason) = deferred_rescan {
+                state.rescan_reason = reason;
+            }
             state.ignore_changed = false;
             state.ignore_refresh_due = None;
             state.ignore_changed_paths.clear();
@@ -4119,6 +4247,169 @@ pub(crate) fn configure_search_order_context_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue645_rescan_yields_before_followup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        let ctx = Arc::new(ctx);
+        ctx.watcher_counters().note_overflow_ignore_relevance(false);
+        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            .unwrap();
+        let (reached, release) = install_watcher_rescan_gate_for_test(&ctx);
+        let worker_ctx = ctx.clone();
+        let drain = std::thread::spawn(move || drain_watcher_events_bounded(&worker_ctx, 16));
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        ctx.watcher_counters().note_overflow_ignore_relevance(false);
+        assert!(ctx
+            .watcher_counters()
+            .note_overflow(RescanReason::Unknown, Vec::new()));
+        release.send(()).unwrap();
+        let outcome = drain.join().unwrap();
+        assert!(
+            outcome.has_more,
+            "a mid-rescan overflow must yield, not loop on dispatch"
+        );
+        assert_eq!(ctx.watcher_counters().snapshot().rescans_unknown_total, 1);
+    }
+
+    #[test]
+    fn issue645_tool_dispatch_does_not_wait_for_ignore_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        let ctx = Arc::new(ctx);
+        let (reached_tx, reached) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        *crate::context::IGNORE_RESCAN_GATE
+            .get_or_init(Default::default)
+            .lock() = Some(crate::context::IgnoreRescanGate {
+            root,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            .unwrap();
+        let (done_tx, done) = crossbeam_channel::bounded(1);
+        let dispatch_ctx = ctx.clone();
+        let dispatch = std::thread::spawn(move || {
+            let result = drain_watcher_events_bounded(&dispatch_ctx, 16);
+            // The next tool's config and matcher reads share these locks.
+            let _config = dispatch_ctx.config();
+            let _matcher = dispatch_ctx.gitignore();
+            done_tx.send(result).unwrap();
+        });
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ignore scanner did not start");
+        let result = done.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        dispatch.join().unwrap();
+        assert!(
+            result
+                .expect("tool dispatch blocked behind ignore scan")
+                .has_more
+        );
+    }
+
+    #[test]
+    fn issue645_overflow_without_ignore_paths_skips_ignore_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        let generation = ctx
+            .gitignore_generation()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ctx.watcher_counters().note_overflow_ignore_relevance(false);
+        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            .unwrap();
+        let outcome = drain_watcher_events_bounded(&ctx, 16);
+        assert!(
+            !outcome.has_more,
+            "metadata-only overflow scheduled an ignore walk"
+        );
+        assert_eq!(
+            ctx.gitignore_generation()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation
+        );
+    }
+
+    #[test]
+    fn issue645_overflow_ignore_walk_never_runs_on_dispatch_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        let before = AppContext::ignore_walks_on_current_thread_for_test();
+        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            .unwrap();
+        drain_watcher_events_bounded(&ctx, 16);
+        assert_eq!(
+            AppContext::ignore_walks_on_current_thread_for_test(),
+            before,
+            "overflow must not walk ignore files on the tool dispatch thread"
+        );
+    }
+
+    #[test]
+    fn issue645_concurrent_overflows_share_one_search_build_and_one_followup() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        let (reached, _, release) = install_search_rebuild_publish_gate(Some(root.clone()));
+        spawn_search_corpus_refresh(&ctx, root.clone(), ctx.config());
+        reached.recv_timeout(Duration::from_secs(12)).unwrap();
+        let sequence =
+            crate::logging::index_build_start_sequence(crate::logging::IndexPlane::Search, &root);
+        let (second_tx, second) = crossbeam_channel::bounded(1);
+        crate::logging::signal_after_index_build_start(
+            crate::logging::IndexPlane::Search,
+            &root,
+            sequence,
+            second_tx,
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                let ctx = &ctx;
+                let root = root.clone();
+                scope.spawn(move || spawn_search_corpus_refresh(ctx, root, ctx.config()));
+            }
+        });
+        let concurrent = second.recv_timeout(Duration::from_millis(500)).is_ok();
+        release.send(()).unwrap();
+        let rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(
+            !concurrent,
+            "a second search build started while the first was still running"
+        );
+        assert_eq!(
+            ctx.search_corpus_refresh_lane
+                .started
+                .lock()
+                .get(&root)
+                .copied(),
+            Some(2)
+        );
+    }
+
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
@@ -5751,10 +6042,10 @@ mod tests {
         // After rebind the retained rescan executes in full: strict memo and
         // acknowledged flag.
         ctx.mark_subc_bound();
-        let mut guard = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
         while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
-            guard += 1;
-            assert!(guard < 16, "rescan replay must finish");
+            assert!(Instant::now() < deadline, "rescan replay must finish");
+            std::thread::yield_now();
         }
         assert_eq!(
             crate::cache_freshness::warm_verify_plan(
@@ -8249,7 +8540,13 @@ mod watcher_slice_tests {
 
         let (rescan_reached, release_rescan) = install_watcher_rescan_gate_for_test(&ctx);
         let drain_ctx = Arc::clone(&ctx);
-        let drain = std::thread::spawn(move || drain_watcher_events(&drain_ctx));
+        let drain = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while drain_watcher_events_bounded(&drain_ctx, usize::MAX).has_more {
+                assert!(Instant::now() < deadline, "async rescan did not converge");
+                std::thread::yield_now();
+            }
+        });
         rescan_reached
             .recv_timeout(Duration::from_secs(2))
             .expect("first rescan did not reach the test gate");
@@ -8257,31 +8554,9 @@ mod watcher_slice_tests {
         raw_tx.send(Ok(overflow())).unwrap();
         raw_tx.send(Ok(overflow())).unwrap();
         let callback_deadline = Instant::now() + Duration::from_millis(50);
-        let mut overflow_lines = Vec::new();
-        while overflow_lines
-            .iter()
-            .filter(|line: &&String| {
-                line.contains(&format!("root={}", root.display()))
-                    && line.contains("rescan_in_progress=true")
-            })
-            .count()
-            != 2
-            && Instant::now() < callback_deadline
-        {
-            overflow_lines.extend(crate::watcher_filter::take_watcher_overflow_logs_for_test());
+        while counters.snapshot().overflows_total != 3 && Instant::now() < callback_deadline {
             std::thread::yield_now();
         }
-        assert_eq!(
-            overflow_lines
-                .iter()
-                .filter(|line| {
-                    line.contains(&format!("root={}", root.display()))
-                        && line.contains("rescan_in_progress=true")
-                })
-                .count(),
-            2,
-            "the filter must finish attributing drops without waiting for the rescan: {overflow_lines:?}"
-        );
         assert_eq!(counters.snapshot().overflows_total, 3);
         assert!(ctx
             .watcher_rx()
@@ -8304,6 +8579,16 @@ mod watcher_slice_tests {
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         filter.join().unwrap();
+        let lines = crate::watcher_filter::take_watcher_overflow_logs_for_test()
+            .into_iter()
+            .filter(|line| line.contains(&format!("root={}", root.display())))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one warning per burst, not per lost-event flag"
+        );
+        assert!(lines[0].contains("count=3"), "{}", lines[0]);
     }
 
     #[test]
@@ -8328,8 +8613,17 @@ mod watcher_slice_tests {
             RescanReason::KernelDropped,
         ))
         .unwrap();
-        let (second, lines) =
-            crate::logging::capture_index_events(|| drain_watcher_events_bounded(&ctx, 2));
+        let (second, lines) = crate::logging::capture_index_events(|| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let result = drain_watcher_events_bounded(&ctx, 2);
+                if !result.has_more {
+                    break result;
+                }
+                assert!(Instant::now() < deadline, "async rescan did not converge");
+                std::thread::yield_now();
+            }
+        });
 
         assert_eq!(second.processed, 0);
         assert!(!second.has_more);

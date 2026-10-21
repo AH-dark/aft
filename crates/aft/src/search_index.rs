@@ -1604,6 +1604,21 @@ impl SearchIndex {
         max_file_size: u64,
         cache_dir: &Path,
     ) -> Self {
+        Self::build_with_limit_to_cache_dir_cancellable(root, max_file_size, cache_dir, &|| true)
+            .expect("uncancellable search build")
+    }
+
+    /// Cancelled refreshes must neither publish a partial index nor start a
+    /// second, in-memory walk through the streaming-error fallback.
+    pub(crate) fn build_with_limit_to_cache_dir_cancellable(
+        root: &Path,
+        max_file_size: u64,
+        cache_dir: &Path,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Self> {
+        if !keep_going() {
+            return None;
+        }
         let started = std::time::Instant::now();
         let key = artifact_cache_key(root);
         let scope =
@@ -1637,7 +1652,7 @@ impl SearchIndex {
             index.project_root = root.to_path_buf();
             index.max_file_size = max_file_size;
             index.build_denied = true;
-            return index;
+            return Some(index);
         }
         crate::logging::log_index_event(
             crate::logging::IndexEvent::from_scope(
@@ -1649,7 +1664,7 @@ impl SearchIndex {
             .field("total", 1)
             .field("elapsed_ms", scope.elapsed_ms()),
         );
-        match build_streaming_index(root, max_file_size, cache_dir) {
+        match build_streaming_index(root, max_file_size, cache_dir, keep_going) {
             Ok((mut index, indexed)) => {
                 index.ready = true;
                 crate::slog_info!(
@@ -1679,9 +1694,17 @@ impl SearchIndex {
                     .field("trigrams", index.trigram_count()),
                 );
                 failure_guard.disarm();
-                index
+                Some(index)
             }
             Err(error) => {
+                if error.kind() == std::io::ErrorKind::Interrupted || !keep_going() {
+                    crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildCancelled,
+                        &scope,
+                    ));
+                    failure_guard.disarm();
+                    return None;
+                }
                 log::warn!(
                         "search index: streaming build failed ({}); falling back to bounded in-memory delta",
                         error
@@ -1696,7 +1719,16 @@ impl SearchIndex {
                     .field("total", 1)
                     .field("elapsed_ms", scope.elapsed_ms()),
                 );
-                let index = Self::build_in_memory(root, max_file_size, started);
+                let Some(index) =
+                    Self::build_in_memory_cancellable(root, max_file_size, started, keep_going)
+                else {
+                    crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildCancelled,
+                        &scope,
+                    ));
+                    failure_guard.disarm();
+                    return None;
+                };
                 crate::logging::log_index_event(
                     crate::logging::IndexEvent::from_scope(
                         crate::logging::IndexEventKind::BuildReady,
@@ -1707,12 +1739,22 @@ impl SearchIndex {
                     .field("trigrams", index.trigram_count()),
                 );
                 failure_guard.disarm();
-                index
+                Some(index)
             }
         }
     }
 
     fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
+        Self::build_in_memory_cancellable(root, max_file_size, started, &|| true)
+            .expect("uncancellable in-memory search build")
+    }
+
+    fn build_in_memory_cancellable(
+        root: &Path,
+        max_file_size: u64,
+        started: Instant,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Self> {
         let _progress = crate::cold_build_limiter::progress::start(
             root,
             "trigram build",
@@ -1724,13 +1766,19 @@ impl SearchIndex {
         let mut index = SearchIndex {
             project_root: project_root.clone(),
             max_file_size,
-            ignore_rules_fingerprint: ignore_rules_fingerprint(&project_root),
+            ignore_rules_fingerprint: ignore_rules_fingerprint_cancellable(
+                &project_root,
+                keep_going,
+            )?,
             ..SearchIndex::new()
         };
         let filters = PathFilters::default();
-        let paths: Vec<PathBuf> = walk_project_files(&index.project_root, &filters);
+        let paths = walk_build_files_cancellable(&index.project_root, &filters, keep_going)?;
         crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
-        let indexed = index.ingest_paths_parallel(&paths);
+        let indexed = index.ingest_paths_parallel_cancellable(&paths, keep_going);
+        if !keep_going() {
+            return None;
+        }
         index.git_head = current_git_head(&index.project_root);
         index.ready = true;
         crate::slog_info!(
@@ -1740,7 +1788,7 @@ impl SearchIndex {
             started.elapsed().as_millis(),
             search_index_build_pool_size()
         );
-        index
+        Some(index)
     }
 
     /// Serial cold build for tests and parity checks against [`build_with_limit`].
@@ -1762,7 +1810,11 @@ impl SearchIndex {
         index
     }
 
-    fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {
+    fn ingest_paths_parallel_cancellable(
+        &mut self,
+        paths: &[PathBuf],
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> usize {
         let max_file_size = self.max_file_size;
         let pool_size = search_index_build_pool_size();
         let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
@@ -1783,10 +1835,19 @@ impl SearchIndex {
 
         let mut indexed = 0usize;
         for chunk in paths.chunks(chunk_size) {
+            if !keep_going() {
+                break;
+            }
             let prepare_chunk = || -> Vec<PreparedSearchPath> {
                 chunk
                     .par_iter()
-                    .map(|path| prepare_search_path(path, max_file_size))
+                    .map(|path| {
+                        if keep_going() {
+                            prepare_search_path(path, max_file_size)
+                        } else {
+                            PreparedSearchPath::Skipped
+                        }
+                    })
                     .collect()
             };
             let prepared = match &pool {
@@ -2092,7 +2153,7 @@ impl SearchIndex {
         };
         let write_result = {
             let mut sources = self.compaction_record_sources(Arc::clone(&plan.id_map));
-            write_cache_file_from_sources(cache_dir, &plan, &mut sources, domain)
+            write_cache_file_from_sources(cache_dir, &plan, &mut sources, domain, &|| true)
         };
 
         match write_result {
@@ -4334,24 +4395,70 @@ trait PostingRecordSource {
 }
 
 struct VecRecordSource {
-    records: Vec<SpillRecord>,
+    records: Arc<Vec<SpillRecord>>,
     index: usize,
+    end: usize,
 }
 
 impl VecRecordSource {
     fn new(records: Vec<SpillRecord>) -> Self {
-        Self { records, index: 0 }
+        Self {
+            end: records.len(),
+            records: Arc::new(records),
+            index: 0,
+        }
     }
 }
 
 impl PostingRecordSource for VecRecordSource {
     fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
+        if self.index == self.end {
+            return Ok(None);
+        }
         let record = self.records.get(self.index).copied();
         if record.is_some() {
             self.index += 1;
         }
         Ok(record)
     }
+}
+
+const SEARCH_BUILD_RECORD_BATCH: usize = 8192;
+
+fn check_search_build(keep_going: &dyn Fn() -> bool) -> std::io::Result<()> {
+    if keep_going() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "search refresh superseded",
+        ))
+    }
+}
+
+fn sorted_record_sources(
+    mut records: Vec<SpillRecord>,
+    keep_going: &dyn Fn() -> bool,
+) -> std::io::Result<Vec<Box<dyn PostingRecordSource>>> {
+    // Sort bounded runs so cancellation need not wait for the entire in-memory
+    // posting block.
+    // The normal merge restores the same global (trigram, file_id) ordering.
+    for run in records.chunks_mut(SEARCH_BUILD_RECORD_BATCH) {
+        check_search_build(keep_going)?;
+        run.sort_unstable_by_key(|record| (record.trigram, record.file_id));
+    }
+    check_search_build(keep_going)?;
+    let records = Arc::new(records);
+    Ok((0..records.len())
+        .step_by(SEARCH_BUILD_RECORD_BATCH)
+        .map(|index| {
+            Box::new(VecRecordSource {
+                records: records.clone(),
+                index,
+                end: (index + SEARCH_BUILD_RECORD_BATCH).min(records.len()),
+            }) as Box<dyn PostingRecordSource>
+        })
+        .collect())
 }
 
 struct SpillSegmentSource {
@@ -4496,10 +4603,29 @@ impl PartialOrd for HeapItem {
     }
 }
 
+#[cfg(test)]
+type RefreshReadProbe = (Arc<AtomicUsize>, Arc<AtomicBool>);
+#[cfg(test)]
+static REFRESH_READ_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, RefreshReadProbe>>> = OnceLock::new();
+
+#[cfg(test)]
+fn note_refresh_read_for_test(root: &Path) {
+    if let Some((reads, cancelled)) = REFRESH_READ_PROBES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .get(root)
+    {
+        reads.fetch_add(1, Ordering::SeqCst);
+        cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
 fn build_streaming_index(
     root: &Path,
     max_file_size: u64,
     cache_dir: &Path,
+    keep_going: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<(SearchIndex, usize)> {
     let _progress = crate::cold_build_limiter::progress::start(
         root,
@@ -4511,9 +4637,13 @@ fn build_streaming_index(
     crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let ignore_fingerprint = ignore_rules_fingerprint(&project_root);
+    let ignore_fingerprint = ignore_rules_fingerprint_cancellable(&project_root, keep_going)
+        .ok_or(std::io::ErrorKind::Interrupted)?;
     let filters = PathFilters::default();
-    let paths: Vec<PathBuf> = walk_project_files(&project_root, &filters);
+    let paths =
+        walk_build_files_cancellable(&project_root, &filters, keep_going).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "search refresh superseded")
+        })?;
     crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
     let pool_size = search_index_build_pool_size();
     let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
@@ -4540,10 +4670,22 @@ fn build_streaming_index(
 
     let build_result = (|| -> std::io::Result<BasePostings> {
         for chunk in paths.chunks(chunk_size) {
+            if !keep_going() {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
             let prepare_chunk = || -> Vec<PreparedSearchPath> {
                 chunk
                     .par_iter()
-                    .map(|path| prepare_search_path(path, max_file_size))
+                    .map(|path| {
+                        if keep_going() {
+                            let prepared = prepare_search_path(path, max_file_size);
+                            #[cfg(test)]
+                            note_refresh_read_for_test(&project_root);
+                            prepared
+                        } else {
+                            PreparedSearchPath::Skipped
+                        }
+                    })
                     .collect()
             };
             let prepared = match &pool {
@@ -4603,13 +4745,13 @@ fn build_streaming_index(
         }
 
         crate::cold_build_limiter::progress::phase("publishing", None);
-        block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
-        let mut sources: Vec<Box<dyn PostingRecordSource>> = Vec::new();
-        for path in &spill_paths {
-            sources.push(Box::new(SpillSegmentSource::open(path)?));
+        if !keep_going() {
+            return Err(std::io::ErrorKind::Interrupted.into());
         }
-        if !block.is_empty() {
-            sources.push(Box::new(VecRecordSource::new(std::mem::take(&mut block))));
+        let mut sources = sorted_record_sources(std::mem::take(&mut block), keep_going)?;
+        for path in &spill_paths {
+            check_search_build(keep_going)?;
+            sources.push(Box::new(SpillSegmentSource::open(path)?));
         }
 
         let plan = CacheWritePlan {
@@ -4635,6 +4777,7 @@ fn build_streaming_index(
             &plan,
             &mut sources,
             crate::write_ledger::Domain::SearchIndexBuild,
+            keep_going,
         )
     })();
 
@@ -4674,7 +4817,9 @@ fn write_cache_file_from_sources(
     plan: &CacheWritePlan,
     sources: &mut [Box<dyn PostingRecordSource>],
     domain: crate::write_ledger::Domain,
+    keep_going: &dyn Fn() -> bool,
 ) -> std::io::Result<BasePostings> {
+    check_search_build(keep_going)?;
     crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let cache_path = cache_dir.join("cache.bin");
@@ -4699,15 +4844,16 @@ fn write_cache_file_from_sources(
         write_u64(&mut writer, 0)?;
 
         let postings_section_start = writer.stream_position()?;
-        let postings_header = build_postings_header_bytes(plan)?;
-        writer.write_all(&postings_header)?;
+        let postings_header = build_postings_header_bytes(plan, keep_going)?;
+        write_search_build_bytes(&mut writer, &postings_header, keep_going)?;
         let postings_blob_len_patch = writer.stream_position()?;
         write_u64(&mut writer, 0)?;
         let postings_blob_start = writer.stream_position()?;
 
-        let (lookup_entries, postings_blob_len) = merge_sources_to_writer(sources, &mut writer)?;
-        let extension = build_file_trigram_count_extension(&plan.file_trigram_count)?;
-        writer.write_all(&extension)?;
+        let (lookup_entries, postings_blob_len) =
+            merge_sources_to_writer(sources, &mut writer, keep_going)?;
+        let extension = build_file_trigram_count_extension(&plan.file_trigram_count, keep_going)?;
+        write_search_build_bytes(&mut writer, &extension, keep_going)?;
         let postings_crc_end = writer.stream_position()?;
 
         writer.flush()?;
@@ -4719,6 +4865,7 @@ fn write_cache_file_from_sources(
             &tmp_cache,
             postings_section_start,
             postings_crc_end.saturating_sub(postings_section_start),
+            keep_going,
         )?;
         writer.seek(SeekFrom::Start(postings_crc_end))?;
         writer.write_all(&checksum.to_le_bytes())?;
@@ -4728,14 +4875,15 @@ fn write_cache_file_from_sources(
         write_u64(&mut writer, postings_len_total)?;
         writer.seek(SeekFrom::Start(postings_section_end))?;
 
-        let lookup_blob = build_lookup_section_bytes(&lookup_entries)?;
-        writer.write_all(&lookup_blob)?;
+        let lookup_blob = build_lookup_section_bytes(&lookup_entries, keep_going)?;
+        write_search_build_bytes(&mut writer, &lookup_blob, keep_going)?;
         let file_bytes = writer.stream_position()?;
         writer.flush()?;
         // CRC-checked caches rebuild from source after power loss. The rename,
         // not a sync, keeps concurrent readers from seeing a partial write.
         drop(writer);
 
+        check_search_build(keep_going)?;
         fs::rename(&tmp_cache, &cache_path)?;
         // Credit the bytes handed to the kernel; this cache is not a durable log.
         crate::write_ledger::credit(
@@ -4762,9 +4910,11 @@ fn write_cache_file_from_sources(
 fn merge_sources_to_writer(
     sources: &mut [Box<dyn PostingRecordSource>],
     writer: &mut BufWriter<File>,
+    keep_going: &dyn Fn() -> bool,
 ) -> std::io::Result<(Vec<LookupEntry>, u64)> {
     let mut heap = BinaryHeap::new();
     for (source_index, source) in sources.iter_mut().enumerate() {
+        check_search_build(keep_going)?;
         if let Some(record) = source.next_record()? {
             heap.push(HeapItem {
                 record,
@@ -4780,6 +4930,9 @@ fn merge_sources_to_writer(
     let mut current_count = 0u32;
 
     while let Some(item) = heap.pop() {
+        if postings_blob_len % (SEARCH_BUILD_RECORD_BATCH * POSTING_BYTES) as u64 == 0 {
+            check_search_build(keep_going)?;
+        }
         let record = item.record;
         if current_trigram != Some(record.trigram) {
             if let Some(trigram) = current_trigram {
@@ -4819,10 +4972,27 @@ fn merge_sources_to_writer(
         });
     }
 
+    check_search_build(keep_going)?;
     Ok((lookup_entries, postings_blob_len))
 }
 
-fn build_postings_header_bytes(plan: &CacheWritePlan) -> std::io::Result<Vec<u8>> {
+fn write_search_build_bytes(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    keep_going: &dyn Fn() -> bool,
+) -> std::io::Result<()> {
+    for chunk in bytes.chunks(64 * 1024) {
+        check_search_build(keep_going)?;
+        writer.write_all(chunk)?;
+    }
+    Ok(())
+}
+
+fn build_postings_header_bytes(
+    plan: &CacheWritePlan,
+    keep_going: &dyn Fn() -> bool,
+) -> std::io::Result<Vec<u8>> {
+    check_search_build(keep_going)?;
     let mut writer = BufWriter::new(Cursor::new(Vec::new()));
     writer.write_all(INDEX_MAGIC)?;
     write_u32(&mut writer, INDEX_VERSION)?;
@@ -4848,6 +5018,9 @@ fn build_postings_header_bytes(plan: &CacheWritePlan) -> std::io::Result<Vec<u8>
     writer.write_all(plan.ignore_fingerprint.as_bytes())?;
 
     for (file_id, file) in plan.files.iter().enumerate() {
+        if file_id % SEARCH_BUILD_RECORD_BATCH == 0 {
+            check_search_build(keep_going)?;
+        }
         let file_id =
             u32::try_from(file_id).map_err(|_| std::io::Error::other("too many files to cache"))?;
         let path = storable_relative_path(&plan.project_root, &file.path).ok_or_else(|| {
@@ -4885,14 +5058,20 @@ fn build_postings_header_bytes(plan: &CacheWritePlan) -> std::io::Result<Vec<u8>
         .into_inner())
 }
 
-fn build_lookup_section_bytes(lookup_entries: &[LookupEntry]) -> std::io::Result<Vec<u8>> {
+fn build_lookup_section_bytes(
+    lookup_entries: &[LookupEntry],
+    keep_going: &dyn Fn() -> bool,
+) -> std::io::Result<Vec<u8>> {
     let mut writer = BufWriter::new(Cursor::new(Vec::new()));
     let entry_count = u32::try_from(lookup_entries.len())
         .map_err(|_| std::io::Error::other("too many lookup entries to cache"))?;
     writer.write_all(LOOKUP_MAGIC)?;
     write_u32(&mut writer, INDEX_VERSION)?;
     write_u32(&mut writer, entry_count)?;
-    for entry in lookup_entries {
+    for (index, entry) in lookup_entries.iter().enumerate() {
+        if index % SEARCH_BUILD_RECORD_BATCH == 0 {
+            check_search_build(keep_going)?;
+        }
         write_u32(&mut writer, entry.trigram)?;
         write_u64(&mut writer, entry.offset)?;
         write_u32(&mut writer, entry.count)?;
@@ -4902,12 +5081,20 @@ fn build_lookup_section_bytes(lookup_entries: &[LookupEntry]) -> std::io::Result
         .into_inner()
         .map_err(|error| std::io::Error::other(error.to_string()))?
         .into_inner();
-    let checksum = crc32fast::hash(&lookup_blob);
+    let mut hasher = crc32fast::Hasher::new();
+    for chunk in lookup_blob.chunks(64 * 1024) {
+        check_search_build(keep_going)?;
+        hasher.update(chunk);
+    }
+    let checksum = hasher.finalize();
     lookup_blob.extend_from_slice(&checksum.to_le_bytes());
     Ok(lookup_blob)
 }
 
-fn build_file_trigram_count_extension(counts: &[u32]) -> std::io::Result<Vec<u8>> {
+fn build_file_trigram_count_extension(
+    counts: &[u32],
+    keep_going: &dyn Fn() -> bool,
+) -> std::io::Result<Vec<u8>> {
     let mut writer = BufWriter::new(Cursor::new(Vec::new()));
     writer.write_all(FILE_TRIGRAM_COUNT_MAGIC)?;
     write_u32(&mut writer, INDEX_VERSION)?;
@@ -4916,7 +5103,10 @@ fn build_file_trigram_count_extension(counts: &[u32]) -> std::io::Result<Vec<u8>
         u32::try_from(counts.len())
             .map_err(|_| std::io::Error::other("too many file trigram counts"))?,
     )?;
-    for count in counts {
+    for (index, count) in counts.iter().enumerate() {
+        if index % SEARCH_BUILD_RECORD_BATCH == 0 {
+            check_search_build(keep_going)?;
+        }
         write_u32(&mut writer, *count)?;
     }
     writer.flush()?;
@@ -5437,13 +5627,19 @@ fn reader_has_remaining<R: Seek>(
     Ok(position <= absolute_end && (len as u64) <= absolute_end - position)
 }
 
-fn crc32_file_range(path: &Path, start: u64, len: u64) -> std::io::Result<u32> {
+fn crc32_file_range(
+    path: &Path,
+    start: u64,
+    len: u64,
+    keep_going: &dyn Fn() -> bool,
+) -> std::io::Result<u32> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
     let mut hasher = crc32fast::Hasher::new();
     let mut remaining = len;
     let mut buffer = vec![0u8; 1024 * 1024];
     while remaining > 0 {
+        check_search_build(keep_going)?;
         let read_len = buffer.len().min(remaining as usize);
         let bytes_read = file.read(&mut buffer[..read_len])?;
         if bytes_read == 0 {
@@ -5863,6 +6059,31 @@ pub(crate) fn build_path_filters(
 pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<PathBuf> {
     walk_project_files_from_inner(root, root, filters, None, false)
         .expect("unbounded project walk cannot exceed a file limit")
+}
+
+fn walk_build_files_cancellable(
+    root: &Path,
+    filters: &PathFilters,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let mut walker = project_walk_builder(root).build();
+    loop {
+        if !keep_going() {
+            return None;
+        }
+        let Some(entry) = walker.next() else {
+            return Some(paths);
+        };
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && filters.matches(root, entry.path())
+        {
+            paths.push(entry.into_path());
+        }
+    }
 }
 
 pub fn walk_project_files_bounded_default(
@@ -8071,11 +8292,21 @@ fn set_git_root_commit_probe_override_for_test(
 /// cache: files that are now ignored may still be indexed. Hashing the ignore
 /// files themselves makes cold-start cache reuse agree with the current walker.
 pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
+    ignore_rules_fingerprint_cancellable(project_root, &|| true)
+        .expect("uncancellable ignore fingerprint")
+}
+
+fn ignore_rules_fingerprint_cancellable(
+    project_root: &Path,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let root = canonicalize_or_normalize(project_root);
     let mut files = Vec::new();
-    collect_ignore_rule_files(&root, &mut files);
+    if !collect_ignore_rule_files(&root, &mut files, keep_going) {
+        return None;
+    }
     if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
         if global_ignore.is_file() {
             files.push(global_ignore);
@@ -8103,6 +8334,9 @@ pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"aft-ignore-rules-v1\0");
     for (identity, path) in files {
+        if !keep_going() {
+            return None;
+        }
         if let Some(relative) = cache_relative_path(&root, &identity) {
             hasher.update(relative.to_string_lossy().as_bytes());
         } else {
@@ -8116,7 +8350,7 @@ pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
         hasher.update(b"\0");
     }
 
-    format!("{:x}", hasher.finalize())
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn git_info_exclude_path(root: &Path) -> PathBuf {
@@ -8130,7 +8364,11 @@ fn git_info_exclude_path(root: &Path) -> PathBuf {
     .join("exclude")
 }
 
-fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
+fn collect_ignore_rule_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    keep_going: &dyn Fn() -> bool,
+) -> bool {
     let mut builder = WalkBuilder::new(root);
     // Nested ignore discovery is a background recursive walk; a disappearing
     // mount must not turn ReadDir::drop's ENXIO into a daemon abort.
@@ -8156,7 +8394,17 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
         true
     });
 
-    for entry in builder.build().filter_map(|entry| entry.ok()) {
+    let mut walker = builder.build();
+    loop {
+        if !keep_going() {
+            return false;
+        }
+        let Some(entry) = walker.next() else {
+            break;
+        };
+        let Ok(entry) = entry else {
+            continue;
+        };
         if !entry
             .file_type()
             .map_or(false, |file_type| file_type.is_file())
@@ -8168,6 +8416,7 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
             files.push(entry.into_path());
         }
     }
+    true
 }
 
 /// Count directories visited when discovering ignore rule files (for perf regression tests).
@@ -9180,6 +9429,242 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    fn publication_records(count: usize) -> Vec<SpillRecord> {
+        (0..count as u32)
+            .rev()
+            .map(|trigram| SpillRecord {
+                trigram,
+                file_id: 0,
+                next_mask: (trigram % 255) as u8,
+                loc_mask: (trigram % 127) as u8,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn issue645_sorted_runs_match_global_sort_cache_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("source.rs"), "fn marker() {}\n").unwrap();
+        let index = SearchIndex::build_with_limit_serial(temp.path(), 1024 * 1024);
+        let plan = CacheWritePlan::from_index(&index, None).unwrap();
+        let records = publication_records(SEARCH_BUILD_RECORD_BATCH * 3 + 17);
+        let mut global = records.clone();
+        global.sort_unstable_by_key(|record| (record.trigram, record.file_id));
+        let mut reference: Vec<Box<dyn PostingRecordSource>> =
+            vec![Box::new(VecRecordSource::new(global))];
+        let mut runs = sorted_record_sources(records, &|| true).unwrap();
+        for (dir, sources) in [(first.path(), &mut reference), (second.path(), &mut runs)] {
+            write_cache_file_from_sources(
+                dir,
+                &plan,
+                sources,
+                crate::write_ledger::Domain::SearchIndexBuild,
+                &|| true,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            fs::read(first.path().join("cache.bin")).unwrap(),
+            fs::read(second.path().join("cache.bin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn issue645_publication_sort_merge_and_checksum_cancel_promptly() {
+        let calls = AtomicUsize::new(0);
+        let result =
+            sorted_record_sources(publication_records(SEARCH_BUILD_RECORD_BATCH * 3), &|| {
+                calls.fetch_add(1, Ordering::SeqCst) < 1
+            });
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        struct CancellingSource {
+            reads: Arc<AtomicUsize>,
+        }
+        impl PostingRecordSource for CancellingSource {
+            fn next_record(&mut self) -> std::io::Result<Option<SpillRecord>> {
+                let reads = self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(
+                    (reads < SEARCH_BUILD_RECORD_BATCH * 3).then_some(SpillRecord {
+                        trigram: reads as u32,
+                        file_id: 0,
+                        next_mask: 0,
+                        loc_mask: 0,
+                    }),
+                )
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("postings");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut sources: Vec<Box<dyn PostingRecordSource>> = vec![Box::new(CancellingSource {
+            reads: reads.clone(),
+        })];
+        let mut writer = BufWriter::new(File::create(&output).unwrap());
+        let result = merge_sources_to_writer(&mut sources, &mut writer, &|| {
+            reads.load(Ordering::SeqCst) < 2
+        });
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
+        assert!(reads.load(Ordering::SeqCst) <= SEARCH_BUILD_RECORD_BATCH + 1);
+
+        let bytes = vec![42; 3 * 1024 * 1024];
+        fs::write(&output, &bytes).unwrap();
+        let calls = AtomicUsize::new(0);
+        let result = crc32_file_range(&output, 0, bytes.len() as u64, &|| {
+            calls.fetch_add(1, Ordering::SeqCst) < 1
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crc32_file_range(&output, 0, bytes.len() as u64, &|| true).unwrap(),
+            crc32fast::hash(&bytes)
+        );
+    }
+
+    #[test]
+    fn issue645_cancelled_publication_preserves_cache() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("source.rs"), "fn original_marker() {}\n").unwrap();
+        let original = SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, cache.path());
+        let before = fs::read(cache.path().join("cache.bin")).unwrap();
+        fs::write(root.join("source.rs"), "fn replacement_marker() {}\n").unwrap();
+        let completed_cache = tempfile::tempdir().unwrap();
+        let _completed =
+            SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, completed_cache.path());
+        let completed_size = fs::metadata(completed_cache.path().join("cache.bin"))
+            .unwrap()
+            .len();
+        // The full serialized size becomes visible only after the final flush,
+        // so the second case cancels at the last checkpoint before rename.
+        for (phase, min_bytes) in [("writing", 0), ("before rename", completed_size)] {
+            let cancelled = AtomicBool::new(false);
+            let result = SearchIndex::build_with_limit_to_cache_dir_cancellable(
+                &root,
+                1024 * 1024,
+                cache.path(),
+                &|| {
+                    let stop = fs::read_dir(cache.path()).unwrap().flatten().any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("cache.bin.tmp.")
+                            && entry.metadata().unwrap().len() >= min_bytes
+                    });
+                    cancelled.fetch_or(stop, Ordering::SeqCst);
+                    !cancelled.load(Ordering::SeqCst)
+                },
+            );
+            assert!(
+                result.is_none(),
+                "a build cancelled {phase} must not publish"
+            );
+            assert!(cancelled.load(Ordering::SeqCst), "did not reach {phase}");
+            assert_eq!(fs::read(cache.path().join("cache.bin")).unwrap(), before);
+            assert_eq!(
+                fs::read_dir(cache.path()).unwrap().count(),
+                1,
+                "no temporary files leak"
+            );
+        }
+        assert_eq!(
+            original
+                .candidates(&decompose_regex("original_marker"))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn issue645_cancelled_fallback_logs_cancelled_not_failed() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let blocked = cache.path().join("not-a-directory");
+        fs::write(&blocked, "blocks streaming cache creation").unwrap();
+        fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
+        let probes = AtomicUsize::new(0);
+        let (result, events) = crate::logging::capture_index_events(|| {
+            SearchIndex::build_with_limit_to_cache_dir_cancellable(
+                &root,
+                1024 * 1024,
+                &blocked,
+                &|| probes.fetch_add(1, Ordering::SeqCst) < 2,
+            )
+        });
+        assert!(result.is_none());
+        let root_field = format!("root={}", crate::logging::normalize_index_root(&root));
+        let events = events
+            .into_iter()
+            .filter(|event| event.contains(&root_field))
+            .collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| event.contains("stage=fallback")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("kind=build_cancelled")),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.contains("kind=build_failed")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn issue645_superseded_search_build_stops_reading_files() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..256 {
+            fs::write(root.join(format!("source-{index}.rs")), "fn marker() {}\n").unwrap();
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        REFRESH_READ_PROBES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .insert(root.clone(), (reads.clone(), cancelled.clone()));
+        let result = SearchIndex::build_with_limit_to_cache_dir_cancellable(
+            &root,
+            1024 * 1024,
+            cache.path(),
+            &|| !cancelled.load(Ordering::SeqCst),
+        );
+        REFRESH_READ_PROBES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&root);
+        let count = reads.load(Ordering::SeqCst);
+        assert!(
+            result.is_none(),
+            "superseded builds cannot publish a partial index; files read={count}"
+        );
+        assert!(
+            (1..=32).contains(&count),
+            "must stop within the active chunk, read {count}/256 files"
+        );
+        assert!(
+            !cache.path().join("cache.bin").exists(),
+            "cancelled build must not persist"
+        );
+    }
+
     #[test]
     fn semantic_namespaces_share_type_identity() {
         use std::any::TypeId;
