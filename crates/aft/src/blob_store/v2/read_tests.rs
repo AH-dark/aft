@@ -88,6 +88,549 @@ impl Drop for ReadProbe {
     }
 }
 
+/// Inserts `rows` straight into the store's payload table, in large
+/// transactions on the store's own connection, so tests can build stores of
+/// several gigabytes quickly. Every row gets epoch 0 and a correct digest.
+pub(crate) fn bulk_insert(
+    store: &FamilyStore,
+    rows: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>,
+) {
+    let mut connection = lock(&store.inner.connection);
+    let mut rows = rows.into_iter().peekable();
+    while rows.peek().is_some() {
+        let tx = connection.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO blob_payloads
+                     (full_key, payload, payload_digest, payload_schema, ref_epoch, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0)",
+                )
+                .unwrap();
+            for (key, payload) in rows.by_ref().take(10_000) {
+                insert
+                    .execute(params![
+                        key.as_slice(),
+                        &payload,
+                        blake3::hash(&payload).as_bytes().as_slice(),
+                        i64::from(store.inner.plane.payload_schema()),
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+}
+
+/// Pages SQLite reports free in the store file.
+pub(crate) fn freelist_pages(store: &FamilyStore) -> u64 {
+    lock(&store.inner.connection)
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap()
+}
+
+/// Sets one row's epoch directly; its size and presence do not change.
+pub(crate) fn set_epoch(store: &FamilyStore, key: &FamilyKey, epoch: u64) {
+    lock(&store.inner.connection)
+        .execute(
+            "UPDATE blob_payloads SET ref_epoch = ?2 WHERE full_key = ?1",
+            params![key.as_bytes().as_slice(), epoch as i64],
+        )
+        .unwrap();
+}
+
+/// Whether the store's payload totals are complete and would be used.
+pub(crate) fn has_totals(store: &FamilyStore) -> bool {
+    exact_totals(&lock(&store.inner.connection))
+        .unwrap()
+        .is_some()
+}
+
+/// The row count and payload bytes from one scan of every row on `connection`.
+fn scanned(connection: &rusqlite::Connection) -> (u64, u64) {
+    connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// The store's totals as `usage` reports them, checked against a fresh scan
+/// and SQLite's integrity check, with the totals required to be in use.
+fn assert_totals_exact(store: &FamilyStore, connection: &rusqlite::Connection, after: &str) {
+    assert!(has_totals(store), "totals incomplete after {after}");
+    let usage = store.usage().unwrap();
+    assert_eq!(
+        (usage.rows, usage.payload_bytes),
+        scanned(connection),
+        "totals differ from a scan after {after}"
+    );
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok",
+        "after {after}"
+    );
+}
+
+fn far_deadline() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(600)
+}
+
+fn semantic_store(dir: &Path, family: &str) -> FamilyStore {
+    FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir, family),
+        FamilyPlane::Semantic,
+    )
+    .unwrap()
+}
+
+fn put_rows(store: &FamilyStore, bytes: std::ops::RangeInclusive<u8>) {
+    for byte in bytes {
+        store
+            .put_or_touch(
+                &FamilyKey::new(FamilyPlane::Semantic, [byte; 32]),
+                &vec![byte; 1_500 + 37 * usize::from(byte)],
+            )
+            .unwrap();
+    }
+}
+
+fn total_changes_of(connection: &rusqlite::Connection) -> u64 {
+    connection
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Once set up, the exact total is read from the totals row with no scan,
+/// stays equal to a scan through this code's puts, touches and deletes, and
+/// through a `DELETE` with no `WHERE` (which SQLite would otherwise run as a
+/// truncation that skips row triggers). Inserts and deletes fire a trigger;
+/// an epoch-only update fires none.
+#[test]
+fn payload_totals_stay_exact_and_epoch_updates_fire_no_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = semantic_store(dir.path(), "totals");
+    put_rows(&store, 1..=200);
+    assert!(!has_totals(&store));
+    assert!(matches!(
+        store.ensure_payload_totals(far_deadline()).unwrap(),
+        PayloadTotals::Built { .. }
+    ));
+    assert_eq!(
+        store.ensure_payload_totals(far_deadline()).unwrap(),
+        PayloadTotals::Present
+    );
+    let check = rusqlite::Connection::open(store.path()).unwrap();
+    take_logical_aggregates();
+    assert_totals_exact(&store, &check, "setup");
+    assert_eq!(
+        take_logical_aggregates(),
+        0,
+        "the total was read, not summed"
+    );
+
+    let key = FamilyKey::new(FamilyPlane::Semantic, [201; 32]);
+    let connection = || lock(&store.inner.connection);
+    let before = total_changes_of(&connection());
+    store.put_or_touch(&key, &[7; 9_000]).unwrap();
+    assert_eq!(
+        total_changes_of(&connection()) - before,
+        2,
+        "an insert updates the totals row"
+    );
+    assert_totals_exact(&store, &check, "an insert");
+
+    let epoch = store.raise_epoch(1).unwrap();
+    let before = total_changes_of(&connection());
+    store.touch(&[key]).unwrap();
+    store.put_or_touch(&key, &[7; 9_000]).unwrap();
+    assert_eq!(
+        total_changes_of(&connection()) - before,
+        1,
+        "an epoch-only update fires no trigger"
+    );
+    assert_totals_exact(&store, &check, "touches");
+
+    let old = FamilyKey::new(FamilyPlane::Semantic, [3; 32]);
+    let before = total_changes_of(&connection());
+    assert!(store.delete_if_unreferenced_since(&old, epoch).unwrap());
+    assert_eq!(
+        total_changes_of(&connection()) - before,
+        2,
+        "a delete updates the totals row"
+    );
+    assert_totals_exact(&store, &check, "a delete");
+
+    connection()
+        .execute("DELETE FROM blob_payloads", [])
+        .unwrap();
+    assert_totals_exact(&store, &check, "a DELETE with no WHERE");
+    assert_eq!(scanned(&check), (0, 0));
+}
+
+/// A store with the totals stays consistent, and its totals exact, under
+/// the exact statements AFT v0.60.0 and v0.61.0 run on a family store,
+/// which predate the totals and use the same bundled SQLite
+/// (libsqlite3-sys 0.30.1, SQLite 3.46.0): opening, put, put-or-touch,
+/// touch, membership and payload reads, listing, the sum, the GC delete,
+/// both releases' incremental vacuum, and a full VACUUM, which must keep
+/// the triggers. They run on a separate connection, as another process
+/// running an older binary would.
+#[test]
+fn payload_totals_stay_exact_under_releases_that_predate_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = semantic_store(dir.path(), "rollback");
+    put_rows(&store, 1..=60);
+    assert!(matches!(
+        store.ensure_payload_totals(far_deadline()).unwrap(),
+        PayloadTotals::Built { .. }
+    ));
+
+    let old = rusqlite::Connection::open(store.path()).unwrap();
+    old.busy_timeout(Duration::from_secs(5)).unwrap();
+    // Both releases open a store with these statements; the schema text is
+    // unchanged since v0.60.0.
+    old.pragma_update(None, "journal_mode", "WAL").unwrap();
+    old.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    old.execute_batch(STORE_SCHEMA).unwrap();
+    assert_totals_exact(&store, &old, "an older binary opened the store");
+
+    let key = |byte: u8| [byte; 32];
+    let schema = i64::from(FamilyPlane::Semantic.payload_schema());
+    let insert = |byte: u8, len: usize| {
+        let payload = vec![byte; len];
+        old.execute(
+            "INSERT INTO blob_payloads
+                     (full_key, payload, payload_digest, payload_schema, ref_epoch, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key(byte).as_slice(),
+                &payload,
+                blake3::hash(&payload).as_bytes().as_slice(),
+                schema,
+                0_i64,
+                0_i64
+            ],
+        )
+        .unwrap();
+    };
+    // v0.60.0 put: digest probe, then insert.
+    assert!(old
+        .query_row(
+            "SELECT payload_digest FROM blob_payloads WHERE full_key = ?1",
+            params![key(100).as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_none());
+    insert(100, 70_000);
+    assert_totals_exact(&store, &old, "a v0.60.0 put");
+    // v0.61.0 put_or_touch: digest and epoch probe, then insert or reuse.
+    assert!(old
+        .query_row(
+            "SELECT payload_digest, ref_epoch FROM blob_payloads WHERE full_key = ?1",
+            params![key(101).as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_none());
+    insert(101, 300);
+    old.execute(
+        "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
+        params![key(100).as_slice(), 3_i64],
+    )
+    .unwrap();
+    assert_totals_exact(&store, &old, "a v0.61.0 put_or_touch");
+    // v0.61.0 touch: covering probe, then the same epoch update.
+    let epoch: i64 = old
+        .query_row(
+            "SELECT ref_epoch FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
+            params![key(101).as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    old.execute(
+        "UPDATE blob_payloads SET ref_epoch = MAX(ref_epoch, ?2) WHERE full_key = ?1",
+        params![key(101).as_slice(), epoch + 1],
+    )
+    .unwrap();
+    assert_totals_exact(&store, &old, "a touch");
+    // Reads, listing and the release's own sum.
+    for sql in [
+        "SELECT 1 FROM blob_payloads WHERE full_key = ?1",
+        "SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
+        "SELECT payload, payload_digest, payload_schema FROM blob_payloads WHERE full_key = ?1",
+    ] {
+        assert!(old
+            .query_row(sql, params![key(100).as_slice()], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_some());
+    }
+    let listed = old
+        .prepare(
+            "SELECT full_key, length(payload), ref_epoch FROM blob_payloads
+             ORDER BY ref_epoch ASC, full_key ASC LIMIT ?1",
+        )
+        .unwrap()
+        .query_map(params![i64::MAX], |row| row.get::<_, u64>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(listed.iter().sum::<u64>(), scanned(&old).1);
+    // The GC delete, for several rows, as a sweep runs it.
+    for byte in 1..=20_u8 {
+        let deleted = old
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key = ?1 AND ref_epoch < ?2",
+                params![key(byte).as_slice(), 1_i64],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+    }
+    assert_totals_exact(&store, &old, "the GC deletes");
+    // v0.61.0 reclaim steps incremental vacuum; v0.60.0 ran it whole and
+    // then truncated the write-ahead log.
+    {
+        let mut statement = old.prepare("PRAGMA incremental_vacuum(16)").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        while rows.next().unwrap().is_some() {}
+    }
+    assert_totals_exact(&store, &old, "v0.61.0 incremental vacuum");
+    old.execute_batch("PRAGMA incremental_vacuum;").unwrap();
+    old.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    assert_totals_exact(&store, &old, "v0.60.0 incremental vacuum");
+    old.execute_batch("VACUUM").unwrap();
+    assert_totals_exact(&store, &old, "VACUUM");
+    insert(102, 5_000);
+    assert_totals_exact(&store, &old, "a put after VACUUM");
+}
+
+/// Totals that are missing a part, or altered, are never used: the total
+/// is summed from every row instead, and the next setup replaces them.
+/// Without the table, the triggers that remain make every insert and delete
+/// fail until setup replaces them; nothing but tampering removes the table,
+/// since setup drops and recreates it inside one transaction.
+#[test]
+fn incomplete_or_altered_payload_totals_are_summed_and_rebuilt() {
+    let tamperings = [
+        "DROP TRIGGER payload_totals_delete",
+        "DROP TRIGGER payload_totals_insert;
+         CREATE TRIGGER payload_totals_insert AFTER INSERT ON blob_payloads BEGIN
+             UPDATE payload_totals SET row_count = row_count + 1 WHERE singleton = 1;
+         END",
+        "DELETE FROM payload_totals",
+        "DROP TABLE payload_totals",
+    ];
+    for tampering in tamperings {
+        let dir = tempfile::tempdir().unwrap();
+        let store = semantic_store(dir.path(), "tampered");
+        put_rows(&store, 1..=40);
+        store.ensure_payload_totals(far_deadline()).unwrap();
+        assert!(has_totals(&store));
+        lock(&store.inner.connection)
+            .execute_batch(tampering)
+            .unwrap();
+        if tampering.starts_with("DROP TABLE") {
+            assert!(store
+                .put_or_touch(&FamilyKey::new(FamilyPlane::Semantic, [41; 32]), &[1; 10])
+                .is_err());
+        } else {
+            put_rows(&store, 41..=45);
+        }
+        assert!(!has_totals(&store), "{tampering}");
+        let check = rusqlite::Connection::open(store.path()).unwrap();
+        take_logical_aggregates();
+        let usage = store.usage().unwrap();
+        assert_eq!(
+            (usage.rows, usage.payload_bytes),
+            scanned(&check),
+            "{tampering}"
+        );
+        assert_eq!(
+            take_logical_aggregates(),
+            1,
+            "{tampering}: summed, not read"
+        );
+        assert!(matches!(
+            store.ensure_payload_totals(far_deadline()).unwrap(),
+            PayloadTotals::Built { .. }
+        ));
+        put_rows(&store, 46..=50);
+        assert_totals_exact(&store, &check, tampering);
+    }
+}
+
+/// Setup waits only briefly for another writer, and a setup that outlives
+/// its deadline is rolled back, leaves the store usable, and is not tried
+/// again in this process.
+#[test]
+fn payload_totals_setup_skips_a_busy_store_and_gives_up_past_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = semantic_store(dir.path(), "busy");
+    put_rows(&store, 1..=3);
+    let other = rusqlite::Connection::open(store.path()).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        store.ensure_payload_totals(far_deadline()).unwrap(),
+        PayloadTotals::Busy
+    );
+    assert!(
+        started.elapsed() < TOTALS_SETUP_BUSY_WAIT + Duration::from_secs(1),
+        "it waited {:?}",
+        started.elapsed()
+    );
+    other.execute_batch("ROLLBACK").unwrap();
+    drop(other);
+    assert!(!has_totals(&store));
+
+    let late = tempfile::tempdir().unwrap();
+    let store = semantic_store(late.path(), "late");
+    bulk_insert(
+        &store,
+        (0_u32..5_000).map(|index| {
+            (
+                *blake3::hash(&index.to_le_bytes()).as_bytes(),
+                vec![7; 3_000],
+            )
+        }),
+    );
+    assert_eq!(
+        store
+            .ensure_payload_totals(std::time::Instant::now())
+            .unwrap(),
+        PayloadTotals::GaveUp
+    );
+    assert!(!has_totals(&store));
+    assert_eq!(
+        store.ensure_payload_totals(far_deadline()).unwrap(),
+        PayloadTotals::GaveUp,
+        "a setup that ran out of time is not retried in this process"
+    );
+    store
+        .put_or_touch(&FamilyKey::new(FamilyPlane::Semantic, [9; 32]), &[9; 100])
+        .unwrap();
+    assert_eq!(store.usage().unwrap().rows, 5_001);
+    assert!(!has_totals(&store));
+}
+
+/// Runs `pragma` on the store's own connection.
+pub(crate) fn set_pragma(store: &FamilyStore, pragma: &str) {
+    lock(&store.inner.connection).execute_batch(pragma).unwrap();
+}
+
+fn temp_store_of(inner: &StoreInner) -> i64 {
+    lock(&inner.connection)
+        .pragma_query_value(None, "temp_store", |row| row.get(0))
+        .unwrap()
+}
+
+/// Both ways of opening a family store, for writing and read-only, give a
+/// connection that keeps temporary storage (statement journals and sorts)
+/// in memory.
+#[test]
+fn every_family_store_connection_keeps_temporary_storage_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = semantic_store(dir.path(), "writer");
+    assert_eq!(temp_store_of(&writer.inner), 2);
+    drop(semantic_store(dir.path(), "reader"));
+    let reader = FamilyStoreReader::open_existing(dir.path(), "reader", FamilyPlane::Semantic)
+        .unwrap()
+        .unwrap();
+    assert_eq!(temp_store_of(&reader.inner), 2);
+}
+
+/// Of every statement a family store connection runs (puts, touches, reads,
+/// quarantine, the totals and their setup, listings, deletes, segments and
+/// space reclaim), only the oldest-first listing builds a temporary b-tree,
+/// for its sort, which its row limit bounds. Kept in memory on these
+/// connections, any other such b-tree would be a new memory cost.
+#[test]
+fn only_the_oldest_first_listing_builds_a_temporary_b_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FamilyStore::open(
+        &StoreWriteAccess::for_registered_view(dir.path(), "temp-trees"),
+        FamilyPlane::Trigram,
+    )
+    .unwrap();
+    let key = |byte: u8| FamilyKey::new(FamilyPlane::Trigram, [byte; 32]);
+    let probe = ReadProbe::start(&store);
+    for byte in 1..=50_u8 {
+        store.put_or_touch(&key(byte), &vec![byte; 5_000]).unwrap();
+    }
+    store.put_or_touch(&key(1), &vec![1; 5_000]).unwrap();
+    store.touch(&[key(1), key(2)]).unwrap();
+    let epoch = store.raise_epoch(1).unwrap();
+    store.touch(&[key(1), key(2)]).unwrap();
+    store.put_or_touch(&key(3), &vec![3; 5_000]).unwrap();
+    store.get(&key(4)).unwrap();
+    store.contains(&key(4)).unwrap();
+    store.quarantine(&key(99)).unwrap();
+    store.usage().unwrap();
+    store.ensure_payload_totals(far_deadline()).unwrap();
+    store.usage().unwrap();
+    store.rows_oldest(10).unwrap();
+    store.delete_if_unreferenced_since(&key(5), epoch).unwrap();
+    let segment = [7_u8; 32];
+    store.begin_segment(&segment).unwrap();
+    store.finish_segment(&segment, 10).unwrap();
+    store.touch_segment(&segment).unwrap();
+    store.segment(&segment).unwrap();
+    store.segments().unwrap();
+    store
+        .delete_segment_if_unreferenced_since(&segment, epoch + 1, &dir.path().join("absent"))
+        .unwrap();
+    store.reclaim_space().unwrap();
+    store.payload_bytes_upper_bound().unwrap();
+    store.gc_epoch().unwrap();
+    let statements = probe.finish().statements;
+    assert!(statements.len() > 20, "{statements:?}");
+
+    let connection = lock(&store.inner.connection);
+    let mut temp_trees = Vec::new();
+    for sql in statements.keys() {
+        let Ok(mut plan) = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")) else {
+            continue;
+        };
+        let mut rows = plan.raw_query();
+        while let Some(row) = rows.next().unwrap() {
+            let detail: String = row.get(3).unwrap();
+            if detail.contains("TEMP B-TREE") {
+                temp_trees.push((sql.trim().to_string(), detail));
+            }
+        }
+    }
+    assert!(
+        !temp_trees.is_empty()
+            && temp_trees
+                .iter()
+                .all(|(sql, _)| sql.starts_with("SELECT p.full_key, length(p.payload)")),
+        "{temp_trees:#?}"
+    );
+}
+
+/// Pages of one b-tree in the store, from SQLite's `dbstat` table.
+pub(crate) fn btree_pages(store: &FamilyStore, name: &str) -> i64 {
+    lock(&store.inner.connection)
+        .query_row(
+            "SELECT COUNT(*) FROM dbstat WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 pub(crate) fn describe(store: &FamilyStore) {
     let connection = lock(&store.inner.connection);
     for pragma in ["page_size", "page_count", "cache_size", "mmap_size"] {

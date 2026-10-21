@@ -2481,7 +2481,10 @@ mod tests {
             report.after.family_store.file_bytes
         );
         let plane_after = store.usage().unwrap();
-        assert_eq!(plane_after.file_bytes, plane_before.file_bytes);
+        // The pass set up the store's payload totals, whose table takes one
+        // page; no other page was added and none was returned.
+        let page_size: u64 = 4096;
+        assert_eq!(plane_after.file_bytes, plane_before.file_bytes + page_size);
         assert!(plane_after.freelist_pages > plane_before.freelist_pages);
         assert_eq!(sweep.space_reclaim.reclaimed_pages, 0);
         assert_eq!(sweep.space_reclaim.steps, 0);
@@ -3250,7 +3253,9 @@ mod tests {
     /// Values one fixed family produces through measurement, key accounting,
     /// recorded usage, admission and two enforcement passes, recorded on
     /// Linux on main before the disk-limit sweep measured the family's files
-    /// to skip deletion. File
+    /// to skip deletion. The collect-all pass's file bytes later grew by one
+    /// 4 KiB page, the payload totals table that pass sets up in the trigram
+    /// store. File
     /// sizes depend on the platform's SQLite page and write-ahead-log
     /// behaviour, so other platforms only run the fixture.
     const GOLDEN_VALUES: &[&str] = &[
@@ -3276,10 +3281,10 @@ mod tests {
         "recorded usage_record complete=true",
         "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
          deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
-         sweep_error=None before_file_bytes=544789 after_file_bytes=514481 \
+         sweep_error=None before_file_bytes=544789 after_file_bytes=518577 \
          after_complete=true over_hard=[] stopped_early=false",
         "recorded view_usage scope=a bytes=41568 held=false",
-        "recorded family_usage file_bytes=514481",
+        "recorded family_usage file_bytes=518577",
         "recorded usage_record complete=true",
         "KeyAccounting { referenced_bytes: 53014, shared_bytes: 0, exclusive_bytes: \
          {\"a\": 53014}, unreferenced_bytes: 0, complete: true }",
@@ -3298,10 +3303,10 @@ mod tests {
             15,
             "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
              deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
-             sweep_error=None before_file_bytes=544789 after_file_bytes=510361 \
+             sweep_error=None before_file_bytes=544789 after_file_bytes=514457 \
              after_complete=true over_hard=[] stopped_early=false",
         ),
-        (17, "recorded family_usage file_bytes=510361"),
+        (17, "recorded family_usage file_bytes=514457"),
     ];
 
     #[test]
@@ -3393,7 +3398,9 @@ mod tests {
     /// the soft limit, a walk of the family's files that could not finish,
     /// and a pass that evicted a view and so collects every unreferenced row.
     /// Of those, the incomplete walk is still settled by the plane's page
-    /// capacity, so only the other two run the logical payload sum.
+    /// capacity. The first pass that needs a plane's exact payload sums its
+    /// rows once to set up the plane's payload totals; the later collect-all
+    /// pass reads those totals and sums nothing.
     #[test]
     fn a_below_limit_sweep_reads_no_logical_totals_and_every_other_pass_reads_them() {
         let storage = tempfile::tempdir().unwrap();
@@ -3443,7 +3450,7 @@ mod tests {
         assert_eq!(evicted(&report), ["a", "b"]);
         assert_eq!(LAST_SWEEP_BUDGET.with(|last| last.replace(None)), Some(0));
         assert!(report.sweep.as_ref().unwrap().deleted_blobs > 0);
-        assert_eq!((checked, sums), (planes, planes), "collect-all pass");
+        assert_eq!((checked, sums), (planes, 0), "collect-all pass");
     }
 
     /// A family whose files fit the sweep budget skips every plane's own
