@@ -114,7 +114,10 @@ pub(crate) fn safe_file(path: &Path) -> bool {
     }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        Err(error) => {
+            return error.kind() == std::io::ErrorKind::NotFound
+                || names_nothing(&error, cfg!(windows))
+        }
     };
     if metadata.is_dir() || metadata.file_type().is_symlink() {
         return true;
@@ -123,6 +126,16 @@ pub(crate) fn safe_file(path: &Path) -> bool {
         return false;
     }
     single_link(path, &metadata)
+}
+
+/// Whether `error` says the spelling cannot name any file at all. Win32 rejects
+/// a literal glob (`src\*.ts`) or two paths joined by a space with
+/// ERROR_INVALID_NAME (123) instead of "not found". Nothing exists at such a
+/// spelling, so there is no hard link or database to refuse; the access probe
+/// that follows still decides whether the spelling is usable, and a glob's
+/// concrete matches are each validated on their own.
+fn names_nothing(error: &std::io::Error, windows: bool) -> bool {
+    windows && error.raw_os_error() == Some(123)
 }
 
 #[cfg(unix)]
@@ -186,4 +199,36 @@ pub(crate) fn safe_tree(path: &Path, managed_roots: &[PathBuf], owned: bool) -> 
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only Windows's "this cannot be a name" error (123) names nothing; the
+    /// same number elsewhere and other errors still fail closed.
+    #[test]
+    fn temp_guard_invalid_name_error_names_nothing_only_on_windows() {
+        let invalid = std::io::Error::from_raw_os_error(123);
+        assert!(names_nothing(&invalid, true));
+        assert!(!names_nothing(&invalid, false));
+        assert!(!names_nothing(&std::io::Error::from_raw_os_error(5), true));
+    }
+
+    /// An unmatched glob or two paths joined by a space under a temp directory
+    /// resolves to no file, so the temp guard has no metadata to refuse. A
+    /// hard-linked file in the same directory is still refused.
+    #[test]
+    fn temp_guard_accepts_unstattable_spellings_but_not_hard_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        assert!(safe_file(&src.join("*.ts")));
+        let compound = PathBuf::from(format!("{} {}", src.display(), temp.path().display()));
+        assert!(safe_file(&compound));
+        let file = src.join("a.ts");
+        std::fs::write(&file, "export {};\n").unwrap();
+        std::fs::hard_link(&file, src.join("b.ts")).unwrap();
+        assert!(!safe_file(&file));
+    }
 }
