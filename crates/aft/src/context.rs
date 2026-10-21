@@ -94,6 +94,10 @@ const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
 /// checkout's semantic index has finished loading.
 pub(crate) const VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX: &str =
     "semantic view publication is waiting for the semantic index";
+/// The publication phase that takes the query pin for a newly assembled
+/// generation. Before it, publication walks source paths, assembles the
+/// generation, and opens the view to load its manifest.
+pub(crate) const VIEW_PUBLICATION_PIN_PHASE: &str = "pin";
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -8706,6 +8710,9 @@ impl AppContext {
             (None, Some(generation)) => view.load_manifest(generation).ok(),
             (None, None) => None,
         };
+        // Taking the query pin can wait on a filesystem lock. A detached
+        // publication gives up its cold-build slot when this phase starts.
+        phase(VIEW_PUBLICATION_PIN_PHASE).map_err(|error| error.to_string())?;
         let pin = generation
             .as_deref()
             .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))

@@ -223,6 +223,73 @@ pub(crate) fn detaches_for(ctx: &AppContext) -> bool {
     })
 }
 
+/// Request id and census kind of a view publication's cold-build admission.
+const PUBLICATION_LIMITER_KIND: &str = "view publication";
+
+/// A detached publication's cold-build slot. It covers preparation through
+/// assembly and manifest loading. [`PublicationSlot::release`] runs before the
+/// publication waits for the query-pin file lock, the root actor's epoch write
+/// gate or the process-wide job table, so those waits hold no build capacity.
+/// Each acquired slot logs once when released, with how long the publication
+/// queued for it and held it. A publication cancelled while queued logs no
+/// release line. Failed attempts are already spaced by the shared retry
+/// backoff, so the line needs no rate limit.
+struct PublicationSlot {
+    permit: Option<crate::cold_build_limiter::ColdBuildPermit>,
+    root: PathBuf,
+    wait: Duration,
+    acquired: Instant,
+}
+
+impl PublicationSlot {
+    /// Queues in the limiter's maintenance class, behind requests of that
+    /// class that queued earlier. `None` when the publication is cancelled
+    /// while it waits.
+    fn acquire(
+        limiter: &Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+        root: &std::path::Path,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Self> {
+        let started = Instant::now();
+        let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::labelled_with_root(
+            root.display().to_string(),
+            PUBLICATION_LIMITER_KIND,
+            crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let permit = crate::cold_build_limiter::acquire_blocking_while_cancellable_with_limiter(
+            limiter,
+            PUBLICATION_LIMITER_KIND,
+            request,
+            || true,
+            cancelled,
+        )?;
+        Some(Self {
+            permit: Some(permit),
+            root: root.to_owned(),
+            wait: started.elapsed(),
+            acquired: Instant::now(),
+        })
+    }
+
+    fn release(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+            log::info!(
+                "view publication cold-build slot released root={} wait_ms={} hold_ms={}",
+                self.root.display(),
+                self.wait.as_millis(),
+                self.acquired.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+impl Drop for PublicationSlot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct Lifecycle(u64);
 impl Lifecycle {
     fn phase(&self, phase: &str) -> crate::views::Result<()> {
@@ -452,15 +519,15 @@ pub(crate) fn schedule(
                 }
                 ran_deferred = target.ctx.defer_callgraph_build();
                 let result = (|| {
-                    let _permit = loop {
-                        lifecycle
-                            .phase("manifest")
-                            .map_err(|error| error.to_string())?;
-                        if let Some(permit) = target.ctx.cold_build_limiter().try_acquire() {
-                            break permit;
-                        }
-                        token.wait_for_cancellation(std::time::Duration::from_millis(25));
-                    };
+                    lifecycle
+                        .phase("manifest")
+                        .map_err(|error| error.to_string())?;
+                    let mut slot = PublicationSlot::acquire(
+                        &target.ctx.cold_build_limiter(),
+                        &target.ctx.canonical_cache_root(),
+                        || token.cancel_requested_before_commit(),
+                    )
+                    .ok_or_else(|| "view publication superseded".to_owned())?;
                     let _progress = crate::cold_build_limiter::progress::start(
                         &target.ctx.canonical_cache_root(),
                         "view publication",
@@ -471,8 +538,16 @@ pub(crate) fn schedule(
                     let mut prepared = target.ctx.prepare_view_paths(
                         paths.clone(),
                         allow_semantic_blob_put,
-                        &mut |phase| lifecycle.phase(phase),
+                        &mut |phase| {
+                            if phase == crate::context::VIEW_PUBLICATION_PIN_PHASE {
+                                slot.release();
+                            }
+                            lifecycle.phase(phase)
+                        },
                     )?;
+                    // The remaining steps wait for the actor's epoch write gate
+                    // and the process-wide job table; none of them builds.
+                    slot.release();
                     crate::cold_build_limiter::progress::advance(paths.len());
                     crate::cold_build_limiter::progress::phase("publishing", None);
                     // Equivalent unbind/rebind retains this root actor and its epoch.

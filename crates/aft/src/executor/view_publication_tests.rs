@@ -1278,3 +1278,126 @@ fn deleted_root_pending_publication_retires_once_without_rescheduling() {
     );
     assert!(!running_for_context(&fixture.ctx));
 }
+
+/// Waits until the limiter's queue shows a waiter of `kind`. The deadline only
+/// guards against a hang; the condition is the queue state itself.
+fn wait_until_queued(
+    limiter: &crate::cold_build_limiter::ColdBuildLimiter,
+    kind: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !limiter.census().queued.iter().any(|job| job.kind == kind) {
+        assert!(
+            Instant::now() < deadline,
+            "{failure}: {:?}",
+            limiter.census()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn publication_queues_for_a_cold_build_slot_behind_an_earlier_waiter() {
+    let fixture = Fixture::new();
+    fixture.ctx.isolate_cold_build_limiter_for_test(1);
+    let limiter = fixture.ctx.cold_build_limiter();
+    let held = limiter.try_acquire().expect("hold the only slot");
+    let (admitted_tx, admitted_rx) = crossbeam_channel::bounded(1);
+    let earlier = {
+        let limiter = Arc::clone(&limiter);
+        let root = fixture.job_root();
+        std::thread::spawn(move || {
+            let permit = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                &limiter,
+                "earlier maintenance",
+                || true,
+            )
+            .expect("earlier waiter is admitted");
+            // Observed while the earlier waiter owns the slot: the publication
+            // must still be queued and must not have started building.
+            let publication_queued = limiter
+                .census()
+                .queued
+                .iter()
+                .any(|job| job.kind == PUBLICATION_LIMITER_KIND);
+            let publication_built = PHASES
+                .lock()
+                .get(&root)
+                .is_some_and(|phases| phases.iter().any(|(_, phase)| phase == "blobs"));
+            admitted_tx
+                .send((publication_queued, publication_built))
+                .unwrap();
+            drop(permit);
+        })
+    };
+    wait_until_queued(
+        &limiter,
+        "earlier maintenance",
+        "the earlier request never queued",
+    );
+    fixture.change("next");
+    fixture.schedule();
+    wait_until_queued(
+        &limiter,
+        PUBLICATION_LIMITER_KIND,
+        "the publication never queued for a cold-build slot",
+    );
+    drop(held);
+    let (publication_queued, publication_built) = admitted_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the earlier waiter was admitted");
+    earlier.join().unwrap();
+    assert!(
+        publication_queued && !publication_built,
+        "the publication took the freed slot ahead of an earlier waiter \
+         (queued={publication_queued} built={publication_built})"
+    );
+    fixture.wait_idle();
+    assert_ne!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
+}
+
+#[test]
+fn publication_waiting_for_the_epoch_write_gate_holds_no_cold_build_slot() {
+    let fixture = Fixture::new();
+    fixture.ctx.isolate_cold_build_limiter_for_test(1);
+    let limiter = fixture.ctx.cold_build_limiter();
+    let (epoch, detached_writers) = {
+        let state = fixture.executor.inner.state.lock();
+        let actor = state.actors.get(&fixture.root).expect("actor");
+        (
+            Arc::clone(&actor.epoch),
+            Arc::clone(&actor.detached_writers),
+        )
+    };
+    fixture.change("next");
+    // The held read guard simulates maintenance work on this root that has
+    // not yet released the actor's read gate.
+    let reader = epoch.read();
+    fixture.schedule();
+    // A detached publication counts itself as writer demand while it waits
+    // for the epoch write gate.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while detached_writers.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the publication never reached the epoch write gate: {}",
+            health_snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let census = limiter.census();
+    assert!(
+        census.holders.is_empty(),
+        "the publication held a cold-build slot while waiting for the epoch write gate: {census:?}"
+    );
+    drop(reader);
+    fixture.wait_idle();
+    assert_ne!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
+}
