@@ -7,6 +7,50 @@ use serde_json::Value;
 
 pub(crate) const MAX_REPLY_BYTES: u64 = 1_048_576;
 
+// Pagination; native renderers' content/run filters; ordinary repository REST
+// filters. Query language, URL/method selection and header keys are not authority
+// that a worker GET may delegate to the upstream provider.
+#[cfg(unix)]
+pub(crate) const WORKER_GET_QUERY_KEYS: &[&str] = &[
+    // Shared list pagination.
+    "page",
+    "per_page",
+    // Filters emitted by native content and workflow/run renderers.
+    "ref",
+    "branch",
+    "head_sha",
+    "event",
+    "actor",
+    "status",
+    "check_suite_id",
+    // Repository-local REST filters; none selects a host, method or principal.
+    "state",
+    "labels",
+    "milestone",
+    "assignee",
+    "creator",
+    "mentioned",
+    "since",
+    "sort",
+    "direction",
+    "base",
+    "head",
+    "path",
+    "sha",
+];
+#[cfg(unix)]
+const MAX_WORKER_QUERY_PAIRS: usize = 16;
+#[cfg(unix)]
+const MAX_WORKER_QUERY_VALUE_BYTES: usize = 4096;
+
+#[derive(Debug)]
+#[cfg(unix)]
+pub(crate) struct WorkerReadRefusal {
+    pub code: &'static str,
+    pub key: Option<String>,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, tag = "action")]
 pub(crate) enum Request {
@@ -70,6 +114,59 @@ pub(crate) struct LogArgs {
 }
 
 impl Request {
+    /// Extra policy for the new worker broker only. Existing head/operator
+    /// executor paths retain their query behavior and call validate instead.
+    #[cfg(unix)]
+    pub(crate) fn validate_worker_query(&self) -> Result<(), WorkerReadRefusal> {
+        let Self::Get { args, .. } = self else {
+            return Ok(());
+        };
+        if args
+            .path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.eq_ignore_ascii_case("graphql"))
+        {
+            return Err(WorkerReadRefusal {
+                code: "worker_graphql_not_supported",
+                key: None,
+                message: "worker reads do not support GraphQL paths".into(),
+            });
+        }
+        if args.query.len() > MAX_WORKER_QUERY_PAIRS {
+            return Err(WorkerReadRefusal {
+                code: "worker_query_too_many_pairs",
+                key: None,
+                message: format!("worker GET permits at most {MAX_WORKER_QUERY_PAIRS} query pairs"),
+            });
+        }
+        for (key, value) in &args.query {
+            if !WORKER_GET_QUERY_KEYS.contains(&key.as_str()) {
+                return Err(WorkerReadRefusal {
+                    code: "worker_query_key_not_allowed",
+                    key: Some(key.clone()),
+                    message: format!(
+                        "worker GET query key {key:?} is not allowed. Allowed keys: {}",
+                        WORKER_GET_QUERY_KEYS.join(", ")
+                    ),
+                });
+            }
+            if value.len() > MAX_WORKER_QUERY_VALUE_BYTES {
+                return Err(WorkerReadRefusal { code:"worker_query_value_too_long", key:Some(key.clone()), message:format!("worker GET query value for {key:?} exceeds {MAX_WORKER_QUERY_VALUE_BYTES} bytes") });
+            }
+            if value.chars().any(char::is_control) {
+                return Err(WorkerReadRefusal {
+                    code: "worker_query_value_invalid",
+                    key: Some(key.clone()),
+                    message: format!(
+                        "worker GET query value for {key:?} contains control characters"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn repository(&self) -> &str {
         match self {
             Self::Get { repository, .. }

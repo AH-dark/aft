@@ -70,13 +70,16 @@ struct WorkerReadGrant {
     socket: std::path::PathBuf,
     deadline: std::time::Instant,
     binding: serde_json::Value,
+    endpoint: Option<std::sync::Arc<crate::gh_shim_worker_endpoints::Endpoint>>,
 }
 
 #[cfg(unix)]
 impl Drop for WorkerReadGrant {
     fn drop(&mut self) {
         self.cancel.send_replace(true);
-        let _ = std::fs::remove_file(&self.socket);
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.remove();
+        }
     }
 }
 
@@ -262,8 +265,32 @@ impl PendingTicket {
             socket,
             deadline,
             binding: serde_json::to_value(binding).ok()?,
+            endpoint: None,
         });
         Some((encode(&capability), cancel))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn attach_worker_read_endpoint(
+        &self,
+        endpoint: std::sync::Arc<crate::gh_shim_worker_endpoints::Endpoint>,
+    ) -> bool {
+        let Some(candidate) = self.ticket.as_deref().and_then(decode) else {
+            return false;
+        };
+        let mut entries = registry();
+        let Some(grant) = entries
+            .iter_mut()
+            .find(|entry| constant_time_eq(&entry.ticket, &candidate))
+            .and_then(|entry| entry.worker_read.as_mut())
+        else {
+            return false;
+        };
+        if grant.socket != endpoint.path() {
+            return false;
+        }
+        grant.endpoint = Some(endpoint);
+        true
     }
 
     /// Attach the spawned task's id so the task's terminal transition revokes

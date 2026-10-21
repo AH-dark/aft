@@ -82,6 +82,8 @@ struct Service {
     relay: Arc<GhRelay>,
     scopes: mpsc::Sender<ScopeQuery>,
     runtime: tokio::runtime::Handle,
+    endpoints: Result<Arc<crate::gh_shim_worker_endpoints::Generation>, String>,
+    connection_slots: Arc<Semaphore>,
 }
 #[cfg(unix)]
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
@@ -119,6 +121,11 @@ pub(crate) fn install(relay: Arc<GhRelay>) -> (ServiceGuard, mpsc::Receiver<Scop
             relay,
             scopes,
             runtime: tokio::runtime::Handle::current(),
+            endpoints: crate::gh_shim_worker_endpoints::Generation::new(
+                crate::sandbox_spawn::managed_task_temp_root(),
+            )
+            .map_err(|error| error.to_string()),
+            connection_slots: GLOBAL.clone(),
         });
     }
     #[cfg(not(unix))]
@@ -131,6 +138,28 @@ fn refusal(code: &str) -> RelayReply {
     RelayReply {
         ok: false,
         data: json!({"refusal_code": code, "stage": "worker_broker", "message": code}),
+    }
+}
+
+#[cfg(unix)]
+struct ReadAudit<'a> {
+    identity: &'a crate::gh_shim_ticket::Redeemed,
+    read: bool,
+    ok: bool,
+    sequence: u32,
+    emit: &'a (dyn Fn(&str) + Send + Sync),
+}
+#[cfg(unix)]
+impl Drop for ReadAudit<'_> {
+    fn drop(&mut self) {
+        (self.emit)(&format!(
+            "gh_shim worker_read: session={} task={} read={} ok={} sequence={}",
+            self.identity.session_id.escape_debug(),
+            self.identity.task_id.escape_debug(),
+            self.read,
+            self.ok,
+            self.sequence
+        ));
     }
 }
 
@@ -149,14 +178,6 @@ struct Budget {
     upstream: u32,
 }
 
-#[cfg(unix)]
-struct SocketPath(PathBuf);
-#[cfg(unix)]
-impl Drop for SocketPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 #[cfg(unix)]
 impl Budget {
     fn take(&mut self, read: bool) -> bool {
@@ -196,17 +217,20 @@ pub(crate) fn start(
         .file_name()
         .ok_or("worker temp has no name")?
         .to_string_lossy();
-    let socket = temp.with_file_name(format!("{name}.gh-read.sock"));
-    let listener = std::os::unix::net::UnixListener::bind(&socket)
+    let generation = service.endpoints.as_ref().map_err(Clone::clone)?;
+    let (listener, endpoint) = generation
+        .bind(&name)
         .map_err(|e| format!("worker read broker bind failed: {e}"))?;
-    let socket_path = SocketPath(socket.clone());
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let socket = endpoint.path();
     ticket.reserve_task(task_id);
     let stamp = crate::bash_background::registry::scope_for_spawn()
         .ok_or("worker read broker requires authenticated spawn scope")?;
     let (capability, cancel) = ticket
         .worker_read_capability(socket.clone(), deadline, &stamp)
         .ok_or("worker read broker grant could not be issued")?;
+    if !ticket.attach_worker_read_endpoint(endpoint.clone()) {
+        return Err("worker read grant ended during endpoint binding".into());
+    }
     let cap_file = temp.join(".gh-read-capability");
     let mut file = OpenOptions::new()
         .write(true)
@@ -228,16 +252,16 @@ pub(crate) fn start(
     env.insert(STATE_ENV.into(), state.to_string_lossy().into_owned());
     let runtime = service.runtime.clone();
     runtime.spawn(async move {
-        let _socket_path = socket_path;
         let listener = match tokio::net::UnixListener::from_std(listener) {
             Ok(listener) => listener,
             Err(_) => {
                 cancel.send_replace(true);
+                endpoint.remove();
                 return;
             }
         };
         serve(listener, socket.clone(), service, tasks, cancel.subscribe()).await;
-        let _ = std::fs::remove_file(socket);
+        endpoint.remove();
     });
     Ok(())
 }
@@ -284,7 +308,7 @@ async fn serve(
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { break; };
                 if !ingress.take(false) { continue; }
-                let (Ok(local), Ok(global)) = (local.clone().try_acquire_owned(), GLOBAL.clone().try_acquire_owned()) else { continue; };
+                let (Ok(local), Ok(global)) = (local.clone().try_acquire_owned(), service.connection_slots.clone().try_acquire_owned()) else { continue; };
                 let service = service.clone();
                 let socket = socket.clone();
                 let tasks = tasks.clone();
@@ -543,6 +567,37 @@ where
     S: Fn(String) -> F,
     F: std::future::Future<Output = Result<Option<ScopeStamp>, ()>>,
 {
+    dispatch_recorded(
+        bytes,
+        socket,
+        transport,
+        authenticate,
+        live,
+        scope,
+        budget,
+        &|line| log::info!("{line}"),
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn dispatch_recorded<T, A, L, S, F>(
+    bytes: &[u8],
+    socket: &Path,
+    transport: &T,
+    authenticate: A,
+    live: L,
+    scope: S,
+    budget: &Mutex<Budget>,
+    emit: &(dyn Fn(&str) + Send + Sync),
+) -> RelayReply
+where
+    T: RelayTransport,
+    A: Fn(&str) -> Option<crate::gh_shim_ticket::Redeemed>,
+    L: Fn(&str) -> bool,
+    S: Fn(String) -> F,
+    F: std::future::Future<Output = Result<Option<ScopeStamp>, ()>>,
+{
     let envelope = match decode(bytes) {
         Ok(envelope) => envelope,
         Err(reply) => return reply,
@@ -554,8 +609,27 @@ where
         return refusal("command_ended");
     }
     let read = matches!(envelope.operation, Operation::ReadRequest { .. });
-    if !budget.lock().unwrap_or_else(|p| p.into_inner()).take(read) {
-        return refusal("read_budget_exceeded");
+    let sequence = {
+        let mut limits = budget.lock().unwrap_or_else(|p| p.into_inner());
+        if !limits.take(read) {
+            return refusal("read_budget_exceeded");
+        }
+        limits.requests
+    };
+    // Admission rate limiting bounds log volume, rather than dropping audit
+    // records for later reads in the same window. Drop also records cancellation.
+    let mut audit = ReadAudit {
+        identity: &identity,
+        read,
+        ok: false,
+        sequence,
+        emit,
+    };
+    let reply = async {
+    if let Operation::ReadRequest { request } = &envelope.operation {
+        if let Err(error) = request.validate_worker_query() {
+            return RelayReply { ok:false, data:json!({"refusal_code":error.code,"stage":"worker_read_policy","key":error.key,"allowed_keys":crate::gh_shim::read_contract::WORKER_GET_QUERY_KEYS,"message":error.message}) };
+        }
     }
     let Ok(stamp) = scope(identity.session_id.clone()).await else {
         return refusal("scope_unavailable");
@@ -596,15 +670,9 @@ where
     if authenticate(&envelope.capability).is_none() || !live(&identity.task_id) {
         return refusal("command_ended");
     }
-    if budget.lock().unwrap_or_else(|p| p.into_inner()).requests == 1 {
-        log::info!(
-            "gh_shim worker_read: session={} task={} read={} ok={}",
-            identity.session_id.escape_debug(),
-            identity.task_id.escape_debug(),
-            read,
-            reply.ok
-        );
-    }
+    reply
+    }.await;
+    audit.ok = reply.ok;
     reply
 }
 

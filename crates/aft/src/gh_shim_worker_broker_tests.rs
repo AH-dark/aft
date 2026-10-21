@@ -274,7 +274,7 @@ async fn gh_shim_broker_t4_frame_and_rate_and_upstream_budgets_are_bounded() {
 }
 
 #[tokio::test]
-async fn gh_shim_broker_revocation_discards_in_flight_reply() {
+async fn gh_shim_broker_revocation_during_lookup_refuses_before_upstream() {
     let grant = Grant::new();
     let transport = Transport::default();
     let reply = dispatch(
@@ -399,7 +399,10 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
         relay: GhRelay::new(root.path().join("unused-connection.json")),
         scopes,
         runtime: tokio::runtime::Handle::current(),
+        endpoints: Err("unused by this listener fixture".into()),
+        connection_slots: Arc::new(Semaphore::new(64)),
     };
+    let connection_slots = service.connection_slots.clone();
     let server = tokio::spawn(serve(
         listener,
         socket.clone(),
@@ -414,7 +417,7 @@ async fn gh_shim_broker_t4_real_listener_bounds_connections_and_read_deadlines()
         clients.push(stream);
     }
     tokio::time::timeout(Duration::from_secs(1), async {
-        while GLOBAL.available_permits() > 64 - CONNECTIONS {
+        while connection_slots.available_permits() != 64 - CONNECTIONS {
             tokio::task::yield_now().await;
         }
     })
@@ -514,6 +517,8 @@ async fn gh_shim_broker_deadline_renewal_follows_the_task_without_an_independent
         relay: GhRelay::new(root.path().join("unused.json")),
         scopes,
         runtime: tokio::runtime::Handle::current(),
+        endpoints: Err("unused by this listener fixture".into()),
+        connection_slots: Arc::new(Semaphore::new(64)),
     };
     let server = tokio::spawn(serve(
         listener,
@@ -540,4 +545,292 @@ async fn gh_shim_broker_deadline_renewal_follows_the_task_without_an_independent
         .await
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn gh_shim_endpoint_cleanup_does_not_unlink_a_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.path().join("000000000001.gh-read.sock");
+    let generation = crate::gh_shim_worker_endpoints::Generation::new(root.path()).unwrap();
+    let (_listener, owner) = generation.bind("000000000001").unwrap();
+    let ticket = PendingTicket::issue("cleanup-owner-session", "/server/project");
+    ticket.reserve_task("cleanup-owner-command");
+    ticket
+        .worker_read_capability(
+            socket.clone(),
+            Instant::now() + Duration::from_secs(60),
+            &stamp(),
+        )
+        .unwrap();
+    assert!(ticket.attach_worker_read_endpoint(owner.clone()));
+    drop(ticket);
+    assert!(!socket.exists());
+    let replacement_generation =
+        crate::gh_shim_worker_endpoints::Generation::new(root.path()).unwrap();
+    let (_replacement, _replacement_owner) = replacement_generation.bind("000000000001").unwrap();
+    drop(owner);
+    assert!(
+        socket.exists(),
+        "late cleanup of the old endpoint must not unlink its replacement"
+    );
+}
+
+#[tokio::test]
+async fn gh_shim_broker_raw_frames_enforce_worker_read_policy() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    let query = |query: Value| json!({"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"issues","query":query}});
+    let mut attacks = vec![
+        json!({"action":"github.repo.get","repository":"cortexkit/other","args":{"path":""}}),
+        json!({"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"graphql"}}),
+        query(json!({"unknown_option":"value"})),
+        query(json!({"q":"repo:other"})),
+        query(json!({"state":"x".repeat(4097)})),
+    ];
+    for q in [
+        "repo:other term",
+        "org:cortexkit term",
+        "user:someone term",
+        "term OR other",
+        "(term)",
+    ] {
+        attacks.push(
+            json!({"action":"github.search.issues","repository":"cortexkit/aft","args":{"q":q}}),
+        );
+    }
+    for request in attacks {
+        let raw = serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":request}})).unwrap();
+        let reply = call(&grant, &transport, &raw, Some(stamp())).await;
+        assert!(!reply.ok, "daemon admitted raw request: {request}");
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            0,
+            "refuse before any upstream call: {request}"
+        );
+        if request["args"]["query"].get("unknown_option").is_some()
+            || request["args"]["query"].get("q").is_some()
+        {
+            assert_eq!(reply.data["refusal_code"], "worker_query_key_not_allowed");
+            assert!(reply.data["allowed_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| key == "state"));
+            assert!(reply.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("Allowed keys"));
+        }
+    }
+    let raw = serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":query(json!({"state":"open"}))}})).unwrap();
+    assert!(call(&grant, &transport, &raw, Some(stamp())).await.ok);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn gh_shim_broker_revocation_discards_in_flight_reply() {
+    struct Held {
+        inner: Transport,
+        reached: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+    impl RelayTransport for Held {
+        fn read_repository(
+            &self,
+            ticket: &crate::gh_shim_ticket::Redeemed,
+        ) -> Result<String, String> {
+            self.inner.read_repository(ticket)
+        }
+        fn opens_scoped_routes(&self) -> bool {
+            true
+        }
+        async fn plexus(
+            &self,
+            root: &str,
+            session: &str,
+            scope: Option<&ScopeSelector>,
+            body: Value,
+        ) -> Result<Value, TransportError> {
+            let reply = self.inner.plexus(root, session, scope, body).await;
+            self.reached.notify_one();
+            self.resume.notified().await;
+            reply
+        }
+    }
+    let grant = Arc::new(Grant::new());
+    let held = Arc::new(Held {
+        inner: Default::default(),
+        reached: Default::default(),
+        resume: Default::default(),
+    });
+    let task_grant = grant.clone();
+    let task_held = held.clone();
+    let task = tokio::spawn(async move {
+        dispatch(
+            &task_grant.envelope(read("cortexkit/aft")),
+            &task_grant.socket,
+            task_held.as_ref(),
+            |cap| crate::gh_shim_ticket::redeem_worker_read(cap, &task_grant.socket),
+            |_| true,
+            |_| std::future::ready(Ok(Some(stamp()))),
+            &budget(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), held.reached.notified())
+        .await
+        .unwrap();
+    assert_eq!(held.inner.calls.load(Ordering::SeqCst), 1);
+    crate::gh_shim_ticket::revoke_task(&grant.task);
+    held.resume.notify_one();
+    let reply = task.await.unwrap();
+    assert!(
+        !reply.ok,
+        "a live observer must not receive the completed upstream result after revocation"
+    );
+    assert!(reply.data.get("sentinel").is_none());
+    assert_eq!(held.inner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn gh_shim_broker_query_keys_and_limits_are_daemon_side() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    let envelope = |query: Value| {
+        serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"issues","query":query}}}})).unwrap()
+    };
+    assert!(
+        call(
+            &grant,
+            &transport,
+            &envelope(json!({"state":"open"})),
+            Some(stamp())
+        )
+        .await
+        .ok
+    );
+    for key in [
+        "unreviewed",
+        "q",
+        "query",
+        "url",
+        "method",
+        "headers",
+        "Authorization",
+    ] {
+        let reply = call(
+            &grant,
+            &transport,
+            &envelope(json!({(key):"value"})),
+            Some(stamp()),
+        )
+        .await;
+        assert!(!reply.ok, "raw worker query key {key} must be refused");
+        assert_eq!(reply.data["refusal_code"], "worker_query_key_not_allowed");
+        assert_eq!(reply.data["key"], key);
+        assert!(reply.data["allowed_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "state"));
+    }
+    let reply = call(
+        &grant,
+        &transport,
+        &envelope(json!({"state":"x".repeat(4097)})),
+        Some(stamp()),
+    )
+    .await;
+    assert_eq!(reply.data["refusal_code"], "worker_query_value_too_long");
+    let keys = [
+        "page",
+        "per_page",
+        "ref",
+        "branch",
+        "head_sha",
+        "event",
+        "actor",
+        "status",
+        "check_suite_id",
+        "state",
+        "labels",
+        "milestone",
+        "assignee",
+        "creator",
+        "mentioned",
+        "since",
+        "sort",
+    ];
+    let query: serde_json::Map<String, Value> = keys
+        .into_iter()
+        .map(|key| (key.into(), json!("1")))
+        .collect();
+    let reply = call(
+        &grant,
+        &transport,
+        &envelope(Value::Object(query)),
+        Some(stamp()),
+    )
+    .await;
+    assert_eq!(reply.data["refusal_code"], "worker_query_too_many_pairs");
+    assert_eq!(
+        transport.calls.load(Ordering::SeqCst),
+        1,
+        "only the allowed key may reach upstream"
+    );
+}
+
+#[tokio::test]
+async fn gh_shim_broker_logs_every_admitted_read_in_one_window() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    let limits = budget();
+    let lines = Mutex::new(Vec::new());
+    for _ in 0..2 {
+        let reply = dispatch_recorded(
+            &grant.envelope(read("cortexkit/aft")),
+            &grant.socket,
+            &transport,
+            |cap| crate::gh_shim_ticket::redeem_worker_read(cap, &grant.socket),
+            |_| true,
+            |_| std::future::ready(Ok(Some(stamp()))),
+            &limits,
+            &|line| lines.lock().unwrap().push(line.to_string()),
+        )
+        .await;
+        assert!(reply.ok);
+    }
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        lines.lock().unwrap().len(),
+        2,
+        "every read, not just the first request in a rate window, needs an audit record"
+    );
+    assert!(lines
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|line| line.contains("read=true")));
+}
+
+#[test]
+fn gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition() {
+    let source = include_str!("cli/sandbox_launch/seatbelt.rs");
+    let helper = source
+        .split("fn render_worker_broker_denies(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        helper.contains("managed_task_temp_root()"),
+        "the network rule must use the same root as endpoint creation"
+    );
+    assert!(
+        !helper.contains("/private/tmp/aft-w"),
+        "do not duplicate a platform namespace literal in the network fence"
+    );
 }

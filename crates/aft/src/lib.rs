@@ -105,6 +105,8 @@ pub mod gh_shim;
 pub mod gh_shim_relay;
 pub mod gh_shim_ticket;
 pub(crate) mod gh_shim_worker_broker;
+#[cfg(unix)]
+pub(crate) mod gh_shim_worker_endpoints;
 pub(crate) mod git_probe;
 pub mod github_read;
 pub mod grep_executor;
@@ -117,6 +119,8 @@ pub mod inspect;
 pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
+#[doc(hidden)]
+pub mod launch_fds;
 pub mod launch_nonce;
 pub mod legacy_partitions;
 pub(crate) mod lifecycle_census;
