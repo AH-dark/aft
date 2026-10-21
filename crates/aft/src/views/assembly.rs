@@ -1712,12 +1712,26 @@ fn missing_callgraph_payload(
         // empty file instead: no symbols, as the call graph built without
         // views leaves unreadable files out. Assembly records the path as
         // skipped.
+        //
+        // Every other error `extract` returns is independent of the file's
+        // content, so it fails the publication rather than skipping the file:
+        // an unknown language name, a grammar the parser refuses, no parse
+        // tree (only possible with a timeout or cancellation, neither of
+        // which is set), or a symbol query that does not compile or does not
+        // exist for the language. Each of these would recur for every file in
+        // that language. A syntax error is not among them: tree-sitter returns
+        // a tree with error nodes, and the file is published with what it
+        // yields. Neither call graph limits file size.
         CallgraphBlob::extract(
             std::str::from_utf8(source).unwrap_or(""),
             language,
             crate::views::callgraph::PRODUCER,
         )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+        .map_err(|error| {
+            ViewError::InvalidManifest(format!(
+                "call graph extraction for {language} source failed: {error}"
+            ))
+        })?
     };
     Ok(Some(blob.to_bytes().map_err(|error| {
         ViewError::InvalidManifest(error.to_string())
@@ -2314,6 +2328,65 @@ mod status_settlement_tests {
         assert!(manifest.entries().any(|(path, entry)| {
             path.as_bytes() == b"vendor/sub" && matches!(entry, ManifestEntry::Gitlink { .. })
         }));
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert!(summary.skipped_by_reason.is_empty());
+    }
+
+    /// Source that does not parse still has a call graph: tree-sitter answers
+    /// a syntax error with a tree holding error nodes, not with an error. So
+    /// broken source neither fails the publication nor is skipped; it is
+    /// published with what the extractor finds in it.
+    #[test]
+    fn views_unparseable_callgraph_sources_publish_with_their_call_graph() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let broken = [
+            ("broken.py", "def (:\n    )))\nclass\n"),
+            ("broken.ts", "export function {{{ ((( => ;;\n"),
+            ("broken.rs", "fn ( { impl for <\n"),
+        ];
+        for (name, source) in broken {
+            fs::write(root.join(name), source).unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "broken",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let report = publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        assert!(report.published);
+        assert!(
+            report.pending_paths.is_empty(),
+            "{:?}",
+            report.pending_paths
+        );
+        let manifest = ViewStore::open(storage.path(), SCOPE)
+            .unwrap()
+            .load_manifest(report.generation.as_deref().unwrap())
+            .unwrap();
+        for (name, _) in broken {
+            assert!(
+                manifest.entries().any(|(path, entry)| {
+                    path.as_bytes() == name.as_bytes()
+                        && matches!(
+                            entry,
+                            ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some()
+                        )
+                }),
+                "{name} has no call graph"
+            );
+        }
         let summary = status(storage.path()).summary().unwrap();
         assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
         assert!(summary.skipped_by_reason.is_empty());
