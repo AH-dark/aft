@@ -1586,9 +1586,9 @@ struct LocalFallback {
 enum Attached {
     /// Re-attached to the job; its records continue on this stream.
     Stream(exec::RemoteStream),
-    /// `bash.kill_scope` paused the task's owner and was waiting for this
-    /// worker to send the runner's cancellation. The cancel result is now
-    /// recorded and the local task is already stopped, so the worker must end
+    /// The scope's owner paused it through `bash.kill_scope`, which stopped
+    /// this task locally and was waiting for this worker to send the runner's
+    /// cancellation. That cancel result is now recorded, so the worker must end
     /// here: another reconnect would only send the cancel again, and giving up
     /// later would overwrite the recorded result with a recovery failure.
     OwnerPauseSettled,
