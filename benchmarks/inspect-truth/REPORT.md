@@ -1,5 +1,74 @@
 # aft_inspect truth at scale: campaign report
 
+## Python document-pull protocol: pre-build source findings
+
+Both checked releases implement **per-document pull diagnostics**: Pyright
+**1.1.414**, commit `a28cce4077d87b80bead12de809f79845e39c8ba`, and the published
+latest basedpyright **1.40.2**, commit
+`344759687c2fff3bd0a7d6a83a9d1847f806b795`. No build or test was needed to
+establish these protocol facts; this section records the source decision before
+the implementation build.
+
+### Registration is dynamic, not an initialize-result diagnosticProvider
+
+- Pyright [`languageServerBase.ts:628-630`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L628-L630)
+  and basedpyright [lines 715-717](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageServerBase.ts#L715-L717)
+  enable pull only if the client declares
+  `textDocument.diagnostic.dynamicRegistration` and initialization option
+  `disablePullDiagnostics` is not true.
+- Their static initialize results do not contain `diagnosticProvider`. Instead,
+  Pyright `languageServerBase.ts:693-703` and basedpyright `:801-811` install and
+  register `PullDiagnosticsDynamicFeature`.
+- Pyright [`pullDiagnosticsDynamicFeature.ts:41-49`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageService/pullDiagnosticsDynamicFeature.ts#L41-L49)
+  and basedpyright [lines 38-48](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageService/pullDiagnosticsDynamicFeature.ts#L38-L48)
+  register `textDocument/diagnostic` through `client/registerCapability`, with
+  `interFileDependencies: true`. `workspaceDiagnostics` is conditional on
+  workspace diagnostic mode; it is not a prerequisite for a document pull.
+- AFT currently advertises `dynamicRegistration: false`, which opts the client
+  out of dynamic registration, and discovers only static diagnosticProvider.
+  The missing static initialize field therefore did not establish that either
+  server lacks pull support.
+
+The document handlers are bound at Pyright `languageServerBase.ts:561` and
+basedpyright `:654`. Pyright [lines 1156-1230](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L1156-L1230)
+and basedpyright [lines 1559-1639](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageServerBase.ts#L1559-L1639)
+await `analyzeFileAndGetDiagnostics` for the requested URI and repeat if its
+diagnostic version changes during analysis. The underlying Program explicitly
+analyzes the file and retrieves its full-range diagnostics (Pyright
+`analyzer/program.ts:827-835`; basedpyright `:873-881`). This is a file certificate,
+not a claim that unrelated files or the whole workspace have been checked.
+The scoped client must open the file first: in open-files-only mode the handler
+intentionally returns an empty full report for a closed document. The handlers
+also have early-return guards for cancellation and files inside ZIP archives
+(`canNavigateToFile`), and Pyright
+additionally guards disabled language services. Client timeout, cancellation,
+missing-cache and rejected-request outcomes must remain failure/unknown rather
+than being converted to successful reports containing zero diagnostics.
+
+### Negotiating pull stops ordinary open-file push analysis
+
+Pushes **cannot remain the assumed source for warm counts or alerts** after this
+negotiation. Pyright [`createAnalyzerService():313-330`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L313-L330)
+and basedpyright [lines 353-370](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageServerBase.ts#L353-L370)
+request `workspace/diagnostic/refresh` on invalidation in open-files-only pull
+mode, and their `shouldRunAnalysis` callback disables ordinary background
+analysis when pull is supported unless a workspace diagnostic request is active.
+
+This does not mean the publishDiagnostics protocol handler is removed. Their send routines still
+call `connection.sendDiagnostics` when not streaming a workspace result
+(Pyright `:1506-1522`; basedpyright `:2075-2098`). Those notifications cannot
+replace the missing normal open-file analysis stream.
+
+The selected implementation path is therefore negotiated document pulls for
+exactly the scoped files, and pull-driven refresh of open files for warm counts
+and alert observations. AFT will honor `disablePullDiagnostics`, issue no
+unregistered document request, retain push/status compatibility and the progress
+fence for non-negotiated servers, and remove the two-second certificate only
+where document pull is actually in effect. Specifically, scoped file authority
+will no longer wait two seconds hoping that no further analysis is announced.
+It will await the file analysis requested by `textDocument/diagnostic`, rather
+than treating a hover/documentSymbol round trip as a proxy for diagnostic completion.
+
 ## Progress liveness and warm-feedback follow-up
 
 The END-after-publication barrier is retained for an **announced or begun**
