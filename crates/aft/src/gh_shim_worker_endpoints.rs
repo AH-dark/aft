@@ -481,3 +481,37 @@ fn gh_shim_endpoint_failed_bind_preserves_existing_socket() {
     );
     assert!(std::os::unix::net::UnixStream::connect(path).is_ok());
 }
+
+#[test]
+fn gh_shim_endpoint_identity_checks_protect_replacement_before_remove() {
+    use std::os::unix::fs::PermissionsExt;
+    for change in ["token", "inode"] {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let generation = Generation::new(root.path()).unwrap();
+        let (_old_listener, owner) = generation.bind("000000000001").unwrap();
+        let path = owner.path();
+        let replacement = if change == "token" {
+            let _namespace = lock_namespace(root.path()).unwrap();
+            let index = root.path().join("000000000001.gh-read.owner");
+            let mut record = read_registration(&index).unwrap();
+            record.token = random_name().unwrap();
+            write_record(&index, &record, true).unwrap();
+            None
+        } else {
+            let _namespace = lock_namespace(root.path()).unwrap();
+            fs::remove_file(&path).unwrap();
+            Some(UnixListener::bind(&path).unwrap())
+        };
+        owner.remove();
+        assert!(
+            path.exists(),
+            "{change} identity changed before removal: the old owner must not unlink it"
+        );
+        assert!(
+            std::os::unix::net::UnixStream::connect(&path).is_ok(),
+            "replacement must remain connectable"
+        );
+        drop(replacement);
+    }
+}

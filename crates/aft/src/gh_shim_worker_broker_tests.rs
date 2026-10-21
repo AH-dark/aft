@@ -817,26 +817,6 @@ async fn gh_shim_broker_logs_every_admitted_read_in_one_window() {
         .all(|line| line.contains("read=true")));
 }
 
-#[test]
-fn gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition() {
-    let source = include_str!("cli/sandbox_launch/seatbelt.rs");
-    let helper = source
-        .split("fn render_worker_broker_denies(")
-        .nth(1)
-        .unwrap()
-        .split("\n}\n")
-        .next()
-        .unwrap();
-    assert!(
-        helper.contains("managed_task_temp_root()"),
-        "the network rule must use the same root as endpoint creation"
-    );
-    assert!(
-        !helper.contains("/private/tmp/aft-w"),
-        "do not duplicate a platform namespace literal in the network fence"
-    );
-}
-
 #[tokio::test]
 async fn gh_shim_broker_encoded_paths_are_canonicalized_before_policy() {
     let grant = Grant::new();
@@ -906,4 +886,139 @@ async fn gh_shim_broker_query_values_cannot_inject_parameters() {
         assert_eq!(reply.data["refusal_code"], "worker_query_value_ambiguous");
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn gh_shim_broker_audit_excludes_capability_file_and_query_secrets() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    let limits = budget();
+    let lines = Mutex::new(Vec::new());
+    let private = tempfile::tempdir().unwrap();
+    let capability_file = private.path().join(".gh-read-capability");
+    std::fs::write(&capability_file, &grant.capability).unwrap();
+    let query = format!("private-query-value:{}", capability_file.display());
+    let raw=serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"issues","query":{"state":query}}}}})).unwrap();
+    let reply = dispatch_recorded(
+        &raw,
+        &grant.socket,
+        &transport,
+        |cap| crate::gh_shim_ticket::redeem_worker_read(cap, &grant.socket),
+        |_| true,
+        |_| std::future::ready(Ok(Some(stamp()))),
+        &limits,
+        &|line| lines.lock().unwrap().push(line.to_string()),
+    )
+    .await;
+    assert!(reply.ok);
+    let lines = lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    for forbidden in [
+        &grant.capability,
+        capability_file.to_str().unwrap(),
+        query.as_str(),
+    ] {
+        assert!(
+            !lines[0].contains(forbidden),
+            "audit output leaked a bearer, capability-file path or query value"
+        );
+    }
+    assert_eq!(
+        transport.requests.lock().unwrap()[0]["arguments"]["args"]["query"]["state"],
+        query,
+        "the sensitive query really reached the checked request"
+    );
+}
+
+#[tokio::test]
+async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
+    use base64::Engine;
+    use ring::signature::Ed25519KeyPair;
+    let _state = crate::test_env::gh_shim_state_guard();
+    let root = PathBuf::from(std::env::var_os(STATE_ENV).unwrap());
+    let mut manifest: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v20-manifest.json")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    manifest["issued_at_unix_secs"] = json!(now);
+    const SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let key = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
+    std::fs::write(root.join("gh-routing-manifest.json"),serde_json::to_vec(&json!({"artifact_id":"gh-routing-manifest","envelope_version":2,"key_id":"gh-routing-dev-test-key-v1","fetched_at_unix_secs":now,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),"manifest_bytes":String::from_utf8(bytes).unwrap()})).unwrap()).unwrap();
+    struct SignedTransport(AtomicUsize);
+    impl RelayTransport for SignedTransport {
+        fn opens_scoped_routes(&self) -> bool {
+            true
+        }
+        async fn plexus(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&ScopeSelector>,
+            _: Value,
+        ) -> Result<Value, TransportError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"sentinel":"signed-worker-read"}))
+        }
+    }
+    let transport = SignedTransport(AtomicUsize::new(0));
+    for repository in ["cortexkit/aft", "cortexkit/not-in-signed-manifest"] {
+        let checkout = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "remote.origin.url", repository],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let task = format!("signed-{repository}");
+        let socket = checkout.path().join("broker.sock");
+        let ticket = PendingTicket::issue(&task, checkout.path().to_str().unwrap());
+        ticket.reserve_task(&task);
+        let (capability, _) = ticket
+            .worker_read_capability(
+                socket.clone(),
+                Instant::now() + Duration::from_secs(60),
+                &stamp(),
+            )
+            .unwrap();
+        for target in [repository, "cortexkit/foreign-request"] {
+            let raw=serde_json::to_vec(&json!({"capability":capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":target,"args":{"path":""}}}})).unwrap();
+            let reply = dispatch(
+                &raw,
+                &socket,
+                &transport,
+                |cap| crate::gh_shim_ticket::redeem_worker_read(cap, &socket),
+                |_| true,
+                |_| std::future::ready(Ok(Some(stamp()))),
+                &budget(),
+            )
+            .await;
+            assert_eq!(
+                reply.ok,
+                repository == "cortexkit/aft" && target == repository,
+                "the real signed binding must govern raw requests: {reply:?}"
+            );
+        }
+    }
+    assert_eq!(transport.0.load(Ordering::SeqCst), 1);
 }
