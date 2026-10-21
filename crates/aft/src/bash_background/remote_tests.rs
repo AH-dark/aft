@@ -3957,6 +3957,69 @@ async fn runon_network_is_present_on_wire_only_when_requested() {
 }
 
 #[tokio::test]
+async fn runon_timeout_uses_the_task_limit_and_preserves_long_explicit_timeouts() {
+    for (timeout_ms, expected_seconds) in [(None, 30 * 60), (Some(7_201_000), 7_201)] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let mut params = serde_json::json!({
+            "command": "printf timeout-proof",
+            "runon": "linux,4c",
+            "compressed": false
+        });
+        if let Some(timeout_ms) = timeout_ms {
+            params["timeout"] = serde_json::json!(timeout_ms);
+        }
+
+        let response = handle_with_policy(&ctx, Some(launch(daemon.connection.clone())), params);
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        let captured: crate::exec_remote::types::RunRequest =
+            serde_json::from_value(runs[0].clone()).unwrap();
+        assert_eq!(
+            captured.timeout,
+            Some(expected_seconds),
+            "the protocol timeout is required and measured in seconds: {runs:?}"
+        );
+        assert_eq!(runs[0]["timeout"], expected_seconds);
+        assert_eq!(captured.weight_hint, Some(4));
+    }
+}
+
+#[tokio::test]
+async fn local_bash_keeps_its_caller_timeout_without_remote_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context_with_runon(dir.path(), false);
+    let response = handle_with_policy(
+        &ctx,
+        None,
+        serde_json::json!({
+            "command": "printf local-timeout-proof",
+            "timeout": 10_000,
+            "compressed": false
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.output_preview, "local-timeout-proof");
+
+    let task = ctx.bash_background().task(task_id).unwrap();
+    let state = task.state.lock().unwrap();
+    assert!(state.metadata.remote.is_none());
+    assert_eq!(state.metadata.timeout_ms, Some(10_000));
+}
+
+#[tokio::test]
 async fn runon_network_not_granted_is_plainly_offline_in_reply_and_persistence() {
     for script in [Script::Plain, Script::NetworkUnknown] {
         let daemon = daemon(script, "exec-remote/v1").await;
@@ -4499,7 +4562,7 @@ fn linked_worktree_remote_requests_use_the_linked_worktree_root() {
             cwd,
             "true",
             BTreeMap::new(),
-            None,
+            30 * 60,
             &exec::PresetParams::default(),
         )
         .expect("linked worktree cwd should be accepted");
@@ -4522,7 +4585,7 @@ fn remote_request_for_main_worktree_keeps_the_main_root() {
         &cwd,
         "true",
         BTreeMap::new(),
-        None,
+        30 * 60,
         &exec::PresetParams::default(),
     )
     .unwrap();
@@ -4547,7 +4610,7 @@ fn nested_linked_worktree_remote_request_uses_the_nested_root() {
         &cwd,
         "true",
         BTreeMap::new(),
-        None,
+        30 * 60,
         &exec::PresetParams::default(),
     )
     .unwrap();
@@ -4570,7 +4633,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
         &unrelated,
         "true",
         BTreeMap::new(),
-        None,
+        30 * 60,
         &exec::PresetParams::default(),
     )
     .unwrap_err()
@@ -4597,7 +4660,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
         outside.path(),
         "true",
         BTreeMap::new(),
-        None,
+        30 * 60,
         &exec::PresetParams::default(),
     )
     .unwrap_err()
