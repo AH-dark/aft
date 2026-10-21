@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use crate::blob_store::v2::{FamilyKey, FamilyStoreReader};
+use crate::blob_store::v2::{DeletionEpoch, FamilyKey, FamilyStoreReader};
 use crate::semantic_index::{SemanticVectors, ViewPayloadProducer};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -44,9 +44,60 @@ pub struct SemanticArena {
     released: Condvar,
     decodes: AtomicU64,
     store_reads: AtomicU64,
+    chunk_row_reads: AtomicU64,
+    chunk_row_bytes: AtomicU64,
+    seeded_chunks: AtomicU64,
     chunk_batch: Mutex<()>,
     #[cfg(test)]
     chunk_shortcut: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    run_seeding: std::sync::atomic::AtomicBool,
+}
+
+/// Most chunk keys the chunk index holds. Entries are counted separately from
+/// vectors because distinct chunk keys can share one vector allocation.
+pub(crate) const MAX_CHUNK_KEYS: usize = 65_536;
+
+/// How one producer names the chunk rows of a stored file run, and the marker
+/// row that says those rows were checked when the run was stored.
+///
+/// A file payload's vectors are not trusted as chunk vectors on their own: a
+/// payload imported from a legacy index, or written before chunk rows existed,
+/// can hold floats that differ from the chunk rows. A fill writes the marker
+/// only after confirming that every vector of the run it stored is bit-equal
+/// to the chunk row for that vector's text, as those rows stood at the
+/// store's current [`DeletionEpoch`]. The marker key covers the exact payload
+/// bytes and that epoch. Chunk rows are immutable while they exist, so the
+/// marker holds until some row is deleted; then the store's epoch moves on,
+/// no lookup computes the old key again, and the marker is left for GC.
+pub(crate) trait ChunkNaming {
+    /// The chunk-row key of a chunk whose embedded text has this digest.
+    fn chunk_key_for_text_digest(&self, text_digest: &blake3::Hash) -> FamilyKey;
+    /// The marker key that vouches for the run whose payload has this digest,
+    /// checked against the chunk rows at `epoch`.
+    fn verified_run_marker(
+        &self,
+        payload_digest: &blake3::Hash,
+        epoch: &DeletionEpoch,
+    ) -> FamilyKey;
+}
+
+/// A run just loaded from the store, with what seeding the chunk index from
+/// it needs: its payload digest and the chunk-row key of each of its vectors.
+#[derive(Debug)]
+pub(crate) struct RunSeed {
+    payload_digest: blake3::Hash,
+    chunk_keys: Vec<FamilyKey>,
+    run: Arc<SemanticVectors>,
+}
+
+/// One chunk-index entry: the vector, and the store's deletion epoch at which
+/// it was known to equal its chunk row. `None` when the store had no epoch.
+/// Only entries checked at the store's current epoch can vouch for a run.
+#[derive(Debug)]
+struct ChunkEntry {
+    vector: Weak<[f32]>,
+    checked_at: Option<DeletionEpoch>,
 }
 
 /// Resident arena memory. Every key is counted once, whatever the number of
@@ -71,9 +122,10 @@ pub struct ArenaMemory {
 #[derive(Debug, Default)]
 struct VectorPool {
     by_digest: HashMap<blake3::Hash, Weak<[f32]>>,
-    // Populate only from chunk-row vectors that were read or stored; a file
-    // payload can contain different legacy floats.
-    by_chunk: HashMap<FamilyKey, Weak<[f32]>>,
+    // Populate only from chunk-row vectors that were read or stored, or from
+    // a loaded run whose marker row vouches for it. Any other file payload
+    // can contain different legacy floats.
+    by_chunk: HashMap<FamilyKey, ChunkEntry>,
     live_after_prune: usize,
     scratch: Vec<u8>,
 }
@@ -84,11 +136,7 @@ impl VectorPool {
         for vector in run.vectors_mut() {
             self.share_vector(vector);
         }
-        if self.by_digest.len() + self.by_chunk.len()
-            > self.live_after_prune.max(1024).saturating_mul(2)
-        {
-            self.prune();
-        }
+        self.prune_if_grown();
     }
 
     fn share_vector(&mut self, vector: &mut Arc<[f32]>) {
@@ -108,9 +156,19 @@ impl VectorPool {
         }
     }
 
+    /// Prunes once the tables have doubled since the last prune.
+    fn prune_if_grown(&mut self) {
+        if self.by_digest.len() + self.by_chunk.len()
+            > self.live_after_prune.max(1024).saturating_mul(2)
+        {
+            self.prune();
+        }
+    }
+
     fn prune(&mut self) {
         self.by_digest.retain(|_, vector| vector.strong_count() > 0);
-        self.by_chunk.retain(|_, vector| vector.strong_count() > 0);
+        self.by_chunk
+            .retain(|_, entry| entry.vector.strong_count() > 0);
         // `retain` keeps the table's allocation, which `memory()` reports;
         // return it once the views that filled it are gone.
         self.by_digest.shrink_to_fit();
@@ -158,9 +216,14 @@ pub fn arena_for(storage: &Path, family: &str) -> Arc<SemanticArena> {
         released: Condvar::new(),
         decodes: AtomicU64::new(0),
         store_reads: AtomicU64::new(0),
+        chunk_row_reads: AtomicU64::new(0),
+        chunk_row_bytes: AtomicU64::new(0),
+        seeded_chunks: AtomicU64::new(0),
         chunk_batch: Mutex::new(()),
         #[cfg(test)]
         chunk_shortcut: std::sync::atomic::AtomicBool::new(true),
+        #[cfg(test)]
+        run_seeding: std::sync::atomic::AtomicBool::new(true),
     });
     arenas.insert(key, Arc::downgrade(&arena));
     arena
@@ -193,15 +256,42 @@ impl SemanticArena {
         self.chunk_shortcut.store(enabled, Ordering::Relaxed);
     }
 
+    /// Lets a test measure loads that do not seed the chunk index from runs
+    /// vouched for by a marker row, which is how loads behaved before.
+    #[cfg(test)]
+    pub(crate) fn set_run_seeding(&self, enabled: bool) {
+        self.run_seeding.store(enabled, Ordering::Relaxed);
+    }
+
     /// Looks up the key derived from the producer identity and exact text.
-    /// Weak handles do not keep floats alive. Cold file loads must first validate
-    /// chunk rows before those vectors become eligible for this shortcut.
+    /// Weak handles do not keep floats alive. A loaded file run's vectors are
+    /// eligible only once its chunk rows were checked: by this process reading
+    /// them, or by the fill that stored the run, as its marker row records.
     pub(crate) fn chunk_vector(&self, key: &FamilyKey) -> Option<Arc<[f32]>> {
         #[cfg(test)]
         if !self.chunk_shortcut.load(Ordering::Relaxed) {
             return None;
         }
-        lock(&self.vectors).by_chunk.get(key)?.upgrade()
+        self.verified_chunk(key).map(|(vector, _)| vector)
+    }
+
+    /// The indexed chunk-row vector for `key`, whether or not a test disabled
+    /// the shortcut, with the deletion epoch at which it was known to equal
+    /// its chunk row. A fill uses it to check a run before vouching for it.
+    pub(crate) fn verified_chunk(
+        &self,
+        key: &FamilyKey,
+    ) -> Option<(Arc<[f32]>, Option<DeletionEpoch>)> {
+        let pool = lock(&self.vectors);
+        let entry = pool.by_chunk.get(key)?;
+        Some((entry.vector.upgrade()?, entry.checked_at))
+    }
+
+    /// Records a chunk-row read a fill made because the chunk index missed.
+    pub(crate) fn note_chunk_row_read(&self, payload_bytes: usize) {
+        self.chunk_row_reads.fetch_add(1, Ordering::Relaxed);
+        self.chunk_row_bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
     }
 
     /// Serializes bounded chunk-vector batches across all views of the family.
@@ -229,13 +319,34 @@ impl SemanticArena {
 
     /// Admits `key` from the family store, decoding it once. Returns `None`
     /// when the store has no row for it. A resident run is returned without
-    /// touching the store.
-    pub fn load(
+    /// touching the store. A run a marker row vouches for also seeds the
+    /// chunk index; see [`Self::seed_verified_runs`].
+    pub(crate) fn load(
         &self,
         store: &FamilyStoreReader,
         key: &FamilyKey,
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
+        naming: &dyn ChunkNaming,
+    ) -> Result<Option<Arc<SemanticVectors>>, String> {
+        let mut seeds = Vec::new();
+        let run = self.load_deferring_seed(store, key, rel_path, producer, naming, &mut seeds)?;
+        self.seed_verified_runs(store, seeds, naming);
+        Ok(run)
+    }
+
+    /// [`Self::load`], leaving the chunk-index seeding to the caller: a
+    /// nonempty run this call newly installs is added to `seeds`. Admitting a
+    /// generation loads many runs and probes all their markers in one batch
+    /// afterwards.
+    pub(crate) fn load_deferring_seed(
+        &self,
+        store: &FamilyStoreReader,
+        key: &FamilyKey,
+        rel_path: &Path,
+        producer: &ViewPayloadProducer<'_>,
+        naming: &dyn ChunkNaming,
+        seeds: &mut Vec<RunSeed>,
     ) -> Result<Option<Arc<SemanticVectors>>, String> {
         if let Some(run) = self.get(key) {
             return Ok(Some(run));
@@ -245,27 +356,134 @@ impl SemanticArena {
             return Ok(None);
         };
         self.decodes.fetch_add(1, Ordering::Relaxed);
-        let run = SemanticVectors::decode_view_payload(&payload, rel_path, producer)?;
-        Ok(Some(self.install(*key, run)))
+        let (run, text_digests) =
+            SemanticVectors::decode_view_payload_with_text_digests(&payload, rel_path, producer)?;
+        let (run, ours) = self.install_inner(*key, run);
+        // Only the run decoded from `payload` matches the marker computed from
+        // it; a run another load installed first is left as it is.
+        if ours && run.chunk_count() > 0 && text_digests.len() == run.chunk_count() {
+            seeds.push(RunSeed {
+                payload_digest: blake3::hash(&payload),
+                chunk_keys: text_digests
+                    .iter()
+                    .map(|digest| naming.chunk_key_for_text_digest(digest))
+                    .collect(),
+                run: Arc::clone(&run),
+            });
+        }
+        Ok(Some(run))
     }
 
     /// Makes a stored run resident, sharing equal allocations. File payloads
     /// alone cannot populate the chunk index: legacy floats may not match the
-    /// independently immutable chunk rows.
-    pub fn install(&self, key: FamilyKey, mut run: SemanticVectors) -> Arc<SemanticVectors> {
+    /// independently immutable chunk rows. Only a run a marker row vouches
+    /// for seeds it, through [`Self::seed_verified_runs`].
+    pub fn install(&self, key: FamilyKey, run: SemanticVectors) -> Arc<SemanticVectors> {
+        self.install_inner(key, run).0
+    }
+
+    /// Installs `run` unless one is already resident for `key`. Returns the
+    /// resident run and whether it is the one passed in.
+    fn install_inner(
+        &self,
+        key: FamilyKey,
+        mut run: SemanticVectors,
+    ) -> (Arc<SemanticVectors>, bool) {
         if let Some(resident) = self.get(&key) {
-            return resident;
+            return (resident, false);
         }
         lock(&self.vectors).share(&mut run);
-        Arc::clone(lock(&self.runs).entry(key).or_insert_with(|| Arc::new(run)))
+        let mut runs = lock(&self.runs);
+        if let Some(resident) = runs.get(&key) {
+            return (Arc::clone(resident), false);
+        }
+        let run = Arc::new(run);
+        runs.insert(key, Arc::clone(&run));
+        (run, true)
+    }
+
+    /// Indexes the chunk vectors of each loaded run whose marker row for the
+    /// store's current deletion epoch is present, so a later fill of the same
+    /// chunks reads no chunk rows. The epoch and the markers are read in one
+    /// read transaction, the markers in one key-ordered batch through the
+    /// payload-free membership index. A marker from an earlier epoch is never
+    /// probed: some row was deleted, or the counter rebuilt, since it was
+    /// written, so one of its chunk rows may since hold another process's
+    /// different floats. A store
+    /// without a valid epoch, or a failed read, indexes nothing.
+    ///
+    /// Seeding never evicts an entry: once the index holds
+    /// [`MAX_CHUNK_KEYS`] keys, the remaining vectors stay unindexed.
+    pub(crate) fn seed_verified_runs(
+        &self,
+        store: &FamilyStoreReader,
+        seeds: Vec<RunSeed>,
+        naming: &dyn ChunkNaming,
+    ) {
+        #[cfg(test)]
+        if !self.run_seeding.load(Ordering::Relaxed) {
+            return;
+        }
+        if seeds.is_empty() {
+            return;
+        }
+        let Ok(Some((epoch, present))) = store.contains_many_at_deletion_epoch(|epoch| {
+            seeds
+                .iter()
+                .map(|seed| naming.verified_run_marker(&seed.payload_digest, epoch))
+                .collect()
+        }) else {
+            return;
+        };
+        let mut pool = lock(&self.vectors);
+        let mut seeded = 0u64;
+        let vouched = seeds.iter().filter(|seed| {
+            present.contains(&naming.verified_run_marker(&seed.payload_digest, &epoch))
+        });
+        'runs: for seed in vouched {
+            for (vector, key) in seed.run.vectors().zip(&seed.chunk_keys) {
+                // Keep a live entry checked at this epoch: it names the same
+                // row's floats. Any other entry is replaced by this fresher one.
+                match pool.by_chunk.get(key) {
+                    Some(resident)
+                        if resident.vector.strong_count() > 0
+                            && resident.checked_at == Some(epoch) =>
+                    {
+                        continue;
+                    }
+                    Some(_) => {}
+                    None if pool.by_chunk.len() >= MAX_CHUNK_KEYS => break 'runs,
+                    None => {}
+                }
+                pool.by_chunk.insert(
+                    *key,
+                    ChunkEntry {
+                        vector: Arc::downgrade(vector),
+                        checked_at: Some(epoch),
+                    },
+                );
+                seeded += 1;
+            }
+        }
+        pool.prune_if_grown();
+        drop(pool);
+        self.seeded_chunks.fetch_add(seeded, Ordering::Relaxed);
     }
 
     /// Records a vector only after its exact chunk row was read or stored.
-    /// The caller keeps this allocation alive until the file run shares it.
-    pub(crate) fn remember_chunk(&self, key: FamilyKey, vector: Vec<f32>) -> Arc<[f32]> {
+    /// `checked_at` is the store's deletion epoch read before that read or
+    /// store. The entry can vouch for a run only while `checked_at` is still the
+    /// store's current epoch: then no row was deleted, so none was replaced,
+    /// after the read or store. The caller keeps
+    /// this allocation alive until the file run shares it.
+    pub(crate) fn remember_chunk(
+        &self,
+        key: FamilyKey,
+        vector: Vec<f32>,
+        checked_at: Option<DeletionEpoch>,
+    ) -> Arc<[f32]> {
         // Cap index entries separately: distinct chunk keys can share the same
         // vector allocation. Weak references never keep the floats alive.
-        const MAX_CHUNK_KEYS: usize = 65_536;
         let mut vector: Arc<[f32]> = vector.into();
         let mut pool = lock(&self.vectors);
         pool.share_vector(&mut vector);
@@ -274,12 +492,14 @@ impl SemanticArena {
                 pool.by_chunk.remove(&old);
             }
         }
-        pool.by_chunk.insert(key, Arc::downgrade(&vector));
-        if pool.by_digest.len() + pool.by_chunk.len()
-            > pool.live_after_prune.max(1024).saturating_mul(2)
-        {
-            pool.prune();
-        }
+        pool.by_chunk.insert(
+            key,
+            ChunkEntry {
+                vector: Arc::downgrade(&vector),
+                checked_at,
+            },
+        );
+        pool.prune_if_grown();
         vector
     }
 
@@ -350,7 +570,7 @@ impl SemanticArena {
         memory.bytes = memory.bytes.saturating_add(memory.vector_bytes);
         memory.bytes = memory.bytes.saturating_add(
             (lock(&self.vectors).by_chunk.capacity()
-                * std::mem::size_of::<(FamilyKey, Weak<[f32]>)>()) as u64,
+                * std::mem::size_of::<(FamilyKey, ChunkEntry)>()) as u64,
         );
         memory
     }
@@ -364,5 +584,25 @@ impl SemanticArena {
     /// Store rows read since the arena was created.
     pub fn store_reads(&self) -> u64 {
         self.store_reads.load(Ordering::Relaxed)
+    }
+
+    /// Chunk rows fills read because the chunk index missed, and their
+    /// payload bytes, since the arena was created.
+    pub fn chunk_row_reads(&self) -> (u64, u64) {
+        (
+            self.chunk_row_reads.load(Ordering::Relaxed),
+            self.chunk_row_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Chunk-index entries seeded from loaded runs a marker vouched for.
+    pub fn seeded_chunks(&self) -> u64 {
+        self.seeded_chunks.load(Ordering::Relaxed)
+    }
+
+    /// Entries in the chunk index, live or not yet pruned.
+    #[cfg(test)]
+    pub(crate) fn chunk_index_len(&self) -> usize {
+        lock(&self.vectors).by_chunk.len()
     }
 }

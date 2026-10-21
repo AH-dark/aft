@@ -155,16 +155,94 @@ impl SemanticProducer {
     }
 
     fn chunk_key(&self, text: &str) -> FamilyKey {
+        self.chunk_key_for_digest(&self.chunk_identity(), &blake3::hash(text.as_bytes()))
+    }
+
+    fn chunk_key_for_digest(&self, identity: &str, text_digest: &blake3::Hash) -> FamilyKey {
         let mut hash = blake3::Hasher::new();
         // A new cache format gets a new domain: immutable JSON rows must not
         // prevent compact vectors from being stored under otherwise equal inputs.
         hash.update(b"aft-semantic-chunk-vector-v2\0");
+        hash.update(&(identity.len() as u64).to_le_bytes());
+        hash.update(identity.as_bytes());
+        hash.update(text_digest.as_bytes());
+        FamilyKey::new(FamilyPlane::Semantic, *hash.finalize().as_bytes())
+    }
+}
+
+/// Domain of verified-run marker keys and the first bytes of every marker
+/// payload. File keys hash under `aft/blob-store/semantic/...` and chunk keys
+/// under `aft-semantic-chunk-vector-v2\0`. Neither domain is a prefix of this
+/// one, so a marker key can equal another row's key only through a BLAKE3
+/// collision. A marker payload starts with `a`, never the version byte (1)
+/// that file payloads and chunk vectors start with, so no decoder accepts it.
+/// `v2` keys include the store's deletion epoch; `v1` keys, which did not,
+/// are never computed and are left for GC.
+const VERIFIED_RUN_DOMAIN: &[u8] = b"aft-semantic-verified-run-v2\0";
+
+impl super::semantic_arena::ChunkNaming for SemanticProducer {
+    fn chunk_key_for_text_digest(&self, text_digest: &blake3::Hash) -> FamilyKey {
+        self.chunk_key_for_digest(&self.chunk_identity(), text_digest)
+    }
+
+    fn verified_run_marker(
+        &self,
+        payload_digest: &blake3::Hash,
+        epoch: &crate::blob_store::v2::DeletionEpoch,
+    ) -> FamilyKey {
+        let mut hash = blake3::Hasher::new();
+        hash.update(VERIFIED_RUN_DOMAIN);
         let identity = self.chunk_identity();
         hash.update(&(identity.len() as u64).to_le_bytes());
         hash.update(identity.as_bytes());
-        hash.update(blake3::hash(text.as_bytes()).as_bytes());
+        hash.update(payload_digest.as_bytes());
+        hash.update(&epoch.to_bytes());
         FamilyKey::new(FamilyPlane::Semantic, *hash.finalize().as_bytes())
     }
+}
+
+/// The payload stored under a verified-run marker: the domain, the digest of
+/// the run payload it vouches for, and the deletion epoch it was checked at.
+/// Only the marker's presence is read; the rest makes a marker row
+/// self-describing.
+fn verified_run_marker_payload(
+    payload_digest: &blake3::Hash,
+    epoch: &crate::blob_store::v2::DeletionEpoch,
+) -> Vec<u8> {
+    let mut payload = VERIFIED_RUN_DOMAIN.to_vec();
+    payload.extend_from_slice(payload_digest.as_bytes());
+    payload.extend_from_slice(&epoch.to_bytes());
+    payload
+}
+
+/// Whether every vector of `run` is bit-equal to the chunk row of its text
+/// as that row stands at deletion epoch `epoch`, judged from the arena's
+/// chunk index. The index holds vectors read from, or stored as, their exact
+/// chunk row, and vectors of loaded runs whose marker says they matched
+/// those rows, each with the epoch it was checked at. Only entries checked
+/// at `epoch` count: an older check may predate a delete and re-put of the
+/// row. `run` must still hold its embedded texts. An empty run vouches for
+/// nothing.
+fn run_matches_chunk_rows(
+    run: &crate::semantic_index::SemanticVectors,
+    producer: &SemanticProducer,
+    arena: &super::semantic_arena::SemanticArena,
+    epoch: &crate::blob_store::v2::DeletionEpoch,
+) -> bool {
+    let identity = producer.chunk_identity();
+    let mut entries = run.embedded_texts_and_vectors().peekable();
+    entries.peek().is_some()
+        && entries.all(|(text, vector)| {
+            let key = producer.chunk_key_for_digest(&identity, &blake3::hash(text.as_bytes()));
+            arena.verified_chunk(&key).is_some_and(|(row, checked_at)| {
+                checked_at.as_ref() == Some(epoch)
+                    && row.len() == vector.len()
+                    && row
+                        .iter()
+                        .zip(vector.iter())
+                        .all(|(row, vector)| row.to_bits() == vector.to_bits())
+            })
+        })
 }
 
 const CHUNK_VECTOR_FORMAT: u8 = 1;
@@ -220,6 +298,7 @@ fn decode_chunk_vector(payload: &[u8], identity: &str, text: &str) -> Option<Vec
 
 fn load_chunk(
     store: &FamilyStore,
+    arena: &super::semantic_arena::SemanticArena,
     key: &FamilyKey,
     identity: &str,
     text: &str,
@@ -227,6 +306,7 @@ fn load_chunk(
     let Some(payload) = store.get(key)? else {
         return Ok(None);
     };
+    arena.note_chunk_row_read(payload.len());
     Ok(decode_chunk_vector(&payload, identity, text))
 }
 
@@ -537,6 +617,8 @@ impl SemanticPlane {
         if compatible {
             let arena = self.arena(access.family());
             let store = Self::store_reader(access)?;
+            // Markers of every run loaded here are probed together afterwards.
+            let mut seeds = Vec::new();
             for (path, entry) in manifest.entries() {
                 let (Some(content), Some(state)) =
                     (entry.content(), entry.plane_state(FamilyPlane::Semantic))
@@ -551,11 +633,13 @@ impl SemanticPlane {
                             self.overlay_path(path),
                         ) {
                             (Some(bytes), Some(store), Some(relative)) => arena
-                                .load(
+                                .load_deferring_seed(
                                     store,
                                     &FamilyKey::new(FamilyPlane::Semantic, bytes),
                                     &relative,
                                     &self.producer.payload(),
+                                    &self.producer,
+                                    &mut seeds,
                                 )
                                 .map_err(plane_error)?,
                             _ => None,
@@ -572,6 +656,9 @@ impl SemanticPlane {
                     }
                     _ => {}
                 }
+            }
+            if let Some(store) = store.as_ref() {
+                arena.seed_verified_runs(store, seeds, &self.producer);
             }
         }
         Ok(Resident {
@@ -795,7 +882,13 @@ impl SemanticPlane {
                 report.resident_hits += 1;
                 ready.push((item.clone(), key));
             } else if arena
-                .load(&store.reader(), &key, relative, &payload_producer)
+                .load(
+                    &store.reader(),
+                    &key,
+                    relative,
+                    &payload_producer,
+                    &self.producer,
+                )
                 .map_err(plane_error)?
                 .is_some()
             {
@@ -813,7 +906,13 @@ impl SemanticPlane {
                     report.resident_hits += 1;
                     ready.push((item.clone(), key));
                 } else if arena
-                    .load(&store.reader(), &key, relative, &payload_producer)
+                    .load(
+                        &store.reader(),
+                        &key,
+                        relative,
+                        &payload_producer,
+                        &self.producer,
+                    )
                     .map_err(plane_error)?
                     .is_some()
                 {
@@ -918,6 +1017,30 @@ impl SemanticPlane {
                         match store.put_or_touch(&key, &payload) {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => {
                                 succeeded.push(full_key);
+                                // The stored row now holds exactly `payload`.
+                                // Vouch for it only after checking every vector
+                                // against its chunk row at the deletion epoch
+                                // read in the marker's own write transaction,
+                                // so no row can be deleted in between and a
+                                // later load can index those vectors without
+                                // reading the rows. The marker is disposable:
+                                // losing it, or failing to write it, only
+                                // costs those reads.
+                                let digest = blake3::hash(&payload);
+                                if let Err(error) = store.put_at_deletion_epoch(|epoch| {
+                                    use super::semantic_arena::ChunkNaming;
+                                    run_matches_chunk_rows(&run, &self.producer, &arena, epoch)
+                                        .then(|| {
+                                            (
+                                                self.producer.verified_run_marker(&digest, epoch),
+                                                verified_run_marker_payload(&digest, epoch),
+                                            )
+                                        })
+                                }) {
+                                    log::debug!(
+                                        "semantic verified-run marker for {key} not stored: {error}"
+                                    );
+                                }
                                 run.strip_embed_text();
                                 arena.install(key, run);
                                 report.embedded_keys += 1;
@@ -934,7 +1057,13 @@ impl SemanticPlane {
                                     hook();
                                 }
                                 if arena
-                                    .load(&store.reader(), &key, &relative, &payload_producer)
+                                    .load(
+                                        &store.reader(),
+                                        &key,
+                                        &relative,
+                                        &payload_producer,
+                                        &self.producer,
+                                    )
                                     .map_err(plane_error)?
                                     .is_some()
                                 {
@@ -1006,7 +1135,13 @@ impl SemanticPlane {
             let lookup_started = Instant::now();
             if arena.get(&key).is_some()
                 || arena
-                    .load(&store.reader(), &key, &relative, &payload_producer)
+                    .load(
+                        &store.reader(),
+                        &key,
+                        &relative,
+                        &payload_producer,
+                        &self.producer,
+                    )
                     .map_err(plane_error)?
                     .is_some()
             {
@@ -1076,11 +1211,16 @@ impl SemanticPlane {
             .collect::<Vec<_>>();
         report.timing.vector_lookup += key_started.elapsed();
         let mut admitted = false;
-        let (_gate, mut rows, misses) = loop {
+        let (_gate, mut rows, misses, checked_at) = loop {
             let wait_started = Instant::now();
             let gate = arena.chunk_batch();
             report.timing.chunk_wait += wait_started.elapsed();
             let lookup_started = Instant::now();
+            // Read before any chunk row below is read or stored: a vector
+            // remembered in this batch equals its row at least at this epoch.
+            // Without an epoch the vectors are still reused, but never vouch
+            // for a run.
+            let checked_at = store.deletion_epoch().ok().flatten();
             let mut rows = Vec::with_capacity(texts.len());
             let mut misses = Vec::new();
             for (text, key) in texts.iter().zip(&keys) {
@@ -1090,9 +1230,9 @@ impl SemanticPlane {
                 }
                 let vector = match resident {
                     Some(vector) => Some(vector),
-                    None => load_chunk(store, key, &identity, text)
+                    None => load_chunk(store, arena, key, &identity, text)
                         .map_err(|error| chunk_store_error(error, report))?
-                        .map(|vector| arena.remember_chunk(*key, vector)),
+                        .map(|vector| arena.remember_chunk(*key, vector, checked_at)),
                 };
                 if let Some(vector) = vector {
                     rows.push(Some(BuildEmbeddingRow::Embedded {
@@ -1116,7 +1256,7 @@ impl SemanticPlane {
                 continue;
             }
             report.chunk_reused += texts.len() - misses.len();
-            break (gate, rows, misses);
+            break (gate, rows, misses, checked_at);
         };
         if !misses.is_empty() {
             report.model_calls += 1;
@@ -1144,7 +1284,7 @@ impl SemanticPlane {
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
                                 // A different process may have won. Only adopt
                                 // its floats after the same exact-text check.
-                                if let Some(stored) = load_chunk(store, key, &identity, text)
+                                if let Some(stored) = load_chunk(store, arena, key, &identity, text)
                                     .map_err(|error| chunk_store_error(error, report))?
                                 {
                                     *vector = stored;
@@ -1156,7 +1296,11 @@ impl SemanticPlane {
                             Err(error) => return Err(chunk_store_error(error, report)),
                         };
                         if cacheable {
-                            canonical_chunks.push(arena.remember_chunk(*key, vector.clone()));
+                            canonical_chunks.push(arena.remember_chunk(
+                                *key,
+                                vector.clone(),
+                                checked_at,
+                            ));
                         }
                         report.timing.store_write += store_started.elapsed();
                     }
@@ -2431,7 +2575,9 @@ mod tests {
             "stored chunk payload uses {} bytes; compact bound is {bound}",
             payload.len()
         );
-        let reused = load_chunk(&store, &key, &identity, text).unwrap().unwrap();
+        let reused = load_chunk(&store, &plane.arena("family"), &key, &identity, text)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             reused
                 .iter()

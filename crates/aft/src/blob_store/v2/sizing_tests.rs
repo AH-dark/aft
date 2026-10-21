@@ -207,3 +207,90 @@ fn disk_limit_pass_large_store_probe() {
         assert_eq!(overflow_reads, 0, "under-budget pass read overflow pages");
     }
 }
+
+/// A disk-limit family sweep that deletes 28,000 rows from a 2.7 GB store,
+/// once with the deletion counter's trigger removed (as before the counter
+/// existed) and once with it. Write-ahead-log frames are counted with
+/// automatic checkpoints off, so they are every page the pass wrote.
+#[test]
+#[ignore = "creates two 2.7 GB stores, one after the other, for deletion-trigger profiling"]
+fn disk_limit_pass_deleting_28000_rows_probe() {
+    use crate::gc::family::{sweep_family_remeasured, FamilySweepPolicy, SweepBounds};
+    use crate::views::registry::FamilyRegistry;
+
+    const ROWS: usize = 84_000;
+    const PAYLOAD: usize = 32 * 1024;
+    const DELETED: usize = 28_000;
+    for counted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(dir.path(), "sizing").unwrap();
+        let store = populate(dir.path(), ROWS, PAYLOAD);
+        // The family sweep deletes only rows last touched before the epoch it
+        // raises the store to; reset every row's epoch so any row qualifies.
+        lock(&store.inner.connection)
+            .execute_batch(
+                "UPDATE blob_payloads SET ref_epoch = 0; UPDATE store_meta SET gc_epoch = 0;",
+            )
+            .unwrap();
+        if !counted {
+            lock(&store.inner.connection)
+                .execute_batch("DROP TRIGGER payload_deletions_count")
+                .unwrap();
+        }
+        let total = store.usage().unwrap().payload_bytes;
+        let oldest = store.rows_oldest(DELETED).unwrap();
+        let budget = total - oldest.iter().map(|row| row.payload_bytes).sum::<u64>();
+        let before = store.deletion_epoch().unwrap();
+        let wal_path = {
+            let mut name = store.path().as_os_str().to_owned();
+            name.push("-wal");
+            PathBuf::from(name)
+        };
+        {
+            let connection = lock(&store.inner.connection);
+            connection
+                .execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let page_size: u64 = lock(&store.inner.connection)
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let wal_before = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        let probe = ReadProbe::install(&lock(&store.inner.connection));
+        let started = std::time::Instant::now();
+        let report = sweep_family_remeasured(
+            &registry,
+            None,
+            FamilySweepPolicy {
+                byte_budget: budget,
+            },
+            SweepBounds::default(),
+            None,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let (reads, overflow_reads) = probe.counts();
+        drop(probe);
+        let wal_after = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        let after = store.deletion_epoch().unwrap();
+        let file_bytes = std::fs::metadata(store.path()).unwrap().len();
+        eprintln!(
+            "DELETION_TRIGGER_PROBE counted={counted} store_file_bytes={file_bytes} payload_bytes={total} deleted_blobs={} deleted_bytes={} elapsed_ms={:.1} main_reads={reads} overflow_reads={overflow_reads} wal_bytes_written={} wal_frames={} epoch_before={before:?} epoch_after={after:?}",
+            report.deleted_blobs,
+            report.deleted_bytes,
+            elapsed.as_secs_f64() * 1000.0,
+            wal_after.saturating_sub(wal_before),
+            wal_after.saturating_sub(wal_before.max(32)) / (page_size + 24),
+        );
+        assert_eq!(report.deleted_blobs, DELETED);
+        if counted {
+            let count = |epoch: DeletionEpoch| {
+                u64::from_le_bytes(epoch.to_bytes()[16..].try_into().unwrap())
+            };
+            assert_eq!(
+                count(after.unwrap()) - count(before.unwrap()),
+                DELETED as u64
+            );
+        }
+    }
+}

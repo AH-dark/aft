@@ -8,6 +8,10 @@ use crate::semantic_index::{
 };
 use std::sync::atomic::AtomicUsize;
 
+/// Store rows a filled one-chunk file leaves: its file run, its chunk-vector
+/// row, and the marker row saying the run's vector matches that chunk row.
+const ROWS_PER_ONE_CHUNK_FILE: u64 = 3;
+
 #[test]
 fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
     use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
@@ -809,8 +813,9 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     );
     assert_eq!(model.calls(), 1);
     assert_eq!(report.embedded_keys, 0);
-    // One canonical file run and one reusable chunk vector.
-    assert_eq!(usage.rows, 2);
+    // One canonical file run, one reusable chunk vector, and the marker row
+    // that vouches for the run's vectors matching that chunk row.
+    assert_eq!(usage.rows, ROWS_PER_ONE_CHUNK_FILE);
     assert_eq!(
         a.installed()
             .generation()
@@ -875,7 +880,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
         (1, 1),
         "a later batch error must not discard an already complete file run"
     );
-    assert_eq!(store.usage().unwrap().rows, 2);
+    assert_eq!(store.usage().unwrap().rows, ROWS_PER_ONE_CHUNK_FILE);
     runtime
         .refresh(budget, &mut |texts| model.embed(texts))
         .unwrap();
@@ -885,7 +890,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
         "retry must not re-embed the completed first file"
     );
     assert_eq!(model.calls(), 4);
-    assert_eq!(store.usage().unwrap().rows, 6);
+    assert_eq!(store.usage().unwrap().rows, 3 * ROWS_PER_ONE_CHUNK_FILE);
     let answer = query(&runtime, "chunk");
     assert!(answer.complete());
     assert_eq!(
@@ -921,11 +926,12 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
     let successful_texts = std::cell::Cell::new(0usize);
     let mut failed_texts = 0usize;
     let mut embed = |texts: Vec<String>| {
-        // One chunk per file produces a file row and a chunk-vector row. Each
-        // completed request must persist both before another request is sent.
+        // One chunk per file produces a file row, a chunk-vector row and a
+        // verified-run marker row. Each completed request must persist them
+        // before another request is sent.
         assert_eq!(
             store.usage().unwrap().rows as usize,
-            successful_texts.get() * 2,
+            successful_texts.get() * ROWS_PER_ONE_CHUNK_FILE as usize,
             "completed batches were not persisted before the next request"
         );
         for text in &texts {
@@ -1003,7 +1009,7 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
     drop(embed);
     assert_eq!(successful_texts.get(), 2056);
     assert_eq!(new_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056 * 2);
+    assert_eq!(store.usage().unwrap().rows, 2056 * ROWS_PER_ONE_CHUNK_FILE);
     assert_eq!(failed_texts, 321);
     assert_eq!(model.texts(), 2377);
     assert_eq!(model.calls(), 46);
@@ -1099,7 +1105,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
     assert_eq!(model.texts(), 2056);
     assert_eq!(model.calls(), 40);
     assert_eq!(embedded_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056 * 2);
+    assert_eq!(store.usage().unwrap().rows, 2056 * ROWS_PER_ONE_CHUNK_FILE);
 
     // A source completion rejected at admission still stores its immutable
     // payload first. Retry and a sibling must reuse it, not re-embed it.
@@ -1152,7 +1158,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
     assert_eq!(model.texts(), before);
     assert_eq!(model.texts(), 2057);
     assert_eq!(model.calls(), 41);
-    assert_eq!(store.usage().unwrap().rows, 2057 * 2);
+    assert_eq!(store.usage().unwrap().rows, 2057 * ROWS_PER_ONE_CHUNK_FILE);
     for (runtime, root) in runtimes.iter().zip(&roots) {
         let answer = query(runtime, "revised item");
         assert!(answer.complete());

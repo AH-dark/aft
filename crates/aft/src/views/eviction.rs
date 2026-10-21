@@ -3454,11 +3454,13 @@ mod tests {
     /// Linux on main before the disk-limit sweep measured the family's files
     /// to skip deletion. The collect-all pass's file bytes later grew by one
     /// 4 KiB page, the payload totals table that pass sets up in the trigram
+    /// store. Every family file size then grew by one more 4 KiB page, the
+    /// deletion counter table a writer sets up when it first opens a family
     /// store. File
     /// sizes depend on the platform's SQLite page and write-ahead-log
     /// behaviour, so other platforms only run the fixture.
     const GOLDEN_VALUES: &[&str] = &[
-        "measure family_store file_bytes=482989 complete=true view_store_bytes=124704 \
+        "measure family_store file_bytes=487085 complete=true view_store_bytes=124704 \
          held_view_bytes=0 complete=true",
         "payload_total=98874",
         "KeyAccounting { referenced_bytes: 159686, shared_bytes: 0, exclusive_bytes: \
@@ -3466,24 +3468,24 @@ mod tests {
         "recorded view_usage scope=a bytes=41568 held=false",
         "recorded view_usage scope=b bytes=41568 held=false",
         "recorded view_usage scope=c bytes=41568 held=false",
-        "recorded family_usage file_bytes=482989",
+        "recorded family_usage file_bytes=487085",
         "recorded usage_record complete=true",
         "admission default admitted",
         "below-limit evicted=[] sweep_byte_budget=Some(2147483648) deleted_blobs=Some(0) \
          deleted_bytes=Some(0) deleted_segments=Some(0) sweep_error=None \
-         before_file_bytes=499469 after_file_bytes=528309 after_complete=true over_hard=[] \
+         before_file_bytes=503565 after_file_bytes=532405 after_complete=true over_hard=[] \
          stopped_early=false",
         "recorded view_usage scope=a bytes=41568 held=false",
         "recorded view_usage scope=b bytes=41568 held=false",
         "recorded view_usage scope=c bytes=41568 held=false",
-        "recorded family_usage file_bytes=528309",
+        "recorded family_usage file_bytes=532405",
         "recorded usage_record complete=true",
         "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
          deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
-         sweep_error=None before_file_bytes=544789 after_file_bytes=518577 \
+         sweep_error=None before_file_bytes=548885 after_file_bytes=522673 \
          after_complete=true over_hard=[] stopped_early=false",
         "recorded view_usage scope=a bytes=41568 held=false",
-        "recorded family_usage file_bytes=518577",
+        "recorded family_usage file_bytes=522673",
         "recorded usage_record complete=true",
         "KeyAccounting { referenced_bytes: 53014, shared_bytes: 0, exclusive_bytes: \
          {\"a\": 53014}, unreferenced_bytes: 0, complete: true }",
@@ -3502,10 +3504,10 @@ mod tests {
             15,
             "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
              deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
-             sweep_error=None before_file_bytes=544789 after_file_bytes=514457 \
+             sweep_error=None before_file_bytes=548885 after_file_bytes=518553 \
              after_complete=true over_hard=[] stopped_early=false",
         ),
-        (17, "recorded family_usage file_bytes=514457"),
+        (17, "recorded family_usage file_bytes=518553"),
     ];
 
     #[test]
