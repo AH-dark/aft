@@ -5926,6 +5926,69 @@ fn scoped_diagnostics_outside_project_root_excluded_by_tsconfig_is_named_gap() {
     );
 }
 
+#[test]
+fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, excluded) = external_typescript_fixture();
+    write_file(
+        &external_root,
+        "tsconfig.json",
+        "{\"include\":[\"included.ts\"]}\n",
+    );
+    let included = write_file(&external_root, "included.ts", "export const ok = 1;\n");
+    let log = root.join("typescript-sync-requests.jsonl");
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "categories");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC_LOG", log.to_str().unwrap());
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-excluded", excluded.to_str().unwrap());
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(response["scope_files"], 1, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
+        "{response:#}"
+    );
+    assert!(
+        diagnostic_messages_for(&response, &diagnostic_path(&excluded)).is_empty(),
+        "{response:#}"
+    );
+    assert!(
+        response["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["file"] == diagnostic_path(&excluded)
+                && gap["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("tsconfig"))),
+        "{response:#}"
+    );
+    assert!(
+        !log.exists(),
+        "an excluded file must not trigger synchronous requests"
+    );
+
+    // An included file exercises the same logger and successful server replies,
+    // so an empty excluded-file log cannot pass because logging was disconnected.
+    let included_response =
+        scoped_diagnostics_inspect(&ctx, "ts-sync-included", included.to_str().unwrap());
+    assert_eq!(
+        included_response["summary"]["diagnostics"]["errors"], 1,
+        "{included_response:#}"
+    );
+    let requests = fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .all(|request| request["arguments"][1]["file"] == file_uri(&included)));
+}
+
 /// The reporter's scenario: the server reported on file Y only, so a scoped
 /// call for file X must return `complete: false` naming X — never an
 /// empty-clean result. The second half is the mutation control: forcing the

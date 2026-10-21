@@ -22,6 +22,7 @@ use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::PullFileOutcome;
 use crate::lsp::registry::{servers_for_file, ServerKind};
 use crate::lsp::roots::ServerKey;
+use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 use crate::lsp::typescript_diagnostics::CertificationFailure;
 
 /// The maximum number of scoped files one inspect opens for analysis. Opening a document
@@ -166,10 +167,15 @@ pub(crate) fn sweep_scoped_files(
 
     // The cap applies to the file iterator: files past it are only counted
     // and attributed, never opened.
+    let mut tsconfig_membership = TsconfigMembershipCache::new();
     let mut eligible = candidates.iter().filter_map(|file| {
         let keys = producer_keys_for_file(file, config, project_root)
             .into_iter()
-            .filter(|key| producers.contains(key))
+            .filter(|key| {
+                producers.contains(key)
+                    && (key.kind != ServerKind::TypeScript
+                        || !tsconfig_membership.should_skip_diagnostics(file))
+            })
             .collect::<Vec<_>>();
         (!keys.is_empty()).then(|| (file.clone(), keys))
     });

@@ -663,6 +663,9 @@ fn collect_warm_working_set(
 
     if let Some(sweep) = sweep {
         for (file, (server, result)) in &sweep.typescript_reports {
+            if !accepts_file(file) || tsconfig_membership.should_skip_diagnostics(file) {
+                continue;
+            }
             if let Ok(diagnostics) = result {
                 let rows = diagnostics
                     .iter()
@@ -974,7 +977,16 @@ impl DiagnosticsCollection {
             if self.saved_files.contains(file) {
                 continue;
             }
-            if let Some((key, result)) = sweep.and_then(|sweep| sweep.typescript_reports.get(file))
+            let coverage = if !file.starts_with(&snapshot.project_root)
+                && tsconfig_membership.should_skip_diagnostics(file)
+            {
+                ScopedFileCoverage::ExcludedByTsconfig
+            } else {
+                scoped_file_coverage(ctx, &snapshot.config, file)
+            };
+            if let Some((key, result)) = sweep
+                .filter(|_| !matches!(coverage, ScopedFileCoverage::ExcludedByTsconfig))
+                .and_then(|sweep| sweep.typescript_reports.get(file))
             {
                 if let Err(failure) = result {
                     self.scope_coverage_gaps.push(ScopedCoverageGap {
@@ -989,13 +1001,6 @@ impl DiagnosticsCollection {
                 // its last push was empty, partial, or has not arrived yet.
                 continue;
             }
-            let coverage = if !file.starts_with(&snapshot.project_root)
-                && tsconfig_membership.should_skip_diagnostics(file)
-            {
-                ScopedFileCoverage::ExcludedByTsconfig
-            } else {
-                scoped_file_coverage(ctx, &snapshot.config, file)
-            };
             // A report published while `cargo check` was still running lacks
             // the compiler's errors, so it cannot certify the file.
             let checking = sweep.and_then(|sweep| {
@@ -1689,6 +1694,99 @@ mod payload_count_tests {
         let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None, None);
         assert!(unscoped.diagnostics.is_empty());
         assert!(unscoped.producer_reports.is_empty());
+    }
+
+    fn typescript_sync_exclusion_fixture() -> (
+        tempfile::TempDir,
+        crate::context::AppContext,
+        InspectSnapshot,
+        PathBuf,
+        PathBuf,
+        crate::inspect::scoped_diagnostics_sweep::ScopedSweep,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let configured = root.join("configured");
+        let external = root.join("external");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            external.join("tsconfig.json"),
+            r#"{"include":["included.ts"]}"#,
+        )
+        .unwrap();
+        let included = external.join("included.ts");
+        let excluded = external.join("excluded.ts");
+        let mut sweep = crate::inspect::scoped_diagnostics_sweep::ScopedSweep::default();
+        for file in [&included, &excluded] {
+            std::fs::write(file, "export const broken: number = \"wrong\";\n").unwrap();
+            let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
+            diagnostic.file = file.clone();
+            sweep.typescript_reports.insert(
+                file.clone(),
+                (
+                    ServerKey {
+                        kind: ServerKind::TypeScript,
+                        root: external.clone(),
+                    },
+                    Ok(vec![diagnostic]),
+                ),
+            );
+        }
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let snapshot = InspectSnapshot::new(
+            configured.clone(),
+            configured.join(".aft"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        (temp, ctx, snapshot, included, excluded, sweep)
+    }
+
+    #[test]
+    fn typescript_sync_excluded_external_report_keeps_exclusion_gap() {
+        let (_temp, ctx, snapshot, included, excluded, mut sweep) =
+            typescript_sync_exclusion_fixture();
+        sweep.typescript_reports.remove(&included);
+        let files = [excluded.clone()];
+        let mut collected =
+            super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
+        collected.record_scope_coverage_gaps(&ctx, &snapshot, &files, Some(&sweep));
+        assert_eq!(collected.scope_coverage_gaps.len(), 1);
+        assert_eq!(collected.scope_coverage_gaps[0].file, excluded);
+        assert_eq!(
+            collected.scope_coverage_gaps[0].reason,
+            "the file is excluded from diagnostics by its tsconfig"
+        );
+        assert!(collected.diagnostics.is_empty());
+        assert!(collected.producer_reports.is_empty());
+    }
+
+    #[test]
+    fn typescript_sync_membership_keeps_producer_counts_equal_to_diagnostic_totals() {
+        let (_temp, ctx, snapshot, included, excluded, sweep) = typescript_sync_exclusion_fixture();
+        let files = [included, excluded];
+        let collected =
+            super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
+        assert_eq!(collected.diagnostics.len(), 1);
+        assert_eq!(
+            collected
+                .producer_reports
+                .iter()
+                .map(|(_, _, rows)| rows.len())
+                .sum::<usize>(),
+            collected.diagnostics.len()
+        );
+        let payload = collected.into_payload(&snapshot);
+        assert_eq!(payload["errors"], 1, "{payload:#}");
+        assert_eq!(
+            payload["by_producer"]["typescript"]["errors"], payload["errors"],
+            "{payload:#}"
+        );
+        assert_eq!(payload["items"].as_array().unwrap().len(), 1, "{payload:#}");
     }
 
     #[test]

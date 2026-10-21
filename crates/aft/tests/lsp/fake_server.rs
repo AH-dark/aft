@@ -896,6 +896,10 @@ pub(crate) fn main() -> io::Result<()> {
                 }
                 "workspace/executeCommand" => {
                     let params = params.as_ref().unwrap();
+                    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_TYPESCRIPT_SYNC_LOG") {
+                        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                        writeln!(log, "{params}")?;
+                    }
                     let args = &params["arguments"];
                     let command = args[0].as_str().unwrap_or_default();
                     let mode = std::env::var("AFT_FAKE_LSP_TYPESCRIPT_SYNC").unwrap_or_default();
