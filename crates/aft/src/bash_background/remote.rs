@@ -1662,17 +1662,16 @@ impl BgTaskRegistry {
                         (std::ffi::OsStr::new(key), std::ffi::OsStr::new(value))
                     }),
                 ));
+            let limit = hard_kill.limit();
+            let timeout_seconds = limit
+                .as_secs()
+                .saturating_add(u64::from(limit.subsec_nanos() > 0));
             build_remote_request(
                 request_root,
                 &workdir,
                 command,
                 environment,
-                Some(
-                    hard_kill
-                        .limit()
-                        .as_secs()
-                        .saturating_add(u64::from(hard_kill.limit().subsec_nanos() > 0)),
-                ),
+                timeout_seconds,
                 &exec::PresetParams {
                     platform: launch.requested_platform,
                     siblings: launch.params.siblings,
@@ -2621,12 +2620,14 @@ impl BgTaskRegistry {
 }
 
 #[cfg(unix)]
+/// Every runon job gets AFT's hard-kill limit, rounded up to seconds so the
+/// runner does not stop earlier than a caller's millisecond timeout.
 fn build_remote_request(
     session_root: &Path,
     cwd: &Path,
     command: &str,
     environment: BTreeMap<String, String>,
-    timeout: Option<u64>,
+    timeout_seconds: u64,
     preset: &exec::PresetParams,
 ) -> Result<RunRequest, exec::Error> {
     let session_root = session_root
@@ -2655,7 +2656,7 @@ fn build_remote_request(
         cwd,
         command,
         environment,
-        timeout,
+        Some(timeout_seconds),
         preset,
     )
 }
