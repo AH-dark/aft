@@ -2,7 +2,7 @@
   "native": {
     "id": "confine-vector",
     "success": true,
-    "text": "open/kept.rs\n1: fn pinned_token() {}\n\nonly.rs\n1: fn pinned_token() {}\n\nFound 2 match across 2 file [index: fallback; searched all 3 files directly]\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)",
+    "text": "open/kept.rs\n1: fn pinned_token() {}\n\nonly.rs\n1: fn pinned_token() {}\n\nFound 2 matches across 2 files [index: fallback; searched all 3 files directly]\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)",
     "complete": true,
     "no_files_matched_scope": false,
     "skipped_foreign_mounts": 0,
@@ -46,5 +46,5 @@
     "fallback": "filesystem",
     "skipped_denied": 2
   },
-  "text": "open/kept.rs\n1: fn pinned_token() {}\n\nonly.rs\n1: fn pinned_token() {}\n\nFound 2 match across 2 file [index: fallback; searched all 3 files directly]\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)"
+  "text": "open/kept.rs\n1: fn pinned_token() {}\n\nonly.rs\n1: fn pinned_token() {}\n\nFound 2 matches across 2 files [index: fallback; searched all 3 files directly]\n\n(2 path(s) under the walked directory are denied by the read policy and were skipped.)"
 }

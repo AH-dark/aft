@@ -186,7 +186,7 @@ fn grep_matches_the_shared_fixtures() {
         // match whatever the index state.
         assert!(text.contains("needle"), "grep/{name} text: {text}");
         assert!(
-            text.contains("Found 1 match across 1 file"),
+            text.contains("Found 1 match in 1 file"),
             "grep/{name} text: {text}"
         );
     }

@@ -466,6 +466,8 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
     }
 }
 
+/// The footer of `format_grep_text`, which aft_search still prints. The grep
+/// tool itself prints `grep_tool_footer`, with real plurals.
 fn grep_footer(result: &GrepResult) -> String {
     // Wholesale-singular ("40 match across 4 file") — the `(es)`/`(s)` plural
     // parentheticals were pure per-call token tax for zero agent value. The
@@ -499,18 +501,28 @@ fn grep_footer(result: &GrepResult) -> String {
 /// match anywhere" or "the walk never got there", and the reader cannot tell
 /// which without re-checking.
 fn grep_tool_footer(result: &GrepResult) -> String {
-    if result.index_status == IndexStatus::Ready {
-        return grep_footer(result);
-    }
+    let found = found_matches_phrase(result.total_matches, result.files_with_matches);
     let cap_note = if result.truncated { " (capped)" } else { "" };
+    if result.index_status == IndexStatus::Ready {
+        return format!("{found}{cap_note}");
+    }
     format!(
-        "Found {} match across {} file{} [index: {}; {}]",
-        result.total_matches,
-        result.files_with_matches,
-        cap_note,
+        "{found}{cap_note} [index: {}; {}]",
         index_status_label(result.index_status),
         direct_read_coverage(result)
     )
+}
+
+/// `Found 1 match in 1 file`, `Found 2 matches in 1 file`, `Found 3 matches
+/// across 2 files`: the grep tool's count sentence, in plain English.
+pub(crate) fn found_matches_phrase(matches: usize, files: usize) -> String {
+    let matches = if matches == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{matches} matches")
+    };
+    let preposition = if files <= 1 { "in" } else { "across" };
+    format!("Found {matches} {preposition} {}", plural(files, "file"))
 }
 
 /// How much of the scope a direct (non-index) read covered, for the footer.
@@ -518,7 +530,8 @@ fn direct_read_coverage(result: &GrepResult) -> String {
     let files = result.files_read_directly;
     if let Some(bound) = result.walk_bound {
         return format!(
-            "incomplete: checked {files} files before {}",
+            "incomplete: checked {} before {}",
+            plural(files, "file"),
             walk_bound_phrase(bound)
         );
     }
@@ -532,7 +545,13 @@ fn direct_read_coverage(result: &GrepResult) -> String {
         // The search stopped collecting once it had enough matches, so some
         // files were never read; the "(capped)" count already says the total
         // is a floor.
-        return format!("stopped at the match limit after searching {files} files directly");
+        return format!(
+            "stopped at the match limit after searching {} directly",
+            plural(files, "file")
+        );
+    }
+    if files == 1 {
+        return "searched 1 file directly".to_string();
     }
     format!("searched all {files} files directly")
 }
@@ -567,10 +586,12 @@ pub(crate) fn walk_coverage_note(result: &GrepResult) -> Option<String> {
             "checked {files} of more than {limit} files ({index}); the fallback walk stops at {limit} files, so files past that limit were not searched and matches may be missing."
         ),
         WalkBound::TimeBudget => format!(
-            "checked {files} files ({index}); the fallback walk ran out of its time budget before reaching every file, so files it did not reach were not searched and matches may be missing."
+            "checked {} ({index}); the fallback walk ran out of its time budget before reaching every file, so files it did not reach were not searched and matches may be missing.",
+            plural(files, "file")
         ),
         WalkBound::Cancelled => format!(
-            "checked {files} files ({index}); the request was cancelled before the fallback walk reached every file, so matches may be missing."
+            "checked {} ({index}); the request was cancelled before the fallback walk reached every file, so matches may be missing.",
+            plural(files, "file")
         ),
     };
     Some(format!("({checked} {exhaustive})"))
@@ -968,9 +989,10 @@ fn page_rows_text(
 fn files_first_summary(shown: &[usize], files: &[MatchingFile<'_>], rendered: usize) -> String {
     let total_rows: usize = shown.iter().map(|&index| files[index].matches.len()).sum();
     let mut summary = format!(
-        "{} in {} match; the first page shows {rendered}. Lines per file:",
+        "{} in {} {}; the first page shows {rendered}. Lines per file:",
         plural(total_rows, "line"),
         plural(shown.len(), "file"),
+        if total_rows == 1 { "matches" } else { "match" },
     );
     let mut ranked: Vec<usize> = shown.to_vec();
     // Stable: files with equal counts keep result order.
@@ -1145,7 +1167,9 @@ fn counted_entries(counted: &[usize], files: &[MatchingFile<'_>]) -> Vec<String>
         }
     }
     for ((content, marker), lines, count) in folded {
-        let what = if count == 1 {
+        let what = if count == 1 && content == ContentKind::Lockfile {
+            content.label().to_string()
+        } else if count == 1 {
             format!("{} file", content.label())
         } else {
             content.plural().to_string()
@@ -1572,6 +1596,68 @@ mod tests {
             );
             assert!(!text.contains("continue with offset="), "{text}");
         }
+    }
+
+    #[test]
+    fn count_phrases_use_singular_and_plural_forms() {
+        assert_eq!(found_matches_phrase(1, 1), "Found 1 match in 1 file");
+        assert_eq!(found_matches_phrase(2, 1), "Found 2 matches in 1 file");
+        assert_eq!(found_matches_phrase(3, 2), "Found 3 matches across 2 files");
+        assert_eq!(found_matches_phrase(0, 0), "Found 0 matches in 0 files");
+
+        let mut one = grep_result(
+            vec![grep_match("/project/a.rs", 1, "needle")],
+            1,
+            1,
+            1,
+            IndexStatus::Fallback,
+            false,
+        );
+        one.files_read_directly = 1;
+        assert_eq!(
+            grep_tool_footer(&one),
+            "Found 1 match in 1 file [index: fallback; searched 1 file directly]"
+        );
+        one.walk_bound = Some(WalkBound::FileLimit(1));
+        assert_eq!(
+            grep_tool_footer(&one),
+            "Found 1 match in 1 file [index: fallback; incomplete: checked 1 file before the walk's 1-file limit]"
+        );
+        one.walk_bound = Some(WalkBound::TimeBudget);
+        assert!(walk_coverage_note(&one)
+            .expect("note")
+            .starts_with("(checked 1 file (index not used);"));
+
+        // A one-line summary and the folded counted-only rows use the
+        // singular too.
+        let matches = vec![grep_match("/project/a.rs", 1, "needle")];
+        let files = group_by_file(&matches, &root());
+        assert!(files_first_summary(&[0], &files, 1)
+            .starts_with("1 line in 1 file matches; the first page shows 1."));
+
+        let mut counted_matches: Vec<GrepMatch> = (0..8)
+            .map(|index| grep_match(&format!("/project/d{index}/rec{index}.json"), 1, "needle"))
+            .collect();
+        counted_matches.push(grep_match("/project/logs/run.log", 1, "needle"));
+        let mut files = group_by_file(&counted_matches, &root());
+        for file in &mut files[..8] {
+            file.kind.content = ContentKind::DataJson;
+            file.kind.marker = Some(".json");
+        }
+        files[8].kind.content = ContentKind::Capture;
+        files[8].kind.marker = Some(".log");
+        let indexes: Vec<usize> = (0..files.len()).collect();
+        let rows = counted_entries(&indexes, &files);
+        assert_eq!(rows.len(), COUNTED_ENTRIES_LISTED + 1, "{rows:?}");
+        assert!(rows[0].ends_with(": 1 line (JSON data)"), "{rows:?}");
+        assert_eq!(
+            rows[COUNTED_ENTRIES_LISTED - 1],
+            "+1 more JSON data file: 1 line; include **/*.json"
+        );
+        assert_eq!(
+            rows[COUNTED_ENTRIES_LISTED],
+            "+1 more log or command output file: 1 line; include **/*.log"
+        );
     }
 
     #[test]

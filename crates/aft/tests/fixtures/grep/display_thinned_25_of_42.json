@@ -306,7 +306,7 @@
   "truncated": false,
   "walk_truncated": false,
   "skipped_foreign_mounts": 0,
-  "text": "src/thinned_1.rs:1: thinned line 1\n\nFound 42 match across 5 file",
+  "text": "src/thinned_1.rs:1: thinned line 1\n\nFound 42 matches across 5 files",
   "matches_list_envelope": {
     "shown": 25,
     "total": {

@@ -384,7 +384,7 @@ fn grep_counts_lockfile_lines_and_names_the_path() {
         "text:\n{text}"
     );
     assert!(
-        text.contains("Found 22 match across 2 file"),
+        text.contains("Found 22 matches across 2 files"),
         "text:\n{text}"
     );
     assert!(
@@ -428,7 +428,7 @@ fn grep_total_is_exact_past_the_page() {
     assert_eq!(data["truncated"], false);
     assert_eq!(data["total_matches"], 250);
     assert!(
-        text.contains("Found 250 match across 3 file"),
+        text.contains("Found 250 matches across 3 files"),
         "text:\n{text}"
     );
     assert!(!text.contains("≥"), "text:\n{text}");

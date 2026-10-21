@@ -287,7 +287,7 @@ maybeDescribe(describeName, () => {
         expect(grep, transport).toContain("sample.ts");
         expect(grep, transport).not.toContain(".aft-env/");
         expect(grep, transport).not.toContain(".aft-user/");
-        expect(grep, transport).toContain("Found 1 match across 1 file");
+        expect(grep, transport).toContain("Found 1 match in 1 file");
 
         const glob = await toolTextUntil(harness, "glob", { pattern: "**/*", path: "." }, ready);
         expect(ready(glob), `${transport}: ${glob}`).toBe(true);
@@ -314,7 +314,7 @@ maybeDescribe(describeName, () => {
       const before = await toolTextUntil(harness, "grep", args, ready);
       expect(ready(before), before).toBe(true);
       expect(before).toContain("deleted.ts");
-      expect(before).toContain("Found 2 match across 2 file");
+      expect(before).toContain("Found 2 matches across 2 files");
 
       // Delete outside AFT's mutation tools: only the OS watcher can retire
       // this entry, not a tool's direct cache invalidation.
@@ -329,7 +329,7 @@ maybeDescribe(describeName, () => {
       expect(after).not.toContain("were not on disk in this checkout");
       expect(after).not.toContain("deleted.ts");
       expect(after).toContain("sample.ts");
-      expect(after).toContain("Found 1 match across 1 file");
+      expect(after).toContain("Found 1 match in 1 file");
       // A generous bound for loaded CI runners: the failure this guards is an
       // entry that is never retired, not a slow watcher.
       expect(Date.now() - started).toBeLessThan(30_000);

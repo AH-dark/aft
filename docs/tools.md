@@ -801,7 +801,7 @@ src/server.ts
 src/test/server.test.ts
 15: import { handleRequest } from "../server"
 
-Found 3 match across 2 file
+Found 3 matches across 2 files
 ```
 
 Lockfiles, generated and minified files, logs and command output, and JSON data files are

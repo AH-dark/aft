@@ -94,7 +94,7 @@
   "truncated": false,
   "walk_truncated": false,
   "skipped_foreign_mounts": 2,
-  "text": "src/mount_file_0.rs:1: match line 1\n\nFound 12 match across 3 file\n\n(Fallback directory walk skipped 2 foreign filesystem mount(s); results may be incomplete.)",
+  "text": "src/mount_file_0.rs:1: match line 1\n\nFound 12 matches across 3 files\n\n(Fallback directory walk skipped 2 foreign filesystem mount(s); results may be incomplete.)",
   "matches_list_envelope": {
     "shown": 12,
     "total": {

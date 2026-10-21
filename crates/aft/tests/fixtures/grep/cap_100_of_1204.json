@@ -710,7 +710,7 @@
   "truncated": true,
   "walk_truncated": false,
   "skipped_foreign_mounts": 0,
-  "text": "src/file_00.rs:1: match line 1\n\nFound 100 match across 20 file (capped)",
+  "text": "src/file_00.rs:1: match line 1\n\nFound 100 matches across 20 files (capped)",
   "matches_list_envelope": {
     "shown": 100,
     "total": {

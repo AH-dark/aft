@@ -121,7 +121,7 @@ export function runReadOnlySpineToolcallSuite(
       );
 
       expect(resultText(output)).toContain("tool_call_grep_marker");
-      expect(resultText(output)).toContain("Found 1 match across 1 file");
+      expect(resultText(output)).toContain("Found 1 match in 1 file");
     });
 
     test("grep appends the plugin-side skipped path footer after tool_call", async () => {
@@ -134,7 +134,7 @@ export function runReadOnlySpineToolcallSuite(
       );
 
       expect(resultText(output)).toContain("tool_call_grep_marker");
-      expect(resultText(output)).toContain("Found 1 match across 1 file");
+      expect(resultText(output)).toContain("Found 1 match in 1 file");
       expect(resultText(output)).toContain("Skipped 1 path not found: missing-dir");
     });
 

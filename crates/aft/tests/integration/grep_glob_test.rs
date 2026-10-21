@@ -591,8 +591,9 @@ fn grep_text_uses_relative_paths_and_compact_format() {
     // No "Line" prefix, no indentation
     assert!(text.contains("1: fn alpha()"));
     assert!(text.contains("1: fn beta()"));
-    assert!(text
-        .ends_with("Found 2 match across 2 file [index: fallback; searched all 2 files directly]"));
+    assert!(text.ends_with(
+        "Found 2 matches across 2 files [index: fallback; searched all 2 files directly]"
+    ));
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -860,7 +861,7 @@ fn grep_while_index_builds_says_the_walk_searched_every_file() {
     let text = response["text"].as_str().expect("grep text");
     // The fixture marker file is searched too, so three files in all.
     assert_eq!(
-        text, "Found 0 match across 0 file [index: building; searched all 3 files directly]",
+        text, "Found 0 matches in 0 files [index: building; searched all 3 files directly]",
         "{response:?}"
     );
     assert_eq!(response["complete"], true, "{response:?}");

@@ -491,8 +491,7 @@ const GrepParams = Type.Object({
       minimum: 0,
       maximum: 100000,
       default: 0,
-      description:
-        "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+      description: "Rows of shown results to skip; follow the next offset the reply names.",
     }),
   ),
 });

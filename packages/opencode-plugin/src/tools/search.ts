@@ -166,7 +166,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       ),
       offset: arg(
         optionalInt(0, 100000).describe(
-          "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+          "Rows of shown results to skip; follow the next offset the reply names.",
         ),
       ),
     },

@@ -2597,7 +2597,7 @@ mod tests {
         let text = grep_tool_text(&result, project.path());
         assert_eq!(
             text,
-            "Found 0 match across 0 file [index: building; searched all 3 files directly]"
+            "Found 0 matches in 0 files [index: building; searched all 3 files directly]"
         );
     }
 
@@ -2623,7 +2623,7 @@ mod tests {
         let text = grep_tool_text(&result, project.path());
         assert!(
             text.starts_with(
-                "Found 0 match across 0 file [index: building; incomplete: checked 2 files before the walk's 2-file limit]"
+                "Found 0 matches in 0 files [index: building; incomplete: checked 2 files before the walk's 2-file limit]"
             ),
             "{text}"
         );
