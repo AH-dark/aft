@@ -891,3 +891,19 @@ async fn gh_shim_broker_query_control_characters_are_refused() {
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn gh_shim_broker_query_values_cannot_inject_parameters() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    for value in ["open&x=y", "open=closed", "open#fragment", "open%26x%3Dy"] {
+        let bytes=serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"issues","query":{"state":value}}}}})).unwrap();
+        let reply = call(&grant, &transport, &bytes, Some(stamp())).await;
+        assert!(
+            !reply.ok,
+            "worker query delimiters must not reach the URL-building provider: {value}"
+        );
+        assert_eq!(reply.data["refusal_code"], "worker_query_value_ambiguous");
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    }
+}
