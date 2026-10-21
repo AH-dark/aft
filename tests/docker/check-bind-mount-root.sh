@@ -12,8 +12,9 @@
 # Environment:
 #   AFT_BIND_CHECK_IMAGE    container image (default ubuntu:22.04, whose glibc
 #                           matches the CI build); it needs only sh and timeout
-#   AFT_BIND_CHECK_WORKDIR  host folder for the project and outputs (default: a
-#                           new temporary folder, removed afterwards)
+#   AFT_BIND_CHECK_WORKDIR  folder in which to create this run's own temporary
+#                           folder (default: $RUNNER_TEMP, $TMPDIR or /tmp); only
+#                           that new folder is removed afterwards
 set -euo pipefail
 
 binary="${1:?usage: check-bind-mount-root.sh <path to a Linux aft binary>}"
@@ -23,14 +24,12 @@ command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 2; }
 [[ -x "$binary" ]] || { echo "not an executable: $binary" >&2; exit 2; }
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
 
-if [[ -n "${AFT_BIND_CHECK_WORKDIR:-}" ]]; then
-  work="$AFT_BIND_CHECK_WORKDIR"
-  rm -rf "$work"
-  mkdir -p "$work"
-else
-  work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/aft-bind-root.XXXXXX")"
-  trap 'rm -rf "$work" 2>/dev/null || true' EXIT
-fi
+# The run always works in a new folder of its own, so a folder the caller names
+# is never emptied or removed; only the new folder is cleaned up.
+parent="${AFT_BIND_CHECK_WORKDIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
+mkdir -p "$parent"
+work="$(mktemp -d "$parent/aft-bind-root.XXXXXX")"
+trap 'rm -rf "$work" 2>/dev/null || true' EXIT
 work="$(cd "$work" && pwd)"
 # The project is a subfolder of the host folder, so the mount exposes a
 # subdirectory of the host filesystem, exactly like `-v "$PWD":/workspace`.

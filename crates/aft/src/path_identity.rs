@@ -99,14 +99,14 @@ pub(crate) fn project_root_volume(canonical_root: &Path, home: Option<&Path>) ->
     }
 }
 
-/// Testable core of [`project_root_volume`]: `read` supplies the text of
+/// Testable core of [`project_root_volume`]: `read` supplies the raw bytes of
 /// `/proc/self/mountinfo` and `volume_of` runs the device walk for a path.
 #[cfg(target_os = "linux")]
 fn project_root_volume_with(
     root: &Path,
     volume: PathBuf,
     home: Option<&Path>,
-    read: impl FnOnce() -> std::io::Result<String>,
+    read: impl FnOnce() -> std::io::Result<Vec<u8>>,
     volume_of: impl FnOnce(&Path) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     // Only a root that is itself the mount point is misjudged; a directory
@@ -149,7 +149,7 @@ const MOUNTINFO_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MOUNTINFO_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[cfg(target_os = "linux")]
-fn read_mountinfo() -> std::io::Result<String> {
+fn read_mountinfo() -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     // Read under this function's own deadline instead of the caller's I/O
     // budget: a failed read recorded in that budget would make the rest of the
@@ -166,7 +166,7 @@ fn read_mountinfo() -> std::io::Result<String> {
                 if bytes.len() as u64 > MOUNTINFO_MAX_BYTES {
                     return Err(std::io::Error::other("mount table exceeds the size limit"));
                 }
-                String::from_utf8(bytes).map_err(std::io::Error::other)
+                Ok(bytes)
             },
         )
     })
@@ -185,16 +185,22 @@ enum MountRoot {
     Unknown,
 }
 
-/// Classify the mount at `mount_point` from the text of `/proc/self/mountinfo`.
-/// Line format (proc(5)): id, parent id, major:minor, root, mount point, mount
-/// options, optional fields, `-`, filesystem type, source, super options.
+/// Classify the mount at `mount_point` from the contents of
+/// `/proc/self/mountinfo`. Line format (proc(5)): id, parent id, major:minor,
+/// root, mount point, mount options, optional fields, `-`, filesystem type,
+/// source, super options.
+///
+/// The table is parsed as bytes: Linux names may hold any byte except `/` and
+/// NUL, and mountinfo octal-escapes only whitespace and backslashes, leaving
+/// non-UTF-8 bytes as they are. A non-UTF-8 mount elsewhere in the table must
+/// not make the requested mount's entry unreadable.
 #[cfg(target_os = "linux")]
-fn mount_root_in(mountinfo: &str, mount_point: &Path) -> MountRoot {
+fn mount_root_in(mountinfo: &[u8], mount_point: &Path) -> MountRoot {
     // Mounts stacked on one mount point are listed in mount order, so the last
     // matching entry is the one that is visible.
     let Some(fields) = mountinfo
-        .lines()
-        .map(|line| line.split(' ').collect::<Vec<_>>())
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.split(|byte| *byte == b' ').collect::<Vec<_>>())
         .filter(|fields| {
             fields
                 .get(4)
@@ -204,7 +210,11 @@ fn mount_root_in(mountinfo: &str, mount_point: &Path) -> MountRoot {
     else {
         return MountRoot::Unknown;
     };
-    let Some(separator) = fields.iter().skip(6).position(|field| *field == "-") else {
+    let Some(separator) = fields
+        .iter()
+        .skip(6)
+        .position(|field| *field == b"-".as_slice())
+    else {
         return MountRoot::Unknown;
     };
     let tail = &fields[6 + separator + 1..];
@@ -222,8 +232,8 @@ fn mount_root_in(mountinfo: &str, mount_point: &Path) -> MountRoot {
     // root other than `/` only means a bind of a subdirectory when it lies
     // below the mounted subvolume.
     let subvolume = super_options
-        .split(',')
-        .find_map(|option| option.strip_prefix("subvol="))
+        .split(|byte| *byte == b',')
+        .find_map(|option| option.strip_prefix(b"subvol=".as_slice()))
         .map(unescape_mount_field);
     match subvolume {
         Some(subvolume) if root == subvolume => MountRoot::WholeVolume,
@@ -231,17 +241,17 @@ fn mount_root_in(mountinfo: &str, mount_point: &Path) -> MountRoot {
         Some(_) => MountRoot::Unknown,
         // Subvolume-capable filesystems that do not name the subvolume give no
         // way to tell a subvolume root from a bind.
-        None if matches!(*fs_type, "btrfs" | "bcachefs") => MountRoot::Unknown,
+        None if matches!(*fs_type, b"btrfs" | b"bcachefs") => MountRoot::Unknown,
         None => MountRoot::Subdirectory(root),
     }
 }
 
 /// Decode the octal escapes (`\040` for a space, for example) that mountinfo
-/// uses for whitespace and backslashes in paths.
+/// uses for whitespace and backslashes in paths. Other bytes, including
+/// non-UTF-8 ones, are kept as they are.
 #[cfg(target_os = "linux")]
-fn unescape_mount_field(field: &str) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    let bytes = field.as_bytes();
+fn unescape_mount_field(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -262,7 +272,7 @@ fn unescape_mount_field(field: &str) -> PathBuf {
             }
         }
     }
-    PathBuf::from(std::ffi::OsString::from_vec(decoded))
+    PathBuf::from(std::ffi::OsStr::from_bytes(&decoded))
 }
 
 /// A bind of a home folder or of a folder containing home folders exposes as
@@ -523,7 +533,7 @@ mod tests {
 
         const OVERLAY_ROOT: &str = "1748 1 0:173 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n";
 
-        fn narrow_with(root: &str, read: impl FnOnce() -> std::io::Result<String>) -> bool {
+        fn narrow_with(root: &str, read: impl FnOnce() -> std::io::Result<Vec<u8>>) -> bool {
             let root = Path::new(root);
             let home = Path::new("/root");
             let volume =
@@ -534,7 +544,7 @@ mod tests {
         }
 
         fn narrow(root: &str, mount: &str) -> bool {
-            narrow_with(root, || Ok(format!("{OVERLAY_ROOT}{mount}\n")))
+            narrow_with(root, || Ok(format!("{OVERLAY_ROOT}{mount}\n").into_bytes()))
         }
 
         #[test]
@@ -565,7 +575,7 @@ mod tests {
             // Classified as a whole volume, not as a bind that only the
             // home-folder rule keeps broad.
             assert_eq!(
-                mount_root_in(mount, Path::new("/data")),
+                mount_root_in(mount.as_bytes(), Path::new("/data")),
                 MountRoot::WholeVolume
             );
         }
@@ -624,7 +634,8 @@ mod tests {
                     || {
                         Ok(format!(
                             "{OVERLAY_ROOT}1801 1748 8:1 {source} /workspace rw - ext4 /dev/sda1 rw\n"
-                        ))
+                        )
+                        .into_bytes())
                     },
                     |_| Some(PathBuf::from("/")),
                 );
@@ -636,8 +647,47 @@ mod tests {
         fn filesystem_root_is_broad() {
             // A sandbox whose `/` is itself a bind of a host subdirectory.
             assert!(!narrow_with("/", || Ok(
-                "1748 317 9:5 /runner/sandboxes/x/root / ro - xfs /dev/md5 rw\n".to_owned()
+                b"1748 317 9:5 /runner/sandboxes/x/root / ro - xfs /dev/md5 rw\n".to_vec()
             )));
+        }
+
+        #[test]
+        fn non_utf8_mount_names_do_not_hide_a_bind() {
+            // Linux names may hold any byte except `/` and NUL, and mountinfo
+            // leaves non-UTF-8 bytes unescaped, so a mount with such bytes
+            // elsewhere in the table must not stop the `/workspace` entry from
+            // being parsed.
+            let table = [
+                OVERLAY_ROOT.as_bytes(),
+                b"1802 1748 8:1 /srv/caf\xe9 /mnt/caf\xe9 rw - ext4 /dev/sda1 rw\n",
+                b"1801 1748 8:1 /tmp/repro/proj-x /workspace rw - ext4 /dev/sda1 rw\n",
+            ]
+            .concat();
+            assert!(narrow_with("/workspace", || Ok(table)));
+        }
+
+        #[test]
+        fn non_utf8_mount_point_matches_its_entry() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let root = Path::new(OsStr::from_bytes(b"/caf\xe9"));
+            let table = [
+                OVERLAY_ROOT.as_bytes(),
+                b"1801 1748 8:1 /srv/proj\xff /caf\xe9 rw - ext4 /dev/sda1 rw\n",
+            ]
+            .concat();
+            assert_eq!(
+                mount_root_in(&table, root),
+                MountRoot::Subdirectory(PathBuf::from(OsStr::from_bytes(b"/srv/proj\xff")))
+            );
+            let volume = project_root_volume_with(
+                root,
+                root.to_path_buf(),
+                Some(Path::new("/root")),
+                || Ok(table.clone()),
+                |_| Some(PathBuf::from("/")),
+            );
+            assert_eq!(volume, Some(PathBuf::from("/")));
         }
 
         #[test]
