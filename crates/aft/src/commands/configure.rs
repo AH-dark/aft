@@ -558,12 +558,12 @@ pub(crate) fn project_root_is_too_broad(
     account_home: Option<&Path>,
 ) -> bool {
     let root_identity = crate::access_policy::policy_path(canonical_root);
+    let account_home = account_home.filter(|home| home.is_dir());
     canonicalization_failed
-        || crate::storage_retention::volume_anchor(canonical_root)
-            .map(|(volume, _)| crate::access_policy::policy_path(&volume))
+        || crate::path_identity::project_root_volume(canonical_root, account_home)
+            .map(|volume| crate::access_policy::policy_path(&volume))
             .is_none_or(|volume| {
                 let home_identity = account_home
-                    .filter(|home| home.is_dir())
                     .map(crate::access_policy::policy_path)
                     .unwrap_or_else(|| volume.clone());
                 crate::path_identity::project_root_is_narrow(
