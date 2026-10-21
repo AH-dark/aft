@@ -1,4 +1,4 @@
-use crate::commands::bash_status::format_unknown_task_message;
+use crate::commands::bash_status::format_unknown_write_task_message;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde::Deserialize;
@@ -91,7 +91,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(code) if code == "task_not_found" => Response::error(
             &req.id,
             "task_not_found",
-            format_unknown_task_message(&params.task_id),
+            format_unknown_write_task_message(&params.task_id, req.host_tool_names().shell()),
         ),
         Err(code) if code == "task_not_pty" => Response::error(
             &req.id,
@@ -319,6 +319,42 @@ mod tests {
             "x".repeat(MAX_INPUT_BYTES - 3), { "key": "up" }
         ]))
         .is_ok());
+    }
+
+    #[test]
+    fn bash_write_unknown_id_reply_is_one_line_naming_bash() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project.path().into()),
+                storage_dir: Some(storage.path().into()),
+                ..crate::config::Config::default()
+            },
+        );
+        for (names, shell) in [(None, "bash"), (Some(json!({ "bash": "shell" })), "shell")] {
+            let mut request = json!({
+                "id": "write-unknown",
+                "command": "bash_write",
+                "session_id": "write-test",
+                "params": { "task_id": "x", "input": "ls\n" },
+            });
+            if let Some(names) = names {
+                request["host_tool_names"] = names;
+            }
+            let request: RawRequest = serde_json::from_value(request).unwrap();
+            let reply = handle(&request, &ctx);
+            assert_eq!(reply.data["code"], "task_not_found", "{:?}", reply.data);
+            let message = reply.data["message"].as_str().unwrap();
+            assert_eq!(
+                message,
+                format!(
+                    "background task not found: x. To run a command, use `{shell}`; `bash_write` only types into a task that `{shell}` started."
+                )
+            );
+            assert!(!message.contains('\n'), "{message:?}");
+        }
     }
 
     #[test]

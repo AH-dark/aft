@@ -9,10 +9,35 @@ use serde_json::json;
 
 const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 
+/// Guidance for the `bash` call paths (foreground wait, promotion) whose own
+/// task disappeared. Tools that take a task id from the agent use the shorter
+/// one-line replies below instead.
 pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling.";
 
 pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
     format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
+}
+
+/// One-line reply when `bash_status`, `bash_kill` or `bash_watch` is given a
+/// task id this session does not know. The id may be made up, or the task's
+/// record may have been lost (for example across an AFT restart); either way
+/// the useful next step is to run the command with the command tool, named
+/// here as the host serves it (`shell_tool`). The `background task not found:`
+/// prefix stays so callers that match on it keep working.
+pub(crate) fn format_unknown_polled_task_message(task_id: &str, shell_tool: &str) -> String {
+    format!(
+        "background task not found: {task_id}. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `{shell_tool}`."
+    )
+}
+
+/// One-line reply when `bash_write` is given a task id this session does not
+/// know. Agents sometimes call `bash_write` as if it were the shell, with
+/// invented ids, so the reply sends them to the command tool (`shell_tool`,
+/// the host's served name for it) instead of explaining lost records.
+pub(crate) fn format_unknown_write_task_message(task_id: &str, shell_tool: &str) -> String {
+    format!(
+        "background task not found: {task_id}. To run a command, use `{shell_tool}`; `bash_write` only types into a task that `{shell_tool}` started."
+    )
 }
 
 pub(crate) fn format_erased_task_message(task_id: &str) -> String {
@@ -299,7 +324,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 None => Response::error(
                     &req.id,
                     "task_not_found",
-                    format_unknown_task_message(&task_id),
+                    format_unknown_polled_task_message(&task_id, req.host_tool_names().shell()),
                 ),
             }
         }
@@ -373,7 +398,10 @@ fn read_status_artifact_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_erased_task_message, format_unknown_task_message};
+    use super::{
+        format_erased_task_message, format_unknown_polled_task_message,
+        format_unknown_task_message, format_unknown_write_task_message,
+    };
     use crate::bash_background::persistence::{
         create_task_layout, write_task_at, PersistedTask, TaskPaths,
     };
@@ -771,10 +799,54 @@ mod tests {
     }
 
     #[test]
-    fn unknown_task_message_steers_agents_to_rerun() {
+    fn unknown_task_messages_are_one_line_and_name_the_command_tool() {
         assert_eq!(
-            format_unknown_task_message("bash-unknown"),
-            "background task not found: bash-unknown. No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling."
+            format_unknown_polled_task_message("bash-unknown", "bash"),
+            "background task not found: bash-unknown. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+        );
+        assert_eq!(
+            format_unknown_write_task_message("x", "bash"),
+            "background task not found: x. To run a command, use `bash`; `bash_write` only types into a task that `bash` started."
+        );
+        // A host that serves the command tool under another name gets that
+        // name, so the redirect points at a tool the agent can actually call.
+        assert_eq!(
+            format_unknown_write_task_message("x", "shell"),
+            "background task not found: x. To run a command, use `shell`; `bash_write` only types into a task that `shell` started."
+        );
+        // The `bash` call paths whose own task vanished keep the rerun advice.
+        assert!(format_unknown_task_message("bash-unknown")
+            .ends_with("re-run the command instead of polling."));
+    }
+
+    #[test]
+    fn bash_status_unknown_id_reply_is_one_line_naming_bash() {
+        let fixture = RestoreFixture::new(Harness::Opencode);
+        let response = fixture.status("noop", SESSION);
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "task_not_found");
+        let message = response.data["message"].as_str().unwrap();
+        assert_eq!(
+            message,
+            "background task not found: noop. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+        );
+        assert!(!message.contains('\n'), "{message:?}");
+
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "served-name-status", "command": "bash_status", "session_id": SESSION,
+            "host_tool_names": { "bash": "shell" },
+            "params": { "task_id": "noop" },
+        }))
+        .unwrap();
+        let response = super::handle(&request, &fixture.ctx);
+        assert_eq!(response.data["code"], "task_not_found");
+        assert!(
+            response.data["message"]
+                .as_str()
+                .unwrap()
+                .ends_with("To run a command, use `shell`."),
+            "{:?}",
+            response.data
         );
     }
 

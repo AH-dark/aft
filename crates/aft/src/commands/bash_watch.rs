@@ -24,7 +24,9 @@ use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
 use crate::commands::bash_orchestrate::{
     format_wait_limit, kill_deadline_sentence, worker_kill_deadline_within_handoff_margin,
 };
-use crate::commands::bash_status::{format_erased_task_message, format_unknown_task_message};
+use crate::commands::bash_status::{
+    format_erased_task_message, format_unknown_polled_task_message,
+};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
@@ -289,6 +291,7 @@ pub(crate) fn handle_deferred_with_budget(
         }
     };
     let session = req.session().to_string();
+    let shell_tool = req.host_tool_names().shell().to_string();
     let registry = ctx.bash_background().clone();
     if registry.has_erased_watch_reference(&task_id) {
         return DispatchOutcome::Immediate(Response::error(
@@ -330,7 +333,7 @@ pub(crate) fn handle_deferred_with_budget(
                 let _ = tx.send(Response::error(
                     &thread_id,
                     "task_not_found",
-                    format_unknown_task_message(&task_id),
+                    format_unknown_polled_task_message(&task_id, &shell_tool),
                 ));
                 return;
             }
@@ -361,7 +364,7 @@ pub(crate) fn handle_deferred_with_budget(
                 None => Response::error(
                     &thread_id,
                     "task_not_found",
-                    format_unknown_task_message(&watch.task_id),
+                    format_unknown_polled_task_message(&watch.task_id, &shell_tool),
                 ),
             };
             let _ = tx.send(response);
@@ -840,6 +843,24 @@ mod tests {
         .await;
         assert!(!response.success, "{response:?}");
         assert_eq!(response.data["code"], "task_not_found");
+    }
+
+    #[tokio::test]
+    async fn bash_watch_unknown_id_reply_is_one_line_naming_bash() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let response = watch_with_deadline(
+            context(project.path(), storage.path()),
+            request(TASK, SESSION),
+        )
+        .await;
+        assert_eq!(response.data["code"], "task_not_found", "{response:?}");
+        let message = response.data["message"].as_str().unwrap();
+        assert_eq!(
+            message,
+            format!("background task not found: {TASK}. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.")
+        );
+        assert!(!message.contains('\n'), "{message:?}");
     }
 
     #[tokio::test]
