@@ -267,3 +267,89 @@ describe("engine outside-access asks", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * A scripted engine for a batch touching `count` distinct outside files: like
+ * the real engine it reports only the first refused file per attempt, and
+ * renews the approvals it was sent.
+ */
+function batchEngine(count: number, refuseAgain = false) {
+  const sends: Array<Record<string, unknown>> = [];
+  const send = async (args: Record<string, unknown>) => {
+    sends.push(structuredClone(args));
+    const granted = (args.permissions_granted as string[] | undefined) ?? [];
+    for (let file = 0; file < count; file++) {
+      const id = `outside:file-${file}`;
+      if (refuseAgain || !granted.includes(id))
+        return {
+          success: false,
+          code: "permission_required",
+          permissions_continuation: granted,
+          asks: [
+            {
+              kind: "external_directory",
+              grant_id: id,
+              path: `/outside/file-${file}`,
+              operation: "write",
+              patterns: ["/outside/*"],
+              always: ["/outside/*"],
+            },
+          ],
+        } as Record<string, unknown>;
+    }
+    return { success: true, text: `wrote ${count} files` } as Record<string, unknown>;
+  };
+  return { send, sends };
+}
+
+describe("outside-access batches", () => {
+  for (const hostVersion of [1, 2] as const) {
+    test(`OpenCode ${hostVersion}: a 32-file outside batch with every ask approved completes`, async () => {
+      const engine = batchEngine(32);
+      const prompt = mock(async (_ask: unknown) => {});
+      const result = await withOutsidePermissions(
+        { ask: prompt, ...(hostVersion === 2 ? { hostVersion } : {}) },
+        { files: ["/outside/..."] },
+        engine.send,
+        false,
+        "write",
+      );
+      expect(result.success).toBe(true);
+      expect(prompt).toHaveBeenCalledTimes(32);
+      expect(engine.sends).toHaveLength(33);
+    });
+
+    test(`OpenCode ${hostVersion}: a batch stops at the first denied path`, async () => {
+      const engine = batchEngine(32);
+      const denial = new Error("user rejected");
+      let prompts = 0;
+      await expect(
+        withOutsidePermissions(
+          {
+            ask: async () => {
+              prompts++;
+              if (prompts === 6) throw denial;
+            },
+            ...(hostVersion === 2 ? { hostVersion } : {}),
+          },
+          { files: ["/outside/..."] },
+          engine.send,
+          false,
+          "write",
+        ),
+      ).rejects.toThrow(hostVersion === 2 ? "user rejected" : /denied|rejected/i);
+      expect(prompts).toBe(6);
+      expect(engine.sends).toHaveLength(6);
+    });
+  }
+
+  test("an approved path refused again stops with a typed error instead of asking forever", async () => {
+    const engine = batchEngine(1, true);
+    const prompt = mock(async (_ask: unknown) => {});
+    await expect(
+      withOutsidePermissions({ ask: prompt }, {}, engine.send, false, "write"),
+    ).rejects.toMatchObject({ code: "outside_permission_stalled" });
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(engine.sends).toHaveLength(2);
+  });
+});

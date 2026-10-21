@@ -18,7 +18,7 @@ const ask = (id: string) => ({
     {
       kind: "external_directory",
       grant_id: `outside:${id}`,
-      path: "/outside/file",
+      path: `/outside/${id}`,
       operation: "read",
     },
   ],
@@ -217,5 +217,72 @@ describe("engine outside-access asks", () => {
     await expect(outcome).rejects.toThrow(/abort/i);
     expect(sends).toHaveLength(1);
     expect(sends[0]).not.toHaveProperty("permissions_granted");
+  });
+});
+
+/**
+ * A scripted engine for a batch touching `count` distinct outside files: like
+ * the real engine it reports only the first refused file per attempt, and
+ * renews the approvals it was sent.
+ */
+function batchEngine(count: number, refuseAgain = false) {
+  const sends: Array<Record<string, unknown>> = [];
+  const send = async (args: Record<string, unknown>) => {
+    sends.push(structuredClone(args));
+    const granted = (args.permissions_granted as string[] | undefined) ?? [];
+    for (let file = 0; file < count; file++) {
+      const id = `outside:file-${file}`;
+      if (refuseAgain || !granted.includes(id))
+        return {
+          success: false,
+          code: "permission_required",
+          permissions_continuation: granted,
+          asks: [
+            {
+              kind: "external_directory",
+              grant_id: id,
+              path: `/outside/file-${file}`,
+              operation: "write",
+            },
+          ],
+        } as Record<string, unknown>;
+    }
+    return { success: true, text: `wrote ${count} files` } as Record<string, unknown>;
+  };
+  return { send, sends };
+}
+
+describe("outside-access batches", () => {
+  test("a 32-file outside batch with every ask approved completes", async () => {
+    const engine = batchEngine(32);
+    const confirm = mock(async () => true);
+    const result = await withOutsidePermissions({}, context(confirm), engine.send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(32);
+    expect(engine.sends).toHaveLength(33);
+  });
+
+  test("a batch stops at the first denied path", async () => {
+    const engine = batchEngine(32);
+    let prompts = 0;
+    await expect(
+      withOutsidePermissions(
+        {},
+        context(async () => ++prompts !== 6),
+        engine.send,
+      ),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+    expect(prompts).toBe(6);
+    expect(engine.sends).toHaveLength(6);
+  });
+
+  test("an approved path refused again stops with a typed error instead of asking forever", async () => {
+    const engine = batchEngine(1, true);
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(engine.sends).toHaveLength(2);
   });
 });

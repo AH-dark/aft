@@ -270,6 +270,11 @@ export function withHostPermissionGrants(args: Record<string, unknown>, grants: 
   return clean;
 }
 
+/** Hard ceiling on sends for one call. The engine reports one refused outside
+ * path per attempt, so a batch needs one round per distinct outside path plus
+ * the final run; this is far above any real batch. */
+export const MAX_OUTSIDE_PERMISSION_ROUNDS = 256;
+
 /** The engine owns containment; Pi only presents its exact outside-path asks. */
 export async function withOutsidePermissions<T extends Record<string, unknown>>(
   args: Record<string, unknown>,
@@ -286,10 +291,19 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   const key = JSON.stringify([sessionId, permissionOperation(operation, clean)]);
   let granted = [...(continuations?.get(key) ?? [])];
   continuations?.delete(key);
-  for (let round = 0; round < 32; round++) {
+  // What this call has approved so far, by operation and path. A batch keeps
+  // retrying while each round approves something new; the engine asking
+  // again for something already approved means retrying cannot finish.
+  const approvedThisCall = new Set<string>();
+  for (let round = 0; ; round++) {
     // Before every send, including an approved retry: a call cancelled
     // while it waited for an answer must not run.
     throwIfCancelled(signals);
+    if (round >= MAX_OUTSIDE_PERMISSION_ROUNDS)
+      throw new BridgeError(
+        `outside-access permission retry stopped after ${MAX_OUTSIDE_PERMISSION_ROUNDS} rounds`,
+        "outside_permission_stalled",
+      );
     const approvals = [...inherited, ...granted];
     const response = await send(
       approvals.length ? { ...clean, permissions_granted: approvals } : clean,
@@ -322,6 +336,18 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
         "permission_denied",
       );
     }
+    // The same operation on the same path is the same request. An ask that
+    // names no path can only be told apart by its own grant ID.
+    const askKey = (ask: (typeof asks)[number]) =>
+      ask.path === undefined
+        ? JSON.stringify(["grant", ask.grant_id])
+        : JSON.stringify([ask.operation ?? "", ask.path]);
+    const repeated = asks.find((ask) => approvedThisCall.has(askKey(ask)));
+    if (repeated)
+      throw new BridgeError(
+        `outside access to ${repeated.path ?? "an outside path"} was refused again after it was approved`,
+        "outside_permission_stalled",
+      );
     for (const ask of asks) {
       throwIfCancelled(signals);
       const approved = await extCtx.ui.confirm(
@@ -333,11 +359,11 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       throwIfCancelled(signals);
       if (!approved)
         throw new BridgeError("Permission denied: outside access was denied.", "permission_denied");
+      approvedThisCall.add(askKey(ask));
       const id = ask.grant_id;
       if (id && !granted.includes(id)) granted.push(id);
     }
   }
-  throw new Error("outside-access permission retry failed: too many rounds");
 }
 
 /**

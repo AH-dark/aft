@@ -40,6 +40,21 @@ export function withHostPermissionGrants(args: Record<string, unknown>, grants: 
   return clean;
 }
 
+/** Hard ceiling on sends for one call. The engine reports one refused outside
+ * path per attempt, so a batch needs one round per distinct outside path plus
+ * the final run; this is far above any real batch. */
+export const MAX_OUTSIDE_PERMISSION_ROUNDS = 256;
+
+/** The engine asked again for outside access that was already approved in
+ * this call, or the ceiling was reached: retrying would not make progress. */
+export class OutsidePermissionStalled extends Error {
+  readonly code = "outside_permission_stalled";
+  constructor(message: string) {
+    super(message);
+    this.name = "OutsidePermissionStalled";
+  }
+}
+
 /** Present AFT's outside-path requests through the host callback: OpenCode 2
  * binds it to permission.assert, while OpenCode 1 binds it to context.ask. */
 export async function withOutsidePermissions<T extends Record<string, unknown>>(
@@ -77,10 +92,18 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   const throwIfCancelled = () => {
     for (const signal of signals) signal.throwIfAborted();
   };
-  for (let round = 0; round < 32; round++) {
+  // What this call has approved so far, by operation and path. A batch keeps
+  // retrying while each round approves something new; the engine asking
+  // again for something already approved means retrying cannot finish.
+  const approvedThisCall = new Set<string>();
+  for (let round = 0; ; round++) {
     // Before an approved retry: a call cancelled while it waited for an
     // answer must not run.
     if (round > 0) throwIfCancelled();
+    if (round >= MAX_OUTSIDE_PERMISSION_ROUNDS)
+      throw new OutsidePermissionStalled(
+        `outside-access permission retry stopped after ${MAX_OUTSIDE_PERMISSION_ROUNDS} rounds`,
+      );
     const approvals = [...inherited, ...granted];
     const response = await send(
       approvals.length ? { ...clean, permissions_granted: approvals } : clean,
@@ -104,6 +127,7 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
           always?: string[];
           path?: string;
           parentDir?: string;
+          operation?: string;
         }>
       | undefined;
     if (
@@ -118,6 +142,17 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
     if (typeof runtime.ask !== "function")
       throw new Error(
         "Permission denied: outside access requires a permission-capable OpenCode host.",
+      );
+    // The same operation on the same path is the same request. An ask that
+    // names no path can only be told apart by its own grant ID.
+    const askKey = (ask: (typeof asks)[number]) =>
+      ask.path === undefined
+        ? JSON.stringify(["grant", ask.grant_id])
+        : JSON.stringify([ask.operation ?? "", ask.path]);
+    const repeated = asks.find((ask) => approvedThisCall.has(askKey(ask)));
+    if (repeated)
+      throw new OutsidePermissionStalled(
+        `outside access to ${repeated.path ?? repeated.parentDir ?? "an outside path"} was refused again after it was approved`,
       );
     for (const ask of asks) {
       throwIfCancelled();
@@ -145,8 +180,8 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       }
       // An answer that arrives after cancellation is ignored.
       throwIfCancelled();
+      approvedThisCall.add(askKey(ask));
       if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
     }
   }
-  throw new Error("outside-access permission retry failed: too many rounds");
 }
