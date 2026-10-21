@@ -85,7 +85,7 @@ test("V2 completion wakes an idle turn as synthetic text and survives later turn
 
   expect(
     await Effect.runPromise(delivery.completion({ sessionID: "s", taskIDs: ["bash-idle"], text })),
-  ).toBe(true);
+  ).toBe("delivered");
   expect(host.inbox).toEqual([{ type: "synthetic", text, delivery: "steer" }]);
   expect(host.messages).toEqual([]);
   expect(host.wakeRequests()).toBe(1);
@@ -123,7 +123,7 @@ test("V2 completion steers a busy turn at its next step without scheduling a sec
     await Effect.runPromise(
       delivery.completion({ sessionID: "s", taskIDs: ["bash-busy"], text: "done" }),
     ),
-  ).toBe(false);
+  ).toBe("already-delivered");
   expect(host.wakeRequests()).toBe(2);
 });
 
@@ -153,9 +153,9 @@ test("V2 completion stays retryable while a staged revert could discard syntheti
     expect(host.inbox).toEqual([{ type: "synthetic", text: "raw pending", delivery: "steer" }]);
     if (settlement === "commit") host.commitRevert();
     else host.cancelRevert();
-    expect(await Effect.runPromise(delivery.completion(wake))).toBe(true);
+    expect(await Effect.runPromise(delivery.completion(wake))).toBe("delivered");
     expect(host.step()).toBe(true);
     expect(host.modelText().filter((text) => text === "completed")).toHaveLength(1);
-    expect(await Effect.runPromise(delivery.completion(wake))).toBe(false);
+    expect(await Effect.runPromise(delivery.completion(wake))).toBe("already-delivered");
   }
 });

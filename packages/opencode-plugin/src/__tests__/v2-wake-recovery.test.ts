@@ -27,8 +27,8 @@ test("V2 completion retries the same task after synthetic admission fails", asyn
   const delivery = new V2SessionDelivery(host.session);
   const wake = { sessionID: "s", taskIDs: ["task"], text: "done" };
   expect((await Effect.runPromiseExit(delivery.completion(wake)))._tag).toBe("Failure");
-  expect(await Effect.runPromise(delivery.completion(wake))).toBe(true);
-  expect(await Effect.runPromise(delivery.completion(wake))).toBe(false);
+  expect(await Effect.runPromise(delivery.completion(wake))).toBe("delivered");
+  expect(await Effect.runPromise(delivery.completion(wake))).toBe("already-delivered");
   expect(host.attempts()).toBe(2);
 });
 

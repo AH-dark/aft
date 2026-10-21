@@ -170,7 +170,7 @@ test.skipIf(!hostBinary)(
             metadata: { kind: "bash_completion", status: "completed" },
           }),
         ),
-      ).toBe(true);
+      ).toBe("delivered");
       await until(async () => {
         const messages = await client.session.context({ sessionID: session.id });
         return messages.some((message) => message.type === "assistant");
@@ -283,7 +283,7 @@ test.skipIf(!hostBinary)(
             cancelled.some((message) => message.type === "synthetic" && message.text === rawText),
           ).toBe(true);
         }
-        expect(await Effect.runPromise(delivery.completion(revertedWake))).toBe(true);
+        expect(await Effect.runPromise(delivery.completion(revertedWake))).toBe("delivered");
         await client.session.wait({ sessionID: reverted.id });
         const settled = await client.session.context({ sessionID: reverted.id });
         expect(
