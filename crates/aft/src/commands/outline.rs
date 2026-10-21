@@ -63,7 +63,7 @@ pub struct OutlineEntry {
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
-    super::read_manifest::normalize_response_content_files(req, ctx, &mut response.data);
+    super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
     response
 }
 
@@ -434,6 +434,19 @@ fn excluded_read_paths(req: &RawRequest, ctx: &AppContext) -> HashSet<PathBuf> {
         }
     }
     excluded
+}
+
+/// Read manifests name each file at its real location, so a host excludes that
+/// spelling. A walk through a symlinked directory reaches the same file under
+/// another spelling, which must be excluded too.
+fn is_read_excluded(excluded: &HashSet<PathBuf>, path: &Path) -> bool {
+    if excluded.is_empty() {
+        return false;
+    }
+    excluded.contains(path)
+        || std::fs::canonicalize(path).is_ok_and(|canonical| {
+            excluded.contains(&crate::inspect::job::normalize_path(&canonical))
+        })
 }
 
 fn include_tests_param(req: &RawRequest) -> bool {
@@ -1448,7 +1461,7 @@ fn handle_outline_files_mode(
         let mut discovery = discover_outline_files_for_files_mode(&dir_path);
         discovery
             .files
-            .retain(|file| !excluded.contains(Path::new(file)));
+            .retain(|file| !is_read_excluded(&excluded, Path::new(file)));
         entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
@@ -2362,7 +2375,7 @@ fn outline_many_files(
     let mut fallback_parser = FileParser::new();
 
     for (file, path) in files.iter().zip(paths) {
-        if excluded.contains(&path) {
+        if is_read_excluded(excluded, &path) {
             continue;
         }
         if crate::bounded_io::metadata(&path).is_err() {
@@ -3374,35 +3387,102 @@ mod tests {
             "export function secret() {}\n",
         )
         .unwrap();
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(real_root.clone()),
-                restrict_to_project_root: true,
-                ..crate::config::Config::default()
-            },
-        );
-        let request = serde_json::from_value(serde_json::json!({
-            "id": "symlinked-outline-manifest", "command": "outline",
-            "files": [secret, barrel],
-        }))
-        .unwrap();
+        // The manifest takes the spelling of the configured project root, not
+        // of the request: an alias root (like macOS `/var` for `/private/var`)
+        // keeps its alias, and a real root names the real files even when the
+        // request goes through the alias.
+        for configured_root in [&request_root, &real_root] {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(configured_root.clone()),
+                    restrict_to_project_root: true,
+                    ..crate::config::Config::default()
+                },
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "symlinked-outline-manifest", "command": "outline",
+                "files": [secret, barrel],
+            }))
+            .unwrap();
 
-        let response = handle_outline(&request, &ctx);
-        assert!(response.success, "{:?}", response.data);
-        let manifest = response.data["content_files"].as_array().unwrap();
-        let expected: Vec<_> = [barrel.clone(), secret.clone()]
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            let manifest = response.data["content_files"].as_array().unwrap();
+            let expected: Vec<_> = [
+                configured_root.join("barrel.ts"),
+                configured_root.join("secret.ts"),
+            ]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        assert_eq!(response.data["content_files"], serde_json::json!(expected));
-        assert!(manifest
-            .iter()
-            .all(|path| { PathBuf::from(path.as_str().unwrap()).starts_with(&request_root) }));
-        assert!(manifest
-            .windows(2)
-            .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
+            assert_eq!(response.data["content_files"], serde_json::json!(expected));
+            assert!(manifest
+                .windows(2)
+                .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outline_excludes_a_file_denied_at_its_real_location_when_walked_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        symlink(root.join("src"), root.join("a/link")).unwrap();
+        std::fs::write(root.join("src/ok.ts"), "export function okSymbol() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/secret.ts"),
+            "export function secretSymbol() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..crate::config::Config::default()
+            },
+        );
+        // The manifest names the walked file at `src/secret.ts`; a host that
+        // denies that path sends it back as the exclusion.
+        for params in [
+            serde_json::json!({"directory": root.join("a/link")}),
+            serde_json::json!({"files": [root.join("a/link/ok.ts"), root.join("a/link/secret.ts")]}),
+        ] {
+            let mut args = params;
+            args["id"] = serde_json::json!("symlinked-exclusion");
+            args["command"] = serde_json::json!("outline");
+            let request: RawRequest = serde_json::from_value(args.clone()).unwrap();
+            let unfiltered = handle_outline(&request, &ctx);
+            assert!(
+                unfiltered.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("secretSymbol"),
+                "{args}"
+            );
+            assert!(unfiltered.data["content_files"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(root.join("src/secret.ts"))));
+
+            args["_exclude_read_paths"] = serde_json::json!([root.join("src/secret.ts")]);
+            let request: RawRequest = serde_json::from_value(args.clone()).unwrap();
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success, "{args}: {:?}", response.data);
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains("okSymbol"), "{args}: {text}");
+            assert!(!text.contains("secretSymbol"), "{args}: {text}");
+            assert_eq!(
+                response.data["content_files"],
+                serde_json::json!([root.join("src/ok.ts")]),
+                "{args}"
+            );
+        }
     }
 
     #[test]
@@ -3825,16 +3905,18 @@ mod tests {
         ];
         let (_temp, files, ctx) = navigation_fixture();
         for (path, leaves) in files.iter().zip(cases) {
+            // Without a project root the manifest names the canonical file.
+            let manifest_path = crate::inspect::job::canonicalize_normalized(path);
             let symbols = ["alpha", "beta"].into_iter().zip(leaves).map(|(name, (range, content, before, after))| serde_json::json!({
                 "name":name, "response":{
                     "id":"zoom-golden", "success":true, "name":name, "kind":"function",
                     "range":{"start_line":range[0], "start_col":range[1], "end_line":range[2], "end_col":range[3]},
                     "content":content, "context_before":before, "context_after":after,
                     "annotations":{"calls_out":[], "called_by":[]},
-                    "content_files":[path]
+                    "content_files":[&manifest_path]
                 }
             })).collect::<Vec<_>>();
-            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols, "content_files":[path]});
+            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols, "content_files":[manifest_path]});
             let request = serde_json::from_value(serde_json::json!({"id":"zoom-golden", "command":"zoom", "file":path, "symbols":["alpha","beta"], "context_lines":3})).unwrap();
             for _ in 0..2 {
                 assert_eq!(

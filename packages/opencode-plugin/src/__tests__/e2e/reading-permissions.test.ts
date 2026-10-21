@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { once } from "node:events";
-import { writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -23,6 +23,7 @@ async function executeReader(
   version: number,
   name: "aft_outline" | "aft_zoom",
   args: Record<string, unknown>,
+  deniedPath = "secret.ts",
 ) {
   const plugin = {
     pool: { getBridge: () => h.bridge } as unknown as BridgePool,
@@ -44,7 +45,7 @@ async function executeReader(
       const [request] = requests;
       if (request.permission !== "read") return;
       readPatterns.push(request.patterns);
-      if (request.patterns.includes("secret.ts")) {
+      if (request.patterns.includes(deniedPath)) {
         throw new Error(
           "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []",
         );
@@ -54,11 +55,11 @@ async function executeReader(
   const host = permissionHost({
     agentRules: [
       { action: "*", resource: "*", effect: "allow" },
-      { action: "read", resource: "secret.ts", effect: "deny" },
+      { action: "read", resource: deniedPath, effect: "deny" },
     ],
   });
   const definition = readingTools(plugin)[name];
-  const output =
+  const run = async () =>
     version === 1
       ? toolResultText(await definition.execute(args, v1))
       : String(
@@ -79,6 +80,11 @@ async function executeReader(
             )
           ).content,
         );
+  // OpenCode 2 reports a whole-call permission refusal as a failed tool call
+  // rather than as output text, so keep its message for the same assertions.
+  const output = await run().catch((error: unknown) =>
+    version === 2 ? String(error instanceof Error ? error.message : error) : Promise.reject(error),
+  );
   const patterns =
     version === 1
       ? readPatterns
@@ -121,6 +127,73 @@ describe.skipIf(!binary.binaryPath)("reading permissions through real tool_call"
       expect(output).not.toContain("privateMember");
       expect(output).not.toContain("content_files");
       expect(patterns.sort()).toEqual([["allowed.ts"], ["barrel.ts"], ["secret.ts"]]);
+    }, 60_000);
+  }
+
+  // A host rule names a file by its path under the project root. A request that
+  // goes through a symlink must still be checked against the real location of
+  // every file whose content comes back, or a rule on that location is bypassed.
+  for (const version of [1, 2]) {
+    for (const layout of ["deeper", "upward"] as const) {
+      test(`OC${version} zoom through a ${layout} symlink checks the re-export source at its real path`, async () => {
+        const h = await createHarness(binary, { fixtureNames: [], timeoutMs: 20_000 });
+        harnesses.push(h);
+        await mkdir(h.path("src"), { recursive: true });
+        await writeFile(
+          h.path("src/secret.ts"),
+          'export function hidden() { return "SECRET_BODY_MUST_NOT_ESCAPE"; }\n',
+        );
+        let target: string;
+        let barrel: string;
+        if (layout === "deeper") {
+          // `a/link` is one directory deeper than the `src` directory it names.
+          await mkdir(h.path("a"));
+          await symlink(h.path("src"), h.path("a/link"), "dir");
+          await writeFile(h.path("src/barrel.ts"), 'export { hidden } from "./secret";\n');
+          target = "a/link/barrel.ts";
+          barrel = "src/barrel.ts";
+        } else {
+          // `src/up` names the project root itself.
+          await symlink(h.tempDir, h.path("src/up"), "dir");
+          await writeFile(h.path("barrel.ts"), 'export { hidden } from "./src/secret";\n');
+          target = "src/up/barrel.ts";
+          barrel = "barrel.ts";
+        }
+        const { output, patterns } = await executeReader(
+          h,
+          version,
+          "aft_zoom",
+          { batch: [{ target, symbols: "hidden" }] },
+          "src/secret.ts",
+        );
+        expect(output).toContain("permission_denied: read");
+        expect(output).not.toContain("SECRET_BODY_MUST_NOT_ESCAPE");
+        // The requested spelling is checked before dispatch; the manifest then
+        // names the barrel and its re-export source at their real locations.
+        expect(patterns.sort()).toEqual([[barrel], ["src/secret.ts"], [target]].sort());
+      }, 60_000);
+    }
+
+    test(`OC${version} outline through a symlink checks the file at its real path`, async () => {
+      const h = await createHarness(binary, { fixtureNames: [], timeoutMs: 20_000 });
+      harnesses.push(h);
+      await mkdir(h.path("src"));
+      await mkdir(h.path("a"));
+      await symlink(h.path("src"), h.path("a/link"), "dir");
+      await writeFile(
+        h.path("src/secret.ts"),
+        "export function SECRET_SIGNATURE_MUST_NOT_ESCAPE() {}\n",
+      );
+      const { output, patterns } = await executeReader(
+        h,
+        version,
+        "aft_outline",
+        { target: "a/link/secret.ts" },
+        "src/secret.ts",
+      );
+      expect(output).toContain("permission_denied");
+      expect(output).not.toContain("SECRET_SIGNATURE_MUST_NOT_ESCAPE");
+      expect(patterns.sort()).toEqual([["a/link/secret.ts"], ["src/secret.ts"]]);
     }, 60_000);
   }
 

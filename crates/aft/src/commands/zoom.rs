@@ -636,7 +636,7 @@ fn finalize_zoom_read_paths(
         .filter_map(serde_json::Value::as_str)
         .map(PathBuf::from)
         .collect();
-    let manifest_paths = super::read_manifest::ReadManifestPaths::for_request(req, ctx);
+    let manifest_paths = super::read_manifest::ReadManifestPaths::for_context(ctx);
     match finalize_zoom_read_data(
         req,
         ctx,
@@ -3015,9 +3015,12 @@ mod tests {
     #[test]
     fn zoom_read_manifest_tracks_reexports_and_masks_only_affected_results() {
         let root = tempfile::tempdir().unwrap();
-        let barrel = root.path().join("barrel.ts");
-        let secret = root.path().join("secret.ts");
-        let allowed = root.path().join("allowed.ts");
+        // Without a project root, a manifest names each file at its canonical
+        // location, so build the fixture there.
+        let dir = crate::inspect::job::canonicalize_normalized(root.path());
+        let barrel = dir.join("barrel.ts");
+        let secret = dir.join("secret.ts");
+        let allowed = dir.join("allowed.ts");
         std::fs::write(
             &barrel,
             "export { hidden } from './secret';\nexport function local() {}\n",
@@ -3087,8 +3090,6 @@ mod tests {
         std::fs::create_dir(&real_root).unwrap();
         let request_root = temp.path().join("project-alias");
         symlink(&real_root, &request_root).unwrap();
-        let barrel = request_root.join("barrel.ts");
-        let secret = request_root.join("secret.ts");
         std::fs::write(
             &real_root.join("barrel.ts"),
             "export { hidden } from './secret';\n",
@@ -3099,35 +3100,196 @@ mod tests {
             "export function hidden() { return 'PRIVATE_BODY'; }\n",
         )
         .unwrap();
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(real_root.clone()),
-                restrict_to_project_root: true,
-                ..Config::default()
-            },
-        );
-        let request = serde_json::from_value(serde_json::json!({
-            "id": "symlinked-read-manifest", "command": "zoom",
-            "file": barrel, "symbol": "hidden",
-        }))
-        .unwrap();
+        // The manifest takes the spelling of the configured project root, not
+        // of the request: an alias root (like macOS `/var` for `/private/var`)
+        // keeps its alias, and a real root names the real files even when the
+        // request goes through the alias.
+        for configured_root in [&request_root, &real_root] {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(configured_root.clone()),
+                    restrict_to_project_root: true,
+                    ..Config::default()
+                },
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "symlinked-read-manifest", "command": "zoom",
+                "file": request_root.join("barrel.ts"), "symbol": "hidden",
+            }))
+            .unwrap();
 
-        let response = handle_zoom(&request, &ctx);
-        assert!(response.success, "{:?}", response.data);
-        let manifest = response.data["content_files"].as_array().unwrap();
-        let expected: Vec<_> = [barrel.clone(), secret.clone()]
+            let response = handle_zoom(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            let manifest = response.data["content_files"].as_array().unwrap();
+            let expected: Vec<_> = [
+                configured_root.join("barrel.ts"),
+                configured_root.join("secret.ts"),
+            ]
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+            assert_eq!(response.data["content_files"], serde_json::json!(expected));
+            assert!(manifest
+                .windows(2)
+                .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
+        }
+    }
+
+    /// Writes a barrel that re-exports `hidden` from a secret file and returns a
+    /// context bound to `root`. Permission rules name files relative to the
+    /// project root, so every manifest path must name the file it came from.
+    #[cfg(unix)]
+    fn symlinked_reexport_ctx(root: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                restrict_to_project_root: true,
+                ..Config::default()
+            },
+        )
+    }
+
+    /// Zooms `requested`, then repeats the zoom with `secret` excluded the way
+    /// a host does after a read-rule denial, and checks both manifests.
+    #[cfg(unix)]
+    fn assert_symlinked_reexport_manifest(
+        ctx: &AppContext,
+        requested: &Path,
+        barrel: &Path,
+        secret: &Path,
+    ) {
+        let mut request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "symlinked-reexport", "command": "zoom",
+            "file": requested, "symbol": "hidden",
+        }))
+        .unwrap();
+        let response = handle_zoom(&request, ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert!(response.data.to_string().contains("PRIVATE_BODY"));
+        let expected: BTreeSet<_> = [barrel.to_path_buf(), secret.to_path_buf()]
+            .into_iter()
+            .collect();
         assert_eq!(response.data["content_files"], serde_json::json!(expected));
-        assert!(manifest
-            .iter()
-            .all(|path| { PathBuf::from(path.as_str().unwrap()).starts_with(&request_root) }));
-        assert!(manifest
-            .windows(2)
-            .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
+
+        request.params["_exclude_read_paths"] = serde_json::json!([secret]);
+        let filtered = serde_json::to_value(handle_zoom(&request, ctx)).unwrap();
+        assert_eq!(filtered["code"], "permission_denied", "{filtered}");
+        assert!(!filtered.to_string().contains("PRIVATE_BODY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_names_reexport_source_through_deeper_symlink_at_real_location() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        // `a/link` sits one directory deeper than the `src` directory it names.
+        symlink(root.join("src"), root.join("a/link")).unwrap();
+        std::fs::write(
+            root.join("src/barrel.ts"),
+            "export { hidden } from './secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+
+        assert_symlinked_reexport_manifest(
+            &symlinked_reexport_ctx(&root),
+            &root.join("a/link/barrel.ts"),
+            &root.join("src/barrel.ts"),
+            &root.join("src/secret.ts"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_names_reexport_source_through_upward_symlink_at_real_location() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // `src/up` names the project root itself, so a request through it is
+        // one directory deeper than the file it reads.
+        symlink(&root, root.join("src/up")).unwrap();
+        std::fs::write(
+            root.join("barrel.ts"),
+            "export { hidden } from './src/secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+
+        assert_symlinked_reexport_manifest(
+            &symlinked_reexport_ctx(&root),
+            &root.join("src/up/barrel.ts"),
+            &root.join("barrel.ts"),
+            &root.join("src/secret.ts"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_names_sources_outside_the_project_root_canonically() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let real = temp.path().join("outside");
+        let alias = temp.path().join("outside-alias");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        std::fs::write(
+            real.join("barrel.ts"),
+            "export { hidden } from './secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            real.join("secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+        let canonical = crate::inspect::job::canonicalize_normalized(&real);
+
+        // Neither a missing project root nor a root that does not contain the
+        // sources may lend the request's alias spelling to the manifest.
+        for project_root in [None, Some(project)] {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: project_root.clone(),
+                    ..Config::default()
+                },
+            );
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "outside-root-manifest", "command": "zoom",
+                "file": alias.join("barrel.ts"), "symbol": "hidden",
+            }))
+            .unwrap();
+            let response = handle_zoom(&request, &ctx);
+            assert!(response.success, "{project_root:?}: {:?}", response.data);
+            let expected: BTreeSet<_> = [canonical.join("barrel.ts"), canonical.join("secret.ts")]
+                .into_iter()
+                .collect();
+            assert_eq!(
+                response.data["content_files"],
+                serde_json::json!(expected),
+                "{project_root:?}"
+            );
+        }
     }
 
     #[test]
