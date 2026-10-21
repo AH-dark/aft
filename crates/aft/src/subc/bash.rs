@@ -770,6 +770,63 @@ async fn unsettled_runon_launch_reply(
 /// is treated as unreadable.
 const RUNON_CAPTURE_READ_GRACE: Duration = Duration::from_secs(1);
 
+/// Added to the promotion reply of a foreground `runon` call whose window
+/// closed before the runner accepted the job.
+pub(super) const REMOTE_ADMISSION_PENDING_NOTE: &str = "The remote job is queued for remote admission: the runner has not accepted it yet. It was not killed and keeps going, and its completion arrives on this task, so do not rerun the command.";
+
+/// The reply of a nonblocking foreground `runon` call whose foreground window
+/// closed while the runner had not yet accepted the job. The capture wait
+/// answers such a task with a bare `starting` reply; a foreground caller needs
+/// what a local command promoted at the end of its window gets: the task id,
+/// what happens next, and that it must not run the command again. The task
+/// itself is moved to the background by the caller of this function, as for
+/// any answered foreground call. Every other reply passes through unchanged:
+/// a finished or refused task, a job the runner already accepted, a background
+/// launch, and a reply decided early by a module drain.
+fn foreground_runon_reply(
+    response: Response,
+    window_end: Option<Instant>,
+    cancel: &BashWaitCancel,
+    timeout: Option<u64>,
+    window_ms: u64,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> Response {
+    let Some(window_end) = window_end else {
+        return response;
+    };
+    if Instant::now() < window_end
+        || cancel.drain.is_active()
+        || !response.success
+        || response.data["status"] != "starting"
+    {
+        return response;
+    }
+    let Some(task_id) = response.data["task_id"].as_str() else {
+        return response;
+    };
+    let promotion = Response::success(
+        &response.id,
+        json!({
+            "output": format!(
+                "{}\n{REMOTE_ADMISSION_PENDING_NOTE}",
+                crate::commands::bash_orchestrate::format_promotion_message(
+                    task_id,
+                    timeout,
+                    window_ms,
+                    worker_session,
+                    bash_watch_available,
+                ),
+            ),
+            "task_id": task_id,
+            "status": "starting",
+            "remote_phase": crate::bash_background::registry::remote::RemotePhase::Submitting.tag(),
+            "remote_job_id": Value::Null,
+        }),
+    );
+    with_capture_warning(&promotion)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn await_runon_launch_reply(
     registry: crate::bash_background::BgTaskRegistry,
@@ -1198,6 +1255,36 @@ pub(super) fn submit_deferred_bash(
         )
     }
     .min(20_000);
+    // A nonblocking foreground `runon` call answers within the same foreground
+    // window as a local command, counted from when the call arrived, never
+    // from when the runner accepts the job. The runner can take far longer than
+    // the window to accept a job when it is busy, and the host plugins give an
+    // ordinary foreground call only the window plus a short margin before they
+    // give up. A caller that gives up gets no task id, cannot tell whether the
+    // job ran, and may run it a second time. So the wait for the runner's
+    // acceptance ends at the window, and a job still unaccepted by then is
+    // handed to the background with its task id (`foreground_runon_reply`).
+    let foreground_runon = capture_deadline.is_some()
+        && !blocking_intent
+        && !server_completion
+        && !["background", "pty"].iter().any(|key| {
+            raw_args
+                .get(*key)
+                .and_then(crate::subc_translate::model_boolean)
+                == Some(true)
+        });
+    let foreground_runon_deadline = foreground_runon
+        .then(|| reply_budget.cap(received_at + Duration::from_millis(startup_window)));
+    let capture_deadline = capture_deadline
+        .map(|deadline| foreground_runon_deadline.map_or(deadline, |window| deadline.min(window)));
+    // The capture wait's state reads get a short grace past the window (see
+    // `RUNON_CAPTURE_READ_GRACE`); a read still blocked then must not hold a
+    // foreground reply any longer.
+    let capture_reply_deadline = foreground_runon_deadline
+        .map_or(reply_budget.deadline, |window| {
+            reply_budget.cap(window + RUNON_CAPTURE_READ_GRACE)
+        });
+    let foreground_runon_timeout = raw_args.get("timeout").and_then(Value::as_u64);
     let startup_deadline =
         reply_budget.cap(startup_started_at + Duration::from_millis(startup_window));
     let receipt = Arc::new(crate::bash_background::SpawnReceipt::new_with_start_time(
@@ -1745,7 +1832,8 @@ pub(super) fn submit_deferred_bash(
                                 tokio::time::timeout_at(reply_budget.deadline.into(), warn_if_runon_capture_missing(spawn_ctx.bash_background().clone(), task_id, session_id.clone(), copy_response(&response))).await.unwrap_or_else(|_| with_capture_warning(&response))
                             } else { response }
                         } else {
-                            await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, server_completion, Some(reply_budget.deadline)).await.unwrap_or(response)
+                            let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, server_completion, Some(capture_reply_deadline)).await.unwrap_or(response);
+                            foreground_runon_reply(reply, foreground_runon_deadline, &cancel, foreground_runon_timeout, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session))
                         };
                         crate::slog_warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={} steps={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"), startup_steps.format_steps());
                         let result = (!cancel.connection.is_cancelled() && !cancel.route.is_cancelled() && claim.try_claim_for_wait_task()).then(|| bash_result_from_response(response, &format_context));
@@ -1774,10 +1862,21 @@ pub(super) fn submit_deferred_bash(
                 &cancel,
                 &claim,
                 server_completion,
-                Some(reply_budget.deadline),
+                Some(capture_reply_deadline),
             )
             .await
             {
+                let response = foreground_runon_reply(
+                    response,
+                    foreground_runon_deadline,
+                    &cancel,
+                    foreground_runon_timeout,
+                    startup_window,
+                    worker_session,
+                    format_context
+                        .bash_watch_available
+                        .unwrap_or(worker_session),
+                );
                 send_bash_deferred_completion(
                     &completion_tx,
                     &task_metrics,
@@ -5150,18 +5249,20 @@ mod grant_path_tests {
         }
     }
 
-    /// Neither a background launch reply nor a foreground promotion may answer
-    /// before the runner's Accepted. The call is received two seconds ago with
-    /// a one-second foreground window, so promotion is already due when the
-    /// capture wait starts, and the capture deadline is an hour out: nothing but
-    /// Accepted may release the reply. The half-second check before Accepted
-    /// can only miss an early reply under load, never fail a correct one; the
-    /// wait after Accepted is a hang watchdog.
+    /// A background launch reply may not answer before the runner's Accepted.
+    /// The call is received two seconds ago with a one-second foreground
+    /// window, and the capture deadline is an hour out: nothing but Accepted
+    /// may release the reply. The half-second check before Accepted can only
+    /// miss an early reply under load, never fail a correct one; the wait after
+    /// Accepted is a hang watchdog. A foreground call is the opposite case: it
+    /// answers at the end of its window whether or not the runner accepted the
+    /// job (`foreground_runon_replies_within_its_window_when_admission_is_slow`).
     #[cfg(unix)]
     #[tokio::test]
-    async fn runon_capture_delays_background_reply_and_foreground_promotion() {
+    async fn runon_capture_delays_background_reply_until_accepted() {
         use crate::exec_remote::wire_tests::Script;
-        for background in [true, false] {
+        {
+            let background = true;
             let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::GatedAcceptance).await;
             ctx.update_config(|config| config.foreground_wait_window_ms = 1_000);
@@ -5210,6 +5311,113 @@ mod grant_path_tests {
                 "neither launch nor promotion may reply before Accepted (background={background}): {response:?}"
             );
         }
+    }
+
+    /// A runner that is slow to accept a job must not hold a foreground call
+    /// past its foreground window. The call's `timeout` is ten minutes, so the
+    /// wait for the runner's acceptance alone would last a full minute; only
+    /// the one-second window may end it. The reply must carry the task id, say
+    /// the job awaits admission and must not be rerun, and the job's later
+    /// completion must arrive on that same task as a background completion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_runon_replies_within_its_window_when_admission_is_slow() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, ctx) =
+            capture_fixture(Script::GatedAcceptanceThenExit).await;
+        ctx.update_config(|config| config.foreground_wait_window_ms = 1_000);
+        let received = Instant::now();
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "timeout":600_000}),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a foreground runon call must answer at its window, not at runner admission")
+            .unwrap();
+        let waited = received.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "the reply took {waited:?}, past the one-second window"
+        );
+        let response = done.response_for_test();
+        let text = done.text_for_test().unwrap();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap().to_owned();
+        assert_eq!(response.data["status"], "starting", "{response:?}");
+        assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
+        assert!(text.contains("promoted to background"), "{text}");
+        assert!(text.contains(&task_id), "{text}");
+        assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
+        assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
+        assert!(
+            ctx.bash_background()
+                .remote_progress(&task_id, "deadline-session")
+                .unwrap()
+                .job_id
+                .is_none(),
+            "the reply must come before the runner accepted the job"
+        );
+
+        daemon.acceptance_gate.notify_one();
+        wait_for_task_state(&ctx, "completed", |registry| {
+            registry.is_task_terminal(&task_id)
+        })
+        .await;
+        assert_eq!(
+            ctx.bash_background()
+                .observed_status(&task_id, "deadline-session", 0)
+                .unwrap()
+                .info
+                .status,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+        wait_for_task_state(&ctx, "completion queued", |registry| {
+            registry.has_completions_for_session(Some("deadline-session"))
+        })
+        .await;
+        assert!(
+            ctx.bash_background()
+                .drain_completions_for_session(Some("deadline-session"))
+                .iter()
+                .any(|completion| completion.task_id == task_id),
+            "the promoted task must deliver its completion on the task id the reply named"
+        );
+    }
+
+    /// A remote job the runner accepts and finishes inside the foreground
+    /// window answers inline with its result, exactly like a fast local
+    /// command: no promotion, no capture warning, no background completion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_foreground_runon_answers_inline_without_promotion() {
+        use crate::exec_remote::wire_tests::Script;
+        let (_daemon, _dir, root, executor, ctx) = capture_fixture(Script::Plain).await;
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "timeout":600_000}),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(14), rx.recv())
+            .await
+            .expect("a fast remote job must answer inside the 15-second window")
+            .unwrap();
+        let response = done.response_for_test();
+        let text = done.text_for_test().unwrap();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert!(!text.contains("promoted to background"), "{text}");
+        assert!(!text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
+        assert!(!text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        assert!(
+            !ctx.bash_background()
+                .drain_completions_for_session(Some("deadline-session"))
+                .iter()
+                .any(|completion| completion.task_id == task_id),
+            "an inline result must not also arrive as a background completion"
+        );
     }
 
     #[cfg(unix)]

@@ -21,6 +21,7 @@ import {
   type ShellTimeoutOutcome,
 } from "./bridge.js";
 import {
+  isDispatchedRequestDeadlineError,
   isLocalRouteCloseRejection,
   isSubcClientClosedError,
   isSubcFrameReadTimeoutError,
@@ -432,6 +433,17 @@ export function adaptToolError(command: string, error: unknown): unknown {
     error.message = error.message
       ? `${error.message} ${SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION}`
       : SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION;
+    return error;
+  }
+
+  // subc-client's own deadline on a bash request that was already sent: AFT
+  // may have started the command, and AFT keeps a started command running, so
+  // the caller gets the same do-not-rerun guidance as for a dropped connection
+  // instead of a bare timeout that reads as a failure to retry.
+  if (command === "bash" && isDispatchedRequestDeadlineError(error)) {
+    const disposition = bashConnectionClosedDisposition(taskIdFromError(error));
+    if (error.message.includes(disposition)) return error;
+    error.message = error.message ? `${error.message} ${disposition}` : disposition;
     return error;
   }
 
