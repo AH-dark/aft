@@ -40,6 +40,10 @@ pub const BOT_REQUEST_OPERATION: &str = "gh_shim.bot_request";
 /// check. Params: `{ticket}`; an `agent_id` the shim still sends is ignored,
 /// because the reply lists every repository's binding whichever agent asks.
 pub const BINDINGS_READ_OPERATION: &str = "gh_shim.bindings_read";
+/// Inspect the ticket's daemon-stamped session kind, without contacting Plexus.
+pub const SESSION_CONTEXT_OPERATION: &str = "gh_shim.session_context";
+/// Relay a credential-free github_read request under the ticket's scoped route.
+pub const READ_REQUEST_OPERATION: &str = "gh_shim.read_request";
 
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
 /// The handle connection named in `bindings.read`. Plexus uses the name only
@@ -51,7 +55,13 @@ const BINDINGS_READ_CONNECTION_ID: &str = "github-handle-aft-alfonso";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn is_relay_operation(operation: &str) -> bool {
-    matches!(operation, BOT_REQUEST_OPERATION | BINDINGS_READ_OPERATION)
+    matches!(
+        operation,
+        BOT_REQUEST_OPERATION
+            | BINDINGS_READ_OPERATION
+            | SESSION_CONTEXT_OPERATION
+            | READ_REQUEST_OPERATION
+    )
 }
 
 /// Plexus answers a tool call either with its facade reply directly or wrapped
@@ -166,6 +176,11 @@ impl RouteScopes {
 /// The outbound call the relay makes. Production uses the daemon's own
 /// `reserved:aft` subc connection; tests use fakes that record the bodies.
 pub trait RelayTransport: Send + Sync {
+    /// Validate the immutable ticket-time repository against the signed local
+    /// manifest. Neither request data nor later Git config can select a target.
+    fn read_repository(&self, ticket: &crate::gh_shim_ticket::Redeemed) -> Result<String, String> {
+        crate::gh_shim::verified_worker_read_repository(ticket.read_repository.as_deref())
+    }
     /// Send `body` to plexus's tool provider and return the parsed JSON reply.
     /// With `scope`, the route to plexus must be opened under that scope, so
     /// plexus sees its stamp; without one the route is unscoped.
@@ -303,6 +318,24 @@ pub async fn relay<T: RelayTransport>(
             redeemed.task_id.clone()
         };
         match call.operation {
+            READ_REQUEST_OPERATION => {
+                let stamp = call.route_scopes.for_session(&redeemed.session_id);
+                let (reply, taken) = read_request(transport, &redeemed, stamp, params).await;
+                path = taken;
+                reply
+            }
+            SESSION_CONTEXT_OPERATION => {
+                match call.route_scopes.for_session(&redeemed.session_id) {
+                    Some(stamp) if worker_scope(stamp) || head_scope(stamp) => RelayReply::relayed(
+                        json!({"worker": worker_scope(stamp), "head": head_scope(stamp), "repository": redeemed.read_repository}),
+                    ),
+                    _ => RelayReply::refused(
+                        "session_unscoped",
+                        "scope",
+                        "the ticket has no unambiguous daemon-stamped session",
+                    ),
+                }
+            }
             BINDINGS_READ_OPERATION => {
                 path = PATH_UNSCOPED;
                 bindings_read(transport, &redeemed).await
@@ -328,6 +361,107 @@ pub async fn relay<T: RelayTransport>(
         reply.outcome_label().escape_debug(),
     ));
     reply
+}
+
+/// Match the worker rule used for access grants: parented runs inherit worker
+/// policy, while an unparented run belongs to the head.
+fn worker_scope(stamp: &ScopeStamp) -> bool {
+    use subc_protocol::scope::ScopeKind;
+    use subc_protocol::Principal;
+    stamp.owner_authorized
+        && matches!(&stamp.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
+        && (stamp.kind == ScopeKind::Worker
+            || (stamp.kind == ScopeKind::Ephemeral && stamp.parent.is_some()))
+}
+
+fn head_scope(stamp: &ScopeStamp) -> bool {
+    use subc_protocol::scope::ScopeKind;
+    stamp.owner_authorized
+        && matches!(&stamp.owner, subc_protocol::Principal::Reserved {module_id} if module_id == "prefrontal-core")
+        && stamp.parent.is_none()
+        && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
+}
+
+async fn read_request<T: RelayTransport>(
+    transport: &T,
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
+    params: &Value,
+) -> (RelayReply, &'static str) {
+    let request = params.get("request").cloned().unwrap_or(Value::Null);
+    let parsed = serde_json::from_value::<crate::gh_shim::read_contract::Request>(request.clone());
+    let parsed = match parsed
+        .map_err(|error| error.to_string())
+        .and_then(|request| {
+            request.validate()?;
+            Ok(request)
+        }) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return (
+                RelayReply::refused("request_malformed", "request", message),
+                "-",
+            );
+        }
+    };
+    let Some(stamp) = stamp.filter(|stamp| worker_scope(stamp) && transport.opens_scoped_routes())
+    else {
+        return (
+            RelayReply::refused(
+                "agent_identity_required",
+                "scope",
+                "governed reads require the ticket's authenticated worker scope",
+            ),
+            "-",
+        );
+    };
+    let bound = match transport.read_repository(redeemed) {
+        Ok(bound) => bound,
+        Err(message) => {
+            return (
+                RelayReply::refused("repository_not_visible", "binding", message),
+                "-",
+            )
+        }
+    };
+    if parsed.repository() != bound {
+        return (
+            RelayReply::refused(
+                "repository_not_visible",
+                "binding",
+                "worker reads are limited to the ticket session's bound checkout repository",
+            ),
+            "-",
+        );
+    }
+    // The selector reopens the redeemed session's scope at the same epoch.
+    // Plexus receives its own target-specific stamp, including worker delegation;
+    // AFT neither reads nor reconstructs the bot identity in that stamp.
+    let selector = scope_selector(stamp);
+    let body = serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
+        name: "github_read".into(),
+        arguments: request,
+        tool_call_id: None,
+        progress_token: None,
+        call_key: None,
+        schema_pin: None,
+        origin: None,
+        preset: None,
+    })
+    .expect("a read tool call serializes to JSON");
+    let reply = match transport
+        .plexus(
+            &redeemed.project_root,
+            &redeemed.session_id,
+            Some(&selector),
+            body,
+        )
+        .await
+    {
+        Ok(reply) => RelayReply::relayed(reply),
+        Err(error) => transport_refusal("plexus", error),
+    };
+    (reply, PATH_STAMP)
 }
 
 /// Read plexus's repository-to-agent bindings for the shim's version check.

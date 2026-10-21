@@ -1582,6 +1582,27 @@ fn linux_jailed_launch_reports_sccache_gap_without_blocking_tcp() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_reports_unenforced_credential_filename_prefixes() {
+    skip_if_landlock_absent!();
+    let mut fixture = ProbeFixture::new();
+    let mut profile: SandboxProfile =
+        serde_json::from_reader(fixture.profile.file.as_file_mut()).unwrap();
+    profile
+        .deny_prefixes
+        .push(fixture.secret.join("credentials"));
+    fixture.profile = InheritedProfile::new(&profile);
+    let output = fixture.launch_bash("printf PREFIX_PROBE_RAN");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"PREFIX_PROBE_RAN");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("credential_filename_prefix_future_entries_unenforced_on_landlock"),
+        "{output:?}"
+    );
+}
+
 #[path = "helpers/session_output.rs"]
 mod session_output;
 

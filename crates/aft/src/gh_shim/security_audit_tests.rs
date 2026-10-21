@@ -1,0 +1,1002 @@
+use super::*;
+
+struct Env(&'static str, Option<OsString>);
+impl Env {
+    fn set(key: &'static str, value: Option<&OsStr>) -> Self {
+        let old = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        Self(key, old)
+    }
+}
+impl Drop for Env {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(value) => std::env::set_var(self.0, value),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
+struct Fixture {
+    paths: StatePaths,
+    home: tempfile::TempDir,
+    _env: Vec<Env>,
+    _guard: crate::test_env::GhShimStateGuard,
+}
+impl Fixture {
+    fn new(version: u64) -> Self {
+        let guard = crate::test_env::gh_shim_state_guard();
+        let home = tempfile::tempdir().unwrap();
+        let mut env = vec![
+            Env::set("HOME", Some(home.path().as_os_str())),
+            Env::set("USERPROFILE", Some(home.path().as_os_str())),
+            Env::set("XDG_CONFIG_HOME", Some(home.path().as_os_str())),
+            Env::set("GH_REPO", Some(OsStr::new("cortexkit/aft"))),
+        ];
+        for key in [
+            "GH_SHIM_BYPASS",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GH_CONFIG_DIR",
+            "GIT_CONFIG_COUNT",
+        ] {
+            env.push(Env::set(key, None));
+        }
+        let paths = StatePaths::from_process();
+        let name = if version == 19 {
+            include_str!("../../tests/fixtures/gh_shim/v19-manifest.json")
+        } else {
+            include_str!("../../tests/fixtures/gh_shim/v20-manifest.json")
+        };
+        let manifest: Manifest = serde_json::from_str(name).unwrap();
+        tests::write_signed_manifest(&paths, manifest, unix_seconds());
+        Self {
+            paths,
+            home,
+            _env: env,
+            _guard: guard,
+        }
+    }
+    fn regress(&self) {
+        assert!(matches!(
+            resolve_manifest(&self.paths, unix_seconds()),
+            ManifestResolution::Active(_)
+        ));
+        fs::write(&self.paths.manifest, b"not a signed envelope").unwrap();
+    }
+    fn repo(&self) -> PathBuf {
+        let root = self.home.path().join("checkout");
+        let output = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/cortexkit/aft.git",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        root
+    }
+}
+fn args(raw: &[&str]) -> Vec<OsString> {
+    raw.iter().map(OsString::from).collect()
+}
+
+fn failure_flow(regressed: bool) {
+    let fixture = Fixture::new(20);
+    if regressed {
+        fixture.regress();
+    }
+    for raw in [
+        vec!["api", "-X", "POST", "repos/cortexkit/aft/issues"],
+        vec!["api", "-f", "a=b", "repos/cortexkit/aft/issues"],
+        vec!["api", "--input", "f", "repos/cortexkit/aft/issues"],
+        vec!["api", "graphql"],
+        vec!["issue", "create"],
+        vec!["issue", "create", "--repo", "outside/unbound"],
+        vec!["auth", "token"],
+    ] {
+        let mut lookups = 0;
+        let status = run_with(
+            &args(&raw),
+            |_| panic!("legacy refusal must not invoke native gh: {raw:?}"),
+            |_, _, _, _| {
+                lookups += 1;
+                Err("ticket_unknown".into())
+            },
+        );
+        assert_eq!(status, 86, "{raw:?}");
+        assert_eq!(lookups, 1, "the actual lookup-error boundary was exercised");
+    }
+    let raw = args(&["api", "repos/cortexkit/aft/issues", "--jq", ".[].title"]);
+    let mut forwarded = Vec::new();
+    let status = run_with(
+        &raw,
+        |args| {
+            forwarded.push(args.to_vec());
+            23
+        },
+        |_, _, _, _| Err("old daemon".into()),
+    );
+    assert_eq!(status, 23);
+    assert_eq!(forwarded, vec![raw]);
+}
+
+#[test]
+fn audit_lookup_error_resumes_all_active_v19_guards() {
+    failure_flow(false);
+}
+#[test]
+fn audit_lookup_error_resumes_regressed_v19_classification() {
+    failure_flow(true);
+}
+
+#[test]
+fn audit_repository_names_have_only_github_characters() {
+    for repo in [
+        "../user",
+        "owner/..",
+        "./repo",
+        "?/repo",
+        "owner/#",
+        "%2e/repo",
+        "owner/repo%2fmore",
+        "ow ner/repo",
+        "owner/répo",
+    ] {
+        assert!(canonical_repository_key(repo).is_none(), "{repo}");
+        let request = read_contract::Request::Get {
+            repository: repo.into(),
+            args: read_contract::GetArgs {
+                path: "issues".into(),
+                query: BTreeMap::new(),
+                accept: read_contract::Accept::Json,
+            },
+        };
+        assert!(request.validate().is_err(), "{repo}");
+    }
+    assert_eq!(
+        canonical_repository_key("Owner-1/Repo_2.name"),
+        Some("owner-1/repo_2.name".into())
+    );
+}
+
+#[test]
+fn audit_daemon_resolves_verified_v20_checkout_not_ambient_repo() {
+    let fixture = Fixture::new(20);
+    let repo = fixture.repo();
+    let snapshot = ticket_repository_snapshot(&repo);
+    assert_eq!(snapshot.as_deref(), Some("cortexkit/aft"));
+    let _foreign = Env::set("GH_REPO", Some(OsStr::new("cortexkit/common-auth")));
+    assert_eq!(
+        verified_worker_read_repository(snapshot.as_deref()).unwrap(),
+        "cortexkit/aft"
+    );
+    fixture.regress();
+    assert!(verified_worker_read_repository(snapshot.as_deref()).is_err());
+}
+
+#[test]
+fn audit_daemon_rejects_v19_manifest_before_read_binding() {
+    let fixture = Fixture::new(19);
+    let repo = fixture.repo();
+    let snapshot = ticket_repository_snapshot(&repo);
+    let error = verified_worker_read_repository(snapshot.as_deref()).unwrap_err();
+    assert!(error.contains("manifest v20"), "{error}");
+}
+
+#[test]
+fn audit_v19_status_matches_legacy_bytes_even_with_a_lookup_record() {
+    let fixture = Fixture::new(19);
+    fs::write(
+        fixture.paths.root.join("read-session-lookup.json"),
+        br#"{"outcome":"unavailable","reason":"old daemon","at_unix_secs":7}"#,
+    )
+    .unwrap();
+    let rendered = render_self_report(&fixture.paths).unwrap();
+    let captured = include_str!("../../tests/fixtures/gh_shim/v19-main-status.jsonc");
+    let (_, expected) = captured.split_once("// END HEADER\n").unwrap();
+    let normalized = super::v19_compat_tests::normalize_v19_status(&rendered).unwrap();
+    assert_eq!(
+        normalized, expected,
+        "v19 status must match the frozen origin/main binary capture"
+    );
+}
+
+fn relay(ticket: Option<&str>) -> RelayContext {
+    RelayContext {
+        connection_file: None,
+        ticket: ticket.map(str::to_string),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(1),
+    }
+}
+
+#[test]
+fn audit_worker_native_exit_is_closed_for_every_legacy_command_shape() {
+    for raw in [
+        vec!["api", "--include", "repos/cortexkit/aft/issues"],
+        vec![
+            "api",
+            "-X",
+            "GET",
+            "-X",
+            "GET",
+            "repos/cortexkit/aft/issues",
+        ],
+        vec!["api", "graphql", "-f", "query=query { viewer { login } }"],
+        vec!["auth", "status"],
+        vec!["repo", "clone", "other/repo"],
+        vec!["--help"],
+    ] {
+        let status = native_guard::dispatch_with(
+            &args(&raw),
+            &relay(Some("worker-ticket")),
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false,
+            },
+            |_| Ok(Some(true)),
+            |_| panic!("worker reached operator gh: {raw:?}"),
+        );
+        assert_eq!(status, 86);
+    }
+}
+
+#[test]
+fn audit_authenticated_head_keeps_native_argv_and_exit_status() {
+    let argv = args(&["api", "graphql", "-f", "query=query { viewer { login } }"]);
+    let mut calls = Vec::new();
+    let status = native_guard::dispatch_with(
+        &argv,
+        &relay(Some("head-ticket")),
+        native_guard::ShellSignals {
+            sandboxed: false,
+            worker_marked: false,
+        },
+        |_| Ok(Some(false)),
+        |forwarded| {
+            calls.push(forwarded.to_vec());
+            27
+        },
+    );
+    assert_eq!(status, 27);
+    assert_eq!(calls, vec![argv]);
+    assert!(native_guard::permission_with(
+        &relay(None),
+        native_guard::ShellSignals::default(),
+        |_| panic!("ordinary head must not need a lookup")
+    )
+    .is_ok());
+}
+
+#[test]
+fn review_unscoped_head_ticket_preserves_native_passthrough() {
+    for outcome in [Ok(None), Err("prefrontal-core unavailable".into())] {
+        let argv = args(&["pr", "view", "42"]);
+        let mut calls = Vec::new();
+        let status = native_guard::dispatch_with(
+            &argv,
+            &relay(Some("unscoped-head-ticket")),
+            native_guard::ShellSignals::default(),
+            |_| outcome,
+            |forwarded| {
+                calls.push(forwarded.to_vec());
+                27
+            },
+        );
+        assert_eq!(status, 27);
+        assert_eq!(calls, vec![argv]);
+    }
+}
+
+fn assert_worker_marker_refuses_native_gh(outcome: Result<Option<bool>, String>) {
+    for ticket in [Some("worker-ticket"), None] {
+        let permission = native_guard::permission_with(
+            &relay(ticket),
+            native_guard::ShellSignals {
+                sandboxed: false,
+                worker_marked: true,
+            },
+            |_| outcome.clone(),
+        );
+        assert_eq!(
+            permission.unwrap_err(),
+            "operator gh is not available to worker-marked shells; use governed reads or bot speech"
+        );
+    }
+}
+
+#[test]
+fn review_worker_marker_refuses_native_gh_when_scope_lookup_errors() {
+    assert_worker_marker_refuses_native_gh(Err("prefrontal-core unavailable".into()));
+}
+
+#[test]
+fn review_worker_marker_refuses_native_gh_when_scope_is_empty() {
+    assert_worker_marker_refuses_native_gh(Ok(None));
+}
+
+#[test]
+fn review_worker_marker_cannot_be_overridden_by_head_attribution() {
+    assert_worker_marker_refuses_native_gh(Ok(Some(false)));
+}
+
+#[test]
+fn review_unscoped_head_keeps_v19_and_missing_manifest_reads() {
+    for missing in [false, true] {
+        let fixture = Fixture::new(19);
+        if missing {
+            fs::remove_file(&fixture.paths.manifest).unwrap();
+        }
+        let argv = args(&["pr", "view", "42"]);
+        let status = run_with(
+            &argv,
+            |forwarded| {
+                native_guard::dispatch_with(
+                    forwarded,
+                    &relay(Some("unscoped-head-ticket")),
+                    native_guard::ShellSignals::default(),
+                    |_| Ok(None),
+                    |native_args| {
+                        assert_eq!(native_args, argv);
+                        27
+                    },
+                )
+            },
+            |_, _, _, _| Ok(None),
+        );
+        assert_eq!(status, 27, "missing manifest: {missing}");
+    }
+}
+
+#[test]
+fn review_canary_denial_overrides_missing_or_head_scope() {
+    for outcome in [Ok(None), Ok(Some(false)), Err("no scope".into())] {
+        let status = native_guard::dispatch_with(
+            &args(&["pr", "view", "42"]),
+            &relay(Some("ticket")),
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false,
+            },
+            |_| outcome,
+            |_| panic!("jailed worker reached native gh"),
+        );
+        assert_eq!(status, 86);
+    }
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn review_stamped_worker_reaches_governed_read_instead_of_native_gh() {
+    use std::sync::Arc;
+    let fixture = Fixture::new(20);
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(|body| {
+        let data = if body["op"] == crate::gh_shim_relay::SESSION_CONTEXT_OPERATION {
+            json!({"worker":true,"head":false,"repository":"cortexkit/aft"})
+        } else {
+            assert_eq!(body["op"], crate::gh_shim_relay::READ_REQUEST_OPERATION);
+            assert_eq!(body["params"]["request"]["repository"], "cortexkit/aft");
+            assert_eq!(body["params"]["request"]["args"]["path"], "pulls/42");
+            json!({"result":{"status":200,"body":{"number":42},"next_page":null},"isError":false})
+        };
+        json!({"op":body["op"],"status":"ok","data":data})
+    }));
+    let file = fixture.home.path().join("connection.json");
+    daemon.write_connection_file(&file);
+    let config = fixture.home.path().join("cortexkit/aft.jsonc");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        json!({"subc":{"connection_file":file}}).to_string(),
+    )
+    .unwrap();
+    let _ticket = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        Some(OsStr::new("worker-ticket")),
+    );
+    let status = run_with(
+        &args(&["pr", "view", "42", "--json", "number"]),
+        |_| panic!("stamped worker reached native gh"),
+        worker_reads::identity_for_command,
+    );
+    assert_eq!(status, 0);
+    let requests = daemon.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|body| body["op"] == crate::gh_shim_relay::READ_REQUEST_OPERATION)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn audit_unattributed_jailed_worker_never_gets_operator_gh() {
+    for signals in [native_guard::ShellSignals {
+        sandboxed: true,
+        ..Default::default()
+    }] {
+        let status = native_guard::dispatch_with(
+            &args(&["api", "repos/cortexkit/aft/issues"]),
+            &relay(None),
+            signals,
+            |_| panic!("missing ticket cannot be looked up"),
+            |_| panic!("stripped agent reached operator gh"),
+        );
+        assert_eq!(status, 86);
+    }
+    for outcome in [Err("old daemon".into()), Ok(None)] {
+        assert!(native_guard::permission_with(
+            &relay(Some("bad-ticket")),
+            native_guard::ShellSignals {
+                sandboxed: true,
+                worker_marked: false
+            },
+            |_| outcome
+        )
+        .is_err());
+    }
+}
+
+/// Run the probe child in a fresh process, as a shell would run the shim:
+/// `mode` picks what confines it, and `clear_all` mimics `env -i`.
+///
+/// Modes: `jail` confines the child the way AFT's worker jail does for the
+/// canary (reads and writes of the canary directory denied). `outer-missing`
+/// and `outer-readable` confine it the way a container or another tool's
+/// sandbox does (Linux no_new_privs; macOS an unrelated Seatbelt profile), with
+/// no canary or a readable one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_probe_child(mode: &str, clear_all: bool) -> (std::process::Output, tempfile::TempDir) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home = home.keep().canonicalize().unwrap();
+    if mode != "outer-missing" {
+        crate::worker_jail_canary::prepare(&home).unwrap();
+    }
+    fs::write(bin.path().join("probe-mode"), mode).unwrap();
+    fs::write(
+        bin.path().join("probe-home"),
+        home.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    let fake = bin.path().join("gh");
+    fs::write(
+        &fake,
+        b"#!/bin/sh\nprintf invoked > \"$0.ran\"\nprintf '123\\n'\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.current_dir(bin.path());
+    command.args([
+        "--exact",
+        "gh_shim::security_audit_tests::stripped_worker_probe_child",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    if clear_all {
+        command.env_clear();
+    } else {
+        command
+            .env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+            .env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // Every Linux confinement in these modes sets no_new_privs, as an
+        // outer container or CI sandbox does; only `jail` adds the canary deny.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let output = command.output().unwrap();
+    let _ = fs::remove_dir_all(&home);
+    (output, bin)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn audit_env_i_and_unset_ticket_keep_kernel_worker_fence() {
+    let _lock = crate::test_env::process_env_lock();
+    for clear_all in [false, true] {
+        let (output, bin) = run_probe_child("jail", clear_all);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(!bin.path().join("gh.ran").exists());
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn audit_linux_prctl_error_still_checks_denied_worker_canary() {
+    let _lock = crate::test_env::process_env_lock();
+    let (output, _) = run_probe_child("jail-prctl-error", true);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A sandbox AFT did not create (a container's no_new_privs, a CI job sandbox,
+/// another tool's Seatbelt profile) is not a worker jail: gh passes through.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn audit_outer_sandbox_without_the_worker_canary_keeps_native_passthrough() {
+    let _lock = crate::test_env::process_env_lock();
+    for mode in ["outer-missing", "outer-readable"] {
+        for clear_all in [false, true] {
+            let (output, bin) = run_probe_child(mode, clear_all);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            // The shim execs the real gh in place of the probe process, so the
+            // fake gh's output, not a test summary, ends the child's stdout.
+            assert!(stdout.ends_with("123\n"), "{mode}: {stdout}");
+            assert!(
+                bin.path().join("gh.ran").exists(),
+                "{mode}: native gh did not run"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("gh_shim_worker_native_gh"),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// Deny reads and writes of `denied` and nothing else, the way the worker jail
+/// treats its canary directory. Landlock grants are allow-lists, so grant every
+/// sibling along the path from `/` and leave only `denied` out.
+#[cfg(target_os = "linux")]
+fn confine_like_the_worker_jail(denied: &Path) {
+    use landlock::{
+        Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus, ABI,
+    };
+    let abi = ABI::V3;
+    let mut ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .unwrap()
+        .create()
+        .unwrap();
+    let mut chain = denied.ancestors().collect::<Vec<_>>();
+    chain.reverse();
+    for pair in chain.windows(2) {
+        for entry in fs::read_dir(pair[0]).unwrap() {
+            let path = entry.unwrap().path();
+            if path == pair[1] {
+                continue;
+            }
+            let Ok(fd) = PathFd::new(&path) else { continue };
+            let access = if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                AccessFs::from_all(abi)
+            } else {
+                AccessFs::from_file(abi)
+            };
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, access)).unwrap();
+        }
+    }
+    let status = ruleset.restrict_self().unwrap();
+    assert_eq!(status.ruleset, RulesetStatus::FullyEnforced);
+}
+
+#[cfg(target_os = "macos")]
+fn confine_with_seatbelt(source: &str) {
+    unsafe extern "C" {
+        fn sandbox_init(
+            profile: *const libc::c_char,
+            flags: u64,
+            errorbuf: *mut *mut libc::c_char,
+        ) -> libc::c_int;
+    }
+    let source = std::ffi::CString::new(source).unwrap();
+    let mut error = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SBPL source and a writable error pointer.
+    assert_eq!(unsafe { sandbox_init(source.as_ptr(), 0, &mut error) }, 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore]
+fn stripped_worker_probe_child() {
+    assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).is_none());
+    assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_none());
+    let cwd = std::env::current_dir().unwrap();
+    let mode = fs::read_to_string(cwd.join("probe-mode")).unwrap();
+    let home = PathBuf::from(String::from_utf8(fs::read(cwd.join("probe-home")).unwrap()).unwrap());
+    let canary_dir = crate::worker_jail_canary::dir_for_home(&home);
+    // Create the shim's state before confinement can deny new temp files.
+    let _guard = crate::test_env::gh_shim_state_guard();
+    std::env::set_var("PATH", &cwd);
+    #[cfg(target_os = "linux")]
+    if mode.starts_with("jail") {
+        confine_like_the_worker_jail(&canary_dir);
+    }
+    #[cfg(target_os = "macos")]
+    confine_with_seatbelt(&if mode == "jail" {
+        format!(
+            "(version 1)\n(allow default)\n(deny file-read* file-write* (subpath \"{}\"))\n",
+            canary_dir.display()
+        )
+    } else {
+        "(version 1)\n(allow default)\n(deny file-write* (subpath \"/aft-unrelated-outer-sandbox\"))\n"
+            .to_string()
+    });
+    crate::worker_jail_canary::with_test_homes(vec![home], || {
+        #[cfg(target_os = "linux")]
+        if mode == "jail-prctl-error" {
+            assert!(
+                crate::worker_jail_canary::inside_worker_jail_with_no_new_privs(-1),
+                "prctl error hid a denied canary"
+            );
+            assert!(!crate::worker_jail_canary::inside_worker_jail_with_no_new_privs(0));
+        }
+        let signals = native_guard::ShellSignals::from_process();
+        // The probe's raw results (resolved canary path, stat errno, and on
+        // macOS the sandbox_check return and errno) explain a wrong verdict.
+        let diagnostics = crate::worker_jail_canary::diagnostics();
+        if !mode.starts_with("jail") {
+            assert!(!signals.sandboxed, "{mode}: {diagnostics}");
+            assert!(native_guard::permission_from_process().is_ok());
+            // Passthrough replaces this process with the real gh, so it runs last.
+            run(&args(&["version"]));
+            unreachable!("native gh passthrough returned instead of exec");
+        }
+        assert!(signals.sandboxed, "{mode}: {diagnostics}");
+        let error = native_guard::permission_with(&RelayContext::from_process(), signals, |_| {
+            panic!("no ticket")
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here"
+        );
+        let status = native_guard::dispatch_with(
+            &args(&["api", "repos/cortexkit/aft/issues"]),
+            &RelayContext::from_process(),
+            signals,
+            |_| panic!("no ticket"),
+            |_| panic!("env -i reached native gh"),
+        );
+        assert_eq!(status, 86);
+        assert!(resolve_and_cache_numeric_id(&StatePaths::from_process(), "test-user").is_none());
+        assert!(rename_guard::resolve_preflight_gh().is_none());
+        assert_eq!(run(&args(&["api", "repos/cortexkit/aft/issues"])), 86);
+    });
+}
+
+#[test]
+fn audit_repository_snapshot_survives_origin_rewrite_after_ticket_mint() {
+    use crate::gh_shim_relay::{
+        RelayCall, RelayTransport, RouteScopes, ScopeSelector, ScopeStamp, TransportError,
+        READ_REQUEST_OPERATION,
+    };
+    use std::sync::Mutex;
+    struct Transport(Mutex<Vec<Value>>);
+    impl RelayTransport for Transport {
+        async fn plexus(
+            &self,
+            _root: &str,
+            _session: &str,
+            _scope: Option<&ScopeSelector>,
+            body: Value,
+        ) -> Result<Value, TransportError> {
+            self.0.lock().unwrap().push(body);
+            Ok(json!({"isError":false,"result":{"status":200,"body":[],"next_page":null}}))
+        }
+        fn opens_scoped_routes(&self) -> bool {
+            true
+        }
+    }
+    let fixture = Fixture::new(20);
+    let repo = fixture.repo();
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        "snapshot-worker",
+        "read-call",
+        repo.to_str().unwrap(),
+    );
+    let value = ticket.value().unwrap();
+    assert_eq!(
+        crate::gh_shim_ticket::redeem(value)
+            .unwrap()
+            .read_repository
+            .as_deref(),
+        Some("cortexkit/aft")
+    );
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/cortexkit/common-auth.git"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let mut scopes = RouteScopes::default();
+    assert_eq!(
+        crate::gh_shim_ticket::redeem(value)
+            .unwrap()
+            .read_repository
+            .as_deref(),
+        Some("cortexkit/aft")
+    );
+    scopes.push(
+        "snapshot-worker",
+        Some(
+            ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                "worker",
+                1,
+                subc_protocol::scope::ScopeKind::Worker,
+            )
+            .with_owner_authorized(true),
+        ),
+    );
+    let transport = Transport(Mutex::new(Vec::new()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (repository, allowed) in [("cortexkit/common-auth", false), ("cortexkit/aft", true)] {
+        let params = json!({"ticket":value,"request":{"action":"github.repo.get","repository":repository,"args":{"path":"issues"}}});
+        let response = runtime.block_on(crate::gh_shim_relay::relay(
+            &transport,
+            RelayCall {
+                operation: READ_REQUEST_OPERATION,
+                params: &params,
+                first_party: true,
+                route_scopes: &scopes,
+            },
+            &|_| {},
+        ));
+        assert_eq!(response.ok, allowed, "{repository}: {:?}", response.data);
+    }
+    let calls = transport.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["arguments"]["repository"], "cortexkit/aft");
+}
+
+#[test]
+fn audit_worker_speech_still_uses_governed_relay_not_native_gh() {
+    use std::sync::Arc;
+    let fixture = Fixture::new(19);
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v19-manifest.json"
+    ))
+    .unwrap();
+    let bindings: Vec<Value> = manifest
+        .bindings
+        .iter()
+        .map(|(repo, agent)| json!({"repository":repo,"agent_id":agent,"app_handle_id":"test"}))
+        .collect();
+    let daemon = relay_client::tests::FakeRelayDaemon::spawn(Arc::new(move |body| {
+        if body["op"] == crate::gh_shim_relay::BINDINGS_READ_OPERATION {
+            json!({"op":body["op"],"status":"ok","data":{"result":{"repo_binding_generation":1,"bindings":bindings}}})
+        } else {
+            assert_eq!(body["op"], crate::gh_shim_relay::BOT_REQUEST_OPERATION);
+            json!({"op":body["op"],"status":"ok","data":{"repo_binding_generation":1,"result":{"status":"completed","result":{"url":"https://github.com/cortexkit/aft/issues/7#issuecomment-1","id":1}}}})
+        }
+    }));
+    let file = fixture.home.path().join("connection.json");
+    daemon.write_connection_file(&file);
+    let relay = RelayContext {
+        connection_file: Some(file),
+        ticket: Some("worker-ticket".into()),
+        transient_delays: [Duration::ZERO; 2],
+        relay_budget: Duration::from_secs(5),
+    };
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: manifest.bindings["cortexkit/aft"].clone(),
+    };
+    let argv = args(&[
+        "issue",
+        "comment",
+        "7",
+        "--body",
+        "hello",
+        "--repo",
+        "cortexkit/aft",
+    ]);
+    let rung = RungDetermination::r3(
+        unix_seconds(),
+        19,
+        &RungRecordProvenance {
+            image_path: "test".into(),
+            version: "test".into(),
+            repo_key: "cortexkit/aft".into(),
+        },
+    )
+    .record;
+    let status = dispatch_r3_with_relay_at(
+        &argv,
+        classify(&argv, &manifest, "linux"),
+        &manifest,
+        &fixture.paths,
+        &rung,
+        &binding,
+        unix_seconds(),
+        |forwarded| {
+            native_guard::dispatch_with(
+                forwarded,
+                &relay,
+                native_guard::ShellSignals {
+                    sandboxed: true,
+                    worker_marked: false,
+                },
+                |_| Ok(Some(true)),
+                |_| panic!("worker speech reached native gh"),
+            )
+        },
+        &relay,
+        fixture.home.path(),
+    );
+    assert_eq!(status, 0);
+    assert!(daemon
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["op"] == crate::gh_shim_relay::BOT_REQUEST_OPERATION));
+}
+
+#[test]
+fn audit_worker_marker_is_injected_from_daemon_jail_state_not_inherited() {
+    let _lock = crate::test_env::process_env_lock();
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.github.shim = false;
+    config.git.co_author = "off".into();
+    let mut environment = std::collections::HashMap::new();
+    crate::sandbox_spawn::with_worker_jail(true, || {
+        crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
+    })
+    .unwrap();
+    assert_eq!(
+        environment
+            .get(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV)
+            .map(String::as_str),
+        Some("1")
+    );
+    crate::sandbox_spawn::with_worker_jail(false, || {
+        crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
+    })
+    .unwrap();
+    assert!(!environment.contains_key(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
+}
+
+#[test]
+fn audit_ticket_snapshot_uses_primary_config_not_worktree_override() {
+    let fixture = Fixture::new(20);
+    let primary = fixture.repo();
+    let hooks = fixture.home.path().join("empty-hooks");
+    fs::create_dir(&hooks).unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&primary)
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c"
+        ])
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .args(["commit", "--allow-empty", "--quiet", "-m", "fixture"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&primary)
+        .args(["config", "extensions.worktreeConfig", "true"])
+        .status()
+        .unwrap()
+        .success());
+    let linked = fixture.home.path().join("linked");
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&primary)
+        .args(["worktree", "add", "--quiet", "--detach"])
+        .arg(&linked)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&linked)
+        .args([
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "https://github.com/cortexkit/common-auth.git"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let effective = Command::new("git")
+        .arg("-C")
+        .arg(&linked)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(effective.stdout).unwrap().trim(),
+        "https://github.com/cortexkit/common-auth.git"
+    );
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        "primary-snapshot-worker",
+        "read",
+        linked.to_str().unwrap(),
+    );
+    assert_eq!(
+        crate::gh_shim_ticket::redeem(ticket.value().unwrap())
+            .unwrap()
+            .read_repository
+            .as_deref(),
+        Some("cortexkit/aft")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_head_child_adapters_do_not_inherit_worker_markers() {
+    let _lock = crate::test_env::process_env_lock();
+    let _marker = Env::set(
+        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        Some(OsStr::new("1")),
+    );
+    let mut child = Command::new("/bin/sh");
+    child.args(["-c", "printf '%s' \"${AFT_GH_SHIM_WORKER-unset}\""]);
+    crate::agent_child_env::apply_to_command(&mut child, &std::collections::HashMap::new());
+    assert_eq!(child.output().unwrap().stdout, b"unset");
+    let root = tempfile::tempdir().unwrap();
+    let (pty, _) = crate::sandbox_spawn::pty_command_for_plan(
+        &crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+        OsStr::new("/bin/sh"),
+        &[],
+        &root.path().join("task"),
+        root.path(),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    assert!(pty
+        .iter_full_env_as_str()
+        .all(|(key, _)| key != crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
+}

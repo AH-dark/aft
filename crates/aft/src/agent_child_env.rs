@@ -733,6 +733,9 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
     if !environment.contains_key(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV) {
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
     }
+    if !environment.contains_key(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV) {
+        command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+    }
     #[cfg(test)]
     for key in
         crate::test_env::secret_named_environment_keys(crate::log_redact::is_secret_environment_key)
@@ -802,6 +805,13 @@ pub fn inject(
     }
 
     let gh_enabled = config.github.shim;
+    environment.remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+    if crate::sandbox_spawn::worker_jail_active() {
+        environment.insert(
+            crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.to_string(),
+            "1".to_string(),
+        );
+    }
     environment.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
     if gh_enabled {
         if let Some(ticket) = gh_shim_ticket {

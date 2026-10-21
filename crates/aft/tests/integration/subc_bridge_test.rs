@@ -12631,6 +12631,8 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "writes.census",
             "gh_shim.bot_request",
             "gh_shim.bindings_read",
+            "gh_shim.session_context",
+            "gh_shim.read_request",
             "backups.purge",
         ])
     );

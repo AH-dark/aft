@@ -298,6 +298,36 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal Landlock read-grant snapshot; tasks beyond the 500-entry budget stay unreadable without a broader grant, not an agent-visible list",
     },
     ExclusionEntry {
+        file: "gh_shim/read_contract.rs",
+        enclosing_item: "validate, validate_path",
+        location_or_primitive: "MAX_REPLY_BYTES job ranges and per_page <= 100",
+        reason: "closed GitHub read wire validation refuses oversized ranges and page sizes; it does not truncate an AFT result list",
+    },
+    ExclusionEntry {
+        file: "gh_shim/read_executor.rs",
+        enclosing_item: "decode_reply",
+        location_or_primitive: "REPLY_BYTES payload ceiling and returned byte range validation",
+        reason: "the GitHub read wire refuses oversized or malformed replies rather than silently cutting a response list",
+    },
+    ExclusionEntry {
+        file: "gh_shim/read_render.rs",
+        enclosing_item: "checked, fetch, stream_log",
+        location_or_primitive: "REPLY_BYTES and bounded JobLog byte windows",
+        reason: "governed read transport bound, not an AFT list surface; oversized replies refuse and complete logs stream through all byte windows",
+    },
+    ExclusionEntry {
+        file: "gh_shim/read_render.rs",
+        enclosing_item: "list, search, native",
+        location_or_primitive: "per_page 100, items.iter().take(remaining), items.iter().take(plan.limit() - rows.len()) and native gh --limit selection",
+        reason: "REST API paging and gh-compatible explicit output limits, not an AFT tool result list; over-return is a fetch error",
+    },
+    ExclusionEntry {
+        file: "gh_shim/worker_reads.rs",
+        enclosing_item: "limit, search_query",
+        location_or_primitive: "native gh defaults and 1000-result search ceiling",
+        reason: "gh-compatible CLI output limits and GitHub search refusal, not an AFT list surface",
+    },
+    ExclusionEntry {
         file: "lsp/manager.rs",
         enclosing_item: "walk_applicable_area_uncached",
         location_or_primitive: "visited >= entry_limit",

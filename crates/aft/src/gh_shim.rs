@@ -32,7 +32,18 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod native_guard;
+pub(crate) mod read_contract;
 mod rename_guard;
+mod worker_reads;
+
+#[cfg(test)]
+#[path = "gh_shim/security_audit_tests.rs"]
+mod security_audit_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/v19_compat_tests.rs"]
+mod v19_compat_tests;
 
 pub const SCHEMA_FLOOR: u64 = 1;
 /// Envelope version that carries the manifest as exact signed bytes. Envelope
@@ -446,6 +457,7 @@ const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 /// callers must parse these identifiers rather than human prose.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalCode {
+    WorkerNativeGh,
     Unclassified,
     AdminTier,
     ManifestBelowFloor,
@@ -468,7 +480,8 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
+        Self::WorkerNativeGh,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -492,6 +505,7 @@ impl RefusalCode {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::WorkerNativeGh => "gh_shim_worker_native_gh",
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
@@ -625,6 +639,19 @@ pub fn run_from_env() -> i32 {
 }
 
 fn run(args: &[OsString]) -> i32 {
+    run_with(args, delegate, worker_reads::identity_for_command)
+}
+
+fn run_with(
+    args: &[OsString],
+    mut delegate: impl FnMut(&[OsString]) -> i32,
+    mut read_identity: impl FnMut(
+        &[OsString],
+        &Manifest,
+        &StatePaths,
+        &RelayContext,
+    ) -> Result<Option<bool>, String>,
+) -> i32 {
     let paths = StatePaths::from_process();
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
@@ -671,9 +698,18 @@ fn run(args: &[OsString]) -> i32 {
     let initial_manifest = resolve_manifest(&paths, now);
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
     if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
+        match read_identity(args, manifest, &paths, &RelayContext::from_process()) {
+            Ok(Some(true)) => {
+                return refuse(
+                    RefusalCode::ManifestRegressed,
+                    "worker reads require a valid signed manifest; repair the installed manifest",
+                )
+            }
+            Err(_) | Ok(Some(false) | None) => {}
+        }
         return match regressed_disposition(args, manifest, current_platform(), problem) {
             RegressedDisposition::Passthrough => {
-                delegate_after_invalid_manifest_notice(args, problem)
+                delegate_after_invalid_manifest_notice(args, problem, delegate)
             }
             RegressedDisposition::Refuse { code, text } => refuse(code, &text),
         };
@@ -688,6 +724,11 @@ fn run(args: &[OsString]) -> i32 {
     // or one that never verified) there are no bindings to compare against,
     // so those keep passing through as before.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
+        if let Some(status) =
+            worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
+        {
+            return status;
+        }
         // The operator's token works on every repository, bound or not, and
         // an agent holding it could reach GitHub around the shim, so this
         // check comes before any target is resolved.
@@ -742,7 +783,9 @@ fn run(args: &[OsString]) -> i32 {
             ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
                 match invalid_manifest_problem.as_ref() {
-                    Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
+                    Some(problem) => {
+                        delegate_after_invalid_manifest_notice(args, problem, delegate)
+                    }
                     None => delegate(args),
                 }
             }
@@ -758,13 +801,13 @@ fn run(args: &[OsString]) -> i32 {
         ManifestResolution::Regressed { manifest, problem } => {
             return match regressed_disposition(args, &manifest, current_platform(), &problem) {
                 RegressedDisposition::Passthrough => {
-                    delegate_after_invalid_manifest_notice(args, &problem)
+                    delegate_after_invalid_manifest_notice(args, &problem, delegate)
                 }
                 RegressedDisposition::Refuse { code, text } => refuse(code, &text),
             }
         }
         ManifestResolution::Invalid(problem) => {
-            return delegate_after_invalid_manifest_notice(args, &problem)
+            return delegate_after_invalid_manifest_notice(args, &problem, delegate)
         }
         ManifestResolution::Dormant => return delegate(args),
     };
@@ -3088,6 +3131,65 @@ fn checkout_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
     resolved_agent_binding(manifest, &TargetRepository::default(), cwd)
 }
 
+pub(crate) fn verified_worker_read_repository(
+    repository_at_mint: Option<&str>,
+) -> Result<String, String> {
+    let paths = StatePaths::from_process();
+    let ManifestResolution::Active(manifest) = resolve_manifest(&paths, unix_seconds()) else {
+        return Err("worker read relay requires a verified active manifest".into());
+    };
+    if manifest.manifest_version < 20 {
+        return Err("worker read relay requires manifest v20".into());
+    }
+    let repository =
+        repository_at_mint.ok_or("the ticket has no repository snapshot; restart the command")?;
+    if !manifest.bindings.contains_key(repository) {
+        return Err("the ticket's repository snapshot has no signed bot binding".into());
+    }
+    Ok(repository.to_string())
+}
+
+pub(crate) fn ticket_repository_snapshot(project_root: &Path) -> Option<String> {
+    if !project_root.is_dir() {
+        return None;
+    }
+    let git = which::which("git").ok()?;
+    let command = || {
+        let mut command = Command::new(&git);
+        command.env_clear().env("GIT_CONFIG_NOSYSTEM", "1");
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+        command
+    };
+    let output = command()
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common = PathBuf::from(std::str::from_utf8(&output.stdout).ok()?.trim());
+    if !common.is_absolute() {
+        return None;
+    }
+    // Read the primary repository's config, not a worktree-specific override.
+    // The resulting name is saved in the daemon's ticket registry before exec.
+    let output = command()
+        .args(["config", "--no-includes", "--file"])
+        .arg(common.join("config"))
+        .args(["--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())
+}
+
 /// The target's binding, else the checkout's.
 ///
 /// Speech is governed by the target alone. This wider answer serves the
@@ -3152,6 +3254,7 @@ fn cached_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
 }
 
 fn resolve_and_cache_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
+    native_guard::permission_from_process().ok()?;
     let image = executing_image();
     let real_gh = resolve_real_gh(&image)?;
     let encoded_login = url::form_urlencoded::byte_serialize(login.as_bytes()).collect::<String>();
@@ -3248,15 +3351,25 @@ fn canonical_repository_key(value: &str) -> Option<String> {
     .trim_end_matches(".git")
     .trim_matches('/');
     let mut parts = path.split('/');
-    let owner = parts.next()?.trim();
-    let repository = parts.next()?.trim();
-    (!owner.is_empty() && !repository.is_empty() && parts.next().is_none()).then(|| {
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    (valid_repository_component(owner)
+        && valid_repository_component(repository)
+        && parts.next().is_none())
+    .then(|| {
         format!(
             "{}/{}",
             owner.to_ascii_lowercase(),
             repository.to_ascii_lowercase()
         )
     })
+}
+
+fn valid_repository_component(value: &str) -> bool {
+    !matches!(value, "" | "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn gh_session_id(agent_id: &str) -> String {
@@ -3442,10 +3555,13 @@ struct Manifest {
     repository_sections: BTreeMap<String, RepositorySection>,
     #[serde(default)]
     bindings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    worker_reads: Vec<TupleDecl>,
 }
 
 impl Manifest {
     fn validate(&self) -> Result<(), String> {
+        worker_reads::validate_class(self)?;
         if self.artifact_id != MANIFEST_ARTIFACT_ID {
             return Err(format!("unexpected artifact id {}", self.artifact_id));
         }
@@ -4071,7 +4187,11 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
     }
 }
 
-fn delegate_after_invalid_manifest_notice(args: &[OsString], problem: &ManifestProblem) -> i32 {
+fn delegate_after_invalid_manifest_notice(
+    args: &[OsString],
+    problem: &ManifestProblem,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
     // Missing manifests identify public installations and must remain silent.
     // An installed but invalid manifest instead signals a misconfigured
     // governed seat, so say which ambient identity will execute the fallback.
@@ -6905,6 +7025,8 @@ struct SelfReport {
     cached_manifest: CachedManifestReport,
     last_rung: LastRungReport,
     last_probe: Option<LastProbeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_read_lookup: Option<worker_reads::LookupRecord>,
     bypass_audit: Option<Vec<Value>>,
     bypass_audit_error: Option<String>,
     executing_image: Option<String>,
@@ -7005,6 +7127,12 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
     } else {
         read_last_probe(paths)
     };
+    let last_read_lookup =
+        if !disabled && cached_manifest.version.is_some_and(|version| version >= 20) {
+            worker_reads::last_lookup(paths)
+        } else {
+            None
+        };
     SelfReport {
         shim_version: env!("CARGO_PKG_VERSION"),
         gh_routing_schema_floor: SCHEMA_FLOOR,
@@ -7015,6 +7143,7 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         cached_manifest,
         last_rung,
         last_probe,
+        last_read_lookup,
         bypass_audit,
         bypass_audit_error,
         executing_image: image
@@ -7277,6 +7406,15 @@ fn executing_image_path_positions(image: &Path) -> Vec<usize> {
 }
 
 fn delegate(args: &[OsString]) -> i32 {
+    native_guard::dispatch(
+        args,
+        &RelayContext::from_process(),
+        native_guard::ShellSignals::from_process(),
+        |args| delegate_allowed(args),
+    )
+}
+
+fn delegate_allowed(args: &[OsString]) -> i32 {
     let image = executing_image();
     let Some(real_gh) = resolve_real_gh(&image) else {
         return refuse(
@@ -7687,7 +7825,7 @@ mod tests {
         )
     }
 
-    fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
+    pub(super) fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
         fs::create_dir_all(&paths.root).expect("state root");
         fs::write(
             &paths.manifest,
@@ -10377,7 +10515,11 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 19);
+        assert_eq!(RefusalCode::ALL.len(), 20);
+        assert_eq!(
+            RefusalCode::WorkerNativeGh.as_str(),
+            "gh_shim_worker_native_gh"
+        );
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));

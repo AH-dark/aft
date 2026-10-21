@@ -1035,11 +1035,376 @@ async fn off_worker_keeps_private_temp_and_governance_without_os_confinement() {
     assert!(reply.contains("OFF_2"), "{reply}");
     assert!(reply.contains("off-secret-readable"), "{reply}");
     assert!(reply.contains("/tmp/aft-w/"), "{reply}");
-    assert!(!reply.contains("unenforced=["), "{reply}");
+    assert!(
+        reply.contains("profile=off unenforced=[operator gh fence: unenforced"),
+        "{reply}"
+    );
     assert_eq!(
         std::fs::read_to_string(jail.base.join("sibling/off-write")).unwrap(),
         "off"
     );
+}
+
+/// The worker-jail gh fence: only the jail denies this canary, at a fixed path
+/// in the account's default AFT storage.
+fn canary_dir(jail: &Jail) -> PathBuf {
+    jail.base
+        .join("home/.local/share/cortexkit/aft/gh-shim-worker-jail")
+}
+
+/// The shim's native exits, with the ticket and worker marker removed (and
+/// once with the environment cleared down to HOME and PATH): only the kernel
+/// canary deny can tell the shim it runs in a worker jail.
+const STRIPPED_GH: &str = "env -u AFT_GH_SHIM_TICKET -u AFT_GH_SHIM_WORKER gh version; echo STRIPPED_EXIT=$?; env -i HOME=\"$HOME\" PATH=\"$PATH\" gh api repos/cortexkit/aft/issues; echo ENV_I_EXIT=$?";
+
+fn assert_stripped_gh_refused(reply: &str) {
+    assert!(reply.contains("STRIPPED_EXIT=86"), "{reply}");
+    assert!(reply.contains("ENV_I_EXIT=86"), "{reply}");
+    assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
+}
+
+/// Even without the gh shim, workers must not read ~/.config/gh/hosts.yml or
+/// inherit GH_TOKEN or GITHUB_TOKEN from the daemon.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_denies_native_gh_credentials() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start_with_layout_and_env(
+        None,
+        None,
+        true,
+        "strict",
+        false,
+        false,
+        |base, command| {
+            let config = base.join("home/.config/gh");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("hosts.yml"), "test-only-gh-token").unwrap();
+            command.env("GH_TOKEN", "test-only-gh-token");
+            command.env("GITHUB_TOKEN", "test-only-github-token");
+        },
+    )
+    .await;
+    let reply = jail.bash("if /bin/cat \"$HOME/.config/gh/hosts.yml\" >/dev/null 2>&1; then echo HOSTS_READABLE; else echo HOSTS_DENIED; fi; if [ \"${GH_TOKEN+x}${GITHUB_TOKEN+x}\" = '' ]; then echo TOKENS_ABSENT; else echo TOKENS_PRESENT; fi").await;
+    assert!(reply.contains("HOSTS_DENIED"), "{reply}");
+    assert!(reply.contains("TOKENS_ABSENT"), "{reply}");
+    assert!(!reply.contains("HOSTS_READABLE"), "{reply}");
+    assert!(!reply.contains("TOKENS_PRESENT"), "{reply}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_credential_floor_covers_daemon_home_and_config_overrides() {
+    if !native_available() {
+        return;
+    }
+    const FILES: &[&str] = &[
+        "home/.config/gh/hosts.yml",
+        "custom-gh/hosts.yml",
+        "xdg/config/gh/hosts.yml",
+        "home/.ssh/key",
+        "home/.gnupg/key",
+        "home/.aws/credentials",
+        "home/.config/gcloud/key",
+        "home/.azure/key",
+        "home/.netrc",
+        "home/.git-credentials",
+        "home/.config/git/credentials",
+        "home/.docker/config.json",
+        "home/.npmrc",
+        "home/.pypirc",
+        "home/.cargo/credentials.toml",
+    ];
+    for profile in ["strict", "relaxed"] {
+        if profile == "relaxed" && cfg!(target_os = "linux") {
+            continue;
+        }
+        let mut jail = Jail::start_with_layout_and_env(
+            None,
+            None,
+            true,
+            profile,
+            false,
+            false,
+            |base, command| {
+                for path in FILES {
+                    let path = base.join(path);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, "synthetic-credential").unwrap();
+                }
+                command.env("GH_CONFIG_DIR", base.join("custom-gh"));
+            },
+        )
+        .await;
+        let command = FILES.iter().enumerate().map(|(index, path)| {
+            let path = quote(&jail.base.join(path));
+            format!("if /bin/cat {path} >/dev/null 2>&1; then echo READABLE_{index}; else echo READ_DENIED_{index}; fi; if : >>{path} 2>/dev/null; then echo WRITABLE_{index}; else echo WRITE_DENIED_{index}; fi")
+        }).collect::<Vec<_>>().join("; ");
+        let reply = jail.bash(&command).await;
+        for (index, path) in FILES.iter().enumerate() {
+            assert!(
+                reply.contains(&format!("READ_DENIED_{index}\n")),
+                "{profile} {path}: {reply}"
+            );
+            assert!(
+                reply.contains(&format!("WRITE_DENIED_{index}\n")),
+                "{profile} {path}: {reply}"
+            );
+        }
+    }
+}
+
+/// Opt in on an unlocked Mac: creates and removes only a uniquely named test item.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires an unlocked login keychain and explicit test-item consent"]
+async fn worker_jail_login_keychain_test_item_is_unreadable() {
+    assert_eq!(
+        std::env::var("AFT_TEST_LOGIN_KEYCHAIN").as_deref(),
+        Ok("1"),
+        "run explicitly with AFT_TEST_LOGIN_KEYCHAIN=1 on an unlocked Mac"
+    );
+    let service = format!(
+        "aft-worker-jail-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let account = "aft-credential-isolation-test";
+    let secret = "disposable-test-value-not-an-operator-token";
+    let login = run(Command::new("/usr/bin/security").args(["default-keychain", "-d", "user"]));
+    let keychain = PathBuf::from(login.trim().trim_matches('"'));
+    assert!(
+        keychain.is_file(),
+        "login keychain unavailable: {}",
+        keychain.display()
+    );
+    let keychain = keychain.to_str().unwrap();
+    struct Cleanup(String, String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("/usr/bin/security")
+                .args([
+                    "delete-generic-password",
+                    "-s",
+                    &self.0,
+                    "-a",
+                    "aft-credential-isolation-test",
+                    &self.1,
+                ])
+                .output();
+        }
+    }
+    run(Command::new("/usr/bin/security").args([
+        "add-generic-password",
+        "-s",
+        &service,
+        "-a",
+        account,
+        "-w",
+        secret,
+        "-T",
+        "/usr/bin/security",
+        keychain,
+    ]));
+    let _cleanup = Cleanup(service.clone(), keychain.into());
+    let baseline = run(Command::new("/usr/bin/security").args([
+        "find-generic-password",
+        "-s",
+        &service,
+        "-a",
+        account,
+        "-w",
+        keychain,
+    ]));
+    assert_eq!(
+        baseline.trim(),
+        secret,
+        "test item must be readable outside the jail"
+    );
+    let mut jail = Jail::start().await;
+    let reply = jail.bash(&format!(
+        "/usr/bin/security find-generic-password -s '{service}' -a '{account}' -w {}; echo KEYCHAIN_EXIT=$?", quote(Path::new(keychain))
+    )).await;
+    assert!(
+        reply.contains("KEYCHAIN_EXIT="),
+        "probe did not execute: {reply}"
+    );
+    assert!(
+        !reply.contains(secret),
+        "worker read the disposable login-keychain secret: {reply}"
+    );
+    assert!(
+        !reply.contains("KEYCHAIN_EXIT=0"),
+        "worker queried the login-keychain item: {reply}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_fences_operator_gh_and_its_canary_resists_tampering() {
+    #[cfg(target_os = "linux")]
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let dir = canary_dir(&jail);
+    let canary = dir.join("canary");
+    let reply = jail.bash(STRIPPED_GH).await;
+    assert_stripped_gh_refused(&reply);
+    let original = std::fs::read(&canary).expect("the worker shell launch created the canary");
+
+    let parent = dir.parent().unwrap();
+    let tamper = format!(
+        "cat {c} >/dev/null 2>&1; echo READ=$?; chmod 644 {c} 2>/dev/null; echo CHMOD=$?; rm -f {c} 2>/dev/null; echo RM=$?; mv {c} {d}/moved 2>/dev/null; echo MV=$?; printf x > {d}/new 2>/dev/null; echo CREATE=$?; mv {d} {d}.moved 2>/dev/null; echo MVDIR=$?; mv {p} {p}.moved 2>/dev/null; echo MVPARENT=$?; {stripped}",
+        c = quote(&canary),
+        d = quote(&dir),
+        p = quote(parent),
+        stripped = STRIPPED_GH,
+    );
+    let reply = jail.bash(&tamper).await;
+    for denied in ["READ", "RM", "MV", "CREATE", "MVDIR", "MVPARENT"] {
+        assert!(!reply.contains(&format!("{denied}=0")), "{denied}: {reply}");
+    }
+    // Seatbelt denies the mode change. Landlock does not mediate chmod, but a
+    // changed mode cannot make the denied canary readable or hide it.
+    #[cfg(target_os = "macos")]
+    assert!(!reply.contains("CHMOD=0"), "{reply}");
+    assert_stripped_gh_refused(&reply);
+    assert_eq!(std::fs::read(&canary).unwrap(), original);
+    assert!(!dir.join("new").exists());
+}
+
+/// The daemon's temporary HOME is not the account home that a cleared shim uses.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_account_home_anchor_survives_replaced_or_missing_home() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let upstream = jail.worktree.join("upstream-gh");
+    std::fs::create_dir(&upstream).unwrap();
+    executable(
+        &upstream.join("gh"),
+        "#!/bin/sh\nprintf 'NATIVE_GH_DISPATCHED\\n'\n",
+    );
+    // Use a local upstream so losing the fence cannot enter an operator's gh
+    // wrapper or start network/authentication work. Kill the whole process group
+    // on timeout so descendants cannot keep the tool's output pipes open.
+    let script = r#"import os, signal, shutil, subprocess, sys
+shim = shutil.which('gh')
+assert shim, 'managed gh shim missing'
+for label, extra in [('NO_HOME', {}), ('WRONG_HOME', {'HOME': '/nonexistent'})]:
+    child = subprocess.Popen([shim, 'version'], env={'PATH': sys.argv[1], **extra},
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        output, _ = child.communicate(timeout=5)
+        code = child.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        output, _ = child.communicate(timeout=2)
+        code = 124
+    print(output.decode(errors='replace'), end='')
+    print(f'{label}_EXIT={code}', flush=True)
+"#;
+    let reply = jail.tool("bash", json!({
+        "command": format!("python3 -B -c {} {}", quote(Path::new(script)), quote(&upstream)),
+        "timeout": 20_000,
+        "wait": true,
+    })).await;
+    assert!(reply.contains("NO_HOME_EXIT=86"), "{reply}");
+    assert!(reply.contains("WRONG_HOME_EXIT=86"), "{reply}");
+    assert!(reply.contains("gh_shim_worker_native_gh"), "{reply}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_canary_metadata_is_readable_but_data_and_writes_are_denied() {
+    let script = r#"import errno, os, pathlib, pwd
+homes = {os.environ['HOME'], pwd.getpwuid(os.geteuid()).pw_dir}
+for home in homes:
+    marker = pathlib.Path(home) / '.local/share/cortexkit/aft/gh-shim-worker-jail/canary'
+    marker.resolve(strict=True)
+    for path in [marker, *marker.parents]:
+        path.lstat()
+    for flags in [os.O_RDONLY, os.O_WRONLY]:
+        try:
+            fd = os.open(marker, flags)
+        except OSError as error:
+            assert error.errno in (errno.EACCES, errno.EPERM), error
+        else:
+            os.close(fd)
+            raise AssertionError(f'canary data access allowed: {marker}, flags={flags}')
+print('CANARY_METADATA_ONLY')
+"#;
+    for profile in ["strict", "relaxed"] {
+        let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
+        let reply = jail
+            .bash(&format!("python3 -B -c {}", quote(Path::new(script))))
+            .await;
+        assert!(reply.contains("CANARY_METADATA_ONLY"), "{profile}: {reply}");
+    }
+}
+
+/// The canary sits in the account's default storage, so a configured storage
+/// root elsewhere still leaves it denied and the fence in place.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn worker_jail_fence_holds_with_storage_configured_elsewhere() {
+    #[cfg(target_os = "linux")]
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start_with_layout_and_env(
+        None,
+        None,
+        true,
+        "strict",
+        false,
+        false,
+        |base, command| {
+            let storage = base.join("elsewhere-storage");
+            std::fs::create_dir_all(&storage).unwrap();
+            command.env("AFT_STORAGE_DIR", storage);
+        },
+    )
+    .await;
+    let canary = canary_dir(&jail).join("canary");
+    let reply = jail
+        .bash(&format!(
+            "cat {} >/dev/null 2>&1; echo READ=$?; {STRIPPED_GH}",
+            quote(&canary)
+        ))
+        .await;
+    assert!(!reply.contains("READ=0"), "{reply}");
+    assert_stripped_gh_refused(&reply);
+    assert!(canary.is_file());
+    assert!(!jail
+        .base
+        .join("elsewhere-storage/gh-shim-worker-jail")
+        .exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_macos_worker_jail_still_fences_operator_gh() {
+    let mut jail = Jail::relaxed(false).await;
+    let canary = canary_dir(&jail).join("canary");
+    let reply = jail
+        .bash(&format!(
+            "cat {c} >/dev/null 2>&1; echo READ=$?; rm -f {c} 2>/dev/null; echo RM=$?; {STRIPPED_GH}",
+            c = quote(&canary)
+        ))
+        .await;
+    assert!(!reply.contains("READ=0"), "{reply}");
+    assert!(!reply.contains("RM=0"), "{reply}");
+    assert_stripped_gh_refused(&reply);
+    assert!(canary.is_file());
 }
 
 #[cfg(target_os = "linux")]
@@ -1061,6 +1426,14 @@ async fn relaxed_linux_names_unenforced_denies_and_keeps_broad_access() {
     assert!(reply.contains("BROAD_2"), "{reply}");
     assert!(reply.contains("linux-secret-unenforced"), "{reply}");
     assert!(reply.contains("profile=relaxed unenforced=["), "{reply}");
+    // Relaxed Linux cannot deny the gh-shim canary, so the worker gets no
+    // shim-level fence; the launcher names that alongside the other denies.
+    assert!(
+        reply.contains("operator gh fence: unenforced (relaxed profile)"),
+        "{reply}"
+    );
+    let stripped = jail.bash(STRIPPED_GH).await;
+    assert!(!stripped.contains("gh_shim_worker_native_gh"), "{stripped}");
     for name in [
         ".ssh",
         ".gnupg",

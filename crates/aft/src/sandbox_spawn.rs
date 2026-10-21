@@ -1597,6 +1597,10 @@ fn build_native_profile(
         return match result {
             Ok(mut profile) => {
                 profile.mode = SandboxMode::Off;
+                if worker_jail_active() {
+                    profile.worker_gh_fence =
+                        Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
+                }
                 Ok(profile)
             }
             Err(error) => {
@@ -1656,6 +1660,18 @@ fn build_native_profile(
         for root in &control_roots {
             let git = resolve_git_policy(root)?;
             write_deny_nested.extend(checkout_control_denies(root, &git)?);
+        }
+        // Only a worker jail denies the gh-shim canary; that deny is how the
+        // shim tells AFT's worker jail from any other sandbox. A canary that
+        // cannot be created refuses the worker launch. Head shells get an
+        // explicit read grant so a canary left by an earlier worker, inside
+        // otherwise private storage, never makes a head look jailed.
+        let canary_dirs = crate::worker_jail_canary::prepare_homes(&home, jailed)?;
+        if !jailed {
+            policy
+                .private_stores
+                .read_allow
+                .extend(canary_dirs.iter().cloned());
         }
         #[cfg(target_os = "macos")]
         if jailed {
@@ -1785,6 +1801,17 @@ fn build_native_profile(
         profile.write_deny.extend(shell_write_deny);
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
+        add_credential_floor(&mut profile, &home, &project_roots)?;
+        if jailed {
+            profile.read_deny.extend(canary_dirs.iter().cloned());
+            profile.write_deny.extend(canary_dirs.iter().cloned());
+            profile.worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Canary {
+                paths: canary_dirs
+                    .iter()
+                    .map(|dir| dir.join(crate::worker_jail_canary::CANARY_FILE))
+                    .collect(),
+            });
+        }
         if let Some(jail) = jail {
             // Read server destinations from the operator's environment, never
             // from a worker request or a file the worker can edit.
@@ -1829,6 +1856,7 @@ fn build_native_profile(
             );
             profile
         };
+        verify_worker_gh_fence(&profile)?;
 
         Ok(profile)
     })();
@@ -1836,6 +1864,58 @@ fn build_native_profile(
         let _ = cleanup_task_temp_dir(&temp_dir);
     }
     result
+}
+
+/// Check the final worker-jail profile against its gh-shim canary before the
+/// launch: the canary directory must be denied for reads and writes, and no
+/// read or write grant may overlap it, including the canary file. A grant over an
+/// ancestor would let a worker read the canary (Landlock grants are whole
+/// subtrees) or rename a directory above it. Any such profile is refused.
+#[cfg(unix)]
+fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
+    let Some(crate::sandbox_profile::WorkerGhFence::Canary { paths }) = &profile.worker_gh_fence
+    else {
+        return Ok(());
+    };
+    if paths.is_empty() {
+        return Err("worker-jail canary paths are empty".into());
+    }
+    for path in paths {
+        let dir = path
+            .parent()
+            .ok_or_else(|| format!("worker-jail canary has no directory: {}", path.display()))?;
+        let covers = |grant: &Path| dir.starts_with(grant);
+        if !profile.read_deny.iter().any(|deny| covers(deny)) {
+            return Err("the worker jail does not deny reading its gh-shim canary".into());
+        }
+        if !profile.write_deny.iter().any(|deny| covers(deny)) {
+            return Err("the worker jail does not deny writing its gh-shim canary".into());
+        }
+        let read_grants = profile
+            .read_allow
+            .iter()
+            .chain(&profile.data_policy.read_allow)
+            .chain(&profile.data_policy.session_task_read_dir);
+        let write_grants = profile
+            .write_allow_roots()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .chain(profile.writable_files.iter().cloned())
+            .chain(profile.data_policy.write_allow.iter().cloned())
+            .collect::<Vec<_>>();
+        if let Some(grant) = read_grants
+            .map(PathBuf::as_path)
+            .chain(write_grants.iter().map(PathBuf::as_path))
+            .find(|grant| dir.starts_with(grant) || grant.starts_with(dir))
+        {
+            return Err(format!(
+            "worker jail grant {} covers its gh-shim canary {}; refusing to start an unfenced worker shell",
+            grant.display(),
+            dir.display()
+        ));
+        }
+    }
+    Ok(())
 }
 
 /// Build relaxed's protected-path list without predicting the caches, sockets
@@ -1854,25 +1934,6 @@ fn build_relaxed_profile(
         .access_policy("")
         .map_err(|error| error.data.to_string())?;
     let mut read_deny = policy.absolute_floor.clone();
-    read_deny.extend(
-        [
-            ".ssh",
-            ".gnupg",
-            "Library/Keychains",
-            ".aws",
-            ".config/gcloud",
-            ".azure",
-            ".config/gh",
-            ".netrc",
-            ".docker/config.json",
-            ".npmrc",
-            ".pypirc",
-        ]
-        .map(|path| home.join(path)),
-    );
-    let (credential_denies, cargo_homes) =
-        relaxed_credential_paths(home, roots, |key| std::env::var_os(key));
-    read_deny.extend(credential_denies);
     let mut write_deny = read_deny.clone();
     write_deny.extend(
         [
@@ -2007,6 +2068,28 @@ fn build_relaxed_profile(
     stores
         .read_allow
         .extend(policy.shell_grants(crate::access_policy::AccessOperation::Read));
+    // The worker jail's gh-shim fence, as in the strict builder. Relaxed Linux
+    // grants all of `/` and enforces no deny, so there the fence is reported
+    // as unenforced instead; macOS relaxed enforces explicit denies.
+    let jailed = worker_jail_active();
+    let mut worker_gh_fence = None;
+    if jailed && cfg!(target_os = "linux") {
+        worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
+    } else if jailed {
+        let dirs = crate::worker_jail_canary::prepare_homes(home, true)?;
+        read_deny.extend(dirs.iter().cloned());
+        write_deny.extend(dirs.iter().cloned());
+        worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Canary {
+            paths: dirs
+                .iter()
+                .map(|dir| dir.join(crate::worker_jail_canary::CANARY_FILE))
+                .collect(),
+        });
+    } else {
+        stores
+            .read_allow
+            .extend(crate::worker_jail_canary::prepare_homes(home, false)?);
+    }
     let mut profile = SandboxProfile {
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
@@ -2025,12 +2108,14 @@ fn build_relaxed_profile(
         loopback_tcp_connect_deny: Vec::new(),
         cache_roots: Vec::new(),
         temp_dir: temp.to_path_buf(),
+        worker_gh_fence,
     };
-    add_relaxed_cargo_credential_denies(&mut profile, cargo_homes);
+    add_credential_floor(&mut profile, home, roots)?;
     protect_worker_credential_services(&mut profile, home)?;
     profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())
+        .and_then(|profile| verify_worker_gh_fence(&profile).map(|()| profile))
 }
 
 /// Mark only authenticated, sandboxed workers for credential-service isolation.
@@ -2138,13 +2223,76 @@ fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>,
     Ok(denies)
 }
 
+/// Credential clients may use HOME, the password database, or explicit config
+/// overrides. Include read/write denies for every location in both profiles,
+/// without private-store exceptions. Backends enforce them or report their limits.
 #[cfg(unix)]
-fn add_relaxed_cargo_credential_denies(profile: &mut SandboxProfile, cargo_homes: Vec<PathBuf>) {
+fn add_credential_floor(
+    profile: &mut SandboxProfile,
+    home: &Path,
+    roots: &[PathBuf],
+) -> Result<(), String> {
+    let account = crate::production_storage::account_home().ok();
+    let (denies, cargo_homes) =
+        credential_floor_paths(home, account.as_deref(), roots, |key| std::env::var_os(key))?;
+    profile.read_deny.extend(denies.iter().cloned());
+    profile.write_deny.extend(denies);
+    add_relaxed_cargo_credential_denies(profile, cargo_homes)
+}
+
+#[cfg(unix)]
+fn credential_floor_paths(
+    home: &Path,
+    account: Option<&Path>,
+    roots: &[PathBuf],
+    getenv: impl Fn(&str) -> Option<OsString>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut denies = Vec::new();
+    let mut cargo_homes = Vec::new();
+    for home in std::iter::once(home).chain(account) {
+        denies.extend(
+            [
+                ".ssh",
+                ".gnupg",
+                "Library/Keychains",
+                ".aws",
+                ".config/gcloud",
+                ".azure",
+                ".config/gh",
+                ".netrc",
+                ".docker/config.json",
+                ".npmrc",
+                ".pypirc",
+                ".git-credentials",
+                ".config/git/credentials",
+                ".config/cortexkit",
+            ]
+            .map(|path| home.join(path)),
+        );
+        let (overrides, cargo) = relaxed_credential_paths(home, roots, &getenv)?;
+        denies.extend(overrides);
+        cargo_homes.extend(cargo);
+    }
+    denies.sort_unstable();
+    denies.dedup();
+    cargo_homes.sort_unstable();
+    cargo_homes.dedup();
+    Ok((denies, cargo_homes))
+}
+
+#[cfg(unix)]
+fn add_relaxed_cargo_credential_denies(
+    profile: &mut SandboxProfile,
+    cargo_homes: Vec<PathBuf>,
+) -> Result<(), String> {
     for cargo_home in cargo_homes {
-        profile.deny_prefixes.extend(resolved_env_deny_paths(
-            "CARGO_HOME",
-            cargo_home.join("credentials"),
-        ));
+        profile.deny_prefixes.extend(
+            crate::sandbox_profile::resolve_env_deny_paths(
+                cargo_home.join("credentials"),
+                "CARGO_HOME",
+            )
+            .map_err(|error| error.to_string())?,
+        );
         // Resolve existing prefix matches too: a credentials file can itself be a
         // symlink to a secret outside CARGO_HOME.
         match std::fs::read_dir(&cargo_home) {
@@ -2153,8 +2301,9 @@ fn add_relaxed_cargo_credential_denies(profile: &mut SandboxProfile, cargo_homes
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
-                            log::warn!("cannot inspect CARGO_HOME credential entry: {error}");
-                            continue;
+                            return Err(format!(
+                                "cannot inspect CARGO_HOME credential entry: {error}"
+                            ))
                         }
                     };
                     if !entry
@@ -2165,18 +2314,23 @@ fn add_relaxed_cargo_credential_denies(profile: &mut SandboxProfile, cargo_homes
                     {
                         continue;
                     }
-                    let paths = resolved_env_deny_paths("CARGO_HOME", entry.path());
+                    let paths =
+                        crate::sandbox_profile::resolve_env_deny_paths(entry.path(), "CARGO_HOME")
+                            .map_err(|error| error.to_string())?;
                     profile.read_deny.extend(paths.iter().cloned());
                     profile.write_deny.extend(paths);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => log::warn!(
-                "cannot inspect CARGO_HOME credentials in {}: {error}",
-                cargo_home.display()
-            ),
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect CARGO_HOME credentials in {}: {error}",
+                    cargo_home.display()
+                ))
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2184,6 +2338,34 @@ fn relaxed_credential_paths(
     home: &Path,
     roots: &[PathBuf],
     getenv: impl Fn(&str) -> Option<OsString>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let errors = std::cell::RefCell::new(Vec::new());
+    let paths = credential_paths_with_resolver(home, roots, getenv, |key, path| {
+        match crate::sandbox_profile::resolve_env_deny_paths(path, key) {
+            Ok(paths) => paths,
+            Err(error) => {
+                errors.borrow_mut().push(error.to_string());
+                Vec::new()
+            }
+        }
+    });
+    let errors = errors.into_inner();
+    if errors.is_empty() {
+        Ok(paths)
+    } else {
+        Err(format!(
+            "cannot resolve mandatory credential floor: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn credential_paths_with_resolver(
+    home: &Path,
+    roots: &[PathBuf],
+    getenv: impl Fn(&str) -> Option<OsString>,
+    resolve_path: impl Fn(&str, PathBuf) -> Vec<PathBuf>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     // Relative tool settings are resolved from the shell's checkout, not the
     // daemon's working directory. Keep the default denies as well as overrides.
@@ -2202,7 +2384,7 @@ fn relaxed_credential_paths(
                 } else {
                     path.join(suffix)
                 };
-                resolved_env_deny_paths(key, path)
+                resolve_path(key, path)
             })
             .collect::<Vec<_>>()
     };
@@ -2215,14 +2397,19 @@ fn relaxed_credential_paths(
     let mut cargo_homes = vec![home.join(".cargo")];
     cargo_homes.extend(paths("CARGO_HOME", ""));
     let mut denies = vec![home.join(".kube/config")];
-    for key in ["GNUPGHOME", "GH_CONFIG_DIR", "CLOUDSDK_CONFIG"] {
+    for key in [
+        "GNUPGHOME",
+        "GH_CONFIG_DIR",
+        "CLOUDSDK_CONFIG",
+        "AZURE_CONFIG_DIR",
+    ] {
         denies.extend(paths(key, ""));
     }
     for key in ["AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"] {
         denies.extend(paths(key, ""));
     }
     denies.extend(paths("DOCKER_CONFIG", "config.json"));
-    for suffix in ["gh", "gcloud"] {
+    for suffix in ["gh", "gcloud", "git/credentials"] {
         denies.extend(paths("XDG_CONFIG_HOME", suffix));
     }
     if let Some(value) = getenv("KUBECONFIG") {
@@ -5285,6 +5472,7 @@ pub(crate) fn pty_command_for_plan(
         // it belongs to whatever started this process, and the request map
         // re-adds the child's own ticket when one was issued.
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
+        command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -5994,7 +6182,8 @@ mod tests {
             ("CLOUDSDK_CONFIG", "/custom/gcloud"),
         ]);
         let (denies, cargo_homes) =
-            relaxed_credential_paths(home, &roots, |key| environment.get(key).map(OsString::from));
+            relaxed_credential_paths(home, &roots, |key| environment.get(key).map(OsString::from))
+                .unwrap();
         assert!(cargo_homes.contains(&PathBuf::from("/custom/cargo")));
         assert!(cargo_homes.contains(&home.join(".cargo")));
         for expected in [
@@ -6026,7 +6215,8 @@ mod tests {
                 "KUBECONFIG" => Some(":kube/a::kube/b:".into()),
                 "GNUPGHOME" => Some(OsString::new()),
                 _ => None,
-            });
+            })
+            .unwrap();
         for root in roots {
             assert!(cargo_homes.contains(&root.join("cargo")));
             assert!(denies.contains(&root.join("kube/a")));
@@ -6057,7 +6247,7 @@ mod tests {
         profile.mode = SandboxMode::Relaxed;
         profile.read_deny = denies.clone();
         profile.write_deny = denies;
-        add_relaxed_cargo_credential_denies(&mut profile, cargo_homes);
+        add_relaxed_cargo_credential_denies(&mut profile, cargo_homes).unwrap();
         profile.canonicalize_for_launch().unwrap()
     }
 
@@ -6071,7 +6261,8 @@ mod tests {
         let input = base.join("alias/../config");
         let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
             (key == "AWS_CONFIG_FILE").then(|| input.clone().into_os_string())
-        });
+        })
+        .unwrap();
         assert!(denies.contains(&base.join("target/config")), "{denies:?}");
         assert!(!denies.contains(&input), "unnormalized alias: {denies:?}");
         let profile = credential_profile(&base, denies, cargo);
@@ -6087,7 +6278,8 @@ mod tests {
         let input = base.join("alias/../missing/config");
         let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
             (key == "AWS_SHARED_CREDENTIALS_FILE").then(|| input.clone().into_os_string())
-        });
+        })
+        .unwrap();
         assert!(
             denies.contains(&base.join("target/missing/config")),
             "{denies:?}"
@@ -6107,7 +6299,8 @@ mod tests {
         std::os::unix::fs::symlink(base.join("target"), &alias).unwrap();
         let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
             (key == "GH_CONFIG_DIR").then(|| alias.clone().into_os_string())
-        });
+        })
+        .unwrap();
         assert!(denies.contains(&base.join("target")), "{denies:?}");
         assert!(denies.contains(&alias), "{denies:?}");
         let profile = credential_profile(&base, denies, cargo);
@@ -6134,7 +6327,8 @@ mod tests {
             let input = PathBuf::from("nested/../missing");
             let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |name| {
                 (name == key).then(|| input.clone().into_os_string())
-            });
+            })
+            .unwrap();
             let profile = credential_profile(&base, denies, cargo);
             for suffix in suffixes {
                 let expected = if suffix.is_empty() {
@@ -6157,7 +6351,7 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_credentials_unresolvable_entry_keeps_other_denies() {
+    fn relaxed_credentials_unresolvable_entry_refuses_the_floor() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let link = base.join("loop");
@@ -6167,12 +6361,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("KUBECONFIG"), "{error}");
-        let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
+        let error = relaxed_credential_paths(&base, &[base.clone()], |key| {
             (key == "KUBECONFIG").then(|| input.clone())
-        });
-        assert!(denies.contains(&base.join("safe")), "{denies:?}");
-        assert!(!denies.contains(&link), "{denies:?}");
-        credential_profile(&base, denies, cargo);
+        })
+        .unwrap_err();
+        assert!(error.contains("KUBECONFIG"), "{error}");
     }
 
     #[test]
@@ -6185,7 +6378,7 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_credentials_cargo_entries_skip_unresolvable_and_deny_targets() {
+    fn relaxed_credentials_cargo_entries_refuse_unresolvable_and_deny_valid_targets() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let cargo_home = base.join("cargo");
@@ -6197,13 +6390,27 @@ mod tests {
         std::os::unix::fs::symlink(&looping, &looping).unwrap();
         let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
             (key == "CARGO_HOME").then(|| cargo_home.clone().into_os_string())
-        });
+        })
+        .unwrap();
+        let mut invalid = SandboxProfile::build(
+            vec![base.clone()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            base.clone(),
+        )
+        .unwrap();
+        assert!(add_relaxed_cargo_credential_denies(&mut invalid, cargo.clone()).is_err());
+        std::fs::remove_file(&looping).unwrap();
         let profile = credential_profile(&base, denies, cargo);
         assert!(profile.read_deny.contains(&secret), "{profile:?}");
         assert!(profile
             .write_deny
             .contains(&cargo_home.join("credentials.toml")));
-        assert!(!profile.deny_prefixes.contains(&looping));
+        assert!(profile.deny_prefixes.contains(&looping));
     }
 
     struct SupervisorRun {
@@ -9442,6 +9649,7 @@ mod read_allow_tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: vec!["/home/alice/.npm".into()],
             temp_dir: temp.into(),
+            worker_gh_fence: None,
         };
         let inventory = FakeLister::default()
             .directory(
@@ -10017,5 +10225,201 @@ mod read_allow_tests {
                 .expect("canonical project")
                 .join("custom-hooks")]
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod worker_gh_fence_tests {
+    use super::*;
+    use crate::sandbox_profile::WorkerGhFence;
+
+    fn fenced_profile(canary_dir: &Path) -> SandboxProfile {
+        SandboxProfile {
+            v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+            mode: crate::config::SandboxMode::Strict,
+            worker_jail: true,
+            keychain_deny: Vec::new(),
+            deny_prefixes: Vec::new(),
+            data_policy: Default::default(),
+            writable_roots: vec![PathBuf::from("/home/alice/work")],
+            writable_files: Vec::new(),
+            write_deny: vec![canary_dir.to_path_buf()],
+            write_deny_nested: Vec::new(),
+            read_allow: vec![PathBuf::from("/usr"), PathBuf::from("/home/alice/work")],
+            read_allow_listed: Vec::new(),
+            read_deny: vec![canary_dir.to_path_buf()],
+            socket_deny: Vec::new(),
+            loopback_tcp_connect_deny: Vec::new(),
+            cache_roots: Vec::new(),
+            temp_dir: PathBuf::from("/home/alice/work/tmp"),
+            worker_gh_fence: Some(WorkerGhFence::Canary {
+                paths: vec![canary_dir.join(crate::worker_jail_canary::CANARY_FILE)],
+            }),
+        }
+    }
+
+    const CANARY: &str = "/home/alice/.local/share/cortexkit/aft/gh-shim-worker-jail";
+
+    #[test]
+    fn a_fenced_worker_profile_passes_only_with_the_canary_denied_and_ungranted() {
+        let dir = Path::new(CANARY);
+        assert!(verify_worker_gh_fence(&fenced_profile(dir)).is_ok());
+
+        let mut no_read_deny = fenced_profile(dir);
+        no_read_deny.read_deny.clear();
+        assert!(verify_worker_gh_fence(&no_read_deny).is_err());
+
+        let mut no_write_deny = fenced_profile(dir);
+        no_write_deny.write_deny.clear();
+        assert!(verify_worker_gh_fence(&no_write_deny).is_err());
+
+        // Landlock grants are whole subtrees: a grant over any ancestor makes
+        // the canary readable, and a writable ancestor lets a worker rename it.
+        for ancestor in ["/home/alice", "/home/alice/.local/share", CANARY] {
+            let mut read = fenced_profile(dir);
+            read.read_allow.push(PathBuf::from(ancestor));
+            assert!(verify_worker_gh_fence(&read).is_err(), "read {ancestor}");
+            let mut data = fenced_profile(dir);
+            data.data_policy.read_allow.push(PathBuf::from(ancestor));
+            assert!(verify_worker_gh_fence(&data).is_err(), "data {ancestor}");
+            let mut write = fenced_profile(dir);
+            write.writable_roots.push(PathBuf::from(ancestor));
+            assert!(verify_worker_gh_fence(&write).is_err(), "write {ancestor}");
+        }
+        // A sibling grant beside the canary is fine.
+        let mut sibling = fenced_profile(dir);
+        sibling.read_allow.push(PathBuf::from(
+            "/home/alice/.local/share/cortexkit/aft/shims",
+        ));
+        assert!(verify_worker_gh_fence(&sibling).is_ok());
+    }
+
+    #[test]
+    fn profiles_without_a_canary_fence_are_not_checked() {
+        let mut head = fenced_profile(Path::new(CANARY));
+        head.worker_gh_fence = None;
+        head.read_allow.push(PathBuf::from("/home/alice"));
+        assert!(verify_worker_gh_fence(&head).is_ok());
+        head.worker_gh_fence = Some(WorkerGhFence::Unenforced);
+        assert!(verify_worker_gh_fence(&head).is_ok());
+    }
+
+    #[test]
+    fn every_home_anchor_must_be_denied() {
+        let mut profile = fenced_profile(Path::new(CANARY));
+        let other = PathBuf::from("/home/daemon/.local/share/cortexkit/aft/gh-shim-worker-jail");
+        let Some(WorkerGhFence::Canary { paths }) = &mut profile.worker_gh_fence else {
+            unreachable!()
+        };
+        paths.push(other.join(crate::worker_jail_canary::CANARY_FILE));
+        assert!(verify_worker_gh_fence(&profile).is_err());
+        profile.read_deny.push(other.clone());
+        assert!(verify_worker_gh_fence(&profile).is_err());
+        profile.write_deny.push(other);
+        assert!(verify_worker_gh_fence(&profile).is_ok());
+    }
+
+    #[test]
+    fn file_directory_and_ancestor_grants_refuse_worker_gh_fence() {
+        let dir = Path::new(CANARY);
+        for grant in [
+            dir.join("canary"),
+            dir.to_path_buf(),
+            dir.parent().unwrap().into(),
+        ] {
+            for kind in 0..6 {
+                let mut profile = fenced_profile(dir);
+                match kind {
+                    0 => profile.read_allow.push(grant.clone()),
+                    1 => profile.data_policy.read_allow.push(grant.clone()),
+                    2 => profile.writable_roots.push(grant.clone()),
+                    3 => profile.writable_files.push(grant.clone()),
+                    4 => profile.data_policy.write_allow.push(grant.clone()),
+                    _ => profile.data_policy.session_task_read_dir = Some(grant.clone()),
+                }
+                assert!(
+                    verify_worker_gh_fence(&profile).is_err(),
+                    "grant {kind}: {}",
+                    grant.display()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod credential_floor_tests {
+    use super::*;
+
+    #[test]
+    fn credential_floor_protects_every_home_and_all_gh_config_locations() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let home = base.join("daemon");
+        let account = base.join("account");
+        let gh = base.join("custom-gh");
+        let xdg = base.join("xdg");
+        let (denies, cargo) = credential_floor_paths(&home, Some(&account), &[], |key| match key {
+            "GH_CONFIG_DIR" => Some(gh.clone().into_os_string()),
+            "XDG_CONFIG_HOME" => Some(xdg.clone().into_os_string()),
+            _ => None,
+        })
+        .unwrap();
+        for home in [&home, &account] {
+            for relative in [
+                ".ssh",
+                ".aws",
+                ".gnupg",
+                ".azure",
+                ".config/gh",
+                ".config/gcloud",
+                ".netrc",
+                ".git-credentials",
+                ".config/git/credentials",
+                ".docker/config.json",
+                ".npmrc",
+                ".pypirc",
+                ".kube/config",
+                "Library/Keychains",
+                ".config/cortexkit",
+            ] {
+                assert!(
+                    denies.contains(&home.join(relative)),
+                    "missing {}",
+                    home.join(relative).display()
+                );
+            }
+            assert!(cargo.contains(&home.join(".cargo")));
+        }
+        for path in [
+            gh,
+            xdg.join("gh"),
+            xdg.join("gcloud"),
+            xdg.join("git/credentials"),
+        ] {
+            assert!(denies.contains(&path), "missing {}", path.display());
+        }
+    }
+
+    #[test]
+    fn credential_floor_keeps_override_aliases_and_refuses_unresolvable_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let real = base.join("real-gh");
+        let alias = base.join("alias-gh");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let (denies, _) = credential_floor_paths(&base, None, &[], |key| {
+            (key == "GH_CONFIG_DIR").then(|| alias.clone().into_os_string())
+        })
+        .unwrap();
+        assert!(denies.contains(&real));
+        assert!(denies.contains(&alias));
+        let loop_path = base.join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        assert!(credential_floor_paths(&base, None, &[], |key| {
+            (key == "GH_CONFIG_DIR").then(|| loop_path.clone().into_os_string())
+        })
+        .is_err());
     }
 }

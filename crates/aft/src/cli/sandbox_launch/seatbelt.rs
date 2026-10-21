@@ -134,6 +134,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
             "(deny network-outbound (remote tcp \"localhost:{port}\"))\n"
         ));
     }
+    render_worker_canary_metadata(&mut source, profile)?;
 
     render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
@@ -232,6 +233,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
             }
         }
     }
+    render_worker_canary_metadata(&mut source, profile)?;
     render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
 }
@@ -265,6 +267,26 @@ fn render_worker_keychain_denies(
             "(deny file-read* file-write* {})\n",
             relaxed_filter(path, false)?
         ));
+    }
+    Ok(())
+}
+
+/// The shim stats and resolves its marker before a no-report data-access query.
+/// Permit only metadata, after broader denies, so those lookups do not generate
+/// sandbox violations. Data reads and writes remain denied by the worker profile.
+fn render_worker_canary_metadata(
+    source: &mut String,
+    profile: &SandboxProfile,
+) -> Result<(), String> {
+    if let Some(aft::sandbox_profile::WorkerGhFence::Canary { paths }) = &profile.worker_gh_fence {
+        for path in paths {
+            for ancestor in path.ancestors() {
+                source.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escape_path(ancestor)?
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -549,6 +571,72 @@ mod tests {
     }
 
     #[test]
+    fn worker_profiles_preserve_keychain_canary_and_gh_config_denies_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let canary_dir = home.join(aft::worker_jail_canary::CANARY_DIR_FROM_HOME);
+        let canary = canary_dir.join(aft::worker_jail_canary::CANARY_FILE);
+        let gh_config = home.join(".config/gh");
+        let mut profile = SandboxProfile::build(
+            vec![home.to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            home.to_path_buf(),
+        )
+        .unwrap();
+        profile.worker_jail = true;
+        profile.keychain_deny = vec![home.join("Library/Keychains"), "/Library/Keychains".into()];
+        profile.read_deny = vec![canary_dir.clone(), gh_config.clone()];
+        profile.write_deny = profile.read_deny.clone();
+        profile.worker_gh_fence = Some(aft::sandbox_profile::WorkerGhFence::Canary {
+            paths: vec![canary.clone()],
+        });
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            for service in ["com.apple.SecurityServer", "com.apple.securityd.xpc"] {
+                assert!(source.contains(&format!("(deny mach-lookup (global-name \"{service}\"))")));
+            }
+            assert!(!source.contains("com.apple.trustd"));
+            let metadata = format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                escape_path(&canary).unwrap()
+            );
+            let metadata_index = source.find(&metadata).expect("canary must remain visible");
+            for path in [&canary_dir, &gh_config] {
+                let filter = if mode == aft::config::SandboxMode::Strict {
+                    format!("(subpath \"{}\")", escape_path(path).unwrap())
+                } else {
+                    relaxed_filter(path, false).unwrap()
+                };
+                for operation in ["file-read*", "file-write*"] {
+                    let deny = format!("(deny {operation} {filter})");
+                    assert!(source
+                        .find(&deny)
+                        .is_some_and(|index| index < metadata_index));
+                }
+            }
+            for path in &profile.keychain_deny {
+                let deny = format!(
+                    "(deny file-read* file-write* {})",
+                    relaxed_filter(path, false).unwrap()
+                );
+                assert!(source
+                    .find(&deny)
+                    .is_some_and(|index| index > metadata_index));
+            }
+            assert!(!source.contains("(allow file-read-data"));
+        }
+    }
+
+    #[test]
     fn relaxed_regex_literal_escapes_dot_once() {
         assert_eq!(
             relaxed_filter(Path::new("/tmp/a.b"), false).unwrap(),
@@ -621,6 +709,7 @@ mod tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: task_temp,
+            worker_gh_fence: None,
         };
         let source = render_profile(&profile).expect("render profile");
         let allow = source.find("(allow file-write*").expect("write allow");
@@ -628,6 +717,67 @@ mod tests {
             .rfind("(deny file-write*")
             .expect("nested write deny");
         assert!(deny > allow, "nested deny must be the last matching rule");
+    }
+
+    #[test]
+    fn worker_canary_metadata_exceptions_follow_data_denies_for_every_home() {
+        // Seatbelt profiles use macOS-style slash-separated paths. Construct them
+        // without `Path::join` so Windows keeps the same profile text.
+        let paths = ["/Users/account", "/Users/daemon"].map(|home| {
+            std::path::PathBuf::from(format!(
+                "{home}/{}/canary",
+                aft::worker_jail_canary::CANARY_DIR_FROM_HOME
+            ))
+        });
+        let dirs = paths
+            .iter()
+            .map(|path| path.parent().unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        let mut profile = SandboxProfile {
+            v: 1,
+            mode: aft::config::SandboxMode::Strict,
+            worker_jail: false,
+            keychain_deny: Vec::new(),
+            deny_prefixes: Vec::new(),
+            data_policy: Default::default(),
+            writable_roots: vec![Path::new("/work").to_path_buf()],
+            writable_files: Vec::new(),
+            write_deny: dirs.clone(),
+            write_deny_nested: Vec::new(),
+            read_allow: Vec::new(),
+            read_allow_listed: Vec::new(),
+            read_deny: dirs,
+            socket_deny: Vec::new(),
+            loopback_tcp_connect_deny: Vec::new(),
+            cache_roots: Vec::new(),
+            temp_dir: Path::new("/task").to_path_buf(),
+            worker_gh_fence: Some(aft::sandbox_profile::WorkerGhFence::Canary {
+                paths: paths.to_vec(),
+            }),
+        };
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            let source = render_profile(&profile).unwrap();
+            let last_deny = source.rfind("(deny file-read*").unwrap();
+            assert!(source.contains("(deny file-write*"));
+            for path in &paths {
+                for ancestor in path.ancestors() {
+                    let allow = format!(
+                        "(allow file-read-metadata (literal \"{}\"))",
+                        ancestor.display()
+                    );
+                    assert!(
+                        source.find(&allow).is_some_and(|index| index > last_deny),
+                        "missing metadata exception for {} in {mode}: {source}",
+                        ancestor.display()
+                    );
+                }
+            }
+            assert!(!source.contains("(allow file-read-data"), "{source}");
+        }
     }
 
     #[test]

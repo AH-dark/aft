@@ -17,6 +17,8 @@ use std::sync::{LazyLock, Mutex};
 
 /// Environment variable that carries the ticket into a spawned command.
 pub const GH_SHIM_TICKET_ENV: &str = "AFT_GH_SHIM_TICKET";
+/// Restriction hint added only by worker launch planning. It cannot grant identity.
+pub const GH_SHIM_WORKER_ENV: &str = "AFT_GH_SHIM_WORKER";
 
 const TICKET_BYTES: usize = 16;
 
@@ -27,9 +29,13 @@ pub struct Redeemed {
     /// Background task id, or the id of the tool call that ran `gh` directly.
     /// Empty while a background task is still being spawned.
     pub task_id: String,
-    /// Project the command ran for; used only to label the daemon's own
-    /// routes to prefrontal and plexus, never to choose who speaks.
+    /// Project root recorded when the daemon launched the command. It is used
+    /// to capture read_repository at mint and to label outbound routes, not to
+    /// re-derive a repository from editable config during a later read.
     pub project_root: String,
+    /// Repository captured from the primary checkout when this ticket was
+    /// minted. Later worktree config edits cannot retarget an existing ticket.
+    pub read_repository: Option<String>,
 }
 
 enum Owner {
@@ -50,6 +56,7 @@ struct Entry {
     session_id: String,
     owner: Owner,
     project_root: String,
+    read_repository: Option<String>,
 }
 
 static REGISTRY: LazyLock<Mutex<Vec<Entry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -99,11 +106,14 @@ fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> 
     // ticket, which makes its governed writes refuse rather than guessable.
     getrandom::fill(&mut ticket).ok()?;
     let encoded = encode(&ticket);
+    let read_repository =
+        crate::gh_shim::ticket_repository_snapshot(std::path::Path::new(project_root));
     registry().push(Entry {
         ticket,
         session_id: session_id.to_string(),
         owner,
         project_root: project_root.to_string(),
+        read_repository,
     });
     Some(encoded)
 }
@@ -120,6 +130,7 @@ pub fn redeem(ticket: &str) -> Option<Redeemed> {
                 session_id: entry.session_id.clone(),
                 task_id: entry.owner.id().to_string(),
                 project_root: entry.project_root.clone(),
+                read_repository: entry.read_repository.clone(),
             });
         }
     }
@@ -259,6 +270,7 @@ mod tests {
                 session_id: "ses-redeem".to_string(),
                 task_id: String::new(),
                 project_root: "/p".to_string(),
+                read_repository: None,
             })
         );
         pending.bind_task("task-redeem");

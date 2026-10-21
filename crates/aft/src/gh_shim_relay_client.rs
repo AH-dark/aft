@@ -1056,4 +1056,126 @@ fn describe_session_agent_mismatch(
 
 #[cfg(test)]
 #[path = "gh_shim_relay_client_tests.rs"]
-mod tests;
+pub(super) mod tests;
+
+/// Resolve session kind from the daemon's ticket record, never from a body claim.
+pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, String> {
+    session_context(relay).map(|context| {
+        context.and_then(|context| {
+            if context.worker {
+                Some(true)
+            } else if context.head {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+pub(super) struct SessionContext {
+    pub(super) worker: bool,
+    pub(super) head: bool,
+    pub(super) repository: Option<String>,
+}
+
+pub(super) fn worker_repository(relay: &RelayContext) -> Result<String, String> {
+    let context = session_context(relay)?.ok_or("no authenticated session context")?;
+    if !context.worker {
+        return Err("the session is not a worker".into());
+    }
+    context.repository.ok_or_else(|| {
+        "the ticket has no immutable repository snapshot; restart the command".into()
+    })
+}
+
+fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, String> {
+    let Some(ticket) = relay.ticket.as_deref().filter(|ticket| !ticket.is_empty()) else {
+        return Ok(None);
+    };
+    let connection = relay
+        .connection_file
+        .as_ref()
+        .ok_or("worker read session lookup requires the AFT daemon connection")?;
+    let budget = SETUP_TIMEOUT.min(relay.relay_budget);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(budget, async {
+            let consumer = SubcConsumer::connect(connection, ConsumerOptions {
+                call_timeout: budget, handshake_timeout: budget, ..ConsumerOptions::default()
+            }).await.map_err(|error| format!("worker read session lookup failed: {error}"))?;
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            let route = consumer.open_route(
+                RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
+                BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-session"),
+                CallOptions::default(),
+            ).await.map_err(|error| format!("worker read session lookup is unavailable; restart the AFT daemon: {error}"))?;
+            let request = json!({"op": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "params": {"ticket": ticket}});
+            let reply = consumer.request(&route, serde_json::to_vec(&request).map_err(|error| error.to_string())?, CallOptions::default()).await;
+            let _ = consumer.close_handle(&route, CloseRouteOptions::default()).await;
+            let bytes = reply.map_err(|error| format!("worker read session lookup failed: {error}"))?;
+            let envelope: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if envelope["status"] != "ok" {
+                if envelope["data"]["refusal_code"] == "session_unscoped" { return Ok(None); }
+                return Err(format!("worker read session lookup refused: {}", envelope["data"]["message"].as_str().unwrap_or("no authenticated session context")));
+            }
+            let worker = envelope["data"]["worker"].as_bool().ok_or("the daemon returned no authenticated worker context")?;
+            let head = envelope["data"].get("head").and_then(Value::as_bool).unwrap_or(false);
+            if worker && head { return Err("the daemon returned conflicting caller roles".into()); }
+            let repository = match envelope["data"].get("repository") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(repository)) if super::canonical_repository_key(repository).as_deref() == Some(repository.as_str()) => Some(repository.clone()),
+                _ => return Err("the daemon returned an invalid repository snapshot".into()),
+            };
+            Ok(Some(SessionContext {worker, head, repository}))
+        }).await.map_err(|_| "worker read session lookup timed out; caller identity was not established".to_string())?
+    })
+}
+
+/// Send one github_read request through AFT's ticket-authenticated management
+/// relay. Tool refusals remain Response bodies; Error frames are transport errors.
+pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Value, String> {
+    let ticket = relay
+        .ticket
+        .as_deref()
+        .filter(|ticket| !ticket.is_empty())
+        .ok_or("no live command ticket is attached")?;
+    let connection = relay
+        .connection_file
+        .as_ref()
+        .ok_or("no AFT daemon connection is configured")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(relay.relay_budget, async {
+            let setup = tokio::time::timeout(SETUP_TIMEOUT, async {
+                let consumer = SubcConsumer::connect(connection, ConsumerOptions {
+                    call_timeout: relay.relay_budget, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
+                }).await.map_err(|error| error.to_string())?;
+                let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+                let route = consumer.open_route(
+                    RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
+                    BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-request"),
+                    CallOptions::default(),
+                ).await.map_err(|error| error.to_string())?;
+                Ok::<_, String>((consumer, route))
+            }).await.map_err(|_| "read relay setup timed out".to_string())??;
+            let (consumer, route) = setup;
+            let body = json!({"op": crate::gh_shim_relay::READ_REQUEST_OPERATION, "params": {"ticket": ticket, "request": request}});
+            let reply = consumer.request(&route, serde_json::to_vec(&body).map_err(|error| error.to_string())?, CallOptions::default()).await;
+            let _ = consumer.close_handle(&route, CloseRouteOptions::default()).await;
+            let bytes = reply.map_err(|error| format!("read relay transport error: {error}"))?;
+            let envelope: Value = serde_json::from_slice(&bytes).map_err(|error| format!("malformed read relay response: {error}"))?;
+            match envelope["status"].as_str() {
+                Some("ok") => envelope.get("data").cloned().ok_or_else(|| "read relay response omitted data".to_string()),
+                Some("error") => Err(format!("{}: {}", envelope["data"]["refusal_code"].as_str().unwrap_or("relay_error"), envelope["data"]["message"].as_str().unwrap_or("read relay refused"))),
+                _ => Err("read relay response has no known status".into()),
+            }
+        }).await.map_err(|_| "read relay timed out; the read was not retried".to_string())?
+    })
+}

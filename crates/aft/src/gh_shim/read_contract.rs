@@ -1,0 +1,255 @@
+//! Draft github_read wire contract pinned by Plexus's build.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub(crate) const MAX_REPLY_BYTES: u64 = 1_048_576;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields, tag = "action")]
+pub(crate) enum Request {
+    #[serde(rename = "github.repo.get")]
+    Get { repository: String, args: GetArgs },
+    #[serde(rename = "github.search.code")]
+    Code {
+        repository: String,
+        args: SearchArgs,
+    },
+    #[serde(rename = "github.search.issues")]
+    Issues {
+        repository: String,
+        args: SearchArgs,
+    },
+    #[serde(rename = "github.actions.job_log")]
+    JobLog { repository: String, args: LogArgs },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) enum Accept {
+    #[default]
+    #[serde(rename = "application/vnd.github+json")]
+    Json,
+    #[serde(rename = "application/vnd.github.raw+json")]
+    Raw,
+    #[serde(rename = "application/vnd.github.diff")]
+    Diff,
+    #[serde(rename = "application/vnd.github.patch")]
+    Patch,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetArgs {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query: BTreeMap<String, String>,
+    #[serde(default)]
+    pub accept: Accept,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchArgs {
+    pub q: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_page: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LogArgs {
+    pub job_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+}
+
+impl Request {
+    pub(crate) fn repository(&self) -> &str {
+        match self {
+            Self::Get { repository, .. }
+            | Self::Code { repository, .. }
+            | Self::Issues { repository, .. }
+            | Self::JobLog { repository, .. } => repository,
+        }
+    }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let repository = match self {
+            Self::Get { repository, .. }
+            | Self::Code { repository, .. }
+            | Self::Issues { repository, .. }
+            | Self::JobLog { repository, .. } => repository,
+        };
+        if super::canonical_repository_key(repository).as_deref() != Some(repository.as_str()) {
+            return Err("repository must be canonical owner/name".into());
+        }
+        match self {
+            Self::Get { args, .. } => {
+                let path = &args.path;
+                validate_path(path)?;
+                if matches!(args.accept, Accept::Diff | Accept::Patch) {
+                    let parts: Vec<_> = path.split('/').collect();
+                    if parts.len() != 2
+                        || !((parts[0] == "pulls"
+                            && parts[1].parse::<u64>().is_ok_and(|id| id > 0))
+                            || (parts[0] == "compare" && !parts[1].is_empty()))
+                    {
+                        return Err(
+                            "diff/patch Accept is limited to numbered pulls and compare endpoints"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            Self::Code { args, .. } | Self::Issues { args, .. } => {
+                validate_search(&args.q)?;
+                if args.page == Some(0) || args.per_page.is_some_and(|size| size == 0 || size > 100)
+                {
+                    return Err("search page must be positive and per_page must be 1..100".into());
+                }
+            }
+            Self::JobLog { args, .. } => {
+                if args.job_id == 0
+                    || args
+                        .length
+                        .is_some_and(|size| size == 0 || size > MAX_REPLY_BYTES)
+                    || args
+                        .offset
+                        .unwrap_or(0)
+                        .checked_add(args.length.unwrap_or(0))
+                        .is_none()
+                {
+                    return Err(
+                        "job log needs a positive job_id and a byte range of at most 1048576 bytes"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validate_path(path: &str) -> Result<(), String> {
+    let lower = path.to_ascii_lowercase();
+    let parts: Vec<_> = path.split('/').collect();
+    // Only these endpoints interpret one segment as a branch, tag or commit
+    // ref. Encoded slashes cannot change endpoint structure or repository scope.
+    let name_index = match parts.as_slice() {
+        ["branches", _]
+        | ["branches", _, "protection"]
+        | ["branches", _, "protection", "required_status_checks"]
+        | ["commits", _]
+        | ["commits", _, "status" | "statuses" | "check-runs"] => Some(1),
+        ["releases", "tags", _] => Some(2),
+        _ => None,
+    };
+    if !path.is_empty()
+        && (path.starts_with('/')
+            || path.contains("//")
+            || path.contains(['\\', '?', '#', ':'])
+            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            || path.bytes().any(|byte| byte.is_ascii_control())
+            || parts.iter().enumerate().any(|(index, part)| {
+                let part = part.to_ascii_lowercase();
+                part.contains("%2f")
+                    && (name_index != Some(index)
+                        || part
+                            .replace("%2f", "/")
+                            .split('/')
+                            .any(|part| matches!(part, "" | "." | "..")))
+            })
+            || ["%5c", "%2e", "%3a", "%3f", "%23", "%25"]
+                .iter()
+                .any(|encoded| lower.contains(encoded)))
+    {
+        return Err(
+            "path must be repository-relative; only the empty string names the repository root"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_search(q: &str) -> Result<(), String> {
+    let qualifiers = regex::Regex::new(r"(?i)(?:^|[^a-z0-9_])(?:repo|org|user)\s*:").unwrap();
+    if q.trim().is_empty() || qualifiers.is_match(q) {
+        return Err("search requires a query without repository/org/user qualifiers; Plexus adds the bound repository".into());
+    }
+    let boolean = regex::Regex::new(r"(?i)\b(?:OR|AND|NOT)\b").unwrap();
+    if q.contains(['(', ')']) || boolean.is_match(q) {
+        return Err("worker search does not allow boolean operators or parentheses; Plexus appends a repository constraint".into());
+    }
+    if q.contains('\\') {
+        return Err("worker search does not allow backslashes: GitHub search syntaxes have different escape rules".into());
+    }
+    let mut quoted = false;
+    for character in q.chars() {
+        if character == '"' {
+            quoted = !quoted;
+        }
+    }
+    if quoted {
+        return Err("worker search requires balanced double quotes before the appended repository constraint".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetReply {
+    pub status: u16,
+    pub body: Value,
+    pub next_page: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchReply {
+    pub total_count: u64,
+    pub incomplete_results: bool,
+    pub items: Vec<Value>,
+    pub next_page: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LogReply {
+    pub body: String,
+    pub offset: u64,
+    pub length: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Reply {
+    Get(GetReply),
+    Search(SearchReply),
+    JobLog(LogReply),
+}
+
+impl Reply {
+    pub(crate) fn bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        match self {
+            Self::Get(GetReply {
+                body: Value::String(text),
+                ..
+            })
+            | Self::JobLog(LogReply { body: text, .. }) => Ok(text.as_bytes().to_vec()),
+            Self::Get(reply) => serde_json::to_vec(&reply.body),
+            Self::Search(reply) => serde_json::to_vec(reply),
+        }
+    }
+    pub(crate) fn next_page(&self) -> Option<u64> {
+        match self {
+            Self::Get(reply) => reply.next_page,
+            Self::Search(reply) => reply.next_page,
+            Self::JobLog(_) => None,
+        }
+    }
+}
