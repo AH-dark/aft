@@ -396,6 +396,7 @@ class SemanticBuildingNotApplicableTests(unittest.TestCase):
                 "schema": "aft-search-score-v1",
                 "model_id": "fixture",
                 "profile": "single_page",
+                "views_enabled": True,
                 "capability": {
                     "schema_path": "fixture.json",
                     "schema_sha256": "0" * 64,
@@ -445,8 +446,9 @@ class SemanticBuildingNotApplicableTests(unittest.TestCase):
         }
         return manifest, reference, candidate, descriptor
 
-    def test_gate_skips_building_fixture_rows_in_both_candidate_and_reference(self) -> None:
+    def test_views_score_with_building_not_applicable_rows_is_accepted(self) -> None:
         manifest, reference, candidate, descriptor = self.documents()
+        self.assertIs(candidate["views_enabled"], True)
         result = total_gate(reference, candidate, manifest, descriptor, [])
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(
@@ -455,6 +457,16 @@ class SemanticBuildingNotApplicableTests(unittest.TestCase):
                 "semantic_building_rows_skipped:followup-census:2:"
                 "views-enabled semantic index was ready before the held-embedding fixture reached the building state",
             ),
+        )
+
+    def test_non_views_score_with_building_not_applicable_rows_is_refused(self) -> None:
+        manifest, reference, candidate, descriptor = self.documents()
+        candidate.pop("views_enabled")
+        result = total_gate(reference, candidate, manifest, descriptor, [])
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(
+            result.reasons,
+            ("semantic_building_rows_not_applicable_requires_views_enabled:true",),
         )
 
     def test_non_building_rows_cannot_be_excluded_as_not_applicable(self) -> None:

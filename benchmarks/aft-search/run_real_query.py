@@ -1084,6 +1084,7 @@ def run(args: argparse.Namespace) -> int:
         Path(args.reference).resolve(),
     )
     if args.views:
+        score["views_enabled"] = True
         score["views_work"] = views_work
     if not_applicable_building_rows:
         score["rows"].extend(not_applicable_building_rows)
