@@ -61,7 +61,9 @@ fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
     assert_eq!(ledger.accounting().unwrap().reserved_bytes, 0);
     assert_eq!(
         ledger
-            .connection
+            .database
+            .connection()
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM reservations", [], |r| r
                 .get::<_, u64>(0))
             .unwrap(),
@@ -93,7 +95,9 @@ fn floor_recheck_refuses_without_reservation_or_plane_store() {
     let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
     assert_eq!(
         ledger
-            .connection
+            .database
+            .connection()
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM reservations", [], |r| r
                 .get::<_, u64>(0))
             .unwrap(),
@@ -360,9 +364,15 @@ fn drift_refusal_is_cleared_after_valid_replacement_and_never_becomes_floor() {
         .unwrap()
         .to_string();
     assert!(persisted_format::refusal_covering(PersistedStore::ViewsV3Registry, &path).is_some());
-    let replacement = tempdir().unwrap();
-    seed(replacement.path(), A);
-    fs::copy(db(replacement.path(), A), &path).unwrap();
+    assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+    for name in ["members.sqlite", "members.sqlite-wal", "members.sqlite-shm"] {
+        match fs::remove_file(path.with_file_name(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
+    publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
     LedgerReader::open_existing(root.path(), A).unwrap();
     assert!(persisted_format::refusal_covering(PersistedStore::ViewsV3Registry, &path).is_none());
     assert!(UnsupportedPersistedFormat::is_refusal_message(&old));
@@ -407,6 +417,60 @@ fn v3_child() {
     let mode = std::env::var("AFT_V3_TEST_MODE").unwrap();
     let control = PathBuf::from(std::env::var_os("AFT_V3_TEST_CONTROL").unwrap());
     set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    if mode == "wal-writer" {
+        let lock = ReservationLock::acquire(&storage).unwrap();
+        let mut writer = RegistryWriter::open_existing(&storage, &family, &lock).unwrap();
+        let _reservation = writer.reserve(1234).unwrap();
+        fs::write(&control, b"uncheckpointed").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    if matches!(
+        mode.as_str(),
+        "ledger-audit" | "ledger-held" | "ledger-transaction"
+    ) {
+        read_audit::enable();
+        let ledger = LedgerReader::open_existing(&storage, &family).unwrap();
+        if mode == "ledger-transaction" {
+            ledger
+                .database
+                .connection()
+                .unwrap()
+                .execute_batch("BEGIN")
+                .unwrap();
+        }
+        let accounting = ledger.accounting().unwrap();
+        // SAFETY: the connection guard keeps the SQLite handle alive.
+        let readonly = unsafe {
+            rusqlite::ffi::sqlite3_db_readonly(
+                ledger.database.connection().unwrap().handle(),
+                c"main".as_ptr(),
+            )
+        };
+        let before = read_audit::counts();
+        fs::write(
+            &control,
+            serde_json::to_vec(
+                &serde_json::json!({"reserved":accounting.reserved_bytes,"readonly":readonly,"before":before}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        if mode != "ledger-audit" {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !control.with_extension("release").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent did not release ledger child"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        drop(ledger);
+        fs::write(&control,serde_json::to_vec(&serde_json::json!({"reserved":accounting.reserved_bytes,"readonly":readonly,"before":before,"after":read_audit::counts()})).unwrap()).unwrap();
+        return;
+    }
     if mode == "reserve" {
         set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
         let result = (|| -> Result<()> {
@@ -542,7 +606,8 @@ fn killed_v3_publishers_recover_at_both_new_boundaries_without_losing_orphans() 
                 assert_eq!(accounting.usage(), inventory(&writer.dir));
                 assert!(accounting.usage() >= 1024 * 1024);
                 let released: u64 = writer
-                    .connection
+                    .connection()
+                    .unwrap()
                     .query_row(
                         "SELECT COUNT(*) FROM reservations WHERE state='released'",
                         [],
@@ -593,44 +658,39 @@ fn normal_child_exit_keeps_data_and_inventory_charge() {
     );
 }
 
-fn file_snapshot(path: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(path).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_dir() {
-            files.extend(file_snapshot(&path));
-        } else {
-            files.push((
-                path.clone(),
-                fs::read(&path).unwrap(),
-                entry.metadata().unwrap().modified().unwrap(),
-            ));
-        }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-}
 #[test]
-fn ledger_read_does_not_write_create_sidecars_or_remeasure_closed_or_live_registry() {
+fn ledger_reads_share_live_owner_without_mutation_or_measurement() {
     let _g = serial();
     let root = tempdir().unwrap();
     seed(root.path(), A);
-    let dir = family_dir(root.path(), A).unwrap();
-    let before = file_snapshot(&dir);
-    let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
-    let original = ledger.accounting().unwrap();
-    assert_eq!(file_snapshot(&dir), before);
-    drop(ledger);
     let lock = ReservationLock::acquire(root.path()).unwrap();
     let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let reservation = writer.reserve(100).unwrap();
-    let before = file_snapshot(&dir);
+    let before = writer.accounting().unwrap();
+    let changes = writer.connection().unwrap().total_changes();
     let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
-    assert_eq!(ledger.accounting().unwrap().reserved_bytes, 100);
-    assert!(original.measured_bytes > 0);
-    assert_eq!(file_snapshot(&dir), before);
+    assert!(Arc::ptr_eq(&ledger.database, &writer.database));
+    assert_eq!(ledger.accounting().unwrap(), before);
+    assert_eq!(writer.connection().unwrap().total_changes(), changes);
+    assert_eq!(
+        writer
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        crate::db::file_identity::open_connections(&db(root.path(), A)),
+        1
+    );
     drop(ledger);
+    assert_eq!(
+        crate::db::file_identity::open_connections(&db(root.path(), A)),
+        1
+    );
+    let second = writer.reserve(1).unwrap();
+    writer.release(second).unwrap();
     writer.release(reservation).unwrap();
 }
 
@@ -657,7 +717,7 @@ fn nested_writer_uses_existing_root_guard_and_does_not_touch_peer_ledger() {
     seed(root.path(), A);
     let lock = ReservationLock::acquire(root.path()).unwrap();
     let a = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
-    let before = file_snapshot(&a.dir);
+    let before = a.connection().unwrap().total_changes();
     let accounting = a.accounting().unwrap();
     let started = std::time::Instant::now();
     publish_locked(root.path(), B, 1024, &lock, None, |p| {
@@ -666,7 +726,7 @@ fn nested_writer_uses_existing_root_guard_and_does_not_touch_peer_ledger() {
     .unwrap();
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(a.accounting().unwrap(), accounting);
-    assert_eq!(file_snapshot(&a.dir), before);
+    assert_eq!(a.connection().unwrap().total_changes(), before);
 }
 
 #[test]
@@ -810,10 +870,206 @@ fn member_kind_constraint_and_v3_namespace_are_not_v2_registration() {
     })
     .unwrap();
     let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
-    let count:u64=ledger.connection.query_row("SELECT COUNT(*) FROM members WHERE kind IN ('view','base') AND state='active' AND missing_sweeps=0 AND last_bind_ms>0",[],|r|r.get(0)).unwrap();
+    let count:u64=ledger.database.connection().unwrap().query_row("SELECT COUNT(*) FROM members WHERE kind IN ('view','base') AND state='active' AND missing_sweeps=0 AND last_bind_ms>0",[],|r|r.get(0)).unwrap();
     assert_eq!(count, 2);
     assert!(!root.path().join("blobs/v2").exists());
     assert!(view_dir(root.path(), A, "view-scope")
         .unwrap()
         .starts_with(family_dir(root.path(), A).unwrap()));
+}
+
+#[test]
+fn read_only_first_owner_upgrades_without_a_second_live_connection() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert!(Arc::ptr_eq(&ledger.database, &writer.database));
+    assert_eq!(
+        crate::db::file_identity::open_connections(&db(root.path(), A)),
+        1
+    );
+    let reservation = writer.reserve(1).unwrap();
+    assert_eq!(ledger.accounting().unwrap().reserved_bytes, 1);
+    writer.release(reservation).unwrap();
+}
+
+#[test]
+fn plane_reader_reuses_the_publication_connection() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    publish(root.path(), A, 1024, None, |p| {
+        p.put(&key(), b"v3 data", 1)?;
+        let reader = PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic)?;
+        assert!(Arc::ptr_eq(&reader.database, &p.planes[0].1));
+        assert_eq!(reader.get(&key())?, Some(b"v3 data".to_vec()));
+        assert_eq!(
+            crate::db::file_identity::open_connections(&plane_path(
+                root.path(),
+                A,
+                FamilyPlane::Semantic
+            )?),
+            1
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn audit_result(control: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(control).unwrap()).unwrap()
+}
+fn assert_reader_io_is_read_only(result: &serde_json::Value) {
+    assert_eq!(result["readonly"], 1);
+    for phase in ["before", "after"] {
+        let counts: read_audit::Counts = serde_json::from_value(result[phase].clone()).unwrap();
+        assert_eq!(
+            (counts.main.writes, counts.main.truncates, counts.main.syncs),
+            (0, 0, 0),
+            "{phase}: {counts:?}"
+        );
+        assert_eq!(
+            (counts.wal.writes, counts.wal.truncates, counts.wal.syncs),
+            (0, 0, 0),
+            "{phase}: {counts:?}"
+        );
+        assert_eq!(
+            (
+                counts.other.writes,
+                counts.other.truncates,
+                counts.other.syncs
+            ),
+            (0, 0, 0),
+            "{phase}: {counts:?}"
+        );
+        assert_eq!(counts.main.opens, 1);
+        assert!(counts.wal.opens > 0);
+    }
+    let after: read_audit::Counts = serde_json::from_value(result["after"].clone()).unwrap();
+    assert_eq!(after.main.closes, 1);
+    assert_eq!(after.wal.closes, after.wal.opens);
+}
+
+#[test]
+fn native_cross_process_ledger_read_has_no_main_or_wal_write_truncate_or_sync() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let control = tempdir().unwrap();
+    seed(root.path(), A);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let reservation = writer.reserve(1234).unwrap();
+    assert!(
+        fs::metadata(db(root.path(), A).with_file_name("members.sqlite-wal"))
+            .unwrap()
+            .len()
+            > 32
+    );
+    let before = writer.accounting().unwrap();
+    let ready = control.path().join("audit.json");
+    assert!(child(root.path(), A, "ledger-audit", &ready)
+        .wait()
+        .unwrap()
+        .success());
+    let result = audit_result(&ready);
+    assert_eq!(result["reserved"], 1234);
+    assert_reader_io_is_read_only(&result);
+    assert_eq!(writer.accounting().unwrap(), before);
+    writer.release(reservation).unwrap();
+}
+
+#[test]
+fn read_only_close_does_not_checkpoint_after_the_writer_is_killed() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let control = tempdir().unwrap();
+    seed(root.path(), A);
+    let writer_ready = control.path().join("writer");
+    let reader_ready = control.path().join("reader.json");
+    let mut writer = child(root.path(), A, "wal-writer", &writer_ready);
+    wait_file(&writer_ready, &mut writer);
+    let mut reader = child(root.path(), A, "ledger-transaction", &reader_ready);
+    wait_file(&reader_ready, &mut reader);
+    assert_eq!(audit_result(&reader_ready)["reserved"], 1234);
+    writer.kill().unwrap();
+    writer.wait().unwrap();
+    let wal = db(root.path(), A).with_file_name("members.sqlite-wal");
+    let length = fs::metadata(&wal).unwrap().len();
+    assert!(length > 32);
+    fs::write(reader_ready.with_extension("release"), b"close").unwrap();
+    assert!(reader.wait().unwrap().success());
+    assert_reader_io_is_read_only(&audit_result(&reader_ready));
+    assert_eq!(fs::metadata(wal).unwrap().len(), length);
+}
+
+#[test]
+fn reader_vfs_audit_counts_real_scratch_writes_truncates_and_syncs() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    read_audit::reset();
+    let c = read_audit::open(&root.path().join("scratch.sqlite"), OpenFlags::default()).unwrap();
+    c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0; CREATE TABLE data(payload); INSERT INTO data VALUES(zeroblob(8192));").unwrap();
+    checkpoint(&c).unwrap();
+    drop(c);
+    let counts = read_audit::counts();
+    eprintln!("audited scratch I/O: {counts:?}");
+    assert!(
+        counts.main.writes > 0 && counts.main.syncs > 0,
+        "{counts:?}"
+    );
+    assert!(
+        counts.wal.writes > 0 && counts.wal.truncates > 0 && counts.wal.syncs > 0,
+        "{counts:?}"
+    );
+    assert_eq!(counts.main.closes, counts.main.opens);
+    assert_eq!(counts.wal.closes, counts.wal.opens);
+}
+
+#[cfg(unix)]
+#[test]
+fn reader_created_shm_stays_within_the_covering_inventory_at_the_budget_boundary() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let control = tempdir().unwrap();
+    seed(root.path(), A);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let covered = writer.accounting().unwrap().usage();
+    assert_eq!(covered, inventory(&writer.dir));
+    drop(writer);
+    drop(lock);
+    let shm = db(root.path(), A).with_file_name("members.sqlite-shm");
+    assert!(!shm.exists());
+    let ready = control.path().join("reader.json");
+    let mut reader = child(root.path(), A, "ledger-held", &ready);
+    wait_file(&ready, &mut reader);
+    assert!(shm.exists());
+    assert!(inventory(&family_dir(root.path(), A).unwrap()) <= covered);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let reservation = writer.reserve(NAMESPACE_BUDGET - covered).unwrap();
+    writer.release(reservation).unwrap();
+    fs::write(ready.with_extension("release"), b"close").unwrap();
+    assert!(reader.wait().unwrap().success());
+    assert_reader_io_is_read_only(&audit_result(&ready));
+}
+
+#[cfg(unix)]
+#[test]
+fn file_identity_aliases_share_one_sqlite_owner() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let alias = root.path().join("registry-alias.sqlite");
+    fs::hard_link(db(root.path(), A), &alias).unwrap();
+    let database = connections::shared(&alias, Kind::Registry, false, true).unwrap();
+    assert!(Arc::ptr_eq(&database, &writer.database));
+    assert_eq!(
+        crate::db::file_identity::open_connections(&db(root.path(), A)),
+        1
+    );
 }

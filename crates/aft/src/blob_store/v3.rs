@@ -5,12 +5,13 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use super::v2::{FamilyKey, FamilyPlane};
+use crate::db::file_identity::IdentityConnection;
 use crate::persisted_format::{
     self, IncompatibleReason, PersistedStore, UnsupportedPersistedFormat,
 };
@@ -24,7 +25,9 @@ pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
 pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 const TIMEOUT_MS: i64 = 5_000;
-mod snapshot;
+mod connections;
+#[cfg(test)]
+mod read_audit;
 
 const META: &str = "CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, layout_tag INTEGER NOT NULL, schema_text TEXT NOT NULL);";
 const REGISTRY_SCHEMA: &str = "
@@ -198,7 +201,7 @@ impl ReservationLock {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Registry,
     Plane,
@@ -318,7 +321,7 @@ fn pragma(c: &Connection, path: &Path, kind: Kind, name: &'static str, value: i6
 #[cfg(test)]
 thread_local! { static BAD_PRAGMA: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 
-fn open_db(path: &Path, kind: Kind, create: bool, readonly: bool) -> Result<Connection> {
+fn open_db(path: &Path, kind: Kind, create: bool, readonly: bool) -> Result<IdentityConnection> {
     let fresh = !path.try_exists()?;
     let flags = if readonly {
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -327,14 +330,14 @@ fn open_db(path: &Path, kind: Kind, create: bool, readonly: bool) -> Result<Conn
     } else {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
-    let c = if readonly && matches!(kind, Kind::Registry) {
-        snapshot::open(path).map_err(|error| match error {
-            Error::Refused(_) => incompatible(kind, path, 0, IncompatibleReason::SchemaDrift),
-            error => error,
-        })?
+    #[cfg(test)]
+    let c = if read_audit::enabled() {
+        IdentityConnection::new(read_audit::open(path, flags)?, "views-v3")
     } else {
-        Connection::open_with_flags(path, flags)?
+        IdentityConnection::open_with_flags(path, flags, "views-v3")?
     };
+    #[cfg(not(test))]
+    let c = IdentityConnection::open_with_flags(path, flags, "views-v3")?;
     if fresh && create {
         c.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         c.execute_batch(META)?;
@@ -403,24 +406,24 @@ fn accounting(c: &Connection) -> Result<Accounting> {
     Ok(c.query_row("SELECT measured_bytes,watermark,COALESCE((SELECT SUM(charge_bytes) FROM reservations WHERE state='committed' AND completed_seq>watermark),0),COALESCE((SELECT SUM(reserved_bytes) FROM reservations WHERE state='reserved'),0) FROM accounting WHERE singleton=1",[],|r|Ok(Accounting { measured_bytes:r.get(0)?,watermark:r.get(1)?,committed_charges:r.get(2)?,reserved_bytes:r.get(3)? }))?)
 }
 
-/// Existing-only read, with no lock, barrier, measurement or source write.
-/// A read-only in-memory snapshot includes the committed WAL frames without
-/// allowing SQLite to create or update sidecars in the source directory.
+/// Existing-only SELECT capability, with no storage lease, registry barrier or
+/// measurement. Local readers share the owning SQLite connection; otherwise
+/// SQLite opens READ_ONLY and may maintain its own shared-memory WAL index.
 pub struct LedgerReader {
-    connection: Connection,
+    database: Arc<connections::Database>,
 }
 impl LedgerReader {
     pub fn open_existing(storage: &Path, family: &str) -> Result<Self> {
         let path = family_dir(storage, family)?.join("members.sqlite");
         Ok(Self {
-            connection: open_db(&path, Kind::Registry, false, true)?,
+            database: connections::shared(&path, Kind::Registry, false, true)?,
         })
     }
     pub fn accounting(&self) -> Result<Accounting> {
-        accounting(&self.connection)
+        accounting(&**self.database.connection()?)
     }
 }
-fn check_floor(storage: &Path, request: u64) -> Result<()> {
+fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) -> Result<()> {
     let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
     let mut reserved = 0u64;
     let root = storage.join("blobs/v3");
@@ -441,8 +444,17 @@ fn check_floor(storage: &Path, request: u64) -> Result<()> {
             let name = name
                 .to_str()
                 .ok_or(Error::Refused("reservation_ledger_unreadable"))?;
-            let ledger = LedgerReader::open_existing(storage, name)
-                .and_then(|r| r.accounting())
+            let own_connection = own.filter(|(path, _)| {
+                registry == *path
+                    || crate::db::file_identity::identity_of(&registry).is_some_and(|identity| {
+                        Some(identity) == crate::db::file_identity::identity_of(path)
+                    })
+            });
+            let ledger = own_connection
+                .map_or_else(
+                    || LedgerReader::open_existing(storage, name).and_then(|r| r.accounting()),
+                    |(_, connection)| accounting(connection),
+                )
                 .map_err(|_| Error::Refused("reservation_ledger_unreadable"))?;
             reserved = reserved
                 .checked_add(ledger.reserved_bytes)
@@ -463,7 +475,7 @@ fn check_floor(storage: &Path, request: u64) -> Result<()> {
 /// A writer holds the root capability before any registry barrier. Creating a
 /// registry is private to publication; recovery/collection open existing files.
 pub struct RegistryWriter<'a> {
-    connection: Connection,
+    database: Arc<connections::Database>,
     dir: PathBuf,
     lock: &'a ReservationLock,
 }
@@ -478,7 +490,12 @@ impl<'a> RegistryWriter<'a> {
             fs::create_dir_all(&dir)?;
         }
         let mut writer = Self {
-            connection: open_db(&dir.join("members.sqlite"), Kind::Registry, create, false)?,
+            database: connections::shared(
+                &dir.join("members.sqlite"),
+                Kind::Registry,
+                create,
+                false,
+            )?,
             dir,
             lock,
         };
@@ -486,7 +503,10 @@ impl<'a> RegistryWriter<'a> {
         Ok(writer)
     }
     pub fn accounting(&self) -> Result<Accounting> {
-        accounting(&self.connection)
+        accounting(&**self.connection()?)
+    }
+    fn connection(&self) -> Result<connections::Guard<'_>> {
+        self.database.connection()
     }
     /// After deleting namespace files, call this to refresh accounting. It releases dead rows
     /// in the same barrier transaction as the measurement, retaining plane data.
@@ -497,11 +517,10 @@ impl<'a> RegistryWriter<'a> {
         self.lock.verify(&self.lock.storage)?;
         // Checkpoint first: recording a measurement must not itself leave a new
         // WAL charge. Repeat if the accounting update allocated registry pages.
-        checkpoint(&self.connection)?;
+        let mut connection = self.connection()?;
+        checkpoint(&connection)?;
         for _ in 0..8 {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let bytes = allocated_bytes(&self.dir)?;
             if let Some(id) = release {
                 tx.execute(
@@ -541,7 +560,7 @@ impl<'a> RegistryWriter<'a> {
                 params![bytes, watermark],
             )?;
             tx.commit()?;
-            checkpoint(&self.connection)?;
+            checkpoint(&connection)?;
             if allocated_bytes(&self.dir)? == bytes {
                 return Ok(bytes);
             }
@@ -553,9 +572,8 @@ impl<'a> RegistryWriter<'a> {
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         self.lock.verify(&self.lock.storage)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = body(&tx)?;
         tx.commit()?;
         Ok(result)
@@ -587,8 +605,11 @@ impl<'a> RegistryWriter<'a> {
         let owner_start = crate::root_cache::process_start_time_ms(std::process::id())
             .ok_or(Error::Refused("reservation_ledger_unreadable"))?;
         let before = allocated_bytes(&self.dir)?;
+        let path = self.dir.join("members.sqlite");
         let id = self.with_barrier(|tx| {
-            check_floor(&storage,request)?;
+            // The current barrier already borrows this owner's connection.
+            // Use that borrow rather than re-entering its connection mutex.
+            check_floor(&storage,request,Some((&path,tx)))?;
             if accounting(tx)?.usage().checked_add(request).is_none_or(|n|n>NAMESPACE_BUDGET) {
                 return Err(Error::Refused("v3_namespace_budget"));
             }
@@ -638,7 +659,7 @@ pub fn publish<T>(
     body: impl FnOnce(&mut Publication<'_, '_>) -> Result<T>,
 ) -> Result<T> {
     family_dir(storage, family)?;
-    check_floor(storage, request)?;
+    check_floor(storage, request, None)?;
     crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
         observe(observer, DurabilityStep::V3FloorRaised);
         let lock = ReservationLock::acquire(storage)?;
@@ -657,7 +678,7 @@ pub fn publish_locked<T>(
     body: impl FnOnce(&mut Publication<'_, '_>) -> Result<T>,
 ) -> Result<T> {
     lock.verify(storage)?;
-    check_floor(storage, request)?;
+    check_floor(storage, request, None)?;
     crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
         observe(observer, DurabilityStep::V3FloorRaised);
         publish_under_lock(storage, family, request, lock, observer, body)
@@ -696,7 +717,7 @@ fn publish_under_lock<T>(
                 Ok(())
             })?;
             // The registry's own publication writes belong to this attempt too.
-            checkpoint(&registry.connection)?;
+            checkpoint(&**registry.connection()?)?;
             let charge = allocated_bytes(&registry.dir)?
                 .saturating_sub(before)
                 .max(payload_bytes);
@@ -707,7 +728,7 @@ fn publish_under_lock<T>(
                 )?;
                 Ok(())
             })?;
-            checkpoint(&registry.connection)?;
+            checkpoint(&**registry.connection()?)?;
             Ok(result)
     });
     match finished {
@@ -721,16 +742,17 @@ fn publish_under_lock<T>(
 
 pub struct Publication<'a, 'b> {
     pub registry: &'a mut RegistryWriter<'b>,
-    planes: Vec<(FamilyPlane, Connection)>,
+    planes: Vec<(FamilyPlane, Arc<connections::Database>)>,
     payload_bytes: u64,
 }
 impl Publication<'_, '_> {
-    fn plane(&mut self, plane: FamilyPlane) -> Result<&mut Connection> {
+    fn plane(&mut self, plane: FamilyPlane) -> Result<connections::Guard<'_>> {
         if let Some(index) = self.planes.iter().position(|(p, _)| *p == plane) {
-            return Ok(&mut self.planes[index].1);
+            return self.planes[index].1.connection();
         }
         let path = self.registry.dir.join(format!("{}.sqlite", plane.as_str()));
-        let c = open_db(&path, Kind::Plane, true, false)?;
+        let database = connections::shared(&path, Kind::Plane, true, false)?;
+        let c = database.connection()?;
         c.execute(
             "INSERT OR IGNORE INTO store_meta VALUES(1,?1,0)",
             [plane.as_str()],
@@ -747,11 +769,12 @@ impl Publication<'_, '_> {
                 IncompatibleReason::SchemaDrift,
             ));
         }
-        self.planes.push((plane, c));
-        Ok(&mut self.planes.last_mut().expect("inserted plane").1)
+        drop(c);
+        self.planes.push((plane, database));
+        self.planes.last().expect("inserted plane").1.connection()
     }
     pub fn put(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<()> {
-        let c = self.plane(key.plane())?;
+        let mut c = self.plane(key.plane())?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let digest = blake3::hash(payload);
         let existing: Option<Vec<u8>> = tx
@@ -772,14 +795,15 @@ impl Publication<'_, '_> {
             true
         };
         tx.commit()?;
+        drop(c);
         if written {
             self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
         }
         Ok(())
     }
     fn flush(&self) -> Result<()> {
-        for (_, c) in &self.planes {
-            checkpoint(c)?;
+        for (_, database) in &self.planes {
+            checkpoint(&**database.connection()?)?;
         }
         crate::durability::sync_dir(&self.registry.dir)?;
         Ok(())
@@ -787,12 +811,12 @@ impl Publication<'_, '_> {
 }
 
 pub struct PlaneReader {
-    connection: Connection,
+    database: Arc<connections::Database>,
 }
 impl PlaneReader {
     pub fn open_existing(storage: &Path, family: &str, plane: FamilyPlane) -> Result<Self> {
         Ok(Self {
-            connection: open_db(
+            database: connections::shared(
                 &plane_path(storage, family, plane)?,
                 Kind::Plane,
                 false,
@@ -802,7 +826,8 @@ impl PlaneReader {
     }
     pub fn get(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self
-            .connection
+            .database
+            .connection()?
             .query_row(
                 "SELECT payload,payload_digest FROM blob_payloads WHERE full_key=?1",
                 [key.as_bytes().as_slice()],
@@ -820,5 +845,7 @@ impl PlaneReader {
     }
 }
 
+#[cfg(test)]
+mod source_guard;
 #[cfg(test)]
 mod tests;
