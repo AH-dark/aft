@@ -166,6 +166,7 @@ pub(crate) fn step_of(sql: &str) -> &'static str {
     } else if sql.starts_with("PRAGMA page_count") || sql.starts_with("PRAGMA page_size") {
         "page_count/page_size (upper bound, reclaim)"
     } else if sql.starts_with("PRAGMA incremental_vacuum")
+        || sql.starts_with("PRAGMA wal_checkpoint")
         || sql.starts_with("PRAGMA freelist_count")
         || sql.starts_with("PRAGMA auto_vacuum")
         || sql.starts_with("PRAGMA busy_timeout")
@@ -693,6 +694,12 @@ fn database_bytes(store: &FamilyStore) -> u64 {
     store.payload_bytes_upper_bound().unwrap()
 }
 
+/// The length of the store's main database file on disk, from a stat of
+/// its path; nothing is opened.
+fn main_file_bytes(store: &FamilyStore) -> u64 {
+    fs::metadata(store.path()).unwrap().len()
+}
+
 /// A family whose store is over its soft limit only because of free pages.
 /// A third of the rows are unmarked; a sweep under a payload budget
 /// deletes about half of those, which leaves their pages free inside the
@@ -749,6 +756,7 @@ fn a_store_over_its_soft_limit_only_by_free_pages_deletes_no_rows_and_shrinks() 
     let storage = tempfile::tempdir().unwrap();
     let (fixture, stored) = free_pages_only_family(storage.path(), 3_000);
     let database_before = database_bytes(&fixture.store);
+    let main_file_before = main_file_bytes(&fixture.store);
     let free_before = freelist_pages(&fixture.store);
 
     let report = crate::views::eviction::enforce(
@@ -791,6 +799,135 @@ fn a_store_over_its_soft_limit_only_by_free_pages_deletes_no_rows_and_shrinks() 
         shrunk_pages >= returned.reclaimed_pages
             && shrunk_pages <= returned.reclaimed_pages + returned.reclaimed_pages / 200 + 2,
         "{shrunk_pages} pages shrunk for {returned:?}"
+    );
+    // The space is back on disk within the pass: the main file, which the
+    // store's connection keeps open, has been cut to the database's size,
+    // not left at its old length until some later checkpoint.
+    let main_file_after = main_file_bytes(&fixture.store);
+    assert!(
+        main_file_after == database_after && main_file_after < main_file_before,
+        "main file {main_file_before} -> {main_file_after} bytes, database {database_after}"
+    );
+}
+
+/// A family of `rows` marked rows whose store also holds about
+/// `free_pages` free pages at the end of its main file, copied into that
+/// file by a checkpoint, with the soft limit between the family's live
+/// bytes and its file bytes.
+fn tail_free_pages_family(storage: &Path, rows: u64, free_pages: u64) -> Fixture {
+    let fixture = build(storage, rows, |_| true);
+    crate::blob_store::v2::read_tests::set_pragma(
+        &fixture.store,
+        &format!(
+            "CREATE TABLE free_fixture (data BLOB);
+             INSERT INTO free_fixture VALUES (zeroblob({}));
+             DROP TABLE free_fixture;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+            free_pages * PAGE as u64
+        ),
+    );
+    let free = freelist_pages(&fixture.store);
+    assert!(free >= free_pages, "{free}");
+    assert_eq!(
+        main_file_bytes(&fixture.store),
+        database_bytes(&fixture.store),
+        "the fixture's free pages are in the main file"
+    );
+    let file = file_bytes(&fixture.registry);
+    fixture
+        .registry
+        .set_disk_budget(crate::views::eviction::DiskBudget {
+            family_store_soft: file - free * PAGE as u64 / 2,
+            family_store_hard: u64::MAX,
+            ..crate::views::eviction::DiskBudget::default()
+        });
+    fixture
+}
+
+/// A reclaim of 64 pages writes far fewer write-ahead-log frames than the
+/// 1,000 at which SQLite checkpoints on its own, and the store is idle
+/// after it. The main file is still cut within the same pass.
+#[test]
+fn a_small_reclaim_cuts_the_main_file_within_the_same_pass() {
+    let storage = tempfile::tempdir().unwrap();
+    let fixture = tail_free_pages_family(storage.path(), 300, 64);
+    let main_file_before = main_file_bytes(&fixture.store);
+
+    let report = crate::views::eviction::enforce(
+        &fixture.registry,
+        crate::views::eviction::EnforceOptions::default(),
+    )
+    .unwrap();
+
+    let sweep = report.sweep.as_ref().expect("the family sweep ran");
+    assert_eq!(sweep.deleted_blobs, 0, "{report:?}");
+    assert!(!report.free_page_reclaim.checkpoint_blocked, "{report:?}");
+    assert_eq!(freelist_pages(&fixture.store), 0, "{report:?}");
+    let main_file_after = main_file_bytes(&fixture.store);
+    assert!(
+        main_file_after == database_bytes(&fixture.store)
+            && main_file_before - main_file_after >= 64 * PAGE as u64,
+        "main file {main_file_before} -> {main_file_after} bytes, database {}",
+        database_bytes(&fixture.store)
+    );
+}
+
+/// Another connection holding a read snapshot from before the reclaim
+/// keeps the main file at its old length, since cutting it would remove
+/// pages that snapshot may read. The pass does not wait for that reader:
+/// it ends well within the store's 5 s busy timeout. Once the reader ends,
+/// the next pass cuts the file. The reader stands for another process; it
+/// is a test-only connection.
+#[test]
+fn a_reader_snapshot_defers_the_cut_to_the_next_pass_without_waiting() {
+    let storage = tempfile::tempdir().unwrap();
+    let fixture = tail_free_pages_family(storage.path(), 300, 64);
+    let main_file_before = main_file_bytes(&fixture.store);
+    let reader = rusqlite::Connection::open_with_flags(
+        fixture.store.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM store_meta", [], |row| row.get(0))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let first = crate::views::eviction::enforce(
+        &fixture.registry,
+        crate::views::eviction::EnforceOptions::default(),
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS),
+        "the pass waited {elapsed:?} for the reader"
+    );
+    assert!(first.free_page_reclaim.reclaimed_pages >= 64, "{first:?}");
+    assert_eq!(
+        main_file_bytes(&fixture.store),
+        main_file_before,
+        "the main file was cut under a reader's snapshot"
+    );
+    assert!(
+        first.free_page_reclaim.checkpoint_blocked,
+        "the reader's snapshot blocked the checkpoint: {first:?}"
+    );
+
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    crate::views::eviction::enforce(
+        &fixture.registry,
+        crate::views::eviction::EnforceOptions::default(),
+    )
+    .unwrap();
+    let main_file_after = main_file_bytes(&fixture.store);
+    assert!(
+        main_file_after == database_bytes(&fixture.store)
+            && main_file_before - main_file_after >= 64 * PAGE as u64,
+        "main file {main_file_before} -> {main_file_after} bytes, database {}",
+        database_bytes(&fixture.store)
     );
 }
 
@@ -840,8 +977,9 @@ fn returning_free_pages_reads_a_bounded_number_of_pages() {
 /// a sweep under a payload budget deletes about half the unmarked rows,
 /// which leaves their pages free, and the soft limit is set halfway through
 /// those free pages. Three enforcement passes follow; each prints the store
-/// pages it read, the rows it listed and deleted, and the database and
-/// family file bytes after it.
+/// pages it read, the rows it listed and deleted, and after it the
+/// database's size by its page count, the main and write-ahead-log files'
+/// lengths on disk (from a stat of each path) and the family's file bytes.
 ///
 /// `cargo test -p agent-file-tools --lib -- --ignored --exact --nocapture
 /// gc::family_read_tests::free_pages_only_pass_receipt` (an optimized test
@@ -887,11 +1025,12 @@ fn free_pages_only_pass_receipt() {
         });
     eprintln!(
         "FREE_PASS fixture rows={rows} built_in_s={:.1} setup_deleted_blobs={} \
-         family_file_bytes={file} database_bytes={} free_page_bytes={free} \
+         family_file_bytes={file} database_bytes={} main_file_bytes={} free_page_bytes={free} \
          live_bytes={} soft_limit={soft}",
         built.elapsed().as_secs_f64(),
         freed.deleted_blobs,
         database_bytes(&fixture.store),
+        main_file_bytes(&fixture.store),
         file - free,
     );
     for pass in 1..=3 {
@@ -912,7 +1051,8 @@ fn free_pages_only_pass_receipt() {
         eprintln!(
             "FREE_PASS pass={pass} elapsed_ms={} store_pages_read={} store_bytes_read={} \
              examined_blobs={} deleted_blobs={} deleted_bytes={} sweep_error={:?} \
-             family_file_bytes={} database_bytes={} freelist_pages={}",
+             family_file_bytes={} database_bytes={} main_file_bytes={} wal_file_bytes={} \
+             freelist_pages={}",
             elapsed.as_millis(),
             counts.misses,
             i64::from(counts.misses) * PAGE,
@@ -922,6 +1062,9 @@ fn free_pages_only_pass_receipt() {
             report.sweep_error,
             file_bytes(&fixture.registry),
             database_bytes(&fixture.store),
+            main_file_bytes(&fixture.store),
+            fs::metadata(format!("{}-wal", fixture.store.path().display()))
+                .map_or(0, |metadata| metadata.len()),
             freelist_pages(&fixture.store),
         );
         for (step, pages) in &pages {

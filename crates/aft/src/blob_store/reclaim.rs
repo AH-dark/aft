@@ -16,6 +16,11 @@ pub struct ReclaimReport {
     pub steps: u64,
     pub legacy_stores: u64,
     pub deferred: bool,
+    /// A checkpoint after the reclaim could not copy the whole write-ahead
+    /// log into the main file, usually because another connection holds an
+    /// older read snapshot, so the main file keeps its old length until a
+    /// later pass checkpoints again.
+    pub checkpoint_blocked: bool,
 }
 
 impl ReclaimReport {
@@ -28,6 +33,7 @@ impl ReclaimReport {
         self.steps += other.steps;
         self.legacy_stores += other.legacy_stores;
         self.deferred |= other.deferred;
+        self.checkpoint_blocked |= other.checkpoint_blocked;
     }
 }
 
