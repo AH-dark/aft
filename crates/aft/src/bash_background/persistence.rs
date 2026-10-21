@@ -654,10 +654,16 @@ pub struct PersistedTask {
     pub notify_on_completion: bool,
     #[serde(default = "default_compressed")]
     pub compressed: bool,
-    /// Only an explicit false permits rendering new output after a restart
-    /// without the task's in-memory environment credential values.
+    /// Whether the child environment held any completion secret, including
+    /// AFT's memory-only gh-shim ticket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_has_env_secrets: Option<bool>,
+    /// Whether completion secrets include values other than AFT's revoked-on-
+    /// restart gh-shim ticket. On older records this field is absent, so the
+    /// completion preview remains withheld unless `completion_has_env_secrets`
+    /// explicitly says the child environment held no secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_has_non_ticket_env_secrets: Option<bool>,
     /// Fully rendered, credential-masked notice text, saved before delivery so
     /// replay never needs the original environment values to reproduce it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -775,6 +781,7 @@ impl PersistedTask {
             notify_on_completion,
             compressed,
             completion_has_env_secrets: None,
+            completion_has_non_ticket_env_secrets: None,
             completion_preview: None,
             pty_rows: None,
             pty_cols: None,
@@ -911,6 +918,7 @@ impl From<BashTaskRow> for PersistedTask {
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,
             completion_has_env_secrets: None,
+            completion_has_non_ticket_env_secrets: None,
             completion_preview: None,
             pty_rows: None,
             pty_cols: None,

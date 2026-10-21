@@ -103,7 +103,9 @@ impl BgTaskRegistry {
         });
         let empty_secrets = crate::log_redact::SecretValues::default();
         let secrets = guard.as_deref().and_then(Option::as_ref).or_else(|| {
-            (metadata.completion_has_env_secrets == Some(false)).then_some(&empty_secrets)
+            (metadata.completion_has_non_ticket_env_secrets == Some(false)
+                || metadata.completion_has_env_secrets == Some(false))
+            .then_some(&empty_secrets)
         });
         let Some(secrets) = secrets else {
             return withheld_preview(RESTART_PREVIEW_WITHHELD, cache);

@@ -3702,8 +3702,10 @@ impl BgTaskRegistry {
         };
         #[cfg(windows)]
         let capture_pipeline_status = false;
-        let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
-        metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
+        let completion_secrets = crate::sandbox_spawn::completion_secrets(&spawn_plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
+        metadata.completion_has_non_ticket_env_secrets =
+            Some(completion_secrets.has_non_ticket_secrets);
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
@@ -3781,7 +3783,7 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
-            completion_secrets: Mutex::new(Some(completion_secrets)),
+            completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -4056,8 +4058,10 @@ impl BgTaskRegistry {
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
-        let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
-        metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
+        let completion_secrets = crate::sandbox_spawn::completion_secrets(&spawn_plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
+        metadata.completion_has_non_ticket_env_secrets =
+            Some(completion_secrets.has_non_ticket_secrets);
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -4130,7 +4134,7 @@ impl BgTaskRegistry {
 
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
-            completion_secrets: Mutex::new(Some(completion_secrets)),
+            completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -4322,8 +4326,10 @@ impl BgTaskRegistry {
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
-        let completion_secrets = crate::sandbox_spawn::completion_secret_values(&spawn_plan, &env);
-        metadata.completion_has_env_secrets = Some(!completion_secrets.is_empty());
+        let completion_secrets = crate::sandbox_spawn::completion_secrets(&spawn_plan, &env);
+        metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
+        metadata.completion_has_non_ticket_env_secrets =
+            Some(completion_secrets.has_non_ticket_secrets);
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -4382,7 +4388,7 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
-            completion_secrets: Mutex::new(Some(completion_secrets)),
+            completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
@@ -9048,7 +9054,9 @@ impl BgTaskRegistry {
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let task = Arc::new(BgTask {
             completion_secrets: Mutex::new(
-                (metadata.completion_has_env_secrets == Some(false)).then(Default::default),
+                (metadata.completion_has_non_ticket_env_secrets == Some(false)
+                    || metadata.completion_has_env_secrets == Some(false))
+                .then(Default::default),
             ),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),

@@ -5235,12 +5235,19 @@ fn isolated_environment_for_plan(
     }
 }
 
+/// Stores literal secret values for output masking and whether any non-ticket
+/// secret remains sensitive after AFT's short-lived gh-shim ticket is revoked.
+pub(crate) struct CompletionSecrets {
+    pub(crate) values: crate::log_redact::SecretValues,
+    pub(crate) has_non_ticket_secrets: bool,
+}
+
 /// Snapshot the environment selected for the child, not the daemon's ambient
 /// credentials. Unsandboxed children intentionally inherit the parent's environment.
-pub(crate) fn completion_secret_values(
+pub(crate) fn completion_secrets(
     plan: &SpawnPlan,
     request_environment: &HashMap<String, String>,
-) -> crate::log_redact::SecretValues {
+) -> CompletionSecrets {
     let mut environment =
         isolated_environment_for_plan(plan, request_environment).unwrap_or_else(|| {
             let mut environment: ChildEnvironment = std::env::vars_os().collect();
@@ -5264,17 +5271,26 @@ pub(crate) fn completion_secret_values(
                 || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
         })
     });
+    let has_non_ticket_secrets = !crate::log_redact::SecretValues::from_environment(
+        environment
+            .iter()
+            .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
+    )
+    .is_empty();
     if let Some(ticket) = memory_only_ticket(request_environment) {
         environment.insert(
             crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
             ticket.into(),
         );
     }
-    crate::log_redact::SecretValues::from_environment(
-        environment
-            .iter()
-            .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
-    )
+    CompletionSecrets {
+        values: crate::log_redact::SecretValues::from_environment(
+            environment
+                .iter()
+                .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
+        ),
+        has_non_ticket_secrets,
+    }
 }
 
 fn sandboxed_child_environment(

@@ -41,14 +41,51 @@ fn bash_background_completion_uses_the_selected_child_environment() {
         shell_path: PathBuf::from("bash"),
         environment: std::collections::BTreeMap::from([("SERVICE_TOKEN".into(), actual.into())]),
     };
-    let secrets = crate::sandbox_spawn::completion_secret_values(
+    let secrets = crate::sandbox_spawn::completion_secrets(
         &plan,
         &HashMap::from([("SERVICE_TOKEN".into(), not_passed.into())]),
     );
     assert_eq!(
-        secrets.redact(&format!("{actual} {not_passed}")),
+        secrets.values.redact(&format!("{actual} {not_passed}")),
         format!("{SECRET_PLACEHOLDER} {not_passed}")
     );
+    assert!(secrets.has_non_ticket_secrets);
+}
+
+#[test]
+fn bash_background_completion_replay_shows_ticket_only_output_and_masks_ticket() {
+    const TICKET: &str = "0123456789abcdef0123456789abcdef";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let raw_output = format!("ticket={TICKET}\n");
+    let (task_id, task) = tests::insert_terminal_piped_task(
+        &registry,
+        &fixture,
+        "printf ticket",
+        &raw_output,
+        "",
+        false,
+    );
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.completion_has_env_secrets = Some(true);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(false);
+        crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+
+    let restarted = BgTaskRegistry::default();
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let replayed = restarted.task(&task_id).unwrap();
+    let completion = restarted.completion_snapshot_for_task(&replayed).unwrap();
+    assert_eq!(completion.output_preview, "ticket=<REDACTED_SECRET>\n");
+    assert!(!completion.output_preview.contains(TICKET));
+    let (match_text, context) =
+        restarted.render_watch_preview(&task_id, raw_output.as_bytes(), 7..(7 + TICKET.len()));
+    assert_eq!(match_text, "<REDACTED_SECRET>");
+    assert!(!context.contains(TICKET));
 }
 
 #[test]
