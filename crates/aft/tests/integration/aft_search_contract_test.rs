@@ -460,6 +460,12 @@ fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
     (base_url, handle)
 }
 
+/// How long the recovering server holds its first response. It is well past
+/// the 1s bound `slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh`
+/// asserts, so a search that waits for this response instead of honouring
+/// its 500ms query budget fails that bound instead of slipping under it.
+const SLOW_FIRST_EMBEDDING_RESPONSE: Duration = Duration::from_millis(2_000);
+
 fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
     let addr = listener.local_addr().expect("slow embedding server addr");
@@ -474,7 +480,7 @@ fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request);
                 if ordinal == 0 {
-                    thread::sleep(Duration::from_millis(750));
+                    thread::sleep(SLOW_FIRST_EMBEDDING_RESPONSE);
                 }
                 let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
                 let response = format!(
@@ -1707,38 +1713,60 @@ fn embed_query_failure_falls_back_to_grep_when_hint_not_explicit_semantic() {
     handle.join().expect("embedding server thread");
 }
 
+/// Run one search that takes the same route as a timed-out query embedding
+/// (semantic lane ready, embedding request fails, lexical fallback answers)
+/// against a backend that fails at once.
+///
+/// The first search in a process pays one-time setup that the query budget
+/// does not cover and is not meant to: the query classifier's lazy tables,
+/// the process-wide TLS verifier and HTTP client, and the fallback ranking
+/// path. Under nextest every test is a fresh process, so without this warm-up
+/// that setup lands inside a timed search and, on a loaded runner, adds
+/// hundreds of milliseconds that have nothing to do with the budget.
+fn warm_up_embedding_fallback_route(query: &str) {
+    let (project, source_file, source) = project_with_needle();
+    let (base_url, handle) = start_mock_embedding_error_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_lexical_index(&ctx, &source_file, source);
+    install_ready_semantic_lane(&ctx, project.path());
+
+    let warmed = response_value(handle_semantic_search(
+        &request_with(query, Some("semantic")),
+        &ctx,
+    ));
+    assert_lexical_fallback(&warmed, "unavailable");
+    handle.join().expect("warm-up embedding server thread");
+}
+
 #[test]
 fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
+    let query = "where is the needle symbol implementation";
+    warm_up_embedding_fallback_route(query);
+
     let (project, source_file, source) = project_with_needle();
     let (base_url, requests, handle) = start_recovering_slow_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     ctx.update_config(|config| config.semantic.query_timeout_ms = 500);
     install_lexical_index(&ctx, &source_file, source);
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-    *ctx.semantic_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+    install_ready_semantic_lane(&ctx, project.path());
 
+    let semantic_request = request_with(query, Some("semantic"));
     let started = Instant::now();
-    let semantic_request = request_with(
-        "where is the needle symbol implementation",
-        Some("semantic"),
-    );
     let degraded = response_value(handle_semantic_search(&semantic_request, &ctx));
     let elapsed = started.elapsed();
 
+    // Checked first so a budget that is not enforced reports as a budget
+    // failure: the search would then wait for the server's held response,
+    // which arrives well after this bound.
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "500ms query budget took {elapsed:?}"
+    );
     assert_lexical_fallback(&degraded, "unavailable");
     assert!(
         degraded["text"].as_str().is_some_and(|text| text
             .contains("Semantic search unavailable; returning lexical-only fallback results.")),
         "existing degraded disclosure must remain byte-identical: {degraded:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(1_000),
-        "500ms query budget took {elapsed:?}"
     );
 
     let recovered = response_value(handle_semantic_search(&semantic_request, &ctx));
