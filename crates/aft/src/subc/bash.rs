@@ -2119,6 +2119,15 @@ pub(super) fn submit_deferred_bash(
 }
 
 async fn wait_for_bash_reply_deadline(deadline: Instant) {
+    // Fixtures that test a reply produced by the wait task itself, such as a
+    // failed promotion, hold this timer. Otherwise a slow runner lets the
+    // deadline handoff answer first with its "still running" reply. While held,
+    // the wait task's own reply is the only one, and finishing it ends the
+    // select that awaits this timer.
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    if std::env::var("AFT_TEST_SUBC_BASH_REPLY_TIMER").as_deref() == Ok("held") {
+        return std::future::pending::<()>().await;
+    }
     tokio::time::sleep_until(deadline.into()).await;
     // Promotion probes require the executor job to start before racing its held
     // result against this timer. The two-second reply assertion includes this

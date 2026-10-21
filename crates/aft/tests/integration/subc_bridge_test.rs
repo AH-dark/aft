@@ -3588,22 +3588,49 @@ fn subc_bridge_bash_route_close_cancels_deferred_wait() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
-    run_subc_bridge_test_with_env(
+    run_subc_bridge_test_inner(
         "subc_bridge_bash_promote_failure_is_normal_tool_error",
         Duration::from_secs(45),
         || {
             vec![
-                // Delegated blocking waits promote at their worker wait cap
-                // without the ordinary foreground deadline handoff competing
-                // for the reply. This exercises delivered errors deterministically.
+                // Delegated blocking waits promote at their worker wait cap.
                 set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "200"),
+                // Without these two, a slow runner answers with something
+                // other than the promote result: an expired startup budget
+                // refuses the command, and the reply timer (wait cap plus two
+                // poll intervals) hands the still-running task back as a
+                // success before the promote job reports its error. Both are
+                // correct product replies covered by other tests; this test is
+                // about the promote job's own reply.
                 set_test_env("AFT_TEST_SUBC_BASH_STARTUP_CLOCK", "frozen"),
+                set_test_env("AFT_TEST_SUBC_BASH_REPLY_TIMER", "held"),
+                // Model a slow runner on every run: the promote job outlasts
+                // the reply timer's margin past the wait cap (the spawn is
+                // slowed by `slow_shell_startup_dispatch`).
+                set_test_env("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS", "300"),
                 set_test_force_bash_promote_error(),
             ]
         },
         drive_bash_promote_failure_daemon,
         |_, _, _| {},
+        true,
+        None,
+        slow_shell_startup_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
+        None,
     );
+}
+
+/// Models shell startup on a slow runner: the bash spawn finishes after the
+/// 200 ms worker wait cap and its reply-timer margin have both passed.
+#[cfg(feature = "test-timing-hooks")]
+fn slow_shell_startup_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.command == "bash" {
+        thread::sleep(Duration::from_millis(600));
+    }
+    bridge_dispatch(req, ctx)
 }
 
 #[cfg(feature = "test-timing-hooks")]
@@ -5955,15 +5982,28 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
         .expect("worker promotion error frame"),
     )
     .await;
+    let sent_at = Instant::now();
     let frame = read_frame_timeout(&mut stream, "promote failure bash response").await;
     // Release even an unexpected reply's command before checking the assertions.
     std::fs::write(&release, b"release").expect("release promotion error command");
-    assert_eq!(frame.header.corr, 114);
-    assert!(tool_result_is_error(&frame));
+    // Name what actually arrived before any assertion, so a failure here says
+    // which reply path answered (text, isError and the structured envelope)
+    // instead of only that the reply was not an error.
+    let reply = format!(
+        "{} after {:?}",
+        describe_tool_reply(&frame),
+        sent_at.elapsed()
+    );
+    eprintln!("promote failure bash reply: {reply}");
+    assert_eq!(frame.header.corr, 114, "unexpected reply: {reply}");
+    assert!(
+        tool_result_is_error(&frame),
+        "expected the forced promote failure as a tool error, got {reply}"
+    );
     let text = tool_result_text(&frame);
     assert!(
         text.contains("forced subc bash promote failure"),
-        "expected promote failure text, got {text:?}"
+        "expected promote failure text, got {reply}"
     );
     wait_for_file(&marker, "promotion error command start marker").await;
     wait_for_file(&done, "promotion error command completion").await;
@@ -14538,6 +14578,29 @@ fn tool_result_text(frame: &Frame) -> String {
         .as_str()
         .expect("tool result text")
         .to_string()
+}
+
+/// One-line description of a reply frame for assertion messages: frame type,
+/// correlation id, `isError`, the first text block and `structuredContent`
+/// (without its `output`/`text` copies of that text). Falls back to the raw
+/// body when it is not JSON (for example an error frame).
+#[cfg(feature = "test-timing-hooks")]
+fn describe_tool_reply(frame: &Frame) -> String {
+    let header = format!("type={:?} corr={}", frame.header.ty, frame.header.corr);
+    match serde_json::from_slice::<Value>(&frame.body) {
+        Ok(body) => {
+            let mut structured = body["structuredContent"].clone();
+            if let Some(fields) = structured.as_object_mut() {
+                fields.remove("output");
+                fields.remove("text");
+            }
+            format!(
+                "{header} isError={} text={:?} structuredContent={structured}",
+                body["isError"], body["content"][0]["text"]
+            )
+        }
+        Err(_) => format!("{header} body={}", String::from_utf8_lossy(&frame.body)),
+    }
 }
 
 fn tool_result_is_error(frame: &Frame) -> bool {
