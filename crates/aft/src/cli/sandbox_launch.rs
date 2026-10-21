@@ -331,6 +331,7 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
         emit_off_worker_gh_warning(profile);
         return Ok(());
     }
+    aft::launch_fds::close_inherited().map_err(SandboxLaunchError::unavailable)?;
     seatbelt::apply(profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Seatbelt profile: {error}"))
     })?;
