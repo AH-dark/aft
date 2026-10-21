@@ -82,7 +82,10 @@ export class V2SessionDelivery {
   private readonly admittedWakes = new Map<string, "pending" | "delivered">();
   private disposed = false;
 
-  constructor(private readonly session: V2SessionAdmission) {}
+  constructor(
+    private readonly session: V2SessionAdmission,
+    private readonly retainedWakeLimit = MAX_ADMITTED_WAKES,
+  ) {}
 
   completion(input: CompletionWake): Effect.Effect<WakeAdmission, unknown> {
     return this.admitWake(
@@ -139,7 +142,7 @@ export class V2SessionDelivery {
         return Effect.succeed("not-delivered");
       }
       const reserved = keys.filter((key) => !this.admittedWakes.has(key));
-      if (this.admittedWakes.size + reserved.length > MAX_ADMITTED_WAKES) {
+      if (this.admittedWakes.size + reserved.length > this.retainedWakeLimit) {
         const error = new WakeDeliveryOverflow();
         warn(
           JSON.stringify({
