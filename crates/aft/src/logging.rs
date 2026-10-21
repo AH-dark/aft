@@ -36,7 +36,7 @@ const LOG_DIRECTORY_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
 const LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
-const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
+pub(crate) const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
 const TOOL_CALL_SAMPLE_CAPACITY: usize = 256;
 /// Census lines stay greppable and short; extra fields are dropped past this.
 const INDEX_EVENT_MAX_BYTES: usize = 300;
@@ -723,6 +723,141 @@ pub(crate) fn take_tool_call_wait() -> (WaitingOn, Option<String>, u64) {
     TOOL_CALL_WAIT.with(|slot| {
         let state = std::mem::take(&mut *slot.borrow_mut());
         (state.waiting_on, state.waiting_on_build_id, state.wait_ms)
+    })
+}
+
+/// A step of the shared edit pipeline whose time a slow tool call reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EditPhase {
+    /// Writing the undo snapshot under the backup store's lock.
+    Backup,
+    /// Atomic writes of the new content (and of a rollback).
+    Write,
+    /// The project formatter.
+    Format,
+    /// Tree-sitter syntax checks before and after the write.
+    Syntax,
+    /// The opt-in full type check.
+    Validate,
+    /// Line diffs for the reply's counts and the host's patch.
+    Diff,
+    /// Language-server notification and the optional diagnostics wait.
+    Lsp,
+}
+
+impl EditPhase {
+    const ALL: [EditPhase; 7] = [
+        EditPhase::Backup,
+        EditPhase::Write,
+        EditPhase::Format,
+        EditPhase::Syntax,
+        EditPhase::Validate,
+        EditPhase::Diff,
+        EditPhase::Lsp,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            EditPhase::Backup => "backup",
+            EditPhase::Write => "write",
+            EditPhase::Format => "format",
+            EditPhase::Syntax => "syntax",
+            EditPhase::Validate => "validate",
+            EditPhase::Diff => "diff",
+            EditPhase::Lsp => "lsp",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Time spent in each [`EditPhase`] by the current tool call's thread.
+struct EditPhaseTimes {
+    elapsed: [Duration; 7],
+    /// Open timers per phase, so a timed helper called from another timed
+    /// helper of the same phase is counted once.
+    depth: [u8; 7],
+    touched: bool,
+}
+
+thread_local! {
+    static EDIT_PHASES: RefCell<EditPhaseTimes> = const {
+        RefCell::new(EditPhaseTimes {
+            elapsed: [Duration::ZERO; 7],
+            depth: [0; 7],
+            touched: false,
+        })
+    };
+}
+
+/// Adds the time until it is dropped to one [`EditPhase`] of this thread's
+/// tool call. Only the outermost open timer of a phase counts.
+pub(crate) struct EditPhaseTimer {
+    phase: EditPhase,
+    started: Instant,
+}
+
+/// Start timing `phase` on this thread; see [`EditPhaseTimer`].
+pub(crate) fn time_edit_phase(phase: EditPhase) -> EditPhaseTimer {
+    EDIT_PHASES.with(|slot| {
+        let mut times = slot.borrow_mut();
+        times.depth[phase.index()] = times.depth[phase.index()].saturating_add(1);
+    });
+    EditPhaseTimer {
+        phase,
+        started: Instant::now(),
+    }
+}
+
+impl Drop for EditPhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        EDIT_PHASES.with(|slot| {
+            let mut times = slot.borrow_mut();
+            let index = self.phase.index();
+            times.depth[index] = times.depth[index].saturating_sub(1);
+            if times.depth[index] == 0 {
+                times.elapsed[index] += elapsed;
+                times.touched = true;
+            }
+        });
+    }
+}
+
+/// Clear this thread's edit phase times at the start of a tool call.
+pub(crate) fn reset_edit_phase_times() {
+    EDIT_PHASES.with(|slot| {
+        let mut times = slot.borrow_mut();
+        times.elapsed = [Duration::ZERO; 7];
+        times.touched = false;
+    });
+}
+
+/// This thread's edit phase times since the last reset, rendered as
+/// `backup:1,write:0,format:0,syntax:12,validate:0,diff:3,lsp:0` (whole
+/// milliseconds), or `None` when the call ran no edit step. Clears them.
+pub(crate) fn take_edit_phase_times() -> Option<String> {
+    EDIT_PHASES.with(|slot| {
+        let mut times = slot.borrow_mut();
+        if !times.touched {
+            return None;
+        }
+        let rendered = EditPhase::ALL
+            .iter()
+            .map(|phase| {
+                format!(
+                    "{}:{}",
+                    phase.as_str(),
+                    duration_millis_u64(times.elapsed[phase.index()])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        times.elapsed = [Duration::ZERO; 7];
+        times.touched = false;
+        Some(rendered)
     })
 }
 
@@ -2147,8 +2282,19 @@ pub fn note_tool_call_trace(
 
     if phases.total > SLOW_TOOL_CALL_THRESHOLD {
         let level = slow_tool_call_level(caller);
+        // The argument shape and edit phase times go before `root=`, which
+        // stays last because a root path may contain spaces.
+        let mut detail = String::new();
+        if let Some(shape) = phases.arg_shape.as_deref() {
+            detail.push(' ');
+            detail.push_str(shape);
+        }
+        if let Some(edit_phases) = phases.edit_phases.as_deref() {
+            detail.push_str(" edit_phases=");
+            detail.push_str(edit_phases);
+        }
         let message = format!(
-            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
+            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
             name,
             session,
             channel,
@@ -2172,6 +2318,7 @@ pub fn note_tool_call_trace(
             phases.waiting_on.as_str(),
             waiting_on_build_id,
             phases.wait_ms,
+            detail,
             root.display(),
         );
         #[cfg(test)]
@@ -2900,6 +3047,8 @@ mod tests {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            arg_shape: None,
+            edit_phases: None,
         }
     }
 

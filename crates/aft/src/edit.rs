@@ -1263,6 +1263,7 @@ pub(crate) fn auto_backup_observed(
     op_id: Option<&str>,
     observation: &EditObservation,
 ) -> Result<Option<String>, AftError> {
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
     if let (Some(capture), Some(version)) = (observation.capture.as_ref(), observation.version) {
         if std::fs::symlink_metadata(path).is_err() {
             return Ok(None);
@@ -1316,6 +1317,7 @@ pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
 /// `diff.after` response fields and render their own patch, but returning the
 /// ready-to-display string keeps the bridge contract self-contained.
 pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     if before == after {
         return format!(
             "Index: {file}
@@ -1395,6 +1397,7 @@ fn construct_diff_with_timeout<'a>(
 ) -> similar::TextDiff<'a, 'a, 'a, str> {
     #[cfg(test)]
     A03_DIFF_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     similar::TextDiff::configure()
         .timeout(timeout)
         .diff_lines(before, after)
@@ -1424,6 +1427,7 @@ pub(crate) fn response_diff(
     before: &str,
     after: &str,
 ) -> (String, serde_json::Value) {
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     let diff = construct_diff(before, after);
     let (additions, deletions) = counts_from_diff(&diff);
     let patch = if before == after {
@@ -1543,6 +1547,7 @@ pub fn auto_backup(
     if std::fs::symlink_metadata(path).is_err() {
         return Ok(None);
     }
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
     let backup_id = {
         let mut store = ctx.backup().lock();
         store.snapshot_with_op(session, path, description, op_id)?
@@ -1580,6 +1585,7 @@ pub(crate) fn auto_backup_from_capture(
     op_id: Option<&str>,
     capture: &crate::backup::CapturedRegularFile,
 ) -> Result<Option<String>, AftError> {
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
     let backup_id = {
         let mut store = ctx.backup().lock();
         store.snapshot_with_op_from_capture(session, path, description, op_id, capture)?
@@ -1957,6 +1963,7 @@ pub(crate) fn validate_written_files(
         return None;
     }
     notify_full_validation_start();
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Validate);
     Some(format::validate_full_batch(paths, config))
 }
 
@@ -2060,14 +2067,18 @@ fn write_format_validate_impl(
 
     let _view_intent = crate::views::intent::record_paths([path]);
     // Step 1: Write
+    let write_phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
     let mut write_warnings = atomic_write_source(path, content.as_bytes())
         .map_err(|e| AftError::InvalidRequest {
             message: format!("failed to write file: {}", e),
         })?
         .warnings;
+    drop(write_phase);
 
     // Step 2: Format (before validate so we validate the formatted content)
+    let format_phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Format);
     let (formatted, format_skipped_reason) = format::auto_format(path, config);
+    drop(format_phase);
 
     // Step 3: Validate syntax
     #[cfg(test)]
@@ -2097,6 +2108,7 @@ fn write_format_validate_impl(
         });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
+            let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
             let rollback = atomic_write_source(path, original.as_bytes()).map_err(|e| {
                 AftError::InvalidRequest {
                     message: format!("failed to roll back invalid edit: {}", e),
@@ -2120,6 +2132,7 @@ fn write_format_validate_impl(
     let validate_requested = full_validation_requested(config, params) && !defer_full_validation;
     let (validation_errors, validate_skipped_reason) = if validate_requested {
         notify_full_validation_start();
+        let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Validate);
         format::validate_full(path, config)
     } else {
         (Vec::new(), None)
@@ -2167,6 +2180,7 @@ fn parse_captured_syntax(path: &Path, source: &str) -> Option<tree_sitter::Tree>
     let lang = detect_language(path)?;
     #[cfg(test)]
     A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
+    let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Syntax);
     crate::parser::parse_source_with_cached_parser(path, source, lang).ok()
 }
 
