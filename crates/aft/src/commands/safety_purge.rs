@@ -268,9 +268,12 @@ mod tests {
         assert_eq!(response["complete"], false, "{response}");
         assert_eq!(response["undo_stacks_removed"], 1, "{response}");
         assert_eq!(response["undo_entries_removed"], 1, "{response}");
+        // Undo history is keyed by the resolved path (on macOS /var resolves
+        // to /private/var), so compare against that form.
+        let resolved_secret = fs::canonicalize(&secret).unwrap();
         assert_eq!(
             response["undo_paths_removed"],
-            json!([secret]),
+            json!([resolved_secret]),
             "{response}"
         );
         assert_eq!(
