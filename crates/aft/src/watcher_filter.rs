@@ -51,6 +51,9 @@ const WATCHER_DISPATCH_BACKLOG_MAX_PATHS: usize = 16 * WATCHER_MAX_BATCH_PATHS;
 const WATCHER_ATTRIBUTION_RING_CAPACITY: usize = 512;
 const WATCHER_OVERFLOW_PREFIX_LIMIT: usize = 5;
 const WATCHER_OBSERVED_EXCLUSION_LIMIT: usize = 32;
+const WATCHER_OVERFLOW_QUIET_INTERVAL: Duration = Duration::from_secs(1);
+// Ten seconds keeps a sustained flood visible without logging every overflow.
+const WATCHER_OVERFLOW_MAX_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(crate) fn rewrite_nested_ignore_line(relative_dir: &Path, line: &str) -> Option<String> {
     if line.trim().is_empty() || line.starts_with('#') {
@@ -2302,11 +2305,10 @@ impl WatcherFilterThread {
 
     fn run_until_stopped(&mut self, raw_rx: mpsc::Receiver<notify::Result<notify::Event>>) {
         loop {
-            if self
-                .overflow_burst
-                .as_ref()
-                .is_some_and(|burst| burst.3.elapsed() >= Duration::from_secs(1))
-            {
+            if self.overflow_burst.as_ref().is_some_and(|burst| {
+                burst.3.elapsed() >= WATCHER_OVERFLOW_QUIET_INTERVAL
+                    || burst.2.elapsed() >= WATCHER_OVERFLOW_MAX_INTERVAL
+            }) {
                 self.flush_overflow_summary();
             }
             if self.shutdown.load(Ordering::SeqCst) {
@@ -2343,9 +2345,12 @@ impl WatcherFilterThread {
                         }
 
                         let reason = RescanReason::from_event_info(event.info());
-                        self.config.counters.note_overflow_ignore_relevance(
-                            self.overflow_paths_may_change_ignore(&event.paths),
-                        );
+                        // Backend rescan paths do not bound the lost events:
+                        // FSEvents can attach an objects path to a stream-wide
+                        // drop. The discarded raw buffer can also contain an
+                        // ignore-file edit. Neither set of paths proves that
+                        // the ignore-rule scan can be skipped.
+                        self.config.counters.note_overflow_ignore_relevance(true);
                         let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
                         self.content_only_paths.clear();
@@ -2401,35 +2406,6 @@ impl WatcherFilterThread {
 
     fn project_root_was_deleted(&self) -> bool {
         !self.config.project_root.exists()
-    }
-
-    fn overflow_paths_may_change_ignore(&self, paths: &[PathBuf]) -> bool {
-        if paths.is_empty() {
-            return true;
-        }
-        let metadata = WatcherBatchMetadata::resolve(&self.config);
-        paths.iter().any(|path| {
-            if metadata.can_change_corpus_ignore(&self.config, path) {
-                return true;
-            }
-            if let Ok(relative) = path.strip_prefix(&self.config.project_root) {
-                let mut components = relative.components();
-                while let Some(component) = components.next() {
-                    if component.as_os_str() == ".git" {
-                        // Objects, refs and linked-worktree bookkeeping cannot
-                        // change corpus membership; info/exclude can.
-                        return components
-                            .next()
-                            .is_none_or(|next| next.as_os_str() == "info");
-                    }
-                }
-                if watcher_path_is_high_churn_infra(relative) {
-                    return false;
-                }
-            }
-            // A directory-level loss can hide an ignore file anywhere below it.
-            !path.is_file()
-        })
     }
 
     fn record_recent_paths(&mut self, paths: &[PathBuf]) {
@@ -2680,7 +2656,8 @@ impl WatcherFilterThread {
             self.overflow_burst
                 .as_ref()
                 .map_or(ROOT_DELETED_CHECK_INTERVAL, |burst| {
-                    (burst.3 + Duration::from_secs(1))
+                    (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
+                        .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
                         .saturating_duration_since(Instant::now())
                         .min(ROOT_DELETED_CHECK_INTERVAL)
                 });
@@ -3175,43 +3152,120 @@ mod tests {
     }
 
     #[test]
-    fn issue645_overflow_ignore_evidence_is_conservative() {
+    fn issue645_backend_overflow_preserves_buffered_ignore_relevance() {
         use super::*;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let (tx, _) = watcher_dispatch_channel();
-        let filter = WatcherFilterThread::new(
+        let (tx, _rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        let counters = config.counters.clone();
+        let mut filter = WatcherFilterThread::new(
+            config,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        filter.raw_paths.insert(root.join(".gitignore"));
+        raw_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Other)
+                .add_path(root.join("repo/.git/objects/pack"))
+                .set_info("rescan: user dropped")
+                .set_flag(notify::event::Flag::Rescan)))
+            .unwrap();
+        drop(raw_tx);
+        filter.run(raw_rx);
+        assert!(filter.raw_paths.is_empty());
+        assert!(
+            counters.take_overflow_ignore_relevance(),
+            "discarding a buffered .gitignore edit must require an ignore scan"
+        );
+    }
+
+    #[test]
+    fn issue645_sustained_overflow_flushes_at_maximum_interval() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (tx, _rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let mut filter = WatcherFilterThread::new(
             WatcherFilterConfig::new(root.clone(), None),
             Arc::new(RwLock::new(None)),
             Arc::new(AtomicU64::new(0)),
             tx,
             Arc::new(AtomicBool::new(false)),
         );
+        let now = Instant::now();
+        filter.overflow_burst = Some((
+            RescanReason::UserDropped,
+            12,
+            now - Duration::from_secs(11),
+            now,
+            false,
+        ));
+        assert!(
+            filter.next_recv_timeout().is_zero(),
+            "a continuous flood must not postpone the summary deadline"
+        );
+        raw_tx
+            .send(Ok(
+                notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+            ))
+            .unwrap();
+        drop(raw_tx);
+        filter.run_until_stopped(raw_rx);
+        let (_, count, first, _, _) = filter.overflow_burst.unwrap();
+        assert_eq!(count, 1, "the ongoing flood must start a new burst");
+        assert!(first >= now);
+    }
+
+    #[test]
+    fn issue645_backend_overflow_paths_do_not_bound_loss_scope() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
         for path in [
             "source.rs",
             "a/.git/objects/pack",
             "b/.git/worktrees/linked/HEAD",
             "a/.git/refs/heads/main",
-        ] {
-            assert!(
-                !filter.overflow_paths_may_change_ignore(&[root.join(path)]),
-                "{path}"
-            );
-        }
-        for path in [
             ".gitignore",
             "a/.aftignore",
             "a/.git/info/exclude",
             "a/.git",
             "a/src",
         ] {
-            assert!(
-                filter.overflow_paths_may_change_ignore(&[root.join(path)]),
-                "{path}"
-            );
+            for info in [
+                "rescan: user dropped",
+                "rescan: kernel dropped",
+                "rescan: buffer overflow",
+                "",
+            ] {
+                let (tx, _rx) = watcher_dispatch_channel();
+                let (raw_tx, raw_rx) = mpsc::channel();
+                let config = WatcherFilterConfig::new(root.clone(), None);
+                let counters = config.counters.clone();
+                let mut filter = WatcherFilterThread::new(
+                    config,
+                    Arc::new(RwLock::new(None)),
+                    Arc::new(AtomicU64::new(0)),
+                    tx,
+                    Arc::new(AtomicBool::new(false)),
+                );
+                raw_tx
+                    .send(Ok(notify::Event::new(notify::EventKind::Other)
+                        .add_path(root.join(path))
+                        .set_info(info)
+                        .set_flag(notify::event::Flag::Rescan)))
+                    .unwrap();
+                drop(raw_tx);
+                filter.run(raw_rx);
+                assert!(counters.take_overflow_ignore_relevance(), "{path}: {info}");
+            }
         }
-        assert!(filter.overflow_paths_may_change_ignore(&[]));
     }
 
     #[test]
