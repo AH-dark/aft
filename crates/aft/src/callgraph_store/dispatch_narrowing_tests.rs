@@ -461,14 +461,15 @@ const RUST_CARGO: (&str, &str) = (
 // The edits below change what a type-aware resolver would infer for a caller
 // in another file (a return type, a field type, a base type, a type's name or
 // file) while the caller's own file stays unchanged. The `CallGraphStore`
-// dispatch pass infers a receiver type only from the caller itself: `self`, a
-// `Type::` path, the caller's own parameter types and a field of a struct
-// declared in the caller's own file (Rust); locals and fields of the enclosing
-// type in the caller's own file (Java, Kotlin); and declarations in the
-// caller's own file (C++). Other languages fall back to name matching. A
-// candidate is then chosen only from the methods sharing the call's name. The
-// edges asserted unchanged below show the edit cannot move them; where edges
-// do change, the caller is selected through the changed method names.
+// dispatch pass infers a receiver type only from the caller itself. In Rust
+// that is `self`, a `Type::` path, the caller's own parameter types, and a
+// direct `self.field` receiver whose struct and field type are declared in the
+// caller's own file. In Java and Kotlin it is locals and fields of the
+// enclosing type in the caller's own file, and in C++ declarations inside the
+// enclosing function. Other languages fall back to name matching. A candidate
+// is then chosen only from the methods sharing the call's name. The edges
+// asserted unchanged below show the edit cannot move them; where edges do
+// change, the caller is selected through the changed method names.
 
 #[test]
 fn s3_cross_file_return_type_change() {
