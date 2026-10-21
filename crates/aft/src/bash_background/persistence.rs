@@ -352,7 +352,7 @@ impl PinnedDir {
                 "root probe requires an absolute directory",
             ));
         }
-        Self::repair_walk(&fs::canonicalize(path)?)
+        Self::repair_walk(&canonical_root_path(path)?)
     }
 
     /// Open an absolute directory one component at a time without following
@@ -3342,6 +3342,19 @@ fn resolved_root_for(path: &Path) -> Option<ResolvedRoot> {
         .cloned()
 }
 
+/// `fs::canonicalize` for a storage or cache root whose resolved path is kept
+/// and handed on (to SQLite, to cache keys, to path comparisons). On Windows
+/// `fs::canonicalize` returns a verbatim `\\?\C:\...` path, a spelling no
+/// other AFT path uses and under which Win32 takes `/` literally; the plain
+/// DOS or UNC spelling is returned instead whenever one exists. Unix paths
+/// are returned exactly as `fs::canonicalize` gives them.
+pub(crate) fn canonical_root_path(path: &Path) -> io::Result<PathBuf> {
+    let resolved = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    let resolved = crate::windows_path::normalize_windows_path(&resolved);
+    Ok(resolved)
+}
+
 /// Resolve a configured storage or cache root once, when AFT opens it, and
 /// record the directory it names by device and inode. Later pinned walks
 /// under the configured spelling open that directory and refuse if it has
@@ -3355,7 +3368,7 @@ pub(crate) fn resolve_configured_root(configured: &Path) -> io::Result<PathBuf> 
     }
     #[cfg(not(unix))]
     {
-        fs::canonicalize(configured)
+        canonical_root_path(configured)
     }
     #[cfg(unix)]
     {
@@ -3537,6 +3550,29 @@ fn repair_walk_recognizes_a_trusted_link_beneath_a_system_alias() {
             .directory_identity()
             .unwrap()
     );
+}
+
+/// A resolved root is kept and handed on (to SQLite, cache keys and path
+/// comparisons), so on Windows it must come back in the plain `C:\...`
+/// spelling, never the verbatim `\\?\C:\...` form `fs::canonicalize` gives.
+/// The temp folder may be spelled with an 8.3 name (`RUNNER~1`); the resolved
+/// path must still name the same directory.
+#[test]
+fn resolved_root_keeps_the_plain_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let resolved = canonical_root_path(temp.path()).unwrap();
+    assert!(
+        !resolved.to_string_lossy().starts_with(r"\\?\"),
+        "resolved root kept a verbatim prefix: {}",
+        resolved.display()
+    );
+    assert!(resolved.is_absolute());
+    assert_eq!(
+        fs::canonicalize(&resolved).unwrap(),
+        fs::canonicalize(temp.path()).unwrap()
+    );
+    #[cfg(not(unix))]
+    assert_eq!(resolve_configured_root(temp.path()).unwrap(), resolved);
 }
 
 #[cfg(unix)]

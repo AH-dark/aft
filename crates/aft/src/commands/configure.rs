@@ -14166,10 +14166,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("refresh worker did not open its blob store");
         // The configured cache parent is resolved once (macOS temp
-        // directories sit behind the /var system symlink).
+        // directories sit behind the /var system symlink; Windows resolves
+        // to the plain, non-verbatim spelling).
         assert_eq!(
             opened_root,
-            std::fs::canonicalize(cache.path()).unwrap().join("aft")
+            crate::bash_background::persistence::canonical_root_path(cache.path())
+                .unwrap()
+                .join("aft")
         );
         assert!(opened);
         assert!(cache.path().join("aft/blobs").is_dir());

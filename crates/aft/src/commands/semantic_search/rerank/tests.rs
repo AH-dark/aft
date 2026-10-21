@@ -1929,7 +1929,10 @@ fn cache_root_onnx_factory_passes_configured_model_cache_to_provisioner() {
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("volume");
     std::fs::create_dir(&parent).unwrap();
-    let parent = std::fs::canonicalize(parent).unwrap();
+    // Resolve the folder the way prepare does (on Windows, the plain spelling
+    // rather than a verbatim `\\?\` path), so the simulated volume and the
+    // expected model path name the folder prepare will use.
+    let parent = crate::bash_background::persistence::canonical_root_path(&parent).unwrap();
     let model = onnx::ALLOWED_MODELS.last().unwrap().name;
     let mut config = crate::config::Config {
         storage_dir: Some(temp.path().join("storage")),

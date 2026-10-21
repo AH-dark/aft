@@ -824,7 +824,10 @@ pub fn prepare_cache_root(
                     || Some(&other) == configured_root.as_ref()
                     || !other.exists()
                     // Another spelling of this same root is not an overlap.
-                    || fs::canonicalize(&other).ok().as_ref() == Some(&root)
+                    || crate::bash_background::persistence::canonical_root_path(&other)
+                        .ok()
+                        .as_ref()
+                        == Some(&root)
                 {
                     continue;
                 }

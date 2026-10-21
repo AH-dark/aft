@@ -262,6 +262,34 @@ fn cache_location_crosstalk_retired_root_does_not_disable_another_prepare() {
     assert!(cache_root(&config).join(OWNER).is_file());
 }
 
+/// The configured cache folder is resolved once, and every cache path is then
+/// built from that resolved path. On Windows it must be the plain spelling,
+/// not the verbatim `\\?\C:\...` form `fs::canonicalize` returns: the rest of
+/// AFT spells paths without that prefix, and Win32 takes `/` literally under
+/// it.
+#[test]
+fn cache_location_resolved_cache_root_is_a_plain_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = unenrolled_cache_config(temp.path());
+    let warning = prepare_cache_root(&mut config);
+    assert!(warning.is_none(), "prepare failed: {warning:?}");
+    let root = cache_root(&config);
+    assert!(
+        !root.to_string_lossy().starts_with(r"\\?\"),
+        "cache root kept a verbatim prefix: {}",
+        root.display()
+    );
+    assert_eq!(
+        root,
+        crate::bash_background::persistence::canonical_root_path(&temp.path().join("cache-volume"))
+            .unwrap()
+            .join("aft")
+    );
+    let models = config.semantic.local_cache_dir.clone().unwrap();
+    crate::private_storage::create_dir_all(&models).unwrap();
+    assert!(models.is_dir(), "{} is not reachable", models.display());
+}
+
 #[cfg(unix)]
 fn symlinked_storage_config(temp: &Path) -> Config {
     let mut config = unenrolled_cache_config(temp);

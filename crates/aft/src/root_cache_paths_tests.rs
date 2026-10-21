@@ -344,9 +344,9 @@ fn cache_root_wins_over_durable_storage_override_for_every_cache_family() {
     let Some(temp) = std::env::var_os("AFT_TEST_CACHE_OVERRIDE_TEMP").map(PathBuf::from) else {
         let temp = tempfile::tempdir().unwrap();
         // Production resolves the cache folder once (macOS temp folders live
-        // under the /var -> /private/var link), so give the child resolved
-        // paths and compare like with like.
-        let base = fs::canonicalize(temp.path()).unwrap();
+        // under the /var -> /private/var link; Windows drops the verbatim
+        // prefix), so give the child resolved paths and compare like with like.
+        let base = crate::bash_background::persistence::canonical_root_path(temp.path()).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env("AFT_STORAGE_DIR", base.join("durable-override"))
