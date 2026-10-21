@@ -107,7 +107,12 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
             false
         }
     }) {
-        return Err(io::Error::other("injected directory sync failure"));
+        return Err(FAIL_DIRECTORY_SYNC_ERRNO.with(|errno| {
+            errno.take().map_or_else(
+                || io::Error::other("injected directory sync failure"),
+                io::Error::from_raw_os_error,
+            )
+        }));
     }
     #[cfg(unix)]
     {
@@ -135,6 +140,11 @@ pub(crate) enum EventKind {
 thread_local! {
     pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
+    };
+    // Optional errno for FAIL_DIRECTORY_SYNC; leaving it unset injects the
+    // existing generic I/O error, so path-only callers need no change.
+    pub(crate) static FAIL_DIRECTORY_SYNC_ERRNO: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
     };
     static EVENTS: std::cell::RefCell<Vec<(EventKind, std::path::PathBuf)>> = const {
         std::cell::RefCell::new(Vec::new())

@@ -52,10 +52,14 @@ pub enum PersistedStore {
     BackupMeta,
     /// Background bash task metadata `<harness>/bash-tasks/.../metadata.json`.
     BashTask,
+    /// Separate v3 family registry `blobs/v3/<family>/members.sqlite`.
+    ViewsV3Registry,
+    /// Format of v3 plane payload databases under `blobs/v3/<family>/`.
+    ViewsV3Store,
 }
 
 impl PersistedStore {
-    pub const ALL: [PersistedStore; 10] = [
+    pub const ALL: [PersistedStore; 12] = [
         PersistedStore::AftDb,
         PersistedStore::SearchIndex,
         PersistedStore::SemanticIndex,
@@ -66,6 +70,8 @@ impl PersistedStore {
         PersistedStore::ArtifactOwner,
         PersistedStore::BackupMeta,
         PersistedStore::BashTask,
+        PersistedStore::ViewsV3Registry,
+        PersistedStore::ViewsV3Store,
     ];
 
     /// Stable key used in the floor file and in `aft --formats`.
@@ -81,6 +87,8 @@ impl PersistedStore {
             PersistedStore::ArtifactOwner => "artifact_owner",
             PersistedStore::BackupMeta => "backup_meta",
             PersistedStore::BashTask => "bash_task",
+            PersistedStore::ViewsV3Registry => "views_v3_registry",
+            PersistedStore::ViewsV3Store => "views_v3_store",
         }
     }
 
@@ -103,6 +111,7 @@ impl PersistedStore {
             PersistedStore::ArtifactOwner => crate::artifact_owner::SCHEMA_VERSION,
             PersistedStore::BackupMeta => crate::backup::SCHEMA_VERSION,
             PersistedStore::BashTask => crate::bash_background::persistence::SCHEMA_VERSION,
+            PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store => 1,
         }
     }
 
