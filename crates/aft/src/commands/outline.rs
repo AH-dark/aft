@@ -596,6 +596,7 @@ struct FileOutline {
     language: Option<LangId>,
 }
 
+#[derive(Clone)]
 struct TestSummary {
     name: String,
     range: Range,
@@ -603,12 +604,93 @@ struct TestSummary {
     unknown_reason: Option<&'static str>,
 }
 
+#[derive(Clone)]
 struct TestRegion {
     summary: TestSummary,
     included_path: Option<String>,
     implicit_include: bool,
     module_scope: Vec<String>,
     standalone: bool,
+}
+
+/// What the multi-file structure map needs from one parse of a file beyond
+/// its symbols: the test regions it collapses and, for Rust, the required
+/// methods of each trait it previews. Both depend only on the file's own
+/// text, so they are stored next to the symbols in the shared symbol cache
+/// under the same freshness key, and a warm outline renders the file without
+/// reading or parsing it. Test includes are resolved at render time, because
+/// they depend on other files and on the caller's read policy.
+pub(crate) struct OutlineParseFacts {
+    test_regions: Vec<TestRegion>,
+    trait_previews: Vec<(Range, Vec<OutlineEntry>)>,
+}
+
+impl OutlineParseFacts {
+    /// Rough resident size, for the symbol cache's memory estimate.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        fn entry_bytes(entry: &OutlineEntry) -> u64 {
+            (std::mem::size_of::<OutlineEntry>()
+                + entry.name.len()
+                + entry.kind.len()
+                + entry.signature.as_ref().map_or(0, String::len)) as u64
+                + entry.members.iter().map(entry_bytes).sum::<u64>()
+        }
+        let regions = self
+            .test_regions
+            .iter()
+            .map(|region| {
+                (std::mem::size_of::<TestRegion>()
+                    + region.summary.name.len()
+                    + region.included_path.as_ref().map_or(0, String::len)
+                    + region.module_scope.iter().map(String::len).sum::<usize>())
+                    as u64
+            })
+            .sum::<u64>();
+        let previews = self
+            .trait_previews
+            .iter()
+            .map(|(_, methods)| {
+                std::mem::size_of::<(Range, Vec<OutlineEntry>)>() as u64
+                    + methods.iter().map(entry_bytes).sum::<u64>()
+            })
+            .sum::<u64>();
+        std::mem::size_of::<Self>() as u64 + regions + previews
+    }
+}
+
+/// Languages whose structure map collapses test code into summary rows.
+fn structure_language(path: &Path) -> Option<LangId> {
+    detect_language(path).filter(|lang| {
+        matches!(
+            lang,
+            LangId::Rust
+                | LangId::Python
+                | LangId::Go
+                | LangId::TypeScript
+                | LangId::Tsx
+                | LangId::JavaScript
+        )
+    })
+}
+
+/// Derive [`OutlineParseFacts`] from a parsed file. A file with syntax errors
+/// is skipped by the structure map, so its regions are not collected.
+fn outline_parse_facts(path: &Path, parsed: &ParsedFile) -> OutlineParseFacts {
+    let root = parsed.tree.root_node();
+    let mut test_regions = Vec::new();
+    if let Some(lang) = structure_language(path) {
+        if !root.has_error() {
+            collect_test_regions(root, &parsed.source, lang, &mut test_regions);
+        }
+    }
+    let mut trait_previews = Vec::new();
+    if parsed.lang == LangId::Rust {
+        collect_trait_member_previews(root, &parsed.source, &mut trait_previews);
+    }
+    OutlineParseFacts {
+        test_regions,
+        trait_previews,
+    }
 }
 
 enum TestNode {
@@ -867,17 +949,7 @@ fn outline_structure_entries(
     collapse_tests: bool,
     parsed: Option<&ParsedFile>,
 ) -> Result<Vec<OutlineEntry>, AftError> {
-    let Some(lang) = detect_language(path).filter(|lang| {
-        matches!(
-            lang,
-            LangId::Rust
-                | LangId::Python
-                | LangId::Go
-                | LangId::TypeScript
-                | LangId::Tsx
-                | LangId::JavaScript
-        )
-    }) else {
+    let Some(lang) = structure_language(path) else {
         return Ok(build_outline_tree(symbols));
     };
     if !collapse_tests && lang != LangId::Rust {
@@ -906,6 +978,82 @@ fn outline_structure_entries(
     if collapse_tests {
         collect_test_regions(tree.root_node(), &source, lang, &mut regions);
     }
+    let scanned_modules;
+    let modules = if lang == LangId::Rust {
+        Some(match parsed.and_then(|parsed| parsed.modules.as_deref()) {
+            Some(modules) => modules,
+            None => {
+                scanned_modules = crate::parser::rust_modules(tree.root_node(), source);
+                scanned_modules.as_slice()
+            }
+        })
+    } else {
+        None
+    };
+    Ok(structure_entries_from_regions(
+        path, symbols, regions, modules, parser, ctx, req_id, session_id,
+    ))
+}
+
+/// The multi-file structure map for one file from its cached or freshly
+/// derived [`OutlineParseFacts`], without touching its tree. `modules` is the
+/// file's Rust module layout and must be present for Rust files.
+#[allow(clippy::too_many_arguments)]
+fn structure_entries_from_facts(
+    path: &Path,
+    symbols: &[Symbol],
+    modules: Option<&[RustModule]>,
+    has_error: bool,
+    facts: &OutlineParseFacts,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    let Some(lang) = structure_language(path) else {
+        return Ok(build_outline_tree(symbols));
+    };
+    if has_error {
+        return Err(AftError::ParseError {
+            message: format!("syntax errors in {}", path.display()),
+        });
+    }
+    if lang == LangId::Rust && modules.is_none() {
+        return Err(AftError::ParseError {
+            message: format!("module layout missing for {}", path.display()),
+        });
+    }
+    let mut entries = structure_entries_from_regions(
+        path,
+        symbols,
+        facts.test_regions.clone(),
+        modules,
+        parser,
+        ctx,
+        req_id,
+        session_id,
+    );
+    if lang == LangId::Rust {
+        apply_trait_member_previews(&facts.trait_previews, &mut entries);
+    }
+    Ok(entries)
+}
+
+/// Fold `symbols` that fall inside a test region into that region's summary
+/// row, resolve test includes, and build the remaining product outline.
+/// `modules` is the Rust module layout (`None` for other languages).
+#[allow(clippy::too_many_arguments)]
+fn structure_entries_from_regions(
+    path: &Path,
+    symbols: &[Symbol],
+    regions: Vec<TestRegion>,
+    modules: Option<&[RustModule]>,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Vec<OutlineEntry> {
+    let mut regions = regions;
     let mut product_symbols = Vec::new();
     for symbol in symbols {
         if let Some(region) = regions
@@ -992,14 +1140,9 @@ fn outline_structure_entries(
     }
     summaries.extend(standalone);
     summaries.sort_by_key(|summary| (summary.range.start_line, summary.range.start_col));
-    let mut entries = if lang == LangId::Rust {
-        if let Some(modules) = parsed.and_then(|parsed| parsed.modules.as_deref()) {
-            rust_modules_outline(modules, &product_symbols, &summaries, &[])
-        } else {
-            rust_module_outline(tree.root_node(), &source, &product_symbols, &summaries, &[])
-        }
-    } else {
-        build_outline_tree(&product_symbols)
+    let mut entries = match modules {
+        Some(modules) => rust_modules_outline(modules, &product_symbols, &summaries, &[]),
+        None => build_outline_tree(&product_symbols),
     };
     for summary in summaries {
         let description = match summary.unknown_reason {
@@ -1025,7 +1168,7 @@ fn outline_structure_entries(
         };
         insert_summary_entry(&mut entries, entry);
     }
-    Ok(entries)
+    entries
 }
 
 fn test_module_include_label(parent: &Path, base: &Path, included_path: &Path) -> String {
@@ -1054,21 +1197,6 @@ fn insert_summary_entry(entries: &mut Vec<OutlineEntry>, entry: OutlineEntry) {
 /// Module containers are absent from the shared symbol table. Keep them in the
 /// outline so nested module functions never masquerade as file-level APIs, and
 /// impl methods attach to the type in their own module rather than a namesake.
-fn rust_module_outline(
-    root: tree_sitter::Node<'_>,
-    source: &str,
-    symbols: &[Symbol],
-    tests: &[TestSummary],
-    scope: &[String],
-) -> Vec<OutlineEntry> {
-    rust_modules_outline(
-        &crate::parser::rust_modules(root, source),
-        symbols,
-        tests,
-        scope,
-    )
-}
-
 fn rust_modules_outline(
     modules: &[RustModule],
     symbols: &[Symbol],
@@ -2399,77 +2527,99 @@ fn outline_many_files(
             continue;
         }
 
-        let parsed = match batch_parser.as_mut() {
-            Some(parser) => match parser.parse_snapshot(&path) {
-                Ok(parsed) => Some(parsed),
-                Err(error) => {
-                    parser.evict_parse_tree(&path);
-                    skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)));
-                    continue;
-                }
-            },
-            None => None,
-        };
-        let symbols = match (batch_parser.as_mut(), parsed.as_ref()) {
-            (Some(parser), Some(parsed)) => parser.extract_symbols_from_snapshot(&path, parsed),
-            _ => crate::parser::list_symbols_shared(ctx.provider(), &path),
-        };
-        match symbols {
-            Ok(symbols) => {
-                let structure = outline_structure_entries(
-                    &path,
-                    &symbols,
-                    batch_parser.as_mut().unwrap_or(&mut fallback_parser),
-                    ctx,
-                    req_id,
-                    session_id,
-                    true,
-                    parsed.as_ref(),
-                );
-                match structure {
-                    Ok(mut entries) => {
-                        if detect_language(&path) == Some(LangId::Rust) {
-                            if let Some(parsed) = &parsed {
-                                add_trait_member_previews(
-                                    parsed.tree.root_node(),
-                                    &parsed.source,
-                                    &mut entries,
-                                );
-                            } else {
-                                let parser = &mut fallback_parser;
-                                if let (Ok(source), Ok((tree, _))) =
-                                    (crate::parser::read_source(&path), parser.parse(&path))
-                                {
-                                    add_trait_member_previews(
-                                        tree.root_node(),
-                                        &source,
-                                        &mut entries,
-                                    );
-                                }
-                            }
-                        }
-                        file_outlines.push(FileOutline {
-                            absolute_path: path.clone(),
-                            path: rel_path,
-                            entries,
-                            language: detect_language(&path),
-                        });
-                    }
-                    Err(error) => {
-                        skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)))
-                    }
-                }
+        let structure = match batch_parser.as_mut() {
+            Some(parser) => {
+                let structure = batch_file_structure(&path, parser, ctx, req_id, session_id);
+                // Extraction and test classification share the validated parse tree.
+                parser.evict_parse_tree(&path);
+                structure
             }
-            Err(e) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&e))),
+            None => {
+                let structure =
+                    fallback_file_structure(&path, &mut fallback_parser, ctx, req_id, session_id);
+                fallback_parser.evict_parse_tree(&path);
+                structure
+            }
+        };
+        match structure {
+            Ok(entries) => file_outlines.push(FileOutline {
+                absolute_path: path.clone(),
+                path: rel_path,
+                entries,
+                language: detect_language(&path),
+            }),
+            Err(error) => {
+                skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)))
+            }
         }
-        // Extraction and test classification share the validated parse tree.
-        if let Some(parser) = batch_parser.as_mut() {
-            parser.evict_parse_tree(&path);
-        }
-        fallback_parser.evict_parse_tree(&path);
     }
 
     Ok((file_outlines, skipped_files))
+}
+
+/// One file's structure-map entries through the batch parser. A fresh cache
+/// entry with outline facts renders without reading or parsing the file;
+/// otherwise the file is parsed once and the facts are stored for next time.
+fn batch_file_structure(
+    path: &Path,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    if let Some(cached) = parser.cached_outline(path) {
+        // A Rust entry whose module layout was dropped cannot render its
+        // modules; parse it again instead.
+        if detect_language(path) != Some(LangId::Rust) || cached.modules.is_some() {
+            return structure_entries_from_facts(
+                path,
+                &cached.symbols,
+                cached.modules.as_deref().map(Vec::as_slice),
+                cached.has_error,
+                &cached.facts,
+                parser,
+                ctx,
+                req_id,
+                session_id,
+            );
+        }
+    }
+    let parsed = parser.parse_snapshot(path)?;
+    let symbols = parser.extract_symbols_from_snapshot(path, &parsed)?;
+    let facts = Arc::new(outline_parse_facts(path, &parsed));
+    parser.store_outline_facts(path, &parsed, Arc::clone(&facts));
+    structure_entries_from_facts(
+        path,
+        &symbols,
+        parsed.modules.as_deref().map(Vec::as_slice),
+        parsed.tree.root_node().has_error(),
+        &facts,
+        parser,
+        ctx,
+        req_id,
+        session_id,
+    )
+}
+
+/// One file's structure-map entries for a provider other than tree-sitter,
+/// which has no shared symbol cache to keep parse facts in.
+fn fallback_file_structure(
+    path: &Path,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    let symbols = crate::parser::list_symbols_shared(ctx.provider(), path)?;
+    let mut entries =
+        outline_structure_entries(path, &symbols, parser, ctx, req_id, session_id, true, None)?;
+    if detect_language(path) == Some(LangId::Rust) {
+        if let (Ok(source), Ok((tree, _))) = (crate::parser::read_source(path), parser.parse(path))
+        {
+            add_trait_member_previews(tree.root_node(), &source, &mut entries);
+        }
+    }
+    Ok(entries)
 }
 
 fn common_outline_path_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -2867,8 +3017,13 @@ fn outline_skip_reason(path: &Path, parser: Option<&mut FileParser>) -> Option<&
     // land in `skipped_files` (not the rendered outline), we still run
     // `validate_syntax()` here. With a batch parser the tree it builds is
     // reused by the symbol extraction that follows, so the file is parsed once.
+    // A fresh symbol-cache entry already records the verdict of the parse its
+    // symbols came from, so a warm file is not parsed at all.
     let validated = match parser {
-        Some(parser) => edit::validate_syntax_with_parser(parser, path),
+        Some(parser) => match parser.cached_has_error(path) {
+            Some(has_error) => Ok(Some(!has_error)),
+            None => edit::validate_syntax_with_parser(parser, path),
+        },
         None => edit::validate_syntax(path),
     };
     match validated {
@@ -3088,28 +3243,22 @@ fn add_trait_member_previews(
     source: &str,
     entries: &mut [OutlineEntry],
 ) {
+    let mut previews = Vec::new();
+    collect_trait_member_previews(node, source, &mut previews);
+    apply_trait_member_previews(&previews, entries);
+}
+
+/// Collect each trait's range and its required method rows from the tree,
+/// so they can be cached and attached later without the tree.
+fn collect_trait_member_previews(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    previews: &mut Vec<(Range, Vec<OutlineEntry>)>,
+) {
     if node.kind() == "trait_item" {
-        let range = node_range_with_decorators(&node, source, LangId::Rust);
-        fn find_trait<'a>(
-            entries: &'a mut [OutlineEntry],
-            range: &Range,
-        ) -> Option<&'a mut OutlineEntry> {
-            for entry in entries {
-                if entry.kind == "interface" && &entry.range == range {
-                    return Some(entry);
-                }
-                if entry.kind == "module" && range_contains(&entry.range, range) {
-                    if let Some(found) = find_trait(&mut entry.members, range) {
-                        return Some(found);
-                    }
-                }
-            }
-            None
-        }
-        if let (Some(entry), Some(body)) = (
-            find_trait(entries, &range),
-            node.child_by_field_name("body"),
-        ) {
+        if let Some(body) = node.child_by_field_name("body") {
+            let range = node_range_with_decorators(&node, source, LangId::Rust);
+            let mut methods = Vec::new();
             let mut cursor = body.walk();
             for method in body
                 .named_children(&mut cursor)
@@ -3120,7 +3269,7 @@ fn add_trait_member_previews(
                 };
                 let text = node_text(source, &method);
                 let first = text.lines().next().unwrap_or(text).trim_end();
-                entry.members.push(OutlineEntry {
+                methods.push(OutlineEntry {
                     name: node_text(source, &name).to_string(),
                     kind: "method".into(),
                     range: node_range_with_decorators(&method, source, LangId::Rust),
@@ -3135,12 +3284,43 @@ fn add_trait_member_previews(
                     members: Vec::new(),
                 });
             }
+            previews.push((range, methods));
         }
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        add_trait_member_previews(child, source, entries);
+        collect_trait_member_previews(child, source, previews);
+    }
+}
+
+/// Append each collected trait's method rows to the outline entry for that
+/// trait. A trait with no entry (for example one inside collapsed test code)
+/// gets nothing.
+fn apply_trait_member_previews(
+    previews: &[(Range, Vec<OutlineEntry>)],
+    entries: &mut [OutlineEntry],
+) {
+    fn find_trait<'a>(
+        entries: &'a mut [OutlineEntry],
+        range: &Range,
+    ) -> Option<&'a mut OutlineEntry> {
+        for entry in entries {
+            if entry.kind == "interface" && &entry.range == range {
+                return Some(entry);
+            }
+            if entry.kind == "module" && range_contains(&entry.range, range) {
+                if let Some(found) = find_trait(&mut entry.members, range) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    for (range, methods) in previews {
+        if let Some(entry) = find_trait(entries, range) {
+            entry.members.extend(methods.iter().cloned());
+        }
     }
 }
 
@@ -3752,7 +3932,9 @@ mod tests {
             assert_eq!(warm, cold);
             counts.push((reads, parses));
         }
-        assert_eq!(counts, vec![(1, 1); 14]);
+        // A warm multi-file outline renders from the parse facts cached next
+        // to each file's symbols, as a warm single-file outline already did.
+        assert_eq!(counts, [(1, 1), (0, 0)].repeat(7));
         let batch_ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
@@ -3764,7 +3946,7 @@ mod tests {
         let (cold, reads, parses) = navigation_counts(&request, &batch_ctx);
         assert_eq!((reads, parses), (7, 7));
         let (warm, reads, parses) = navigation_counts(&request, &batch_ctx);
-        assert_eq!((reads, parses), (7, 7));
+        assert_eq!((reads, parses), (0, 0));
         assert_eq!(warm, cold);
     }
 
@@ -3866,16 +4048,15 @@ mod tests {
             serde_json::json!({"id":"layout-work", "command":"outline", "files":[files[5]]}),
         )
         .unwrap();
-        for _ in 0..2 {
+        // The first call scans the file root and its nested module once each;
+        // the warm call reuses the cached layout and scans nothing.
+        for expected in [2, 0] {
             let before = crate::parser::work_counters::RUST_MODULE_SCANS.with(|count| count.get());
             let response = handle_outline(&request, &ctx);
             assert!(response.success);
             let scans =
                 crate::parser::work_counters::RUST_MODULE_SCANS.with(|count| count.get()) - before;
-            assert_eq!(
-                scans, 2,
-                "one scan of the file root and one of its nested module"
-            );
+            assert_eq!(scans, expected);
         }
     }
 
@@ -5037,6 +5218,73 @@ mod tests {
         let skipped = response["skipped_files"].as_array().expect("skipped files");
         assert_eq!(skipped.len(), 1, "{response}");
         assert_eq!(skipped[0]["reason"], "parse_error");
+    }
+
+    /// A warm multi-file outline renders test summaries, module layout and
+    /// trait method previews from the facts cached next to the symbols, with
+    /// no read or parse, and gives the same text as the cold call. A file
+    /// edited since is read and parsed again and shows its new content.
+    #[test]
+    fn multi_file_outline_warm_cache_skips_parse_and_reparses_edited_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rust = temp.path().join("lib.rs");
+        let script = temp.path().join("suite.ts");
+        std::fs::write(
+            &rust,
+            "pub trait Shape {\n    fn area(&self) -> f64;\n    fn name(&self) -> String;\n}\npub mod inner {\n    pub fn helper() {}\n}\npub fn product() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks() {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &script,
+            "export function visible() {}\ndescribe(\"suite\", () => {\n  it(\"works\", () => {});\n});\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "warm-batch", "command": "outline", "files": [&rust, &script],
+        }))
+        .unwrap();
+
+        let (cold, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (2, 2), "{cold}");
+        let text = cold["text"].as_str().unwrap();
+        for expected in [
+            ".fn area(&self) -> f64;",
+            "modu inner",
+            "tests: 1 items",
+            "describe \"suite\"",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+
+        let (warm, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (0, 0), "warm outline read or parsed");
+        assert_eq!(warm, cold);
+
+        std::fs::write(
+            &rust,
+            "pub trait Shape {\n    fn perimeter(&self) -> f64;\n}\npub fn renamed_product() {}\n",
+        )
+        .unwrap();
+        let (edited, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!(
+            (reads, parses),
+            (1, 1),
+            "only the edited file is parsed again"
+        );
+        let text = edited["text"].as_str().unwrap();
+        assert!(
+            text.contains("renamed_product") && text.contains(".fn perimeter"),
+            "{text}"
+        );
+        assert!(!text.contains("area") && !text.contains("tests:"), "{text}");
+
+        let (again, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (0, 0));
+        assert_eq!(again, edited);
     }
 
     fn outline_ignore_fixture(root: &Path) {
