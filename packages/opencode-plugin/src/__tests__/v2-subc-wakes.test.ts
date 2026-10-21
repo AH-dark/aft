@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -31,7 +31,9 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 function workspace() {
-  const root = mkdtempSync(join(tmpdir(), "aft-v2-subc-"));
+  // The transport binds the canonical root (on macOS, /var is a link to
+  // /private/var), so the module double must key its queues by the same path.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "aft-v2-subc-")));
   roots.push(root);
   return root;
 }
