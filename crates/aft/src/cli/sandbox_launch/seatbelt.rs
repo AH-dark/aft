@@ -242,6 +242,7 @@ fn render_worker_keychain_denies(
     source: &mut String,
     profile: &SandboxProfile,
 ) -> Result<(), String> {
+    render_worker_broker_denies(source, profile)?;
     if !profile.worker_jail {
         return Ok(());
     }
@@ -268,6 +269,30 @@ fn render_worker_keychain_denies(
             relaxed_filter(path, false)?
         ));
     }
+    Ok(())
+}
+
+fn render_worker_broker_denies(
+    source: &mut String,
+    profile: &SandboxProfile,
+) -> Result<(), String> {
+    if !profile.worker_jail {
+        return Ok(());
+    }
+    // Broker endpoints are host-owned siblings of task temp directories.
+    // A worker may connect to its own endpoint, never another command's.
+    let name = profile
+        .temp_dir
+        .file_name()
+        .ok_or("worker temp has no name")?
+        .to_string_lossy();
+    let own_socket = profile
+        .temp_dir
+        .with_file_name(format!("{name}.gh-read.sock"));
+    source.push_str(&format!(
+        "(deny network-outbound (require-all (remote unix-socket (path-regex #\"^/private/tmp/aft-w/[^/]+[.]gh-read[.]sock$\")) (require-not (path \"{}\"))))\n",
+        escape_path(&own_socket)?
+    ));
     Ok(())
 }
 

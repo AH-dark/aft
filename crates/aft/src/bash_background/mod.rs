@@ -1041,13 +1041,9 @@ pub(crate) fn spawn(
     // The ticket lets this command's `gh` shim relay bot writes for the
     // session that spawned it. Dropping it on any early return revokes it; a
     // spawned task's terminal transition revokes it after `bind_task`.
-    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue(
+    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue_for_project(
         session_id,
-        &project_root
-            .as_deref()
-            .unwrap_or(&workdir)
-            .display()
-            .to_string(),
+        project_root.as_deref(),
     );
     if let Err(error) = crate::agent_child_env::inject(
         config.as_ref(),
@@ -1118,6 +1114,30 @@ pub(crate) fn spawn(
             (plan, Some(task))
         } else {
             let root = project_root.as_deref().unwrap_or(&workdir);
+            if crate::sandbox_spawn::worker_jail_active()
+                && config.github.shim
+                && remote.is_none()
+                && plan.enforces_shell_containment()
+            {
+                let result = plan
+                    .temp_dir()
+                    .ok_or_else(|| "worker read broker requires private task temp".to_string())
+                    .and_then(|temp| {
+                        crate::gh_shim_worker_broker::start(
+                            &gh_shim_ticket,
+                            &task.paths.task_id,
+                            temp,
+                            std::time::Instant::now() + hard_kill.limit(),
+                            ctx.bash_background().clone(),
+                            &mut env,
+                        )
+                    });
+                if let Err(error) = result {
+                    plan.cleanup_unspawned();
+                    let _ = persistence::delete_resolved_task(&task);
+                    return Response::error(request_id, "worker_read_broker_unavailable", error);
+                }
+            }
             enter_bash_startup_step(BashStartupStep::Environment);
             let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
             enter_bash_startup_step(BashStartupStep::ControlFiles);
