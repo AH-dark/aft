@@ -105,8 +105,9 @@ pub struct ArenaMemory {
 #[derive(Debug, Default)]
 struct VectorPool {
     by_digest: HashMap<blake3::Hash, Weak<[f32]>>,
-    // Populate only from chunk-row vectors that were read or stored; a file
-    // payload can contain different legacy floats.
+    // Populate only from chunk-row vectors that were read or stored, or from
+    // a loaded run whose marker row vouches for it. Any other file payload
+    // can contain different legacy floats.
     by_chunk: HashMap<FamilyKey, Weak<[f32]>>,
     live_after_prune: usize,
     scratch: Vec<u8>,
@@ -245,8 +246,9 @@ impl SemanticArena {
     }
 
     /// Looks up the key derived from the producer identity and exact text.
-    /// Weak handles do not keep floats alive. Cold file loads must first validate
-    /// chunk rows before those vectors become eligible for this shortcut.
+    /// Weak handles do not keep floats alive. A loaded file run's vectors are
+    /// eligible only once its chunk rows were checked: by this process reading
+    /// them, or by the fill that stored the run, as its marker row records.
     pub(crate) fn chunk_vector(&self, key: &FamilyKey) -> Option<Arc<[f32]>> {
         #[cfg(test)]
         if !self.chunk_shortcut.load(Ordering::Relaxed) {
@@ -309,8 +311,8 @@ impl SemanticArena {
         Ok(run)
     }
 
-    /// [`Self::load`], leaving the chunk-index seeding to the caller: a run
-    /// this call installs is added to `seeds`. Admitting a generation loads
+    /// [`Self::load`], leaving the chunk-index seeding to the caller: a
+    /// nonempty run this call newly installs is added to `seeds`. Admitting a generation loads
     /// many runs and probes all their markers in one batch afterwards.
     pub(crate) fn load_deferring_seed(
         &self,

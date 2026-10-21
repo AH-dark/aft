@@ -1365,9 +1365,8 @@ fn contains_many(inner: &StoreInner, keys: &[FamilyKey]) -> StoreResult<HashSet<
     sorted.sort_unstable();
     sorted.dedup();
     let connection = lock(&inner.connection);
-    let mut statement = connection.prepare(
-        "SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
-    )?;
+    let mut statement = connection
+        .prepare("SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1")?;
     let mut present = HashSet::new();
     for key in sorted {
         if statement.exists(params![key.as_bytes().as_slice()])? {

@@ -204,9 +204,10 @@ fn verified_run_marker_payload(run_payload: &[u8]) -> Vec<u8> {
 }
 
 /// Whether every vector of `run` is bit-equal to the chunk row of its text,
-/// as the arena's chunk index records it. The index holds only vectors read
-/// from, or stored as, their exact chunk row. `run` must still hold its
-/// embedded texts. An empty run vouches for nothing.
+/// as the arena's chunk index records it. The index holds vectors read from,
+/// or stored as, their exact chunk row, and vectors of loaded runs whose
+/// marker says they matched those rows when stored. `run` must still hold
+/// its embedded texts. An empty run vouches for nothing.
 fn run_matches_chunk_rows(
     run: &crate::semantic_index::SemanticVectors,
     producer: &SemanticProducer,
