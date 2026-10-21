@@ -168,6 +168,8 @@ impl Drop for Completions {
 
 struct GateEntry {
     phase: &'static str,
+    /// Matching phase reports to let through before the gate holds one.
+    skip: usize,
     started: Sender<u64>,
     release: Receiver<()>,
 }
@@ -184,10 +186,13 @@ pub(super) fn phase_gate(id: u64, root: &Path, phase: &str) {
         .push((id, phase.to_owned()));
     let gate = {
         let mut gates = GATES.lock();
-        if gates.get(root).is_some_and(|gate| gate.phase == phase) {
-            gates.remove(root)
-        } else {
-            None
+        match gates.get_mut(root) {
+            Some(gate) if gate.phase == phase && gate.skip > 0 => {
+                gate.skip -= 1;
+                None
+            }
+            Some(gate) if gate.phase == phase => gates.remove(root),
+            _ => None,
         }
     };
     if let Some(gate) = gate {
@@ -202,12 +207,18 @@ struct Gate {
 }
 impl Gate {
     fn new(root: &Path, phase: &'static str) -> Self {
+        Self::after(root, phase, 0)
+    }
+    /// Holds the publication at the report of `phase` that follows `skip`
+    /// earlier reports of the same phase on `root`.
+    fn after(root: &Path, phase: &'static str, skip: usize) -> Self {
         let (started, arrived) = crossbeam_channel::bounded(1);
         let (release, released) = crossbeam_channel::bounded(1);
         GATES.lock().insert(
             root.to_owned(),
             GateEntry {
                 phase,
+                skip,
                 started,
                 release: released,
             },
@@ -1240,10 +1251,26 @@ fn deleted_root_pending_publication_retires_once_without_rescheduling() {
     fixture.change("next");
     let root = fixture.job_root();
     let before = fixture.ctx.view_publication_attempts_for_test();
-    let gate = Gate::new(&root, "manifest");
+    // The detached job reports "manifest" twice per attempt: once before it
+    // queues for its cold-build slot, and again as the first step of
+    // preparation, after the attempt counter has moved. Hold it at the second
+    // report, so the root disappears while preparation is running.
+    //
+    // Holding it at the first report instead makes the count depend on timing.
+    // Slot admission checks cancellation, and that check probes the root on
+    // disk again only once 50 ms (or 256 checks) have passed since its last
+    // probe on the worker thread. When the deletion takes longer than that, as
+    // it can on Windows, admission sees the deleted root and the job retires
+    // without preparing at all: zero attempts, which is also correct.
+    let gate = Gate::after(&root, "manifest", 1);
     let completions = Completions::new(root.clone());
     fixture.schedule();
     gate.started();
+    assert_eq!(
+        fixture.ctx.view_publication_attempts_for_test(),
+        before + 1,
+        "the gate must hold the publication inside its preparation attempt"
+    );
     std::fs::remove_dir_all(fixture.project.path()).unwrap();
     drop(gate);
     completions.next();
