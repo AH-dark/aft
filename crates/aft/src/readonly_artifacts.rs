@@ -1104,24 +1104,55 @@ mod tests {
 
     #[test]
     fn callgraph_writer_and_reader_keep_the_full_standing_subtree_key() {
+        let storage = tempfile::tempdir().unwrap();
+        build_and_read_standing_subtree_callgraph(storage.path());
+    }
+
+    /// A standing subtree's callgraph files carry its 64-character key twice,
+    /// in the directory and in each file name, so under a storage directory
+    /// of ordinary depth their SQLite paths and sidecars pass Windows'
+    /// 260-character `MAX_PATH`. Both the cold build (which writes a journal)
+    /// and the read-only open of the published generation must still work.
+    #[cfg(windows)]
+    #[test]
+    fn callgraph_of_a_standing_subtree_builds_and_reads_past_the_windows_path_limit() {
+        let storage = tempfile::tempdir().unwrap();
+        let deep = storage
+            .path()
+            .join("a-storage-directory-as-deep-as-a-real-profile")
+            .join("another-level-of-ordinary-nesting");
+        fs::create_dir_all(&deep).unwrap();
+        // A generation file name is at least `<64-char key>.g<19-digit nanos>.<pid>.sqlite`.
+        let generation_dir_len = deep
+            .join("callgraph")
+            .join("k".repeat(64))
+            .as_os_str()
+            .len();
+        assert!(
+            generation_dir_len + 1 + 94 >= 260,
+            "the fixture must put the generation files past MAX_PATH"
+        );
+        build_and_read_standing_subtree_callgraph(&deep);
+    }
+
+    fn build_and_read_standing_subtree_callgraph(storage: &Path) {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (project, root) = fixture_project();
         let subtree = root.join("src");
-        let storage = tempfile::tempdir().unwrap();
         let resolved = crate::scoped_key::resolve_standing_root_in_storage(
             subtree.to_str().unwrap(),
-            storage.path(),
+            storage,
             true,
         )
         .unwrap();
         let key = resolved.artifact_key;
         assert_eq!(key.len(), 64);
         assert_ne!(
-            crate::search_index::artifact_cache_key_read_only(&subtree, storage.path()).unwrap(),
+            crate::search_index::artifact_cache_key_read_only(&subtree, storage).unwrap(),
             key
         );
         crate::root_cache::configure_artifact_access(&subtree, &key, false);
-        let dir = storage.path().join("callgraph").join(&key);
+        let dir = storage.join("callgraph").join(&key);
         let (graph, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
             dir.clone(),
             subtree.clone(),

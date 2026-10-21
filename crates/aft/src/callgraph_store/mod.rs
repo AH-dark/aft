@@ -10925,7 +10925,15 @@ fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<Tra
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
+    let path = crate::db::lifecycle::sqlite_open_path(path);
+    let lossy = path.to_string_lossy();
+    if lossy.starts_with(r"\\?\") {
+        // Windows reads a `\\?\` path literally, so its backslashes stay
+        // backslashes (percent-encoded) instead of becoming `/`. SQLite drops
+        // the leading `/` of `/\\?\` when it resolves the file name.
+        return format!("file:///{}?mode=ro", percent_encode_sqlite_uri_path(&lossy));
+    }
+    let raw = lossy.replace('\\', "/");
     let encoded = percent_encode_sqlite_uri_path(&raw);
     if raw.starts_with('/') {
         format!("file://{encoded}?mode=ro")
@@ -24841,6 +24849,16 @@ mod cold_build_insert_tests {
         assert_eq!(
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
+        );
+    }
+
+    /// A `\\?\` path keeps its backslashes: Windows does not treat `/` as a
+    /// separator inside one, so turning them into `/` would name another file.
+    #[test]
+    fn sqlite_readonly_uri_keeps_windows_verbatim_paths_literal() {
+        assert_eq!(
+            sqlite_readonly_uri(Path::new(r"\\?\C:\Users\name with spaces\db#1.sqlite")),
+            "file:///%5C%5C%3F%5CC:%5CUsers%5Cname%20with%20spaces%5Cdb%231.sqlite?mode=ro"
         );
     }
 
