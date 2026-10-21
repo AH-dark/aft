@@ -6,6 +6,7 @@ import {
   _setSubagentClockForTest,
   FAILED_LOOKUP_RETRY_MS,
   resolveIsSubagent,
+  resolveSubagentStatus,
 } from "../shared/subagent-detect.js";
 
 let timeoutFixtureId = 0;
@@ -155,9 +156,7 @@ describe("subagent-detect", () => {
     expect(calls).toBe(1);
   });
 
-  // A failed lookup answers "primary" for a while instead of asking a
-  // struggling host on every call, then retries so the real answer is still
-  // found. (It used to retry on the very next call.)
+  // Failed lookups stay unknown for the retry window, then ask the host again.
   test("after an SDK error, calls within the retry window make no lookup; a later call retries", async () => {
     let clock = 1_000_000;
     _setSubagentClockForTest(() => clock);
@@ -255,14 +254,14 @@ describe("subagent-detect", () => {
       expect(await resolveIsSubagent(context, "ses_root", "/cwd")).toBe(false);
     });
 
-    test("a failed lookup counts as primary only until the retry window passes", async () => {
+    test("a failed V2 lookup stays unknown until retry, never a cached primary", async () => {
       let clock = 1_000_000;
       _setSubagentClockForTest(() => clock);
       const records: Record<string, { id: string; parentID?: string }> = {};
       const { context, inputs } = v2Context(records);
-      expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(false);
+      expect(await resolveSubagentStatus(context, "ses_late", "/cwd")).toBe("unknown");
       records.ses_late = { id: "ses_late", parentID: "ses_parent" };
-      expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(false);
+      expect(await resolveSubagentStatus(context, "ses_late", "/cwd")).toBe("unknown");
       expect(inputs).toHaveLength(1);
       clock += FAILED_LOOKUP_RETRY_MS;
       expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(true);
@@ -316,4 +315,35 @@ describe("subagent-detect", () => {
     await resolveIsSubagent(client, "ses_primary", "/cwd");
     expect(calls).toBe(1);
   });
+});
+
+test("V2 timed-out role lookup interrupts its fiber and retries the unknown answer", async () => {
+  _resetSubagentCacheForTest();
+  let clock = 0;
+  _setSubagentClockForTest(() => clock);
+  let interrupted = false;
+  let calls = 0;
+  const host = {
+    location: { directory: process.cwd() },
+    session: {
+      get: () => {
+        calls += 1;
+        return calls === 1
+          ? Effect.never.pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  interrupted = true;
+                }),
+              ),
+            )
+          : Effect.succeed({ parentID: "parent" });
+      },
+    },
+  };
+  expect(await resolveIsSubagent(host, "timeout-child")).toBe(false);
+  await Bun.sleep(20);
+  expect(interrupted).toBe(true);
+  clock += FAILED_LOOKUP_RETRY_MS;
+  expect(await resolveIsSubagent(host, "timeout-child")).toBe(true);
+  expect(calls).toBe(2);
 });

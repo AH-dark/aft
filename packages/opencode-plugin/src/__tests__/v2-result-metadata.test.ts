@@ -154,3 +154,29 @@ describe("V2 tool result metadata", () => {
     expect(progress[0]).toEqual({ status: "running" });
   });
 });
+
+test("flat shell progress reaches the V2 host and rejected progress is handled", async () => {
+  const progress: unknown[] = [];
+  const definition = {
+    description: "progress probe",
+    args: {},
+    execute: async (_input: unknown, runtime: { metadata(update: unknown): void }) => {
+      runtime.metadata({ output: "live chunk", description: "build", missing: undefined });
+      await Bun.sleep(10);
+      return "done";
+    },
+  } as unknown as ToolDefinition;
+  const projected = projectV2Tool("bash", definition, { directory: process.cwd() });
+  await Effect.runPromise(
+    projected.execute(
+      {},
+      {
+        progress: (update) => {
+          progress.push(update);
+          return Effect.fail(new Error("host disconnected")) as never;
+        },
+      },
+    ),
+  );
+  expect(progress).toEqual([{ output: "live chunk", description: "build" }]);
+});

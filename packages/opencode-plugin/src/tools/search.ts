@@ -185,7 +185,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         path: bridgePath,
         include: includeArg,
       });
-      if (grepDenied) return permissionDeniedResponse(grepDenied);
+      if (grepDenied) return permissionDeniedResponse(grepDenied, context);
 
       if (pathSplit) {
         for (const target of searchPathTargets(projectRoot, pathSplit, "file")) {
@@ -198,7 +198,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
               serverValidatedRead: true,
             },
           );
-          if (externalDenied) return permissionDeniedResponse(externalDenied);
+          if (externalDenied) return permissionDeniedResponse(externalDenied, context);
         }
       }
 
@@ -287,7 +287,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       // external_directory check on the resolved search root if it's
       // outside the project.
       const globDenied = await askGlobPermission(context, globPattern, { path: bridgePath });
-      if (globDenied) return permissionDeniedResponse(globDenied);
+      if (globDenied) return permissionDeniedResponse(globDenied, context);
 
       if (pathSplit) {
         for (const target of searchPathTargets(projectRoot, pathSplit, "directory")) {
@@ -300,7 +300,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
               serverValidatedRead: true,
             },
           );
-          if (externalDenied) return permissionDeniedResponse(externalDenied);
+          if (externalDenied) return permissionDeniedResponse(externalDenied, context);
         }
       }
 

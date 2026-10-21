@@ -118,9 +118,9 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           const denial = await assertExternalDirectoryPermission(ctx, context, target, {
             serverValidatedRead: true,
           });
-          if (denial) return permissionDeniedResponse(denial);
+          if (denial) return permissionDeniedResponse(denial, context);
           const readDenial = await assertV2ReadPermission(context, target);
-          if (readDenial) return permissionDeniedResponse(readDenial);
+          if (readDenial) return permissionDeniedResponse(readDenial, context);
         }
 
         const rawArgs: Record<string, unknown> = {

@@ -405,7 +405,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
     execute: async (args, context): Promise<string> => {
       const sections = normalizeStringOrArray(coerceJsonCollectionParam(args.sections, "sections"));
       const scoped = await resolveAndGateScope(ctx, context, normalizeStringOrArray(args.scope));
-      if (scoped.denial) return permissionDeniedResponse(scoped.denial);
+      if (scoped.denial) return permissionDeniedResponse(scoped.denial, context);
       const rawArgs: Record<string, unknown> = {};
       if (sections !== undefined) rawArgs.sections = sections;
       if (scoped.scope !== undefined) rawArgs.scope = scoped.scope;

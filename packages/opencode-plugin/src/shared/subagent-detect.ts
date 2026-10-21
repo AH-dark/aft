@@ -25,8 +25,9 @@
  * lookup must stay cheap and bounded:
  * - concurrent first calls for one session share a single lookup;
  * - a lookup that has not answered within LOOKUP_TIMEOUT_MS is abandoned and
- *   that call proceeds as primary, so a slow host can't delay a read;
- * - a failed or abandoned lookup is cached as "primary" for
+ *   that call proceeds with an unknown role, so a slow host delays a read by
+ *   at most LOOKUP_TIMEOUT_MS;
+ * - a failed or abandoned lookup is cached as unknown for
  *   FAILED_LOOKUP_RETRY_MS, then retried, so a struggling host is not asked on
  *   every call but the real answer is still picked up later.
  *
@@ -50,10 +51,12 @@ interface OpenCodeClientShape {
   };
 }
 
+export type SubagentStatus = boolean | "unknown";
+
 interface CacheEntry {
-  isSubagent: boolean;
+  isSubagent: SubagentStatus;
   /**
-   * When a provisional "primary" answer (recorded after a failed or timed-out
+   * When an unknown answer (recorded after a failed or timed-out
    * lookup) stops counting and the host is asked again. Absent for a real
    * answer, which never changes: a session's parent is fixed at creation.
    */
@@ -63,19 +66,25 @@ interface CacheEntry {
 const CACHE_MAX_ENTRIES = 200;
 /** Longest a caller waits for the host's session lookup. */
 export const LOOKUP_TIMEOUT_MS = 1_000;
-/** How long a failed or timed-out lookup is answered as "primary" before retrying. */
-export const FAILED_LOOKUP_RETRY_MS = 30_000;
+/**
+ * How long an unknown role (after a failed or timed-out lookup) is reused
+ * before the host is asked again. Short, because an unknown role is treated
+ * cautiously by the shell and stop handlers until the real answer arrives; not
+ * zero, because a host that keeps timing out would otherwise add up to
+ * LOOKUP_TIMEOUT_MS to every tool call.
+ */
+export const FAILED_LOOKUP_RETRY_MS = 5_000;
 const cache = new Map<string, CacheEntry>();
 /** One lookup per session at a time; concurrent first calls await it. */
-const inflight = new Map<string, Promise<boolean>>();
+const inflight = new Map<string, Promise<SubagentStatus>>();
 let now: () => number = () => Date.now();
 
 /**
- * Returns `true` when the given session has a non-empty `parentID`
- * (subagent). Returns `false` for primary sessions, when the SDK is
- * unavailable, or when the lookup fails or takes longer than
- * LOOKUP_TIMEOUT_MS; the false default keeps primary sessions working
- * exactly as before.
+ * Returns `true` only when the given session is known to have a non-empty
+ * `parentID` (subagent). Returns `false` for primary sessions, when the SDK is
+ * unavailable, and for an unknown role (the lookup failed or took longer than
+ * LOOKUP_TIMEOUT_MS). Callers whose safe default for an unknown role is the
+ * subagent behaviour use resolveSubagentStatus instead.
  *
  * A known answer is an O(1) cache hit. Otherwise at most one host lookup
  * per session is in flight, and it is bounded by LOOKUP_TIMEOUT_MS.
@@ -83,8 +92,24 @@ let now: () => number = () => Date.now();
 export async function resolveIsSubagent(
   client: unknown,
   sessionId: string | undefined,
-  _fallbackDirectory?: string,
+  fallbackDirectory?: string,
 ): Promise<boolean> {
+  return (await resolveSubagentStatus(client, sessionId, fallbackDirectory)) === true;
+}
+
+/**
+ * The session's role: `true` when a non-empty `parentID` marks a subagent,
+ * `false` when the host says it has no parent (or there is no session or no
+ * lookup API to ask), and "unknown" while the host lookup is failing or slow.
+ * The shell tool, the watch tool and the OpenCode 2 stop handler treat
+ * "unknown" like a subagent, so a slow lookup cannot strip a subagent of its
+ * foreground rule or its stop cleanup.
+ */
+export async function resolveSubagentStatus(
+  client: unknown,
+  sessionId: string | undefined,
+  _fallbackDirectory?: string,
+): Promise<SubagentStatus> {
   if (!sessionId) {
     sessionLog(undefined, "[subagent-detect] no sessionId provided → primary");
     return false;
@@ -110,18 +135,22 @@ export async function resolveIsSubagent(
 
 /**
  * Runs the host lookup, giving up after LOOKUP_TIMEOUT_MS. A real answer is
- * cached for good; a failure or timeout is cached as "primary" until
- * FAILED_LOOKUP_RETRY_MS has passed. The abandoned host call is left to
- * settle on its own; its late answer is ignored.
+ * cached for good; a failure or timeout is cached as "unknown" until
+ * FAILED_LOOKUP_RETRY_MS has passed. On OpenCode 2 the lookup is an Effect, and
+ * Effect.timeout interrupts it when the time is up, so no abandoned lookup
+ * keeps running. An OpenCode 1 lookup is a promise that cannot be cancelled;
+ * its late answer is ignored.
  */
-async function boundedLookup(client: unknown, sessionId: string): Promise<boolean> {
+async function boundedLookup(client: unknown, sessionId: string): Promise<SubagentStatus> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), LOOKUP_TIMEOUT_MS);
   });
   let answer: boolean | "failed" | "timeout";
   try {
-    answer = await Promise.race([lookupSession(client, sessionId), timedOut]);
+    answer = isV2PluginContext(client)
+      ? await resolveV2(client, sessionId)
+      : await Promise.race([lookupSession(client, sessionId), timedOut]);
   } finally {
     clearTimeout(timer);
   }
@@ -132,11 +161,11 @@ async function boundedLookup(client: unknown, sessionId: string): Promise<boolea
   if (answer === "timeout") {
     sessionWarn(
       sessionId,
-      `[subagent-detect] session lookup did not answer within ${LOOKUP_TIMEOUT_MS}ms → primary for now`,
+      `[subagent-detect] session lookup did not answer within ${LOOKUP_TIMEOUT_MS}ms → unknown for now`,
     );
   }
-  setCache(sessionId, false, now() + FAILED_LOOKUP_RETRY_MS);
-  return false;
+  setCache(sessionId, "unknown", now() + FAILED_LOOKUP_RETRY_MS);
+  return "unknown";
 }
 
 /** The host's answer, or "failed" when the lookup threw. Never rejects. */
@@ -225,17 +254,16 @@ async function resolveV2(
   let session: SessionInfo | undefined;
   try {
     session = await Effect.runPromise(
-      context.session.get({ sessionID: sessionId }) as Effect.Effect<SessionInfo | undefined>,
+      Effect.timeout(context.session.get({ sessionID: sessionId }), LOOKUP_TIMEOUT_MS),
     );
   } catch (err) {
-    // Same policy as the V1 path: a failed lookup counts as primary only
-    // until FAILED_LOOKUP_RETRY_MS has passed.
     sessionWarn(
       sessionId,
       `[subagent-detect] OpenCode 2 session lookup failed: ${err instanceof Error ? err.message : String(err)}`,
     );
     return "failed";
   }
+  if (!session) return "failed";
   const isSubagent = typeof session?.parentID === "string" && session.parentID.length > 0;
   sessionLog(
     sessionId,
@@ -244,7 +272,7 @@ async function resolveV2(
   return isSubagent;
 }
 
-function setCache(sessionId: string, isSubagent: boolean, retryAfter?: number): void {
+function setCache(sessionId: string, isSubagent: SubagentStatus, retryAfter?: number): void {
   if (cache.has(sessionId)) cache.delete(sessionId);
   cache.set(sessionId, retryAfter === undefined ? { isSubagent } : { isSubagent, retryAfter });
   if (cache.size > CACHE_MAX_ENTRIES) {

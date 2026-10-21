@@ -1,10 +1,14 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Effect, Exit, PubSub, Scope, Stream } from "effect";
 
+import { sessionBgStates, trackBgTask } from "../bg-notifications.js";
+import * as logger from "../logger.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
+import { isSyncWatchAborted, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import type { PluginContext } from "../types.js";
 import {
+  _v2SessionCountForTest,
   allowV2WatchWake,
   awaitV2ExecutionSettlement,
   noteV2ToolAbort,
@@ -310,5 +314,93 @@ test("V2 stop unions in-memory and persisted task ids without duplicate kills", 
     expect(killed).toEqual(["bash-live", "bash-before-reload"]);
   } finally {
     await r.close();
+  }
+});
+
+test("V2 unknown role never skips stop cleanup after a failed lookup", async () => {
+  const r = await rig();
+  r.host.session.get = () => Effect.die(new Error("host lookup unavailable"));
+  try {
+    await trackV2BackgroundTask(
+      r.ctx,
+      { sessionID: "child", directory: process.cwd() },
+      "bash-unknown",
+      0,
+    );
+    await r.event("session.execution.interrupted", "user");
+    expect(
+      r.calls.filter((call) => call.name === "bash_kill").map((call) => call.args.task_id),
+    ).toEqual(["bash-unknown"]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 ended event subscription logs the Location once", async () => {
+  const logged = spyOn(logger, "error");
+  logged.mockClear();
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle({
+        location: { directory: "/work/events-ended" },
+        event: { subscribe: () => Stream.empty },
+      }).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    await Bun.sleep(10);
+    const lines = logged.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("event") && line.includes("/work/events-ended"));
+    expect(lines).toHaveLength(1);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    logged.mockRestore();
+  }
+});
+
+test("V2 session deletion releases watches, tasks, settlement and auxiliary session maps", async () => {
+  const r = await rig();
+  try {
+    const runtime = { sessionID: "child", directory: process.cwd() };
+    await trackV2BackgroundTask(r.ctx, runtime, "bash-deleted", 0);
+    await trackV2Watch(r.ctx, runtime, "bash-deleted", "watch-deleted");
+    noteV2ToolAbort(r.host, "child");
+    let settled = false;
+    void awaitV2ExecutionSettlement(r.host, "child").then(() => {
+      settled = true;
+    });
+    signalSyncWatchAbort("child");
+    signalSyncWatchAbort("sibling");
+    trackBgTask("child", "bash-deleted");
+    trackBgTask("sibling", "bash-retained");
+    await r.event("session.deleted");
+    expect(settled).toBe(true);
+    expect(isSyncWatchAborted("child")).toBe(false);
+    expect(isSyncWatchAborted("sibling")).toBe(true);
+    expect(sessionBgStates.has("child")).toBe(false);
+    expect(sessionBgStates.has("sibling")).toBe(true);
+    expect(r.calls.map((call) => call.name).sort()).toEqual(["bash_kill", "bash_unnotify"]);
+    expect(v2WatchWakeAllowed(r.host, "child", "bash-deleted")).toBe(false);
+    expect(_v2SessionCountForTest(r.host)).toBe(0);
+  } finally {
+    await r.close();
+    sessionBgStates.clear();
+  }
+});
+
+test("V2 replies arriving after session deletion cannot recreate session state", async () => {
+  const r = await rig();
+  try {
+    const runtime = { sessionID: "child", directory: process.cwd() };
+    const epoch = v2StopEpoch(r.host, "child");
+    await r.event("session.deleted");
+    await trackV2BackgroundTask(r.ctx, runtime, "bash-late-deleted", epoch);
+    await trackV2Watch(r.ctx, runtime, "bash-late-deleted", "watch-late-deleted");
+    expect(r.calls.map((call) => call.name)).toEqual(["bash_kill", "bash_unnotify"]);
+    expect(_v2SessionCountForTest(r.host)).toBe(0);
+    expect(sessionBgStates.has("child")).toBe(false);
+  } finally {
+    await r.close();
+    sessionBgStates.clear();
   }
 });

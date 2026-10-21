@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { Effect, Exit } from "effect";
-
 import { projectV2Tool } from "../../src/tools/definitions/v2.js";
+import { safetyTools } from "../../src/tools/safety.js";
+import type { PluginContext } from "../../src/types.js";
 
 const LOCATION = {
-  directory: "/work/project",
-  project: { directory: "/work/project", canonical: "/work/project" },
+  directory: process.cwd(),
+  project: { directory: process.cwd(), canonical: process.cwd() },
 };
 const EXECUTION_CONTEXT = {
   sessionID: "session-envelope",
@@ -17,6 +18,21 @@ const EXECUTION_CONTEXT = {
 };
 
 function toolReturning(output: unknown): ReturnType<typeof projectV2Tool> {
+  if (output && typeof output === "object" && "success" in output) {
+    const response = output as Record<string, unknown>;
+    const bridge = { toolCall: async () => ({ text: JSON.stringify(response), ...response }) };
+    const ctx = {
+      config: {},
+      client: {},
+      pool: { getBridge: () => bridge },
+    } as unknown as PluginContext;
+    const definition = safetyTools(ctx).aft_safety as ToolDefinition;
+    return projectV2Tool(
+      "safety",
+      { ...definition, execute: (_args, runtime) => definition.execute({ op: "list" }, runtime) },
+      LOCATION,
+    );
+  }
   const definition = {
     description: "result envelope probe",
     args: {},
@@ -30,11 +46,14 @@ async function runExit(output: unknown) {
 }
 
 describe("V2 tool result envelopes", () => {
-  test("a returned failure envelope fails the call instead of reporting success", async () => {
+  test("a structured engine failure fails the call instead of reporting success", async () => {
     const message = 'Permission denied (external_directory) for "/etc/hosts".';
-    const exit = await runExit(
-      JSON.stringify({ success: false, code: "permission_denied", message, error: message }),
-    );
+    const exit = await runExit({
+      success: false,
+      code: "permission_denied",
+      message,
+      error: message,
+    });
 
     expect(Exit.isFailure(exit)).toBe(true);
   });
@@ -43,9 +62,10 @@ describe("V2 tool result envelopes", () => {
     const message = "no undo history for: operation";
     const error = await Effect.runPromise(
       Effect.flip(
-        toolReturning(
-          JSON.stringify({ success: false, code: "no_history", message, error: message }),
-        ).execute({}, EXECUTION_CONTEXT),
+        toolReturning({ success: false, code: "no_history", message, error: message }).execute(
+          {},
+          EXECUTION_CONTEXT,
+        ),
       ),
     );
 
@@ -53,28 +73,6 @@ describe("V2 tool result envelopes", () => {
     expect((error as Error).message).toBe(message);
     expect((error as Error).message).not.toContain('"success"');
     expect((error as Error).message).not.toContain('"error"');
-  });
-
-  test("falls back to error, then code, when the envelope carries no message", async () => {
-    const withError = await Effect.runPromise(
-      Effect.flip(
-        toolReturning(JSON.stringify({ success: false, error: "rendered failure" })).execute(
-          {},
-          EXECUTION_CONTEXT,
-        ),
-      ),
-    );
-    const withCode = await Effect.runPromise(
-      Effect.flip(
-        toolReturning(JSON.stringify({ success: false, code: "bridge_timeout" })).execute(
-          {},
-          EXECUTION_CONTEXT,
-        ),
-      ),
-    );
-
-    expect((withError as Error).message).toBe("rendered failure");
-    expect((withCode as Error).message).toBe("bridge_timeout");
   });
 
   test("leaves ordinary output alone, including JSON that is not a failure envelope", async () => {
@@ -92,17 +90,11 @@ describe("V2 tool result envelopes", () => {
     ).toEqual({ content: "plain text output" });
   });
 
-  test("recognises the envelope when a tool reports it through a structured result", async () => {
-    const message = "checkpoint restore failed";
-    const error = await Effect.runPromise(
-      Effect.flip(
-        toolReturning({
-          output: JSON.stringify({ success: false, message }),
-          title: "aft_safety",
-        }).execute({}, EXECUTION_CONTEXT),
-      ),
+  test("structured tool output containing failure-shaped JSON remains data", async () => {
+    const output = JSON.stringify({ success: false, message: "application data" });
+    const result = await Effect.runPromise(
+      toolReturning({ output, title: "read" }).execute({}, EXECUTION_CONTEXT),
     );
-
-    expect((error as Error).message).toBe(message);
+    expect(result.content).toBe(output);
   });
 });

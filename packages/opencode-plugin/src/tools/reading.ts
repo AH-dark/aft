@@ -205,7 +205,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             filesMode ? "directory" : "file",
             checkedReads,
           );
-          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+          if (permissionDenied) return permissionDeniedResponse(permissionDenied, context);
         } else {
           if (typeof target !== "string" || target.length === 0) {
             throw new Error("'target' must be a non-empty string or array of strings");
@@ -228,7 +228,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               kind,
               checkedReads,
             );
-            if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+            if (permissionDenied) return permissionDeniedResponse(permissionDenied, context);
           }
         }
 
@@ -260,7 +260,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           for (const file of distinctFiles) {
             const denial = checkedReads.get(file);
             if (!denial) continue;
-            if (denial !== permissionRuleDenial("read")) return permissionDeniedResponse(denial);
+            if (denial !== permissionRuleDenial("read"))
+              return permissionDeniedResponse(denial, context);
             if (excluded.has(file))
               throw new Error("Outline server did not exclude a read-denied file");
             excluded.add(file);
@@ -268,7 +269,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           }
           if (denied) {
             if (distinctFiles.size === denied)
-              return permissionDeniedResponse(permissionRuleDenial("read"));
+              return permissionDeniedResponse(permissionRuleDenial("read"), context);
             continue;
           }
           return (
@@ -320,7 +321,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         } else {
           for (const file of distinctFiles) {
             const denial = await assertPathReadPermissions(ctx, context, file);
-            if (denial) return permissionDeniedResponse(denial);
+            if (denial) return permissionDeniedResponse(denial, context);
           }
         }
         const allowed = args.batch.filter((entry) => {
@@ -352,7 +353,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         });
         if (!allowed.length) {
           const denial = deniedPaths.values().next().value;
-          if (args.batch.length === 1 && denial) return permissionDeniedResponse(denial);
+          if (args.batch.length === 1 && denial) return permissionDeniedResponse(denial, context);
           return withMeta(deniedText);
         }
         const response = await callToolCall(ctx, context, "zoom", rawArgs);

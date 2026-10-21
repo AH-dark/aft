@@ -186,7 +186,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       // Auto routing may use either the indexed or grep-backed lane, so ask for
       // the aft_search permission before executing every search.
       const denied = await askSearchPermission(context, permissionSubject);
-      if (denied) return permissionDeniedResponse(denied);
+      if (denied) return permissionDeniedResponse(denied, context);
 
       const rawArgs: Record<string, unknown> = {};
       if (hasQuery) rawArgs.query = query;
@@ -233,7 +233,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
               continuityKey(sessionProjectRoot, continuitySubject, includeTests, topK),
             );
           }
-          return permissionDeniedResponse(externalDenied.message);
+          return permissionDeniedResponse(externalDenied.message, context);
         }
         rawArgs.path = pathArg;
       }

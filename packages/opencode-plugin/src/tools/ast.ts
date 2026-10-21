@@ -88,7 +88,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     execute: async (args, context): Promise<string> => {
       const paths = await resolveAstPaths(ctx, context, args.paths);
       const externalDenied = await checkAstPathsPermission(ctx, context, paths, true);
-      if (externalDenied) return permissionDeniedResponse(externalDenied);
+      if (externalDenied) return permissionDeniedResponse(externalDenied, context);
 
       const rawArgs: Record<string, unknown> = {
         pattern: args.pattern,
@@ -131,7 +131,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       const paths = await resolveAstPaths(ctx, context, args.paths);
 
       const externalDenied = await checkAstPathsPermission(ctx, context, paths);
-      if (externalDenied) return permissionDeniedResponse(externalDenied);
+      if (externalDenied) return permissionDeniedResponse(externalDenied, context);
 
       if (!isDryRun) {
         // External-directory check first (mirrors opencode-native grep/glob directory checks).
@@ -140,7 +140,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
           const denial = await assertExternalDirectoryPermission(ctx, context, targetPath, {
             kind: "directory",
           });
-          if (denial) return permissionDeniedResponse(denial);
+          if (denial) return permissionDeniedResponse(denial, context);
         }
 
         const explicitPaths = paths !== undefined ? resolveRelativePatterns(context, paths) : [];
@@ -158,7 +158,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
           metadata,
         );
         if (permissionError) {
-          return permissionDeniedResponse(permissionError);
+          return permissionDeniedResponse(permissionError, context);
         }
       }
 

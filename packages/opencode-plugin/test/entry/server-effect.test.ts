@@ -208,7 +208,7 @@ describe("V2 server effect", () => {
     }
   });
 
-  test("acquires the bridge with the Location's canonical project directory", async () => {
+  test("acquires the bridge with the Location's own directory, not the main checkout", async () => {
     const events: string[] = [];
     const host = hostContext("/work/alias", events, [], "/work/canonical");
 
@@ -216,8 +216,8 @@ describe("V2 server effect", () => {
       Effect.scoped(makeServerEffect(testDependencies(events))(host.context)),
     );
 
-    expect(events).toContain("acquire:/work/canonical:/isolated/bin/aft");
-    expect(events).toContain("release:/work/canonical");
+    expect(events).toContain("acquire:/work/alias:/isolated/bin/aft");
+    expect(events).toContain("release:/work/alias");
   });
 
   test("registers shared definitions with Effect execution and the host AbortSignal", async () => {
@@ -447,4 +447,30 @@ describe("V2 server effect", () => {
     expect(events).toContain("active-root:/work/a");
     expect(events).not.toContain("active-root:/canonical/a");
   });
+});
+
+test("V2 boot rejection logs the Location once before the host ignores its cause", async () => {
+  const logged = spyOn(logger, "error");
+  logged.mockClear();
+  try {
+    const events: string[] = [];
+    const dependencies = {
+      ...testDependencies(events),
+      resolveBinary: async () => {
+        throw new Error("boot failed");
+      },
+    };
+    await Effect.runPromise(
+      Effect.scoped(
+        makeServerEffect(dependencies)(hostContext("/work/broken", events, []).context),
+      ).pipe(Effect.ignoreCause),
+    );
+    const lines = logged.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("boot failed"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("/work/broken");
+  } finally {
+    logged.mockRestore();
+  }
 });

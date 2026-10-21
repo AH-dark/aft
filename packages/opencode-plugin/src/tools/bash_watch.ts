@@ -31,7 +31,7 @@ import {
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
-import { resolveIsSubagent } from "../shared/subagent-detect.js";
+import { resolveSubagentStatus } from "../shared/subagent-detect.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -137,8 +137,17 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       const requestedAsync = coerceBoolean(args.background);
       const waitFor = parseWaitPattern(args.pattern);
       const bashCfg = resolveBashConfig(ctx.config);
-      const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
-      const subagentForcedSync = requestedAsync && isSubagent && !bashCfg.subagent_background;
+      // An unknown role (the host lookup failed or was slow) follows the
+      // subagent rule, as in the shell tool: an async watch would make a
+      // subagent end its turn to hear the result.
+      const subagentStatus = await resolveSubagentStatus(
+        ctx.client,
+        context.sessionID,
+        context.directory,
+      );
+      const subagentForcedSync =
+        requestedAsync && subagentStatus !== false && !bashCfg.subagent_background;
+      const isSubagent = subagentStatus === true;
       const asyncMode = requestedAsync && !subagentForcedSync;
 
       if (asyncMode) {
@@ -197,9 +206,12 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         effectiveWaitMs,
         role,
       );
-      if (isSubagent && context.abort.aborted)
+      // The stop handler treats an unknown role as a subagent, so the stop
+      // check here must too.
+      const maybeSubagent = subagentStatus !== false;
+      if (maybeSubagent && context.abort.aborted)
         await awaitV2ExecutionSettlement(ctx.client, context.sessionID);
-      const stopped = isSubagent && v2SubagentStopped(ctx.client, context.sessionID);
+      const stopped = maybeSubagent && v2SubagentStopped(ctx.client, context.sessionID);
       if (stopped && data.waited?.reason === "user_message") data.waited.reason = "aborted";
       const waited = data.waited;
       // User-message abort: the sync wait was interrupted because the user

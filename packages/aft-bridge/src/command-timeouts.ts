@@ -24,6 +24,16 @@ export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
   glob: 60_000,
   search: 60_000,
   semantic_search: 60_000,
+  // Parse and traverse every candidate source file; replacement also writes them.
+  ast_search: 60_000,
+  ast_replace: 60_000,
+  // Directory outlines walk the tree; annotated zoom can build a call graph.
+  outline: 60_000,
+  zoom: 60_000,
+  // Organizing imports may wait on a language server and validate the rewrite.
+  import: 60_000,
+  // Checkpoint, restore and undo can copy or restore many files in one operation.
+  safety: 60_000,
 };
 
 /** Returns the per-command timeout override, or undefined to use the bridge default. */

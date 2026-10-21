@@ -1512,6 +1512,24 @@ export function __setBusyWakeDeferCeilingForTests(timeoutMs: number): void {
   busyWakeDeferCeilingMs = timeoutMs;
 }
 
+/** Release timers and task bookkeeping even if a task never reports completion. */
+export function clearSessionBgState(sessionID: string): void {
+  const state = sessionBgStates.get(sessionID);
+  if (state) {
+    if (state.debounceTimer) clearTimeout(state.debounceTimer);
+    for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
+    sessionBgStates.delete(sessionID);
+  }
+  clearDeferredBusyWake(sessionID);
+  foreignSessionDropLogState.delete(sessionID);
+  // In-flight subc nudges remove themselves when they settle; only the log
+  // throttle keeps per-session keys after that.
+  for (const key of subcNudgeLogState.keys()) {
+    if (key.endsWith(`\0${sessionID}`)) subcNudgeLogState.delete(key);
+  }
+  if (activeSessionId === sessionID) activeSessionId = undefined;
+}
+
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
