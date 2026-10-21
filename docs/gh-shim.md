@@ -405,3 +405,49 @@ Audit line: `{as_of_unix_secs, tuple: "label create", repository, label, color}`
 
 Without the bypass it refuses as `gh_shim_unclassified`. `label delete` and
 `label edit` stay undeclared.
+
+## Worker broker security boundary and GET query contract
+
+Worker reads use a command-scoped bearer at a dedicated Unix socket. This
+boundary separates **independently jailed commands**; it does not isolate an
+unsandboxed process owned by the same user. Such a process can read a mode-0600
+capability file and use its matching endpoint. The host and other unsandboxed
+same-user processes are trusted. Processes within an authorized command may
+intentionally delegate its read capability until command revocation. Neither a
+particular `gh` executable nor process ancestry is authenticated by the bearer.
+
+The daemon derives the command identity, live scope and repository binding; it
+admits only session-context lookup and the typed governed read operation. The
+worker's signed manifest snapshot is not daemon authority, and the daemon checks
+its own active v20-or-later manifest before serving reads.
+
+Only the worker broker's `github.repo.get` query map has the following closed
+key set. Existing operator/head execution paths retain their current behavior.
+
+- Pagination: `page`, `per_page`.
+- Native content/run reads: `ref`, `branch`, `head_sha`, `event`, `actor`, `status`,
+  `check_suite_id`.
+- Repository REST filters: `state`, `labels`, `milestone`, `assignee`, `creator`,
+  `mentioned`, `since`, `sort`, `direction`, `base`, `head`, `path`, `sha`.
+
+At most 16 pairs are permitted; each decoded value is at most 4096 UTF-8 bytes
+and must contain no control characters. Unknown keys, including `q`, `query`,
+`url`, `method`, and header-like keys, are refused before upstream work with a
+typed refusal naming the key and listing the allowed keys. Dedicated search
+requests still accept an unqualified search term; repository/organization/user
+qualifiers, boolean operators and parentheses remain forbidden there. A GET
+request cannot substitute a GraphQL endpoint.
+
+Revocation invalidates the registry grant and closes the endpoint and its
+connections. Production relay operations own cancellation-safe, bounded route
+cleanup rather than relying on a canceled client's future to release a lease.
+Endpoint ownership records and generation locks live outside worker-writable
+scratch; startup reclaims endpoints of dead generations without PID-based
+ownership guesses or deleting a live replacement.
+
+On Linux, pathname AF_UNIX connection itself is not restricted by the deployed
+Landlock ABI, so capability-file isolation is essential. A separately jailed
+command can also consume another command's **pre-authentication** socket slots
+without learning its capability. Per-endpoint/global caps and short frame
+read deadlines bound the resources, but repeated connections can still starve
+reads. This is a known availability limit, not cross-command read authority.
