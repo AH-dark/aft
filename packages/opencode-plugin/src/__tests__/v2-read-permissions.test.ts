@@ -79,7 +79,10 @@ function readers(
   const bridge = {
     toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
       dispatched.push(args);
-      return response?.(args) ?? { success: true, text: "export function allowed() {}" };
+      return {
+        content_files: [],
+        ...(response?.(args) ?? { success: true, text: "export function allowed() {}" }),
+      };
     },
   };
   const plugin = {

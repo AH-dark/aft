@@ -223,6 +223,14 @@ impl RevisionSession {
         }
     }
 
+    /// Map a materialized revision file back to its checkout path for host read checks.
+    pub(crate) fn logical_path(&self, staged: &Path) -> Option<PathBuf> {
+        self.materialized
+            .borrow()
+            .iter()
+            .find_map(|(relative, path)| (path == staged).then(|| self.toplevel.join(relative)))
+    }
+
     /// Copy `requested` (the path argument, already checked against the read
     /// rules by the caller) out of the commit, returning the copy's path.
     /// `display` is how the reply names the path.

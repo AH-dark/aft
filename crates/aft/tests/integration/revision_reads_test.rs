@@ -240,6 +240,13 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
         "{text}"
     );
     assert!(text.contains("pub fn feature_flag() -> bool"), "{text}");
+    let source = fixture.repo.canonicalize().unwrap().join("src/lib.rs");
+    assert_eq!(zoom["content_files"], json!([source]));
+    assert_eq!(
+        zoom["targets"][0]["response"]["content_files"],
+        json!([source])
+    );
+    assert!(!text.contains("content_files"), "{text}");
 
     // Every target of a batch is read at the one revision.
     let batch = call(
@@ -257,6 +264,10 @@ fn revision_outline_and_zoom_parse_the_blob_with_the_usual_parsers() {
     assert!(text.starts_with(&header("release", &fixture.v1)), "{text}");
     assert!(text.contains("\"tagged\""), "{text}");
     assert!(!text.contains("    99"), "{text}");
+    assert_eq!(batch["content_files"], json!([source]));
+    for entry in batch["targets"].as_array().unwrap() {
+        assert_eq!(entry["response"]["content_files"], json!([source]));
+    }
 }
 
 #[cfg(unix)]

@@ -129,7 +129,7 @@ function createHarness(
         ...(options?.preview ? { options: { preview: true } } : {}),
       });
       const response = await sendImpl(name, rawArgs, options);
-      return { text: "ok", ...response };
+      return { text: "ok", content_files: [], ...response };
     },
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;

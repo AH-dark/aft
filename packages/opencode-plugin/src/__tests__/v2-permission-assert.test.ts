@@ -64,7 +64,7 @@ function pluginContext(
       name: string,
       _args: Record<string, unknown>,
       options?: { preview?: boolean },
-    ) => bridgeResponse(name, options?.preview === true),
+    ) => ({ content_files: [], ...bridgeResponse(name, options?.preview === true) }),
   };
   return {
     pool: { getBridge: () => bridge } as unknown as BridgePool,

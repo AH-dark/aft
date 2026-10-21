@@ -32,6 +32,9 @@ import {
 const z = tool.schema;
 const READ_PERMISSION_CONCURRENCY = 8;
 const MAX_OUTLINE_READ_ROUNDS = 8;
+const MAX_ZOOM_READ_ROUNDS = 8;
+const SOURCE_MANIFEST_REQUIRED =
+  "requires server content_files for read authorization. The AFT binary or daemon is older than this plugin or returned an invalid source-file manifest. Update AFT to match the plugin and restart the daemon, then retry.";
 
 /** GitHub discussion targets are fetched by the server, not read from disk. */
 function isGithubPathArg(value: unknown): boolean {
@@ -264,8 +267,11 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           // Directory results are held until every contributing file is authorized.
           // Exclusions can reveal more rows under the output budget, so check each render.
           const contentFiles = response.content_files;
-          if (!Array.isArray(contentFiles)) {
-            throw new Error("Outline requires server content_files for read authorization");
+          if (
+            !Array.isArray(contentFiles) ||
+            !contentFiles.every((file) => typeof file === "string" && file.length > 0)
+          ) {
+            throw new Error(`Outline ${SOURCE_MANIFEST_REQUIRED}`);
           }
           const distinctFiles = new Set(contentFiles as string[]);
           const unchecked = [...distinctFiles].filter((file) => !checkedReads.has(file));
@@ -326,6 +332,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         );
         const resolvedByInput = new Map(localPaths.map((input, index) => [input, resolved[index]]));
         const deniedPaths = new Map<string, string>();
+        const checkedReads = new Map<string, string | undefined>();
         const distinctFiles = [...new Set(resolved)];
         if ((context as ToolRuntime).hostVersion === 2) {
           const outcomes = await checkReadPaths(context, distinctFiles, (file, batchContext) =>
@@ -334,6 +341,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               batchContext,
               file,
               ref !== undefined ? "revision" : "file",
+              checkedReads,
             ),
           );
           for (const [file, denial] of outcomes) if (denial) deniedPaths.set(file, denial);
@@ -344,6 +352,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               context,
               file,
               ref !== undefined ? "revision" : "file",
+              checkedReads,
             );
             if (denial) {
               if (denial !== permissionRuleDenial("read"))
@@ -384,10 +393,50 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           if (args.batch.length === 1 && denial) return permissionDeniedResponse(denial, context);
           return withMeta(deniedText);
         }
-        const response = await callToolCall(ctx, context, "zoom", rawArgs);
-        if (response.success === false)
-          throw new Error(response.text || response.message || "zoom failed");
-        return withMeta([response.text, deniedText].filter(Boolean).join("\n\n"));
+        const excluded = new Set<string>();
+        for (let round = 0; round < MAX_ZOOM_READ_ROUNDS; round++) {
+          const response = await callToolCall(ctx, context, "zoom", {
+            ...rawArgs,
+            ...(excluded.size ? { _exclude_read_paths: [...excluded] } : {}),
+          });
+          if (response.success === false)
+            throw new Error(response.text || response.message || "zoom failed");
+          // Re-exports can supply bodies or menu signatures from another file.
+          // Hold all text until the server's complete source manifest is checked.
+          if (
+            !Array.isArray(response.content_files) ||
+            !response.content_files.every((file) => typeof file === "string" && file.length > 0)
+          )
+            throw new Error(`Zoom ${SOURCE_MANIFEST_REQUIRED}`);
+          const files = new Set(response.content_files as string[]);
+          const outcomes = await checkReadPaths(
+            context,
+            [...files].filter((file) => !checkedReads.has(file)),
+            (file, batchContext) =>
+              assertPathReadPermissions(
+                ctx,
+                batchContext,
+                file,
+                ref !== undefined ? "revision" : "file",
+                checkedReads,
+              ),
+          );
+          let denied = false;
+          for (const [file, denial] of outcomes) checkedReads.set(file, denial);
+          for (const file of files) {
+            const denial = checkedReads.get(file);
+            if (!denial) continue;
+            if (denial !== permissionRuleDenial("read")) return permissionDeniedResponse(denial);
+            if (excluded.has(file))
+              throw new Error("Zoom server did not exclude a read-denied file");
+            excluded.add(file);
+            denied = true;
+          }
+          if (!denied) return withMeta([response.text, deniedText].filter(Boolean).join("\n\n"));
+        }
+        throw new Error(
+          `Zoom read authorization limit reached after ${MAX_ZOOM_READ_ROUNDS} renders; narrow the batch.`,
+        );
       },
     },
   });

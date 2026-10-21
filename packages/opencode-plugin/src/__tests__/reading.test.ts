@@ -95,7 +95,7 @@ function createMockReadingHarness(
       rawArgs: Record<string, unknown> = {},
     ) => {
       toolCallCalls.push({ sessionId, name, rawArgs });
-      return await sendImpl(name, rawArgs);
+      return { content_files: [], ...(await sendImpl(name, rawArgs)) };
     },
   };
   const pool = {

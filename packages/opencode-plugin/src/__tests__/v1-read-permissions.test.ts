@@ -16,7 +16,10 @@ function readers(response?: (args: Record<string, unknown>) => Record<string, un
       getBridge: () => ({
         toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
           dispatched.push(args);
-          return response?.(args) ?? { success: true, text: "export function allowed() {}" };
+          return {
+            content_files: [],
+            ...(response?.(args) ?? { success: true, text: "export function allowed() {}" }),
+          };
         },
       }),
     } as unknown as BridgePool,
@@ -167,3 +170,33 @@ for (const files of [false, true]) {
     }
   });
 }
+
+for (const name of ["aft_outline", "aft_zoom"] as const) {
+  test(`OC1 ${name} refuses missing or malformed content manifests with an AFT upgrade instruction`, async () => {
+    for (const content_files of [undefined, [42], [""]]) {
+      const { execute } = readers(() => ({ success: true, text: "HELD_SOURCE", content_files }));
+      await expect(
+        execute(
+          name,
+          name === "aft_outline"
+            ? { target: "." }
+            : { batch: [{ target: "allowed.ts", symbols: "allowed" }] },
+        ),
+      ).rejects.toThrow(
+        /requires server content_files.*AFT binary or daemon.*older than this plugin.*Update AFT.*restart the daemon/,
+      );
+    }
+  });
+}
+
+test("OC1 zoom refuses a server that repeats read-denied source", async () => {
+  const { execute, dispatched } = readers(() => ({
+    success: true,
+    text: "HELD_SOURCE",
+    content_files: [resolve("secret.ts")],
+  }));
+  await expect(
+    execute("aft_zoom", { batch: [{ target: "allowed.ts", symbols: "allowed" }] }),
+  ).rejects.toThrow("Zoom server did not exclude a read-denied file");
+  expect(dispatched).toHaveLength(2);
+});

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -565,7 +565,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some(reference) = crate::revision_read::requested_ref(req) else {
-        return zoom_at(req, ctx, None);
+        return finalize_zoom_read_paths(req, ctx, zoom_at(req, ctx, None), None);
     };
     let has_url = ["file", "url"]
         .into_iter()
@@ -611,9 +611,95 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(session) => session,
         Err(refusal) => return refusal,
     };
-    let mut response = zoom_at(req, ctx, Some(&session));
+    let mut response =
+        finalize_zoom_read_paths(req, ctx, zoom_at(req, ctx, Some(&session)), Some(&session));
     session.annotate(&mut response);
     response
+}
+
+/// Keep file identities in structured data so hosts can hold text until every
+/// source is authorized. When a source is denied, replace the entire affected
+/// lookup with a permission error, including ambiguity signatures and member
+/// menus rather than only its body.
+fn finalize_zoom_read_paths(
+    req: &RawRequest,
+    ctx: &AppContext,
+    mut response: Response,
+    revision: Option<&RevisionSession>,
+) -> Response {
+    let excluded: HashSet<PathBuf> = req
+        .params
+        .get("_exclude_read_paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .collect();
+    match finalize_zoom_read_data(req, ctx, &mut response.data, revision, &excluded) {
+        Ok(_) => response,
+        Err(refusal) => refusal,
+    }
+}
+
+fn finalize_zoom_read_data(
+    req: &RawRequest,
+    ctx: &AppContext,
+    data: &mut serde_json::Value,
+    revision: Option<&RevisionSession>,
+    excluded: &HashSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, Response> {
+    let mut files = BTreeSet::new();
+    let mut refused = false;
+    for key in ["targets", "symbols"] {
+        if let Some(entries) = data.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+            for entry in entries {
+                if let Some(inner) = entry.get_mut("response") {
+                    match finalize_zoom_read_data(req, ctx, inner, revision, excluded) {
+                        Ok(inner_files) => files.extend(inner_files),
+                        Err(refusal) => {
+                            *inner = serialize_zoom_target_response(req, refusal);
+                            refused = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if refused && data.get("complete").is_some() {
+        data["complete"] = false.into();
+    }
+    if let Some(paths) = data
+        .get("content_files")
+        .and_then(serde_json::Value::as_array)
+    {
+        for path in paths.iter().filter_map(serde_json::Value::as_str) {
+            let path = PathBuf::from(path);
+            files.insert(match revision {
+                Some(revision) => revision.logical_path(&path).ok_or_else(|| {
+                    Response::error(
+                        &req.id,
+                        "internal_error",
+                        "zoom: cannot identify a revision source file",
+                    )
+                })?,
+                None => path,
+            });
+        }
+    }
+    if let Some(denied) = files.iter().find(|file| excluded.contains(*file)) {
+        return Err(Response::error(&req.id, "permission_denied", format!(
+            "permission_denied: read for {} is denied by this session's permission rules (not a user choice)",
+            denied.display(),
+        )));
+    }
+    // Followed files must also satisfy the server's read floor; a host's
+    // external-directory approval cannot override project confinement.
+    for file in &files {
+        ctx.validate_read_path(&req.id, req.session(), file)?;
+    }
+    data["content_files"] = serde_json::json!(files);
+    Ok(files)
 }
 
 /// A GitHub discussion is not a repository file and has no git revision.
@@ -823,6 +909,7 @@ fn zoom_at(req: &RawRequest, ctx: &AppContext, revision: Option<&RevisionSession
                         "end_col": end_col + 1,
                     },
                     "content": content,
+                    "content_files": if is_http_url(file) { vec![] } else { vec![path.clone()] },
                     "context_before": context_before,
                     "context_after": context_after,
                     "annotations": {
@@ -1299,6 +1386,7 @@ fn zoom_one_symbol(
     include_callgraph: bool,
     enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
 ) -> Response {
+    let mut content_files = BTreeSet::from([path.to_path_buf()]);
     let mut response = if is_http_url(_file) && detect_language(path) == Some(LangId::Json) {
         super::url_output::json_preview(req, source, Some(symbol_name))
     } else {
@@ -1313,6 +1401,7 @@ fn zoom_one_symbol(
             context_lines,
             include_callgraph,
             enrichments,
+            &mut content_files,
         )
     };
     if is_http_url(_file) {
@@ -1337,7 +1426,9 @@ fn zoom_one_symbol(
             }
         }
         super::url_output::disclose_download(path, &mut response);
+        content_files.clear();
     }
+    response.data["content_files"] = serde_json::json!(content_files);
     response
 }
 
@@ -1353,6 +1444,7 @@ fn zoom_one_symbol_inner(
     context_lines: usize,
     include_callgraph: bool,
     enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
+    content_files: &mut BTreeSet<PathBuf>,
 ) -> Response {
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
     // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
@@ -1387,6 +1479,11 @@ fn zoom_one_symbol_inner(
         matches
     };
 
+    content_files.extend(
+        matches
+            .iter()
+            .map(|candidate| PathBuf::from(&candidate.file)),
+    );
     if matches.len() > 1 {
         let suggestions = ambiguous_symbol_selectors(&matches);
         let content = render_ambiguous_symbol_menu(symbol_name, &matches, &suggestions);
@@ -2892,6 +2989,71 @@ mod tests {
 
     fn make_ctx() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn zoom_read_manifest_tracks_reexports_and_masks_only_affected_results() {
+        let root = tempfile::tempdir().unwrap();
+        let barrel = root.path().join("barrel.ts");
+        let secret = root.path().join("secret.ts");
+        let allowed = root.path().join("allowed.ts");
+        std::fs::write(
+            &barrel,
+            "export { hidden } from './secret';\nexport function local() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &secret,
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &allowed,
+            "export function visible() { return 'PUBLIC_BODY'; }\n",
+        )
+        .unwrap();
+        let mut req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "read-manifest", "command": "zoom", "callgraph": true,
+            "targets": [
+                { "file": barrel, "symbols": ["hidden"] },
+                { "file": allowed, "symbols": ["visible"] },
+            ],
+        }))
+        .unwrap();
+        let ctx = make_ctx();
+        let response = handle_zoom(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        let manifest = &response.data["targets"][0]["response"]["content_files"];
+        let expected: BTreeSet<_> = [barrel.clone(), secret.clone()].into_iter().collect();
+        assert_eq!(*manifest, serde_json::json!(expected));
+        assert!(response.data["targets"][0]["response"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("PRIVATE_BODY"));
+
+        req.params["_exclude_read_paths"] = serde_json::json!([secret]);
+        let filtered = handle_zoom(&req, &ctx);
+        let denied = &filtered.data["targets"][0]["response"];
+        assert_eq!(denied["code"], "permission_denied");
+        assert!(denied["message"].as_str().unwrap().contains("secret.ts"));
+        assert!(denied.get("content").is_none());
+        assert!(!filtered.data.to_string().contains("PRIVATE_BODY"));
+        assert!(filtered.data["targets"][1]["response"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("PUBLIC_BODY"));
+        assert_eq!(filtered.data["content_files"], serde_json::json!([allowed]));
+
+        let mut direct =
+            make_zoom_request("same-file", barrel.to_str().unwrap(), "hidden local", None);
+        direct.params["_exclude_read_paths"] = serde_json::json!([secret]);
+        let same_file = handle_zoom(&direct, &ctx);
+        assert_eq!(same_file.data["complete"], false);
+        assert_eq!(
+            same_file.data["symbols"][0]["response"]["code"],
+            "permission_denied"
+        );
+        assert_eq!(same_file.data["symbols"][1]["response"]["success"], true);
     }
 
     #[test]
