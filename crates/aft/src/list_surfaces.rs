@@ -412,6 +412,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "management health detail, not an agent result list; omitted retention reports are counted exactly and aggregate retention counters remain present",
     },
     ExclusionEntry {
+        file: "status_push.rs",
+        enclosing_item: "project",
+        location_or_primitive: "REFUSAL_DETAILS .take()",
+        reason: "root-owned status notification detail, not an agent result list; exact refusal totals, omitted and unattributed counts remain present with an explicit status read pointer",
+    },
+    ExclusionEntry {
         file: "bash_background/registry.rs",
         enclosing_item: "cleanup_finished_at_with, gc_harness_stores",
         location_or_primitive: "GC_ENTRY_BUDGET maintenance queue and namespace iterator",

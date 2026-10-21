@@ -384,6 +384,48 @@ pub fn refusals_under(root: &Path) -> Vec<UnsupportedPersistedFormat> {
     found
 }
 
+/// Select refusals for the project's cached artifact key and shared storage.
+/// The second result counts unknown owners without assigning their paths to
+/// this project. No artifact reads or database queries are needed.
+pub(crate) fn refusals_for_push(
+    storage: &Path,
+    artifact_key: Option<&str>,
+) -> (Vec<UnsupportedPersistedFormat>, usize) {
+    let mut owned = Vec::new();
+    let mut unattributed = 0;
+    for refusal in refusals_under(storage) {
+        if refusal.source != RefusalSource::Artifact
+            || (refusal.store == PersistedStore::AftDb && refusal.path == storage.join("aft.db"))
+        {
+            owned.push(refusal);
+            continue;
+        }
+        let plane = match refusal.store {
+            PersistedStore::SearchIndex => Some("index"),
+            PersistedStore::SemanticIndex | PersistedStore::SemanticSegment => Some("semantic"),
+            PersistedStore::CallgraphStore => Some("callgraph"),
+            PersistedStore::SymbolCache | PersistedStore::SymbolExtraction => Some("symbols"),
+            PersistedStore::ArtifactOwner => Some("artifact-owners"),
+            _ => None,
+        };
+        if let Some(plane) = plane {
+            if let Some(key) = artifact_key {
+                if refusal.path.starts_with(storage.join(plane).join(key)) {
+                    owned.push(refusal);
+                }
+            } else {
+                unattributed += 1;
+            }
+        } else {
+            unattributed += 1;
+        }
+    }
+    owned.sort_by(|a, b| {
+        (a.store.name(), &a.path, a.found).cmp(&(b.store.name(), &b.path, b.found))
+    });
+    (owned, unattributed)
+}
+
 /// Gate one artifact read: a floor refusal for the store wins; otherwise a
 /// newer `found` version is recorded and returned. Anything else (a readable
 /// version, or no recognisable artifact at all) clears a stale refusal left

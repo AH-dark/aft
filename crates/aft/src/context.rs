@@ -1110,7 +1110,7 @@ pub struct StatusEmitter {
 }
 
 enum PendingStatusSnapshot {
-    Ready(StatusPayload),
+    Ready(StatusPayload, Weak<AppContext>),
     Context(Weak<AppContext>),
 }
 
@@ -2344,8 +2344,13 @@ impl StatusEmitter {
     }
 
     pub fn signal(&self, snapshot: StatusPayload) {
+        let context = self
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(PendingStatusSnapshot::Ready(snapshot));
+            *latest = Some(PendingStatusSnapshot::Ready(snapshot, context));
         }
         let _ = self.notify.send(());
     }
@@ -2384,12 +2389,15 @@ fn status_debounce_loop(
             // emitter lock. Upgrade at emission so queued signals cannot keep a
             // retired actor (and its watchers/servers) alive.
             let snapshot = match snapshot {
-                PendingStatusSnapshot::Ready(snapshot) => snapshot,
+                PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
+                    Some(context) => crate::status_push::project(&context, snapshot),
+                    None => snapshot,
+                },
                 PendingStatusSnapshot::Context(context) => {
                     let Some(context) = context.upgrade() else {
                         continue;
                     };
-                    let Some(snapshot) = context.try_build_status_snapshot() else {
+                    let Some(snapshot) = context.try_build_status_push_snapshot() else {
                         // Keep the previous bar; the next producer signal retries.
                         continue;
                     };
@@ -4598,7 +4606,7 @@ impl AppContext {
         } else {
             // Stack-owned contexts are supported by the library API. Transport
             // roots register their owning Arc before serving any requests.
-            if let Some(snapshot) = self.try_build_status_snapshot() {
+            if let Some(snapshot) = self.try_build_status_push_snapshot() {
                 self.status_emitter().signal(snapshot);
             }
         }

@@ -22327,3 +22327,7 @@ mod a02_tests {
         assert_eq!(work_counts::get().artifact_bytes, 0);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "push_projection_fixture.rs"]
+pub(crate) mod push_projection_fixture;
