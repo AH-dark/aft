@@ -4801,6 +4801,12 @@ pub(crate) fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, St
         .map_err(|error| format!("failed to allocate task temp directory: {error}"))
 }
 
+/// Host-owned namespace for command-private scratch and broker endpoints.
+#[cfg(unix)]
+pub fn managed_task_temp_root() -> &'static Path {
+    task_temp::root()
+}
+
 #[cfg(target_os = "macos")]
 fn install_worker_mktemp(temp_dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
