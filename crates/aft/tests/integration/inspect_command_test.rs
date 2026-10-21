@@ -674,6 +674,98 @@ fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
 }
 
 #[test]
+fn inspect_partial_parse_keeps_dead_findings_and_names_the_parse_reason() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", r#"{"main":"src/index.ts"}"#);
+    write_file(&root, "src/index.ts", "console.log('entry');\n");
+    write_file(&root, "src/dead.ts", "export function trulyDead() {}\n");
+    write_file(&root, "src/broken.ts", "export function broken( {\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    let response = inspect(
+        &ctx,
+        json!({"id": "partial-parse", "command": "inspect", "sections": ["dead_code", "unused_exports"]}),
+    );
+
+    assert_eq!(response["success"], true, "{response:#}");
+    for category in ["dead_code", "unused_exports"] {
+        let summary = &response["summary"][category];
+        assert_eq!(summary["complete"], false, "{response:#}");
+        assert_eq!(summary["count"], 1, "{response:#}");
+        assert!(
+            response["details"][category]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["file"] == "src/dead.ts" && item["symbol"] == "trulyDead" }),
+            "{response:#}"
+        );
+        let error = summary["parse_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|error| error["file"] == "src/broken.ts")
+            .expect("broken file named");
+        let reason = error["message"].as_str().expect("parse reason");
+        assert!(!reason.is_empty());
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            text.contains(&format!("src/broken.ts ({reason})")),
+            "parse reason missing: {text}"
+        );
+    }
+    let counts = ctx.status_bar_count_values();
+    assert_eq!(counts.dead_code, Some(1));
+    assert_eq!(counts.unused_exports, Some(1));
+    assert!(
+        counts.tier2_stale,
+        "partial counts must use the existing ~ marker"
+    );
+}
+
+#[test]
+fn inspect_partial_parse_reports_symbols_used_only_from_broken_files_with_caveat() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", r#"{"main":"src/index.ts"}"#);
+    write_file(&root, "src/index.ts", "console.log('entry');\n");
+    write_file(
+        &root,
+        "src/nearby.ts",
+        "export function onlyBrokenUser() {}\n",
+    );
+    write_file(&root, "src/broken.ts", "import { onlyBrokenUser } from './nearby';\nonlyBrokenUser();\nexport function broken( {\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    let response = inspect(
+        &ctx,
+        json!({"id": "partial-parse-reference", "command": "inspect", "sections": ["dead_code", "unused_exports"]}),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    for category in ["dead_code", "unused_exports"] {
+        assert_eq!(
+            response["summary"][category]["complete"], false,
+            "{response:#}"
+        );
+        assert!(
+            response["details"][category]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["file"] == "src/nearby.ts" && item["symbol"] == "onlyBrokenUser"
+                }),
+            "{response:#}"
+        );
+    }
+    assert!(
+        response["text"].as_str().unwrap().contains(
+            "A symbol used only from files that could not be parsed may appear in this list."
+        ),
+        "caveat missing: {response:#}"
+    );
+}
+
+#[test]
 fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
     let (_temp_dir, root) = fixture_project();
     write_file(

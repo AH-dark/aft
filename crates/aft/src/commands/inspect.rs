@@ -1526,7 +1526,8 @@ fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCatego
     .any(|category| match outcomes.get(category) {
         Some(JobOutcome::Fresh { payload }) => {
             category_is_incomplete(payload)
-                && available_count_from_payload(*category, payload).is_none()
+                && (available_count_from_payload(*category, payload).is_none()
+                    || partial_parse_findings_available(*category, payload))
         }
         Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. } | JobOutcome::Failed { .. }) => {
             true
@@ -2354,7 +2355,22 @@ fn incomplete_analysis_reason(value: &Value) -> String {
         let names = files
             .iter()
             .take(MAX_PARSE_FAILURE_FILES)
-            .filter_map(|file| file.get("file").and_then(Value::as_str))
+            .filter_map(|file| {
+                let path = file.get("file").and_then(Value::as_str)?;
+                Some(
+                    match file
+                        .get("message")
+                        .or_else(|| file.get("reason"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(reason) => format!(
+                            "{path} ({})",
+                            reason.split_whitespace().collect::<Vec<_>>().join(" ")
+                        ),
+                        None => path.to_string(),
+                    },
+                )
+            })
             .collect::<Vec<_>>();
         let mut reason = format!("{} {label} could not be parsed", files.len());
         if !names.is_empty() {
@@ -4084,6 +4100,18 @@ fn render_symbol_category(
     }
     render_generated_symbol_usage(lines, summary, details, key);
     render_test_only_usage(lines, summary, details, key);
+    if section["parse_errors"].as_array().is_some_and(|errors| {
+        errors.iter().any(|error| {
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("parse:"))
+        })
+    }) {
+        lines.push(
+            "A symbol used only from files that could not be parsed may appear in this list."
+                .to_string(),
+        );
+    }
 }
 
 /// The headline clause for findings a category withheld because they live in
@@ -5096,7 +5124,34 @@ fn generated_details_for(payload: &Value, top_k: usize, offset: usize) -> Value 
     }
 }
 
-fn available_count_from_payload(_category: InspectCategory, payload: &Value) -> Option<usize> {
+/// Parse failures leave real findings in the successfully parsed files. Read
+/// failures and unavailable producers still cannot supply a current count.
+fn partial_parse_findings_available(category: InspectCategory, payload: &Value) -> bool {
+    matches!(
+        category,
+        InspectCategory::DeadCode | InspectCategory::UnusedExports
+    ) && payload["unavailable"] != true
+        && payload["callgraph_available"] != false
+        && payload["parse_errors"].as_array().is_some_and(|errors| {
+            !errors.is_empty()
+                && errors.iter().all(|error| {
+                    error["message"]
+                        .as_str()
+                        .is_some_and(|message| message.starts_with("parse:"))
+                })
+        })
+        && payload["skipped_files"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && payload["skipped_files_count"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        && payload["gaps"]
+            .as_array()
+            .is_none_or(|gaps| gaps.iter().all(|gap| gap["kind"] == "language_unsupported"))
+}
+
+fn available_count_from_payload(category: InspectCategory, payload: &Value) -> Option<usize> {
     let incomplete_files = ["parse_errors", "skipped_files"].iter().any(|key| {
         payload[*key]
             .as_array()
@@ -5105,6 +5160,7 @@ fn available_count_from_payload(_category: InspectCategory, payload: &Value) -> 
         .as_u64()
         .is_some_and(|count| count > 0);
     if category_is_incomplete(payload)
+        && !partial_parse_findings_available(category, payload)
         && (incomplete_files
             || payload["gaps"]
                 .as_array()
@@ -5282,6 +5338,10 @@ mod incomplete_reason_tests {
             "{reason}"
         );
         assert!(reason.contains("Alfonso/File4.swift"), "{reason}");
+        assert!(
+            reason.contains("Alfonso/File4.swift (tree-sitter parse contains syntax errors)"),
+            "{reason}"
+        );
         assert!(reason.ends_with("+5 more"), "{reason}");
         assert!(!reason.contains("File5.swift"), "{reason}");
     }
@@ -5325,6 +5385,43 @@ mod status_bar_refresh_tests {
 
     fn ctx() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+    }
+
+    #[test]
+    fn partial_parse_counts_do_not_enable_other_incomplete_counts() {
+        let parse = serde_json::json!({"count": 2, "complete": false,
+            "parse_errors": [{"file": "broken.ts", "message": "parse: unexpected EOF"}]});
+        for category in [InspectCategory::DeadCode, InspectCategory::UnusedExports] {
+            assert_eq!(available_count_from_payload(category, &parse), Some(2));
+            for (field, value) in [
+                ("unavailable", serde_json::json!(true)),
+                ("callgraph_available", serde_json::json!(false)),
+                (
+                    "parse_errors",
+                    serde_json::json!([{ "file": "broken.ts", "message": "read: permission denied" }]),
+                ),
+                (
+                    "skipped_files",
+                    serde_json::json!([{ "file": "outside.ts", "reason": "outside_project_root" }]),
+                ),
+                (
+                    "gaps",
+                    serde_json::json!([{ "kind": "analysis_incomplete", "reason": "timeout" }]),
+                ),
+            ] {
+                let mut payload = parse.clone();
+                payload[field] = value;
+                assert_eq!(
+                    available_count_from_payload(category, &payload),
+                    None,
+                    "{field}: {payload}"
+                );
+            }
+        }
+        assert_eq!(
+            available_count_from_payload(InspectCategory::Cycles, &parse),
+            None
+        );
     }
 
     #[test]
@@ -6579,7 +6676,7 @@ mod fresh_payload_tests {
         let response = header_response(&payloads, &Sections::summary_only());
         assert_header(
             &response,
-            "PARTIAL — unused exports incomplete: 1 file could not be parsed: a.ts; retry aft_inspect.",
+            "PARTIAL — unused exports incomplete: 1 file could not be parsed: a.ts (parse failed); retry aft_inspect.",
             false,
         );
         assert!(response.data["text"]

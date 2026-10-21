@@ -193,7 +193,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v38: compact Go initializer groups participate in the incremental graph hashes.
 /// v40: duplicate fragments use compact exact tuples; legacy rows are rescanned
 /// before roll-up, with fact-version checks served from row metadata.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 40;
+/// v41: parse-incomplete dead-code and unused-export roll-ups expose findings
+/// from parsed files instead of retaining a legacy unknown aggregate.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 41;
 
 fn expected_facts_version(category: InspectCategory) -> i64 {
     match category {
@@ -3439,7 +3441,48 @@ pub(crate) mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 40);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 41);
+    }
+
+    #[test]
+    fn partial_parse_cache_version_rejects_legacy_unknown_aggregates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let cache = InspectCache::open(temp.path().join("inspect"), root).unwrap();
+        let config = Config::default();
+        for category in [InspectCategory::DeadCode, InspectCategory::UnusedExports] {
+            let legacy_hash = contribution_set_hash_with_version(
+                &cache.conn.lock().unwrap(),
+                category,
+                &cache.project_key,
+                &cache.project_root,
+                Some(&config),
+                40,
+            )
+            .unwrap();
+            cache
+                .store_tier2_aggregate(
+                    JobKey::for_project_category(category),
+                    &legacy_hash,
+                    serde_json::json!({"unavailable": true, "complete": false}),
+                )
+                .unwrap();
+            assert!(cache
+                .load_aggregate_if_hash_matches(category, &legacy_hash)
+                .unwrap()
+                .is_some());
+            let current_hash = cache
+                .contribution_set_hash_for_config(category, &config)
+                .unwrap();
+            assert!(
+                cache
+                    .load_aggregate_if_hash_matches(category, &current_hash)
+                    .unwrap()
+                    .is_none(),
+                "legacy unknown aggregate must be recomputed for {category:?}"
+            );
+        }
     }
 
     #[test]
