@@ -397,8 +397,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset AFT_TEST_AFT_BINARY NEXTEST_BIN_EXE_aft CARGO_BIN_EXE_aft
           cargo --version
-          listing="$(cargo test -p agent-file-tools --test worker_jail -- worker_gh_read --list)"
+          listing="$(cargo test -p agent-file-tools --test worker_jail -- --list)"
           printf '%s\n' "$listing"
           for test in \
             worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied \
@@ -406,13 +407,16 @@ jobs:
             worker_gh_read_t9_policy_matrix_keeps_repository_and_search_fences \
             worker_gh_read_t10_terminal_revocation_unlinks_endpoint \
             worker_gh_read_t10_retained_descendants_fail_after_end_cancel_timeout_and_restart \
+            worker_gh_read_t10_promotion_keeps_the_original_command_grant \
             worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply \
             worker_gh_read_t11_cross_command_capability_file_and_socket_isolation \
             worker_gh_read_t12_missing_and_stale_endpoint_fail_without_native_gh \
-            worker_gh_read_t12_malformed_peer_reply_and_endpoint_replacement_fail_closed; do
+            worker_gh_read_t12_malformed_peer_reply_and_endpoint_replacement_fail_closed \
+            worker_jail_temp_denies_other_task_directory; do
             [[ "$listing" == *"$test: test"* ]] || { printf 'missing native test: %s\n' "$test" >&2; exit 1; }
           done
           cargo test -p agent-file-tools --test worker_jail -- worker_gh_read --test-threads=1 --nocapture
+          cargo test -p agent-file-tools --test worker_jail -- worker_jail_temp_denies_other_task_directory --exact --test-threads=1 --nocapture
 
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
