@@ -14,6 +14,9 @@ impl BgTaskRegistry {
         &self,
         metadata: &PersistedTask,
     ) -> Option<crate::bash_background::persistence::PersistedCompletionPreview> {
+        if metadata.completion_has_non_ticket_env_secrets.is_none() {
+            return None;
+        }
         self.task(&metadata.task_id)
             .and_then(|task| task.lock_state().ok()?.metadata.completion_preview.clone())
             .or_else(|| metadata.completion_preview.clone())
@@ -38,8 +41,14 @@ impl BgTaskRegistry {
         let Ok(mut state) = task.lock_state() else {
             return preview;
         };
-        if let Some(saved) = &state.metadata.completion_preview {
-            return saved.clone();
+        if state
+            .metadata
+            .completion_has_non_ticket_env_secrets
+            .is_some()
+        {
+            if let Some(saved) = &state.metadata.completion_preview {
+                return saved.clone();
+            }
         }
         state.metadata.completion_preview = Some(preview.clone());
         if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {

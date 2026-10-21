@@ -268,11 +268,18 @@ fn bash_background_completion_replay_withholds_output_and_keeps_pointers() {
     // Older metadata could report no secrets because its check did not include
     // AFT's ticket.
     metadata.completion_has_env_secrets = Some(false);
+    metadata.completion_preview = Some(
+        crate::bash_background::persistence::PersistedCompletionPreview {
+            output_preview: "opaque deployment credential\\n".to_string(),
+            output_truncated: false,
+            bash_output_list_envelope: None,
+        },
+    );
     crate::bash_background::persistence::write_task(&task.paths.json, &metadata).unwrap();
     assert_eq!(metadata.completion_has_env_secrets, Some(false));
     assert_eq!(metadata.completion_has_non_ticket_env_secrets, None);
     assert_eq!(metadata.completion_ticket_digest, None);
-    assert!(metadata.completion_preview.is_none());
+    assert!(metadata.completion_preview.is_some());
     let replayed = BgTaskRegistry::default();
     replayed
         .insert_rehydrated_task(metadata, task.paths.clone(), true)
