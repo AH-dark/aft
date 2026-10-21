@@ -2141,10 +2141,6 @@ fn protect_worker_credential_services(
     Ok(())
 }
 
-/// Filesystem modes do not isolate same-UID commands. Shell profiles deny
-/// shared task scratch except the command's own directory and, on macOS,
-/// metadata for its exact broker socket. The read tool's separate session-scoped
-/// access to retained scratch is unchanged.
 #[cfg(unix)]
 fn protect_worker_private_temp(profile: &mut SandboxProfile) -> Result<(), String> {
     let root = task_temp::root();
