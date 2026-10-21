@@ -56,7 +56,7 @@ class DiagnosticsComparisonTests(unittest.TestCase):
         self.assertIn("E7 W3", result)
 
     def test_same_mode_skip_is_limited_to_own_config(self):
-        with tempfile.TemporaryDirectory(dir=diagnostics.truth.CHECKOUT_ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / ".cortexkit" / "aft.jsonc"
             config.parent.mkdir()
@@ -70,6 +70,19 @@ class DiagnosticsComparisonTests(unittest.TestCase):
                     config.chmod(0o600)
                 self.assertEqual(skipped, [str(config)])
                 self.assertEqual(original.call_count, 2)
+
+    def test_failed_project_capture_counts_as_incomplete(self):
+        languages = {"python": {"comparison": {"status": "measured"}}}
+        timed_out = {"repo": "x", "languages": languages,
+                     "project_diagnostics": {"success": False, "code": "timeout"}}
+        self.assertTrue(diagnostics.capture_incomplete(timed_out))
+        no_summary = {"repo": "x", "languages": languages,
+                      "project_diagnostics": {"success": True, "complete": True}}
+        self.assertTrue(diagnostics.capture_incomplete(no_summary))
+        complete = {"repo": "x", "languages": languages,
+                    "project_diagnostics": {"success": True, "complete": True,
+                                            "summary": {"diagnostics": {"complete": True}}}}
+        self.assertFalse(diagnostics.capture_incomplete(complete))
 
 
 if __name__ == "__main__":

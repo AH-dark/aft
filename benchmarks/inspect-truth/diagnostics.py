@@ -211,13 +211,29 @@ def main() -> int:
             truth.write_json(out / "results.json", result)
         result["same_mode_chmod_skips"] = skipped
     truth.write_json(out / "results.json", result)
-    failed = sum("collection_failure" in record or "footer_failure" in record
-                 or (record.get("project_diagnostics", {}).get("summary", {}).get("diagnostics") or {}).get("complete", True) is False
-                 or any(
-        value["comparison"]["status"] == "unknown" for value in record.get("languages", {}).values())
-        for record in result["repositories"])
+    failed = sum(capture_incomplete(record) for record in result["repositories"])
     print(f"Collected {len(selected)} repositories; {failed} with incomplete diagnostics/footer coverage")
     return 1 if failed else 0
+
+
+def capture_incomplete(record: dict) -> bool:
+    """Whether a repository's capture fails the gate.
+
+    A missing flag counts as incomplete: a timed-out project request can come
+    back as success:false with no summary at all.
+    """
+    if "collection_failure" in record or "footer_failure" in record:
+        return True
+    project = record.get("project_diagnostics")
+    if not isinstance(project, dict) or project.get("success") is not True:
+        return True
+    if project.get("complete") is False:
+        return True
+    summary = (project.get("summary") or {}).get("diagnostics")
+    if not isinstance(summary, dict) or summary.get("complete") is not True:
+        return True
+    return any(value["comparison"]["status"] == "unknown"
+               for value in record.get("languages", {}).values())
 
 
 if __name__ == "__main__":
