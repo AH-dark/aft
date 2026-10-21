@@ -11,7 +11,7 @@ import {
   SubcError,
 } from "@cortexkit/subc-client";
 import { getActiveLogger, setActiveLogger } from "../active-logger.js";
-import { adaptToolError } from "../error-contract.js";
+import { adaptToolError, bashConnectionClosedDisposition } from "../error-contract.js";
 import type { Logger, LogMeta } from "../logger.js";
 import {
   __dispatchProbeCountForTests,
@@ -1265,6 +1265,76 @@ describe("SubcTransport Rd reconnect", () => {
     expect(madeClients).toBe(1); // never reconnected
     expect(client.routeOpens.length).toBe(1); // live route retained
     expect(calls).toBe(2); // exactly two underlying requests — no auto-retry
+  });
+
+  test("a bash request that hits the client's own deadline after it was sent gets the unknown-outcome guidance", async () => {
+    // subc-client rejects a sent request whose reply did not arrive in time
+    // with a bare `request_deadline` error. AFT may already be running the
+    // command, so a bash caller must be told not to rerun it, exactly as when
+    // the connection drops mid-call.
+    const deadline = new SubcError(
+      "request on local_port=52801 channel 294 corr 7214 timed out after 25000ms",
+      "request_deadline",
+    );
+    let failure: Error = deadline;
+    const client = new FakeClient(async () => {
+      throw failure;
+    });
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+
+    let bashRejection: unknown;
+    try {
+      await transport.send("bash", { session_id: "s", command: "cargo test" });
+    } catch (error) {
+      bashRejection = adaptToolError("bash", error);
+    }
+    expect(client.requests).toHaveLength(1);
+    expect(bashRejection).toBe(deadline);
+    expect((bashRejection as SubcError).code).toBe("request_deadline");
+    const message = (bashRejection as Error).message;
+    expect(message).toStartWith("request on local_port=52801 channel 294 corr 7214");
+    expect(message).toContain(bashConnectionClosedDisposition());
+
+    // Another tool's deadline keeps its existing error text.
+    const readDeadline = new SubcError(
+      "request on channel 1 timed out after 30000ms",
+      "request_deadline",
+    );
+    failure = readDeadline;
+    let readRejection: unknown;
+    try {
+      await transport.toolCall("s", "read", {});
+    } catch (error) {
+      readRejection = adaptToolError("read", error);
+    }
+    expect((readRejection as Error).message).toBe("request on channel 1 timed out after 30000ms");
+  });
+
+  test("a bash route.open that hits the client's deadline was never sent and gets no unknown-outcome guidance", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true }));
+    const openDeadline = new SubcError(
+      "request on local_port=50123 channel 0 corr 9 timed out after 30000ms",
+      "request_deadline",
+    );
+    client.routeOpenError = openDeadline;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+    });
+    let rejection: unknown;
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).send("bash", { session_id: "s", command: "ls" });
+    } catch (error) {
+      rejection = adaptToolError("bash", error);
+    }
+    expect(client.requests).toHaveLength(0);
+    expect((rejection as Error).message).not.toContain(bashConnectionClosedDisposition());
   });
 
   test("a route GOODBYE carrying kind=outcome_unknown KEEPS the client until the classifier reads it", async () => {

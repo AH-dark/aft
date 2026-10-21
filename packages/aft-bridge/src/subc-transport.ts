@@ -306,6 +306,30 @@ function connectionClosedAfterDispatch(error: unknown): unknown {
 }
 
 /**
+ * Requests that subc-client's own deadline rejected after the request had been
+ * handed to `client.request`. Unlike the same `request_deadline` code on a
+ * route.open (which proves nothing was sent), the request may have reached AFT
+ * and started running, so its outcome is unknown. Kept outside the error
+ * object so the error's class, code, message and retry handling stay as
+ * subc-client made them.
+ */
+const dispatchedRequestDeadlines = new WeakSet<object>();
+
+function noteDispatchedRequestDeadline(error: unknown): void {
+  if (error instanceof SubcError && error.code === REQUEST_DEADLINE_CODE) {
+    dispatchedRequestDeadlines.add(error);
+  }
+}
+
+/**
+ * True for a request that ran out of subc-client's deadline after it was sent,
+ * so AFT may have started it (see `dispatchedRequestDeadlines`).
+ */
+export function isDispatchedRequestDeadlineError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && dispatchedRequestDeadlines.has(error);
+}
+
+/**
  * A call that never got an answer on a socket that may still be alive: the
  * client's own request deadline (raw `request`/`routeOpen` reject with code
  * `request_deadline`) or a managed verdict of `not_sent` / `outcome_unknown`
@@ -2692,6 +2716,7 @@ export class SubcTransportPool implements AftTransportPool {
             continue;
           }
           handleRequestFailure(error, routeAndEntry.entry);
+          noteDispatchedRequestDeadline(error);
           throw error;
         }
       }
