@@ -236,7 +236,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Budget,
                 kind: ReasonKind::Selecting,
-                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, format_multi_file_tree, budget_rollups_present",
+                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, MultiFileTreeWriter, budget_rollups_present",
             },
             ReasonEntry {
                 reason: Reason::Walk,

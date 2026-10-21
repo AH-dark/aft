@@ -121,27 +121,24 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let (file_outlines, skipped_files) = match outline_many_files(
+        let walk_incomplete = discovery.walk_truncated
+            || discovery.collection_truncated
+            || discovery.skipped_foreign_mounts > 0;
+        let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
             &req.id,
             req.session(),
             project_root.as_deref(),
             &excluded,
+            MAX_OUTPUT_BYTES,
+            files.len(),
+            walk_incomplete,
         ) {
             Ok(result) => result,
             Err(resp) => return resp,
         };
 
-        let walk_incomplete = discovery.walk_truncated
-            || discovery.collection_truncated
-            || discovery.skipped_foreign_mounts > 0;
-        let rendered = format_multi_file_tree(
-            &file_outlines,
-            MAX_OUTPUT_BYTES,
-            files.len(),
-            walk_incomplete,
-        );
         let mut body = serde_json::json!({
             "text": rendered.text,
             "discovered": true,
@@ -167,24 +164,21 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             .filter_map(|file_val| file_val.as_str().map(String::from))
             .collect();
         let total_files_requested = files_arr.len();
-        let (file_outlines, skipped_files) = match outline_many_files(
+        let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
             &req.id,
             req.session(),
             project_root.as_deref(),
             &excluded,
+            MAX_OUTPUT_BYTES,
+            total_files_requested,
+            false,
         ) {
             Ok(result) => result,
             Err(resp) => return resp,
         };
 
-        let rendered = format_multi_file_tree(
-            &file_outlines,
-            MAX_OUTPUT_BYTES,
-            total_files_requested,
-            false,
-        );
         // Honest reporting: complete only when no requested file was skipped.
         // skipped_files names the gaps (missing/unreadable/unparseable inputs).
         return Response::success(
@@ -2477,6 +2471,13 @@ fn directory_rollup_summary(stats: &OutlineDirectoryStats) -> String {
     }
 }
 
+/// Outline `files` and render their structure map within `max_bytes`.
+///
+/// Files are outlined in the order the map shows them (by display path), and
+/// outlining stops as soon as the rendered output budget is spent: a file
+/// that could not be shown is never read or parsed. Those files still count
+/// in `total_requested`, so the footer reports them as not shown.
+#[allow(clippy::too_many_arguments)]
 fn outline_many_files(
     files: &[String],
     ctx: &AppContext,
@@ -2484,7 +2485,10 @@ fn outline_many_files(
     session_id: &str,
     project_root: Option<&Path>,
     excluded: &HashSet<PathBuf>,
-) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
+    max_bytes: usize,
+    total_requested: usize,
+    walk_incomplete: bool,
+) -> Result<(RenderedOutline, Vec<SkippedFile>), Response> {
     let paths = files
         .iter()
         .map(|file| ctx.validate_read_path(req_id, session_id, Path::new(file)))
@@ -2494,8 +2498,22 @@ fn outline_many_files(
         .map(Path::to_path_buf)
         .or_else(|| common_outline_path_ancestor(&paths));
 
-    let mut file_outlines: Vec<FileOutline> = Vec::with_capacity(files.len());
-    let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    // Visit files in rendering order (stable, so equal display paths keep
+    // their request order) so that the budget check below can stop early.
+    let mut ordered = files
+        .iter()
+        .zip(paths)
+        .enumerate()
+        .map(|(index, (file, path))| {
+            let rel_path = display_path(&path, file, display_root.as_deref());
+            (index, file, path, rel_path)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.3.cmp(&b.3));
+
+    let mut writer = MultiFileTreeWriter::new(max_bytes, total_requested, walk_incomplete);
+    // Skipped files are reported in request order, keyed by request index.
+    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
     // One parser for the whole batch, sharing the provider's symbol cache:
     // the syntax check below leaves its tree in this parser's tree cache, and
     // symbol extraction for the same file then reuses that tree instead of
@@ -2509,21 +2527,20 @@ fn outline_many_files(
         });
     let mut fallback_parser = FileParser::new();
 
-    for (file, path) in files.iter().zip(paths) {
+    for (index, file, path, rel_path) in ordered {
         if is_read_excluded(excluded, &path) {
             continue;
         }
         if crate::bounded_io::metadata(&path).is_err() {
-            skipped_files.push(SkippedFile::new(file, "file_not_found"));
+            skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
             continue;
         }
 
-        let rel_path = display_path(&path, file, display_root.as_deref());
         if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
             if let Some(parser) = batch_parser.as_mut() {
                 parser.evict_parse_tree(&path);
             }
-            skipped_files.push(SkippedFile::new(rel_path, reason));
+            skipped_files.push((index, SkippedFile::new(rel_path, reason)));
             continue;
         }
 
@@ -2542,19 +2559,32 @@ fn outline_many_files(
             }
         };
         match structure {
-            Ok(entries) => file_outlines.push(FileOutline {
-                absolute_path: path.clone(),
-                path: rel_path,
-                entries,
-                language: detect_language(&path),
-            }),
-            Err(error) => {
-                skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)))
+            Ok(entries) => {
+                let outline = FileOutline {
+                    absolute_path: path.clone(),
+                    path: rel_path,
+                    entries,
+                    language: detect_language(&path),
+                };
+                if !writer.push(&outline) {
+                    break;
+                }
             }
+            Err(error) => skipped_files.push((
+                index,
+                SkippedFile::new(rel_path, outline_error_reason(&error)),
+            )),
         }
     }
 
-    Ok((file_outlines, skipped_files))
+    skipped_files.sort_by_key(|(index, _)| *index);
+    Ok((
+        writer.finish(),
+        skipped_files
+            .into_iter()
+            .map(|(_, skipped)| skipped)
+            .collect(),
+    ))
 }
 
 /// One file's structure-map entries through the batch parser. A fresh cache
@@ -3331,10 +3361,8 @@ fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
     output
 }
 
-/// Build a directory tree structure from file paths and render as text.
-///
-/// Groups files by directory hierarchy and renders symbols under each file.
-/// If output exceeds `max_bytes`, truncates with a narrowing hint.
+/// The rendered structure map for a batch of files, built incrementally by
+/// [`MultiFileTreeWriter`] in path order.
 struct RenderedOutline {
     text: String,
     truncated: bool,
@@ -3372,41 +3400,74 @@ fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool
     .unwrap_or_default()
 }
 
-fn format_multi_file_tree(
-    file_outlines: &[FileOutline],
+/// Renders a directory tree of files and their structure entries, one file
+/// at a time in path order, within an output byte budget. Files are rendered
+/// atomically, so every shown type keeps its preview and exact remainder.
+///
+/// The writer is fed while files are still being outlined, so a batch can
+/// stop reading and parsing as soon as [`MultiFileTreeWriter::push`] reports
+/// that the budget is spent. The files never offered count toward the total
+/// in the footer but are not shown.
+struct MultiFileTreeWriter {
+    output: String,
+    truncated: bool,
+    files_shown: usize,
+    content_files: BTreeSet<PathBuf>,
+    /// Path components of the last shown file, for directory grouping.
+    prev_parts: Vec<String>,
     max_bytes: usize,
     total_requested: usize,
     walk_incomplete: bool,
-) -> RenderedOutline {
-    // Build a tree of directories → files → symbols
-    // Using a simple sorted-path approach with indentation
-    let mut output = String::new();
-    let mut truncated = false;
-    let mut files_shown = 0;
-    let mut content_files = BTreeSet::new();
-    // Reserve the real list trailer, not a guessed number of bytes. Rendering
-    // files atomically keeps every shown type's preview and exact remainder.
-    let trailer_reserve =
-        outline_structure_footer(total_requested, total_requested, true, walk_incomplete).len() + 2;
+    trailer_reserve: usize,
+    /// A rendered file that fits only if no trailer follows it, which is
+    /// known only once no later file is offered.
+    pending: Option<(String, Vec<String>, PathBuf)>,
+}
 
-    // Sort by path for clean directory grouping
-    let mut sorted: Vec<&FileOutline> = file_outlines.iter().collect();
-    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+impl MultiFileTreeWriter {
+    fn new(max_bytes: usize, total_requested: usize, walk_incomplete: bool) -> Self {
+        // Reserve the real list trailer, not a guessed number of bytes.
+        let trailer_reserve =
+            outline_structure_footer(total_requested, total_requested, true, walk_incomplete).len()
+                + 2;
+        Self {
+            output: String::new(),
+            truncated: false,
+            files_shown: 0,
+            content_files: BTreeSet::new(),
+            prev_parts: Vec::new(),
+            max_bytes,
+            total_requested,
+            walk_incomplete,
+            trailer_reserve,
+            pending: None,
+        }
+    }
 
-    // Track directory nesting via path components
-    let mut prev_parts: Vec<&str> = Vec::new();
-
-    for fo in &sorted {
+    /// Offer the next file in path order. Returns `false` once the budget is
+    /// spent: this file and every later one would not be shown, so the
+    /// caller stops outlining files.
+    fn push(&mut self, fo: &FileOutline) -> bool {
+        if self.truncated {
+            return false;
+        }
+        if self.pending.take().is_some() {
+            // The held file was not the last one, so it needed room for the
+            // trailer and does not fit.
+            self.truncated = true;
+            return false;
+        }
         let mut file_output = String::new();
         let parts: Vec<&str> = fo.path.split('/').collect();
         let file_name = parts.last().copied().unwrap_or(&fo.path);
         let dir_parts = &parts[..parts.len().saturating_sub(1)];
 
         // Find common prefix with previous path
-        let common = prev_parts
+        let common = self
+            .prev_parts
             .iter()
             .zip(dir_parts.iter())
-            .take_while(|(a, b)| a == b)
+            .take_while(|(a, b)| a.as_str() == **b)
             .count();
 
         // Emit new directory levels
@@ -3429,34 +3490,50 @@ fn format_multi_file_tree(
             fo.language,
         );
 
-        let reserve = if files_shown + 1 == sorted.len() && !walk_incomplete {
-            0
-        } else {
-            trailer_reserve
-        };
-        if output.len() + file_output.len() + reserve > max_bytes {
-            truncated = true;
-            break;
+        let parts = parts.iter().map(|part| part.to_string()).collect();
+        let used = self.output.len() + file_output.len();
+        if used + self.trailer_reserve <= self.max_bytes {
+            self.accept(file_output, parts, fo.absolute_path.clone());
+            return true;
         }
-        output.push_str(&file_output);
-        content_files.insert(fo.absolute_path.clone());
-
-        files_shown += 1;
-        prev_parts = parts.iter().map(|s| *s).collect();
+        if !self.walk_incomplete && used <= self.max_bytes {
+            // Fits only as the last file; keep looking for a later one.
+            self.pending = Some((file_output, parts, fo.absolute_path.clone()));
+            return true;
+        }
+        self.truncated = true;
+        false
     }
 
-    let footer = outline_structure_footer(files_shown, total_requested, truncated, walk_incomplete);
-    if !footer.is_empty() {
-        output.push('\n');
-        output.push_str(&footer);
+    fn accept(&mut self, file_output: String, parts: Vec<String>, path: PathBuf) {
+        self.output.push_str(&file_output);
+        self.content_files.insert(path);
+        self.files_shown += 1;
+        self.prev_parts = parts;
     }
 
-    RenderedOutline {
-        text: output,
-        truncated,
-        shown: files_shown,
-        footer,
-        content_files,
+    fn finish(mut self) -> RenderedOutline {
+        if let Some((file_output, parts, path)) = self.pending.take() {
+            self.accept(file_output, parts, path);
+        }
+        let footer = outline_structure_footer(
+            self.files_shown,
+            self.total_requested,
+            self.truncated,
+            self.walk_incomplete,
+        );
+        let mut output = self.output;
+        if !footer.is_empty() {
+            output.push('\n');
+            output.push_str(&footer);
+        }
+        RenderedOutline {
+            text: output,
+            truncated: self.truncated,
+            shown: self.files_shown,
+            footer,
+            content_files: self.content_files,
+        }
     }
 }
 
@@ -5031,16 +5108,18 @@ mod tests {
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, _) = outline_many_files(
+        let (rendered, _) = outline_many_files(
             &files,
             &ctx,
             "budget",
             "budget-session",
             None,
             &HashSet::new(),
+            550,
+            3,
+            false,
         )
         .unwrap();
-        let rendered = format_multi_file_tree(&outlines, 550, 3, false);
         assert!(rendered.text.len() <= 550, "{} bytes", rendered.text.len());
         assert_eq!(rendered.shown, 2, "{}", rendered.text);
         assert!(rendered.truncated);
@@ -5285,6 +5364,51 @@ mod tests {
         let (again, reads, parses) = navigation_counts(&request, &ctx);
         assert_eq!((reads, parses), (0, 0));
         assert_eq!(again, edited);
+    }
+
+    /// Once the rendered output budget is spent, the remaining files are not
+    /// read or parsed: they are reported as not shown through `files_shown`
+    /// and the footer. Only the file that overflowed the budget is parsed
+    /// beyond the shown ones.
+    #[test]
+    fn multi_file_outline_stops_parsing_once_output_budget_is_spent() {
+        use crate::parser::work_counters::tree_parses;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().unwrap();
+        // About 21 KB of rendered rows per file: one fits the 30 KB budget.
+        let source = (0..700)
+            .map(|index| format!("export function symbol_{index:04}() {{}}\n"))
+            .collect::<String>();
+        let mut files = Vec::new();
+        for index in 0..10 {
+            let path = root.join(format!("file_{index:02}.ts"));
+            std::fs::write(&path, &source).unwrap();
+            files.push(path);
+        }
+        for params in [
+            serde_json::json!({"files": files}),
+            serde_json::json!({"directory": root}),
+        ] {
+            // A fresh context each time, so no file is warm in the cache.
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let mut args = params;
+            args["id"] = serde_json::json!("budget-stop");
+            args["command"] = serde_json::json!("outline");
+            let request: RawRequest = serde_json::from_value(args).unwrap();
+            let before = tree_parses();
+            let response = handle_outline(&request, &ctx);
+            let parses = tree_parses() - before;
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["files_shown"], 1);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["output_truncated"], true);
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains("shown 1 of 10 files (budget)"), "{text}");
+            assert_eq!(parses, 2, "parsed files that could not be shown");
+        }
     }
 
     fn outline_ignore_fixture(root: &Path) {
@@ -5622,17 +5746,20 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, skipped) = outline_many_files(
+        let (rendered, skipped) = outline_many_files(
             &files,
             &ctx,
             "outline-fixture",
             "fixture-session",
             None,
             &HashSet::new(),
+            30 * 1024,
+            files.len(),
+            false,
         )
         .expect("outline fixture files");
         assert!(skipped.is_empty(), "{skipped:?}");
-        format_multi_file_tree(&outlines, 30 * 1024, files.len(), false).text
+        rendered.text
     }
 
     #[test]
