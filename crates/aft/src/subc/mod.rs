@@ -4838,6 +4838,8 @@ where
     // Serves the gh shim's bot-write relay on management routes; it dials
     // prefrontal and plexus over its own connection, off the frame loop.
     let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
+    let (_worker_read_service, mut worker_read_scopes) =
+        crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
     let push_senders = PushSenders {
@@ -5146,6 +5148,10 @@ where
                 }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
                 health_rollup_worker.request_refresh();
+            }
+            Some(query) = worker_read_scopes.recv() => {
+                let scopes = gh_relay_route_scopes(&routes);
+                let _ = query.reply.send(scopes.for_session(&query.session).cloned());
             }
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
