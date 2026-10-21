@@ -136,7 +136,23 @@ pub(crate) fn resolve_git_root_from_user_path(
     project_root: &Path,
     raw_path: &str,
 ) -> Result<PathBuf, GitRootResolutionError> {
-    let expanded = expand_tilde(raw_path);
+    let account_home = crate::commands::configure::resolve_account_home_dir();
+    let environment_home = home_dir();
+    resolve_git_root_from_user_path_with_homes(
+        project_root,
+        raw_path,
+        account_home.as_deref(),
+        environment_home.as_deref(),
+    )
+}
+
+fn resolve_git_root_from_user_path_with_homes(
+    project_root: &Path,
+    raw_path: &str,
+    account_home: Option<&Path>,
+    environment_home: Option<&Path>,
+) -> Result<PathBuf, GitRootResolutionError> {
+    let expanded = expand_tilde_with_home(raw_path, environment_home);
     let requested = if expanded.is_absolute() {
         expanded
     } else {
@@ -166,23 +182,36 @@ pub(crate) fn resolve_git_root_from_user_path(
     match git_toplevel(&git_base) {
         Ok(root) => Ok(root),
         Err(error) if error == "not_a_git_root" => {
-            let account_home =
-                crate::commands::configure::resolve_account_home_dir().or_else(home_dir);
+            let account_home = account_home.or(environment_home);
             // A scan must use the same narrow-root policy as a watcher, even
             // though it never starts a watcher or builds an index.
             if (!crate::developer_tools::git_usable()
                 && crate::git_probe::repository_marker_or_uncertainty_in_directory(&git_base))
-                || crate::commands::configure::project_root_is_too_broad(
-                    &git_base,
-                    false,
-                    account_home.as_deref(),
-                )
+                || plain_scan_root_is_too_broad(&git_base, account_home, environment_home)
             {
                 return Err(GitRootResolutionError::NotAGitRoot);
             }
             Ok(git_base)
         }
         Err(error) => Err(GitRootResolutionError::Other(error)),
+    }
+}
+
+fn plain_scan_root_is_too_broad(
+    root: &Path,
+    account_home: Option<&Path>,
+    environment_home: Option<&Path>,
+) -> bool {
+    // HOME can differ from the OS account home, so a scan root must be narrow
+    // relative to both homes when both are available.
+    match (account_home, environment_home) {
+        (None, None) => crate::commands::configure::project_root_is_too_broad(root, false, None),
+        (account_home, environment_home) => [account_home, environment_home]
+            .into_iter()
+            .flatten()
+            .any(|home| {
+                crate::commands::configure::project_root_is_too_broad(root, false, Some(home))
+            }),
     }
 }
 
@@ -497,11 +526,18 @@ fn semantic_index_location(
 }
 
 pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    let home = home_dir();
+    expand_tilde_with_home(raw, home.as_deref())
+}
+
+fn expand_tilde_with_home(raw: &str, home: Option<&Path>) -> PathBuf {
     if raw == "~" {
-        return home_dir().unwrap_or_else(|| PathBuf::from(raw));
+        return home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(raw));
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
+        if let Some(home) = home {
             return home.join(rest);
         }
     }
@@ -648,18 +684,46 @@ mod tests {
     }
 
     #[test]
-    fn plain_folder_scan_root_refuses_home_and_ancestors() {
+    fn plain_folder_scan_roots_refuse_environment_and_account_homes() {
         let project = tempfile::tempdir().unwrap();
-        let home = home_dir().expect("home directory");
-        for root in home.ancestors() {
-            assert!(
-                matches!(
-                    resolve_git_root_from_user_path(project.path(), root.to_str().unwrap()),
-                    Err(GitRootResolutionError::NotAGitRoot)
-                ),
-                "unsafe scan root: {}",
-                root.display()
-            );
+        let environment_home = tempfile::tempdir().unwrap();
+        let account_home = tempfile::tempdir().unwrap();
+
+        for (label, home) in [
+            ("environment home", environment_home.path()),
+            ("account home", account_home.path()),
+        ] {
+            for root in home.ancestors() {
+                assert!(
+                    matches!(
+                        resolve_git_root_from_user_path_with_homes(
+                            project.path(),
+                            &root.to_string_lossy(),
+                            Some(account_home.path()),
+                            Some(environment_home.path()),
+                        ),
+                        Err(GitRootResolutionError::NotAGitRoot)
+                    ),
+                    "unsafe {label} scan root: {}",
+                    root.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_account_home_is_refused_when_available() {
+        // A host's account home may also be a Git checkout. Check the broad-root
+        // policy directly so Git-root resolution cannot bypass this assertion.
+        match crate::commands::configure::resolve_account_home_dir() {
+            Some(home) => assert!(
+                crate::commands::configure::project_root_is_too_broad(&home, false, Some(&home),),
+                "account home must be treated as too broad: {}",
+                home.display()
+            ),
+            None => eprintln!(
+                "skipping real account-home assertion: the host could not provide an account home"
+            ),
         }
     }
 

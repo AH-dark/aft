@@ -1005,24 +1005,27 @@ fn external_plain_folder_respects_configured_and_force_restriction() {
 }
 
 #[test]
-fn external_unsafe_plain_roots_are_refused_with_grep_hint() {
+fn external_volume_root_is_refused_with_grep_hint() {
     let session_project = tempfile::tempdir().expect("session project");
     let ctx = test_context(session_project.path());
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .expect("home directory");
-    for root in home.ancestors() {
-        let response = response_value(handle_semantic_search(
-            &request_with_path("needle_symbol", Some("literal"), root),
-            &ctx,
-        ));
-        assert_eq!(response["success"], false, "{response:?}");
-        assert_eq!(response["code"], "not_a_git_root", "{response:?}");
-        let message = response["message"].as_str().expect("message");
-        assert!(message.contains("bounded"), "{message}");
-        assert!(message.contains("grep"), "{message}");
-    }
+    // Use filesystem root rather than ambient HOME so this public search response
+    // stays stable when tests isolate HOME or the host home is a Git checkout.
+    // readonly_artifacts.rs tests cover temporary environment-home and account-home
+    // paths directly.
+    let root = session_project
+        .path()
+        .ancestors()
+        .last()
+        .expect("filesystem root");
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), root),
+        &ctx,
+    ));
+    assert_eq!(response["success"], false, "{response:?}");
+    assert_eq!(response["code"], "not_a_git_root", "{response:?}");
+    let message = response["message"].as_str().expect("message");
+    assert!(message.contains("bounded"), "{message}");
+    assert!(message.contains("grep"), "{message}");
 }
 
 #[test]
