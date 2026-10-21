@@ -1690,13 +1690,16 @@ pub(crate) enum DispatchTypeTargetPlan<'p> {
     /// Resolve every file of `recompute`. Other Rust files are checked only
     /// when their previous trace depends on a path of `recompute`, on a path
     /// of `membership_changed`, on a file whose index entry this join had to
-    /// rebuild, or on the crate-wide module domain. A checked file is resolved
+    /// rebuild, or, when `module_domain_changed` is set, on the crate-wide
+    /// module domain. The owner clears it only when no input of the module
+    /// index changed, so no domain answer can differ. A checked file is resolved
     /// again when its trace probed an added or removed path, or when one of
     /// the index answers it recorded is different now. Every other file keeps
     /// its previous targets.
     Selected {
         recompute: &'p BTreeSet<String>,
         membership_changed: &'p BTreeSet<String>,
+        module_domain_changed: bool,
         traces: DispatchTypeTargetTraces<'p>,
     },
 }
@@ -1787,6 +1790,11 @@ pub(crate) struct SelectedManifestJoin {
     pub dispatch_type_targets: BTreeMap<String, DispatchTypeTargets>,
     /// Parse blobs decoded only to resolve receiver type targets.
     pub dispatch_type_target_decoded_blobs: usize,
+    /// Previous traces of other files checked against the new index.
+    pub dispatch_type_target_traces: usize,
+    /// Checked traces whose only dependency among the seeds was the module
+    /// domain.
+    pub module_domain_traces: usize,
 }
 
 /// Compact, deterministic snapshot of one file's resolver index. It deliberately
@@ -2573,6 +2581,8 @@ fn join_manifest_with_surfaces(
     profile.finish("dependency_union");
     let mut dispatch_type_targets = BTreeMap::new();
     let mut dispatch_type_target_decoded_blobs = 0;
+    let mut dispatch_type_target_traces = 0;
+    let mut module_domain_traces = 0;
     if let Some(plan) = dispatch_type_target_plan {
         let mut stage = crate::views::materialization::profile::StageTimer::new("join");
         let (recompute, replayed) = match plan {
@@ -2580,13 +2590,27 @@ fn join_manifest_with_surfaces(
             DispatchTypeTargetPlan::Selected {
                 recompute,
                 membership_changed,
+                module_domain_changed,
                 traces,
             } => {
                 let mut seeds = recompute.clone();
                 seeds.extend(rebuilt_surface_paths.iter().cloned());
                 seeds.extend(membership_changed.iter().cloned());
-                seeds.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
+                if module_domain_changed {
+                    seeds.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
+                }
                 let traces = traces(&seeds)?;
+                if module_domain_changed {
+                    module_domain_traces = traces
+                        .values()
+                        .filter(|trace| {
+                            trace.dependencies().iter().all(|dependency| {
+                                dependency == VIEW_RUST_MODULE_DOMAIN || !seeds.contains(dependency)
+                            })
+                        })
+                        .count();
+                }
+                dispatch_type_target_traces = traces.len();
                 stage.finish(
                     "dispatch_type_target_traces",
                     format_args!("seeds={} traces={}", seeds.len(), traces.len()),
@@ -2681,6 +2705,8 @@ fn join_manifest_with_surfaces(
         resolved_bindings,
         dispatch_type_targets,
         dispatch_type_target_decoded_blobs,
+        dispatch_type_target_traces,
+        module_domain_traces,
     })
 }
 

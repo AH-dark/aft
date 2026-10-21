@@ -58,6 +58,25 @@ pub struct MaterializeStats {
     pub dispatch_type_target_decoded_blobs: usize,
     /// The method-call pass resolved every file, as a cold build does.
     pub dispatch_full: bool,
+    /// Receiver type target traces of other files checked again.
+    pub dispatch_type_target_traces: usize,
+    /// Files whose bindings were selected for re-resolution, the changed
+    /// files included; zero when every caller was resolved.
+    pub selected_callers: usize,
+    /// The Rust module digest changed (or a cold build computed it), so the
+    /// crate-wide module domain was seeded.
+    pub module_digest_changed: bool,
+    /// The module digest was computed from every Rust file and Cargo manifest
+    /// instead of updated from the changed paths.
+    pub module_digest_full: bool,
+    /// Parse blobs decoded to decide whether the module digest changed.
+    pub module_digest_decoded_blobs: usize,
+    /// Selected callers whose only path into the selection was the module
+    /// domain.
+    pub module_domain_callers: usize,
+    /// Receiver type target traces checked only because the module domain
+    /// was seeded.
+    pub module_domain_traces: usize,
 }
 
 impl MaterializeStats {
@@ -107,6 +126,7 @@ pub(crate) fn apply_manifest_diff_profiled(
     )
 }
 
+mod module_digest;
 #[cfg(test)]
 pub(crate) mod parity;
 pub(crate) mod profile;
@@ -281,6 +301,7 @@ fn materialize_reading(
     initialize_schema(&connection)?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut base_fingerprint = None;
     if let Some(base_manifest) = base {
         let recorded: Option<String> = transaction
             .query_row(
@@ -296,11 +317,12 @@ fn materialize_reading(
                 |row| row.get(0),
             )
             .optional()?;
+        let base_fp = fingerprint(base_manifest)?;
         if recorded.is_none() && version.is_none() {
             // Cloned generations written before diff metadata existed must be
             // rebuilt; their graph cannot safely seed dependency invalidation.
             base = None;
-        } else if recorded.as_deref() != Some(fingerprint(base_manifest)?.as_str()) {
+        } else if recorded.as_deref() != Some(base_fp.as_str()) {
             return Err(CallGraphStoreError::Unavailable(
                 BASE_FINGERPRINT_MISMATCH.into(),
             ));
@@ -311,14 +333,17 @@ fn materialize_reading(
             return Ok((MaterializeStats::default(), profile.into_timings()));
         } else if manifest_callgraph_equivalent(base_manifest, manifest) {
             profile.finish("load_bindings_select");
+            let next_fp = fingerprint(manifest)?;
             transaction.execute(
                 "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
-                [fingerprint(manifest)?],
+                [&next_fp],
             )?;
+            module_digest::advance_unchanged(&transaction, &base_fp, &next_fp)?;
             transaction.commit()?;
             profile.finish("commit");
             return Ok((MaterializeStats::default(), profile.into_timings()));
         }
+        base_fingerprint = Some(base_fp);
     }
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS view_bindings (
@@ -330,6 +355,7 @@ fn materialize_reading(
              payload TEXT NOT NULL
          )",
     )?;
+    transaction.execute_batch(module_digest::CREATE_TABLES)?;
     let changed = base.map(|base| {
         base.entries()
             .chain(manifest.entries())
@@ -337,6 +363,24 @@ fn materialize_reading(
             .map(|(path, _)| path.as_bytes().to_vec())
             .collect::<BTreeSet<_>>()
     });
+    // Decide before selecting dependents whether the crate-wide Rust module
+    // index can answer differently; a cold build computes the digest from the
+    // blobs it decodes below.
+    let module_digest = match (&changed, base) {
+        (Some(changed), Some(base)) => Some(module_digest::update(
+            &transaction,
+            base,
+            base_fingerprint
+                .as_deref()
+                .expect("an incremental base has a fingerprint"),
+            manifest,
+            changed,
+            reader,
+        )?),
+        _ => None,
+    };
+    let module_domain_changed = module_digest.is_none_or(|digest| digest.changed);
+    let mut module_domain_callers = 0;
     let mut cached_for_invalidation = None;
     let mut fact_invalidated = BTreeSet::new();
     let mut fallback_count = 0;
@@ -412,7 +456,10 @@ fn materialize_reading(
                 }) {
                     seeds.insert(join::VIEW_GO_PACKAGE_DOMAIN.as_bytes().to_vec());
                 }
-                Some(dependent_closure(&transaction, &seeds)?)
+                let (selected, domain_only) =
+                    dependent_closure(&transaction, &seeds, module_domain_changed)?;
+                module_domain_callers = domain_only;
+                Some(selected)
             }
         }
         _ => None,
@@ -433,6 +480,16 @@ fn materialize_reading(
     let mut stats = MaterializeStats {
         full_resolution: selected.is_none(),
         unattributed_callers: fallback_count,
+        selected_callers: selected.as_ref().map_or(0, |selected| {
+            selected
+                .iter()
+                .filter(|path| !path.starts_with('\0'))
+                .count()
+        }),
+        module_digest_changed: module_domain_changed,
+        module_digest_full: module_digest.is_none_or(|digest| digest.full),
+        module_digest_decoded_blobs: module_digest.map_or(0, |digest| digest.decoded_blobs),
+        module_domain_callers,
         ..MaterializeStats::default()
     };
     profile.finish("load_bindings_select");
@@ -505,6 +562,7 @@ fn materialize_reading(
     let mut loaded_paths = BTreeSet::new();
     let mut owned_files = Vec::new();
     let mut owned_nodes = Vec::new();
+    let mut cold_module_facts = HashMap::new();
     for (path, entry) in manifest.entries() {
         if changed
             .as_ref()
@@ -536,6 +594,11 @@ fn materialize_reading(
             CallGraphStoreError::Unavailable("non-UTF-8 manifest callgraph path".to_string())
         })?;
         loaded_paths.insert(path.clone());
+        if changed.is_none() && path.ends_with(".rs") {
+            if let Some(facts) = module_digest::RustParseFacts::of(parse) {
+                cold_module_facts.insert(path.clone(), facts);
+            }
+        }
         let write_owned = changed
             .as_ref()
             .is_none_or(|paths| paths.contains(path.as_bytes()));
@@ -624,6 +687,11 @@ fn materialize_reading(
                 .map(|written| count + written)
         })
     })?;
+    if changed.is_none() {
+        module_digest::compute_full(&transaction, manifest, |path, _| {
+            Ok(cold_module_facts.remove(path))
+        })?;
+    }
     profile.finish("owned_blob_decode_and_insert");
     let changed_strings = changed.as_ref().map_or_else(BTreeSet::new, |paths| {
         paths
@@ -667,6 +735,7 @@ fn materialize_reading(
         join::DispatchTypeTargetPlan::Selected {
             recompute: &changed_strings,
             membership_changed: &membership_changed,
+            module_domain_changed,
             traces: &type_target_traces,
         }
     } else {
@@ -1180,6 +1249,8 @@ fn materialize_reading(
     stats.dispatch_resolved_sites = dispatch_work.resolved_sites;
     stats.dispatch_type_target_files = joined.dispatch_type_targets.len();
     stats.dispatch_type_target_decoded_blobs = joined.dispatch_type_target_decoded_blobs;
+    stats.dispatch_type_target_traces = joined.dispatch_type_target_traces;
+    stats.module_domain_traces = joined.module_domain_traces;
     stats.dispatch_full = dispatch_work.full;
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1199,10 +1270,12 @@ fn materialize_reading(
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
     crate::callgraph_store::insert_meta(&transaction)?;
+    let manifest_fingerprint = fingerprint(manifest)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
-        [fingerprint(manifest)?],
+        [&manifest_fingerprint],
     )?;
+    module_digest::record_fingerprint(&transaction, &manifest_fingerprint)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_materialization_version', ?1)",
         [MATERIALIZATION_VERSION],
@@ -1520,10 +1593,15 @@ fn load_bindings_for_selection(
     Ok(bindings)
 }
 
+/// Paths whose bindings must be checked again: the seeds and every path that
+/// depends on one, transitively. The crate-wide Rust module domain is seeded
+/// only when `seed_module_domain` is set. Also returns how many selected
+/// files only the domain reached.
 fn dependent_closure(
     connection: &Connection,
     changed: &BTreeSet<Vec<u8>>,
-) -> Result<BTreeSet<String>> {
+    seed_module_domain: bool,
+) -> Result<(BTreeSet<String>, usize)> {
     connection.execute_batch(
         "CREATE TEMP TABLE dependency_seed_paths (
              path TEXT PRIMARY KEY
@@ -1537,27 +1615,43 @@ fn dependent_closure(
                 insert.execute([path])?;
             }
         }
-        if !changed.is_empty() {
-            // Rust inline-module and parent queries can inspect the crate-wide index.
-            // Recheck that domain even for non-.rs paths: explicit module paths may
-            // name other extensions, and membership changes can expose new modules.
-            insert.execute([join::VIEW_RUST_MODULE_DOMAIN])?;
+    }
+    let closure = || -> Result<BTreeSet<String>> {
+        let mut statement = connection.prepare_cached(
+            "WITH RECURSIVE selected(path) AS (
+                 SELECT path FROM dependency_seed_paths
+                 UNION
+                 SELECT dependencies.file_path
+                 FROM selected
+                 JOIN file_dependencies AS dependencies INDEXED BY idx_file_dependencies_dep_file
+                     ON dependencies.dep_file = selected.path
+             )
+             SELECT path FROM selected",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
+    };
+    let mut selected = closure()?;
+    let mut domain_only = 0;
+    if seed_module_domain && !changed.is_empty() {
+        // Rust inline-module and parent queries read the crate-wide module
+        // index, so their callers depend on the domain instead of on the files
+        // the answer came from. The closure of a union of seeds is the union
+        // of their closures, so the domain's dependents are collected
+        // separately to count those nothing else selected.
+        connection.execute_batch("DELETE FROM dependency_seed_paths")?;
+        connection.execute(
+            "INSERT INTO dependency_seed_paths(path) VALUES(?1)",
+            [join::VIEW_RUST_MODULE_DOMAIN],
+        )?;
+        for path in closure()? {
+            if selected.insert(path.clone()) && !path.starts_with('\0') {
+                domain_only += 1;
+            }
         }
     }
-    let mut statement = connection.prepare(
-        "WITH RECURSIVE selected(path) AS (
-             SELECT path FROM dependency_seed_paths
-             UNION
-             SELECT dependencies.file_path
-             FROM selected
-             JOIN file_dependencies AS dependencies INDEXED BY idx_file_dependencies_dep_file
-                 ON dependencies.dep_file = selected.path
-         )
-         SELECT path FROM selected",
-    )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    rows.collect::<std::result::Result<BTreeSet<_>, _>>()
-        .map_err(Into::into)
+    Ok((selected, domain_only))
 }
 
 fn requires_full_resolution(
