@@ -706,7 +706,24 @@ impl FamilyStore {
         deadline: Option<std::time::Instant>,
     ) -> StoreResult<super::reclaim::ReclaimReport> {
         let connection = lock(&self.inner.connection);
-        Ok(super::reclaim::reclaim(&connection, deadline, &|| false)?)
+        let mut report = super::reclaim::reclaim(&connection, deadline, &|| false)?;
+        checkpoint_after_reclaim(&self.inner, &connection, &mut report)?;
+        Ok(report)
+    }
+
+    /// Returns up to `max_pages` free pages whatever their share of the
+    /// file, on the store's own connection, in bounded incremental-vacuum
+    /// steps (never a full `VACUUM`). See
+    /// [`super::reclaim::reclaim_all_free_pages`].
+    pub(crate) fn reclaim_all_free_pages(
+        &self,
+        deadline: Option<std::time::Instant>,
+        max_pages: u64,
+    ) -> StoreResult<super::reclaim::ReclaimReport> {
+        let connection = lock(&self.inner.connection);
+        let mut report = super::reclaim::reclaim_all_free_pages(&connection, deadline, max_pages)?;
+        checkpoint_after_reclaim(&self.inner, &connection, &mut report)?;
+        Ok(report)
     }
 
     pub fn usage(&self) -> StoreResult<StoreUsage> {
@@ -1140,6 +1157,24 @@ impl FamilyStoreReader {
     pub fn usage(&self) -> StoreResult<StoreUsage> {
         usage(&self.inner)
     }
+
+    /// Bytes of the store's database file that hold no data: its free pages,
+    /// plus any tail of the main file past the database's last page, which
+    /// returning free pages leaves in place until a checkpoint cuts it off.
+    /// Reads the database header in one read transaction on the store's own
+    /// connection, and the main file's length.
+    pub(crate) fn unused_file_bytes(&self) -> StoreResult<u64> {
+        let mut connection = lock(&self.inner.connection);
+        let read = connection.transaction()?;
+        let page_size: u64 = read.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let pages: u64 = read.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let free: u64 = read.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+        read.commit()?;
+        let main_file = fs::metadata(&self.inner.path)?.len();
+        Ok(free
+            .saturating_mul(page_size)
+            .saturating_add(main_file.saturating_sub(pages.saturating_mul(page_size))))
+    }
 }
 
 /// One stored payload row, for the sweep.
@@ -1238,6 +1273,61 @@ fn shared_inner(
     }
     stores.insert(path.to_path_buf(), Arc::downgrade(&inner));
     Ok(inner)
+}
+
+/// Gives the space a reclaim freed back to the filesystem now. Returning
+/// free pages shrinks the database only in the write-ahead log; the main
+/// file is cut to the new size when a checkpoint copies the whole log into
+/// it. SQLite checkpoints on its own only once the log reaches 1,000
+/// frames, which a small reclaim on a store nobody writes to afterwards may
+/// never reach, so this runs one checkpoint, on the store's own connection,
+/// whenever the reclaim returned pages or the main file is still longer
+/// than the database (a cut an earlier pass could not make).
+///
+/// The checkpoint is PASSIVE: it copies what it can and never waits for
+/// readers or writers, and never calls the busy handler. A reader holding
+/// an older snapshot leaves the file uncut and `checkpoint_blocked` set;
+/// the next pass tries again, and until then the main file's tail counts
+/// as unused bytes (see [`FamilyStoreReader::unused_file_bytes`]). FULL,
+/// RESTART and TRUNCATE would instead wait on the busy handler for other
+/// connections, up to the store's busy timeout, and RESTART and TRUNCATE
+/// also wait for every reader to finish so the log can start over. The
+/// copy is bounded by the log's current frame count: SQLite checkpoints on
+/// its own at 1,000 frames, but a checkpoint a reader kept from finishing
+/// can leave the log larger than that.
+fn checkpoint_after_reclaim(
+    inner: &StoreInner,
+    connection: &rusqlite::Connection,
+    report: &mut super::reclaim::ReclaimReport,
+) -> StoreResult<()> {
+    if report.reclaimed_pages == 0 {
+        let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let pages: u64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        if fs::metadata(&inner.path)?.len() <= pages.saturating_mul(page_size) {
+            return Ok(());
+        }
+    }
+    let checkpoint = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    });
+    match checkpoint {
+        // Columns: whether it was blocked, frames in the log, frames copied.
+        Ok((busy, log, copied)) => report.checkpoint_blocked |= busy != 0 || copied < log,
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            report.checkpoint_blocked = true;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn ensure_schema(inner: &StoreInner) -> StoreResult<()> {
