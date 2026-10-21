@@ -410,3 +410,78 @@ fn s3_path_form_lookup_searches_the_partial_index() {
         .unwrap();
     assert!(check_path_form_plan(path_form_plan(&conn, sql)).is_err());
 }
+
+/// The probe edit of the call-graph incremental-speed study: a leading comment
+/// that shifts every line, plus a new uniquely named caller/callee pair at the
+/// end of the file.
+fn speed_probe_edit(original: &str, tag: &str) -> String {
+    let caller = format!("aft_speed_probe_caller_{tag}");
+    let callee = format!("aft_speed_probe_callee_{tag}");
+    let mut text = format!("// aft speed probe {tag}\n{original}");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\npub fn {caller}() -> usize {{\n    {callee}()\n}}\npub fn {callee}() -> usize {{\n    {}\n}}\n",
+        tag.len()
+    ));
+    text
+}
+
+fn host_load() -> String {
+    fs::read_to_string("/proc/loadavg")
+        .map(|load| load.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Views-off refresh phases for the probe edit on two Rust hub files of a real
+/// repository. `AFT_S3_MEASURE_ROOT` names a git checkout whose tracked
+/// sources are copied; `AFT_S3_MEASURE_ROUNDS` (default 3) sets the edits per
+/// file. Each edit is undone with an unmeasured refresh before the next.
+#[test]
+#[ignore = "offline measurement: set AFT_S3_MEASURE_ROOT to a git checkout"]
+fn s3_offline_hub_refresh_measurement() {
+    let source = PathBuf::from(std::env::var_os("AFT_S3_MEASURE_ROOT").expect("source checkout"));
+    let rounds = std::env::var("AFT_S3_MEASURE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3usize);
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    perf_tests::copy_tracked_sources(&source, &root);
+    let files: Vec<_> = callgraph::walk_project_files(&root).collect();
+    let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+    let started = Instant::now();
+    store.cold_build(&files).unwrap();
+    eprintln!(
+        "S3 measurement cold build: files={} ms={} load={}",
+        files.len(),
+        started.elapsed().as_millis(),
+        host_load()
+    );
+    for round in 0..rounds {
+        for rel in ["crates/aft/src/protocol.rs", "crates/aft/src/context.rs"] {
+            let path = root.join(rel);
+            let original = fs::read_to_string(&path).unwrap();
+            fs::write(&path, speed_probe_edit(&original, &format!("s3r{round}"))).unwrap();
+            store.checkpoint_wal_truncate();
+            let load = host_load();
+            let (stats, profile) = store
+                .refresh_files_profiled(std::slice::from_ref(&path))
+                .unwrap();
+            eprintln!(
+                "S3 measurement {rel} round={round} load_before=[{load}]: {} dependency_selected_refs={} refreshed_own_files={} projection_callers={} dispatch_callers_recomputed={} dispatch_path_form_rows_examined={}",
+                profile.report(),
+                stats.dependency_selected_refs,
+                stats.refreshed_own_files,
+                stats.projection_callers.len(),
+                stats.dispatch_callers_recomputed.len(),
+                stats.dispatch_path_form_rows_examined,
+            );
+            fs::write(&path, original).unwrap();
+            store.refresh_files(std::slice::from_ref(&path)).unwrap();
+        }
+    }
+}
