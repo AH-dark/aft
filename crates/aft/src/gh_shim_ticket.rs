@@ -57,6 +57,27 @@ struct Entry {
     owner: Owner,
     project_root: String,
     read_repository: Option<String>,
+    #[cfg(unix)]
+    worker_read: Option<WorkerReadGrant>,
+}
+
+/// The worker-read capability is separate from the general relay ticket. Dropping
+/// the registry entry tears down its endpoint and every outstanding exchange.
+#[cfg(unix)]
+struct WorkerReadGrant {
+    capability: [u8; TICKET_BYTES],
+    cancel: tokio::sync::watch::Sender<bool>,
+    socket: std::path::PathBuf,
+    deadline: std::time::Instant,
+    binding: serde_json::Value,
+}
+
+#[cfg(unix)]
+impl Drop for WorkerReadGrant {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+        let _ = std::fs::remove_file(&self.socket);
+    }
 }
 
 static REGISTRY: LazyLock<Mutex<Vec<Entry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -114,6 +135,8 @@ fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> 
         owner,
         project_root: project_root.to_string(),
         read_repository,
+        #[cfg(unix)]
+        worker_read: None,
     });
     Some(encoded)
 }
@@ -178,8 +201,69 @@ impl PendingTicket {
         }
     }
 
+    /// A caller-selected command workdir is not a repository binding. Missing
+    /// trusted project context leaves reads unbound rather than inferring it.
+    pub(crate) fn issue_for_project(
+        session_id: &str,
+        project_root: Option<&std::path::Path>,
+    ) -> Self {
+        Self::issue(
+            session_id,
+            &project_root
+                .map(|root| root.display().to_string())
+                .unwrap_or_default(),
+        )
+    }
+
     pub fn value(&self) -> Option<&str> {
         self.ticket.as_deref()
+    }
+
+    /// Reserve the task identity before exec, while retaining drop-on-error
+    /// revocation until the spawning code commits the ticket with bind_task.
+    #[cfg(unix)]
+    pub(crate) fn reserve_task(&self, task_id: &str) {
+        if let Some(candidate) = self.ticket.as_deref().and_then(decode) {
+            for entry in registry().iter_mut() {
+                if constant_time_eq(&entry.ticket, &candidate) {
+                    entry.owner = Owner::Task(task_id.to_string());
+                }
+            }
+        }
+    }
+
+    /// Called only after resolving a native worker-jail plan with the shim
+    /// enabled. Host synchronous calls have no entry point to mint this grant.
+    #[cfg(unix)]
+    pub(crate) fn worker_read_capability(
+        &self,
+        socket: std::path::PathBuf,
+        deadline: std::time::Instant,
+        binding: &crate::gh_shim_relay::ScopeStamp,
+    ) -> Option<(String, tokio::sync::watch::Sender<bool>)> {
+        if !crate::gh_shim_relay::worker_scope(binding) {
+            return None;
+        }
+        let candidate = decode(self.ticket.as_deref()?)?;
+        let mut entries = registry();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| constant_time_eq(&entry.ticket, &candidate))?;
+        if !matches!(&entry.owner, Owner::Task(id) if !id.is_empty()) || entry.worker_read.is_some()
+        {
+            return None;
+        }
+        let mut capability = [0; TICKET_BYTES];
+        getrandom::fill(&mut capability).ok()?;
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        entry.worker_read = Some(WorkerReadGrant {
+            capability,
+            cancel: cancel.clone(),
+            socket,
+            deadline,
+            binding: serde_json::to_value(binding).ok()?,
+        });
+        Some((encode(&capability), cancel))
     }
 
     /// Attach the spawned task's id so the task's terminal transition revokes
@@ -199,6 +283,71 @@ impl PendingTicket {
             }
         }
     }
+}
+
+/// Redeem only at the endpoint that minted this purpose-specific capability.
+/// A general ticket, another command's endpoint, and expired grants all fail.
+#[cfg(unix)]
+pub(crate) fn redeem_worker_read(capability: &str, socket: &std::path::Path) -> Option<Redeemed> {
+    let candidate = decode(capability)?;
+    let entries = registry();
+    entries.iter().find_map(|entry| {
+        let grant = entry.worker_read.as_ref()?;
+        if !constant_time_eq(&grant.capability, &candidate)
+            || grant.socket != socket
+            || *grant.cancel.borrow()
+            || std::time::Instant::now() >= grant.deadline
+        {
+            return None;
+        }
+        Some(Redeemed {
+            session_id: entry.session_id.clone(),
+            task_id: entry.owner.id().to_string(),
+            project_root: entry.project_root.clone(),
+            read_repository: entry.read_repository.clone(),
+        })
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn worker_read_scope_matches(
+    capability: &str,
+    socket: &std::path::Path,
+    stamp: &crate::gh_shim_relay::ScopeStamp,
+) -> bool {
+    let Some(candidate) = decode(capability) else {
+        return false;
+    };
+    let Ok(binding) = serde_json::to_value(stamp) else {
+        return false;
+    };
+    registry().iter().any(|entry| {
+        entry.worker_read.as_ref().is_some_and(|grant| {
+            constant_time_eq(&grant.capability, &candidate)
+                && grant.socket == socket
+                && grant.binding == binding
+        })
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn renew_worker_read_deadline(task_id: &str, deadline: std::time::Instant) {
+    for entry in registry().iter_mut() {
+        if matches!(&entry.owner, Owner::Task(id) if id == task_id) {
+            if let Some(grant) = &mut entry.worker_read {
+                grant.deadline = grant.deadline.max(deadline);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn worker_read_deadline(socket: &std::path::Path) -> Option<std::time::Instant> {
+    registry()
+        .iter()
+        .filter_map(|entry| entry.worker_read.as_ref())
+        .find(|grant| grant.socket == socket)
+        .map(|grant| grant.deadline)
 }
 
 impl Drop for PendingTicket {
