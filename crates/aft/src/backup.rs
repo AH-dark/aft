@@ -64,6 +64,8 @@ static RESTORE_BEFORE_LOCK_HOOKS: LazyLock<Mutex<HashMap<String, RestoreBeforeLo
 
 static BACKUP_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static BACKUP_MIGRATION_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 thread_local! {
     /// Storage segment of the harness whose route issued the request running on
@@ -780,9 +782,10 @@ impl Default for BackupPolicy {
 ///   `<storage_dir>/backups/<session_hash>/<path_hash>/meta.json` — file path + count + session
 ///   `<storage_dir>/backups/<session_hash>/<path_hash>/bak_<order>_<id>.bak` — append-only content
 ///
-/// Legacy layouts from before sessionization (flat `<path_hash>/` directly under
-/// `backups/`) are migrated by process-wide maintenance on the first backup
-/// mutation or restore, never during configure.
+/// On a backup mutation or restore, migrate legacy flat entries only after
+/// backups in `<storage_dir>/backups/` have moved to the effective harness's
+/// `<storage_dir>/<harness>/backups/` directory. Configuration does not trigger
+/// this migration.
 #[derive(Debug)]
 pub struct BackupStore {
     /// session -> path -> entry stack
@@ -826,6 +829,8 @@ pub struct BackupStore {
     history_content_reads: AtomicU64,
     #[cfg(test)]
     history_metadata_reads: AtomicU64,
+    #[cfg(test)]
+    migration_backups_dir_reads: AtomicU64,
     #[cfg(test)]
     fail_next_disk_write: bool,
 }
@@ -890,6 +895,8 @@ impl BackupStore {
             history_content_reads: AtomicU64::new(0),
             #[cfg(test)]
             history_metadata_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            migration_backups_dir_reads: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_disk_write: false,
         }
@@ -1015,13 +1022,16 @@ impl BackupStore {
         };
         let repair = self.repair_root_backups_if_needed();
         let key = (storage_dir, self.effective_storage_harness());
-        let first_maintenance = BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key);
+        let first_maintenance = BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key.clone());
         if first_maintenance {
             self.record_disk_io_for_tests();
             self.gc_stale_sessions(self.maintenance_ttl_hours);
         }
 
-        if repair.leftovers == 0 && repair.failed == 0 {
+        let first_migration = repair.leftovers == 0
+            && repair.failed == 0
+            && BACKUP_MIGRATION_KEYS.lock().unwrap().insert(key);
+        if first_migration {
             self.migrate_legacy_layout_if_needed();
         }
         if first_maintenance {
@@ -1044,6 +1054,11 @@ impl BackupStore {
     #[cfg(test)]
     pub(crate) fn disk_io_count_for_tests(&self) -> u64 {
         self.disk_io_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn migration_backups_dir_reads_for_tests(&self) -> u64 {
+        self.migration_backups_dir_reads.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -3295,13 +3310,13 @@ impl BackupStore {
         }
     }
 
-    /// One-time migration: move pre-session flat layout into the default
-    /// session namespace. Called from `set_storage_dir` so existing backups
-    /// survive the upgrade.
+    /// One-time migration: after backups in `<storage_dir>/backups/` have moved
+    /// to the effective harness's `<storage_dir>/<harness>/backups/` directory,
+    /// move legacy flat entries into the default session namespace.
     ///
     /// Detection: any directory directly under `backups/` that contains a
-    /// `meta.json` (as opposed to a `session.json` marker or subdirectories)
-    /// is treated as a legacy entry.
+    /// `meta.json` (rather than `session.json` and per-path subdirectories)
+    /// identifies a legacy entry.
     fn migrate_legacy_layout_if_needed(&mut self) {
         let backups_dir = match self.backups_dir() {
             Some(d) if d.exists() => d,
@@ -3310,6 +3325,9 @@ impl BackupStore {
         let default_session_dir =
             backups_dir.join(Self::session_hash(crate::protocol::DEFAULT_SESSION_ID));
 
+        #[cfg(test)]
+        self.migration_backups_dir_reads
+            .fetch_add(1, Ordering::Relaxed);
         let entries = match std::fs::read_dir(&backups_dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -7620,6 +7638,52 @@ mod tests {
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_flat_migration_does_not_rescan_backups_directory_after_completion() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("legacy.txt");
+        fs::write(&path, "current content").unwrap();
+        let key = canonicalize_key(&path);
+        let backups_dir = storage.path().join("opencode/backups");
+        let legacy_dir = backups_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("0.bak"), "original content").unwrap();
+        fs::write(
+            legacy_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        store.run_process_maintenance_once();
+
+        let default_session_dir = backups_dir.join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let migrated_dir = default_session_dir.join(BackupStore::path_hash(&key));
+        assert!(migrated_dir.join("meta.json").exists());
+        assert!(!legacy_dir.exists());
+        let reads_after_migration = store.migration_backups_dir_reads_for_tests();
+        assert_eq!(reads_after_migration, 1);
+
+        for _ in 0..3 {
+            store.run_process_maintenance_once();
+        }
+
+        assert_eq!(
+            store.migration_backups_dir_reads_for_tests() - reads_after_migration,
+            0,
+            "completed legacy migration must not rescan the harness backups directory"
+        );
     }
 
     #[test]
