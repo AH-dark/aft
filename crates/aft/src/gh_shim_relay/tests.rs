@@ -1784,3 +1784,92 @@ fn audit_session_context_never_calls_untrusted_scopes_a_head() {
     }
     assert!(transport.calls().is_empty());
 }
+
+#[tokio::test]
+async fn gh_shim_relay_cancellation_after_acquisition_releases_lease() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let transport = daemon.transport().await;
+    let consumer = transport.consumer().await.unwrap();
+    let leases = Arc::new(RouteLeases::default());
+    let pause = Arc::new(LeaseTestPause::default());
+    *leases.pause.lock().unwrap() = Some(pause.clone());
+    let task_leases = leases.clone();
+    let caller = tokio::spawn(async move {
+        route_request(
+            &consumer,
+            &task_leases,
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: "plexus".into(),
+            },
+            subc_protocol::BindIdentity::new("/project", "lease-test", "cancel-acquire"),
+            None,
+            Default::default(),
+            &json!({"name":"github_read"}),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), pause.acquired.notified())
+        .await
+        .unwrap();
+    assert_eq!(leases.holders.lock().await.len(), 1);
+    caller.abort();
+    let _ = caller.await;
+    pause.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if leases.holders.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancellation after acquire must remove its lease entry");
+    assert!(daemon.opens().is_empty());
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn gh_shim_relay_cancellation_after_forwarding_closes_route() {
+    let daemon = fake_daemon(DaemonScript {
+        hold_first_request: true,
+        ..Default::default()
+    })
+    .await;
+    let transport = Arc::new(daemon.transport().await);
+    let caller_transport = transport.clone();
+    let caller = tokio::spawn(async move {
+        caller_transport
+            .plexus(
+                "/project",
+                "cancel-forward",
+                Some(&scope_selector(&delegating_stamp())),
+                json!({"name":"github_read"}),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while daemon.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        daemon.requests().len(),
+        1,
+        "the upstream must actually be reached"
+    );
+    assert_eq!(transport.leases.holders.lock().await.len(), 1);
+    caller.abort();
+    let _ = caller.await;
+    assert_eq!(
+        daemon.closes(1).await.len(),
+        1,
+        "canceled forwarding must close the scoped handle"
+    );
+    assert!(
+        transport.leases.holders.lock().await.is_empty(),
+        "no canceled lease/map entry may remain"
+    );
+}
