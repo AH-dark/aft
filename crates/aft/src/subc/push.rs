@@ -694,6 +694,15 @@ fn matching_route_channels(
     root: &ProjectRootId,
     frame: &PushFrame,
 ) -> Vec<RouteChannel> {
+    // A progress frame carries one request's command output but no route of its
+    // own, so the session filter below would copy it to every route bound to the
+    // root: other sessions saw the output, and one chunk multiplied by ~45 routes
+    // on one client overflowed the daemon's per-client byte budget and dropped
+    // the connection. Until progress carries its originating route, send it to
+    // no one; callers still get the full output in the tool reply.
+    if matches!(frame, PushFrame::Progress(_)) {
+        return Vec::new();
+    }
     let Some(channels) = root_channels.get(root) else {
         return Vec::new();
     };
