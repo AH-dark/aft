@@ -282,13 +282,17 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                     const state = sessions.get(sessionID);
                     // Collect the in-memory kill targets before the entry is
                     // dropped; killStoppedBackgroundTasks reads them from it.
-                    const kills = state
-                      ? killStoppedBackgroundTasks(context, sessionID)
-                      : Promise.resolve();
+                    // It also asks the bridge for the tasks this session owns:
+                    // after a plugin reload a running command may be known
+                    // only there, with no in-memory entry for the session.
+                    const kills = killStoppedBackgroundTasks(context, sessionID, ctx);
                     rememberDeleted(context, sessionID);
                     sessions.delete(sessionID);
                     releaseSessionState(sessionID);
-                    if (!state) return;
+                    if (!state) {
+                      void kills.finally(() => releaseSessionState(sessionID));
+                      return;
+                    }
                     state.settling?.resolve();
                     state.settling = undefined;
                     state.stopped = true;

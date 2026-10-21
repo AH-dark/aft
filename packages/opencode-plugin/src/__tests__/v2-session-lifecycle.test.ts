@@ -404,3 +404,60 @@ test("V2 replies arriving after session deletion cannot recreate session state",
     sessionBgStates.clear();
   }
 });
+
+test("V2 session deletion after a reload kills only the tasks the bridge says that session owns", async () => {
+  _resetSubagentCacheForTest();
+  const bus = await Effect.runPromise(
+    PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  // Persisted task ownership as the engine keeps it; after a plugin reload
+  // nothing about these tasks is held in memory.
+  const owned: Record<string, string[]> = {
+    "deleted-child": ["bash-deleted-owned"],
+    "live-sibling": ["bash-sibling-owned"],
+  };
+  const bridge = {
+    // Mirrors the engine's bash_owned_tasks reply: the running tasks of the
+    // session the request is bound to, never another session's.
+    send: async (name: string, args: Record<string, unknown>) => {
+      calls.push({ name, args });
+      if (name === "bash_owned_tasks") {
+        const session = String(args.session_id ?? "");
+        return { success: true, task_ids: owned[session] ?? [], skipped_missing_owner: 0 };
+      }
+      return { success: true };
+    },
+  };
+  const host = {
+    location: { directory: process.cwd() },
+    event: { subscribe: () => Stream.fromPubSub(bus) },
+    session: { get: () => Effect.succeed({ parentID: "parent" }) },
+  };
+  const ctx = {
+    client: host,
+    pool: { getBridge: () => bridge, getActiveBridgeForRoot: () => bridge },
+    config: {},
+  } as unknown as PluginContext;
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host, ctx).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    await Effect.runPromise(
+      PubSub.publish(bus, { type: "session.deleted", data: { sessionID: "deleted-child" } }),
+    );
+    await Bun.sleep(20);
+    const kills = calls.filter((call) => call.name === "bash_kill");
+    expect(kills.map((call) => call.args.task_id)).toEqual(["bash-deleted-owned"]);
+    expect(kills.every((call) => call.args.session_id === "deleted-child")).toBe(true);
+    expect(
+      calls.some(
+        (call) => call.name === "bash_owned_tasks" && call.args.session_id === "deleted-child",
+      ),
+    ).toBe(true);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    sessionBgStates.clear();
+  }
+});
