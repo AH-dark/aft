@@ -196,8 +196,9 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<ReaderFloor, FloorError> {
 /// the per-store maximum. Never lowers any store and never drops a store name
 /// this build does not know. Writes nothing when the floor already covers the
 /// requirements. Refuses (without writing) when the existing floor cannot be
-/// interpreted. Even a covered request re-syncs the storage-root directory:
-/// a previous raise may have renamed the floor but failed to sync that rename.
+/// interpreted. A covered v3 request re-syncs the storage-root directory: a
+/// previous raise may have renamed the floor but failed to sync that rename.
+/// Covered legacy requests keep their existing no-sync behavior.
 pub fn raise(
     storage_root: &Path,
     requirements: &[(PersistedStore, u32)],
@@ -231,10 +232,12 @@ pub fn raise(
         )
     });
     if current.as_ref() == Some(&next) {
-        sync_dir(storage_root, strict).map_err(|error| FloorError::Io {
-            path: storage_root.to_path_buf(),
-            error,
-        })?;
+        if strict {
+            sync_dir(storage_root, strict).map_err(|error| FloorError::Io {
+                path: storage_root.to_path_buf(),
+                error,
+            })?;
+        }
         return Ok(next);
     }
     write_atomic(&path, &next, strict)?;
@@ -242,9 +245,9 @@ pub fn raise(
 }
 
 /// Raise the floor for `store` to `version`, then run `write`. The floor is
-/// durable before the first byte of the new format exists, so a crash after
-/// the raise leaves the floor ahead of the data, never behind it. If raising
-/// fails, `write` does not run.
+/// installed before the first byte of the new format exists. Directory sync
+/// is required for v3 stores but remains best-effort for legacy stores. If
+/// raising fails, `write` does not run.
 pub fn publish_with_floor<T>(
     storage_root: &Path,
     store: PersistedStore,
@@ -311,17 +314,13 @@ fn write_atomic(path: &Path, floor: &ReaderFloor, strict: bool) -> Result<(), Fl
 
 fn sync_dir(dir: &Path, strict: bool) -> io::Result<()> {
     let result = crate::durability::sync_dir(dir);
-    // Legacy floor writers have always tolerated filesystems without directory
-    // fsync support. V3 publication requires that guarantee and must refuse.
-    #[cfg(unix)]
-    if !strict && result.as_ref().is_err_and(|error| {
-        matches!(error.raw_os_error(), Some(errno) if errno == libc::EINVAL || errno == libc::ENOTSUP)
-    }) {
-        return Ok(());
+    // Legacy floor writers ignore every directory-sync error. Only v3 writers
+    // require directory durability before their publication closure may run.
+    if strict {
+        result
+    } else {
+        Ok(())
     }
-    #[cfg(not(unix))]
-    let _ = strict;
-    result
 }
 
 #[cfg(not(test))]
@@ -572,13 +571,56 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn floor_write_propagates_directory_sync_failure() {
+    fn covered_legacy_raise_performs_no_directory_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let requirements = [(PersistedStore::SearchIndex, 4)];
+        raise(root.path(), &requirements).unwrap();
+        let before = fs::read(floor_path(root.path())).unwrap();
+        crate::durability::take();
+        raise(root.path(), &requirements).unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_raise_ignores_eio_directory_sync_failure() {
+        let root = tempfile::tempdir().unwrap();
+        fail_directory_sync(root.path(), Some(libc::EIO));
+        let result = raise(root.path(), &[(PersistedStore::SearchIndex, 4)]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            read(root.path())
+                .unwrap()
+                .unwrap()
+                .get(PersistedStore::SearchIndex),
+            Some(4)
+        );
+        assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+        fail_directory_sync(root.path(), Some(libc::EIO));
+        let mut wrote = false;
+        publish_with_floor(root.path(), PersistedStore::SearchIndex, 5, || wrote = true).unwrap();
+        assert!(wrote);
+        assert_eq!(
+            read(root.path())
+                .unwrap()
+                .unwrap()
+                .get(PersistedStore::SearchIndex),
+            Some(5)
+        );
+        assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_floor_write_propagates_directory_sync_failure() {
         let root = tempfile::tempdir().unwrap();
         crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
             *slot.borrow_mut() = Some(root.path().to_path_buf());
         });
         let mut wrote = false;
-        let result = publish_with_floor(root.path(), PersistedStore::SearchIndex, 4, || {
+        let result = publish_v3_with_floor(root.path(), 1, 1, || {
             wrote = true;
         });
         assert!(matches!(result, Err(FloorError::Io { .. })), "{result:?}");
@@ -587,9 +629,9 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn covered_floor_resyncs_without_rewriting_and_propagates_failure() {
+    fn covered_v3_floor_resyncs_without_rewriting_and_propagates_failure() {
         let root = tempfile::tempdir().unwrap();
-        let requirements = [(PersistedStore::SearchIndex, 4)];
+        let requirements = [(PersistedStore::ViewsV3Store, 1)];
         raise(root.path(), &requirements).unwrap();
         let before = fs::read(floor_path(root.path())).unwrap();
         let stamp = fs::metadata(floor_path(root.path()))
@@ -675,9 +717,6 @@ pub(crate) mod tests {
                 crate::durability::FAIL_DIRECTORY_SYNC_ERRNO.with(|slot| slot.get()),
                 None
             );
-            fail_directory_sync(root.path(), Some(errno));
-            raise(root.path(), &[(PersistedStore::SearchIndex, next)]).unwrap();
-            assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
         }
     }
     use std::cell::RefCell;

@@ -136,20 +136,21 @@ already covers its versions. There is no first-write decision or pending flag.
 `raise` holds the cross-process floor lock and preserves every existing store
 name, including unknown names, taking a separate maximum for each requirement.
 It never rewrites an uninterpretable floor. Changed floors use a temporary
-file, file sync, rename and storage-root directory sync; a failed directory
-sync returns `FloorError::Io`, leaving the closure uncalled. A rename may have
-already installed the higher floor when sync fails. Consequently, an
-already-covered raise writes no floor bytes but **always re-syncs the storage
-root**, propagating failure again. A subsequent process can safely retry
-without relying on the previous process's memory.
+file, file sync, rename and storage-root directory sync. A request naming either
+v3 store is strict: a failed directory sync returns `FloorError::Io`, leaving
+the closure uncalled. A rename may have already installed the higher floor
+when sync fails. Consequently, an already-covered **strict** raise writes no
+floor bytes but always re-syncs the storage root, propagating failure again.
+A subsequent process can safely retry without relying on the previous
+process's memory.
 
-On Unix, EINVAL and ENOTSUP from directory sync are tolerated only when the
-request names no v3 store. This preserves the old startup baseline and
-old-store `publish_with_floor` behavior on filesystems without directory-fsync
-support. A requirement naming either v3 store is strict and refuses those
-errors too. Other sync errors propagate for old and new stores alike.
-`durability::sync_dir` itself retains its existing platform policy; the
-legacy exception belongs only to reader floors.
+Requests naming no v3 store preserve the legacy behavior: an already-covered
+raise performs no directory sync, and a changed floor attempts directory sync
+but ignores every resulting error, including EIO, EACCES, EINVAL and ENOTSUP.
+The startup baseline and old-store `publish_with_floor` therefore gain neither
+a covered-request fsync nor a new directory-sync failure. Strict v3 requests
+refuse all directory-sync errors. `durability::sync_dir` itself retains its
+existing platform policy; the legacy exception belongs only to reader floors.
 
 On non-Unix, `durability::sync_dir` remains a no-op `Ok`. **Non-Unix directory
 durability is unverified**; a cross-compile is not a durability test. All
