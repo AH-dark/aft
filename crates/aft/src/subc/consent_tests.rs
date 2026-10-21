@@ -3442,6 +3442,89 @@ async fn consent_route_close_reaches_the_approved_rerun() {
 }
 
 #[cfg(unix)]
+static ELICITED_RERUN_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static ELICITED_RERUN_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static ELICITED_RERUN_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Writes normally, except that a write approved by reverse elicitation (one
+/// carrying `once` approvals) first waits up to five seconds for its job to
+/// be cancelled. It records whether it was, and writes only if it was not.
+#[cfg(unix)]
+fn blocking_elicited_write(request: RawRequest, ctx: &AppContext) -> Response {
+    if let AskRoute::Elicitation { once } = crate::access_policy::current_ask_route() {
+        if !once.is_empty() {
+            ELICITED_RERUN_STARTED.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::executor::current_job_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let cancelled = crate::executor::current_job_cancelled();
+            ELICITED_RERUN_CANCELLED.store(cancelled, Ordering::SeqCst);
+            let response = if cancelled {
+                Response::error(&request.id, "request_cancelled", "rerun stopped")
+            } else {
+                crate::commands::write::handle_write(&request, ctx)
+            };
+            ELICITED_RERUN_DONE.store(true, Ordering::SeqCst);
+            return response;
+        }
+    }
+    crate::commands::write::handle_write(&request, ctx)
+}
+
+/// An untrusted consumer that approves an outside write by reverse
+/// elicitation and then closes its route while the approved write is running
+/// gets the write stopped: the job is cancelled, the file is unchanged, and
+/// the call is no longer tracked for a later reply.
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_route_close_cancels_the_approved_rerun() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    ELICITED_RERUN_STARTED.store(false, Ordering::SeqCst);
+    ELICITED_RERUN_DONE.store(false, Ordering::SeqCst);
+    ELICITED_RERUN_CANCELLED.store(false, Ordering::SeqCst);
+    let f = fixture(FakeCingulate::up());
+    let corr = 9_100_003;
+    let target = f.head_root.join("shared.txt");
+    let before = std::fs::read_to_string(&target).unwrap();
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "write",
+            json!({"path": target, "content": "approved outside write"}),
+            corr,
+            blocking_elicited_write,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    wait_for(|| ELICITED_RERUN_STARTED.load(Ordering::SeqCst)).await;
+    note_route_closed(route_key(41, 1));
+    wait_for(|| ELICITED_RERUN_DONE.load(Ordering::SeqCst)).await;
+    assert!(
+        ELICITED_RERUN_CANCELLED.load(Ordering::SeqCst),
+        "closing the route must cancel the approved write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        before,
+        "the approved write must not land after the route closed"
+    );
+    wait_for(|| !active_tool_call_is_registered(&f.active, route_key(41, 1), corr)).await;
+    f.connection_cancel.cancel();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
     let _lock = CONSENT_TEST_LOCK.lock().await;

@@ -232,7 +232,31 @@ where
             return None;
         }
         once.push(grant);
-        result = rerun(AskRoute::Elicitation { once: once.clone() }).await;
+        let running = rerun(AskRoute::Elicitation { once: once.clone() });
+        tokio::pin!(running);
+        result = loop {
+            tokio::select! {
+                done = &mut running => break done,
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    // The consumer closed the route while the approved run
+                    // was in flight. Route teardown keeps a started job so a
+                    // rebound route can collect its reply, so stop the run
+                    // here (it is the call's active job); otherwise the
+                    // approved outside write could still land after the
+                    // consumer withdrew.
+                    if route_hold.closed() {
+                        cancel_active_tool_call(
+                            &call.active,
+                            &call.executor,
+                            call.route,
+                            call.corr,
+                            "route closed during an approved outside-path rerun",
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
     }
     if consent::requested_ask(&result.0).is_some() {
         let response = Response::error(
