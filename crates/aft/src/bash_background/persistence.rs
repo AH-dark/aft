@@ -3575,6 +3575,34 @@ fn resolved_root_keeps_the_plain_spelling() {
     assert_eq!(resolve_configured_root(temp.path()).unwrap(), resolved);
 }
 
+/// Windows will not rename a directory while a file inside it is open: the
+/// rename fails with ERROR_ACCESS_DENIED (os error 5) even though every handle
+/// shares delete access. Publishing a staged cache folder must therefore close
+/// the lock file it holds inside that folder before renaming it.
+#[cfg(windows)]
+#[test]
+fn windows_directory_rename_waits_for_files_inside_to_close() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = PinnedDir::open(temp.path()).unwrap();
+    let staging = OsStr::new(".staging");
+    let published = OsStr::new("published");
+    let folder = parent.repair_create_dir(staging).unwrap();
+    let lock = folder
+        .repair_coordination_file(OsStr::new("in-use.lock"))
+        .unwrap();
+    lock.try_lock_shared().unwrap();
+    let source = parent.repair_entry_for_rename(staging).unwrap();
+    let refused = parent
+        .repair_rename_entry_to(staging, &source, &parent, published)
+        .expect_err("rename with an open file inside");
+    assert_eq!(refused.raw_os_error(), Some(5), "{refused}");
+    drop(lock);
+    parent
+        .repair_rename_entry_to(staging, &source, &parent, published)
+        .unwrap();
+    assert!(temp.path().join("published").join("in-use.lock").is_file());
+}
+
 #[cfg(unix)]
 #[test]
 fn configured_root_is_resolved_once_and_refused_after_it_is_retargeted() {

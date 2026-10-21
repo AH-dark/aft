@@ -998,6 +998,15 @@ pub fn prepare_cache_root(
                 if pinned_identity(&source.directory()?)? != expected_root {
                     return Err(io::Error::other("enrollment source identity changed"));
                 }
+                // Windows refuses to rename a directory while a file inside it
+                // is open (ERROR_ACCESS_DENIED), and the staging lease holds
+                // `.aft-in-use.lock` open in the folder being published. Close
+                // that lease first. Cleanup cannot step in meanwhile: it needs
+                // the history lock held above, and the pending record still
+                // protects the staging folder. The lease is taken again on
+                // `aft` right after the rename.
+                #[cfg(windows)]
+                drop(lease);
                 // No-replace publication must refuse even an empty foreign folder
                 // or symlink installed at the destination during registration.
                 parent_pin.repair_rename_entry_to(

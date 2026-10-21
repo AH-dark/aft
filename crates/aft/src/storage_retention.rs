@@ -4644,6 +4644,13 @@ mod storage_retention_tests {
                 }
             }),
         );
+        // Windows will not rename a folder while a file inside it is open, and
+        // the cache lease keeps the root's in-use lock open. Release it so the
+        // substitution below can be staged; the removal must still refuse it.
+        #[cfg(windows)]
+        {
+            config.cache_lease = None;
+        }
         fs::rename(&root, &parked).unwrap();
         fs::rename(&foreign, &root).unwrap();
         let result = remove_directory_if_closed(&cache);
@@ -4876,6 +4883,13 @@ mod storage_retention_tests {
         };
         assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
         let paths = StoragePaths::for_config(&config);
+        // Windows will not move a folder while a file below it is open, and the
+        // cache lease keeps the root's in-use lock open. Release it so the
+        // volume can be taken away for this test.
+        #[cfg(windows)]
+        {
+            config.cache_lease = None;
+        }
         fs::rename(&parent, temp.path().join("unmounted")).unwrap();
         assert!(cache_barrier(&paths).is_err());
         assert!(
