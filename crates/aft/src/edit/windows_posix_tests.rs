@@ -97,6 +97,9 @@ fn windows_posix_unsupported_volume_falls_back() {
         ERROR_INVALID_FUNCTION,
     ] {
         assert_fallback(Fault::Rename(code));
+        // The benchmark's unsupported-filesystem counter reads this prefix.
+        let reason = LAST_REASON.with(|reason| reason.borrow().clone());
+        assert!(reason.starts_with("rename unsupported:"), "{code}: {reason}");
     }
 }
 
@@ -109,6 +112,9 @@ fn windows_posix_rename_constraints_fall_back() {
         ERROR_USER_MAPPED_FILE,
     ] {
         assert_fallback(Fault::Rename(code));
+        // Per-file refusals must not count as unsupported filesystems.
+        let reason = LAST_REASON.with(|reason| reason.borrow().clone());
+        assert!(reason.starts_with("rename failed:"), "{code}: {reason}");
     }
 }
 

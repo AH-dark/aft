@@ -508,22 +508,30 @@ pub(super) fn replace(destination: &Path, replacement: &Path, parent: &Path) -> 
             Err(error)
                 if matches!(
                     error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION)
+                ) =>
+            {
+                // The volume or API does not support POSIX rename. The benchmark
+                // counts these under "rename unsupported:" as unsupported-filesystem
+                // fallbacks, separate from per-file refusals below.
+                record(Method::ReplaceFile, &format!("rename unsupported: {error}"));
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error().map(|code| code as u32),
                     Some(
-                        ERROR_NOT_SUPPORTED
-                            | ERROR_INVALID_PARAMETER
-                            | ERROR_INVALID_FUNCTION
-                            | ERROR_ACCESS_DENIED
+                        ERROR_ACCESS_DENIED
                             | ERROR_SHARING_VIOLATION
                             | ERROR_LOCK_VIOLATION
                             | ERROR_USER_MAPPED_FILE
                     )
                 ) =>
             {
-                // Unsupported rename APIs, delete-access restrictions, sharing,
-                // locks and mappings can prohibit replacement but permit writing
-                // the existing file. Try ReplaceFileW, then the caller's in-place
-                // rewrite with a recovery copy. Other errors (such as missing
-                // paths or disk/I/O failures) still abort without another method.
+                // Delete-access restrictions, sharing, locks and mappings can
+                // prohibit replacement but permit writing the existing file. Try
+                // ReplaceFileW, then the caller's in-place rewrite with a recovery
+                // copy. Other errors (such as missing paths or disk/I/O failures)
+                // still abort without another method.
                 record(Method::ReplaceFile, &format!("rename failed: {error}"));
             }
             Err(error) => {
