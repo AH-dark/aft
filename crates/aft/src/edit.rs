@@ -1364,10 +1364,40 @@ pub fn attach_preview_diff(
     result["preview_diff"] = serde_json::json!(patch);
 }
 
+/// Longest a line diff may search for a minimal edit script. Past it,
+/// `similar` stops refining and returns a diff that is still correct but
+/// coarser (larger replaced blocks), so a pathological before/after pair
+/// cannot stall an edit's reply. Measured diffs of 7,000 changed lines take
+/// about half a second, so ordinary edits never reach it.
+const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Replaces [`DIFF_TIMEOUT`] for tests that compare the diff with an
+    /// untimed reference: on a loaded machine a debug build can reach the
+    /// real limit and return the coarser diff the limit exists for.
+    static DIFF_TIMEOUT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn construct_diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
     #[cfg(test)]
+    if let Some(timeout) = DIFF_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return construct_diff_with_timeout(before, after, timeout);
+    }
+    construct_diff_with_timeout(before, after, DIFF_TIMEOUT)
+}
+
+fn construct_diff_with_timeout<'a>(
+    before: &'a str,
+    after: &'a str,
+    timeout: std::time::Duration,
+) -> similar::TextDiff<'a, 'a, 'a, str> {
+    #[cfg(test)]
     A03_DIFF_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
-    similar::TextDiff::from_lines(before, after)
+    similar::TextDiff::configure()
+        .timeout(timeout)
+        .diff_lines(before, after)
 }
 
 fn counts_from_diff<'a>(diff: &similar::TextDiff<'a, 'a, 'a, str>) -> (usize, usize) {
@@ -2303,8 +2333,62 @@ mod tests {
         assert!(result.rolled_back);
         assert_eq!(result.syntax_error_line, None);
     }
+    /// A line diff that runs out of time still describes the edit exactly:
+    /// replaying its changes rebuilds both texts, and its counts agree with
+    /// the line totals. It is only coarser than the untimed diff.
+    #[test]
+    fn timed_out_diff_is_coarser_but_still_correct() {
+        let before = (0..4_000)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
+        let after = (0..4_000)
+            .map(|i| {
+                if i % 3 == 0 {
+                    format!("changed {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect::<String>();
+        let untimed = similar::TextDiff::from_lines(&before, &after);
+        let timed_out = construct_diff_with_timeout(&before, &after, std::time::Duration::ZERO);
+        fn changed<'a>(diff: &similar::TextDiff<'a, 'a, 'a, str>) -> usize {
+            diff.iter_all_changes()
+                .filter(|change| change.tag() != similar::ChangeTag::Equal)
+                .count()
+        }
+        assert!(
+            changed(&timed_out) > changed(&untimed),
+            "a zero timeout did not coarsen the diff, so the deadline was not applied"
+        );
+        let mut rebuilt_before = String::new();
+        let mut rebuilt_after = String::new();
+        for change in timed_out.iter_all_changes() {
+            match change.tag() {
+                similar::ChangeTag::Equal => {
+                    rebuilt_before.push_str(change.value());
+                    rebuilt_after.push_str(change.value());
+                }
+                similar::ChangeTag::Delete => rebuilt_before.push_str(change.value()),
+                similar::ChangeTag::Insert => rebuilt_after.push_str(change.value()),
+            }
+        }
+        assert_eq!(rebuilt_before, before);
+        assert_eq!(rebuilt_after, after);
+        let (additions, deletions) = counts_from_diff(&timed_out);
+        assert_eq!(additions, deletions, "both texts have 4,000 lines");
+        assert!(timed_out
+            .unified_diff()
+            .header("a.txt", "a.txt")
+            .to_string()
+            .contains("+changed 0\n"));
+    }
     #[test]
     fn a03_diff_construction_bound_and_output_goldens() {
+        // The goldens are the untimed diff; keep the time limit out of reach
+        // so a loaded machine cannot make this test compare a coarser diff.
+        DIFF_TIMEOUT_OVERRIDE
+            .with(|timeout| timeout.set(Some(std::time::Duration::from_secs(3600))));
         let cases = [
             (String::new(), "é\r\n".to_owned()),
             ("same\n".to_owned(), "same\n".to_owned()),
@@ -2376,6 +2460,7 @@ mod tests {
                 );
             }
         }
+        DIFF_TIMEOUT_OVERRIDE.with(|timeout| timeout.set(None));
     }
 
     #[test]
