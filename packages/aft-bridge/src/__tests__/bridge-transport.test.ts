@@ -19,6 +19,7 @@ import { BridgePool } from "../pool.js";
 import { findBinarySync } from "../resolver.js";
 import { cachedExecutable, linkCachedExecutable } from "./test-utils/cached-executable.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
+import { ManualClock } from "./test-utils/manual-clock.js";
 
 let workDir: string;
 
@@ -129,21 +130,28 @@ process.stdin.on("data", chunk => {
 });
 `,
     );
+    const clock = new ManualClock();
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1000,
       hangWindowMinMs: 1000,
       maxRestarts: 0,
+      clock,
     });
     // An unanswered call, then a second one still waiting when the child has
     // been silent for the 1000 ms window (sent at 700 ms, waiting until 1200).
+    // Time moves only through the manual clock, so this cannot race the load.
     const silentPair = async (): Promise<string> => {
-      const start = Date.now();
-      await expect(bridge.send("silent", {}, { timeoutMs: 100 })).rejects.toThrow("timed out");
-      await new Promise((resolve) => setTimeout(resolve, Math.max(0, start + 700 - Date.now())));
-      return bridge.send("silent", {}, { timeoutMs: 500 }).then(
+      const first = bridge.send("silent", {}, { timeoutMs: 100 });
+      clock.advance(100);
+      await expect(first).rejects.toThrow("timed out");
+      clock.advance(600);
+      const second = bridge.send("silent", {}, { timeoutMs: 500 }).then(
         () => "resolved",
         (err: unknown) => (err instanceof Error ? err.name : String(err)),
       );
+      clock.advance(300);
+      clock.advance(200);
+      return second;
     };
     try {
       await bridge.send("configure", {}, { timeoutMs: 5000 });
@@ -161,7 +169,7 @@ process.stdin.on("data", chunk => {
     } finally {
       await bridge.shutdown();
     }
-  }, 15_000);
+  });
 
   test("completion drain timeouts never escalate into a startup kill", async () => {
     const script = writeExecutable(

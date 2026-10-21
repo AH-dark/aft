@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { BinaryBridge } from "../bridge.js";
 import type { Logger, LogMeta } from "../logger.js";
 import { cachedExecutable } from "./test-utils/cached-executable.js";
+import { ManualClock } from "./test-utils/manual-clock.js";
 
 let workDir: string;
 
@@ -121,39 +122,59 @@ function settle<T>(promise: Promise<T>): Promise<{ value?: T; error?: unknown }>
   );
 }
 
-function sleepUntil(at: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, at - Date.now())));
+/** Poll real time (not the bridge clock) until the fake engine has logged `tool`. */
+async function waitForLogged(tool: string, generation: number): Promise<void> {
+  const giveUpAt = Date.now() + 5_000;
+  while (!loggedRequests().some((r) => r.tool === tool && r.generation === generation)) {
+    if (Date.now() > giveUpAt) throw new Error(`engine never received ${tool} (gen ${generation})`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
-function bridgeWithWindow(windowMinMs: number, logger?: Logger): BinaryBridge {
+function bridgeWithClock(clock: ManualClock, logger?: Logger): BinaryBridge {
   return new BinaryBridge(cachedExecutable(FAKE_ENGINE), workDir, {
     timeoutMs: 5_000,
     maxRestarts: 0,
-    hangWindowMinMs: windowMinMs,
+    hangWindowMinMs: WINDOW_MS,
+    clock,
     ...(logger ? { logger } : {}),
-  } as ConstructorParameters<typeof BinaryBridge>[2]);
+  });
+}
+
+/** Pending request count, read from the bridge's internals. */
+function pendingCount(bridge: BinaryBridge): number {
+  return (bridge as unknown as { pending: Map<string, unknown> }).pending.size;
 }
 
 /**
  * Wedge the generation-1 engine with a call that times out on its own, then,
  * while the engine stays silent, start `tool` from another session so that it
- * is still waiting when the silence reaches the window.
+ * is still waiting when the silence reaches the window. Time moves only
+ * through the manual clock, so every step below happens at an exact instant.
  *
  * Timeline from the wedge (W = WINDOW_MS = 1000 ms): the wedge times out at
- * 100 ms; `tool` is sent at 700 ms with a 500 ms budget, so it waits until
- * 1200 ms; the window stays 1000 ms (twice 500 ms), so the watchdog fires at
- * about 1000 ms while `tool` is still waiting.
+ * 100 ms; `tool` is sent at 700 ms with a 500 ms budget, so it would wait until
+ * 1200 ms; the window stays 1000 ms (twice 500 ms). At 999 ms nothing has
+ * been killed; at 1000 ms the watchdog fires while `tool` is still waiting.
  */
 async function wedgeThen(
   bridge: BinaryBridge,
+  clock: ManualClock,
   tool: string,
 ): Promise<{ value?: Record<string, unknown>; error?: unknown }> {
-  const start = Date.now();
-  const wedge = await settle(bridge.toolCall("wedge-session", "wedge", {}, { timeoutMs: 100 }));
-  expect(String((wedge.error as Error | undefined)?.message)).toContain("timed out");
-  await sleepUntil(start + 700);
+  const wedge = settle(bridge.toolCall("wedge-session", "wedge", {}, { timeoutMs: 100 }));
+  clock.advance(100);
+  expect(String(((await wedge).error as Error | undefined)?.message)).toContain("timed out");
+  clock.advance(600);
+  const call = settle(bridge.toolCall("other-session", tool, {}, { timeoutMs: 500 }));
+  // The engine must have read the call before it is killed, so the request
+  // log can show which generation saw it.
+  await waitForLogged(tool, 1);
+  clock.advance(299);
   expect(bridge.isAlive()).toBe(true);
-  return settle(bridge.toolCall("other-session", tool, {}, { timeoutMs: 500 }));
+  expect(pendingCount(bridge)).toBe(1);
+  clock.advance(1);
+  return call;
 }
 
 describe("request timeouts are isolated from other requests", () => {
@@ -211,14 +232,13 @@ describe("request timeouts are isolated from other requests", () => {
 });
 
 describe("hang watchdog", () => {
-  test("a silent child with a waiting call is killed after the window; an edit gets the typed error and is not retried", async () => {
+  test("a silent child with a waiting call is killed at the window; an edit gets the typed error and is not retried", async () => {
     const { logger, logs } = recordingLogger();
-    const bridge = bridgeWithWindow(WINDOW_MS, logger);
+    const clock = new ManualClock();
+    const bridge = bridgeWithClock(clock, logger);
     try {
       await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
-      const start = Date.now();
-      const edit = await wedgeThen(bridge, "edit");
-      const elapsed = Date.now() - start;
+      const edit = await wedgeThen(bridge, clock, "edit");
 
       const error = edit.error as
         | (Error & { retryable?: boolean; outcomeUnknown?: boolean; tool?: string })
@@ -228,21 +248,19 @@ describe("hang watchdog", () => {
       expect(error?.outcomeUnknown).toBe(true);
       expect(error?.tool).toBe("edit");
       expect(error?.message).toContain("inspect before repeating it");
-      // Killed by the watchdog at the window, not by the edit's own timer.
-      expect(elapsed).toBeGreaterThanOrEqual(WINDOW_MS - 50);
       expect(bridge.isAlive()).toBe(false);
 
       // The edit reached only the killed child; nothing re-sent it.
       expect(loggedRequests().filter(({ tool }) => tool === "edit")).toEqual([
         expect.objectContaining({ generation: 1 }),
       ]);
-      expect(existsSync(join(workDir, "spawns"))).toBe(true);
       expect(readFileSync(join(workDir, "spawns"), "utf8").trim().split("\n")).toHaveLength(1);
 
       const killLog = logs.find(
         ({ level, message }) =>
           level === "error" && message.includes("Bridge killed after timeout of the hang watchdog"),
       );
+      expect(killLog?.message).toContain("silent_ms=1000");
       expect(killLog?.message).toContain(`hang_window_ms=${WINDOW_MS}`);
       expect(killLog?.message).toContain('oldest_unanswered_tool="wedge"');
       expect(killLog?.message).toContain('"tool":"edit","retry":false');
@@ -250,13 +268,14 @@ describe("hang watchdog", () => {
     } finally {
       await bridge.shutdown();
     }
-  }, 10_000);
+  });
 
   test("a read cut off by the watchdog is retried once and succeeds on the respawned child", async () => {
-    const bridge = bridgeWithWindow(WINDOW_MS);
+    const clock = new ManualClock();
+    const bridge = bridgeWithClock(clock);
     try {
       await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
-      const read = await wedgeThen(bridge, "read");
+      const read = await wedgeThen(bridge, clock, "read");
 
       expect(read.error).toBeUndefined();
       expect(read.value).toMatchObject({ success: true, tool: "read", generation: 2 });
@@ -269,42 +288,49 @@ describe("hang watchdog", () => {
     } finally {
       await bridge.shutdown();
     }
-  }, 10_000);
+  });
 
   test("a child that keeps answering other calls is never killed, even with an unanswered call waiting past the window", async () => {
-    const bridge = bridgeWithWindow(WINDOW_MS);
-    let pumping = true;
+    const clock = new ManualClock();
+    const bridge = bridgeWithClock(clock);
+    const internals = bridge as unknown as { process: { pid?: number } };
+    // Another session's call, answered by the engine at the current instant.
+    const answeredCall = async (): Promise<void> => {
+      expect(await bridge.toolCall("busy-session", "grep", {}, { timeoutMs: 1_000 })).toMatchObject(
+        { success: true, tool: "grep" },
+      );
+    };
     try {
       await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
-      const pid = (bridge as unknown as { process: { pid?: number } }).process.pid;
-      // Other sessions keep getting answers every 50 ms throughout.
-      const pump = (async () => {
-        while (pumping) {
-          await bridge.toolCall("busy-session", "grep", {}, { timeoutMs: 1_000 });
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-      })();
+      const pid = internals.process.pid;
 
       // The same timeline as `wedgeThen`, except that the engine keeps
-      // answering the traffic above. Without that traffic, `second` would
-      // still be waiting when the child had been silent for the window.
-      const start = Date.now();
-      const first = await settle(bridge.toolCall("stuck-session", "never", {}, { timeoutMs: 100 }));
-      expect(String((first.error as Error | undefined)?.message)).toContain("timed out");
-      await sleepUntil(start + 700);
-      const second = await settle(
-        bridge.toolCall("stuck-session", "never", {}, { timeoutMs: 500 }),
-      );
-      expect(String((second.error as Error | undefined)?.message)).toContain("timed out");
-      expect((second.error as Error).name).not.toBe("BridgeRestartedError");
-
-      pumping = false;
-      await pump;
+      // answering other calls (at 300, 650 and 900 ms). Without those
+      // answers, `second` would still be waiting at 1000 ms, when the
+      // child would have been silent for the whole window.
+      const first = settle(bridge.toolCall("stuck-session", "never", {}, { timeoutMs: 100 }));
+      clock.advance(100);
+      expect(String(((await first).error as Error | undefined)?.message)).toContain("timed out");
+      clock.advance(200);
+      await answeredCall();
+      clock.advance(350);
+      await answeredCall();
+      clock.advance(50);
+      const second = settle(bridge.toolCall("stuck-session", "never", {}, { timeoutMs: 500 }));
+      clock.advance(200);
+      await answeredCall();
+      clock.advance(100);
       expect(bridge.isAlive()).toBe(true);
-      expect((bridge as unknown as { process: { pid?: number } }).process.pid).toBe(pid);
+      expect(pendingCount(bridge)).toBe(1);
+      clock.advance(200);
+      const secondError = (await second).error as Error | undefined;
+      expect(String(secondError?.message)).toContain("timed out after 500ms");
+      expect(secondError?.name).not.toBe("BridgeRestartedError");
+
+      expect(bridge.isAlive()).toBe(true);
+      expect(internals.process.pid).toBe(pid);
     } finally {
-      pumping = false;
       await bridge.shutdown();
     }
-  }, 10_000);
+  });
 });

@@ -201,10 +201,33 @@ export function compareSemver(a: string, b: string): number {
   return 0;
 }
 
+/** Opaque handle returned by {@link BridgeClock.setTimeout}. */
+export type BridgeTimer = unknown;
+
+/**
+ * Time source for request deadlines, the bash late-reply grace and the hang
+ * watchdog. Production uses the system clock; tests inject a manual clock so
+ * deadlines and the watchdog fire exactly when the test advances time,
+ * independent of machine load.
+ */
+export interface BridgeClock {
+  now(): number;
+  setTimeout(callback: () => void, ms: number): BridgeTimer;
+  clearTimeout(timer: BridgeTimer): void;
+}
+
+// Looks up the global timer functions at call time, so code that replaces
+// globalThis.setTimeout (as some tests do) still sees bridge timers.
+const SYSTEM_CLOCK: BridgeClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: BridgeTimer;
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   onSettled?: () => void;
   command: string;
@@ -406,6 +429,11 @@ export interface BridgeOptions {
    */
   hangWindowMinMs?: number;
   /**
+   * Time source for request deadlines, the bash late-reply grace and the hang
+   * watchdog. Default: the system clock. Tests inject a manual clock.
+   */
+  clock?: BridgeClock;
+  /**
    * How long a `bash`/`powershell` call that timed out with
    * `keepBridgeOnTimeout` keeps waiting for AFT's late reply, so its timeout
    * error can name the task AFT started. 0 rejects at the deadline. Default:
@@ -588,6 +616,7 @@ export class BinaryBridge implements AftProjectTransport {
   private _shuttingDown = false;
   private timeoutMs: number;
   private hangWindowMinMs: number;
+  private readonly clock: BridgeClock;
   private lateShellReplyGraceMs: number;
   private maxRestarts: number;
   private configured = false;
@@ -630,7 +659,7 @@ export class BinaryBridge implements AftProjectTransport {
     string,
     { sentAt: number; budgetMs: number; tool: string; sessionId: string | undefined }
   >();
-  private hangWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private hangWatchdogTimer: BridgeTimer | null = null;
   /** Set once per child when a suppressed watchdog kill has been logged. */
   private hangSuppressionLogged = false;
   // One watchdog restart may recover a genuine hang. Restarting again before
@@ -655,6 +684,7 @@ export class BinaryBridge implements AftProjectTransport {
     this.cwd = cwd;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
     this.hangWindowMinMs = options?.hangWindowMinMs ?? DEFAULT_MIN_HANG_WINDOW_MS;
+    this.clock = options?.clock ?? SYSTEM_CLOCK;
     this.lateShellReplyGraceMs =
       options?.lateShellReplyGraceMs ?? DEFAULT_LATE_SHELL_REPLY_GRACE_MS;
     this.maxRestarts = options?.maxRestarts ?? 3;
@@ -1224,7 +1254,7 @@ export class BinaryBridge implements AftProjectTransport {
         // rejects other requests: one slow call says nothing about the calls
         // of other sessions sharing this child, and a child that is truly
         // hung is caught by the hang watchdog, which watches its silence.
-        const timer = setTimeout(() => {
+        const timer = this.clock.setTimeout(() => {
           const entry = this.pending.get(id);
           if (!entry) return;
           if (
@@ -1234,7 +1264,7 @@ export class BinaryBridge implements AftProjectTransport {
             return;
           }
           this.pending.delete(id);
-          clearTimeout(entry.timer);
+          this.clock.clearTimeout(entry.timer);
           entry.onSettled?.();
 
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms — bridge kept warm`;
@@ -1274,7 +1304,7 @@ export class BinaryBridge implements AftProjectTransport {
 
         if (!child?.stdin?.writable) {
           this.pending.delete(id);
-          clearTimeout(timer);
+          this.clock.clearTimeout(timer);
           const error = new BridgeTransportUnavailableError(
             `${this.errorPrefix} stdin not writable for command "${command}"`,
           );
@@ -1293,7 +1323,7 @@ export class BinaryBridge implements AftProjectTransport {
           const entry = this.pending.get(id);
           if (entry) {
             this.pending.delete(id);
-            clearTimeout(entry.timer);
+            this.clock.clearTimeout(entry.timer);
             entry.onSettled?.();
             entry.reject(error);
           }
@@ -1867,7 +1897,7 @@ export class BinaryBridge implements AftProjectTransport {
   private processStdoutLine(line: string): void {
     try {
       const response = JSON.parse(line) as Record<string, unknown>;
-      this.lastChildActivityAt = Date.now();
+      this.lastChildActivityAt = this.clock.now();
       if (response.type === "progress") {
         const requestId = response.request_id as string | undefined;
         const entry = requestId ? this.pending.get(requestId) : undefined;
@@ -1882,7 +1912,7 @@ export class BinaryBridge implements AftProjectTransport {
         if (requestId && entry) {
           this.pending.delete(requestId);
           this.noteReplyReceived(requestId);
-          clearTimeout(entry.timer);
+          this.clock.clearTimeout(entry.timer);
           entry.onSettled?.();
           entry.resolve({
             success: false,
@@ -1932,7 +1962,7 @@ export class BinaryBridge implements AftProjectTransport {
         const entry = this.pending.get(id);
         if (!entry) return;
         this.pending.delete(id);
-        clearTimeout(entry.timer);
+        this.clock.clearTimeout(entry.timer);
         entry.onSettled?.();
         if (
           response.success !== false &&
@@ -2013,8 +2043,8 @@ export class BinaryBridge implements AftProjectTransport {
     // A reply now arrives after the caller's deadline, so it settles the call
     // as a timeout that reports what AFT answered.
     entry.resolve = (response) => settle(shellOutcomeFromLateReply(response));
-    clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => {
+    this.clock.clearTimeout(entry.timer);
+    entry.timer = this.clock.setTimeout(() => {
       if (this.pending.get(id) !== entry) return;
       this.pending.delete(id);
       entry.onSettled?.();
@@ -2051,7 +2081,7 @@ export class BinaryBridge implements AftProjectTransport {
     tool: string,
     sessionId: string | undefined,
   ): void {
-    const now = Date.now();
+    const now = this.clock.now();
     // When no other caller is waiting, forget unanswered requests whose own
     // silence window has fully passed: the child kept running long after them
     // and nobody waits on their replies, so they are lost replies, not a
@@ -2110,20 +2140,21 @@ export class BinaryBridge implements AftProjectTransport {
     if (this.hangWatchdogTimer || this.pending.size === 0) return;
     const hang = this.hangDeadline();
     if (!hang) return;
-    this.hangWatchdogTimer = setTimeout(
+    const timer = this.clock.setTimeout(
       () => {
         this.hangWatchdogTimer = null;
         this.checkForHang();
       },
-      Math.max(0, hang.deadline - Date.now()),
+      Math.max(0, hang.deadline - this.clock.now()),
     );
     // Each waiting call has its own referenced timeout timer that keeps the
     // host alive, so the watchdog timer does not need to.
-    this.hangWatchdogTimer.unref?.();
+    (timer as { unref?: () => void }).unref?.();
+    this.hangWatchdogTimer = timer;
   }
 
   private clearHangWatchdogTimer(): void {
-    if (this.hangWatchdogTimer) clearTimeout(this.hangWatchdogTimer);
+    if (this.hangWatchdogTimer) this.clock.clearTimeout(this.hangWatchdogTimer);
     this.hangWatchdogTimer = null;
   }
 
@@ -2146,7 +2177,7 @@ export class BinaryBridge implements AftProjectTransport {
     if (this.pending.size === 0 || !this.isAlive()) return;
     const hang = this.hangDeadline();
     if (!hang) return;
-    const now = Date.now();
+    const now = this.clock.now();
     if (now < hang.deadline) {
       this.armHangWatchdog();
       return;
@@ -2183,7 +2214,7 @@ export class BinaryBridge implements AftProjectTransport {
     const pending = Array.from(this.pending.values());
     this.pending.clear();
     for (const entry of pending) {
-      clearTimeout(entry.timer);
+      this.clock.clearTimeout(entry.timer);
       entry.onSettled?.();
       const readOnly = isReadOnlyRetryCommand(entry.tool);
       entry.reject(
@@ -2300,7 +2331,7 @@ export class BinaryBridge implements AftProjectTransport {
   private rejectAllPending(error: BridgeTransportUnavailableError): void {
     this.configureWarningClients.clear();
     for (const [_id, entry] of this.pending) {
-      clearTimeout(entry.timer);
+      this.clock.clearTimeout(entry.timer);
       entry.onSettled?.();
       entry.reject(error);
     }

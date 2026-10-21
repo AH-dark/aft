@@ -78,8 +78,10 @@ export {
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,
+  BridgeClock,
   BridgeOptions,
   BridgeRequestOptions,
+  BridgeTimer,
   ConfigureDroppedKey,
   ConfigureWarning,
   ConfigureWarningsContext,
