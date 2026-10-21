@@ -1147,6 +1147,52 @@ fn base_ref_edit_invalidates_and_refreshes_strictly() {
 
 #[cfg(unix)]
 #[test]
+fn base_ref_active_prebind_write_waits_even_without_begin_notification() {
+    let storage = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    write_tree(main.path(), FILES);
+    write_tree(worker.path(), FILES);
+    let base = base_ref_runtime(storage.path(), "main", main.path());
+    refresh(&base, &Model::default());
+    // The root already exists, but its new semantic driver is not listening
+    // when the write begins. The root-wide active count must still fence bind.
+    let delta = Arc::new(Mutex::new(LiveDelta::new(Arc::clone(
+        base.installed().generation(),
+    ))));
+    super::super::intent::register(worker.path(), &delta);
+    let path = worker.path().join("src/alpha.rs");
+    let writing = super::super::intent::record_paths([path.as_path()]);
+    assert!(super::super::intent::active(worker.path()));
+    let mut runtime = CheckoutSemantic::new(
+        storage.path(),
+        "family",
+        "worker",
+        worker.path(),
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
+    runtime.base_ref_prototype = true;
+    super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
+    runtime.driver().register_write_intent();
+    assert!(
+        runtime.load().is_err(),
+        "an active write was declared ready"
+    );
+    assert_eq!(runtime.installed().generation().name(), "empty");
+    drop(writing);
+    assert!(!super::super::intent::active(worker.path()));
+    runtime.load().unwrap();
+    assert!(runtime
+        .installed()
+        .generation()
+        .name()
+        .starts_with("base-ref-"));
+}
+
+#[cfg(unix)]
+#[test]
 fn base_ref_kill_child() {
     let Ok(subject) = std::env::var("AFT_BASE_REF_KILL_SUBJECT") else {
         return;
