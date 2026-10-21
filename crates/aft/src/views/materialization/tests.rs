@@ -189,7 +189,7 @@ fn selected_binding_load_skips_changed_payloads_and_matches_cold() {
 
 #[test]
 fn incremental_rows_match_cold_with_cross_file_relink() {
-    let f = fixture();
+    let f = relinking_fixture();
     let (base, copy) = prepare(&f);
     let before = snapshot(&base);
     let stats = apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).unwrap();
@@ -211,7 +211,7 @@ fn incremental_rows_match_cold_with_cross_file_relink() {
 
 #[test]
 fn incremental_writes_only_owned_rows_and_relinks() {
-    let f = fixture();
+    let f = relinking_fixture();
     let (_, copy) = prepare(&f);
     let stats = apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).unwrap();
     println!("incremental counts: {stats:?}");
@@ -2305,4 +2305,223 @@ fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
             assert!(stats.dispatch_resolved_sites > 0, "{label}: {stats:?}");
         }
     }
+}
+
+#[test]
+fn s4_shift_views_on_keeps_inbound_edges_and_matches_cold() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let hub = crate::callgraph_store::position_identity_tests::HUB;
+    let caller = crate::callgraph_store::position_identity_tests::CALLER;
+    let inputs = |hub| {
+        vec![
+            ("hub.rs", hub),
+            ("caller0.rs", caller),
+            ("caller1.rs", caller),
+            ("caller2.rs", caller),
+            (
+                "lib.rs",
+                "mod hub; mod caller0; mod caller1; mod caller2;\n",
+            ),
+        ]
+    };
+    let base = manifest(&conn, &inputs(hub));
+    let shifted = format!("// inserted comment\n{hub}");
+    let next = manifest(&conn, &inputs(&shifted));
+    drop(conn);
+    let database = f.dir.path().join("s4-shift.sqlite");
+    materialize_manifest_view_database(&database, &f.blobs, &base).unwrap();
+    {
+        let conn = Connection::open(&database).unwrap();
+        assert!(
+            conn.query_row(
+                "SELECT count(DISTINCT n.file_path) FROM edges e JOIN nodes n ON n.id=e.source_node WHERE e.provenance='name_match' AND e.target_file='hub.rs' AND n.file_path!='hub.rs'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap()
+                >= 3
+        );
+        conn.execute_batch("CREATE TABLE s4_dispatch_writes(file TEXT); CREATE TRIGGER s4_record_dispatch AFTER INSERT ON edges WHEN NEW.provenance IN ('name_match','dispatch','exact') BEGIN INSERT INTO s4_dispatch_writes SELECT file_path FROM nodes WHERE id=NEW.source_node; END;").unwrap();
+    }
+    let stats = apply_manifest_diff(&database, &base, &next, &f.blobs).unwrap();
+    assert_eq!(stats.relinked_deleted, 0);
+    assert_eq!(stats.relinked_inserted, 0);
+    {
+        let conn = Connection::open(&database).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM s4_dispatch_writes WHERE file != 'hub.rs'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(conn.query_row("SELECT count(*) FROM edges e JOIN nodes n ON n.id=e.source_node WHERE n.file_path='hub.rs' AND e.line=5", [], |r| r.get::<_,usize>(0)).unwrap() > 0);
+        conn.execute_batch("DROP TRIGGER s4_record_dispatch; DROP TABLE s4_dispatch_writes;")
+            .unwrap();
+    }
+    let cold = f.dir.path().join("s4-shift-cold.sqlite");
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    parity::assert_logical_parity(&database, &cold);
+}
+
+#[test]
+fn s4_collisions_and_in_file_moves_views_on_every_table() {
+    for (name, _, source) in crate::callgraph_store::position_identity_tests::COLLISIONS {
+        let f = fixture();
+        let conn = Connection::open(&f.blobs).unwrap();
+        let base = manifest(&conn, &[(name, source)]);
+        let lines: Vec<_> = source.lines().collect();
+        let moved = format!(
+            "{}\n{}\n",
+            lines.last().unwrap(),
+            lines[..lines.len() - 1].join("\n")
+        );
+        let next = manifest(&conn, &[(name, &moved)]);
+        drop(conn);
+        let database = f.dir.path().join("collision.sqlite");
+        materialize_manifest_view_database(&database, &f.blobs, &base).unwrap();
+        let legacy = f.dir.path().join("pre-s4-collision.sqlite");
+        crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
+            materialize_manifest_view_database(&legacy, &f.blobs, &base)
+        })
+        .unwrap();
+        let baseline: (usize, usize) = Connection::open(&legacy)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM nodes),(SELECT count(*) FROM edges)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        {
+            let conn = Connection::open(&database).unwrap();
+            let counts: (usize, usize) = conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM edges)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            eprintln!("S4 view collision baseline {name}: {counts:?}");
+            assert_eq!(counts, baseline);
+            assert_eq!(counts, if *name == "impl.rs" { (4, 2) } else { (2, 1) });
+            assert_eq!(conn.query_row("SELECT count(*) FROM (SELECT scoped_name FROM nodes GROUP BY file_path,scoped_name HAVING count(*)>1)", [], |r| r.get::<_,usize>(0)).unwrap(), 0);
+        }
+        apply_manifest_diff(&database, &base, &next, &f.blobs).unwrap();
+        let cold = f.dir.path().join("cold-collision.sqlite");
+        materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+        parity::assert_logical_parity(&database, &cold);
+    }
+}
+
+#[test]
+fn s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape() {
+    let f = fixture();
+    let database = f.dir.path().join("old-materializer.sqlite");
+    crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
+        materialize_manifest_view_database(&database, &f.blobs, &f.base)
+    })
+    .unwrap();
+    {
+        let conn = Connection::open(&database).unwrap();
+        crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
+        crate::callgraph_store::position_identity_tests::stamp_pre_s4(&conn, true);
+    }
+    let stats = apply_manifest_diff(&database, &f.base, &f.base, &f.blobs).unwrap();
+    assert!(stats.full_resolution);
+    crate::callgraph_store::position_identity_tests::assert_current_graph(
+        &Connection::open(&database).unwrap(),
+    );
+}
+
+#[test]
+fn s4_shared_symbol_ranges_views_on_every_table() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let make = |shift: u32| {
+        let mut blob =
+            join::CallgraphBlob::extract("fn first() {}\nfn other() {}\n", "rust", "fixture")
+                .unwrap();
+        let join::CallgraphBlob::Parse(parse) = &mut blob else {
+            unreachable!()
+        };
+        assert_eq!(parse.symbols.len(), 2);
+        let first = parse.symbols[0].clone();
+        for symbol in &mut parse.symbols {
+            symbol.start_line = first.start_line + shift;
+            symbol.end_line = first.end_line + shift;
+            symbol.start_col = first.start_col;
+            symbol.end_col = first.end_col;
+        }
+        let payload = blob.to_bytes().unwrap();
+        let key = blake3::hash(&payload);
+        conn.execute(
+            "INSERT INTO blob_payloads VALUES(?1,?2,?3,1)",
+            params![
+                key.as_bytes().as_slice(),
+                payload,
+                key.as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+        Manifest::new([(
+            RelPath::new(b"ranges.rs").unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: RegularPlanes {
+                    callgraph: Some(key.to_hex().to_string()),
+                    semantic: None,
+                },
+                resolution_input: false,
+            },
+        )])
+        .unwrap()
+    };
+    let base = make(0);
+    let next = make(1);
+    drop(conn);
+    let database = f.dir.path().join("shared-ranges.sqlite");
+    materialize_manifest_view_database(&database, &f.blobs, &base).unwrap();
+    let conn = Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, usize>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM edges", [], |r| r.get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+    drop(conn);
+    apply_manifest_diff(&database, &base, &next, &f.blobs).unwrap();
+    let cold = f.dir.path().join("shared-ranges-cold.sqlite");
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    parity::assert_logical_parity(&database, &cold);
+}
+
+// A position-only move preserves the target's identity. Change its kind so
+// these tests still cover updating callers in another file when identity changes.
+fn relinking_fixture() -> Fixture {
+    let mut f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    f.next = manifest(
+        &conn,
+        &[
+            (
+                "caller.ts",
+                "import { target } from './target'; export function caller() { return target(); }",
+            ),
+            (
+                "target.ts",
+                "export function before() {} export class target {}",
+            ),
+            ("added.ts", "export function added() { return 4; }"),
+            ("untouched.ts", "export function untouched() { return 8; }"),
+        ],
+    );
+    f
 }

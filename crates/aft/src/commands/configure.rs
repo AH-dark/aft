@@ -10262,6 +10262,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn s4_upgrade_same_head_configure_recovers_old_view_identities() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let storage = temp.path().join("storage");
+        init_git_fixture(&main);
+        fs::write(main.join("tracked.rs"), "pub struct C; impl C { pub fn unique(&self) {} }\npub fn tracked(x: &C) { x.unique(); }\n").unwrap();
+        let main = main.canonicalize().unwrap();
+        let family = crate::search_index::artifact_cache_key(&main);
+        let scope = crate::path_identity::project_scope_key(&main);
+        let head = crate::views::assembly::head_tree_fingerprint(
+            &crate::alias::head_tree_entries(&main).unwrap(),
+        );
+        let request = crate::views::assembly::AssemblyRequest {
+            storage: storage.clone(),
+            project_root: main.clone(),
+            family: family.clone(),
+            scope: scope.clone(),
+            desired_head: head.clone(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        let seeded = crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
+            crate::views::assembly::publish_checkout(&request)
+        })
+        .unwrap();
+        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
+        let old = view
+            .derived_path(seeded.generation.as_deref().unwrap())
+            .unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(&old);
+        {
+            let conn = rusqlite::Connection::open(&old).unwrap();
+            crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
+            crate::callgraph_store::position_identity_tests::stamp_pre_s4(&conn, true);
+        }
+        let owner = test_context();
+        let params = json!({"project_root":main,"storage_dir":storage,"harness":"opencode","config":[user_tier(json!({"views":{"enabled":true},"indexes":{"trigram":false,"semantic":false,"callgraph":true}}))]});
+        let response =
+            handle_configure_for_test(&configure_request_with_session(params, "s4-owner"), &owner);
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&owner);
+        match owner.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => assert!(
+                !crate::callgraph_store::CallGraphRead::edge_snapshot(&store)
+                    .unwrap()
+                    .is_empty()
+            ),
+            _ => panic!("same-HEAD configure must recover a ready view"),
+        }
+        assert_eq!(
+            head,
+            crate::views::assembly::head_tree_fingerprint(
+                &crate::alias::head_tree_entries(&main).unwrap()
+            )
+        );
+        let current = view.current_generation().unwrap().unwrap();
+        assert_ne!(Some(current.as_str()), seeded.generation.as_deref());
+        let database = view.derived_path(&current).unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(&database);
+        crate::callgraph_store::position_identity_tests::assert_current_graph(
+            &rusqlite::Connection::open(&database).unwrap(),
+        );
+    }
+
     /// `lib.rs` of the on-demand call-graph fixtures: one caller, one callee
     /// and one function nothing calls, so callers, impact and dead code all
     /// have something to report.
