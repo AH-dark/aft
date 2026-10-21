@@ -171,6 +171,11 @@ export class BridgePool implements AftTransportPool {
       // documented `BridgeOptions.childEnv` (PoolOptions extends BridgeOptions);
       // omitting it silently dropped the override for pooled spawns.
       childEnv: options.childEnv,
+      // The hang watchdog's window floor and the time source (tests inject a
+      // manual clock); without these a pooled bridge silently used the
+      // defaults whatever the pool was given.
+      hangWindowMinMs: options.hangWindowMinMs,
+      clock: options.clock,
     };
     this.configOverrides = { ...configOverrides };
     const initialEditSlotSurvives = this.configOverrides.edit_slot_survives;

@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BinaryBridge } from "../bridge.js";
 import type { Logger, LogMeta } from "../logger.js";
+import { BridgePool } from "../pool.js";
 import { cachedExecutable } from "./test-utils/cached-executable.js";
 import { ManualClock } from "./test-utils/manual-clock.js";
 
@@ -423,6 +424,30 @@ describe("hang watchdog with default budgets", () => {
       });
     } finally {
       await bridge.shutdown();
+    }
+  });
+});
+
+describe("pooled bridges", () => {
+  test("a pool passes its clock and hang window to the bridges it creates", async () => {
+    const clock = new ManualClock();
+    const pool = new BridgePool(cachedExecutable(FAKE_ENGINE), {
+      idleTimeoutMs: Number.POSITIVE_INFINITY,
+      timeoutMs: 5_000,
+      maxRestarts: 0,
+      hangWindowMinMs: WINDOW_MS,
+      clock,
+    });
+    try {
+      const bridge = pool.getBridge(workDir);
+      await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
+      // Fires at exactly WINDOW_MS on the pool's manual clock (see wedgeThen);
+      // with the default 60 s window or the system clock it would not.
+      const edit = await wedgeThen(bridge, clock, "edit");
+      expect((edit.error as Error | undefined)?.name).toBe("BridgeRestartedError");
+      expect(bridge.isAlive()).toBe(false);
+    } finally {
+      await pool.shutdown();
     }
   });
 });
