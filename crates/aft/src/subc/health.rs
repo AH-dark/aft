@@ -7225,6 +7225,18 @@ mod tests {
         let helpers = &metrics["filesystem_helpers"];
         assert_eq!(helpers["pool_size"], 8);
         assert_eq!(helpers["thread_cap"], 64);
+        match helpers["status"].as_str() {
+            Some("unavailable") => {
+                assert!(matches!(
+                    helpers["reason"].as_str(),
+                    Some("state_busy" | "state_poisoned")
+                ));
+                assert!(helpers.get("live").is_none());
+                return;
+            }
+            Some("not_started" | "ready") => {}
+            status => panic!("unexpected helper health status: {status:?}"),
+        }
         for field in [
             "live",
             "idle",

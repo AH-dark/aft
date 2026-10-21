@@ -118,6 +118,139 @@ impl Drop for BlockDirectory {
 }
 
 #[test]
+fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
+    use crate::commands::read::{
+        IMAGE_PROCESSING_DELAY, LEGACY_HASHLINE_READ, LEGACY_READ_RENDER_BYTES,
+    };
+    use crate::hashline::snapshot::{SOURCE_AFTER_READ, SOURCE_READS};
+    use crate::inspect::job::CANONICALIZE_CALLS;
+    use crate::search_index::{
+        audit_record, audit_work, AuditWork, AUDIT_CANCEL_ELAPSED, AUDIT_IO_PROBE,
+    };
+
+    let pool = Limiter::new(1);
+    let nested_pool = pool.clone();
+    let first = run_with_limiter(Path::new("first"), None, pool.clone(), move |_| {
+        SOURCE_READS.with(|count| count.set(count.get() + 1));
+        LEGACY_READ_RENDER_BYTES.with(|count| count.set(count.get() + 7));
+        LEGACY_HASHLINE_READ.with(|flag| flag.set(true));
+        IMAGE_PROCESSING_DELAY.with(|delay| delay.set(Duration::from_secs(1)));
+        SOURCE_AFTER_READ.with(|hook| *hook.borrow_mut() = Some(Box::new(|| panic!("old hook"))));
+        CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(vec![PathBuf::from("old")]));
+        AUDIT_IO_PROBE.with(|probe| *probe.borrow_mut() = Some(Box::new(|| panic!("old probe"))));
+        AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.set(Some(Duration::from_secs(1))));
+        audit_record(|work| {
+            work.cancel_probes += 1;
+            work.corpus_opens += 1;
+            work.sort_stats += 1;
+            work.sort_canonicalizes += 1;
+            work.watcher_global += 1;
+            work.watcher_head += 1;
+            work.filter_keys += 1;
+            work.presence_checks += 1;
+        });
+        MUTATION_ADMISSION.with(|flag| flag.set(true));
+        DIRECTORIES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.0 = 42;
+            cache
+                .1
+                .insert(PathBuf::from("old"), Access { direct: true });
+        });
+        let thread = std::thread::current().id();
+        run_with_limiter(Path::new("nested"), None, nested_pool, move |_| {
+            assert_eq!(std::thread::current().id(), thread);
+            assert_eq!(SOURCE_READS.with(|count| count.get()), 1);
+            assert_eq!(LEGACY_READ_RENDER_BYTES.with(|count| count.get()), 7);
+            assert_eq!(audit_work().filter_keys, 1);
+            Ok(())
+        })?;
+        Ok(std::thread::current().id())
+    })
+    .unwrap();
+    let second = run_with_limiter(Path::new("second"), None, pool, |_| {
+        Ok((
+            std::thread::current().id(),
+            SOURCE_READS.with(|count| count.get()),
+            LEGACY_READ_RENDER_BYTES.with(|count| count.get()),
+            LEGACY_HASHLINE_READ.with(|flag| flag.get()),
+            IMAGE_PROCESSING_DELAY.with(|delay| delay.get()),
+            SOURCE_AFTER_READ.with(|hook| hook.borrow().is_none()),
+            DIRECTORIES.with(|cache| cache.borrow().1.is_empty()),
+            audit_work(),
+            MUTATION_ADMISSION.with(|flag| flag.get()),
+            CANONICALIZE_CALLS.with(|calls| calls.borrow().is_none()),
+            AUDIT_IO_PROBE.with(|probe| probe.borrow().is_none()),
+            AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.get()),
+        ))
+    })
+    .unwrap();
+    assert_eq!(first, second.0, "both jobs must use the same helper");
+    assert_eq!((second.1, second.2), (0, 0), "per-job counters leaked");
+    assert!(!second.3, "legacy read flag leaked");
+    assert_eq!(second.4, Duration::ZERO, "image delay leaked");
+    assert!(second.5, "source-read hook leaked");
+    assert!(second.6, "directory cache leaked");
+    assert_eq!(second.7, AuditWork::default(), "grep work counters leaked");
+    assert!(!second.8, "mutation admission leaked");
+    assert!(second.9, "canonicalization collector leaked");
+    assert!(second.10, "grep I/O probe leaked");
+    assert_eq!(second.11, None, "grep cancellation clock leaked");
+}
+
+#[test]
+fn helper_job_scope_restores_state_after_unwind() {
+    use crate::commands::read::LEGACY_READ_RENDER_BYTES;
+    use crate::hashline::snapshot::SOURCE_READS;
+
+    let previous_reads = SOURCE_READS.with(|count| count.replace(11));
+    let previous_render = LEGACY_READ_RENDER_BYTES.with(|count| count.replace(13));
+    let unwound = std::panic::catch_unwind(|| {
+        let _state = HelperJobScope::enter();
+        assert_eq!(SOURCE_READS.with(|count| count.get()), 0);
+        assert_eq!(LEGACY_READ_RENDER_BYTES.with(|count| count.get()), 0);
+        SOURCE_READS.with(|count| count.set(1));
+        LEGACY_READ_RENDER_BYTES.with(|count| count.set(7));
+        panic!("unwind a helper job");
+    });
+    let reads = SOURCE_READS.with(|count| count.replace(previous_reads));
+    let render = LEGACY_READ_RENDER_BYTES.with(|count| count.replace(previous_render));
+    assert!(unwound.is_err());
+    assert_eq!((reads, render), (11, 13));
+}
+
+#[test]
+fn helper_health_does_not_start_an_unused_pool() {
+    let helpers = OnceLock::new();
+    let health = helper_health_from(&helpers);
+    assert_eq!(health["status"], "not_started");
+    assert_eq!(health["pool_size"], IO_POOL_SIZE);
+    assert_eq!(health["thread_cap"], MAX_IO_THREADS);
+    assert_eq!(health["live"], 0);
+    assert!(helpers.get().is_none(), "health started the helper factory");
+}
+
+#[test]
+fn helper_health_does_not_wait_for_the_state_lock() {
+    let pool = Limiter::new(1);
+    let state = pool.state.lock().unwrap();
+    let reader = pool.clone();
+    let (tx, rx) = channel();
+    let thread = std::thread::spawn(move || tx.send(reader.health()).unwrap());
+    let health = rx.recv_timeout(Duration::from_secs(1));
+    drop(state);
+    thread.join().unwrap();
+    let health = health.expect("health waited for the helper state lock");
+    assert_eq!(health["status"], "unavailable");
+    assert_eq!(health["reason"], "state_busy");
+    assert!(
+        health.get("live").is_none(),
+        "unavailable counts are unknown"
+    );
+    assert_eq!(pool.health()["status"], "ready");
+}
+
+#[test]
 fn metadata_and_canonicalize_do_not_enumerate_an_ancestor() {
     let dir = tempfile::tempdir().unwrap();
     let ancestor = std::fs::canonicalize(dir.path()).unwrap();

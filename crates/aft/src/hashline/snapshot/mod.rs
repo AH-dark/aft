@@ -1129,7 +1129,24 @@ impl ReadSource {
 #[cfg(test)]
 thread_local! {
     pub(crate) static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct HelperStateScope(usize, Option<Box<dyn FnOnce() + Send>>);
+#[cfg(test)]
+impl Drop for HelperStateScope {
+    fn drop(&mut self) {
+        SOURCE_READS.with(|reads| reads.set(self.0));
+        SOURCE_AFTER_READ.with(|hook| *hook.borrow_mut() = self.1.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn helper_state_scope() -> HelperStateScope {
+    HelperStateScope(
+        SOURCE_READS.with(|reads| reads.replace(0)),
+        SOURCE_AFTER_READ.with(|hook| hook.replace(None)),
+    )
 }
 
 pub(crate) fn read_source(path: &Path) -> io::Result<ReadSource> {

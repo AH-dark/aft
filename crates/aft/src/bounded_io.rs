@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+#[cfg(test)]
+use std::sync::LazyLock;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::context::AppContext;
@@ -24,7 +26,7 @@ pub(crate) const MUTATION_BUDGET: Duration = Duration::from_secs(25);
 const MAX_IO_THREADS: usize = 64;
 const IO_POOL_SIZE: usize = 8;
 static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
-static HELPERS: LazyLock<Arc<Limiter>> = LazyLock::new(|| Limiter::new(IO_POOL_SIZE));
+static HELPERS: OnceLock<Arc<Limiter>> = OnceLock::new();
 #[cfg(test)]
 static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -545,7 +547,10 @@ impl Limiter {
                 while let Ok(job) = receiver.recv() {
                     // A panicking job disconnects its result channel. Keep this
                     // worker alive until its caller retires it and closes sender.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _state = HelperJobScope::enter();
+                        job();
+                    }));
                 }
             });
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -597,24 +602,96 @@ impl Limiter {
         }
     }
     fn health(&self) -> serde_json::Value {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        serde_json::json!({
-            "pool_size": self.max,
-            "thread_cap": self.max_live,
-            "live": state.live,
-            "idle": state.idle.len(),
-            "usable": state.usable,
-            "abandoned": state.abandoned,
-            "spawned_total": state.spawned,
-            "abandoned_total": state.retired_total,
-            "replacements_total": state.replacements,
-            "cap_hits_total": state.cap_hits,
-            "queue_timeouts_total": state.queue_timeouts,
-        })
+        match self.state.try_lock() {
+            Ok(state) => pool_health_snapshot(&state, self.max, self.max_live, "ready"),
+            Err(error) => serde_json::json!({
+                "pool_size": self.max,
+                "thread_cap": self.max_live,
+                "status": "unavailable",
+                "reason": match error {
+                    std::sync::TryLockError::WouldBlock => "state_busy",
+                    std::sync::TryLockError::Poisoned(_) => "state_poisoned",
+                },
+            }),
+        }
     }
 }
+struct HelperJobScope {
+    directories: (u64, HashMap<PathBuf, Access>),
+    mutation_admission: bool,
+    #[cfg(test)]
+    canonicalize_calls: Option<Vec<PathBuf>>,
+    #[cfg(test)]
+    _read: crate::commands::read::HelperStateScope,
+    #[cfg(test)]
+    _snapshot: crate::hashline::snapshot::HelperStateScope,
+    #[cfg(test)]
+    _search: crate::search_index::HelperStateScope,
+}
+impl HelperJobScope {
+    fn enter() -> Self {
+        // Reset only at the dispatched job boundary. Nested probes run inline
+        // and must keep the enclosing job's cache, counters and test hooks.
+        Self {
+            directories: DIRECTORIES.with(|cache| cache.replace(Default::default())),
+            mutation_admission: MUTATION_ADMISSION.with(|flag| flag.replace(false)),
+            #[cfg(test)]
+            canonicalize_calls: crate::inspect::job::CANONICALIZE_CALLS
+                .with(|calls| calls.replace(None)),
+            #[cfg(test)]
+            _read: crate::commands::read::helper_state_scope(),
+            #[cfg(test)]
+            _snapshot: crate::hashline::snapshot::helper_state_scope(),
+            #[cfg(test)]
+            _search: crate::search_index::helper_state_scope(),
+        }
+    }
+}
+impl Drop for HelperJobScope {
+    fn drop(&mut self) {
+        DIRECTORIES.with(|cache| cache.replace(std::mem::take(&mut self.directories)));
+        MUTATION_ADMISSION.with(|flag| flag.set(self.mutation_admission));
+        #[cfg(test)]
+        crate::inspect::job::CANONICALIZE_CALLS
+            .with(|calls| *calls.borrow_mut() = self.canonicalize_calls.take());
+    }
+}
+fn pool_health_snapshot(
+    state: &PoolState,
+    max: usize,
+    max_live: usize,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pool_size": max,
+        "thread_cap": max_live,
+        "status": status,
+        "live": state.live,
+        "idle": state.idle.len(),
+        "usable": state.usable,
+        "abandoned": state.abandoned,
+        "spawned_total": state.spawned,
+        "abandoned_total": state.retired_total,
+        "replacements_total": state.replacements,
+        "cap_hits_total": state.cap_hits,
+        "queue_timeouts_total": state.queue_timeouts,
+    })
+}
 pub(crate) fn helper_health() -> serde_json::Value {
-    HELPERS.health()
+    helper_health_from(&HELPERS)
+}
+fn helper_health_from(helpers: &OnceLock<Arc<Limiter>>) -> serde_json::Value {
+    // Health runs on the frame loop: observing an unused pool must not start
+    // its factory, and observing a busy pool must not wait for its state lock.
+    match helpers.get() {
+        Some(pool) => pool.health(),
+        None => pool_health_snapshot(
+            &PoolState::default(),
+            IO_POOL_SIZE,
+            MAX_IO_THREADS,
+            "not_started",
+        ),
+    }
 }
 struct WorkerExit {
     pool: std::sync::Weak<Limiter>,
@@ -673,7 +750,12 @@ pub(crate) fn run<T: Send + 'static>(
     at: Option<Instant>,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    run_with_limiter(path, at, Arc::clone(&HELPERS), work)
+    run_with_limiter(
+        path,
+        at,
+        Arc::clone(HELPERS.get_or_init(|| Limiter::new(IO_POOL_SIZE))),
+        work,
+    )
 }
 
 /// Reserves time for a bounded walk to return partial results before the bounded I/O helper's
@@ -897,7 +979,7 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
         let result = run_with_timeout(
             path,
             at,
-            Arc::clone(&HELPERS),
+            Arc::clone(HELPERS.get_or_init(|| Limiter::new(IO_POOL_SIZE))),
             access_budget(path),
             Some(Arc::clone(&probe)),
             |path| {

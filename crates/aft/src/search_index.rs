@@ -9130,7 +9130,7 @@ fn to_glob_path(path: &Path) -> String {
 // Thread-local operation counters keep concurrent tests from charging each
 // other's filesystem work. They observe the call sites, not elapsed time.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AuditWork {
     pub cancel_probes: usize,
     pub corpus_opens: usize,
@@ -9145,8 +9145,27 @@ pub(crate) struct AuditWork {
 #[cfg(test)]
 thread_local! {
     static AUDIT_WORK: std::cell::Cell<AuditWork> = std::cell::Cell::new(AuditWork::default());
-    static AUDIT_IO_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
-    static AUDIT_CANCEL_ELAPSED: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    pub(crate) static AUDIT_IO_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static AUDIT_CANCEL_ELAPSED: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct HelperStateScope(AuditWork, Option<Box<dyn FnMut()>>, Option<Duration>);
+#[cfg(test)]
+impl Drop for HelperStateScope {
+    fn drop(&mut self) {
+        AUDIT_WORK.with(|work| work.set(self.0));
+        AUDIT_IO_PROBE.with(|probe| *probe.borrow_mut() = self.1.take());
+        AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.set(self.2));
+    }
+}
+#[cfg(test)]
+pub(crate) fn helper_state_scope() -> HelperStateScope {
+    HelperStateScope(
+        AUDIT_WORK.with(|work| work.replace(AuditWork::default())),
+        AUDIT_IO_PROBE.with(|probe| probe.replace(None)),
+        AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.replace(None)),
+    )
 }
 
 #[cfg(test)]
