@@ -790,8 +790,8 @@ grep would have used.
 { "pattern": "handleRequest", "include": "*.ts" }
 ```
 
-Returns matches grouped by file with relative paths, sorted by modification time (newest first),
-100 matching lines per call:
+Returns matches grouped by file with relative paths, sorted by modification time (newest first).
+With default paging, a result of at most 100 lines and 16 KiB prints whole:
 
 ```
 src/server.ts
@@ -801,23 +801,40 @@ src/server.ts
 src/test/server.test.ts
 15: import { handleRequest } from "../server"
 
-Found 3 match(es) across 2 file(s). [index: ready]
+Found 3 match across 2 file
 ```
 
-Every matching line of the page is printed. Lines longer than 500 characters are cut and marked
-`… [line truncated]`, and a page stops early once its rows reach 50 KB. When more matches remain,
-the reply names the next `offset` and ends with the standard
-`shown N of M rows (cap) · narrow: offset, path, include, exclude` trailer.
+Lockfiles, generated and minified files, logs and command output, and JSON data files are
+counted, not printed, unless `path` names the file or `include` names it or its kind (`bun.lock`,
+`*.log`, `**/stdout`, `*.json`, `*.min.js`). The reply lists each counted file or pattern with its
+line count and kind, and the value to pass:
 
-Paging with `offset` is exact for a single file and for any search that saw every match. When a
-search over several files stops at the match limit, the engine keeps the first matches it reaches
-before sorting them, so later pages may overlap or skip rows; the reply says so, and narrowing with
-`path` or `include` restores exact paging.
+```
+Counted only, not shown: 112 lines in 1 file. To show them, pass a file below as path, or a pattern below as include.
+tools/common-auth-build/bun.lock: 112 lines (lockfile)
+```
+
+Counted lines are printed anyway when nothing else matched, or when there are at most 10 of them
+(2 KiB or less). A folder passed as `path` does not by itself print the counted files inside
+it.
+
+A larger result starts with the matching lines per file (up to 25 files, then a per-folder roll-up
+of the rest) and a first page of 40 lines dealt round-robin across files, at most 5 per file when
+several files match. Later pages hold up to
+100 lines and stop once their rows reach 50 KB. Lines longer than 500 characters are shown as a
+window around the match, marked `… [line truncated]`. Counts are exact: every match in scope is
+counted (up to 100,100 stored lines; past that the total is shown as a lower bound), and pages are
+cut from one fixed order, so while the files do not change, following `offset` never repeats or
+skips a line. When rows are cut,
+the reply ends with the standard trailer, for example
+`shown 40 of 1187 rows (cap) · narrow: offset, path, include`, or
+`shown 2 of 114 rows (kind) · narrow: path, include` when only counted lines were left out.
 
 Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path),
-`include` (glob filter, e.g. `"*.ts"`), `offset` (zero-based count of matching lines to skip,
+`include` (glob filter, e.g. `"*.ts"`), `offset` (zero-based count of printed lines to skip,
 default 0). The bridge command also accepts `exclude` (negate glob), `case_sensitive`
-(default true) and `max_results` (page size, default 100).
+(default true) and `max_results` (page size for every page; by default the first page holds 40
+lines and later pages 100).
 
 ---
 

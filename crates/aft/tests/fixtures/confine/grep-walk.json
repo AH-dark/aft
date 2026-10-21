@@ -13,6 +13,9 @@
     "lines_truncated": 0,
     "next_offset": null,
     "total_matches": 0,
+    "display_matches": 0,
+    "counted_matches": 0,
+    "counted_files": [],
     "files_searched": 0,
     "files_read_directly": 0,
     "files_with_matches": 0,
@@ -40,12 +43,10 @@
         "walk"
       ],
       "narrow": [
-        "offset",
         "path",
-        "include",
-        "exclude"
+        "include"
       ]
     }
   },
-  "text": "Found 0 match across 0 file [index: fallback; incomplete: checked 0 files before the walk's 0-file limit]\n\n(checked 0 of more than 0 files (index not used); the fallback walk stops at 0 files, so files past that limit were not searched and matches may be missing. For an exhaustive search, narrow with path or include so the walk reaches every file.)\n\nshown 0 of ≥0 rows (walk) · narrow: offset, path, include, exclude"
+  "text": "Found 0 match across 0 file [index: fallback; incomplete: checked 0 files before the walk's 0-file limit]\n\n(checked 0 of more than 0 files (index not used); the fallback walk stops at 0 files, so files past that limit were not searched and matches may be missing. For an exhaustive search, narrow with path or include so the walk reaches every file.)\n\nshown 0 of ≥0 rows (walk) · narrow: path, include"
 }

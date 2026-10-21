@@ -726,8 +726,7 @@
     "narrow": [
       "offset",
       "path",
-      "include",
-      "exclude"
+      "include"
     ]
   }
 }

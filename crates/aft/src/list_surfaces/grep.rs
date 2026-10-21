@@ -2,8 +2,9 @@
 //!
 //! Produces the truncation envelope for grep match lists (`payload.matches`),
 //! accounting for directory walk boundaries (such as search timeouts or skipped
-//! filesystem mounts) and match caps (such as the page size, `offset` paging,
-//! or the output byte budget).
+//! filesystem mounts), match caps (such as the page size, `offset` paging,
+//! or the output byte budget), and lines grep counted instead of printing
+//! because of their file's kind (lockfiles, logs, generated files, ...).
 
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use serde_json::Value;
@@ -11,7 +12,7 @@ use serde_json::Value;
 pub const COMMAND: &str = "grep";
 pub const LIST_ID: &str = "payload.matches";
 pub const UNIT: Unit = Unit::Rows;
-pub const NARROW: &[&str] = &["offset", "path", "include", "exclude"];
+pub const NARROW: &[&str] = &["offset", "path", "include"];
 
 /// Build the list truncation envelope for a grep response from its component parts.
 ///
@@ -51,11 +52,63 @@ pub fn build_grep_envelope_for_page(
     walk_truncated: bool,
     skipped_foreign_mounts: usize,
 ) -> Option<ListEnvelope> {
+    build_grep_envelope_with_counted(
+        GrepPageCounts {
+            offset,
+            shown,
+            total_matches,
+            display_matches: total_matches,
+            matches_count,
+            counted_matches: 0,
+        },
+        truncated,
+        walk_truncated,
+        skipped_foreign_mounts,
+    )
+}
+
+/// Row counts of one grep page.
+#[derive(Debug, Clone, Copy)]
+pub struct GrepPageCounts {
+    /// Printed rows earlier pages covered.
+    pub offset: usize,
+    /// Rows this page printed.
+    pub shown: usize,
+    /// Every matching line in scope, counted ones included.
+    pub total_matches: usize,
+    /// Rows grep prints across all pages: every match except the lines left
+    /// counted only.
+    pub display_matches: usize,
+    /// Rows this page held before the output byte budget applied.
+    pub matches_count: usize,
+    /// Matching lines counted, not printed, because of their file's kind.
+    pub counted_matches: usize,
+}
+
+/// Build the list truncation envelope for one page of grep matches, where
+/// some matching lines may be counted instead of printed. Paging cuts are
+/// `cap`; lines counted because of their file's kind are `kind`, which ranks
+/// below `cap`, so `kind` is the reason only when nothing else cut rows.
+pub fn build_grep_envelope_with_counted(
+    counts: GrepPageCounts,
+    truncated: bool,
+    walk_truncated: bool,
+    skipped_foreign_mounts: usize,
+) -> Option<ListEnvelope> {
+    let GrepPageCounts {
+        offset,
+        shown,
+        total_matches,
+        display_matches,
+        matches_count,
+        counted_matches,
+    } = counts;
     let walk_cause = walk_truncated || skipped_foreign_mounts > 0;
     let seen = offset.saturating_add(matches_count);
-    let cap_cause = truncated || shown < matches_count || offset > 0 || total_matches > seen;
+    let cap_cause = truncated || shown < matches_count || offset > 0 || display_matches > seen;
+    let kind_cause = counted_matches > 0;
 
-    if !walk_cause && !cap_cause {
+    if !walk_cause && !cap_cause && !kind_cause {
         return None;
     }
 
@@ -65,6 +118,9 @@ pub fn build_grep_envelope_for_page(
     }
     if cap_cause {
         causes.push(Reason::Cap);
+    }
+    if kind_cause {
+        causes.push(Reason::Kind);
     }
 
     let total = if walk_cause {
@@ -120,13 +176,30 @@ pub fn build_grep_envelope(data: &Value) -> Option<ListEnvelope> {
         .map(|v| v as usize)
         .unwrap_or(0);
 
+    // Replies from before file kinds were counted carry neither field: every
+    // match was printable and none was counted.
+    let display_matches = data
+        .get("display_matches")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(total_matches);
+    let counted_matches = data
+        .get("counted_matches")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(0);
+
     let shown = crate::subc_format::rendered_grep_match_count(data);
 
-    build_grep_envelope_for_page(
-        offset,
-        shown,
-        total_matches,
-        matches_count,
+    build_grep_envelope_with_counted(
+        GrepPageCounts {
+            offset,
+            shown,
+            total_matches,
+            display_matches,
+            matches_count,
+            counted_matches,
+        },
         truncated,
         walk_truncated,
         skipped_foreign_mounts,

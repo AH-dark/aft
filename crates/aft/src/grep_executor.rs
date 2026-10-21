@@ -2557,13 +2557,17 @@ mod tests {
 
     /// The grep tool's reply text for `result`, as `handle_grep` builds it.
     fn grep_tool_text(result: &GrepResult, project_root: &Path) -> String {
-        let page_matches: Vec<&GrepMatch> = result.matches.iter().collect();
-        let page = crate::commands::grep::render_grep_page(
-            &page_matches,
-            project_root,
-            crate::commands::grep::GREP_MAX_OUTPUT_BYTES,
-        );
-        let mut text = crate::commands::grep::grep_page_text(result, &page, 0, false);
+        let mut text = crate::commands::grep::grep_page_output(
+            result,
+            &crate::commands::grep::GrepPageRequest {
+                project_root,
+                include: &[],
+                file_roots: &[],
+                offset: 0,
+                explicit_page_rows: None,
+            },
+        )
+        .text;
         if let Some(note) = crate::commands::grep::walk_coverage_note(result) {
             text.push_str("\n\n");
             text.push_str(&note);

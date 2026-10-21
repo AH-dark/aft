@@ -1,0 +1,1 @@
+grep now counts lines in lockfiles, generated and minified files, logs and command output, and JSON data files instead of printing them, telling you the exact `path` or `include` value that shows them; totals are exact, large results start with matching lines per file and a 40-line first page that samples every file, and long lines show a window around the match.

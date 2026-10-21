@@ -439,7 +439,10 @@ fn grep_multi_path_enforces_max_results_globally() {
         response["matches"].as_array().expect("matches array").len(),
         100
     );
-    assert_eq!(response["truncated"], true);
+    // Every match is counted before the page is cut, so 150 matches are
+    // complete, not truncated; the next page starts where this one ended.
+    assert_eq!(response["truncated"], false);
+    assert_eq!(response["next_offset"], 100);
 
     let status = aft.shutdown();
     assert!(status.success());

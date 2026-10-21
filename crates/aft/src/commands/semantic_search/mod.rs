@@ -20,7 +20,7 @@ mod recall_audit;
 mod regex_route;
 pub(crate) mod rerank;
 pub mod scoring;
-mod snippet_bounds;
+pub(crate) mod snippet_bounds;
 pub mod split_query;
 pub mod telemetry;
 pub mod trailer;

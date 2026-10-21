@@ -79,11 +79,11 @@ fn grep_surface_metadata_matches_registry() {
     assert_eq!(COMMAND, "grep");
     assert_eq!(LIST_ID, "payload.matches");
     assert_eq!(UNIT, Unit::Rows);
-    assert_eq!(NARROW, &["offset", "path", "include", "exclude"]);
+    assert_eq!(NARROW, &["offset", "path", "include"]);
 
     let surface = find_surface("grep", "", "payload.matches").expect("grep surface registered");
     assert_eq!(surface.unit, Unit::Rows);
-    assert_eq!(surface.narrow, &["offset", "path", "include", "exclude"]);
+    assert_eq!(surface.narrow, &["offset", "path", "include"]);
 
     let walk_entry = surface
         .reasons
@@ -121,15 +121,14 @@ fn cap_on_finished_walk_renders_at_least_floor() {
         vec![
             "offset".to_string(),
             "path".to_string(),
-            "include".to_string(),
-            "exclude".to_string()
+            "include".to_string()
         ]
     );
 
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 100 of ≥1204 rows (cap) · narrow: offset, path, include, exclude"
+        "shown 100 of ≥1204 rows (cap) · narrow: offset, path, include"
     );
 
     // Formatter suppresses (capped) and appends the trailer
@@ -141,15 +140,12 @@ fn cap_on_finished_walk_renders_at_least_floor() {
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
     assert!(!formatted.contains("(capped)"));
-    assert!(formatted
-        .contains("shown 100 of ≥1204 rows (cap) · narrow: offset, path, include, exclude"));
+    assert!(formatted.contains("shown 100 of ≥1204 rows (cap) · narrow: offset, path, include"));
 
     // NDJSON text builder produces the same trailer
     let base_text = fixture["text"].as_str().unwrap();
     let ndjson = build_ndjson_text(base_text, &fixture, Some("payload.matches"), false);
-    assert!(
-        ndjson.contains("shown 100 of ≥1204 rows (cap) · narrow: offset, path, include, exclude")
-    );
+    assert!(ndjson.contains("shown 100 of ≥1204 rows (cap) · narrow: offset, path, include"));
 }
 
 #[test]
@@ -171,15 +167,14 @@ fn walk_truncated_and_cap_renders_mixed_cause() {
         vec![
             "offset".to_string(),
             "path".to_string(),
-            "include".to_string(),
-            "exclude".to_string()
+            "include".to_string()
         ]
     );
 
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 100 of ≥100 rows (walk) · narrow: offset, path, include, exclude"
+        "shown 100 of ≥100 rows (walk) · narrow: offset, path, include"
     );
 
     let resp = Response {
@@ -189,8 +184,7 @@ fn walk_truncated_and_cap_renders_mixed_cause() {
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
-    assert!(formatted
-        .contains("shown 100 of ≥100 rows (walk) · narrow: offset, path, include, exclude"));
+    assert!(formatted.contains("shown 100 of ≥100 rows (walk) · narrow: offset, path, include"));
 }
 
 #[test]
@@ -212,7 +206,7 @@ fn skipped_foreign_mounts_renders_walk_and_is_independent_of_walk_truncated() {
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 12 of ≥12 rows (walk) · narrow: offset, path, include, exclude"
+        "shown 12 of ≥12 rows (walk) · narrow: offset, path, include"
     );
 
     let resp = Response {
@@ -222,9 +216,7 @@ fn skipped_foreign_mounts_renders_walk_and_is_independent_of_walk_truncated() {
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
-    assert!(
-        formatted.contains("shown 12 of ≥12 rows (walk) · narrow: offset, path, include, exclude")
-    );
+    assert!(formatted.contains("shown 12 of ≥12 rows (walk) · narrow: offset, path, include"));
 
     // Verify independence: neither walk_truncated alone nor skipped_foreign_mounts alone renders as complete.
     let env_walk_only = build_grep_envelope_from_parts(10, 10, 10, false, true, 0)
@@ -268,7 +260,7 @@ fn display_selector_thinned_renders_exact_total() {
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 25 of 42 rows (cap) · narrow: offset, path, include, exclude"
+        "shown 25 of 42 rows (cap) · narrow: offset, path, include"
     );
 
     // Formatter renders the trailer
@@ -279,9 +271,7 @@ fn display_selector_thinned_renders_exact_total() {
     };
     let ctx = FormatContext::default();
     let formatted = format_response_with_context("grep", &resp, &ctx);
-    assert!(
-        formatted.contains("shown 25 of 42 rows (cap) · narrow: offset, path, include, exclude")
-    );
+    assert!(formatted.contains("shown 25 of 42 rows (cap) · narrow: offset, path, include"));
 
     // JSON match array remains completely unchanged
     assert_eq!(fixture["matches"].as_array().unwrap().len(), 42);
@@ -303,7 +293,7 @@ fn mutation_computing_shown_from_match_array_length_reds() {
         Total::Exact(42),
         Unit::Rows,
         vec![Reason::Cap],
-        &["offset", "path", "include", "exclude"],
+        &["offset", "path", "include"],
     );
 
     let real_trailer = render_trailer(&real_envelope).unwrap();
@@ -311,11 +301,11 @@ fn mutation_computing_shown_from_match_array_length_reds() {
 
     assert_eq!(
         real_trailer,
-        "shown 25 of 42 rows (cap) · narrow: offset, path, include, exclude"
+        "shown 25 of 42 rows (cap) · narrow: offset, path, include"
     );
     assert_eq!(
         mutated_trailer,
-        "shown 42 of 42 rows (cap) · narrow: offset, path, include, exclude"
+        "shown 42 of 42 rows (cap) · narrow: offset, path, include"
     );
 
     // Assert that the mutation would fail the required assertion
@@ -431,9 +421,8 @@ fn handle_grep_attaches_envelope_when_capped() {
         serde_json::from_value(envelope_val.unwrap().clone()).expect("valid ListEnvelope");
     assert_eq!(envelope.unit, Unit::Rows);
     assert_eq!(envelope.reason, Some(Reason::Cap));
-    assert!(envelope.total.is_at_least());
-    assert_eq!(
-        envelope.narrow,
-        vec!["offset", "path", "include", "exclude"]
-    );
+    // grep counts every match before cutting the page, so the total of a
+    // page cut by its size is exact.
+    assert_eq!(envelope.total, Total::Exact(150));
+    assert_eq!(envelope.narrow, vec!["offset", "path", "include"]);
 }

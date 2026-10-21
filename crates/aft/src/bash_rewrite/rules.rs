@@ -1035,7 +1035,6 @@ fn grep_request_from_parsed(parsed: Option<&ParsedCommand>, binary: &str) -> Opt
     let mut params = json!({
         "pattern": pattern,
         "case_sensitive": case_sensitive,
-        "max_results": 100,
     });
     if let Some(path) = path {
         params["path"] = json!(path);
