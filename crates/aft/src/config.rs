@@ -206,23 +206,38 @@ pub fn expand_index_root_path(
     path: &str,
     home: Option<&std::path::Path>,
 ) -> Result<PathBuf, String> {
+    expand_configured_absolute_path("index.roots", path, home)
+}
+
+/// Expand the supported `~` forms in `storage.cache_dir` and require the
+/// result to be absolute.
+pub fn expand_cache_dir_path(
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    expand_configured_absolute_path("storage.cache_dir", path, home)
+}
+
+/// Shared `~` expansion and absolute-path check for user-configured paths.
+/// `key` is the setting's name as the user writes it, so a refusal names the
+/// setting that actually holds the bad value.
+fn expand_configured_absolute_path(
+    key: &str,
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let no_home = || format!("{key} path uses ~ but no home directory is available");
     let expanded = if path == "~" {
-        home.ok_or_else(|| {
-            "index.roots path uses ~ but no home directory is available".to_string()
-        })?
-        .to_path_buf()
+        home.ok_or_else(no_home)?.to_path_buf()
     } else if let Some(remainder) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        home.ok_or_else(|| {
-            "index.roots path uses ~ but no home directory is available".to_string()
-        })?
-        .join(remainder)
+        home.ok_or_else(no_home)?.join(remainder)
     } else {
         PathBuf::from(path)
     };
 
     if !expanded.is_absolute() {
         return Err(format!(
-            "index.roots path must be absolute after ~ expansion: {path:?}"
+            "{key} path must be absolute after ~ expansion: {path:?}"
         ));
     }
     Ok(expanded)
@@ -1150,5 +1165,27 @@ mod tests {
         );
         assert!(expand_index_root_path("relative/root", Some(&home)).is_err());
         assert!(expand_index_root_path("~", None).is_err());
+    }
+
+    #[test]
+    fn relative_path_refusals_name_the_setting_that_holds_the_path() {
+        let home = std::env::temp_dir().join("aft-home");
+        let cache_error = expand_cache_dir_path("relative/cache", Some(&home)).unwrap_err();
+        assert!(
+            cache_error.starts_with("storage.cache_dir path must be absolute"),
+            "{cache_error}"
+        );
+        assert!(!cache_error.contains("index.roots"), "{cache_error}");
+        let no_home = expand_cache_dir_path("~/cache", None).unwrap_err();
+        assert!(
+            no_home.starts_with("storage.cache_dir path uses ~"),
+            "{no_home}"
+        );
+
+        // The index.roots wording is unchanged.
+        assert_eq!(
+            expand_index_root_path("relative/root", Some(&home)).unwrap_err(),
+            "index.roots path must be absolute after ~ expansion: \"relative/root\""
+        );
     }
 }

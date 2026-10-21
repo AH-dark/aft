@@ -862,7 +862,7 @@ pub fn resolve_config_for_harness(
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(std::path::PathBuf::from);
-        match crate::config::expand_index_root_path(raw, home.as_deref()) {
+        match crate::config::expand_cache_dir_path(raw, home.as_deref()) {
             Ok(path) => config.cache_dir = Some(path),
             Err(error) => {
                 let path = std::path::PathBuf::from(raw);
@@ -920,7 +920,7 @@ fn rejected_cache_config(tiers: &[ConfigTier], mut config: Config, errors: &[Str
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(std::path::PathBuf::from);
             config.cache_dir = Some(
-                crate::config::expand_index_root_path(&raw, home.as_deref())
+                crate::config::expand_cache_dir_path(&raw, home.as_deref())
                     .unwrap_or_else(|_| std::path::PathBuf::from(raw)),
             );
         }
