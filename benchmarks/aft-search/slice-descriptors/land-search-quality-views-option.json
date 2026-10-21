@@ -1,8 +1,8 @@
 {
-  "fixtures": [
-    "harness-goldens"
-  ],
+  "targeted_mechanism": "none",
   "kind": "harness",
   "slice_class": "non_ranking",
-  "targeted_mechanism": "none"
+  "fixtures": [
+    "harness-goldens"
+  ]
 }
