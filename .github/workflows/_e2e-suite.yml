@@ -149,6 +149,13 @@ jobs:
           mv tests/docker/fixtures/aft tests/docker/fixtures/aft-linux-x64
           chmod +x tests/docker/fixtures/aft-linux-x64
 
+      # A project opened at a bind-mount target (`-v "$PWD":/workspace`) must
+      # not be refused as too broad (its watcher starts and its search index is
+      # not disabled), and `/` must stay refused. Needs a real kernel mount
+      # table, which only a container run provides.
+      - name: Check bind-mounted project root
+        run: bash tests/docker/check-bind-mount-root.sh tests/docker/fixtures/aft-linux-x64
+
       # The E2E Dockerfile installs the local package artifacts (npm pack
       # tarballs) instead of the published @latest plugin, so the image
       # exercises the code under test (real package.json + dist + deps), not
