@@ -175,7 +175,14 @@ class NdjsonClient:
         self._stderr.seek(position)
         return text.strip()
 
-    def configure(self, endpoint: Optional[str], model_id: str, timeout: float) -> None:
+    def configure(
+        self,
+        endpoint: Optional[str],
+        model_id: str,
+        timeout: float,
+        *,
+        views_enabled: bool = False,
+    ) -> None:
         semantic: JsonObject = {
             "backend": "openai_compatible" if endpoint else "fastembed",
             "model": model_id,
@@ -190,6 +197,8 @@ class NdjsonClient:
             "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "semantic": semantic,
         })
+        if views_enabled:
+            doc["views"] = {"enabled": True}
         response = self.call(
             "configure",
             {
@@ -202,6 +211,19 @@ class NdjsonClient:
         )
         if response.get("success") is not True:
             raise AftProtocolError(f"configure_failed:{response}")
+
+    def views_work(self) -> JsonObject:
+        """Return the health counters without inventing values when absent."""
+        try:
+            response = self.call("health")
+        except (AftProtocolError, OSError):
+            return {"status": "unavailable"}
+        report = response.get("report", response)
+        metrics = report.get("metrics") if isinstance(report, Mapping) else None
+        counters = metrics.get("views_work") if isinstance(metrics, Mapping) else None
+        if not isinstance(counters, Mapping):
+            return {"status": "unavailable"}
+        return {"status": "available", "counters": dict(counters)}
 
     def wait_ready(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -667,29 +689,74 @@ def load_inputs(
 
 
 @contextmanager
-def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
+def runtime_evidence_tree(tree: Path, *, views_enabled: bool = False) -> Iterator[Path]:
     """Copy the verified tree outside its parent checkout before starting AFT."""
     with tempfile.TemporaryDirectory(prefix="aft-real-query-tree-") as directory:
         root = Path(directory) / "tree"
         shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
+        if views_enabled:
+            attach_pinned_git_metadata(root)
         copy_answer_key_ignore(root)
         copy_evidence_root_ignore(root)
         yield root
+
+
+def attach_pinned_git_metadata(root: Path) -> None:
+    """Expose the pinned commit's tree to content-addressed views in the copy."""
+    objects_result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "objects"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if objects_result.returncode:
+        detail = objects_result.stderr.strip()
+        raise InputFault(f"views_git_objects_unavailable:{detail}")
+    objects_path = Path(objects_result.stdout.strip())
+    if not objects_path.is_absolute():
+        objects_path = ROOT / objects_path
+    objects_path = objects_path.resolve()
+
+    init_result = subprocess.run(
+        ["git", "init", "--quiet", str(root)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if init_result.returncode:
+        detail = init_result.stderr.strip()
+        raise InputFault(f"views_git_init_failed:{detail}")
+    alternates = root / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(f"{objects_path}\n", encoding="utf-8")
+    head_result = subprocess.run(
+        ["git", "update-ref", "--no-deref", "HEAD", EVIDENCE_SHA],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if head_result.returncode:
+        detail = head_result.stderr.strip()
+        raise InputFault(f"views_git_head_unavailable:{detail}")
 
 
 # Where the answer-key ignore list is copied inside the evidence tree, which is
 # a projection of this repository and so has the same relative layout.
 BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
 
-# First line of the copy's root .aftignore. The evidence copy has no .git, and
-# AFT applies .gitignore files (and the machine's global git excludes file) in
-# folders that are not git repositories too. The benchmark's candidate pool is
-# the tracked tree, including files that were force-added despite matching a
-# .gitignore (plans and reports under .alfonso/, benchmark results), so the root
-# .aftignore re-includes every entry before its own exclusions. An .aftignore
-# outranks .gitignore and the global excludes file, later lines in the same
-# file still win, and the deeper benchmarks/aft-search/.aftignore is consulted
-# first, so every exclusion the benchmark writes still applies.
+# First line of the copy's root .aftignore. The default evidence copy has no .git;
+# views-enabled copies attach the pinned commit's metadata. AFT applies .gitignore
+# files and the machine's global git excludes file whether or not the copy is a
+# Git repository. The benchmark's candidate pool is the tracked tree, including
+# files that were force-added despite matching a .gitignore (plans and reports
+# under .alfonso/, benchmark results), so the root .aftignore re-includes every
+# entry before its own exclusions. An .aftignore outranks .gitignore and the
+# global excludes file, later lines in the same file still win, and the deeper
+# benchmarks/aft-search/.aftignore is consulted first, so every exclusion the
+# benchmark writes still applies.
 #
 # The pattern re-includes only names that do not start with a dot. A
 # re-included entry also bypasses the hidden-file filter, so `!*` would add
@@ -798,6 +865,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reference", default=str(HERE / "real-query-baseline.json"))
     result.add_argument("--output", default=str(HERE / ".bench/search-quality/score.json"))
     result.add_argument("--ready-timeout", type=float, default=600.0)
+    result.add_argument("--views", action="store_true", help="Enable content-addressed views and record AFT views-work counters.")
     result.add_argument(
         "--live-model",
         action="store_true",
@@ -831,7 +899,9 @@ def run(args: argparse.Namespace) -> int:
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
-    with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(provisioned_tree) as project_root:
+    with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(
+        provisioned_tree, views_enabled=args.views
+    ) as project_root:
         runtime = Path(run_dir)
         log_path = runtime / "embedding-requests.log"
         stderr_path = runtime / "aft.stderr"
@@ -847,8 +917,9 @@ def run(args: argparse.Namespace) -> int:
             configured_model = FIXTURE_PROVIDER_MODEL
         with endpoint_context as endpoint:
             client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env)
+            views_work: JsonObject = {}
             try:
-                client.configure(endpoint, configured_model, args.ready_timeout)
+                client.configure(endpoint, configured_model, args.ready_timeout, views_enabled=args.views)
                 client.wait_ready(args.ready_timeout)
                 bench_rerank.report_warm_up("real_query", bench_rerank.warm_up(
                     lambda query: client.search({"query": query, "topK": 50, "includeTests": False}),
@@ -861,24 +932,45 @@ def run(args: argparse.Namespace) -> int:
                         building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
                         building.allow_building = True
                         try:
-                            building.configure(building_endpoint, FIXTURE_PROVIDER_MODEL, args.ready_timeout)
+                            building.configure(
+                                building_endpoint,
+                                FIXTURE_PROVIDER_MODEL,
+                                args.ready_timeout,
+                                views_enabled=args.views,
+                            )
                             deadline = time.monotonic() + args.ready_timeout
                             while time.monotonic() < deadline:
                                 status = building.call("status")
                                 semantic_status = status.get("semantic_index", {}).get("status")
-                                if semantic_status in {"ready", "failed", "unavailable"}:
+                                lexical_status = status.get("search_index", {}).get("status")
+                                if semantic_status in {"failed", "unavailable"}:
                                     raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
-                                if status.get("search_index", {}).get("status") == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
+                                if semantic_status == "ready":
+                                    if args.views and lexical_status == "ready":
+                                        break
+                                    if not args.views:
+                                        raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
+                                if lexical_status == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
                                     break
                                 time.sleep(0.1)
                             else:
                                 raise InputFault(f"semantic_building_fixture_timeout:lexical={status.get('search_index', {}).get('status')}:semantic={status.get('semantic_index', {}).get('status')}:stage={status.get('semantic_index', {}).get('stage')}")
                             rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
+                            if args.views:
+                                views_work["building"] = building.views_work()
                         finally:
+                            if args.views and "building" not in views_work:
+                                views_work["building"] = building.views_work()
                             building.close()
                 else:
                     rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
+                if args.views:
+                    views_work["primary"] = client.views_work()
             finally:
+                if args.views:
+                    if "primary" not in views_work:
+                        views_work["primary"] = client.views_work()
+                    print(f"views_work:{json.dumps(views_work, sort_keys=True)}")
                 client.close()
     score = assemble_score(
         manifest,
@@ -892,6 +984,8 @@ def run(args: argparse.Namespace) -> int:
         binary,
         Path(args.reference).resolve(),
     )
+    if args.views:
+        score["views_work"] = views_work
     if args.tuning_only:
         score["tuning_only"] = True
     else:

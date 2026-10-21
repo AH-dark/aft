@@ -11,7 +11,7 @@ from typing import Any
 from unittest import mock
 
 from run_real_query import load_capability
-from run_search_quality import selected_profile
+from run_search_quality import parser as quality_runner_parser, run as quality_runner_run, selected_profile
 from search_quality import (
     diff_paths,
     run as quality_run,
@@ -316,6 +316,34 @@ class ProfileSelectionTests(unittest.TestCase):
         profile, capability = self.profile_for_schema({"properties": {}})
         self.assertEqual(profile, "single_page")
         validate_profile_score({"profile": profile, "capability": capability, "rows": []})
+
+
+class ViewsOptionPropagationTests(unittest.TestCase):
+    def test_views_flag_is_forwarded_to_real_query_only_when_enabled(self) -> None:
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                argv = [
+                    "--corpus", str(root / "corpus.toml"),
+                    "--binary", str(root / "aft"),
+                    "--profile", "single_page",
+                    "--score-output", str(root / "score.json"),
+                ]
+                if enabled:
+                    argv.append("--views")
+                args = quality_runner_parser().parse_args(argv)
+                commands: list[list[str]] = []
+
+                with (
+                    mock.patch("run_search_quality.parse_corpus_toml", return_value=({}, [])),
+                    mock.patch("run_search_quality.clone_root_for", return_value=root / "clones"),
+                    mock.patch("run_search_quality.ensure_binary"),
+                    mock.patch("run_search_quality.command", side_effect=lambda arguments, **kwargs: commands.append(list(arguments))),
+                ):
+                    quality_runner_run(args)
+
+                real_query = next(command for command in commands if command[1].endswith("run_real_query.py"))
+                self.assertEqual("--views" in real_query, enabled)
 
 
 class PageZeroProjectionTests(unittest.TestCase):
