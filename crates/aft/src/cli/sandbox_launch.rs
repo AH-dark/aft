@@ -112,7 +112,15 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
         }
         .canonicalize_for_launch()
         .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
-        let applied = profile.and_then(|profile| apply_sandbox(&profile));
+        let applied = profile.and_then(|profile| {
+            // Seal while still privileged: confinement must not be able to
+            // block descriptor flag changes. CLOEXEC keeps this launcher’s
+            // error write available but closes the channel in the target.
+            if let Some(fd) = args.failure_fd {
+                seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
+            }
+            apply_sandbox(&profile)
+        });
         if let Err(error) = applied {
             if error.exit_code == SANDBOX_UNAVAILABLE_EXIT_CODE {
                 if let Some(path) = args.failure_marker.as_deref() {
@@ -123,9 +131,6 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
                 }
             }
             return Err(error);
-        }
-        if let Some(fd) = args.failure_fd {
-            seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
         }
         exec_target(&args.command)
     }
