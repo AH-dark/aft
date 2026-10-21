@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -53,6 +53,9 @@ pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
 /// own bot's connection.
 const BINDINGS_READ_CONNECTION_ID: &str = "github-handle-aft-alfonso";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+const RELAY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+static RELAY_OPERATIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
 
 pub fn is_relay_operation(operation: &str) -> bool {
     matches!(
@@ -730,6 +733,16 @@ struct RouteLeases {
     /// A route that died mid-call is replaced by a fresh one under the same
     /// key, so one key can have handed out more than one handle.
     holders: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<LeaseHolders>>>>,
+    #[cfg(test)]
+    pause: std::sync::Mutex<Option<Arc<LeaseTestPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LeaseTestPause {
+    acquired: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    finished: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -766,11 +779,14 @@ impl RouteLeases {
     /// while unrelated keys can still acquire and release their routes.
     async fn release(&self, key: &str, consumer: &subc_client_rs::SubcConsumer) {
         self.release_with(key, |handles| async move {
-            for route in handles {
-                let _ = consumer
-                    .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
-                    .await;
-            }
+            let _ = tokio::time::timeout(RELAY_CLEANUP_TIMEOUT, async {
+                for route in handles {
+                    let _ = consumer
+                        .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
+                        .await;
+                }
+            })
+            .await;
         })
         .await;
     }
@@ -785,7 +801,10 @@ impl RouteLeases {
             return;
         };
         let mut holder = entry.lock().await;
-        holder.count = holder.count.saturating_sub(1);
+        holder.count = holder
+            .count
+            .checked_sub(1)
+            .expect("each acquired route lease is released once");
         if holder.count > 0 {
             return;
         }
@@ -807,6 +826,13 @@ struct CallFailure {
     reconnect: bool,
 }
 
+struct RequestCancellation(tokio::sync::watch::Sender<bool>);
+impl Drop for RequestCancellation {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 /// Open a route to `target` (or share the one another call holds), send `body`
 /// on it, and release it again.
 ///
@@ -815,12 +841,12 @@ struct CallFailure {
 /// as an unscoped open: that would send the write without the stamp that
 /// names its agent.
 async fn route_request(
-    consumer: &subc_client_rs::SubcConsumer,
-    leases: &RouteLeases,
+    consumer: &Arc<subc_client_rs::SubcConsumer>,
+    leases: &Arc<RouteLeases>,
     target: subc_protocol::RouteTarget,
     identity: subc_protocol::BindIdentity,
     scope: Option<&ScopeSelector>,
-    options: subc_client_rs::CallOptions,
+    mut options: subc_client_rs::CallOptions,
     body: &Value,
 ) -> Result<Value, CallFailure> {
     let bytes = serde_json::to_vec(body).map_err(|error| CallFailure {
@@ -831,13 +857,74 @@ async fn route_request(
         error: TransportError::Unavailable(error.to_string()),
         reconnect: false,
     })?;
-    leases.acquire(&key).await;
-    let outcome = open_and_send(
-        consumer, leases, &key, target, identity, scope, options, bytes,
-    )
-    .await;
-    leases.release(&key, consumer).await;
-    outcome
+    let permit = RELAY_OPERATIONS
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| CallFailure {
+            error: TransportError::Unavailable("the relay operation budget is busy".into()),
+            reconnect: false,
+        })?;
+    let consumer = Arc::clone(consumer);
+    let leases = Arc::clone(leases);
+    let scope = scope.cloned();
+    options.timeout = options.timeout.min(RELAY_CALL_TIMEOUT);
+    options.route_retry_deadline = options.route_retry_deadline.min(RELAY_CALL_TIMEOUT);
+    let (cancel, mut canceled) = tokio::sync::watch::channel(false);
+    let _cancellation = RequestCancellation(cancel);
+    // The transport owns open/register/release, not the caller. Dropping the
+    // caller signals cancellation but cannot interrupt lease bookkeeping or
+    // strand a handle between a successful open and registration.
+    let operation = tokio::spawn(async move {
+        let _permit = permit;
+        leases.acquire(&key).await;
+        #[cfg(test)]
+        let pause = leases.pause.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(pause) = &pause {
+            pause.acquired.notify_one();
+            pause.resume.notified().await;
+        }
+        let mut opened = Vec::new();
+        let was_canceled = *canceled.borrow();
+        let outcome = if was_canceled {
+            Err(CallFailure {
+                error: TransportError::Unavailable("relay requester canceled".into()),
+                reconnect: false,
+            })
+        } else {
+            // SDK-owned open/retry deadlines bound this phase. Do not drop an
+            // opening future on the broker's shorter deadline: finish the open,
+            // register its handle, then honor cancellation before forwarding.
+            open_and_send(
+                &consumer,
+                &leases,
+                &key,
+                target,
+                identity,
+                scope.as_ref(),
+                options,
+                bytes,
+                &mut opened,
+                &mut canceled,
+            )
+            .await
+        };
+        // Finalization outlives the caller, including asynchronous handle
+        // registration. Closing is bounded without canceling map bookkeeping.
+        for route in opened {
+            leases.opened(&key, route).await;
+        }
+        leases.release(&key, &consumer).await;
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.finished.notify_one();
+        }
+        outcome
+    });
+    operation.await.map_err(|error| CallFailure {
+        error: TransportError::Unavailable(format!("relay operation failed: {error}")),
+        reconnect: false,
+    })?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -850,6 +937,8 @@ async fn open_and_send(
     scope: Option<&ScopeSelector>,
     options: subc_client_rs::CallOptions,
     bytes: Vec<u8>,
+    opened_handles: &mut Vec<subc_client_rs::RouteHandle>,
+    canceled: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Value, CallFailure> {
     use subc_client_rs::{CallError, CallOptions};
     let opened = match scope {
@@ -885,11 +974,20 @@ async fn open_and_send(
             });
         }
     };
+    opened_handles.push(route.clone());
     leases.opened(key, route).await;
-    match consumer
-        .request(&route, bytes, CallOptions::default())
-        .await
-    {
+    if *canceled.borrow() {
+        return Err(CallFailure {
+            error: TransportError::Unavailable("relay requester canceled".into()),
+            reconnect: false,
+        });
+    }
+    let reply = tokio::select! {
+        biased;
+        _ = canceled.changed() => return Err(CallFailure { error:TransportError::Unavailable("relay requester canceled".into()), reconnect:false }),
+        reply = consumer.request(&route, bytes, CallOptions { timeout:RELAY_CALL_TIMEOUT, ..CallOptions::default() }) => reply,
+    };
+    match reply {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| CallFailure {
             error: TransportError::OutcomeUnknown("the reply was not JSON".to_string()),
             reconnect: false,
@@ -917,7 +1015,7 @@ async fn open_and_send(
 pub struct SubcRelayTransport {
     connection_file: PathBuf,
     consumer: tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>,
-    leases: RouteLeases,
+    leases: Arc<RouteLeases>,
     /// Replaces the subc client's route-open deadline (30 s, with retries for
     /// up to 90 s) when set. Production leaves it unset; tests shorten it so a
     /// retried refusal runs out quickly.
@@ -929,7 +1027,7 @@ impl SubcRelayTransport {
         Self {
             connection_file,
             consumer: tokio::sync::Mutex::new(None),
-            leases: RouteLeases::default(),
+            leases: Arc::new(RouteLeases::default()),
             route_open_deadline: None,
         }
     }
