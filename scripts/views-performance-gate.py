@@ -25,6 +25,7 @@ COUNTERS = (
     "full_walks", "applicability_walks", "logical_aggregates", "own_generation_folds",
 )
 PROBE = "views_perf_probe.rs"
+SEMANTIC_QUERY = "function probe_entry in views_perf_probe.rs"
 EDIT_STATES = ("atomic_edit", "revert", "tool_write", "tool_revert", "branch_switch", "branch_return")
 
 
@@ -121,6 +122,7 @@ def lexical_witness(grep, glob, search, path, token):
 
 def semantic_witness(answer, path, token):
     return (answer.get("success") is True and answer.get("semantic_status") == "ready"
+            and answer.get("lanes", {}).get("semantic", {}).get("status") == "ready"
             and answer.get("complete") is True
             and any(Path(row.get("file", "")) == path and token in row.get("snippet", "")
                     for row in answer.get("results", [])))
@@ -472,7 +474,7 @@ class Acquisition:
                     and token in json.dumps(inspect.get("details", {})))
             latest = checks
             if self.semantic:
-                semantic_answer = self.tool(channel, "search", {"query": "function probe returning the number twenty nine", "includeTests": True, "topK": 20}, state)
+                semantic_answer = self.tool(channel, "search", {"query": SEMANTIC_QUERY, "includeTests": True, "topK": 20}, state)
                 semantic_status = semantic_answer.get("semantic_status")
                 observe("semantic", semantic_witness(semantic_answer, self.roots[channel] / PROBE, token))
             else:

@@ -19,6 +19,23 @@ SPEC.loader.exec_module(gate)
 
 
 class MeasurementContractTests(unittest.TestCase):
+    def test_semantic_witness_accepts_captured_targeted_ready_reply(self):
+        capture = json.loads((Path(__file__).parent / "views-performance-baselines/slice-4a-witness-ready.json").read_text())
+        self.assertEqual(gate.SEMANTIC_QUERY, capture["request"]["query"])
+        self.assertTrue(gate.semantic_witness(capture["reply"], Path(capture["probe_path"]), capture["marker"]))
+
+    def test_semantic_witness_rejects_captured_building_reply(self):
+        capture = json.loads((Path(__file__).parent / "views-performance-baselines/slice-4a-witness-not-ready.json").read_text())
+        self.assertFalse(gate.semantic_witness(capture["reply"], Path(capture["probe_path"]), capture["marker"]))
+
+    def test_semantic_witness_requires_public_semantic_lane(self):
+        capture = json.loads((Path(__file__).parent / "views-performance-baselines/slice-4a-witness-ready.json").read_text())
+        answer = capture["reply"]
+        for lane in [None, {}, {"status": "building"}]:
+            with self.subTest(lane=lane):
+                answer["lanes"] = {} if lane is None else {"semantic": lane}
+                self.assertFalse(gate.semantic_witness(answer, Path(capture["probe_path"]), capture["marker"]))
+
     def test_bad_pid_is_rejected(self):
         with self.assertRaisesRegex(gate.MeasurementError, "PID"):
             gate.validate_subject(123, 456, "registry", "registry")
@@ -143,7 +160,8 @@ class MeasurementContractTests(unittest.TestCase):
         path = Path("/intended") / gate.PROBE
         token = "VIEWS_PERF_STATE_BETA"
         row = {"file": str(path), "snippet": token}
-        answer = {"success": True, "complete": True, "semantic_status": "ready", "results": [row]}
+        answer = {"success": True, "complete": True, "semantic_status": "ready", "results": [row],
+                  "lanes": {"semantic": {"status": "ready"}}}
         self.assertTrue(gate.semantic_witness(answer, path, token))
         row["snippet"] = "VIEWS_PERF_STATE_ALPHA"
         self.assertFalse(gate.semantic_witness(answer, path, token))
