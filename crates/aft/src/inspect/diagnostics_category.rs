@@ -1705,7 +1705,7 @@ mod payload_count_tests {
         crate::inspect::scoped_diagnostics_sweep::ScopedSweep,
     ) {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
         let configured = root.join("configured");
         let external = root.join("external");
         std::fs::create_dir(&configured).unwrap();
