@@ -1931,7 +1931,6 @@ describe("loadAftConfig", () => {
   test("bridge config defaults when omitted", () => {
     expect(resolveBridgePoolTransportOptions({})).toEqual({
       timeoutMs: 30_000,
-      hangThreshold: 2,
     });
   });
 
@@ -1939,11 +1938,11 @@ describe("loadAftConfig", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ bridge: { request_timeout_ms: 45_000, hang_threshold: 3 } }, null, 2),
+      JSON.stringify({ bridge: { request_timeout_ms: 45_000 } }, null, 2),
     );
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ bridge: { hang_threshold: 99, request_timeout_ms: 999_999 } }, null, 2),
+      JSON.stringify({ bridge: { request_timeout_ms: 999_999 } }, null, 2),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -1952,9 +1951,9 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as {
-      bridge?: { request_timeout_ms?: number; hang_threshold?: number };
+      bridge?: { request_timeout_ms?: number };
     };
-    expect(config.bridge).toEqual({ request_timeout_ms: 45_000, hang_threshold: 3 });
+    expect(config.bridge).toEqual({ request_timeout_ms: 45_000 });
     expect(result.stderr).toContain("Ignoring bridge from project config");
   });
 
@@ -2004,15 +2003,11 @@ describe("loadAftConfig", () => {
     expect(config.bash?.worker_wait_max_ms).toBe(120_000);
   });
 
-  test("bridge rejects request_timeout_ms below 1000 and hang_threshold below 1", () => {
+  test("bridge rejects request_timeout_ms below 1000", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify(
-        { bridge: { request_timeout_ms: 500, hang_threshold: 0 }, format_on_edit: true },
-        null,
-        2,
-      ),
+      JSON.stringify({ bridge: { request_timeout_ms: 500 }, format_on_edit: true }, null, 2),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {

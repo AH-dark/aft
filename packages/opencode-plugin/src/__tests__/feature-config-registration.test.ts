@@ -13,9 +13,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CANONICAL_TOOLS, SEMANTIC_COST_NOTICE } from "@cortexkit/aft-bridge";
+import {
+  CANONICAL_TOOLS,
+  RETIRED_HANG_THRESHOLD_NOTE,
+  SEMANTIC_COST_NOTICE,
+} from "@cortexkit/aft-bridge";
 
-import { type AftConfig, getConfigLoadNotices, loadAftConfig } from "../config.js";
+import {
+  type AftConfig,
+  getConfigLoadNotices,
+  getConfigValidationErrors,
+  loadAftConfig,
+} from "../config.js";
 import { buildOpenCodeToolMap, registerAftTools } from "../tool-registration.js";
 import type { V2ProviderTool } from "../tools/definitions/v2.js";
 import type { PluginContext } from "../types.js";
@@ -212,6 +221,38 @@ describe("OpenCode feature-config registration", () => {
     const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
     expect(notices.map((notice) => notice.message)).toEqual([
       `${projectFile} uses retired keys (gh_read, hoist_builtin_tools, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
+    ]);
+  });
+
+  test("a retired bridge.hang_threshold loads cleanly; a project file gets a notice that it does nothing", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ bridge: { hang_threshold: 4 } }));
+    const config = loadWithUserConfig({
+      bridge: { request_timeout_ms: 45_000, hang_threshold: 3 },
+    });
+    expect(config.bridge).toEqual({ request_timeout_ms: 45_000 });
+    expect(getConfigValidationErrors()).toEqual([]);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    // Nothing was applied, so the notice is only the no-effect sentence.
+    expect(notices.map((notice) => notice.message)).toEqual([
+      "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.",
+    ]);
+  });
+
+  test("a project file mixing translated keys with bridge.hang_threshold names only the translated keys, then says the threshold does nothing", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(
+      projectFile,
+      JSON.stringify({ search_index: false, bridge: { hang_threshold: 4 } }),
+    );
+    const config = loadWithUserConfig({});
+    expect(config.indexes?.trigram).toBe(false);
+    expect(getConfigValidationErrors()).toEqual([]);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${projectFile} uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${RETIRED_HANG_THRESHOLD_NOTE}`,
     ]);
   });
 

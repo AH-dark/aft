@@ -952,6 +952,16 @@ const CASES: ParityCase[] = [
     project: '{ "idle": { "lsp_ttl_minutes": 12.0 } }',
   },
   { name: "retired_soft_deadline_project", project: { inspect: { tier2_soft_deadline_ms: 50 } } },
+  {
+    name: "retired_hang_threshold_user",
+    user: { bridge: { request_timeout_ms: 45000, hang_threshold: 3 } },
+  },
+  { name: "retired_hang_threshold_project", project: { bridge: { hang_threshold: 3 } } },
+  {
+    name: "retired_hang_threshold_harness",
+    harness: "pi",
+    user: { harnesses: { pi: { bridge: { hang_threshold: 5 } } } },
+  },
   { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
   ...(["opencode", "pi"] as const).flatMap((harness) =>
     [

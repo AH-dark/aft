@@ -107,6 +107,51 @@
         }
       },
       "digest": "0f151a39937744ac521ababd68ca6083cf24d34ac1d727d24c73f5018f7749a8"
+    },
+    {
+      "name": "retired_key_only",
+      "note": "a file with one retired key, before bridge.hang_threshold is added",
+      "doc": {
+        "search_index": false
+      },
+      "digest": "2670d23b1c83be8016451c8224441d31f76da5e7a6c8944d501d73bfefb8b6fa"
+    },
+    {
+      "name": "retired_key_plus_hang_threshold",
+      "note": "adding the no-effect bridge.hang_threshold changes the digest, so an acknowledged notice is shown again",
+      "doc": {
+        "search_index": false,
+        "bridge": {
+          "hang_threshold": 3
+        }
+      },
+      "digest": "9cdaf18ca179725b36cbf3894f73cbe4ef5a9552e6e310305a35003cfb7a9dc7"
+    },
+    {
+      "name": "retired_key_plus_harness_hang_threshold",
+      "note": "the same inside a harness block",
+      "doc": {
+        "search_index": false,
+        "harnesses": {
+          "pi": {
+            "bridge": {
+              "hang_threshold": 5
+            }
+          }
+        }
+      },
+      "digest": "1635c3a670240912074f6674c538aaf5a02747828787ac81c61902678fdf1623"
+    },
+    {
+      "name": "retired_key_plus_current_bridge_setting",
+      "note": "a current bridge setting is not projected, so this matches retired_key_only",
+      "doc": {
+        "search_index": false,
+        "bridge": {
+          "request_timeout_ms": 45000
+        }
+      },
+      "digest": "2670d23b1c83be8016451c8224441d31f76da5e7a6c8944d501d73bfefb8b6fa"
     }
   ]
 }

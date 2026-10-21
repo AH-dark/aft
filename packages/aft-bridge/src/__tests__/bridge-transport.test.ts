@@ -19,6 +19,7 @@ import { BridgePool } from "../pool.js";
 import { findBinarySync } from "../resolver.js";
 import { cachedExecutable, linkCachedExecutable } from "./test-utils/cached-executable.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
+import { ManualClock } from "./test-utils/manual-clock.js";
 
 let workDir: string;
 
@@ -110,7 +111,7 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test("timeout respawn cannot repeat startup kills before a tool recovers", async () => {
+  test("a watchdog restart is not repeated before a tool recovers", async () => {
     const script = writeExecutable(
       "startup-hang.js",
       `#!/usr/bin/env node
@@ -129,27 +130,44 @@ process.stdin.on("data", chunk => {
 });
 `,
     );
+    const clock = new ManualClock();
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1000,
-      hangThreshold: 1,
+      hangWindowMinMs: 1000,
+      hangProbeTimeoutMs: 100,
       maxRestarts: 0,
+      clock,
     });
+    // An unanswered call, then a second one still waiting when the child has
+    // been silent for the 1000 ms window (sent at 700 ms, waiting until 1200).
+    // The engine ignores the watchdog's ping, so the probe times out at
+    // 1100 ms and the child is killed while the second call waits.
+    // Time moves only through the manual clock, so this cannot race the load.
+    const silentPair = async (): Promise<string> => {
+      const first = bridge.send("silent", {}, { timeoutMs: 100 });
+      clock.advance(100);
+      await expect(first).rejects.toThrow("timed out");
+      clock.advance(600);
+      const second = bridge.send("silent", {}, { timeoutMs: 500 }).then(
+        () => "resolved",
+        (err: unknown) => (err instanceof Error ? err.name : String(err)),
+      );
+      clock.advance(300);
+      clock.advance(200);
+      return second;
+    };
     try {
       await bridge.send("configure", {}, { timeoutMs: 5000 });
-      await expect(bridge.send("silent", {}, { timeoutMs: 30 })).rejects.toThrow("timed out");
+      expect(await silentPair()).toBe("BridgeRestartedError");
       expect(bridge.isAlive()).toBe(false);
       // A successful configure/version on the replacement does not prove that
       // its tools have made it past the same index startup work.
       await bridge.send("configure", {}, { timeoutMs: 5000 });
       await bridge.send("version");
-      for (let i = 0; i < 3; i++) {
-        await expect(bridge.send("silent", {}, { timeoutMs: 30 })).rejects.toThrow(
-          "automatic timeout restart already attempted",
-        );
-        expect(bridge.isAlive()).toBe(true);
-      }
+      expect(await silentPair()).toBe("Error");
+      expect(bridge.isAlive()).toBe(true);
       await bridge.send("recovered");
-      await expect(bridge.send("silent", {}, { timeoutMs: 30 })).rejects.toThrow("timed out");
+      expect(await silentPair()).toBe("BridgeRestartedError");
       expect(bridge.isAlive()).toBe(false);
     } finally {
       await bridge.shutdown();
@@ -175,7 +193,6 @@ process.stdin.on("data", chunk => {
     );
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1000,
-      hangThreshold: 1,
       maxRestarts: 0,
     });
     try {
@@ -713,7 +730,14 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test("repeated silent timeouts attribute the bridge kill and aborted siblings", async () => {
+  // The hang watchdog's restart and its kill attribution log are covered in
+  // bridge-hang-watchdog.test.ts.
+  //
+  // The same scenario as issue #646's measurement (two silent timeouts from one
+  // session, a read from another session and a keep-warm shell call pending),
+  // which used to kill the shared bridge and abort both. Each call now settles
+  // on its own timer, and nothing is killed.
+  test("repeated silent timeouts abort neither siblings nor a keep-warm shell call", async () => {
     const script = writeExecutable(
       "silent-hang.js",
       `#!/usr/bin/env node
@@ -742,6 +766,8 @@ process.stdin.on("data", (chunk) => {
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1_000,
       maxRestarts: 0,
+      // The shell call's own timeout should settle at its deadline here.
+      lateShellReplyGraceMs: 0,
       logger,
     });
     const testBridge = bridge as unknown as { configured: boolean };
@@ -764,16 +790,13 @@ process.stdin.on("data", (chunk) => {
           (err) => String(err instanceof Error ? err.message : err),
         );
       const siblingResult = bridge
-        .toolCall("sibling-session", "read", {}, { timeoutMs: 1_000 })
+        .toolCall("sibling-session", "read", {}, { timeoutMs: 400 })
         .then<unknown>(
           () => "resolved",
           (err) => err,
         );
-
-      // A shell call that opted out of killing on its own timeout is still
-      // aborted when another request's timeout kills the shared bridge.
       const shellResult = bridge
-        .send("bash", { command: "long-running" }, { timeoutMs: 1_000, keepBridgeOnTimeout: true })
+        .send("bash", { command: "long-running" }, { timeoutMs: 400, keepBridgeOnTimeout: true })
         .then<unknown>(
           () => "resolved",
           (error) => error,
@@ -783,37 +806,24 @@ process.stdin.on("data", (chunk) => {
         siblingResult,
         shellResult,
       ]);
-      expect(shell).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
 
-      expect(second).toMatch(/timed out|aborted/);
-      expect(sibling).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
-      const siblingMessage = String(sibling instanceof Error ? sibling.message : sibling);
-      expect(siblingMessage).toContain("triggering_request_id=3");
-      expect(siblingMessage).toContain('triggering_tool="aft_inspect"');
-      expect(siblingMessage).toContain("bridge_generation=1");
-      expect(siblingMessage).toContain(
-        'aborted_siblings=[{"request_id":"4","tool":"read"},{"request_id":"5","tool":"bash"}]',
+      expect(second).toContain("timed out after 20ms");
+      // Each sibling ran out its own budget; neither was cut off by a kill.
+      expect(sibling).not.toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+      expect(String(sibling instanceof Error ? sibling.message : sibling)).toContain(
+        "timed out after 400ms",
       );
-
-      const killLog = logs.find(
-        ({ level, message }) =>
-          level === "error" && message.includes("Bridge killed after timeout"),
-      );
-      expect(killLog?.message).toContain("triggering_request_id=3");
-      expect(killLog?.message).toContain('triggering_tool="aft_inspect"');
-      expect(killLog?.message).toContain("bridge_generation=1");
-      expect(killLog?.message).toContain(
-        'aborted_siblings=[{"request_id":"4","tool":"read"},{"request_id":"5","tool":"bash"}]',
-      );
-      expect(killLog?.meta).toEqual({ sessionId: "timeout-session" });
-      expect(bridge.isAlive()).toBe(false);
-      expect(testBridge.configured).toBe(false);
+      expect(isBridgeTransportTimeout(shell)).toBe(true);
+      expect(shell).not.toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+      expect(logs.some(({ message }) => message.includes("Bridge killed"))).toBe(false);
+      expect(bridge.isAlive()).toBe(true);
+      expect(testBridge.configured).toBe(true);
     } finally {
       await bridge.shutdown();
     }
   });
 
-  test("custom hangThreshold delays bridge kill until threshold silent timeouts", async () => {
+  test("many silent timeouts in a row keep the bridge warm", async () => {
     const script = writeExecutable(
       "hang-threshold-five.js",
       `#!/usr/bin/env node
@@ -840,7 +850,6 @@ process.stdin.on("data", (chunk) => {
     );
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1_000,
-      hangThreshold: 5,
       maxRestarts: 0,
     });
 

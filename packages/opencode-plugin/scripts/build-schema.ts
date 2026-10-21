@@ -756,13 +756,6 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Per-request bridge transport timeout in milliseconds. Default 30000. Raise on slow filesystems (WSL/DrvFs/NFS) where cold aft operations exceed the default.",
           },
-          hang_threshold: {
-            type: "integer",
-            minimum: 1,
-            default: 2,
-            description:
-              "Consecutive silent request timeouts before the shared bridge process is killed and respawned (aborting all pending requests). Default 2. Raise when many editor windows share one bridge.",
-          },
         },
         additionalProperties: false,
         description:

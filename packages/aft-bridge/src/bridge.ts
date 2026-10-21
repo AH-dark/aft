@@ -5,7 +5,11 @@ import { StringDecoder } from "node:string_decoder";
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
 import { binaryContentHash, binaryStampKey, peekBinaryContentHash } from "./binary-identity.js";
 import { type ChildProcess, spawn } from "./child-process.js";
-import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
+import {
+  isPassiveCommand,
+  isReadOnlyRetryCommand,
+  PASSIVE_COMMAND_TIMEOUT_MS,
+} from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { withPathPrepended } from "./path-env.js";
 import { type BgCompletion, isTerminalBashStatus, type StatusCompression } from "./protocol.js";
@@ -18,7 +22,35 @@ import type {
 import { HOST_TOOL_NAMES_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
-const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
+/** Default floor of the hang watchdog's silence window (`hangWindowMinMs`). */
+const DEFAULT_MIN_HANG_WINDOW_MS = 60_000;
+/** Default wait for the answer to the hang watchdog's `ping` (`hangProbeTimeoutMs`). */
+const DEFAULT_HANG_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * How long the child may write nothing at all (no reply, progress frame or
+ * push frame) while it owes a reply, before the hang watchdog probes it with a
+ * `ping`. The window starts at the child's last output, or at the oldest
+ * unanswered request when that request was sent after the last output.
+ *
+ * The window is twice the longest transport budget among those unanswered
+ * requests and the calls still waiting, and never less than `minWindowMs`. A
+ * request that is slow but healthy finishes within its own budget, and a
+ * request queued behind it within roughly one more, so a child that stays
+ * silent for twice the longest budget is suspected hung and gets the probe.
+ * (A deeper silent backlog can still reach the window; any parsed stdout frame
+ * resets it.) The floor keeps short budgets (5 s status polls, 30 s defaults)
+ * from turning a slow disk or a cold index into a kill. This is the only place
+ * the window is computed.
+ */
+export function hangWindowMs(
+  budgetsMs: Iterable<number>,
+  minWindowMs: number = DEFAULT_MIN_HANG_WINDOW_MS,
+): number {
+  let longest = 0;
+  for (const budget of budgetsMs) longest = Math.max(longest, budget);
+  return Math.max(minWindowMs, 2 * longest);
+}
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 /** Characters of an unparseable stdout line quoted in the warning log. */
 const MALFORMED_STDOUT_LOG_CHARS = 512;
@@ -174,10 +206,35 @@ export function compareSemver(a: string, b: string): number {
   return 0;
 }
 
+/** Opaque handle returned by {@link BridgeClock.setTimeout}. */
+export type BridgeTimer = unknown;
+
+/**
+ * Time source for request deadlines, the bash late-reply grace and the hang
+ * watchdog. Production uses the system clock; tests inject a manual clock so
+ * deadlines and the watchdog fire exactly when the test advances time,
+ * independent of machine load.
+ */
+export interface BridgeClock {
+  now(): number;
+  setTimeout(callback: () => void, ms: number): BridgeTimer;
+  clearTimeout(timer: BridgeTimer): void;
+}
+
+// Looks up the global timer functions at call time, so code that replaces
+// globalThis.setTimeout (as some tests do) still sees bridge timers.
+const SYSTEM_CLOCK: BridgeClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: BridgeTimer;
+  /** Transport budget of this call; widens the hang watchdog's window while it waits. */
+  budgetMs: number;
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   onSettled?: () => void;
   command: string;
@@ -327,6 +384,37 @@ export class BridgeTransportUnknownOutcomeError extends BridgeTransportUnavailab
   }
 }
 
+/**
+ * The hang watchdog killed the child while this request was waiting: the child
+ * had written nothing for longer than its silence window (see `hangWindowMs`).
+ * The bridge respawns on the next call, so the request can be sent again.
+ *
+ * `outcomeUnknown` is false for read-only tools (`READ_ONLY_RETRY_COMMANDS`):
+ * they cannot have changed anything, and the bridge retries them once on the
+ * respawned child (unless the call was aborted or the bridge is shutting
+ * down), so a caller sees this only if that retry was cut off too. For every
+ * other command it is true: the child may
+ * have applied the request before it went silent, so a mutation must be
+ * inspected before it is repeated.
+ */
+export class BridgeRestartedError extends BridgeTransportUnknownOutcomeError {
+  readonly retryable = true as const;
+  readonly restartReason = "hang_watchdog" as const;
+  constructor(
+    public readonly tool: string,
+    public readonly outcomeUnknown: boolean,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BridgeRestartedError";
+  }
+}
+
+/** Type guard for a rejection caused by a hang-watchdog restart. */
+export function isBridgeRestarted(err: unknown): err is BridgeRestartedError {
+  return err instanceof BridgeRestartedError;
+}
+
 /** Type guard for a transport-timeout rejection (bridge busy, retryable). */
 export function isBridgeTransportTimeout(err: unknown): err is BridgeTransportTimeoutError {
   return err instanceof Error && (err as { code?: unknown }).code === "transport_timeout";
@@ -336,11 +424,22 @@ export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
   /**
-   * Consecutive silent request timeouts (no id-matched response) before the
-   * bridge is killed and respawned. Default: 2. Child stdout activity since
-   * the request still keeps the bridge warm regardless of this counter.
+   * Floor of the hang watchdog's silence window in milliseconds. Default:
+   * 60000. Tests lower it to exercise the watchdog quickly.
    */
-  hangThreshold?: number;
+  hangWindowMinMs?: number;
+  /**
+   * How long the hang watchdog waits for the answer to the `ping` it sends
+   * once the child has been silent for its window. The child is killed only
+   * when neither that answer nor any other stdout frame arrives in this time.
+   * Default: 5000. Tests lower it to fit their timelines.
+   */
+  hangProbeTimeoutMs?: number;
+  /**
+   * Time source for request deadlines, the bash late-reply grace and the hang
+   * watchdog. Default: the system clock. Tests inject a manual clock.
+   */
+  clock?: BridgeClock;
   /**
    * How long a `bash`/`powershell` call that timed out with
    * `keepBridgeOnTimeout` keeps waiting for AFT's late reply, so its timeout
@@ -443,21 +542,17 @@ export interface BridgeRequestOptions {
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
   transportTimeoutMs?: number;
   /**
-   * Skip bridge-hang escalation for this request.
+   * Reject a transport-level timeout of this request with a typed
+   * `BridgeTransportTimeoutError` (code `transport_timeout`), and for
+   * `bash`/`powershell` first wait a short grace period for AFT's late reply
+   * naming the task it started. Without it the timeout rejects with a plain
+   * error carrying the same outcome-unknown guidance.
    *
-   * The default (false) treats a transport-level timeout as a possible bridge
-   * hang. The bridge now escalates cautiously: a single timeout while the child
-   * is still emitting stdout, or before the hang threshold is reached, rejects
-   * only that request and keeps warm state. Repeated silent timeouts still kill
-   * the child so the next call gets a fresh bridge.
-   *
-   * Some commands enforce their own timeouts on the Rust side (notably `bash`,
-   * which uses a watchdog thread to terminate the child shell and return a
-   * timeout response). For those, a transport timeout means the response was
-   * lost or queued behind something else — the bridge itself is still healthy
-   * and should keep its warm state (LSP servers, semantic index, callers
-   * cache, undo history). Pass `keepBridgeOnTimeout: true` to reject the
-   * request without contributing to hang escalation.
+   * Either way a timeout rejects only this request: it never kills the child
+   * or touches other pending requests. Restarting a hung child is the hang
+   * watchdog's job, which judges the child by its silence (see
+   * `hangWindowMs`), not by request timeouts. Passive polls and
+   * `bash_drain_completions` always get this flag.
    */
   keepBridgeOnTimeout?: boolean;
 }
@@ -527,7 +622,9 @@ export class BinaryBridge implements AftProjectTransport {
   private _restartCount = 0;
   private _shuttingDown = false;
   private timeoutMs: number;
-  private hangThreshold: number;
+  private hangWindowMinMs: number;
+  private hangProbeTimeoutMs: number;
+  private readonly clock: BridgeClock;
   private lateShellReplyGraceMs: number;
   private maxRestarts: number;
   private configured = false;
@@ -559,13 +656,40 @@ export class BinaryBridge implements AftProjectTransport {
   private configureWarningClients = new Map<string, unknown>();
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Updated after every successfully parsed stdout frame from the child. */
-  private lastChildActivityAt = 0;
-  /** Consecutive non-bash-style request timeouts without an id-matched response. */
-  private consecutiveRequestTimeouts = 0;
-  // One timeout-driven replacement may recover a genuine hang. Replacing it
-  // again before any tool succeeds only repeats the same cold startup work.
-  // This survives spawn/configure/version and is re-armed by a tool response.
+  /**
+   * Hang evidence: requests written to the current child that it has not
+   * answered. An entry stays after its caller timed out, because the child
+   * still owes the reply. An entry is removed when the child answers that
+   * request (`settleHangEvidence`), when an answered liveness probe shows the
+   * child is alive while the entry's caller is gone (`onHangProbeAnswered`),
+   * or when a new child starts (`resetHangWatchdog`). Output for other
+   * requests does not remove it: the child may have answered one session and
+   * then frozen on another's request.
+   */
+  private awaitingReply = new Map<
+    string,
+    { sentAt: number; budgetMs: number; tool: string; sessionId: string | undefined }
+  >();
+  /**
+   * Bridge-clock time of the current child's last parsed stdout frame of any
+   * kind. The watchdog's silence is measured from here, so a child that keeps
+   * writing is never judged silent.
+   */
+  private lastChildActivity = Number.NEGATIVE_INFINITY;
+  /**
+   * The watchdog's `ping` to the current child that has not been answered
+   * yet; at most one is in flight. It is not a caller's request: it is never
+   * retried, never counts as hang evidence, and its answer is handled only by
+   * `onHangProbeAnswered`.
+   */
+  private hangProbe: { id: string; sentAt: number; timer: BridgeTimer } | null = null;
+  private hangWatchdogTimer: BridgeTimer | null = null;
+  /** Set once per child when a suppressed watchdog kill has been logged. */
+  private hangSuppressionLogged = false;
+  // One watchdog restart may recover a genuine hang. Restarting again before
+  // any tool succeeds only repeats the same cold startup work, so the
+  // watchdog stands down until then. This survives spawn/configure/version
+  // and is re-armed by a successful tool response.
   private timeoutRestartAwaitingRecovery = false;
   private errorPrefix: string;
   private readonly logger: Logger | undefined;
@@ -583,7 +707,9 @@ export class BinaryBridge implements AftProjectTransport {
     this.binaryPath = binaryPath;
     this.cwd = cwd;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
-    this.hangThreshold = options?.hangThreshold ?? BRIDGE_HANG_TIMEOUT_THRESHOLD;
+    this.hangWindowMinMs = options?.hangWindowMinMs ?? DEFAULT_MIN_HANG_WINDOW_MS;
+    this.hangProbeTimeoutMs = options?.hangProbeTimeoutMs ?? DEFAULT_HANG_PROBE_TIMEOUT_MS;
+    this.clock = options?.clock ?? SYSTEM_CLOCK;
     this.lateShellReplyGraceMs =
       options?.lateShellReplyGraceMs ?? DEFAULT_LATE_SHELL_REPLY_GRACE_MS;
     this.maxRestarts = options?.maxRestarts ?? 3;
@@ -976,6 +1102,7 @@ export class BinaryBridge implements AftProjectTransport {
     params: Record<string, unknown>,
     options: SendOptions | undefined,
     canRetryAfterVersionSwap: boolean,
+    retriedAfterHangRestart = false,
   ): Promise<Record<string, unknown>> {
     try {
       if (this._retiringDueToBinaryChange) {
@@ -1139,18 +1266,20 @@ export class BinaryBridge implements AftProjectTransport {
       }
       const line = `${JSON.stringify(request)}\n`;
 
-      // Passive polls NEVER count toward hang escalation regardless of caller:
-      // a queued status poll timing out means the bridge is BUSY, not hung, and
-      // killing it would abort the user's in-flight request waiting on the same
-      // work (issue #117). This is enforced bridge-side so no call site can
-      // forget it.
+      // Passive polls and completion drains always take the typed keep-warm
+      // timeout regardless of caller: a queued status poll timing out means
+      // the bridge is BUSY, not hung (issue #117). Enforced bridge-side so no
+      // call site can forget it.
       const keepBridgeOnTimeout =
         passive || command === "bash_drain_completions" || options?.keepBridgeOnTimeout === true;
-      let requestSentAt = Date.now();
 
       const child = this.process;
       const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
-        const timer = setTimeout(() => {
+        // A timeout settles only this request. It never kills the child or
+        // rejects other requests: one slow call says nothing about the calls
+        // of other sessions sharing this child, and a child that is truly
+        // hung is caught by the hang watchdog, which watches its silence.
+        const timer = this.clock.setTimeout(() => {
           const entry = this.pending.get(id);
           if (!entry) return;
           if (
@@ -1160,16 +1289,17 @@ export class BinaryBridge implements AftProjectTransport {
             return;
           }
           this.pending.delete(id);
-          clearTimeout(entry.timer);
+          this.clock.clearTimeout(entry.timer);
           entry.onSettled?.();
 
+          const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms — bridge kept warm`;
+          if (requestSessionId) {
+            this.sessionWarnVia(requestSessionId, timeoutMsg);
+          } else {
+            this.warnVia(timeoutMsg);
+          }
+
           if (keepBridgeOnTimeout) {
-            const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`;
-            if (requestSessionId) {
-              this.sessionWarnVia(requestSessionId, timeoutMsg);
-            } else {
-              this.warnVia(timeoutMsg);
-            }
             entry.reject(
               new BridgeTransportTimeoutError(
                 command,
@@ -1179,46 +1309,10 @@ export class BinaryBridge implements AftProjectTransport {
             );
             return;
           }
-
-          const childActiveSinceRequest = this.lastChildActivityAt > requestSentAt;
-          const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
-          this.consecutiveRequestTimeouts = consecutiveTimeouts;
-          const restartSuppressed = this.timeoutRestartAwaitingRecovery;
-          const keepWarm =
-            restartSuppressed ||
-            childActiveSinceRequest ||
-            consecutiveTimeouts < this.hangThreshold;
-          const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
-          const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
-          if (requestSessionId) {
-            this.sessionWarnVia(requestSessionId, timeoutMsg);
-          } else {
-            this.warnVia(timeoutMsg);
-          }
-
-          if (keepWarm) {
-            entry.reject(
-              new Error(
-                restartSuppressed
-                  ? `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms; automatic timeout restart already attempted; bridge kept warm to finish startup. Retry later or restart the host explicitly if it remains unresponsive. A timed-out mutation may still complete; inspect before repeating it.`
-                  : `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry`,
-              ),
-            );
-            return;
-          }
-
           entry.reject(
             new Error(
-              `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
+              `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry. A timed-out mutation may still complete; inspect before repeating it.`,
             ),
-          );
-          this.handleTimeout(
-            {
-              requestId: id,
-              tool: entry.tool,
-              generation: entry.generation,
-            },
-            requestSessionId,
           );
         }, effectiveTimeoutMs);
 
@@ -1226,6 +1320,7 @@ export class BinaryBridge implements AftProjectTransport {
           resolve,
           reject,
           timer,
+          budgetMs: effectiveTimeoutMs,
           onProgress: options?.onProgress,
           command,
           tool,
@@ -1235,7 +1330,7 @@ export class BinaryBridge implements AftProjectTransport {
 
         if (!child?.stdin?.writable) {
           this.pending.delete(id);
-          clearTimeout(timer);
+          this.clock.clearTimeout(timer);
           const error = new BridgeTransportUnavailableError(
             `${this.errorPrefix} stdin not writable for command "${command}"`,
           );
@@ -1244,7 +1339,7 @@ export class BinaryBridge implements AftProjectTransport {
           return;
         }
 
-        requestSentAt = Date.now();
+        this.recordAwaitingReply(id, effectiveTimeoutMs, tool, requestSessionId);
         const handleWriteFailure = (cause: unknown): void => {
           const writeError = cause instanceof Error ? cause : new Error(String(cause));
           const error = new BridgeTransportUnknownOutcomeError(
@@ -1254,7 +1349,7 @@ export class BinaryBridge implements AftProjectTransport {
           const entry = this.pending.get(id);
           if (entry) {
             this.pending.delete(id);
-            clearTimeout(entry.timer);
+            this.clock.clearTimeout(entry.timer);
             entry.onSettled?.();
             entry.reject(error);
           }
@@ -1291,7 +1386,34 @@ export class BinaryBridge implements AftProjectTransport {
         this.logVia(
           `Retrying request "${command}" once after coordinated binary replacement: ${err.newBinaryPath}`,
         );
-        return this.sendWithVersionMismatchRetry(command, params, options, false);
+        return this.sendWithVersionMismatchRetry(
+          command,
+          params,
+          options,
+          false,
+          retriedAfterHangRestart,
+        );
+      }
+      // A watchdog restart rejected this call. A read-only tool is sent once
+      // more on the respawned child; anything else may already have taken
+      // effect, so its caller gets the typed restart error to decide on.
+      const tool =
+        command === "tool_call" && typeof params.name === "string" ? params.name : command;
+      if (
+        err instanceof BridgeRestartedError &&
+        !retriedAfterHangRestart &&
+        isReadOnlyRetryCommand(tool) &&
+        !this._shuttingDown &&
+        options?.abortSignal?.aborted !== true
+      ) {
+        this.logVia(`Retrying read-only request "${tool}" once after the hang watchdog restart`);
+        return this.sendWithVersionMismatchRetry(
+          command,
+          params,
+          options,
+          canRetryAfterVersionSwap,
+          true,
+        );
       }
       throw err;
     }
@@ -1384,6 +1506,7 @@ export class BinaryBridge implements AftProjectTransport {
   async shutdown(): Promise<void> {
     this._shuttingDown = true;
     this.spawnedBinaryFingerprint = null;
+    this.resetHangWatchdog();
     this.clearRestartResetTimer();
     this.clearRestartTimer();
     this.configureWarningClients.clear();
@@ -1678,8 +1801,7 @@ export class BinaryBridge implements AftProjectTransport {
     this.stdoutPending = [];
     this.stdoutPendingLength = 0;
     this.stderrBuffer = "";
-    this.lastChildActivityAt = 0;
-    this.consecutiveRequestTimeouts = 0;
+    this.resetHangWatchdog();
     // Fresh spawn — clear the stderr ring so crash diagnostics only reflect
     // the current child's output, not output from prior restart cycles.
     this.stderrTail = [];
@@ -1800,7 +1922,9 @@ export class BinaryBridge implements AftProjectTransport {
   private processStdoutLine(line: string): void {
     try {
       const response = JSON.parse(line) as Record<string, unknown>;
-      this.lastChildActivityAt = Date.now();
+      // Any parsed frame proves the child is alive: it restarts the silence
+      // clock but forgets no unanswered request (see `awaitingReply`).
+      this.lastChildActivity = this.clock.now();
       if (response.type === "progress") {
         const requestId = response.request_id as string | undefined;
         const entry = requestId ? this.pending.get(requestId) : undefined;
@@ -1814,7 +1938,7 @@ export class BinaryBridge implements AftProjectTransport {
         const entry = requestId ? this.pending.get(requestId) : undefined;
         if (requestId && entry) {
           this.pending.delete(requestId);
-          clearTimeout(entry.timer);
+          this.clock.clearTimeout(entry.timer);
           entry.onSettled?.();
           entry.resolve({
             success: false,
@@ -1823,6 +1947,9 @@ export class BinaryBridge implements AftProjectTransport {
             asks: response.asks,
           });
         }
+        // The ask settles the request in place of a reply. This runs after the
+        // pending entry is gone, so its budget no longer widens the window.
+        if (requestId) this.settleHangEvidence(requestId);
         return;
       }
       if (response.type === "bash_completed") {
@@ -1859,13 +1986,19 @@ export class BinaryBridge implements AftProjectTransport {
         return;
       }
       const id = response.id as string | undefined;
+      if (id && this.hangProbe?.id === id) {
+        this.onHangProbeAnswered();
+        return;
+      }
       if (id && this.pending.has(id)) {
         const entry = this.pending.get(id);
         if (!entry) return;
         this.pending.delete(id);
-        clearTimeout(entry.timer);
+        // Answered: the child no longer owes this request. Settled after the
+        // pending entry is gone, so its budget no longer widens the window.
+        this.settleHangEvidence(id);
+        this.clock.clearTimeout(entry.timer);
         entry.onSettled?.();
-        this.consecutiveRequestTimeouts = 0;
         if (
           response.success !== false &&
           ![
@@ -1884,6 +2017,8 @@ export class BinaryBridge implements AftProjectTransport {
         this.accountForBashTaskResponse(entry.command, response);
         entry.resolve(response);
       } else if (id && typeof response.type !== "string") {
+        // A late reply still means the child no longer owes this request.
+        this.settleHangEvidence(id);
         // A reply for a request that already settled (its deadline and any
         // grace period passed). One that names a task is a warning: the task
         // may still be running, and this log line is the only record of its id.
@@ -1945,8 +2080,8 @@ export class BinaryBridge implements AftProjectTransport {
     // A reply now arrives after the caller's deadline, so it settles the call
     // as a timeout that reports what AFT answered.
     entry.resolve = (response) => settle(shellOutcomeFromLateReply(response));
-    clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => {
+    this.clock.clearTimeout(entry.timer);
+    entry.timer = this.clock.setTimeout(() => {
       if (this.pending.get(id) !== entry) return;
       this.pending.delete(id);
       entry.onSettled?.();
@@ -1976,31 +2111,236 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
-  private handleTimeout(
-    trigger: { requestId: string; tool: string; generation: number },
-    triggeringSessionId?: string,
+  /** Record a request the child now owes a reply, and make sure the watchdog runs. */
+  private recordAwaitingReply(
+    id: string,
+    budgetMs: number,
+    tool: string,
+    sessionId: string | undefined,
   ): void {
-    this.consecutiveRequestTimeouts = 0;
+    this.awaitingReply.set(id, { sentAt: this.clock.now(), budgetMs, tool, sessionId });
+    this.armHangWatchdog();
+  }
+
+  /**
+   * The child answered request `id`, so it no longer owes that reply. Only
+   * this request's evidence goes: other unanswered requests stay, because a
+   * child can answer one session and then freeze on another's request.
+   */
+  private settleHangEvidence(id: string): void {
+    if (!this.awaitingReply.delete(id)) return;
+    // The window may have shrunk with this request's budget, so the timer is
+    // set again from the remaining evidence (or dropped when none is left).
+    this.clearHangWatchdogTimer();
+    this.armHangWatchdog();
+  }
+
+  /**
+   * When the current child counts as silent for too long: the silence window
+   * measured from its last output, or from the oldest unanswered request when
+   * that was sent later (a child owes nothing before it is asked). The window
+   * covers the budgets of the unanswered requests and of every call still
+   * waiting, so a slow request that is still within its budget widens it.
+   * Null when the child owes no reply.
+   */
+  private hangDeadline(): {
+    deadline: number;
+    windowMs: number;
+    silentSince: number;
+    oldestId: string;
+  } | null {
+    if (this.awaitingReply.size === 0) return null;
+    let oldestId = "";
+    let oldestSentAt = Number.POSITIVE_INFINITY;
+    const budgets: number[] = [];
+    for (const [id, entry] of this.awaitingReply) {
+      budgets.push(entry.budgetMs);
+      if (entry.sentAt < oldestSentAt) {
+        oldestSentAt = entry.sentAt;
+        oldestId = id;
+      }
+    }
+    for (const entry of this.pending.values()) budgets.push(entry.budgetMs);
+    const windowMs = hangWindowMs(budgets, this.hangWindowMinMs);
+    const silentSince = Math.max(oldestSentAt, this.lastChildActivity);
+    return { deadline: silentSince + windowMs, windowMs, silentSince, oldestId };
+  }
+
+  private armHangWatchdog(): void {
+    // While a probe is in flight, its own timer decides what happens next.
+    if (this.hangWatchdogTimer || this.hangProbe) return;
+    const hang = this.hangDeadline();
+    if (!hang) return;
+    const timer = this.clock.setTimeout(
+      () => {
+        this.hangWatchdogTimer = null;
+        this.checkForHang();
+      },
+      Math.max(0, hang.deadline - this.clock.now()),
+    );
+    // Waiting calls have their own referenced timeout timers that keep the
+    // host alive; an idle host must be able to exit with a hung child.
+    (timer as { unref?: () => void }).unref?.();
+    this.hangWatchdogTimer = timer;
+  }
+
+  private clearHangWatchdogTimer(): void {
+    if (this.hangWatchdogTimer) this.clock.clearTimeout(this.hangWatchdogTimer);
+    this.hangWatchdogTimer = null;
+  }
+
+  private clearHangProbe(): void {
+    if (this.hangProbe) this.clock.clearTimeout(this.hangProbe.timer);
+    this.hangProbe = null;
+  }
+
+  private resetHangWatchdog(): void {
+    this.clearHangWatchdogTimer();
+    this.clearHangProbe();
+    this.awaitingReply.clear();
+    this.lastChildActivity = Number.NEGATIVE_INFINITY;
+    this.hangSuppressionLogged = false;
+  }
+
+  /**
+   * Runs when the silence window may have elapsed. A child that owes a reply
+   * and has written nothing for the whole window is either hung, or healthy
+   * and idle while one request it was given never finishes (a stuck worker, a
+   * lost reply). Only a hung child should be replaced: the bridge is shared by
+   * every session, and a restart throws away everyone's warm state. So the
+   * watchdog sends a `ping` (answered by the engine's dispatcher without
+   * touching any index) and decides when it is answered or times out; see
+   * `onHangProbeAnswered` and `onHangProbeTimeout`.
+   *
+   * The probe goes out at this tick even when no caller is waiting any more
+   * (every caller may already have timed out). Waiting for the next call
+   * instead would let that call run into the same silent child. So a hung
+   * child is replaced one window plus one probe timeout after its silence
+   * began (its last output, or the oldest unanswered request if that came
+   * later), and a call made in that time waits at most until then.
+   *
+   * After one watchdog restart it stands down until a tool succeeds (see
+   * `timeoutRestartAwaitingRecovery`), and then sends no probe either.
+   */
+  private checkForHang(): void {
+    if (!this.isAlive() || this.hangProbe) return;
+    const hang = this.hangDeadline();
+    if (!hang) return;
+    const now = this.clock.now();
+    if (now < hang.deadline) {
+      this.armHangWatchdog();
+      return;
+    }
+    if (this.timeoutRestartAwaitingRecovery) {
+      // Pending calls are left to their own timeouts; see the field comment.
+      if (!this.hangSuppressionLogged) {
+        this.hangSuppressionLogged = true;
+        this.warnVia(
+          `Hang watchdog: child silent past its window, but it was already restarted once and no tool has succeeded since; not restarting again; ${this.hangAttribution(hang)}`,
+        );
+      }
+      return;
+    }
+    this.sendHangProbe(hang);
+  }
+
+  private hangAttribution(hang: NonNullable<ReturnType<BinaryBridge["hangDeadline"]>>): string {
+    return (
+      `silent_ms=${this.clock.now() - hang.silentSince} ` +
+      `hang_window_ms=${hang.windowMs} ` +
+      `oldest_unanswered_request_id=${hang.oldestId} ` +
+      `oldest_unanswered_tool=${JSON.stringify(this.awaitingReply.get(hang.oldestId)?.tool)} ` +
+      `bridge_generation=${this.processGeneration}`
+    );
+  }
+
+  /** Write the liveness `ping` straight to the child, outside the request path. */
+  private sendHangProbe(hang: NonNullable<ReturnType<BinaryBridge["hangDeadline"]>>): void {
+    const id = `hang-probe-${this.nextId++}`;
+    const timer = this.clock.setTimeout(() => this.onHangProbeTimeout(id), this.hangProbeTimeoutMs);
+    // Like the watchdog timer, the probe must not keep an idle host alive.
+    (timer as { unref?: () => void }).unref?.();
+    this.hangProbe = { id, sentAt: this.clock.now(), timer };
+    this.logVia(
+      `Hang watchdog: child silent past its window; sending liveness probe id=${id} probe_timeout_ms=${this.hangProbeTimeoutMs}; ${this.hangAttribution(hang)}`,
+    );
+    // A probe that cannot be written goes unanswered, and its timeout decides.
+    try {
+      this.process?.stdin?.write(`${JSON.stringify({ id, command: "ping" })}\n`, () => {});
+    } catch {
+      // Same as above: the probe timeout handles it.
+    }
+  }
+
+  /**
+   * The child answered the probe, so it can still respond. Requests whose
+   * callers already gave up (timed out or aborted) stop counting as evidence:
+   * their missing replies alone are no reason to replace a responsive child.
+   * Requests whose callers are still waiting stay, and the silence window
+   * restarts from this answer.
+   */
+  private onHangProbeAnswered(): void {
+    const probeId = this.hangProbe?.id;
+    this.clearHangProbe();
+    let dropped = 0;
+    for (const id of Array.from(this.awaitingReply.keys())) {
+      if (this.pending.has(id)) continue;
+      this.awaitingReply.delete(id);
+      dropped += 1;
+    }
+    this.logVia(
+      `Hang watchdog: liveness probe id=${probeId} answered; child kept; dropped ${dropped} unanswered request(s) whose callers already settled, ${this.awaitingReply.size} still waiting`,
+    );
+    this.clearHangWatchdogTimer();
+    this.armHangWatchdog();
+  }
+
+  /**
+   * No answer to the probe within its timeout. If the child wrote anything
+   * else since the probe was sent it is not silent, and the watchdog simply
+   * starts over from that output. Otherwise it is hung and is killed.
+   */
+  private onHangProbeTimeout(probeId: string): void {
+    const probe = this.hangProbe;
+    if (!probe || probe.id !== probeId) return;
+    this.hangProbe = null;
+    if (!this.isAlive()) return;
+    const hang = this.hangDeadline();
+    if (!hang) return;
+    if (this.lastChildActivity >= probe.sentAt) {
+      this.armHangWatchdog();
+      return;
+    }
+    const attribution = `${this.hangAttribution(hang)} probe_id=${probeId} probe_timeout_ms=${this.hangProbeTimeoutMs}`;
+    this.killHungChild(attribution, this.awaitingReply.get(hang.oldestId)?.sessionId);
+  }
+
+  private killHungChild(attribution: string, sessionId: string | undefined): void {
     this.timeoutRestartAwaitingRecovery = true;
     this.spawnedBinaryFingerprint = null;
-    const abortedSiblings = Array.from(this.pending, ([requestId, entry]) => ({
+    const aborted = Array.from(this.pending, ([requestId, entry]) => ({
       request_id: requestId,
       tool: entry.tool,
+      retry: isReadOnlyRetryCommand(entry.tool),
     }));
-    const attribution =
-      `triggering_request_id=${trigger.requestId} ` +
-      `triggering_tool=${JSON.stringify(trigger.tool)} ` +
-      `bridge_generation=${trigger.generation} ` +
-      `aborted_siblings=${JSON.stringify(abortedSiblings)}`;
-    // A timed-out request means the child is about to be SIGKILLed. Reject all
-    // sibling in-flight requests now instead of leaving them parked until their
-    // own independent timers fire. Keep the full kill attribution on every
-    // sibling error because the trigger's timeout is otherwise invisible there.
-    this.rejectAllPending(
-      new BridgeTransportUnknownOutcomeError(
-        `${this.errorPrefix} bridge killed during sibling timeout — request aborted; ${attribution}`,
-      ),
-    );
+    const fullAttribution = `${attribution} aborted_requests=${JSON.stringify(aborted)}`;
+    this.configureWarningClients.clear();
+    const pending = Array.from(this.pending.values());
+    this.pending.clear();
+    for (const entry of pending) {
+      this.clock.clearTimeout(entry.timer);
+      entry.onSettled?.();
+      const readOnly = isReadOnlyRetryCommand(entry.tool);
+      entry.reject(
+        new BridgeRestartedError(
+          entry.tool,
+          !readOnly,
+          readOnly
+            ? `${this.errorPrefix} bridge restarted: the child wrote nothing for longer than its hang window and did not answer a liveness probe; "${entry.tool}" is read-only and safe to retry; ${fullAttribution}`
+            : `${this.errorPrefix} bridge restarted: the child wrote nothing for longer than its hang window and did not answer a liveness probe; the outcome of "${entry.tool}" is unknown — a mutation may already have been applied, inspect before repeating it; ${fullAttribution}`,
+        ),
+      );
+    }
     // Forget outstanding background task ids: their removal hooks died with
     // the child (foreground polls were just rejected and won't resume, and a
     // completion frame can't arrive from a killed process), so keeping them
@@ -2008,6 +2348,7 @@ export class BinaryBridge implements AftProjectTransport {
     // detached tasks persist undelivered completions on disk, and the next
     // spawn rehydrates and delivers them.
     this.outstandingBackgroundTaskIds.clear();
+    this.resetHangWatchdog();
     if (this.process) {
       this.process.kill("SIGKILL");
       this.process = null;
@@ -2021,11 +2362,12 @@ export class BinaryBridge implements AftProjectTransport {
     // rejection error. Clear the ring so the next spawn doesn't inherit it.
     const tail = this.formatStderrTail();
     this.stderrTail = [];
+    // "Bridge killed after timeout" is the phrase log tooling groups on.
     const killedMsg = tail
-      ? `Bridge killed after timeout; ${attribution}.${tail}`
-      : `Bridge killed after timeout; ${attribution} (see ${this.getLogFilePathVia()})`;
-    if (triggeringSessionId) {
-      this.sessionErrorVia(triggeringSessionId, killedMsg);
+      ? `Bridge killed after timeout of the hang watchdog; ${fullAttribution}.${tail}`
+      : `Bridge killed after timeout of the hang watchdog; ${fullAttribution} (see ${this.getLogFilePathVia()})`;
+    if (sessionId) {
+      this.sessionErrorVia(sessionId, killedMsg);
     } else {
       this.errorVia(killedMsg);
     }
@@ -2042,7 +2384,7 @@ export class BinaryBridge implements AftProjectTransport {
     this.clearRestartResetTimer();
     this.configured = false; // Force reconfigure on next command after restart
     // Forget outstanding background task ids — same rationale as
-    // handleTimeout: abandoned removal hooks would otherwise pin this bridge
+    // killHungChild: abandoned removal hooks would otherwise pin this bridge
     // against idle eviction permanently (phantom ids). Disk-persisted
     // completions are re-delivered after the next spawn rehydrates.
     this.outstandingBackgroundTaskIds.clear();
@@ -2103,7 +2445,7 @@ export class BinaryBridge implements AftProjectTransport {
   private rejectAllPending(error: BridgeTransportUnavailableError): void {
     this.configureWarningClients.clear();
     for (const [_id, entry] of this.pending) {
-      clearTimeout(entry.timer);
+      this.clock.clearTimeout(entry.timer);
       entry.onSettled?.();
       entry.reject(error);
     }

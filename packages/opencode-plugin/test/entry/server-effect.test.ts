@@ -53,7 +53,7 @@ function testDependencies(events: string[]) {
       events.push(`binary:${version}`);
       return "/isolated/bin/aft";
     },
-    resolvePoolOptions: () => ({ timeoutMs: 30_000, hangThreshold: 2 }),
+    resolvePoolOptions: () => ({ timeoutMs: 30_000 }),
     acquireBridge: async (directory: string, { binaryPath }: { binaryPath: string }) => {
       events.push(`acquire:${directory}:${binaryPath}`);
       return { directory, setConfigureOverride: () => {} };

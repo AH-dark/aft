@@ -1,0 +1,5 @@
+{
+  "bridge": {
+    "hang_threshold": 3
+  }
+}

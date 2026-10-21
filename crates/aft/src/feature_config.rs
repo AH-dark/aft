@@ -161,6 +161,17 @@ pub const REMOVED_INSPECT_LSP_PATHS: [(&str, &str); 3] = [
     ("inspect.max_drill_down_items", "aft_inspect.topK"),
 ];
 
+/// Retired paths that no longer do anything and have no replacement. They are
+/// dropped on load and removed by `doctor --fix`, and the notice says so.
+/// `bridge.hang_threshold` counted request timeouts toward restarting the
+/// bridge; a timeout now fails only its own request, and the bridge's hang
+/// watchdog judges a stuck child by its silence instead.
+pub const REMOVED_NO_EFFECT_PATHS: [(&str, &str); 1] = [("bridge.hang_threshold", "")];
+
+/// Notice sentence for a retired `bridge.hang_threshold`. Mirrors the
+/// TypeScript `RETIRED_HANG_THRESHOLD_NOTE`.
+pub const RETIRED_HANG_THRESHOLD_NOTE: &str = "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.";
+
 /// Index leaf, its immediate legacy key and (when one exists) the older
 /// experimental alias, in precedence order after the canonical leaf.
 pub const INDEX_INPUTS: [(&str, &str, Option<&str>); 3] = [
@@ -427,6 +438,18 @@ fn translate_inspect_lsp_paths(
     }
 }
 
+/// Drop the retired keys that no longer do anything
+/// ([`REMOVED_NO_EFFECT_PATHS`]), exactly as `doctor --fix` removes them.
+fn drop_no_effect_paths(map: &mut Map<String, Value>, prefix: &str, out: &mut DocumentTranslation) {
+    for (path, _) in REMOVED_NO_EFFECT_PATHS {
+        if let Some((container, leaf)) = path.split_once('.') {
+            if take_nested(map, container, leaf).is_some() {
+                record_retired(out, prefix, path);
+            }
+        }
+    }
+}
+
 /// What a retired `enabled: false` no longer does. The translation only hides
 /// tools; indexing continues, so a user who relied on it to keep AFT out of a
 /// repository must also switch the indexes off. Mirrors the TypeScript
@@ -560,6 +583,7 @@ fn translate_block(
     };
     translate_github_aliases(map, &prefix, out);
     translate_inspect_lsp_paths(map, &prefix, out);
+    drop_no_effect_paths(map, &prefix, out);
     translate_experimental_paths(map, &prefix, out);
     if let Some(Value::Object(sandbox)) = map.get_mut("sandbox") {
         if let Some(enabled) = sandbox.remove("enabled") {
@@ -842,25 +866,82 @@ fn has_enabled_false_note(translation: &DocumentTranslation) -> bool {
         .any(|warning| warning.code == "legacy_enabled_false_indexes_still_build")
 }
 
-fn with_enabled_false_note(text: String, translation: &DocumentTranslation) -> String {
-    if has_enabled_false_note(translation) {
-        format!("{text} {RETIRED_ENABLED_FALSE_INDEXES_NOTE}")
-    } else {
-        text
+/// Retired keys that no longer do anything, each with the notice sentence that
+/// says so. Nothing is applied for them, so a notice never counts them among
+/// the keys whose "current equivalents" were applied. Kept in key order;
+/// mirrors the TypeScript `NO_EFFECT_RETIRED_NOTES`.
+pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 3] = [
+    ("bridge.hang_threshold", RETIRED_HANG_THRESHOLD_NOTE),
+    (
+        "inspect.max_drill_down_items",
+        "inspect.max_drill_down_items never had an effect, so the setting can be removed.",
+    ),
+    (
+        "inspect.tier2_soft_deadline_ms",
+        "inspect.tier2_soft_deadline_ms never had an effect, so the setting can be removed.",
+    ),
+];
+
+/// The no-effect sentence for a retired key, which may carry a
+/// `harnesses.<id>.` prefix.
+fn no_effect_note(key: &str) -> Option<&'static str> {
+    NO_EFFECT_RETIRED_NOTES
+        .iter()
+        .find(|(path, _)| {
+            key == *path
+                || key
+                    .strip_suffix(path)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+        .map(|(_, note)| *note)
+}
+
+/// Build a retired-key notice. `with_equivalents` renders the sentence about
+/// keys whose current equivalents were applied, given those keys joined by
+/// ", "; it is used only when there are such keys. The sentences for keys
+/// that no longer do anything follow, once each. A file whose only retired
+/// keys have no effect gets just those sentences.
+fn retired_keys_notice(
+    translation: &DocumentTranslation,
+    with_equivalents: impl FnOnce(&str) -> String,
+) -> String {
+    let mut equivalents = Vec::new();
+    let mut notes: Vec<&str> = Vec::new();
+    for key in &translation.retired_keys {
+        match no_effect_note(key) {
+            Some(note) => {
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+            None => equivalents.push(key.as_str()),
+        }
     }
+    notes.sort_by_key(|note| {
+        NO_EFFECT_RETIRED_NOTES
+            .iter()
+            .position(|(_, known)| known == note)
+    });
+    let mut parts = Vec::new();
+    if !equivalents.is_empty() {
+        parts.push(with_equivalents(&equivalents.join(", ")));
+        if has_enabled_false_note(translation) {
+            parts.push(RETIRED_ENABLED_FALSE_INDEXES_NOTE.to_string());
+        }
+    }
+    parts.extend(notes.into_iter().map(str::to_string));
+    parts.join(" ")
 }
 
 /// Notice for a project config file whose retired keys were translated in
 /// memory. The file itself is never written: it is shared through the
-/// repository. Mirrors the TypeScript `retiredKeysNoticeMessage`.
+/// repository. Mirrors the TypeScript `legacyConfigNoticeMessage`.
 pub fn project_retired_keys_notice(path: &str, translation: &DocumentTranslation) -> String {
-    with_enabled_false_note(
+    retired_keys_notice(translation, |keys| {
         format!(
-            "{path} uses retired keys ({}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file.",
-            translation.retired_keys.join(", ")
-        ),
-        translation,
-    )
+            "{path} uses retired keys ({keys}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file."
+        )
+    })
 }
 
 /// Notice for the user config file after AFT rewrote its retired keys.
@@ -869,13 +950,11 @@ pub fn user_config_migrated_notice(
     backup: &str,
     translation: &DocumentTranslation,
 ) -> String {
-    with_enabled_false_note(
+    retired_keys_notice(translation, |keys| {
         format!(
-            "AFT updated {path}: its retired keys ({}) now use their current equivalents. The previous file is saved as {backup}.",
-            translation.retired_keys.join(", ")
-        ),
-        translation,
-    )
+            "AFT updated {path}: its retired keys ({keys}) now use their current equivalents. The previous file is saved as {backup}."
+        )
+    })
 }
 
 /// Notice for the user config file when AFT could not rewrite it and applied
@@ -885,13 +964,11 @@ pub fn user_config_not_migrated_notice(
     reason: &str,
     translation: &DocumentTranslation,
 ) -> String {
-    with_enabled_false_note(
+    retired_keys_notice(translation, |keys| {
         format!(
-            "{path} uses retired keys ({}); AFT applied their current equivalents but could not update the file ({reason}). Run `npx @cortexkit/aft doctor --fix` to update it.",
-            translation.retired_keys.join(", ")
-        ),
-        translation,
-    )
+            "{path} uses retired keys ({keys}); AFT applied their current equivalents but could not update the file ({reason}). Run `npx @cortexkit/aft doctor --fix` to update it."
+        )
+    })
 }
 
 /// Sorted, de-duplicated disabled list.
@@ -964,7 +1041,10 @@ fn project_block(block: &Map<String, Value>) -> Value {
     let mut projected = Map::new();
 
     let mut legacy_paths = Map::new();
-    for (path, _) in RETIRED_PATHS {
+    // Retired keys with no replacement are projected too: otherwise adding one
+    // to a file whose notice was already acknowledged would keep the old
+    // digest and the saved record would hide the new notice.
+    for (path, _) in RETIRED_PATHS.into_iter().chain(REMOVED_NO_EFFECT_PATHS) {
         let value = match path.split_once('.') {
             Some((container, leaf)) => block
                 .get(container)
@@ -1462,6 +1542,72 @@ mod tests {
                 .ends_with(RETIRED_ENABLED_FALSE_INDEXES_NOTE)
         );
     }
+
+    #[test]
+    fn retired_hang_threshold_is_dropped_and_the_notice_says_it_does_nothing() {
+        let (value, out) = translate(json!({
+            "bridge": {"hang_threshold": 3, "request_timeout_ms": 45000},
+            "harnesses": {"pi": {"bridge": {"hang_threshold": 5}}}
+        }));
+        assert_eq!(
+            value,
+            json!({"bridge": {"request_timeout_ms": 45000}, "harnesses": {"pi": {}}})
+        );
+        assert!(out.legacy_input);
+        assert_eq!(
+            out.retired_keys,
+            vec![
+                "bridge.hang_threshold",
+                "harnesses.pi.bridge.hang_threshold"
+            ]
+        );
+        // Nothing is applied for a key that no longer does anything, so a
+        // file whose only retired keys are such keys gets just their sentence.
+        for notice in [
+            project_retired_keys_notice("/repo/.cortexkit/aft.jsonc", &out),
+            user_config_migrated_notice("/u/aft.jsonc", "/u/aft.jsonc.bak-1", &out),
+            user_config_not_migrated_notice("/u/aft.jsonc", "read-only", &out),
+        ] {
+            assert_eq!(notice, RETIRED_HANG_THRESHOLD_NOTE);
+        }
+        let (_, out) = translate(json!({
+            "inspect": {"tier2_soft_deadline_ms": 50, "max_drill_down_items": 20}
+        }));
+        assert_eq!(
+            project_retired_keys_notice("/p", &out),
+            "inspect.max_drill_down_items never had an effect, so the setting can be removed. inspect.tier2_soft_deadline_ms never had an effect, so the setting can be removed."
+        );
+
+        // Mixed with keys that have equivalents: the generic sentence names
+        // only those keys, and the no-effect sentence follows.
+        let (_, out) = translate(json!({
+            "search_index": false,
+            "bridge": {"hang_threshold": 3},
+            "harnesses": {"pi": {"bridge": {"hang_threshold": 5}}}
+        }));
+        assert_eq!(
+            project_retired_keys_notice("/repo/.cortexkit/aft.jsonc", &out),
+            format!("/repo/.cortexkit/aft.jsonc uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. {RETIRED_HANG_THRESHOLD_NOTE}")
+        );
+        assert_eq!(
+            user_config_migrated_notice("/u/aft.jsonc", "/u/aft.jsonc.bak-1", &out),
+            format!("AFT updated /u/aft.jsonc: its retired keys (search_index) now use their current equivalents. The previous file is saved as /u/aft.jsonc.bak-1. {RETIRED_HANG_THRESHOLD_NOTE}")
+        );
+        assert_eq!(
+            user_config_not_migrated_notice("/u/aft.jsonc", "read-only", &out),
+            format!("/u/aft.jsonc uses retired keys (search_index); AFT applied their current equivalents but could not update the file (read-only). Run `npx @cortexkit/aft doctor --fix` to update it. {RETIRED_HANG_THRESHOLD_NOTE}")
+        );
+        let (_, out) = translate(json!({"enabled": false, "bridge": {"hang_threshold": 3}}));
+        assert!(project_retired_keys_notice("/p", &out).ends_with(&format!(
+            "{RETIRED_ENABLED_FALSE_INDEXES_NOTE} {RETIRED_HANG_THRESHOLD_NOTE}"
+        )));
+
+        // Only the retired leaf goes; an emptied bridge block goes with it.
+        let (value, _) = translate(json!({"bridge": {"hang_threshold": 2}}));
+        assert_eq!(value, json!({}));
+        let (_, out) = translate(json!({"search_index": false}));
+        assert!(!project_retired_keys_notice("/p", &out).contains("hang_threshold"));
+    }
     #[test]
     fn resolved_validation_reports_sorted_paths_and_containers_only() {
         assert_eq!(
@@ -1488,6 +1634,37 @@ mod tests {
             "indexes": {"trigram": true, "semantic": false, "callgraph": true}
         }))
         .is_ok());
+    }
+
+    #[test]
+    fn adding_a_no_effect_key_changes_the_notice_identity_and_nothing_else_does() {
+        let digest = |doc: Value| notice_digest(&notice_projection(doc.as_object()));
+        let acknowledged = digest(json!({"search_index": false}));
+        // Nothing a notice depends on changed: same identity, no repeat.
+        assert_eq!(acknowledged, digest(json!({"search_index": false})));
+        assert_eq!(
+            acknowledged,
+            digest(json!({"search_index": false, "bridge": {"request_timeout_ms": 45000}}))
+        );
+        // Adding the retired key, in the base or a harness block, is a new
+        // identity, so a saved record for the old one cannot hide it.
+        let added = json!({"search_index": false, "bridge": {"hang_threshold": 3}});
+        assert_ne!(acknowledged, digest(added.clone()));
+        assert_ne!(
+            acknowledged,
+            digest(
+                json!({"search_index": false, "harnesses": {"pi": {"bridge": {"hang_threshold": 5}}}})
+            )
+        );
+        // The notice for the new identity names it.
+        let Value::Object(mut map) = added else {
+            panic!("object")
+        };
+        let out = translate_document(&mut map, DocumentTier::Project);
+        assert_eq!(
+            project_retired_keys_notice("/p", &out),
+            format!("/p uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. {RETIRED_HANG_THRESHOLD_NOTE}")
+        );
     }
 
     #[test]

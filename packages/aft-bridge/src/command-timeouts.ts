@@ -66,3 +66,29 @@ export const PASSIVE_COMMAND_TIMEOUT_MS = 5_000;
 export function isPassiveCommand(command: string): boolean {
   return PASSIVE_COMMANDS.has(command);
 }
+
+/**
+ * Agent tools that only read project state, so repeating one cannot apply a
+ * change twice. When the bridge's hang watchdog kills a silent child, a
+ * pending call to one of these is sent again once on the respawned child;
+ * every other command (edits, writes, bash, safety, ...) is never repeated
+ * automatically, because the dead child may already have applied it.
+ *
+ * Names are the `tool_call` tool names (or the direct command name for
+ * requests sent without `tool_call`).
+ */
+export const READ_ONLY_RETRY_COMMANDS: ReadonlySet<string> = new Set([
+  "read",
+  "outline",
+  "zoom",
+  "grep",
+  "glob",
+  "search",
+  "callgraph",
+  "inspect",
+]);
+
+/** True when a call to `tool` may be repeated after the bridge restarts. */
+export function isReadOnlyRetryCommand(tool: string): boolean {
+  return READ_ONLY_RETRY_COMMANDS.has(tool);
+}

@@ -78,8 +78,10 @@ export {
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,
+  BridgeClock,
   BridgeOptions,
   BridgeRequestOptions,
+  BridgeTimer,
   ConfigureDroppedKey,
   ConfigureWarning,
   ConfigureWarningsContext,
@@ -88,10 +90,13 @@ export type {
 } from "./bridge.js";
 export {
   BinaryBridge,
+  BridgeRestartedError,
   BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
   BridgeTransportUnknownOutcomeError,
   compareSemver,
+  hangWindowMs,
+  isBridgeRestarted,
   isBridgeTransportTimeout,
   tagStderrLine,
 } from "./bridge.js";
@@ -138,7 +143,12 @@ export {
   isFindReplaceOnlyEdit,
   usableZoomTargets,
 } from "./coerce.js";
-export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
+export {
+  isReadOnlyRetryCommand,
+  LONG_RUNNING_COMMAND_TIMEOUT_MS,
+  READ_ONLY_RETRY_COMMANDS,
+  timeoutForCommand,
+} from "./command-timeouts.js";
 // --- config error state (a plugin that loads but fails every tool call) ---
 export {
   AftConfigError,

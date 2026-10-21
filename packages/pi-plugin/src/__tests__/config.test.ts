@@ -1497,11 +1497,12 @@ describe("loadAftConfig", () => {
   test("bridge config defaults when omitted", () => {
     expect(resolveBridgePoolTransportOptions({})).toEqual({
       timeoutMs: 30_000,
-      hangThreshold: 2,
     });
   });
 
-  test("project config cannot set bridge (strict allowlist)", () => {
+  // The retired bridge.hang_threshold in either file is dropped before
+  // validation, so it neither fails the load nor reaches the resolved config.
+  test("project config cannot set bridge (strict allowlist); a retired hang_threshold is dropped", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -1518,10 +1519,11 @@ describe("loadAftConfig", () => {
     });
 
     const config = JSON.parse(result.stdout) as {
-      bridge?: { request_timeout_ms?: number; hang_threshold?: number };
+      bridge?: Record<string, unknown>;
     };
-    expect(config.bridge).toEqual({ request_timeout_ms: 45_000, hang_threshold: 3 });
+    expect(config.bridge).toEqual({ request_timeout_ms: 45_000 });
     expect(result.stderr).toContain("Ignoring bridge from project config");
+    expect(result.stderr).not.toContain("validation error");
   });
 
   // Below the one-minute minimum is a config error, not a silent clamp: the
@@ -1570,15 +1572,11 @@ describe("loadAftConfig", () => {
     expect(config.bash?.worker_wait_max_ms).toBe(120_000);
   });
 
-  test("bridge rejects request_timeout_ms below 1000 and hang_threshold below 1", () => {
+  test("bridge rejects request_timeout_ms below 1000", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify(
-        { bridge: { request_timeout_ms: 500, hang_threshold: 0 }, format_on_edit: true },
-        null,
-        2,
-      ),
+      JSON.stringify({ bridge: { request_timeout_ms: 500 }, format_on_edit: true }, null, 2),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {

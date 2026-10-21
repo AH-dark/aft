@@ -80,6 +80,32 @@ fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
     assert_eq!(value["lsp"]["idle_minutes"], 12);
 }
 
+#[test]
+fn doctor_fix_removes_retired_hang_threshold() {
+    let doc = "{\n  // bridge tuning\n  \"bridge\": {\n    \"request_timeout_ms\": 45000,\n    \"hang_threshold\": 3\n  },\n  \"harnesses\": {\"pi\": {\"bridge\": {\"hang_threshold\": 5}, \"edit_mode\": \"hashline\"}}\n}\n";
+    for tier in [FixTier::User, FixTier::Project] {
+        let migration = assert_fix_preserves_intent(doc, tier);
+        assert!(
+            migration.text.contains("// bridge tuning"),
+            "{}",
+            migration.text
+        );
+        let value: Value =
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&migration.text)).unwrap();
+        assert_eq!(value["bridge"], json!({"request_timeout_ms": 45000}));
+        // The emptied harness bridge block goes with its only key.
+        assert_eq!(value["harnesses"]["pi"], json!({"edit_mode": "hashline"}));
+        assert!(!migrate_config_text(&migration.text, tier).unwrap().changed);
+    }
+    let migration =
+        migrate_config_text(r#"{"bridge":{"hang_threshold":2}}"#, FixTier::User).unwrap();
+    assert!(migration.changed);
+    assert_eq!(
+        serde_json::from_str::<Value>(&migration.text).unwrap(),
+        json!({})
+    );
+}
+
 fn resolved(doc: &str, tier: &str, harness: Option<&Harness>) -> Value {
     let mut tiers = Vec::new();
     if tier == "project" {

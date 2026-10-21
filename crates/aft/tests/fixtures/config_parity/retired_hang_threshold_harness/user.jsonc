@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "pi": {
+      "bridge": {
+        "hang_threshold": 5
+      }
+    }
+  }
+}
