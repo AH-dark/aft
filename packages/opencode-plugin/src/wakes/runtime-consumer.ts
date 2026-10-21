@@ -160,9 +160,11 @@ async function routeCompletion(
       if (admitted) forgetUnroutedCompletion(completion.session_id, completion.task_id);
       return admitted;
     } catch (error) {
-      // Keep a failed admission for the next session registration or subc nudge
-      // instead of dropping it or spinning in a retry loop.
-      holdUnrouted(completion, bridge);
+      // Subc drains retain failed admissions in their shared retry queue. An
+      // unrouted copy could also wake the session after an async watch converts
+      // the queued completion to a task-exit notice, duplicating its wake/ack.
+      // Only pushed completions need a separate session-registration retry.
+      if (acknowledge) holdUnrouted(completion, bridge);
       warn(
         `[bash_completion] delivery of task ${completion.task_id} to session ${completion.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -170,9 +172,9 @@ async function routeCompletion(
     }
   }
 
-  // Not acknowledged, so the bridge keeps it pending. It is held here and
-  // delivered when a Location registers the session.
-  holdUnrouted(completion, bridge);
+  // Drained completions stay in the shared retry queue until a Location
+  // registers. Only pushed completions need a local copy for registration.
+  if (acknowledge) holdUnrouted(completion, bridge);
   warnUnroutedOnce(
     completion.session_id,
     `[bash_completion] no OpenCode Location has session ${completion.session_id} registered; completion of task ${completion.task_id} is held unacknowledged until the session registers`,

@@ -566,6 +566,72 @@ test("OC2 subc retroactive async-watch exit retains its session across admission
   }
 });
 
+for (const { nudgeFirst, registered } of [
+  { nudgeFirst: true, registered: true },
+  { nudgeFirst: false, registered: true },
+  { nudgeFirst: true, registered: false },
+]) {
+  test(`OC2 subc ${registered ? "held" : "unregistered"} completion and async-watch exit racing a tool call wake and ack once (${nudgeFirst ? "nudge first" : "tool first"})`, async () => {
+    const root = workspace();
+    const module = new ModuleDouble();
+    const state: { revert?: unknown } = {};
+    const runtime = await start(root, module, [], state);
+    const warnings = spyOn(logger, "warn").mockImplementation(() => {});
+    let admit!: () => void;
+    let toolCall: ReturnType<typeof runtime.toolAfter> | undefined;
+    try {
+      if (registered) runtime.consumer.registerSession?.("s");
+      await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+      await tick();
+      if (registered) state.revert = { messageID: "boundary" };
+      module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+      module.nudge("s");
+      await until(() =>
+        warnings.mock.calls.some(([message]) =>
+          String(message).includes(registered ? "delivery of task task" : "no OpenCode Location"),
+        ),
+      );
+      expect(runtime.synthetic).toHaveLength(0);
+      expect(module.events).not.toContain("bash_ack_completions:s");
+
+      // The first completion could not be admitted. Mark the task as explicitly
+      // controlled by an async watch before allowing the tool-call retry.
+      markExplicitControl("s", "task");
+      state.revert = undefined;
+      module.admissionGate = new Promise((resolve) => {
+        admit = resolve;
+      });
+      const drains = module.events.filter((event) => event === "bash_drain_completions:s").length;
+      if (nudgeFirst) module.nudge("s");
+      else toolCall = runtime.toolAfter();
+      await until(
+        () => module.events.filter((event) => event === "bash_drain_completions:s").length > drains,
+      );
+      if (nudgeFirst) toolCall = runtime.toolAfter();
+      else module.nudge("s");
+      await tick();
+      expect(runtime.synthetic).toHaveLength(0);
+      expect(module.events).not.toContain("bash_ack_completions:s");
+      admit();
+      expect((await toolCall!).result.content).toBe("tool result");
+      await until(() => !module.pending.has(module.key(root, "s")));
+      await tick();
+      expect(runtime.synthetic).toHaveLength(1);
+      expect(runtime.synthetic[0]?.metadata?.kind).toBe("bash_pattern_match");
+      expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+      module.nudge("s");
+      await runtime.toolAfter();
+      expect(runtime.synthetic).toHaveLength(1);
+      expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+    } finally {
+      admit?.();
+      await toolCall;
+      warnings.mockRestore();
+      await runtime.stop();
+    }
+  });
+}
+
 test("OC2 subc recovery is root-scoped, recent, and capped at twenty newest host sessions", async () => {
   const root = workspace();
   const foreign = workspace();
