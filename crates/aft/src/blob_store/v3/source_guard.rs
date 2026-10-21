@@ -16,6 +16,11 @@ fn forbidden(source: &str, allow_text_controls: bool) -> bool {
 fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
     for (name, source, text_controls) in [
         ("v3.rs", include_str!("../v3.rs"), false),
+        (
+            "initialization.rs",
+            include_str!("initialization.rs"),
+            false,
+        ),
         ("connections.rs", include_str!("connections.rs"), false),
         ("read_audit.rs", include_str!("read_audit.rs"), false),
         // The process harness reads only its JSON/ready files and reader-floor
@@ -30,7 +35,14 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
     let modules = regex::Regex::new(r"(?m)^mod\s+(\w+)\s*;").unwrap();
     for module in modules.captures_iter(include_str!("../v3.rs")) {
         assert!(
-            ["connections", "read_audit", "tests", "source_guard"].contains(&&module[1]),
+            [
+                "connections",
+                "initialization",
+                "read_audit",
+                "tests",
+                "source_guard"
+            ]
+            .contains(&&module[1]),
             "new v3 module must join the source fence: {}",
             &module[1]
         );

@@ -148,6 +148,16 @@ pub enum RefusalSource {
 }
 
 impl RefusalSource {
+    // Status push keeps the original source ranks when new refusal kinds are
+    // added, rather than depending on Rust enum discriminants.
+    fn sort_key(self) -> u8 {
+        match self {
+            Self::Artifact => 0,
+            Self::Floor => 1,
+            Self::FloorUnreadable => 2,
+            Self::Incompatible(_) => 3,
+        }
+    }
     fn is_artifact(self) -> bool {
         matches!(self, Self::Artifact | Self::Incompatible(_))
     }
@@ -452,14 +462,14 @@ pub(crate) fn refusals_for_push(
         (
             a.store.name(),
             &a.path,
-            a.source as u8,
+            a.source.sort_key(),
             a.found,
             a.supported,
         )
             .cmp(&(
                 b.store.name(),
                 &b.path,
-                b.source as u8,
+                b.source.sort_key(),
                 b.found,
                 b.supported,
             ))
@@ -571,6 +581,39 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_refusal_source_order_preserves_existing_variants() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("aft.db");
+        let expected = [
+            RefusalSource::Artifact,
+            RefusalSource::Floor,
+            RefusalSource::FloorUnreadable,
+            RefusalSource::Incompatible(IncompatibleReason::SchemaDrift),
+        ];
+        with_registry(|entries| {
+            for (index, source) in expected.into_iter().rev().enumerate() {
+                let mut refusal =
+                    UnsupportedPersistedFormat::artifact(PersistedStore::AftDb, &path, 99);
+                refusal.source = source;
+                entries.push(Entry {
+                    scope: root.path().join(format!("scope-{index}")),
+                    refusal,
+                });
+            }
+        });
+        let (refusals, unknown) = refusals_for_push(root.path(), None);
+        assert_eq!(unknown, 0);
+        assert_eq!(
+            refusals
+                .iter()
+                .map(|refusal| refusal.source)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        with_registry(|entries| entries.retain(|entry| !entry.scope.starts_with(root.path())));
+    }
 
     #[test]
     fn incompatible_refusals_follow_artifact_lifecycle_not_floor_lifecycle() {

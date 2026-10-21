@@ -417,6 +417,25 @@ fn v3_child() {
     let mode = std::env::var("AFT_V3_TEST_MODE").unwrap();
     let control = PathBuf::from(std::env::var_os("AFT_V3_TEST_CONTROL").unwrap());
     set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    if mode.starts_with("init-") {
+        publish(&storage, &family, 0, None, |p| {
+            if mode.starts_with("init-plane-") {
+                p.put(&key(), b"v3 data", 1)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        panic!("initialization boundary was not reached: {mode}");
+    }
+    if mode == "abandoned-reservation" {
+        let lock = ReservationLock::acquire(&storage).unwrap();
+        let mut writer = RegistryWriter::open_existing(&storage, &family, &lock).unwrap();
+        let _reservation = writer.reserve(100).unwrap();
+        fs::write(&control, b"reserved").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
     if mode == "wal-writer" {
         let lock = ReservationLock::acquire(&storage).unwrap();
         let mut writer = RegistryWriter::open_existing(&storage, &family, &lock).unwrap();
@@ -781,7 +800,7 @@ fn reclaimed_plane_pages_reduce_usage_only_at_the_next_covering_measurement() {
     let mut registry = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let before = registry.accounting().unwrap().usage();
     let path = plane_path(root.path(), A, FamilyPlane::Semantic).unwrap();
-    let c = open_db(&path, Kind::Plane, false, false).unwrap();
+    let c = open_db(&path, Kind::Plane(FamilyPlane::Semantic), false, false).unwrap();
     c.execute("DELETE FROM blob_payloads", []).unwrap();
     checkpoint(&c).unwrap();
     for _ in 0..16 {
@@ -1071,5 +1090,299 @@ fn file_identity_aliases_share_one_sqlite_owner() {
     assert_eq!(
         crate::db::file_identity::open_connections(&db(root.path(), A)),
         1
+    );
+}
+
+#[test]
+fn reservation_release_rejects_a_different_registry_with_the_same_row_id() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
+    publish(root.path(), B, 0, None, |_| Ok(())).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut a = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let mut b = RegistryWriter::open_existing(root.path(), B, &lock).unwrap();
+    let reservation_a = a.reserve(100).unwrap();
+    let reservation_b = b.reserve(200).unwrap();
+    assert_eq!(reservation_a.id, reservation_b.id);
+    let before_a = a.accounting().unwrap();
+    let before_b = b.accounting().unwrap();
+    let error = b
+        .release(reservation_a)
+        .expect_err("a different registry must reject the reservation token");
+    assert!(
+        matches!(error, Error::ReservationRegistryMismatch),
+        "{error}"
+    );
+    assert_eq!(a.accounting().unwrap(), before_a);
+    assert_eq!(b.accounting().unwrap(), before_b);
+    b.release(reservation_b).unwrap();
+}
+
+fn publish_after_dead_owner(target: &str) {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let control = tempdir().unwrap();
+    publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
+    let ready = control.path().join("owner");
+    let mut owner = child(root.path(), A, "abandoned-reservation", &ready);
+    wait_file(&ready, &mut owner);
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    assert_eq!(
+        LedgerReader::open_existing(root.path(), A)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes,
+        100
+    );
+    set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    publish(root.path(), target, 100, None, |_| Ok(()))
+        .expect("dead reservations must be recovered before the final floor decision");
+    assert_eq!(
+        LedgerReader::open_existing(root.path(), A)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes,
+        0
+    );
+}
+#[test]
+fn dead_same_family_reservation_is_recovered_before_floor_admission() {
+    publish_after_dead_owner(A);
+}
+#[test]
+fn dead_peer_reservation_is_recovered_before_floor_admission() {
+    publish_after_dead_owner(B);
+}
+
+pub(super) fn initialization_hook(kind: Kind, step: &str) {
+    let prefix = if matches!(kind, Kind::Registry) {
+        "registry"
+    } else {
+        "plane"
+    };
+    if std::env::var("AFT_V3_TEST_MODE").ok().as_deref()
+        == Some(format!("init-{prefix}-{step}").as_str())
+    {
+        fs::write(
+            PathBuf::from(std::env::var_os("AFT_V3_TEST_CONTROL").unwrap()),
+            step,
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+}
+fn interrupted_initialization(kind: Kind, step: &str, check_visibility: bool) {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let control = tempdir().unwrap();
+    let ready = control.path().join("ready");
+    let prefix = if matches!(kind, Kind::Registry) {
+        "registry"
+    } else {
+        "plane"
+    };
+    let mut publisher = child(root.path(), A, &format!("init-{prefix}-{step}"), &ready);
+    wait_file(&ready, &mut publisher);
+    let mut visible = if check_visibility {
+        if matches!(kind, Kind::Registry) {
+            LedgerReader::open_existing(root.path(), A).is_ok()
+        } else {
+            PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic).is_ok()
+        }
+    } else {
+        false
+    };
+    let partial_schema = if check_visibility {
+        let path = match kind {
+            Kind::Registry => db(root.path(), A),
+            Kind::Plane(plane) => plane_path(root.path(), A, plane).unwrap(),
+        };
+        (|| -> Result<bool> {
+            if crate::db::file_identity::open_connections(&path) != 0 {
+                return Err(Error::InvalidIdentity);
+            }
+            let connection = IdentityConnection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                "v3-initialization-visibility",
+            )?;
+            Ok(!schema_rows(&connection)?.is_empty())
+        })()
+    } else {
+        Ok(false)
+    };
+    publisher.kill().unwrap();
+    publisher.wait().unwrap();
+    visible |= partial_schema.expect("SQLite-only initialization visibility probe");
+    assert!(
+        !visible,
+        "initialization became visible before its final commit: {prefix}/{step}"
+    );
+    let retry = publish(root.path(), A, 1024, None, |p| p.put(&key(), b"v3 data", 1));
+    assert!(
+        retry.is_ok(),
+        "interrupted {prefix}/{step} must be retryable: {retry:?}"
+    );
+    assert_eq!(
+        LedgerReader::open_existing(root.path(), A)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes,
+        0
+    );
+    assert_eq!(
+        PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic)
+            .unwrap()
+            .get(&key())
+            .unwrap(),
+        Some(b"v3 data".to_vec())
+    );
+}
+macro_rules! interrupted_initialization_cases {
+    ($kind:expr, $($name:ident => $step:literal),+ $(,)?) => { $(
+        #[test] fn $name() { interrupted_initialization($kind,$step,false); }
+    )+ };
+}
+interrupted_initialization_cases!(Kind::Registry,
+    interrupted_registry_auto_vacuum_is_retryable=>"auto_vacuum",
+    interrupted_registry_meta_is_retryable=>"meta",
+    interrupted_registry_schema_is_retryable=>"schema",
+    interrupted_registry_format_is_retryable=>"format",
+    interrupted_registry_application_id_is_retryable=>"application_id",
+    interrupted_registry_accounting_is_retryable=>"accounting",
+);
+interrupted_initialization_cases!(Kind::Plane(FamilyPlane::Semantic),
+    interrupted_plane_auto_vacuum_is_retryable=>"auto_vacuum",
+    interrupted_plane_meta_is_retryable=>"meta",
+    interrupted_plane_schema_is_retryable=>"schema",
+    interrupted_plane_format_is_retryable=>"format",
+    interrupted_plane_application_id_is_retryable=>"application_id",
+    interrupted_plane_store_meta_is_retryable=>"store_meta",
+);
+#[test]
+fn registry_initialization_is_invisible_until_its_commit() {
+    interrupted_initialization(Kind::Registry, "accounting", true);
+}
+#[test]
+fn plane_initialization_is_invisible_until_its_commit() {
+    interrupted_initialization(Kind::Plane(FamilyPlane::Semantic), "store_meta", true);
+}
+
+fn legacy_bootstrap(storage: &Path, kind: Kind, stage: u8, populated: bool) {
+    let directory = family_dir(storage, A).unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    let path = match kind {
+        Kind::Registry => directory.join("members.sqlite"),
+        Kind::Plane(plane) => directory.join(format!("{}.sqlite", plane.as_str())),
+    };
+    let c = IdentityConnection::open(&path, "v3-bootstrap-fixture").unwrap();
+    c.pragma_update(None, "auto_vacuum", 2).unwrap();
+    if stage >= 1 {
+        c.execute_batch(META).unwrap();
+    }
+    if stage >= 2 {
+        c.execute_batch(kind.schema()).unwrap();
+    }
+    if stage >= 3 {
+        c.execute(
+            "INSERT INTO format_meta VALUES(1,?1,?2,?3,?4)",
+            params![
+                FORMAT_VERSION,
+                SCHEMA_VERSION,
+                kind.layout(),
+                format!("{META}{}", kind.schema())
+            ],
+        )
+        .unwrap();
+    }
+    if stage >= 4 {
+        c.pragma_update(None, "application_id", kind.app_id())
+            .unwrap();
+    }
+    if stage >= 5 {
+        match kind {
+            Kind::Registry => {
+                c.execute("INSERT INTO accounting VALUES(1,0,0)", [])
+                    .unwrap();
+            }
+            Kind::Plane(plane) => {
+                c.execute("INSERT INTO store_meta VALUES(1,?1,0)", [plane.as_str()])
+                    .unwrap();
+            }
+        }
+    }
+    if populated {
+        c.execute("INSERT INTO members(scope,kind,view_dir,registered_at_ms,last_bind_ms,state) VALUES('keep','base','keep',0,0,'active')",[]).unwrap();
+    }
+}
+#[test]
+fn legacy_partial_registry_bootstraps_do_not_block_another_family() {
+    let _g = serial();
+    for stage in 0..=5 {
+        let root = tempdir().unwrap();
+        legacy_bootstrap(root.path(), Kind::Registry, stage, false);
+        publish(root.path(), B, 1, None, |_| Ok(())).unwrap();
+        let lock = ReservationLock::acquire(root.path()).unwrap();
+        let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+        assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+    }
+}
+#[test]
+fn legacy_partial_plane_bootstraps_are_retryable() {
+    let _g = serial();
+    for stage in 0..=5 {
+        let root = tempdir().unwrap();
+        legacy_bootstrap(
+            root.path(),
+            Kind::Plane(FamilyPlane::Semantic),
+            stage,
+            false,
+        );
+        publish(root.path(), A, 1024, None, |p| p.put(&key(), b"v3 data", 1)).unwrap();
+        assert_eq!(
+            PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic)
+                .unwrap()
+                .get(&key())
+                .unwrap(),
+            Some(b"v3 data".to_vec())
+        );
+    }
+}
+#[test]
+fn incomplete_marker_with_application_data_is_not_reset() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    legacy_bootstrap(root.path(), Kind::Registry, 2, true);
+    let error = publish(root.path(), B, 1, None, |_| Ok(())).unwrap_err();
+    assert_eq!(error.to_string(), "reservation_ledger_unreadable");
+    let path = db(root.path(), A);
+    assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+    let c = IdentityConnection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        "v3-bootstrap-check",
+    )
+    .unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT COUNT(*) FROM members WHERE scope='keep'",
+            [],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.query_row("SELECT COUNT(*) FROM format_meta", [], |row| row
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
     );
 }
