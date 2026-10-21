@@ -14159,7 +14159,8 @@ mod tests {
                 lock.execute_batch("ROLLBACK").unwrap();
                 drop(lock);
 
-                // What the refused replay's key step leaves behind.
+                // Simulate the key caches after a replay resolves its key but is
+                // refused before its commit.
                 let key = ctx
                     .memoized_artifact_cache_key_for_configure(&root, &root, &storage, None)
                     .unwrap()
