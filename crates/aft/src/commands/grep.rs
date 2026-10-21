@@ -56,6 +56,23 @@ mod contract_tests {
     }
 }
 
+/// Test-only counters for the page layout: they let tests prove that its
+/// work grows with the rows involved, not with file sizes or with the
+/// number of files times the deepest file.
+#[cfg(test)]
+pub(crate) mod work_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Slots `round_robin_order` examined on this thread.
+        pub(crate) static ROUND_ROBIN_VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn visit_round_robin_slot() {
+        ROUND_ROBIN_VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+}
+
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     crate::bounded_io::command(req, ctx, handle_grep_inner)
 }
@@ -905,20 +922,31 @@ fn display_path(path: &Path, project_root: &Path) -> String {
 }
 
 /// `(file, round)` slots, round by round: the first match of every shown
-/// file, then the second of every file that has one, and so on.
+/// file, then the second of every file that has one, and so on. Each round
+/// visits only the files that still have rows, so the work grows with the
+/// number of stored matches, not with the number of files times the depth
+/// of the busiest file.
 fn round_robin_order(shown: &[usize], files: &[MatchingFile<'_>]) -> Vec<(usize, usize)> {
-    let deepest = shown
+    let total: usize = shown.iter().map(|&index| files[index].matches.len()).sum();
+    let mut order = Vec::with_capacity(total);
+    let mut active: Vec<usize> = shown
         .iter()
-        .map(|&index| files[index].matches.len())
-        .max()
-        .unwrap_or(0);
-    let mut order = Vec::new();
-    for round in 0..deepest {
-        for &index in shown {
-            if round < files[index].matches.len() {
-                order.push((index, round));
-            }
+        .copied()
+        .filter(|&index| !files[index].matches.is_empty())
+        .collect();
+    let mut round = 0usize;
+    while !active.is_empty() {
+        for &index in &active {
+            #[cfg(test)]
+            work_probe::visit_round_robin_slot();
+            order.push((index, round));
         }
+        round += 1;
+        active.retain(|&index| {
+            #[cfg(test)]
+            work_probe::visit_round_robin_slot();
+            files[index].matches.len() > round
+        });
     }
     order
 }
@@ -1636,6 +1664,43 @@ mod tests {
             );
             assert!(!text.contains("continue with offset="), "{text}");
         }
+    }
+
+    #[test]
+    fn round_robin_work_grows_with_stored_matches_not_with_files_times_depth() {
+        // One busy file and many single-match files: dealing rows must not
+        // revisit every file for every round of the busiest one.
+        let mut matches = Vec::with_capacity(100_000);
+        for line in 1..=50_000 {
+            matches.push(grep_match("/project/busy.rs", line, "needle"));
+        }
+        for index in 0..49_999 {
+            matches.push(grep_match(
+                &format!("/project/single_{index}.rs"),
+                1,
+                "needle",
+            ));
+        }
+        let files = group_by_file(&matches, &root());
+        let shown: Vec<usize> = (0..files.len()).collect();
+        work_probe::ROUND_ROBIN_VISITS.with(|visits| visits.set(0));
+        let order = round_robin_order(&shown, &files);
+        let visits = work_probe::ROUND_ROBIN_VISITS.with(|visits| visits.get());
+        assert_eq!(order.len(), matches.len());
+        assert!(
+            visits <= 2 * matches.len(),
+            "visited {visits} slots for {} stored matches",
+            matches.len()
+        );
+        // Round one deals the first row of every file, in file order.
+        assert!(order[..files.len()]
+            .iter()
+            .enumerate()
+            .all(|(position, &(file, round))| file == position && round == 0));
+        assert!(order[files.len()..]
+            .iter()
+            .enumerate()
+            .all(|(position, &(file, round))| file == 0 && round == position + 1));
     }
 
     #[test]
