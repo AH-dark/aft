@@ -7963,10 +7963,14 @@ impl BgTaskRegistry {
                     state.metadata.status.is_terminal() && state.metadata.completion_delivered
                 });
             let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
+            // No cutoff means the retention window reaches back past the
+            // monotonic clock's origin. On Windows that origin is near boot,
+            // so a 24-hour window has no cutoff on a machine up for less than
+            // a day. No task can have finished before the origin, so nothing
+            // is old enough to remove yet.
             let expired = match (terminal_at, cutoff) {
                 (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
-                (Some(_), None) => true,
-                (None, _) => false,
+                (Some(_), None) | (None, _) => false,
             };
             // Pruning the record ends the scratch's retention too: without the
             // record nothing could find and delete the directory later.
@@ -18086,7 +18090,39 @@ mod tests {
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
     }
 
-    /// Foreground bash calls (the common case) spawn with
+    /// On Windows `Instant` cannot go below an origin near boot, so on a
+    /// machine up for less than a day the 24-hour retention window has no
+    /// cutoff instant. That window reaches back past every task the process
+    /// could have finished, so a delivered result stays in memory and on disk
+    /// until it is really older than the window. `Duration::MAX` reaches past
+    /// the clock's origin on every platform, which lets this run anywhere.
+    #[test]
+    fn cleanup_finished_keeps_delivered_terminals_when_retention_predates_clock_origin() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (task_id, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        task.lock_state().unwrap().metadata.completion_delivered = true;
+        let now = Instant::now();
+        assert!(
+            now.checked_sub(Duration::MAX).is_none(),
+            "the window must reach past the clock's origin"
+        );
+
+        registry.cleanup_finished_at(Duration::MAX, now);
+
+        assert!(
+            registry.observed_status(&task_id, "session", 0).is_some(),
+            "a delivered result was pruned before its retention window ended"
+        );
+        assert!(
+            task.paths.json.exists(),
+            "the task record was deleted early"
+        );
+        // The same task is pruned once its window has ended, so the check
+        // above is not passing only because this task could never be pruned.
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(registry.observed_status(&task_id, "session", 0).is_none());
+    }
     /// `notify_on_completion: false`, register as foreground tasks, poll
     /// `status` with a zero preview until terminal, and return the result
     /// inline without draining or acking anything. Retention must still
