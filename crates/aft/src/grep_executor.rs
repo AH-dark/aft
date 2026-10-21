@@ -29,6 +29,7 @@ thread_local! {
     static WALK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_FALLBACK_WALK_FILES) };
     static WALK_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::from_secs(10)) };
     static WALK_ENTRY_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    static WALK_SORT_METADATA_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 fn fallback_walk_limit() -> usize {
@@ -79,6 +80,17 @@ fn fallback_walk_entry_delay() -> Duration {
     }
 }
 
+fn fallback_walk_sort_metadata_delay() -> Duration {
+    #[cfg(test)]
+    {
+        return WALK_SORT_METADATA_DELAY.with(std::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        Duration::ZERO
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn with_fallback_walk_budget_for_test<R>(
     budget: Duration,
@@ -106,6 +118,21 @@ pub(crate) fn with_fallback_walk_entry_delay_for_test<R>(
         }
     }
     let _restore = Restore(WALK_ENTRY_DELAY.with(|current| current.replace(delay)));
+    run()
+}
+
+#[cfg(test)]
+pub(crate) fn with_fallback_walk_sort_metadata_delay_for_test<R>(
+    delay: Duration,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_SORT_METADATA_DELAY.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_SORT_METADATA_DELAY.with(|current| current.replace(delay)));
     run()
 }
 
@@ -1361,6 +1388,7 @@ fn bounded_fallback_walk_files_with_limits_target(
     let filter_root = filter_root.to_path_buf();
     let filters = filters.clone();
     let entry_delay = fallback_walk_entry_delay();
+    let sort_metadata_delay = fallback_walk_sort_metadata_delay();
     let deadline = crate::bounded_io::deadline_before_io_timeout(
         search_root,
         budget,
@@ -1375,6 +1403,7 @@ fn bounded_fallback_walk_files_with_limits_target(
             deadline,
             ignored_target,
             entry_delay,
+            sort_metadata_delay,
         ))
     })
     .unwrap_or_else(|_| FallbackWalkOutcome {
@@ -1394,6 +1423,7 @@ fn walk_files_unbounded(
     deadline: Instant,
     ignored_target: bool,
     entry_delay: Duration,
+    sort_metadata_delay: Duration,
 ) -> FallbackWalkOutcome {
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     // Built before the file test below, which would stat the starting path.
@@ -1459,7 +1489,14 @@ fn walk_files_unbounded(
         }
     }
 
-    sort_walked_paths_by_mtime_desc(&mut files, filter_root);
+    if !walk_time_limit_reached {
+        if !sort_metadata_delay.is_zero() {
+            for _ in &files {
+                std::thread::sleep(sort_metadata_delay);
+            }
+        }
+        sort_walked_paths_by_mtime_desc(&mut files, filter_root);
+    }
     FallbackWalkOutcome {
         files,
         walk_truncated,
