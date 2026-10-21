@@ -204,11 +204,27 @@ pub(crate) mod simulated_volumes {
         // `canonical_root_path` returns. Missing that last spelling made the
         // simulated cache volume invisible and enrollment saw the real, shared
         // volume.
+        // A folder the test creates only later resolves through its nearest
+        // existing ancestor.
+        let mut existing = path;
+        let mut missing = Vec::new();
+        while !existing.exists() {
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => break,
+            }
+        }
         let resolved = [
-            std::fs::canonicalize(path).ok(),
-            crate::bash_background::persistence::canonical_root_path(path).ok(),
+            std::fs::canonicalize(existing).ok(),
+            crate::bash_background::persistence::canonical_root_path(existing).ok(),
         ];
-        for spelling in resolved.into_iter().flatten() {
+        for mut spelling in resolved.into_iter().flatten() {
+            for name in missing.iter().rev() {
+                spelling.push(name);
+            }
             if !paths.contains(&spelling) {
                 paths.push(spelling);
             }
@@ -272,6 +288,15 @@ mod tests {
         assert_eq!(
             super::simulated_volumes::device_of(&resolved.join("aft")),
             Some(u64::MAX - 90)
+        );
+        // A folder registered before the test creates it.
+        let later = temp.path().join("detour").join("..").join("created-later");
+        let _later = super::simulated_volumes::simulate(&later, u64::MAX - 91);
+        std::fs::create_dir(&later).unwrap();
+        let resolved = crate::bash_background::persistence::canonical_root_path(&later).unwrap();
+        assert_eq!(
+            super::simulated_volumes::device_of(&resolved),
+            Some(u64::MAX - 91)
         );
     }
 
