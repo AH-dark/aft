@@ -1441,6 +1441,28 @@ pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     read_task_file(&mut file, path)
 }
 
+#[cfg(all(test, unix))]
+pub(super) fn read_task_retrying_replacement_for_test(path: &Path) -> io::Result<PersistedTask> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match read_task(path) {
+            Err(error)
+                if attempts < METADATA_OPEN_ATTEMPTS
+                    && error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) =>
+            {
+                if attempts <= 2 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50 << (attempts - 3).min(5)));
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Terminal status describes the leader's outcome, not the lifetime of its
 /// descendants. Require the process group to have disappeared before deleting
 /// scratch space; a cached `live_descendants` sample can already be out of date.
@@ -3661,6 +3683,65 @@ mod tests {
         let counts = work_counts::get();
         eprintln!("task lifecycle work: {counts:?}");
         assert!(read_task_at(&task).unwrap().is_terminal());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_task_replacement_retry_handles_concurrent_metadata_writes() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        let path = task.paths.json.clone();
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_writing = writing.clone();
+        let writer_path = path.clone();
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_started = started.clone();
+        let writer = std::thread::spawn(move || {
+            write_task(&writer_path, &metadata).unwrap();
+            writer_started.wait();
+            while writer_writing.load(std::sync::atomic::Ordering::Relaxed) {
+                write_task(&writer_path, &metadata).unwrap();
+                std::thread::yield_now();
+            }
+        });
+        started.wait();
+
+        let mut replacement_error = None;
+        let mut other_error = None;
+        for _ in 0..3_000 {
+            if let Err(error) = read_task(&path) {
+                if error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED)
+                {
+                    replacement_error.get_or_insert_with(|| error.to_string());
+                } else {
+                    other_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+
+        let mut retry_error = None;
+        for _ in 0..3_000 {
+            if let Err(error) = read_task_retrying_replacement_for_test(&path) {
+                retry_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+
+        writing.store(false, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            other_error.is_none(),
+            "unexpected read error: {other_error:?}"
+        );
+        assert!(
+            replacement_error.is_some(),
+            "plain read_task never observed a transient metadata replacement"
+        );
+        assert!(
+            retry_error.is_none(),
+            "retrying metadata read failed: {retry_error:?}"
+        );
+        eprintln!("plain read_task observed {replacement_error:?}; retrying reads succeeded");
     }
 
     #[test]

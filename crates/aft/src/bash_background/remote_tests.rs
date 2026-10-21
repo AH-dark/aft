@@ -3226,7 +3226,7 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
         local_os_name()
     )));
     assert!(
-        crate::bash_background::persistence::read_task(&paths.json)
+        crate::bash_background::persistence::read_task_retrying_replacement_for_test(&paths.json)
             .unwrap()
             .local_fallback_started
     );
