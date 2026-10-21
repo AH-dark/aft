@@ -8771,13 +8771,6 @@
       "reason": "The confinement test helper builds an existing legacy read call to exercise boundary enforcement; this spelling is test input, not a new agent argument."
     },
     {
-      "path": "crates/aft/tests/fixtures/confine/catalog-reply.json",
-      "token": "filePath",
-      "location": "file-level",
-      "class": "compatibility-fixture",
-      "reason": "The captured catalog records the existing read schema's legacy filePath property and required-key declaration; changing these bytes would stop it matching the real handler."
-    },
-    {
       "path": "crates/aft/src/subc/consent_tests.rs",
       "line": 2055,
       "column": 22,
