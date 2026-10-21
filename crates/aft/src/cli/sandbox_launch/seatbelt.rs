@@ -276,24 +276,36 @@ fn render_worker_broker_denies(
     source: &mut String,
     profile: &SandboxProfile,
 ) -> Result<(), String> {
-    if !profile.worker_jail {
+    #[cfg(not(unix))]
+    {
+        let _ = (source, profile);
         return Ok(());
     }
-    // Broker endpoints are host-owned siblings of task temp directories.
-    // A worker may connect to its own endpoint, never another command's.
-    let name = profile
-        .temp_dir
-        .file_name()
-        .ok_or("worker temp has no name")?
-        .to_string_lossy();
-    let own_socket = profile
-        .temp_dir
-        .with_file_name(format!("{name}.gh-read.sock"));
-    source.push_str(&format!(
-        "(deny network-outbound (require-all (remote unix-socket (path-regex #\"^/private/tmp/aft-w/[^/]+[.]gh-read[.]sock$\")) (require-not (path \"{}\"))))\n",
+    #[cfg(unix)]
+    {
+        if !profile.worker_jail {
+            return Ok(());
+        }
+        // Broker endpoints are host-owned siblings of task temp directories.
+        // A worker may connect to its own endpoint, never another command's.
+        let name = profile
+            .temp_dir
+            .file_name()
+            .ok_or("worker temp has no name")?
+            .to_string_lossy();
+        let own_socket = profile
+            .temp_dir
+            .with_file_name(format!("{name}.gh-read.sock"));
+        let root = aft::sandbox_spawn::managed_task_temp_root()
+            .to_str()
+            .ok_or("broker root is not UTF-8")?;
+        source.push_str(&format!(
+        "(deny network-outbound (require-all (remote unix-socket (path-regex #\"^{}/[^/]+[.]gh-read[.]sock$\")) (require-not (path \"{}\"))))\n",
+        regex::escape(root),
         escape_path(&own_socket)?
     ));
-    Ok(())
+        Ok(())
+    }
 }
 
 /// The shim stats and resolves its marker before a no-report data-access query.

@@ -933,8 +933,8 @@ fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
     fs::write(&own_payload_path, b"approved-payload\n").expect("write own payload");
     fs::write(&sibling_payload_path, b"sibling-secret\n").expect("write sibling payload");
     let own_payload = fs::File::open(&own_payload_path).expect("open own payload before sandbox");
-    let payload_fd = own_payload.as_raw_fd();
-    set_close_on_exec(payload_fd, false);
+    // Payloads intentionally carried by the caller use stdio; arbitrary
+    // inherited descriptors above the reserved marker slots are closed.
 
     let profile = SandboxProfile::build(
         vec![own_io],
@@ -949,14 +949,11 @@ fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
     .expect("build task-store denial profile");
     let mut inherited = InheritedProfile::new(&profile);
     inherited.rewind();
-    let script = format!(
-        "cat /dev/fd/{payload_fd}; cat {}",
-        shell_path(&sibling_payload_path)
-    );
+    let script = format!("cat; cat {}", shell_path(&sibling_payload_path));
     let output = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .stdin(std::process::Stdio::from(own_payload))
         .output()
         .expect("launch task-store Seatbelt probe");
-    set_close_on_exec(payload_fd, true);
 
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
@@ -1688,4 +1685,39 @@ fn shell_cannot_write_saved_task_output() {
         assert_denied(&output, "saved output write");
     }
     assert_eq!(fs::read(&outputs.own.stdout).unwrap(), b"saved-output\n");
+}
+
+#[test]
+fn launcher_closes_late_inherited_listener_above_marker_slots() {
+    #[cfg(target_os = "linux")]
+    if !landlock_available() {
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let mut fixture = ProbeFixture::new();
+    let listener =
+        std::os::unix::net::UnixListener::bind(fixture.project.join("listener.sock")).unwrap();
+    let source = listener.as_raw_fd();
+    fixture.profile.rewind();
+    let script="import errno,os\ntry:\n os.fstat(128)\nexcept OSError as e:\n assert e.errno == errno.EBADF\n print('LATE_LISTENER_CLOSED')\nelse:\n raise AssertionError('inherited broker listener remained open')\n";
+    let mut command = launcher_command(fixture.profile.fd(), &["python3", "-c", script]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source, 128) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(128, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(source);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("LATE_LISTENER_CLOSED"));
 }
