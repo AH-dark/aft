@@ -116,6 +116,18 @@ const aftSearchExternalPendingAsks = new Map<
 const POSIX_SYSTEM_TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
 const MACOS_SYSTEM_TEMP_ROOTS = ["/var/folders", "/private/var/folders"];
 
+/** Discard notices and decisions when the host removes a session. */
+export function clearSessionPermissions(sessionID: string): void {
+  restrictNoticeLastSentAt.delete(sessionID);
+  const prefix = `${sessionID}\0`;
+  for (const key of aftSearchExternalDecisionCache.keys()) {
+    if (key.startsWith(prefix)) aftSearchExternalDecisionCache.delete(key);
+  }
+  for (const key of aftSearchExternalPendingAsks.keys()) {
+    if (key.startsWith(prefix)) aftSearchExternalPendingAsks.delete(key);
+  }
+}
+
 export type AftSearchExternalPermissionDenial = PermissionAskFailure & {
   permission: "aft_search_external";
   root: string;
@@ -685,7 +697,7 @@ export async function assertAftSearchExternalPermission(
     process.platform === "win32"
       ? normalizePathPattern(path.join(externalRoot, "*"))
       : path.join(externalRoot, "*").replaceAll("\\", "/");
-  const askPromise = (async () => {
+  const askPromise = Promise.resolve().then(async () => {
     try {
       await runAsk(
         context.ask({
@@ -698,7 +710,8 @@ export async function assertAftSearchExternalPermission(
           },
         }),
       );
-      if (cacheDecisions) aftSearchExternalDecisionCache.set(cacheKey, undefined);
+      if (cacheDecisions && aftSearchExternalPendingAsks.get(cacheKey) === askPromise)
+        aftSearchExternalDecisionCache.set(cacheKey, undefined);
       return undefined;
     } catch (error) {
       const failure = classifyPermissionError(error, "Permission denied (aft_search_external).");
@@ -711,12 +724,14 @@ export async function assertAftSearchExternalPermission(
         permission: "aft_search_external",
         root: externalRoot,
       };
-      if (cacheDecisions) aftSearchExternalDecisionCache.set(cacheKey, denial);
+      if (cacheDecisions && aftSearchExternalPendingAsks.get(cacheKey) === askPromise)
+        aftSearchExternalDecisionCache.set(cacheKey, denial);
       return denial;
     } finally {
-      if (cacheDecisions) aftSearchExternalPendingAsks.delete(cacheKey);
+      if (cacheDecisions && aftSearchExternalPendingAsks.get(cacheKey) === askPromise)
+        aftSearchExternalPendingAsks.delete(cacheKey);
     }
-  })();
+  });
   if (cacheDecisions) aftSearchExternalPendingAsks.set(cacheKey, askPromise);
   return askPromise;
 }
@@ -810,7 +825,10 @@ export async function askGlobPermission(
   }
 }
 
-export function permissionDeniedResponse(message: string): string {
+export function permissionDeniedResponse(message: string, context?: ToolContext): string {
+  // V2 reports explicit local refusals as failures, without parsing tool text.
+  // V1 retains its serialized denial contract.
+  if ((context as ToolRuntime | undefined)?.hostVersion === 2) throw new Error(message);
   return JSON.stringify({
     success: false,
     code: "permission_denied",

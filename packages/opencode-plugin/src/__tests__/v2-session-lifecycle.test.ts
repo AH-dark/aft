@@ -1,10 +1,14 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Effect, Exit, PubSub, Scope, Stream } from "effect";
 
+import { sessionBgStates, trackBgTask } from "../bg-notifications.js";
+import * as logger from "../logger.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
+import { isSyncWatchAborted, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import type { PluginContext } from "../types.js";
 import {
+  _v2SessionCountForTest,
   allowV2WatchWake,
   awaitV2ExecutionSettlement,
   noteV2ToolAbort,
@@ -15,6 +19,7 @@ import {
   v2SubagentStopped,
   v2WatchWakeAllowed,
 } from "../v2-session-lifecycle.js";
+import { __resetV2WakeRoutesForTests, createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 
 async function rig(parentID: string | undefined = "parent", persistedTaskIds?: string[]) {
   _resetSubagentCacheForTest();
@@ -310,5 +315,311 @@ test("V2 stop unions in-memory and persisted task ids without duplicate kills", 
     expect(killed).toEqual(["bash-live", "bash-before-reload"]);
   } finally {
     await r.close();
+  }
+});
+
+test("V2 unknown role never skips stop cleanup after a failed lookup", async () => {
+  const r = await rig();
+  r.host.session.get = () => Effect.die(new Error("host lookup unavailable"));
+  try {
+    await trackV2BackgroundTask(
+      r.ctx,
+      { sessionID: "child", directory: process.cwd() },
+      "bash-unknown",
+      0,
+    );
+    await r.event("session.execution.interrupted", "user");
+    expect(
+      r.calls.filter((call) => call.name === "bash_kill").map((call) => call.args.task_id),
+    ).toEqual(["bash-unknown"]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 ended event subscription logs the Location once", async () => {
+  const logged = spyOn(logger, "error");
+  logged.mockClear();
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle({
+        location: { directory: "/work/events-ended" },
+        event: { subscribe: () => Stream.empty },
+      }).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    await Bun.sleep(10);
+    const lines = logged.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("event") && line.includes("/work/events-ended"));
+    expect(lines).toHaveLength(1);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    logged.mockRestore();
+  }
+});
+
+test("V2 session deletion releases watches, tasks, settlement and auxiliary session maps", async () => {
+  const r = await rig();
+  try {
+    const runtime = { sessionID: "child", directory: process.cwd() };
+    await trackV2BackgroundTask(r.ctx, runtime, "bash-deleted", 0);
+    await trackV2Watch(r.ctx, runtime, "bash-deleted", "watch-deleted");
+    noteV2ToolAbort(r.host, "child");
+    let settled = false;
+    void awaitV2ExecutionSettlement(r.host, "child").then(() => {
+      settled = true;
+    });
+    signalSyncWatchAbort("child");
+    signalSyncWatchAbort("sibling");
+    trackBgTask("child", "bash-deleted");
+    trackBgTask("sibling", "bash-retained");
+    await r.event("session.deleted");
+    expect(settled).toBe(true);
+    expect(isSyncWatchAborted("child")).toBe(false);
+    expect(isSyncWatchAborted("sibling")).toBe(true);
+    expect(sessionBgStates.has("child")).toBe(false);
+    expect(sessionBgStates.has("sibling")).toBe(true);
+    expect(r.calls.map((call) => call.name).sort()).toEqual(["bash_kill", "bash_unnotify"]);
+    expect(v2WatchWakeAllowed(r.host, "child", "bash-deleted")).toBe(false);
+    expect(_v2SessionCountForTest(r.host)).toBe(0);
+  } finally {
+    await r.close();
+    sessionBgStates.clear();
+  }
+});
+
+test("V2 replies arriving after session deletion cannot recreate session state", async () => {
+  const r = await rig();
+  try {
+    const runtime = { sessionID: "child", directory: process.cwd() };
+    const epoch = v2StopEpoch(r.host, "child");
+    await r.event("session.deleted");
+    await trackV2BackgroundTask(r.ctx, runtime, "bash-late-deleted", epoch);
+    await trackV2Watch(r.ctx, runtime, "bash-late-deleted", "watch-late-deleted");
+    expect(r.calls.map((call) => call.name)).toEqual(["bash_kill", "bash_unnotify"]);
+    expect(_v2SessionCountForTest(r.host)).toBe(0);
+    expect(sessionBgStates.has("child")).toBe(false);
+  } finally {
+    await r.close();
+    sessionBgStates.clear();
+  }
+});
+
+test("V2 session deletion after a reload kills only the tasks the bridge says that session owns", async () => {
+  _resetSubagentCacheForTest();
+  const bus = await Effect.runPromise(
+    PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  // Persisted task ownership as the engine keeps it; after a plugin reload
+  // nothing about these tasks is held in memory.
+  const owned: Record<string, string[]> = {
+    "deleted-child": ["bash-deleted-owned"],
+    "live-sibling": ["bash-sibling-owned"],
+  };
+  const bridge = {
+    // Mirrors the engine's bash_owned_tasks reply: the running tasks of the
+    // session the request is bound to, never another session's.
+    send: async (name: string, args: Record<string, unknown>) => {
+      calls.push({ name, args });
+      if (name === "bash_owned_tasks") {
+        const session = String(args.session_id ?? "");
+        return { success: true, task_ids: owned[session] ?? [], skipped_missing_owner: 0 };
+      }
+      return { success: true };
+    },
+  };
+  const host = {
+    location: { directory: process.cwd() },
+    event: { subscribe: () => Stream.fromPubSub(bus) },
+    session: { get: () => Effect.succeed({ parentID: "parent" }) },
+  };
+  const ctx = {
+    client: host,
+    pool: { getBridge: () => bridge, getActiveBridgeForRoot: () => bridge },
+    config: {},
+  } as unknown as PluginContext;
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host, ctx).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    await Effect.runPromise(
+      PubSub.publish(bus, { type: "session.deleted", data: { sessionID: "deleted-child" } }),
+    );
+    await Bun.sleep(20);
+    const kills = calls.filter((call) => call.name === "bash_kill");
+    expect(kills.map((call) => call.args.task_id)).toEqual(["bash-deleted-owned"]);
+    expect(kills.every((call) => call.args.session_id === "deleted-child")).toBe(true);
+    expect(
+      calls.some(
+        (call) => call.name === "bash_owned_tasks" && call.args.session_id === "deleted-child",
+      ),
+    ).toBe(true);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    sessionBgStates.clear();
+  }
+});
+
+test("V2 completion arriving after session deletion creates no session state and is acknowledged", async () => {
+  _resetSubagentCacheForTest();
+  __resetV2WakeRoutesForTests();
+  const bus = await Effect.runPromise(
+    PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  const synthetic: unknown[] = [];
+  const host = {
+    location: { directory: process.cwd() },
+    event: { subscribe: () => Stream.fromPubSub(bus) },
+    session: {
+      get: () => Effect.succeed({ parentID: "parent" }),
+      prompt: () => Effect.succeed({ id: "wake" }),
+      synthetic: (input: unknown) =>
+        Effect.sync(() => {
+          synthetic.push(input);
+          return { id: "status" };
+        }),
+    },
+  };
+  const sends: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const bridge = {
+    getCwd: () => process.cwd(),
+    send: async (command: string, params: Record<string, unknown>) => {
+      sends.push({ command, params });
+      return { success: true };
+    },
+  };
+  const consumer = createV2RuntimeConsumer(host as never);
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    consumer.registerSession?.("deleted-child");
+    await Effect.runPromise(
+      PubSub.publish(bus, { type: "session.deleted", data: { sessionID: "deleted-child" } }),
+    );
+    await Bun.sleep(10);
+    await consumer.bridgeOptions.onBashCompletion?.(
+      {
+        type: "bash_completed",
+        session_id: "deleted-child",
+        task_id: "bash-late-child",
+        status: "completed",
+        exit_code: 0,
+        command: "sleep 1",
+        output_preview: "done",
+      } as never,
+      bridge as never,
+    );
+    expect(sessionBgStates.has("deleted-child")).toBe(false);
+    expect(synthetic).toEqual([]);
+    expect(sends).toEqual([
+      {
+        command: "bash_ack_completions",
+        params: { session_id: "deleted-child", task_ids: ["bash-late-child"] },
+      },
+    ]);
+  } finally {
+    consumer.dispose();
+    __resetV2WakeRoutesForTests();
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    sessionBgStates.clear();
+  }
+});
+
+test("V2 subc drain for a deleted session acknowledges its completion and watch match and leaves no session state", async () => {
+  _resetSubagentCacheForTest();
+  __resetV2WakeRoutesForTests();
+  const bus = await Effect.runPromise(
+    PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  const synthetic: unknown[] = [];
+  const host = {
+    location: { directory: process.cwd() },
+    event: { subscribe: () => Stream.fromPubSub(bus) },
+    session: {
+      get: () => Effect.succeed({ parentID: "parent" }),
+      prompt: () => Effect.succeed({ id: "wake" }),
+      synthetic: (input: unknown) =>
+        Effect.sync(() => {
+          synthetic.push(input);
+          return { id: "status" };
+        }),
+    },
+  };
+  const sends: Array<{ command: string; params: Record<string, unknown> }> = [];
+  let pending = [
+    {
+      task_id: "bash-drained-late",
+      status: "completed",
+      exit_code: 0,
+      command: "sleep 1",
+      output_preview: "done",
+    },
+  ];
+  let matches = [
+    {
+      task_id: "bash-watched-late",
+      session_id: "drained-child",
+      watch_id: "watch-late",
+      match_text: "ready",
+      match_offset: 0,
+      context: "ready",
+      once: true,
+    },
+  ];
+  const bridge = {
+    getCwd: () => process.cwd(),
+    send: async (command: string, params: Record<string, unknown>) => {
+      sends.push({ command, params });
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: pending, pending_matches: matches };
+      if (command === "bash_ack_completions") {
+        const acked = new Set(params.task_ids as string[]);
+        pending = pending.filter((item) => !acked.has(item.task_id));
+        matches = matches.filter((item) => !acked.has(item.task_id));
+      }
+      return { success: true };
+    },
+  };
+  const consumer = createV2RuntimeConsumer(host as never);
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    await Effect.runPromise(
+      PubSub.publish(bus, { type: "session.deleted", data: { sessionID: "drained-child" } }),
+    );
+    await Bun.sleep(10);
+    const wakes = consumer.subcWakes(
+      () => ({ getBridge: () => bridge, getActiveBridgeForRoot: () => bridge }) as never,
+      process.cwd(),
+    );
+    await wakes.drainSession("drained-child");
+    expect(synthetic).toEqual([]);
+    expect(
+      sends.some(
+        (send) =>
+          send.command === "bash_ack_completions" &&
+          (send.params.task_ids as string[]).includes("bash-drained-late"),
+      ),
+    ).toBe(true);
+    expect(
+      sends.some(
+        (send) =>
+          send.command === "bash_ack_completions" &&
+          (send.params.task_ids as string[]).includes("bash-watched-late"),
+      ),
+    ).toBe(true);
+    expect(sessionBgStates.has("drained-child")).toBe(false);
+  } finally {
+    consumer.dispose();
+    __resetV2WakeRoutesForTests();
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    sessionBgStates.clear();
   }
 });

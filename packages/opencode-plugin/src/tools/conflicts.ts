@@ -41,7 +41,7 @@ export function conflictTools(ctx: PluginContext): Record<string, ToolDefinition
           const denied = await assertExternalDirectoryPermission(ctx, context, resolved, {
             kind: "directory",
           });
-          if (denied) return permissionDeniedResponse(denied);
+          if (denied) return permissionDeniedResponse(denied, context);
           // Send the SAME resolved path the permission check approved (closes the
           // check-vs-use gap and gives Rust an absolute path it won't re-resolve
           // against a possibly-different cwd).

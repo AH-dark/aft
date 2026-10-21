@@ -109,7 +109,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           const previewPaths = Array.from(new Set(responsePaths(preview)));
           for (const filePath of previewPaths) {
             const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-            if (denial) return permissionDeniedResponse(denial);
+            if (denial) return permissionDeniedResponse(denial, context);
           }
 
           const filePath =
@@ -121,7 +121,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             relativePatternsFromPaths(context, previewPaths),
             filePath ? { filepath: filePath } : { operation: "undo", paths: previewPaths },
           );
-          if (permissionError) return permissionDeniedResponse(permissionError);
+          if (permissionError) return permissionDeniedResponse(permissionError, context);
         }
 
         if (op === "checkpoint") {
@@ -148,7 +148,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
               const denial = await assertExternalDirectoryPermission(ctx, context, abs, {
                 kind: "file",
               });
-              if (denial) return permissionDeniedResponse(denial);
+              if (denial) return permissionDeniedResponse(denial, context);
             }
           }
         }
@@ -170,7 +170,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
           for (const filePath of new Set(responsePaths(preview))) {
             const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-            if (denial) return permissionDeniedResponse(denial);
+            if (denial) return permissionDeniedResponse(denial, context);
           }
 
           const permissionError = await askEditPermission(
@@ -178,7 +178,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             relativePatternsFromPaths(context, Array.from(new Set(responsePaths(preview)))),
             { checkpoint: args.name },
           );
-          if (permissionError) return permissionDeniedResponse(permissionError);
+          if (permissionError) return permissionDeniedResponse(permissionError, context);
         }
 
         if (op === "purge") {
@@ -200,7 +200,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           const denial = await assertExternalDirectoryPermission(ctx, context, absolutePath, {
             kind: isDirectory ? "directory" : "file",
           });
-          if (denial) return permissionDeniedResponse(denial);
+          if (denial) return permissionDeniedResponse(denial, context);
           // Sent as the purge itself sends it, so the engine resolves both alike.
           const preview = await callBridge(ctx, context, "safety_purge_paths", {
             file: expandTilde(args.path as string),
@@ -211,7 +211,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           const previewPaths = Array.from(new Set(responsePaths(preview)));
           for (const savedPath of previewPaths) {
             const previewDenial = await assertExternalDirectoryPermission(ctx, context, savedPath);
-            if (previewDenial) return permissionDeniedResponse(previewDenial);
+            if (previewDenial) return permissionDeniedResponse(previewDenial, context);
           }
           const pattern = resolveRelativePatternFromAbsolute(context, absolutePath);
           const patterns = isDirectory ? [pattern, path.join(pattern, "*")] : [pattern];
@@ -222,7 +222,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             filepath: absolutePath,
             operation: "purge",
           });
-          if (permissionError) return permissionDeniedResponse(permissionError);
+          if (permissionError) return permissionDeniedResponse(permissionError, context);
         }
 
         const rawArgs: Record<string, unknown> = { op };

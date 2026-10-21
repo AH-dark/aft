@@ -560,7 +560,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
               serverValidatedRead: true,
             }),
           );
-          if (denial) return permissionDeniedResponse(denial);
+          if (denial) return permissionDeniedResponse(denial, context);
         }
 
         // Permission check
@@ -585,6 +585,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           const failure = classifyPermissionError(error);
           return permissionDeniedResponse(
             failure.kind === "rule_denied" ? permissionRuleDenial("read") : failure.message,
+            context,
           );
         }
 
@@ -733,7 +734,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
           diff: content,
           content,
         });
-        if (denial) return permissionDeniedResponse(denial);
+        if (denial) return permissionDeniedResponse(denial, context);
         const data = await callToolCall(ctx, context, "write", rawArgs);
         if (data.success === false) throw toolErrorFromResponse("write", data);
         return data.text;
@@ -749,7 +750,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       // External-directory check first (mirrors opencode-native write.ts:43).
       {
         const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-        if (denial) return permissionDeniedResponse(denial);
+        if (denial) return permissionDeniedResponse(denial, context);
       }
 
       const rawArgs: Record<string, unknown> = { filePath: file, content };
@@ -763,7 +764,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         filepath: filePath,
         diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
       });
-      if (denial) return permissionDeniedResponse(denial);
+      if (denial) return permissionDeniedResponse(denial, context);
 
       const data = await callToolCall(ctx, context, "write", rawArgs);
 
@@ -938,13 +939,13 @@ function createHashlineEditTool(ctx: PluginContext): ToolDefinition {
       ]) {
         const absolute = resolvePathFromProjectRoot(projectRoot, target);
         const denial = await assertExternalDirectoryPermission(ctx, context, absolute);
-        if (denial) return permissionDeniedResponse(denial);
+        if (denial) return permissionDeniedResponse(denial, context);
       }
 
       const denial = await askEditPermission(context, permissionPatterns, {
         surface: "hashline",
       });
-      if (denial) return permissionDeniedResponse(denial);
+      if (denial) return permissionDeniedResponse(denial, context);
 
       const data = await callToolCall(ctx, context, "edit", rawArgs);
       if (data.success === false) throw toolErrorFromResponse("edit", data);
@@ -1057,7 +1058,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
           diff: renderedBody,
           content: renderedBody,
         });
-        if (denial) return permissionDeniedResponse(denial);
+        if (denial) return permissionDeniedResponse(denial, context);
         const data = await callToolCall(ctx, context, "edit", rawArgs);
         if (data.success === false) throw toolErrorFromResponse("edit", data);
         return data.text;
@@ -1073,7 +1074,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
         const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-        if (denial) return permissionDeniedResponse(denial);
+        if (denial) return permissionDeniedResponse(denial, context);
       }
 
       const rawArgs: Record<string, unknown> = { path: file };
@@ -1090,7 +1091,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         filepath: filePath,
         diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
       });
-      if (denial) return permissionDeniedResponse(denial);
+      if (denial) return permissionDeniedResponse(denial, context);
 
       const data = await callToolCall(ctx, context, "edit", rawArgs);
 
@@ -1271,7 +1272,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         if (askedExternalPaths.has(filePath)) continue;
         askedExternalPaths.add(filePath);
         const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-        if (denial) return permissionDeniedResponse(denial);
+        if (denial) return permissionDeniedResponse(denial, context);
       }
 
       const affectedRelPaths = stringArray(preview.affected_rel_paths);
@@ -1286,7 +1287,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             ? preview.filepath
             : (affectedPaths[0] ?? affectedRelPaths[0]),
       });
-      if (denial) return permissionDeniedResponse(denial);
+      if (denial) return permissionDeniedResponse(denial, context);
 
       const response = await callToolCall(ctx, context, "apply_patch", { patchText });
       if (response.success === false) {
@@ -1374,7 +1375,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
           if (asked.has(filePath)) continue;
           asked.add(filePath);
           const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-          if (denial) return permissionDeniedResponse(denial);
+          if (denial) return permissionDeniedResponse(denial, context);
         }
       }
 
@@ -1457,10 +1458,10 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
         const sourceDenial = await assertExternalDirectoryPermission(ctx, context, filePath, {
           kind: "file",
         });
-        if (sourceDenial) return permissionDeniedResponse(sourceDenial);
+        if (sourceDenial) return permissionDeniedResponse(sourceDenial, context);
         if (destPath !== filePath) {
           const destDenial = await assertExternalDirectoryPermission(ctx, context, destPath);
-          if (destDenial) return permissionDeniedResponse(destDenial);
+          if (destDenial) return permissionDeniedResponse(destDenial, context);
         }
       }
 

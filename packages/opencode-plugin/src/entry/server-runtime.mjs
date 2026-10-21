@@ -1,5 +1,5 @@
 import { acquireBridge, releaseBridge } from "@cortexkit/aft-bridge";
-import { Effect } from "effect";
+import { Cause, Effect } from "effect";
 
 import {
   applyToolSurfaceOverrides,
@@ -14,7 +14,7 @@ import {
 import { resolveBridgePoolTransportOptions } from "../config.js";
 import { buildConfigErrorToolMap } from "../config-error-surface.js";
 import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
-import { debug, log, warn } from "../logger.js";
+import { debug, error, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
@@ -89,7 +89,6 @@ async function bootLocation(context, location, dependencies) {
     { configRoot: directory, lspDirectory: directory, config, pluginVersion, notify },
     dependencies,
   );
-  const canonicalDirectory = location.project?.canonical ?? directory;
   let liveConfig = config;
   const consumers = dependencies.toolConsumers(context, config, () => liveConfig);
   // Only a rejected configuration keeps AFT out of a project; there is no
@@ -99,7 +98,7 @@ async function bootLocation(context, location, dependencies) {
     ? consumers.subcWakes?.(() => pool, directory)
     : undefined;
   // getPool is only called on a version mismatch, after the pool exists.
-  const pool = await dependencies.acquireBridge(canonicalDirectory, {
+  const pool = await dependencies.acquireBridge(directory, {
     harness: "opencode",
     binaryPath: environment.binaryPath,
     poolOptions: {
@@ -222,7 +221,19 @@ export function makeServerEffect(overrides = {}) {
       // finalizer logs when the host disposes the Location.
       const logRuntimeStop = logRuntimeStart(location);
       yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
-      const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies));
+      // The host runs this program under Effect.ignoreCause, so a rejected boot
+      // would otherwise leave the Location without AFT and without any log.
+      // Interruption is the host disposing the Location mid-boot, not a failure.
+      const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies)).pipe(
+        Effect.tapCause((cause) =>
+          Effect.sync(() => {
+            if (Cause.hasInterruptsOnly(cause)) return;
+            error(
+              `AFT V2 boot failed for Location ${location.id ?? "(no id)"} at ${location.directory}: ${Cause.pretty(cause)}`,
+            );
+          }),
+        ),
+      );
       if (!runtime) return;
 
       if (runtime.configError !== undefined) {
@@ -247,8 +258,8 @@ export function makeServerEffect(overrides = {}) {
       // The config is read through the tool context so live reloads apply.
       // The bridge asked first is the one this Location's tools run on, the
       // Location's own directory; for a Location in a linked git worktree that
-      // is the worktree, not the canonical main checkout the pool was acquired
-      // for (issue #387). Other bridges are still tried after it.
+      // is the worktree, not the canonical main checkout. Other bridges are
+      // still tried after it.
       yield* dependencies.registerPromptHook(context, {
         pool: runtime.pool,
         projectRoot: runtime.directory,

@@ -1,7 +1,8 @@
-import { Effect, Stream } from "effect";
+import { Cause, Effect, Stream } from "effect";
 import { markHeldBgCompletions } from "./bg-notifications.js";
-import { warn } from "./logger.js";
-import { resolveIsSubagent } from "./shared/subagent-detect.js";
+import { error as logError, warn } from "./logger.js";
+import { releaseSessionState } from "./shared/session-cleanup.js";
+import { resolveSubagentStatus } from "./shared/subagent-detect.js";
 import { callBashBridge } from "./tools/_shared.js";
 import type { PluginContext } from "./types.js";
 
@@ -29,16 +30,64 @@ export async function awaitV2ExecutionSettlement(
   client: unknown,
   sessionID: string,
 ): Promise<void> {
-  await stateFor(client, sessionID)?.settling?.promise;
+  await stateFor(client, sessionID, false)?.settling?.promise;
 }
 const locations = new WeakMap<object, Map<string, SessionWatches>>();
+/**
+ * Sessions the host has deleted, per Location. A background spawn or watch
+ * registration can answer after the delete event; without this record that
+ * late reply would recreate the session's entry and nothing would remove it
+ * again. Capped so the record itself cannot grow without bound.
+ */
+const deletedSessions = new WeakMap<object, Set<string>>();
+const DELETED_SESSIONS_MAX = 1_000;
 
-function stateFor(client: unknown, sessionID: string): SessionWatches | undefined {
+function sessionDeleted(client: unknown, sessionID: string): boolean {
+  return (
+    !!client && typeof client === "object" && deletedSessions.get(client)?.has(sessionID) === true
+  );
+}
+
+/**
+ * True once the host has deleted this session in this Location. Wake routes
+ * use it to drop a late completion without recreating per-session state.
+ */
+export function v2SessionDeleted(client: unknown, sessionID: string): boolean {
+  return sessionDeleted(client, sessionID);
+}
+
+function rememberDeleted(client: object, sessionID: string): void {
+  let deleted = deletedSessions.get(client);
+  if (!deleted) {
+    deleted = new Set();
+    deletedSessions.set(client, deleted);
+  }
+  deleted.add(sessionID);
+  if (deleted.size > DELETED_SESSIONS_MAX) {
+    const oldest = deleted.values().next().value;
+    if (oldest !== undefined) deleted.delete(oldest);
+  }
+}
+
+/** Test-only visibility into retained session entries, including task-kill closures. */
+export function _v2SessionCountForTest(client: object): number {
+  return locations.get(client)?.size ?? 0;
+}
+
+function stateFor(client: unknown, sessionID: string, create = true): SessionWatches | undefined {
   if (!client || typeof client !== "object") return;
   const sessions = locations.get(client);
   if (!sessions) return;
   let state = sessions.get(sessionID);
-  if (!state) {
+  if (!state && sessionDeleted(client, sessionID)) {
+    // A deleted session gets a detached, already-stopped state: late task and
+    // watch registrations see `stopped` and kill or cancel what they started,
+    // and the state is never stored, so it cannot leak.
+    return create
+      ? { stopped: true, stopEpoch: 0, tasks: new Map(), wakes: new Set(), watches: new Map() }
+      : undefined;
+  }
+  if (!state && create) {
     state = {
       stopped: false,
       stopEpoch: 0,
@@ -52,7 +101,7 @@ function stateFor(client: unknown, sessionID: string): SessionWatches | undefine
 }
 
 export function v2SubagentStopped(client: unknown, sessionID: string): boolean {
-  return stateFor(client, sessionID)?.stopped === true;
+  return stateFor(client, sessionID, false)?.stopped === true;
 }
 
 export function v2StopEpoch(client: unknown, sessionID: string): number {
@@ -72,6 +121,12 @@ async function killBackgroundTask(
     { abortSignal: undefined },
   );
   if (result.success === false) throw new Error(String(result.message ?? "bash_kill failed"));
+  // The reply may carry completions that recreate per-session notification
+  // state; a deleted session must not keep any.
+  if (sessionDeleted(ctx.client, runtime.sessionID)) {
+    releaseSessionState(runtime.sessionID);
+    return;
+  }
   // A kill reply can drain the completion before its push callback runs.
   // Keep that existing notice queued for a resumed tool result too.
   markHeldBgCompletions(runtime.sessionID);
@@ -158,12 +213,12 @@ export function allowV2WatchWake(client: unknown, sessionID: string, taskId: str
 }
 
 export function v2WatchWakeAllowed(client: unknown, sessionID: string, taskId: string): boolean {
-  const state = stateFor(client, sessionID);
+  const state = stateFor(client, sessionID, false);
   return state !== undefined && !state.stopped && state.wakes.has(taskId);
 }
 
 export function forgetV2Watch(client: unknown, sessionID: string, taskId: string): void {
-  const state = stateFor(client, sessionID);
+  const state = stateFor(client, sessionID, false);
   if (!state) return;
   state.wakes.delete(taskId);
   state.tasks.delete(taskId);
@@ -191,6 +246,7 @@ export async function trackV2Watch(
   // Registration may finish after the execution's stop event was pulled.
   if (state.stopped) {
     await cancel();
+    if (sessionDeleted(ctx.client, runtime.sessionID)) releaseSessionState(runtime.sessionID);
     return;
   }
   state.wakes.add(taskId);
@@ -230,6 +286,47 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                 Effect.promise(async () => {
                   const sessionID = event.data.sessionID;
                   if (!sessionID) return;
+                  if (event.type === "session.deleted") {
+                    const state = sessions.get(sessionID);
+                    // Collect the in-memory kill targets before the entry is
+                    // dropped; killStoppedBackgroundTasks reads them from it.
+                    // It also asks the bridge for the tasks this session owns:
+                    // after a plugin reload a running command may be known
+                    // only there, with no in-memory entry for the session.
+                    const kills = killStoppedBackgroundTasks(context, sessionID, ctx);
+                    rememberDeleted(context, sessionID);
+                    sessions.delete(sessionID);
+                    releaseSessionState(sessionID);
+                    if (!state) {
+                      void kills.finally(() => releaseSessionState(sessionID));
+                      return;
+                    }
+                    state.settling?.resolve();
+                    state.settling = undefined;
+                    state.stopped = true;
+                    state.stopEpoch += 1;
+                    state.wakes.clear();
+                    const watches = [...state.watches.values()];
+                    state.watches.clear();
+                    // Like a deliberate stop, cleanup must not hold up the
+                    // events that follow this one. Kill and cancel replies can
+                    // carry completions that recreate notification state, so
+                    // release it again once they have settled.
+                    void Promise.all([
+                      kills,
+                      ...watches.map((watch) =>
+                        watch
+                          .cancel()
+                          .catch((error) =>
+                            warn(
+                              `[bash_watch] failed to cancel deleted session ${sessionID}'s watch on ${watch.taskId}: ${String(error)}`,
+                            ),
+                          ),
+                      ),
+                    ]).finally(() => releaseSessionState(sessionID));
+                    return;
+                  }
+                  if (!event.type.startsWith("session.execution.")) return;
                   const state = stateFor(context, sessionID);
                   if (!state) return;
                   if (event.type === "session.execution.started") {
@@ -250,7 +347,9 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                     }
                     return;
                   }
-                  if (!(await resolveIsSubagent(context, sessionID))) {
+                  // Only a proven primary is exempt: a failed lookup must not
+                  // leave a stopped worker's tasks and watches alive.
+                  if ((await resolveSubagentStatus(context, sessionID)) === false) {
                     state.settling?.resolve();
                     state.settling = undefined;
                     return;
@@ -278,6 +377,20 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
               { discard: true },
             ),
           ),
+        ),
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            if (!Cause.hasInterruptsOnly(cause)) {
+              const directory = (context as { location?: { directory?: string } }).location
+                ?.directory;
+              // Without this subscription a stopped subagent's background
+              // tasks and watches are never cleaned up, so say it stopped.
+              logError(
+                `AFT V2 session event consumer ended for Location ${directory ?? "(unknown)"}: ${Cause.pretty(cause)}`,
+              );
+            }
+          }),
         ),
       ),
       { startImmediately: true },

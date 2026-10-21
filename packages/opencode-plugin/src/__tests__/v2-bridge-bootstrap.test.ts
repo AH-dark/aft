@@ -15,11 +15,13 @@
  */
 
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as bridge from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
+import { withHermeticGitEnv } from "../../../../tests/helpers/git-env.js";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { makeServerEffect } from "../entry/server-runtime.mjs";
 
@@ -338,4 +340,62 @@ describe.serial("OpenCode 2 live config reload", () => {
 
     expect(stopped).toBe(1);
   });
+});
+
+test("V2 linked-worktree boot preserves Location storage and shell permission overrides end to end", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "aft-v2-linked-"));
+  const main = join(tempDir, "main");
+  const worktree = join(tempDir, "linked");
+  mkdirSync(main);
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: main, env: withHermeticGitEnv(), stdio: "pipe" });
+  git("init");
+  git(
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+    "--allow-empty",
+    "-m",
+    "fixture",
+  );
+  git("worktree", "add", "-b", "linked", worktree);
+  const storage = join(tempDir, "location-storage");
+  const pools: bridge.BridgePool[] = [];
+  let configure: Overrides | undefined;
+  const host = v2Host(worktree);
+  host.location.project.canonical = main;
+  const dependencies = {
+    ...inertV2Surface,
+    loadConfig: () => ({}),
+    configLoadErrors: () => [],
+    migrateConfigLocations: () => [],
+    resolveVersion: () => "0.0.0-test",
+    resolveBinary: async () => "never-spawned-aft",
+    ensureStorageMigrated: async () => {},
+    resolveStorageRoot: () => storage,
+    buildConfigureParams: (_root: string, state: Overrides) => ({
+      ...state,
+      bash_permissions: { sentinel: "location" },
+      config: [],
+    }),
+    ensureOnnxRuntime: async () => null,
+    startLspAutoInstall: () => null,
+    pushLspPaths: async () => {},
+    isOrtAutoDownloadSupported: () => true,
+    acquireBridge: realBridgePoolAcquire(pools),
+    releaseBridge: bridge.releaseBridge,
+    buildToolMap: () => ({}),
+  };
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* makeServerEffect(dependencies)(host);
+        configure = firstBridgeConfigure(pools[0] as never, worktree);
+      }),
+    ),
+  );
+  expect(configure?.storage_dir).toBe(storage);
+  expect(configure?.bash_permissions).toEqual({ sentinel: "location" });
 });

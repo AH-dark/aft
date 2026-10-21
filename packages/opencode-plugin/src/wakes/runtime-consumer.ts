@@ -23,6 +23,7 @@ import {
 } from "../bg-notifications.js";
 import type { AftConfig } from "../config.js";
 import { warn } from "../logger.js";
+import { releaseSessionState } from "../shared/session-cleanup.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { executeV2Bash } from "../tools/bash/executor.js";
 import type { V2ToolConsumers } from "../tools/definitions/v2.js";
@@ -30,6 +31,7 @@ import {
   awaitV2ExecutionSettlement,
   forgetV2Watch,
   noteV2ToolAbort,
+  v2SessionDeleted,
   v2SubagentStopped,
   v2WatchWakeAllowed,
 } from "../v2-session-lifecycle.js";
@@ -300,6 +302,19 @@ export function createV2RuntimeConsumer(
   let subcPool: (() => AftTransportPool) | undefined;
   const route: WakeRoute = {
     completion: async (completion, bridge, acknowledge = true) => {
+      // The host deleted this session. Holding or delivering the completion
+      // would recreate notification state nothing releases again, so drop it
+      // here. It is still acknowledged so the bridge does not deliver it again;
+      // a drain (acknowledge false) acknowledges what this returns true for.
+      if (v2SessionDeleted(context, completion.session_id)) {
+        if (acknowledge) {
+          await bridge.send("bash_ack_completions", {
+            session_id: completion.session_id,
+            task_ids: [completion.task_id],
+          });
+        }
+        return true;
+      }
       if (await resolveIsSubagent(context, completion.session_id)) {
         await awaitV2ExecutionSettlement(context, completion.session_id);
       }
@@ -357,6 +372,9 @@ export function createV2RuntimeConsumer(
       return true;
     },
     patternMatch: async (match, bridge) => {
+      // A deleted session has no one to tell. Report the match handled so the
+      // drain acknowledges it instead of queueing it for the session again.
+      if (v2SessionDeleted(context, match.session_id)) return true;
       if (await resolveIsSubagent(context, match.session_id)) {
         await awaitV2ExecutionSettlement(context, match.session_id);
         if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return false;
@@ -417,7 +435,7 @@ export function createV2RuntimeConsumer(
         resolvedBridge?: AftProjectTransport,
       ) => {
         if (disposed) return Promise.resolve();
-        return handleSubcBgEventsNudge({
+        const drained = handleSubcBgEventsNudge({
           ctx: { pool: getPool() },
           directory: root,
           sessionID,
@@ -439,6 +457,11 @@ export function createV2RuntimeConsumer(
               );
             },
           },
+        });
+        // A drain keeps its own per-session bookkeeping while it delivers and
+        // acknowledges. For a deleted session, release it once the drain ends.
+        return drained.finally(() => {
+          if (v2SessionDeleted(context, sessionID)) releaseSessionState(sessionID);
         });
       };
       return {

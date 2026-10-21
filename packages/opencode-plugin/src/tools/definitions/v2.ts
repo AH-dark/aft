@@ -174,41 +174,6 @@ function resultContent(result: ToolResult): Record<string, unknown> {
   };
 }
 
-/**
- * Pull the human-readable message out of a serialized failure envelope.
- *
- * Several tools report a refusal by *returning* `{"success": false, ...}` as
- * their text instead of throwing. Left alone that reaches the host as a
- * successful call whose content is raw JSON, so a transcript shows a check mark
- * over a result that does not exist, and the reader has to parse JSON to learn
- * it failed. Recognising the envelope here turns it back into a failure that
- * carries only the rendered sentence.
- *
- * The match is deliberately narrow — a top-level object with `success: false`
- * — so ordinary tool output that merely happens to be JSON is untouched.
- */
-function failureEnvelopeMessage(result: ToolResult): string | undefined {
-  const output = typeof result === "string" ? result : result.output;
-  if (typeof output !== "string") return undefined;
-  const trimmed = output.trim();
-  if (!trimmed.startsWith("{") || !trimmed.includes('"success"')) return undefined;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return undefined;
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-
-  const envelope = parsed as Record<string, unknown>;
-  if (envelope.success !== false) return undefined;
-  for (const field of [envelope.message, envelope.error, envelope.code]) {
-    if (typeof field === "string" && field.length > 0) return field;
-  }
-  return "The tool call failed.";
-}
-
 function bareToolName(name: string): string {
   return name.startsWith("aft_") ? name.slice(4) : name;
 }
@@ -336,11 +301,15 @@ function runtimeFor(
       void Effect.runPromise(
         context.progress(
           jsonSafeMetadata({
-            ...(update.metadata ?? {}),
-            ...(update.title ? { title: update.title } : {}),
+            ...update,
+            metadata: undefined,
+            ...(isPlainObject(update.metadata) ? update.metadata : {}),
           }) as Record<string, unknown>,
         ),
-      );
+      ).catch(() => {
+        // Progress is best-effort; a disconnected host must not reject a tool
+        // or leave an unhandled promise rejection on each output chunk.
+      });
     },
     ask: (asked, permissionSignal) => {
       const request = v2PermissionRequest(name, asked);
@@ -438,8 +407,9 @@ export function projectV2Tool(
                   })
                 : await definition.execute(input, runtime as never);
             if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
-            const refusal = failureEnvelopeMessage(result);
-            if (refusal) throw new Error(refusal);
+            // Shared tools inspect the structured engine reply's success flag
+            // before rendering it. Rendered text is data, even when it is JSON
+            // containing success:false (for example a file read or shell stdout).
             return resultContent(result);
           } catch (error) {
             // The shared tool implementations can catch permission errors and

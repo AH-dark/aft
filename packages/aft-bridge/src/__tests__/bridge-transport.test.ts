@@ -770,12 +770,20 @@ process.stdin.on("data", (chunk) => {
           (err) => err,
         );
 
-      const [second, sibling] = (await Promise.race([
-        Promise.all([secondResult, siblingResult]),
-        new Promise<[string, unknown]>((resolve) =>
-          setTimeout(() => resolve(["pending", "pending"]), 200),
-        ),
-      ])) as [string, unknown];
+      // A shell call that opted out of killing on its own timeout is still
+      // aborted when another request's timeout kills the shared bridge.
+      const shellResult = bridge
+        .send("bash", { command: "long-running" }, { timeoutMs: 1_000, keepBridgeOnTimeout: true })
+        .then<unknown>(
+          () => "resolved",
+          (error) => error,
+        );
+      const [second, sibling, shell] = await Promise.all([
+        secondResult,
+        siblingResult,
+        shellResult,
+      ]);
+      expect(shell).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
 
       expect(second).toMatch(/timed out|aborted/);
       expect(sibling).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
@@ -783,7 +791,9 @@ process.stdin.on("data", (chunk) => {
       expect(siblingMessage).toContain("triggering_request_id=3");
       expect(siblingMessage).toContain('triggering_tool="aft_inspect"');
       expect(siblingMessage).toContain("bridge_generation=1");
-      expect(siblingMessage).toContain('aborted_siblings=[{"request_id":"4","tool":"read"}]');
+      expect(siblingMessage).toContain(
+        'aborted_siblings=[{"request_id":"4","tool":"read"},{"request_id":"5","tool":"bash"}]',
+      );
 
       const killLog = logs.find(
         ({ level, message }) =>
@@ -792,7 +802,9 @@ process.stdin.on("data", (chunk) => {
       expect(killLog?.message).toContain("triggering_request_id=3");
       expect(killLog?.message).toContain('triggering_tool="aft_inspect"');
       expect(killLog?.message).toContain("bridge_generation=1");
-      expect(killLog?.message).toContain('aborted_siblings=[{"request_id":"4","tool":"read"}]');
+      expect(killLog?.message).toContain(
+        'aborted_siblings=[{"request_id":"4","tool":"read"},{"request_id":"5","tool":"bash"}]',
+      );
       expect(killLog?.meta).toEqual({ sessionId: "timeout-session" });
       expect(bridge.isAlive()).toBe(false);
       expect(testBridge.configured).toBe(false);

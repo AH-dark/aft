@@ -74,6 +74,7 @@ import {
   pushStatusChange,
 } from "./shared/rpc-notifications.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
+import { releaseSessionState } from "./shared/session-cleanup.js";
 import {
   getSessionDirectory,
   getSessionDirectoryCached,
@@ -861,6 +862,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // transport idle eviction and connection-exit quiesce handle abandoned
       // sessions, while in-flight bash aborts now use bash_abort_inflight.
       if (eventType === "session.deleted" && sessionID) {
+        releaseSessionState(sessionID);
         inspectTier2Idle.clear(sessionID);
         // Release this session's transport routes (subc: tool + bg_events;
         // standalone: no-op). Best-effort — never block the event hook.

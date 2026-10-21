@@ -42,7 +42,7 @@ describe("V2 bootstrap fixture isolation", () => {
           },
         );
         expect(result.error).toBeUndefined();
-        expect(`${result.stdout}\n${result.stderr}`).toContain("10 pass");
+        expect(`${result.stdout}\n${result.stderr}`).toContain("11 pass");
         expect(result.status).toBe(0);
       } finally {
         rmSync(root, { recursive: true, force: true });

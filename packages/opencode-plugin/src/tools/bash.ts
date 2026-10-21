@@ -24,7 +24,7 @@ import { trackBgTask } from "../bg-notifications.js";
 import { remoteRunsOffered, resolveBashConfig, toolEnabled } from "../config.js";
 import { flushLog, sessionLog } from "../logger.js";
 import { normalizeToolArgSchemas } from "../normalize-schemas.js";
-import { resolveIsSubagent } from "../shared/subagent-detect.js";
+import { resolveIsSubagent, resolveSubagentStatus } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { trackV2BackgroundTask, v2StopEpoch } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
@@ -610,7 +610,12 @@ export function createBashTool(
       const cwd = (args.workdir as string | undefined) ?? context.directory;
 
       // Detect whether the calling session is a subagent (has a non-empty parentID).
-      const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
+      const subagentStatus = await resolveSubagentStatus(
+        ctx.client,
+        context.sessionID,
+        context.directory,
+      );
+      const isSubagent = subagentStatus === true;
       const backgroundDisabled = !bashCfg.background;
       // With background off, `wait` is not in the schema and every command
       // already runs to completion. A stale `wait: true` is ignored rather than
@@ -640,7 +645,8 @@ export function createBashTool(
       // a retry loop. pty: true silently implies background: true (Rust
       // bash.rs handles the auto-promote); no explicit check needed.
       const allowSubagentBg = bashCfg.subagent_background;
-      const subagentForcedForeground = isSubagent && !allowSubagentBg;
+      // Unknown roles follow the worker restriction until the host can classify them.
+      const subagentForcedForeground = subagentStatus !== false && !allowSubagentBg;
       if (requestedPty && subagentForcedForeground) {
         // A PTY session only exists as a background task, which
         // `bash.subagent_background: false` rules out for subagents; running it

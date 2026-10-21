@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { type BridgePool, execFileSync, type ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 
+import { releaseSessionState } from "../shared/session-cleanup.js";
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { astTools } from "../tools/ast.js";
 import { createBashTool } from "../tools/bash.js";
@@ -523,9 +524,9 @@ describe("permission audit regressions", () => {
       permission: "aft_search_external",
       message: "policy changed",
     });
-    const denied = await tools.aft_search.execute({ query: "TODO", path: external }, sdkCtx);
-    expect(denied).toContain("policy changed");
-    expect(parsePermissionDenied(denied).message).toBe("policy changed");
+    await expect(
+      tools.aft_search.execute({ query: "TODO", path: external }, sdkCtx),
+    ).rejects.toThrow("policy changed");
     expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(2);
     expect(calls).toHaveLength(1);
   });
@@ -1901,4 +1902,37 @@ test("containsPath accepts dot-dot-prefixed child names", async () => {
       "/project/..cache/file.ts",
     ),
   ).toBe(true);
+});
+
+test("session removal releases cached permission decisions without affecting another session", async () => {
+  const { project, external } = await makeProjectAndExternalDirs();
+  const asks: AskCall[] = [];
+  const { tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+  const deleted = createSdkContext(project, recordingAsk(asks), "permission-deleted");
+  const sibling = createSdkContext(project, recordingAsk(asks), "permission-retained");
+  const args = { query: "TODO", hint: "literal", path: external };
+  await tools.aft_search.execute(args, deleted);
+  await tools.aft_search.execute(args, sibling);
+  releaseSessionState("permission-deleted");
+  await tools.aft_search.execute(args, deleted);
+  await tools.aft_search.execute(args, sibling);
+  expect(asks.filter((ask) => ask.permission === "aft_search_external")).toHaveLength(3);
+});
+
+test("session removal releases the restriction-notice throttle", async () => {
+  const { project, external } = await makeProjectAndExternalDirs();
+  const context = createSdkContext(project, recordingAsk([]), "restrict-deleted-session");
+  const prompts: unknown[] = [];
+  const client = {
+    ...createMockClient(),
+    session: { prompt: (input: unknown) => prompts.push(input) },
+  };
+  const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool, client);
+  ctx.config = { restrict_to_project_root: true } as PluginContext["config"];
+  await assertExternalDirectoryPermission(ctx, context, path.join(external, "a.txt"));
+  await assertExternalDirectoryPermission(ctx, context, path.join(external, "b.txt"));
+  expect(prompts).toHaveLength(1);
+  releaseSessionState("restrict-deleted-session");
+  await assertExternalDirectoryPermission(ctx, context, path.join(external, "c.txt"));
+  expect(prompts).toHaveLength(2);
 });

@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "packages/opencode-plugin/src/tools/semantic.ts"
+  ],
+  "slices": [
+    "opencode2-plugin-fixes-646"
+  ],
+  "note": "The ranking fence hit is packages/opencode-plugin/src/tools/semantic.ts. The only change there passes the call context to the plugin's permission-denial helper, so an OpenCode 2 denial is thrown instead of returned as text. The engine, query routing, admission and ranking are untouched, and the tool schema is unchanged; ranked rows must remain byte-identical to the committed reference."
+}

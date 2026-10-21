@@ -98,7 +98,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
           const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-          if (denial) return permissionDeniedResponse(denial);
+          if (denial) return permissionDeniedResponse(denial, context);
         }
 
         const permissionError = await askEditPermission(
@@ -106,7 +106,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
           [resolveRelativePattern(context, filePath)],
           { filepath: filePath },
         );
-        if (permissionError) return permissionDeniedResponse(permissionError);
+        if (permissionError) return permissionDeniedResponse(permissionError, context);
 
         const rawArgs: Record<string, unknown> = { op, filePath };
         if (args.module !== undefined) rawArgs.module = args.module;
