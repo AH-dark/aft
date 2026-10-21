@@ -204,9 +204,93 @@ fn start_with_hard_kill(
         .unwrap()
 }
 
+/// Every path under `root` (relative, sorted, `.git` skipped) and every
+/// persisted-format refusal recorded for bash-task records under it, for
+/// failure messages about a task the registry does not hold.
+fn storage_report(root: &Path) -> String {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            out.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+            if path.is_dir() {
+                walk(&path, root, out);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(root, root, &mut paths);
+    paths.sort();
+    // A refusal recorded for `root` or a directory above it, then any recorded
+    // for paths inside it.
+    use crate::persisted_format::{refusal_covering, refusals_under, PersistedStore};
+    let mut refusals: Vec<String> = refusal_covering(PersistedStore::BashTask, root)
+        .into_iter()
+        .chain(
+            refusals_under(root)
+                .into_iter()
+                .filter(|refusal| refusal.store == PersistedStore::BashTask),
+        )
+        .map(|refusal| refusal.to_string())
+        .collect();
+    refusals.dedup();
+    format!(
+        "files under {}: {paths:?}; bash-task format refusals: {refusals:?}",
+        root.display()
+    )
+}
+
+/// Fail unless `replay` left the task registered for `session`. Replay
+/// registers every task it restores before it returns, so a missing task means
+/// the record was skipped (deferred, refused or quarantined) rather than slow.
+fn assert_replayed(registry: &BgTaskRegistry, task: &str, storage: &Path, replay: &str) {
+    if registry.observed_status(task, "session", 0).is_none() {
+        panic!(
+            "{replay} did not register task {task} for session `session` (held under session {:?}); {}",
+            registry.task_for_test(task).map(|held| held.session_id.clone()),
+            storage_report(storage)
+        );
+    }
+}
+
+/// Poll until the task reaches a terminal status. A task that is not in the
+/// registry is a failure, not something to wait out: the callers registered it
+/// before polling, and nothing in these tests acknowledges a completion, which
+/// is what retention cleanup needs before it removes a task.
 async fn terminal(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
+    // The task's bundle directory from the first poll that found it, so a task
+    // that later disappears is reported with what its session directory holds.
+    let mut seen_in: Option<PathBuf> = None;
+    let started = Instant::now();
     wait_for("fake executor must terminate", || {
-        let snapshot = registry.observed_status(task, "session", 8192).unwrap();
+        let Some(snapshot) = registry.observed_status(task, "session", 8192) else {
+            let held_under = registry
+                .task_for_test(task)
+                .map(|held| held.session_id.clone());
+            match &seen_in {
+                Some(bundle) => panic!(
+                    "task {task} disappeared from the registry {:?} into the wait for a terminal status (held under session {held_under:?}); {}",
+                    started.elapsed(),
+                    storage_report(bundle.parent().unwrap_or(bundle))
+                ),
+                None => panic!(
+                    "task {task} was not registered for session `session` when the wait for a terminal status began (held under session {held_under:?})"
+                ),
+            }
+        };
+        if seen_in.is_none() {
+            seen_in = registry.task_for_test(task).map(|held| held.paths.dir.clone());
+        }
         snapshot.info.status.is_terminal().then_some(snapshot)
     })
     .await
@@ -1640,6 +1724,7 @@ async fn exec_remote_bash_executor_env_disclosure_survives_reattach_and_caps_nam
         drop(original);
         let restarted = registry();
         restarted.replay_session(dir.path(), "session").unwrap();
+        assert_replayed(&restarted, &task_id, dir.path(), "the first replay");
         let done = terminal(&restarted, &task_id).await;
         let line = "the remote job does not receive:";
         if dropped.as_ref().is_some_and(|names| !names.is_empty()) {
@@ -1661,6 +1746,7 @@ async fn exec_remote_bash_executor_env_disclosure_survives_reattach_and_caps_nam
         );
         let replay = registry();
         replay.replay_session(dir.path(), "session").unwrap();
+        assert_replayed(&replay, &task_id, dir.path(), "the second replay");
         let done = terminal(&replay, &task_id).await;
         assert_eq!(
             done.output_preview.contains(line),
