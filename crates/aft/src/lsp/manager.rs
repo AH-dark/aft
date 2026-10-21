@@ -1438,8 +1438,9 @@ impl LspManager {
         self.project_applicability.is_some()
     }
 
-    /// A failed diagnostics producer differs from one still starting. Either
-    /// prevents project totals, but only actual failures report producer_missing.
+    /// Warm counts may retain a previously certified pair during reanalysis.
+    /// This is not inspect's fresh per-file authority; failures and clients
+    /// without a certified baseline still prevent numeric project counts.
     pub(crate) fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {
         let Some(snapshot) = &self.project_applicability else {
             return (false, Vec::new());
@@ -1482,10 +1483,24 @@ impl LspManager {
         let authoritative = gaps.is_empty()
             && snapshot.server_keys.iter().all(|key| {
                 self.has_client(key)
-                    && !self.server_is_warming(key)
-                    && self.has_authoritative_report_for_server(key)
+                    && (self.clients.get(key).is_some_and(|client| {
+                        client.has_certified_analysis_report()
+                            && (client.diagnostics_are_provisional()
+                                || self.diagnostics.has_provisional_report_for_server(key))
+                    }) || (!self.server_is_warming(key)
+                        && self.has_authoritative_report_for_server(key)))
             });
         (authoritative, gaps)
+    }
+
+    pub(crate) fn project_analysis_progress_pending(&self) -> bool {
+        self.project_applicability.as_ref().is_some_and(|snapshot| {
+            snapshot.server_keys.iter().any(|key| {
+                self.clients.get(key).is_some_and(|client| {
+                    client.uses_analysis_progress() && client.diagnostics_are_provisional()
+                })
+            })
+        })
     }
 
     /// Start exactly the servers selected by a prior applicability snapshot.
@@ -3238,18 +3253,36 @@ impl LspManager {
         }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         self.send_due_rust_saves();
-        for (key, client) in &self.clients {
+        let mut promoted_reports = Vec::new();
+        for (key, client) in &mut self.clients {
             if client.uses_analysis_progress() {
-                diagnostics_changed |= if client.diagnostics_are_provisional() {
-                    self.diagnostics.mark_provisional_for_server(key)
-                } else if client.has_analysis_progress() {
-                    self.diagnostics.promote_provisional_through_epoch(
-                        key,
-                        client.analysis_progress_completed_epoch().unwrap_or(0),
-                    )
-                } else {
-                    self.diagnostics.promote_provisional_for_server(key)
-                };
+                // Keep old certified entries as warm snapshots. Only replacement
+                // publications are provisional; fresh inspect separately gates
+                // the producer because analysis can change dependent files too.
+                let mut no_run = false;
+                let promoted = self.diagnostics.promote_provisional_reports(
+                    key,
+                    |file, epoch, published_at| {
+                        let certified =
+                            client.analysis_progress_certifies(file, epoch, published_at);
+                        no_run |= certified && !client.analysis_progress_covered_by_end(epoch);
+                        certified
+                    },
+                );
+                if !promoted.is_empty() {
+                    diagnostics_changed = true;
+                    if self.diagnostics.has_authoritative_report_for_server(key) {
+                        client.note_certified_diagnostics(no_run);
+                    }
+                }
+                promoted_reports.extend(promoted.into_iter().map(|file| (key.clone(), file)));
+            }
+        }
+        // A provisional publication was deliberately absent from live alert
+        // ingestion. Deliver its version-checked snapshot once it is certified.
+        for (key, file) in promoted_reports {
+            if let Some(snapshot) = self.accepted_snapshot_for_file(&key, &file) {
+                accepted_snapshots.push(snapshot);
             }
         }
         for client in self.clients.values_mut() {
@@ -4838,7 +4871,23 @@ impl LspManager {
     pub fn has_authoritative_report_for_file(&self, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
         self.diagnostics
-            .has_authoritative_report_for_file(&normalized)
+            .entries_for_file(&normalized)
+            .into_iter()
+            .any(|(key, entry)| {
+                !entry.stale
+                    && !entry.provisional
+                    && self.clients.get(key).is_none_or(|client| {
+                        !client.uses_analysis_progress()
+                            || (!self.server_is_warming(key)
+                                && self
+                                    .documents
+                                    .get(key)
+                                    .and_then(|documents| documents.version(&normalized))
+                                    .is_none_or(|version| {
+                                        entry.version.is_none_or(|reported| reported == version)
+                                    }))
+                    })
+            })
     }
 
     /// True if this server instance holds any authoritative report: an entry
@@ -4870,9 +4919,14 @@ impl LspManager {
     pub(crate) fn analysis_progress_certifies_file(&self, server: &ServerKey, file: &Path) -> bool {
         self.clients.get(server).is_none_or(|client| {
             !client.uses_analysis_progress()
-                || self
-                    .diagnostic_epoch(server, file)
-                    .is_some_and(|epoch| client.analysis_progress_certifies(epoch))
+                || self.diagnostic_epoch(server, file).is_some_and(|epoch| {
+                    client.analysis_progress_certifies(
+                        file,
+                        epoch,
+                        self.diagnostics
+                            .publication_time(server, &normalize_lookup_path(file)),
+                    )
+                })
         })
     }
 
@@ -4953,18 +5007,26 @@ impl LspManager {
             kind: server_kind.clone(),
             root: root.clone(),
         };
-        if self.live_publish_drop_reason(&server_key, file).is_some() {
+        self.accepted_snapshot_for_file(&server_key, file)
+    }
+
+    fn accepted_snapshot_for_file(
+        &self,
+        server_key: &ServerKey,
+        file: &Path,
+    ) -> Option<AcceptedDiagnosticSnapshot> {
+        if self.live_publish_drop_reason(server_key, file).is_some() {
             return None;
         }
-        let document_version = self.documents.get(&server_key)?.version(file)?;
+        let document_version = self.documents.get(server_key)?.version(file)?;
         let entry = self
             .diagnostics
             .entries_for_file(file)
             .into_iter()
-            .find_map(|(stored_key, entry)| (stored_key == &server_key).then_some(entry))?;
+            .find_map(|(stored_key, entry)| (stored_key == server_key).then_some(entry))?;
 
         Some(AcceptedDiagnosticSnapshot::new(
-            server_key,
+            server_key.clone(),
             document_version,
             entry.diagnostics.clone(),
         ))
@@ -4977,7 +5039,9 @@ impl LspManager {
         if client.state() != ServerState::Ready {
             return Some("server-not-ready");
         }
-        if client.diagnostics_are_provisional() {
+        if (client.uses_analysis_progress() && client.analysis_progress_running())
+            || (!client.uses_analysis_progress() && client.diagnostics_are_provisional())
+        {
             return Some("producer-warming");
         }
         let Some(document_version) = self
@@ -5068,6 +5132,7 @@ impl LspManager {
                 server_kind,
                 root,
                 method,
+                params: Some(params),
                 ..
             } if method == "window/workDoneProgress/create" => {
                 if let Some(client) = self.clients.get_mut(&ServerKey {
@@ -5075,7 +5140,7 @@ impl LspManager {
                     root: root.clone(),
                 }) {
                     if client.uses_analysis_progress() {
-                        client.note_analysis_progress_support();
+                        client.note_analysis_progress_support(params);
                     }
                 }
                 None
@@ -5263,6 +5328,18 @@ impl LspManager {
             version,
             provisional,
         );
+        let epoch = self.diagnostics.current_epoch();
+        let published_at = self.diagnostics.publication_time(&key, &file);
+        if let Some(client) = self.clients.get_mut(&key) {
+            if client.uses_analysis_progress() {
+                client.note_analysis_publication(&file, epoch, published_at);
+                if !provisional {
+                    client.note_certified_diagnostics(
+                        !client.analysis_progress_covered_by_end(epoch),
+                    );
+                }
+            }
+        }
         if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
             slog_info!(
                 "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-{} file={} version={}",

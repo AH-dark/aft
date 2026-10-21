@@ -518,6 +518,12 @@ impl DiagnosticsStore {
             })
     }
 
+    pub(crate) fn publication_time(&self, server: &ServerKey, file: &Path) -> Option<Instant> {
+        self.last_publish_at_for_file
+            .get(&(server.clone(), file.to_path_buf()))
+            .copied()
+    }
+
     /// Get current diagnostics for files under a directory.
     pub fn for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         self.entries
@@ -829,21 +835,6 @@ impl DiagnosticsStore {
         true
     }
 
-    /// Keep existing reports provisional while their server analyzes new opens.
-    pub fn mark_provisional_for_server(&mut self, key: &ServerKey) -> bool {
-        let mut changed = false;
-        for ((server, _), entry) in &mut self.entries {
-            if server == key && !entry.provisional {
-                entry.provisional = true;
-                changed = true;
-            }
-        }
-        if changed {
-            self.generation = self.generation.wrapping_add(1);
-        }
-        changed
-    }
-
     pub fn promote_provisional_for_server(&mut self, key: &ServerKey) -> bool {
         self.promote_provisional_through_epoch(key, u64::MAX)
     }
@@ -865,18 +856,37 @@ impl DiagnosticsStore {
         key: &ServerKey,
         end_epoch: u64,
     ) -> bool {
-        let mut changed = false;
-        for ((stored_key, _), entry) in &mut self.entries {
-            if stored_key == key && entry.provisional && entry.epoch <= end_epoch {
+        !self
+            .promote_provisional_reports(key, |_, epoch, _| epoch <= end_epoch)
+            .is_empty()
+    }
+
+    pub(crate) fn promote_provisional_reports(
+        &mut self,
+        key: &ServerKey,
+        mut certifies: impl FnMut(&Path, u64, Option<Instant>) -> bool,
+    ) -> Vec<PathBuf> {
+        let mut promoted = Vec::new();
+        for ((stored_key, file), entry) in &mut self.entries {
+            if stored_key == key
+                && entry.provisional
+                && certifies(
+                    file,
+                    entry.epoch,
+                    self.last_publish_at_for_file
+                        .get(&(stored_key.clone(), file.clone()))
+                        .copied(),
+                )
+            {
                 entry.provisional = false;
-                changed = true;
+                promoted.push(file.clone());
             }
         }
-        if changed {
+        if !promoted.is_empty() {
             self.generation = self.generation.wrapping_add(1);
         }
         self.debug_assert_index_consistent();
-        changed
+        promoted
     }
 
     /// Clear the readiness marker after a pull response is received from a

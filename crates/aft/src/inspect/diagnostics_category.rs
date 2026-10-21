@@ -205,8 +205,10 @@ struct DiagnosticsCollection {
 /// The authority halves differ by design. An unscoped request makes a
 /// full-root claim. Rust needs current reports or a completed current compiler
 /// check; an idle pre-begin Current state is not check authority. Pyright and
-/// basedpyright require a work-done END following each file's publication, or
-/// explicitly disclose first-publish fallback when no progress is supported.
+/// basedpyright require an END after publications from an announced/begun run.
+/// A short analysis with no run can settle a post-input publication after that
+/// publication's two-second grace. Clients that never report progress disclose
+/// the separate first_publish_no_analysis_progress rule.
 /// Other producers retain the settlement contract: an authoritative report or a
 /// non-warming successful client certifies the warm working set, not unopened
 /// files. This applies to TypeScript, Biome, oxlint, YAML and bash.
@@ -331,7 +333,7 @@ pub(crate) fn run_diagnostics_category(
                 key.root.clone(),
                 authority.to_string(),
             ));
-            collection.producer_notes.insert(format!("{} @ {}: diagnostics authority={authority} (servers without analysis progress use first-publish authority after a 2s grace)", server_id(key), display_root(snapshot, &key.root)));
+            collection.producer_notes.insert(format!("{} @ {}: diagnostics authority={authority} (post-input publications can settle after a 2s no-run grace; announced or begun runs require END after publication)", server_id(key), display_root(snapshot, &key.root)));
         }
     }
     // A producer whose `cargo check` was still running is not indexing. Its
@@ -484,6 +486,16 @@ pub(crate) fn run_diagnostics_category(
             .iter()
             .map(|gap| gap.file.clone())
             .collect::<HashSet<_>>();
+        // Warm storage can retain a prior certificate for feedback, but a fresh
+        // scoped reply must not label a cached, unanswered file as complete.
+        for row in &mut collection.diagnostics {
+            row.provisional |= uncovered.contains(&row.diagnostic.file);
+        }
+        for (_, _, rows) in &mut collection.producer_reports {
+            for row in rows {
+                row.provisional |= uncovered.contains(&row.diagnostic.file);
+            }
+        }
         let saved_file_count = collection.saved_files.len();
         let saved_files = collection.saved_files.clone();
         let mut payload = collection.into_payload(snapshot);
@@ -1042,13 +1054,14 @@ impl DiagnosticsCollection {
             }
             // Rust pushes in pull mode carry only compiler results, and
             // TypeScript pushes can carry only syntax results. Neither answers
-            // a failed explicit request; unfinished Python analysis is also
-            // a per-file obligation that a provisional push cannot discharge.
+            // a failed explicit request. Python likewise cannot substitute a
+            // cached pre-open certificate for an unanswered new open.
             if let Some((key, reason)) = sweep
                 .and_then(|sweep| sweep.unanswered.get(file))
                 .filter(|(key, reason)| {
                     matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript)
                         || reason.starts_with("analysis_progress_pending:")
+                        || ctx.lsp().analysis_progress_authority(key).is_some()
                 })
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {

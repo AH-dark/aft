@@ -403,7 +403,9 @@ pub(crate) fn sweep_scoped_files(
         let now = Instant::now();
         if now >= deadline || cancellation_requested() {
             for (file, key, _) in waiting {
-                let reason = if !ctx.lsp().analysis_progress_certifies_file(&key, &file) {
+                let reason = if ctx.lsp().diagnostic_epoch(&key, &file).is_none() {
+                    NO_PUBLISH_REASON
+                } else if !ctx.lsp().analysis_progress_certifies_file(&key, &file) {
                     "analysis_progress_pending: the server has not completed analysis after didOpen; retry aft_inspect"
                 } else {
                     NO_PUBLISH_REASON

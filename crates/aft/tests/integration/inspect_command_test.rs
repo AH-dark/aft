@@ -4777,6 +4777,13 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
 }
 
 fn python_progress_fixture(mode: Option<&str>) -> (tempfile::TempDir, AppContext) {
+    python_progress_fixture_with_timeout(mode, 3000)
+}
+
+fn python_progress_fixture_with_timeout(
+    mode: Option<&str>,
+    timeout_ms: u64,
+) -> (tempfile::TempDir, AppContext) {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     std::fs::write(
@@ -4785,7 +4792,7 @@ fn python_progress_fixture(mode: Option<&str>) -> (tempfile::TempDir, AppContext
     )
     .unwrap();
     std::fs::write(root.join("broken.py"), "value: int = 'wrong'\n").unwrap();
-    let ctx = configured_context_with_diagnostics_timeout(&root, 3000);
+    let ctx = configured_context_with_diagnostics_timeout(&root, timeout_ms);
     ctx.lsp()
         .override_binary(ServerKind::Python, fake_server_path());
     if let Some(mode) = mode {
@@ -4871,6 +4878,329 @@ fn scoped_python_progress_existing_run_certifies_later_opened_files() {
         "{response:#}"
     );
     assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
+#[test]
+fn scoped_python_progress_announced_run_cannot_use_no_run_grace() {
+    // Inspect reserves five seconds and gives each phase half the work budget;
+    // leave this injected >2s announcement delay room to finish its real run.
+    let (_dir, ctx) = python_progress_fixture_with_timeout(Some("announce_delay"), 30_000);
+    let response = scoped_diagnostics_inspect(&ctx, "python-announced-run", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
+fn python_short_run_fixture() -> (tempfile::TempDir, AppContext) {
+    let (dir, ctx) = python_progress_fixture(Some("short_runs"));
+    let first = scoped_diagnostics_inspect(&ctx, "python-short-warmup", "broken.py");
+    assert_eq!(first["summary"]["diagnostics"]["errors"], 1, "{first:#}");
+    (dir, ctx)
+}
+
+fn assert_short_run_complete(ctx: &AppContext, file: &str) {
+    let response = scoped_diagnostics_inspect(ctx, "python-short-open", file);
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["python"]["authority"][0]["rule"],
+        "post_input_publish_no_analysis_run",
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_python_progress_excluded_file_without_new_run_settles() {
+    let (dir, ctx) = python_short_run_fixture();
+    std::fs::write(
+        dir.path().join("pyrightconfig.json"),
+        r#"{"exclude":["excluded.py"]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("excluded.py"), "value: int = 'wrong'\n").unwrap();
+    assert_short_run_complete(&ctx, "excluded.py");
+}
+
+#[test]
+fn scoped_python_progress_nonsource_file_without_new_run_settles() {
+    let (dir, ctx) = python_short_run_fixture();
+    ctx.update_config(|config| {
+        config.lsp_servers.push(aft::config::UserServerDef {
+            id: "python".into(),
+            extensions: vec!["py".into(), "txt".into()],
+            binary: String::new(),
+            args: Vec::new(),
+            root_markers: vec!["pyproject.toml".into()],
+            env: Default::default(),
+            initialization_options: None,
+            disabled: false,
+        })
+    });
+    std::fs::write(dir.path().join("notes.txt"), "plain text\n").unwrap();
+    assert_short_run_complete(&ctx, "notes.txt");
+}
+
+#[test]
+fn scoped_python_progress_unchanged_reopen_without_new_run_settles() {
+    let (_dir, ctx) = python_short_run_fixture();
+    assert_short_run_complete(&ctx, "broken.py");
+}
+
+#[test]
+fn scoped_python_progress_second_file_after_idle_without_new_run_settles() {
+    let (dir, ctx) = python_progress_fixture(Some("short_runs"));
+    std::fs::write(dir.path().join("second.py"), "value: int = 'wrong'\n").unwrap();
+    let first = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
+    let config = ctx.config();
+    ctx.lsp().ensure_file_open(&first, &config).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ended = false;
+    loop {
+        let drained = ctx.lsp().drain_events();
+        ended |= drained.events.iter().any(|event| matches!(event, LspEvent::Notification { method, params: Some(params), .. } if method == "$/progress" && params["value"]["kind"] == "end"));
+        if ended && ctx.lsp().has_authoritative_report_for_file(&first) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first analysis never completed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ctx.lsp().document_is_open_for_test(&first),
+        "the first file remains open while the second is opened"
+    );
+    assert_short_run_complete(&ctx, "second.py");
+}
+
+#[test]
+fn scoped_python_progress_silent_open_cannot_reuse_cached_report_or_poison_server() {
+    let (dir, ctx) = python_progress_fixture(Some("short_no_publish"));
+    let first = scoped_diagnostics_inspect(&ctx, "python-silent-warmup", "broken.py");
+    assert_eq!(first["summary"]["diagnostics"]["errors"], 1, "{first:#}");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(
+        !ctx.lsp()
+            .get_diagnostics_for_file(&root.join("broken.py"))
+            .is_empty(),
+        "the pre-open cache must actually exist"
+    );
+    let response = scoped_diagnostics_inspect(&ctx, "python-silent-open", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "the cached pre-open report is not a reply: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
+        "{response:#}"
+    );
+    let key = ServerKey {
+        kind: ServerKind::Python,
+        root,
+    };
+    assert!(
+        !ctx.lsp().server_is_warming(&key),
+        "absence of a publication is a file gap, not a permanent producer run"
+    );
+    assert!(
+        ctx.lsp().producer_has_settled(&key),
+        "the unanswered file must not leave a fictitious producer run"
+    );
+}
+
+fn accept_progress_alerts(
+    root: &Path,
+    state: &mut aft::alert_state::AlertDeltaState,
+    renderer: &mut aft::response_finalize::alert_render::AlertEngine,
+    snapshots: Vec<aft::alert_state::AcceptedDiagnosticSnapshot>,
+) -> Vec<aft::alert_state::AcceptedObservationResult> {
+    use aft::alert_state::AcceptedObservationBatch;
+    use aft::response_finalize::alert_render::{AlertDiagnostic, AlertObservation};
+    let batch =
+        AcceptedObservationBatch::from_diagnostic_snapshots("progress-alerts", root, snapshots)
+            .unwrap();
+    let results = state.accept_batch(&batch).unwrap();
+    renderer.observe_authoritative_batch(
+        "progress-alerts",
+        root,
+        batch.observations().iter().map(|observation| {
+            AlertObservation::new(
+                observation.producer_key.as_str(),
+                observation
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == aft::lsp::diagnostics::DiagnosticSeverity::Error)
+                    .map(|d| {
+                        AlertDiagnostic::error(
+                            d.file.strip_prefix(root).unwrap().to_string_lossy(),
+                            d.line,
+                            d.message.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        }),
+    );
+    results
+}
+
+#[test]
+fn scoped_python_progress_reanalysis_keeps_warm_counts_and_alert_episode() {
+    use aft::alert_state::{
+        AcceptedDiagnosticSnapshot, AlertDeltaState, AlertPartitionKey, DiagnosticIdentity,
+        ProducerKey,
+    };
+    use aft::response_finalize::alert_render::AlertEngine;
+    let (dir, ctx) = python_progress_fixture(Some("held_runs"));
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let file = root.join("broken.py");
+    let release = root.join("analysis-release");
+    let before_publish = root.join("before-publish-release");
+    std::fs::write(&release, "ready").unwrap();
+    std::fs::write(&before_publish, "ready").unwrap();
+    ctx.lsp().set_extra_env(
+        "AFT_FAKE_LSP_ANALYSIS_RELEASE_FILE",
+        release.to_str().unwrap(),
+    );
+    ctx.lsp().set_extra_env(
+        "AFT_FAKE_LSP_BEFORE_ANALYSIS_PUBLISH",
+        before_publish.to_str().unwrap(),
+    );
+    let first = scoped_diagnostics_inspect(&ctx, "progress-alert-warmup", "broken.py");
+    assert_eq!(first["summary"]["diagnostics"]["errors"], 1, "{first:#}");
+    let key = ServerKey {
+        kind: ServerKind::Python,
+        root: root.clone(),
+    };
+    let diagnostics = ctx
+        .lsp()
+        .get_diagnostics_for_file(&file)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let identity = DiagnosticIdentity::from_stored(
+        &root,
+        diagnostics
+            .iter()
+            .find(|d| d.severity == aft::lsp::diagnostics::DiagnosticSeverity::Error)
+            .unwrap(),
+    )
+    .unwrap();
+    let partition =
+        AlertPartitionKey::new("progress-alerts", &root, ProducerKey::from_server_key(&key));
+    let mut state = AlertDeltaState::default();
+    let mut renderer = AlertEngine::default();
+    accept_progress_alerts(
+        &root,
+        &mut state,
+        &mut renderer,
+        vec![AcceptedDiagnosticSnapshot::new(key.clone(), 0, Vec::new())],
+    );
+    accept_progress_alerts(
+        &root,
+        &mut state,
+        &mut renderer,
+        vec![AcceptedDiagnosticSnapshot::new(key.clone(), 0, diagnostics)],
+    );
+    let episode = state
+        .partition(&partition)
+        .unwrap()
+        .episode_for(&identity)
+        .unwrap();
+    assert!(renderer
+        .finalize("progress-alerts", &root, "read")
+        .is_some());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (Some(1), Some(1)));
+
+    std::fs::remove_file(&release).unwrap();
+    std::fs::remove_file(&before_publish).unwrap();
+    ctx.lsp()
+        .diagnostics_store_mut_for_test()
+        .mark_stale_for_file(&file);
+    let config = ctx.config();
+    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let drained = ctx.lsp().drain_events();
+        assert!(drained.accepted_snapshots.is_empty());
+        if drained.events.iter().any(|event| matches!(event, LspEvent::Notification { method, .. } if method == "custom/beforeAnalysisPublish")) { break; }
+        assert!(
+            Instant::now() < deadline,
+            "fake never reached the pre-publication hold"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let counts = ctx.status_bar_count_values();
+    assert_eq!(
+        (counts.errors, counts.warnings),
+        (Some(1), Some(1)),
+        "a pending producer cannot turn stale/missing storage into a clean zero"
+    );
+    std::fs::write(&before_publish, "ready").unwrap();
+    loop {
+        let drained = ctx.lsp().drain_events();
+        assert!(
+            drained.accepted_snapshots.is_empty(),
+            "an uncertified empty report must not clear alerts"
+        );
+        accept_progress_alerts(&root, &mut state, &mut renderer, drained.accepted_snapshots);
+        if drained.events.iter().any(|event| matches!(event, LspEvent::Notification { method, params: Some(params), .. } if method == "$/progress" && params["value"]["kind"] == "begin")) { break; }
+        assert!(Instant::now() < deadline, "fake analysis never began");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let counts = ctx.status_bar_count_values();
+    assert_eq!(
+        (counts.errors, counts.warnings),
+        (Some(1), Some(1)),
+        "a reanalysis must retain the last certified warm pair"
+    );
+    assert_eq!(
+        state.partition(&partition).unwrap().episode_for(&identity),
+        Some(episode)
+    );
+    assert!(renderer
+        .finalize("progress-alerts", &root, "read")
+        .is_none());
+
+    std::fs::write(&release, "ready").unwrap();
+    let mut accepted = Vec::new();
+    loop {
+        let drained = ctx.lsp().drain_events();
+        accepted.extend(drained.accepted_snapshots);
+        if !ctx.lsp().server_is_warming(&key) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fake analysis never ended");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        accepted.len(),
+        1,
+        "the completed replacement must reach observation ingestion exactly once"
+    );
+    let results = accept_progress_alerts(&root, &mut state, &mut renderer, accepted);
+    assert!(results
+        .iter()
+        .all(|r| r.entered.is_empty() && r.closed.is_empty()));
+    assert_eq!(
+        state.partition(&partition).unwrap().episode_for(&identity),
+        Some(episode)
+    );
+    assert!(
+        renderer
+            .finalize("progress-alerts", &root, "read")
+            .is_none(),
+        "unchanged errors must not re-appear as new reminders"
+    );
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (Some(1), Some(1)));
 }
 
 /// Drain events until the fake reports the `didClose` and then sends the

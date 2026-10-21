@@ -591,6 +591,7 @@ pub(crate) fn main() -> io::Result<()> {
     let mut check_completed = false;
     // Open documents with their latest version and the diagnostics the fake
     // last published for them from its own analysis, for the emulated check.
+    let mut analysis_opens = 0usize;
     let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
         std::collections::BTreeMap::new();
     // Files the last emulated check found a compiler error in. Like
@@ -1411,11 +1412,24 @@ pub(crate) fn main() -> io::Result<()> {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
                     if let Ok(mode) = std::env::var("AFT_FAKE_LSP_ANALYSIS_PROGRESS") {
+                        analysis_opens += 1;
+                        if let Some(release) = std::env::var_os("AFT_FAKE_LSP_BEFORE_ANALYSIS_PUBLISH") {
+                            write_custom_notification(&mut writer, "custom/beforeAnalysisPublish", uri.clone(), version.clone())?;
+                            while !std::path::Path::new(&release).exists() { std::thread::sleep(std::time::Duration::from_millis(10)); }
+                        }
+                        if mode == "short_no_publish" && analysis_opens > 1 { continue; }
+                        if mode == "short_runs" && analysis_opens > 1 {
+                            write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
+                            continue;
+                        }
                         // Model an empty startup report arriving before the
                         // server's background analysis has even started.
-                        write_publish_diagnostics_versioned(&mut writer, uri.clone(), json!([]), version.clone())?;
+                        if mode != "end_before_publication" {
+                            write_publish_diagnostics_versioned(&mut writer, uri.clone(), json!([]), version.clone())?;
+                        }
                         if mode != "already_running" {
                             write_request(&mut writer, 20_000, "window/workDoneProgress/create", json!({"token": 17}))?;
+                            if mode == "announce_delay" { std::thread::sleep(std::time::Duration::from_millis(2500)); }
                             write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "begin", "title": "Analysis"}}))))?;
                         }
                         if mode == "end_before_publication" {
@@ -1433,6 +1447,11 @@ pub(crate) fn main() -> io::Result<()> {
                             continue;
                         }
                         if mode != "never" {
+                            if let Some(release) = std::env::var_os("AFT_FAKE_LSP_ANALYSIS_RELEASE_FILE") {
+                                while !std::path::Path::new(&release).exists() {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                            }
                             std::thread::sleep(std::time::Duration::from_millis(600));
                             write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
                             write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
