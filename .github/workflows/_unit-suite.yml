@@ -393,6 +393,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build real AFT for the worker-read jail gate
         run: cargo build -p agent-file-tools --bin aft
+      - name: Run worker broker host policy and rendered socket rule regressions
+        run: |
+          cargo test -p agent-file-tools --lib -- gh_shim --test-threads=1
+          binary_listing="$(cargo test -p agent-file-tools --bin aft -- --list)"
+          [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
+          cargo test -p agent-file-tools --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
       - name: Require worker-read test inventory and run the native gate
         shell: bash
         run: |
@@ -424,7 +430,11 @@ jobs:
           cargo test -p agent-file-tools --test worker_jail -- worker_jail_temp_denies_other_task_directory --exact --test-threads=1 --nocapture
           probe_listing="$(cargo test -p agent-file-tools --test sandbox_launch_probe -- --list)"
           [[ "$probe_listing" == *"launcher_closes_late_inherited_listener_above_marker_slots: test"* ]]
+          [[ "$probe_listing" == *"launcher_fd_probe_required_mode_cannot_silently_skip: test"* ]]
+          [[ "$probe_listing" == *"launcher_failure_marker_cannot_be_forged_by_jailed_exec: test"* ]]
           cargo test -p agent-file-tools --test sandbox_launch_probe -- launcher_closes_late_inherited_listener_above_marker_slots --exact --test-threads=1 --nocapture
+          cargo test -p agent-file-tools --test sandbox_launch_probe -- launcher_fd_probe_required_mode_cannot_silently_skip --exact --test-threads=1 --nocapture
+          cargo test -p agent-file-tools --test sandbox_launch_probe -- launcher_failure_marker_cannot_be_forged_by_jailed_exec --exact --test-threads=1 --nocapture
 
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
