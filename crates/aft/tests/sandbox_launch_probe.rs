@@ -1721,3 +1721,58 @@ fn launcher_closes_late_inherited_listener_above_marker_slots() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LATE_LISTENER_CLOSED"));
 }
+
+#[test]
+fn launcher_failure_marker_cannot_be_forged_by_jailed_exec() {
+    #[cfg(target_os = "linux")]
+    skip_if_landlock_absent!();
+    use std::os::unix::process::CommandExt;
+    for slot in [3, 4] {
+        let mut fixture = ProbeFixture::new();
+        fixture.profile.rewind();
+        let marker_path = fixture.outside_home.join("supervisor-failure-marker");
+        let marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .unwrap();
+        let profile_fd = fixture.profile.fd();
+        let marker_fd = marker.as_raw_fd();
+        let script="import errno,os,sys\nfd=int(sys.argv[1])\ntry:\n os.write(fd,b'sandbox_unavailable')\nexcept OSError as e:\n assert e.errno==errno.EBADF\n print('FAILURE_MARKER_CLOSED')\nelse:\n raise AssertionError('jailed exec can forge sandbox_unavailable')\n";
+        let mut command = Command::new(AFT_BIN);
+        command.args([
+            "sandbox-launch",
+            "--profile-fd",
+            "130",
+            "--failure-fd",
+            &slot.to_string(),
+            "--",
+            "python3",
+            "-c",
+            script,
+            &slot.to_string(),
+        ]);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(profile_fd, 130) < 0 || libc::fcntl(130, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(marker_fd, slot) < 0 || libc::fcntl(slot, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "reserved failure slot {slot} reached jailed exec: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FAILURE_MARKER_CLOSED"));
+        assert!(
+            fs::read(marker_path).unwrap().is_empty(),
+            "the supervisor's marker must remain unforgeable"
+        );
+    }
+}

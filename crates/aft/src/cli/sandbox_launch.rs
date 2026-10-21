@@ -124,6 +124,9 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             }
             return Err(error);
         }
+        if let Some(fd) = args.failure_fd {
+            seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
+        }
         exec_target(&args.command)
     }
 }
@@ -323,6 +326,29 @@ fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
     // ManuallyDrop leaves it open so this write does not close it.
     let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
     file.write_all(b"sandbox_unavailable")
+}
+
+#[cfg(unix)]
+fn seal_failure_fd(fd: RawFd) -> Result<(), String> {
+    // Keep the channel available for launcher failures, but never delegate it
+    // to the successfully jailed executable, even in reserved marker slots.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            return Ok(());
+        }
+        return Err(format!(
+            "cannot inspect failure descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "cannot seal failure descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
