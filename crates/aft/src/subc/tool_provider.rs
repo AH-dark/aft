@@ -616,7 +616,8 @@ struct ToolReference {
     served: Option<String>,
 }
 
-/// Whether `at` begins a word in `text`.
+/// Whether `at` is at the start of `text` or follows a character other than
+/// an ASCII letter, digit or underscore.
 fn starts_word(text: &str, at: usize) -> bool {
     text[..at]
         .chars()
