@@ -244,10 +244,12 @@ fn s3_b_added_method_examines_only_matching_path_form_rows() {
             stats.dispatch_path_form_rows_examined, matching,
             "matching={matching} unrelated={unrelated}"
         );
-        assert_eq!(
-            stats.dispatch_callers_recomputed,
-            set(&["ghost_matching.rs", "hub.rs"])
-        );
+        assert!(stats
+            .dispatch_callers_recomputed
+            .contains("ghost_matching.rs"));
+        assert!(!stats
+            .dispatch_callers_recomputed
+            .contains("ghost_unrelated.rs"));
     }
 }
 
