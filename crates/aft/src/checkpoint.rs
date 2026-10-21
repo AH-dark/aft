@@ -888,8 +888,13 @@ impl CheckpointStore {
                 continue;
             };
             if self.durable_checkpoint_dir(session, &name).is_some() {
+                let file_count_before = checkpoint.file_contents.len();
+                let had_pending_purge = !checkpoint.pending_purge.is_empty();
                 let (paths, failures) =
                     self.purge_durable_checkpoint_locked(session, &mut checkpoint, matches);
+                let removed_checkpoint_entry = checkpoint.file_contents.len() < file_count_before;
+                let finished_pending_purge =
+                    had_pending_purge && checkpoint.pending_purge.is_empty();
                 if !paths.is_empty() {
                     report.pruned.push((name.clone(), paths.len()));
                     report.paths.extend(paths);
@@ -897,7 +902,10 @@ impl CheckpointStore {
                 report
                     .failures
                     .extend(failures.into_iter().map(|error| (name.clone(), error)));
-                if checkpoint.file_contents.is_empty() && checkpoint.pending_purge.is_empty() {
+                if checkpoint.file_contents.is_empty()
+                    && checkpoint.pending_purge.is_empty()
+                    && (removed_checkpoint_entry || finished_pending_purge)
+                {
                     match self.remove_checkpoint_from_disk_locked(session, &name) {
                         Ok(()) => {
                             report.pruned.retain(|(pruned, _)| pruned != &name);
@@ -4149,6 +4157,58 @@ mod tests {
             .unwrap();
         assert!(retry.failures.is_empty(), "{retry:?}");
         assert_eq!(retry.paths, vec![secret]);
+    }
+
+    #[test]
+    fn purge_paths_keeps_empty_checkpoint_when_no_path_matches() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let unrelated = project.path().join("unrelated.txt");
+        let mut store = fresh_checkpoint_store(storage.path());
+        store.create_for_files("s1", "empty", Vec::new()).unwrap();
+
+        let report = store
+            .purge_paths("s1", &|path: &Path| path == unrelated.as_path())
+            .unwrap();
+
+        assert!(report.paths.is_empty(), "{report:?}");
+        assert!(report.pruned.is_empty(), "{report:?}");
+        assert!(report.dropped.is_empty(), "{report:?}");
+        assert!(report.failures.is_empty(), "{report:?}");
+        let mut reloaded = fresh_checkpoint_store(storage.path());
+        let checkpoints = reloaded.list("s1").unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].name, "empty");
+        assert_eq!(checkpoints[0].file_count, 0);
+    }
+
+    #[test]
+    fn purge_paths_drops_checkpoint_when_pending_purge_finishes() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        fs::write(&secret, "secret").unwrap();
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "only-secret", vec![secret.clone()])
+            .unwrap();
+
+        // The first metadata save records deletion intent; fail its cleanup
+        // save so the next purge must finish the pending deletion.
+        CHECKPOINT_FAIL_METADATA_WRITE_AFTER.with(|fail| fail.set(Some(1)));
+        let first = store
+            .purge_paths("s1", &|path: &Path| path == secret.as_path())
+            .unwrap();
+        assert!(!first.failures.is_empty(), "{first:?}");
+        assert!(first.dropped.is_empty(), "{first:?}");
+
+        let finished = store
+            .purge_paths("s1", &|path: &Path| path == secret.as_path())
+            .unwrap();
+        assert!(finished.failures.is_empty(), "{finished:?}");
+        assert!(finished.paths.is_empty(), "{finished:?}");
+        assert_eq!(finished.dropped, vec!["only-secret"]);
+        assert!(store.list("s1").unwrap().is_empty());
     }
 
     #[test]
