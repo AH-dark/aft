@@ -56,10 +56,16 @@ def require_counters(counters):
     return counters
 
 
-def require_base_ref_prototype(counters):
-    if (os.environ.get("AFT_VIEWS_BASE_REF_PROTOTYPE") == "1"
-            and counters.get("base_ref_prototype") is not True):
+def require_base_ref_prototype(counters, *, views=True, semantic=True):
+    # Each arm starts a fresh daemon; the opt-in selects the base-ref prototype
+    # only when both views and semantic search are enabled.
+    expected = (os.environ.get("AFT_VIEWS_BASE_REF_PROTOTYPE") == "1"
+                and views and semantic)
+    active = counters.get("base_ref_prototype") is True
+    if expected and not active:
         raise MeasurementError("prototype-on acquisition did not report metrics.views_work.base_ref_prototype: true")
+    if not expected and active:
+        raise MeasurementError("inactive arm unexpectedly reported metrics.views_work.base_ref_prototype: true")
 
 
 def counter_delta(before, after):
@@ -649,7 +655,8 @@ def run_arm(args, corpus, count, views, out):
         # Include delayed checkpoint/writeback work in a separate, explicit tail.
         acquisition.idle(max(2, args.quiet_minutes * 60), "quiet")
         final = acquisition.sample("final")
-        require_base_ref_prototype(final["health"]["metrics"]["views_work"])
+        require_base_ref_prototype(final["health"]["metrics"]["views_work"],
+                                   views=views, semantic=args.semantic)
         result["final"] = final
         result["storage"] = storage_sample(subject / "storage")
         result["counter_delta"] = counter_delta(initial["health"]["metrics"]["views_work"], final["health"]["metrics"]["views_work"])
