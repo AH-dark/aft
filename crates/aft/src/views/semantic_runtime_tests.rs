@@ -1659,6 +1659,10 @@ fn unreconciled_reuse_only_edit_completes_with_cold_cap_held() {
     };
     // Decide by what the fill does, not by how long it takes: it either
     // finishes, or it queues on the held cold-build cap, which is the defect.
+    // The deadline only guards against a worker that stalls before doing
+    // either. On expiry the lane is cleared and the held permit released
+    // before the test fails; the worker stops at its next currency check.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let completed = loop {
         match rx.recv_timeout(Duration::from_millis(5)) {
             Ok(result) => break Some(result),
@@ -1668,6 +1672,14 @@ fn unreconciled_reuse_only_edit_completes_with_cold_cap_held() {
         if !cold.census().queued.is_empty() {
             slot.clear();
             break None;
+        }
+        if Instant::now() >= deadline {
+            slot.clear();
+            drop(held);
+            panic!(
+                "hang guard: the fill neither finished nor queued on the held \
+                 cold-build cap within 60 s"
+            );
         }
     };
     drop(held);
