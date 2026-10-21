@@ -62,6 +62,35 @@ type RestoreBeforeLockHook = Box<dyn FnMut(usize) -> bool + Send>;
 static RESTORE_BEFORE_LOCK_HOOKS: LazyLock<Mutex<HashMap<String, RestoreBeforeLockHook>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+type MigrationAfterRepairHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static MIGRATION_AFTER_REPAIR_HOOKS: LazyLock<Mutex<HashMap<PathBuf, MigrationAfterRepairHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn set_migration_after_repair_hook_for_tests(
+    storage_dir: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    MIGRATION_AFTER_REPAIR_HOOKS
+        .lock()
+        .unwrap()
+        .insert(storage_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_migration_after_repair_hook_for_tests(storage_dir: &Path) {
+    let hook = MIGRATION_AFTER_REPAIR_HOOKS
+        .lock()
+        .unwrap()
+        .remove(storage_dir);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 static BACKUP_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static BACKUP_MIGRATION_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
@@ -1029,8 +1058,16 @@ impl BackupStore {
             self.gc_stale_sessions(self.maintenance_ttl_hours);
         }
 
+        if repair.moved > 0 {
+            // Root repair can expose flat history that still needs migration. Clear
+            // the migration-complete marker before migration's nonblocking lock attempt,
+            // so a later maintenance pass can retry after a busy deferral.
+            BACKUP_MIGRATION_KEYS.lock().unwrap().remove(&key);
+        }
         let first_migration = !BACKUP_MIGRATION_KEYS.lock().unwrap().contains(&key);
         if first_migration || repair.moved > 0 {
+            #[cfg(test)]
+            run_migration_after_repair_hook_for_tests(&key.0);
             self.migrate_legacy_layout_if_needed();
         }
         if first_maintenance {
@@ -7807,6 +7844,83 @@ mod tests {
             0,
             "completed legacy migration must not rescan the harness backups directory"
         );
+    }
+
+    #[test]
+    fn root_repair_deferred_migration_retries_after_namespace_unlock() {
+        let storage = tempfile::tempdir().unwrap();
+        let harness_backups = storage.path().join("opencode/backups");
+        let first_key = storage.path().join("first-legacy.txt");
+        let first_legacy_dir = harness_backups.join(BackupStore::path_hash(&first_key));
+        fs::create_dir_all(&first_legacy_dir).unwrap();
+        fs::write(first_legacy_dir.join("0.bak"), "first original").unwrap();
+        fs::write(
+            first_legacy_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": first_key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        store.run_process_maintenance_once();
+        let default_session_dir =
+            harness_backups.join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        assert!(default_session_dir
+            .join(BackupStore::path_hash(&first_key))
+            .join("meta.json")
+            .exists());
+
+        let repaired_key = storage.path().join("repaired-legacy.txt");
+        let root_entry = storage
+            .path()
+            .join("backups")
+            .join(BackupStore::path_hash(&repaired_key));
+        fs::create_dir_all(&root_entry).unwrap();
+        fs::write(root_entry.join("0.bak"), "repaired original").unwrap();
+        fs::write(
+            root_entry.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": repaired_key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let held_namespace_lock = Arc::new(Mutex::new(None));
+        let lock_slot = Arc::clone(&held_namespace_lock);
+        let storage_path = storage.path().to_path_buf();
+        set_migration_after_repair_hook_for_tests(storage.path(), move || {
+            let lock = backup_namespace_gate(&storage_path, false)
+                .unwrap()
+                .expect("repair releases its namespace lock before migration");
+            *lock_slot.lock().unwrap() = Some(lock);
+        });
+        store.run_process_maintenance_once();
+
+        let repaired_harness_entry = harness_backups.join(BackupStore::path_hash(&repaired_key));
+        let repaired_session_entry =
+            default_session_dir.join(BackupStore::path_hash(&repaired_key));
+        assert!(repaired_harness_entry.join("meta.json").exists());
+        assert!(
+            !repaired_session_entry.exists(),
+            "migration must defer while another backup operation holds the namespace"
+        );
+
+        drop(held_namespace_lock.lock().unwrap().take());
+        store.run_process_maintenance_once();
+
+        assert!(repaired_session_entry.join("meta.json").exists());
+        assert_eq!(store.history(DEFAULT_SESSION_ID, &repaired_key).len(), 1);
+        assert!(!repaired_harness_entry.exists());
     }
 
     #[test]
