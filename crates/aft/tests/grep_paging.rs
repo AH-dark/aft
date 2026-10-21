@@ -662,3 +662,109 @@ fn grep_small_result_prints_whole() {
     assert!(!text.contains("shown "), "text:\n{text}");
     assert!(!text.contains("Lines per file"), "text:\n{text}");
 }
+
+/// Every counted-only row's `path` or `include` value: a pattern after
+/// `include `, else the paths a row names.
+fn counted_hints(text: &str) -> Vec<String> {
+    let Some(block) = text.split("Counted only, not shown:").nth(1) else {
+        return Vec::new();
+    };
+    let mut hints = Vec::new();
+    for row in block.lines().skip(1) {
+        if row.is_empty() {
+            break;
+        }
+        if let Some((_, include)) = row.split_once("; include ") {
+            hints.push(format!("include:{include}"));
+        } else if let Some((_, paths)) = row.split_once("; paths ") {
+            hints.extend(paths.split(", ").map(|path| format!("path:{path}")));
+        } else if !row.starts_with('+') {
+            let label = row.split(": ").next().unwrap_or_default();
+            hints.push(format!("label:{label}"));
+        } else {
+            hints.push(format!("bare:{row}"));
+        }
+    }
+    hints
+}
+
+#[test]
+fn grep_folded_counted_rows_name_every_file() {
+    // Nine generated files (decided by their folder, so no include pattern
+    // names them): more than the counted-only block lists one by one.
+    let project = tempfile::tempdir().expect("tempdir");
+    for index in 0..9 {
+        write_file(
+            project.path(),
+            &format!("pkg{index}/generated/api_{index}.ts"),
+            "needle one\nneedle two\n",
+        );
+    }
+    write_file(project.path(), "src/main.ts", "needle main\n");
+    let ctx = grep_ctx(project.path());
+
+    let (_, text) = run_grep(&ctx, serde_json::json!({"pattern": "needle"}));
+    assert!(
+        text.contains("Counted only, not shown: 18 lines in 9 files."),
+        "text:\n{text}"
+    );
+    for index in 0..9 {
+        assert!(
+            text.contains(&format!("pkg{index}/generated/api_{index}.ts")),
+            "generated file {index} has no path to show it:\n{text}"
+        );
+    }
+    assert!(
+        counted_hints(&text)
+            .iter()
+            .all(|hint| !hint.starts_with("bare:")),
+        "a folded row has no path or include:\n{text}"
+    );
+}
+
+#[test]
+fn grep_folded_counted_include_selects_the_folded_files() {
+    // Nine rotated logs in separate folders: the folded row's include must
+    // select them (`**/*.log` does not match `app.log.1`).
+    let project = tempfile::tempdir().expect("tempdir");
+    for index in 0..9 {
+        write_file(
+            project.path(),
+            &format!("logs/r{index}/app{index}.log.1"),
+            "needle a\nneedle b\n",
+        );
+    }
+    write_file(project.path(), "src/main.ts", "needle main\n");
+    let ctx = grep_ctx(project.path());
+
+    let (_, text) = run_grep(&ctx, serde_json::json!({"pattern": "needle"}));
+    let mut reached = std::collections::BTreeSet::new();
+    for hint in counted_hints(&text) {
+        if let Some(label) = hint
+            .strip_prefix("label:")
+            .or_else(|| hint.strip_prefix("path:"))
+        {
+            reached.insert(label.to_string());
+        } else if let Some(include) = hint.strip_prefix("include:") {
+            let (_, shown) = run_grep(
+                &ctx,
+                serde_json::json!({"pattern": "needle", "include": include}),
+            );
+            let files: std::collections::BTreeSet<String> = printed_rows(&shown)
+                .into_iter()
+                .map(|(file, _)| file)
+                .collect();
+            assert!(
+                !files.is_empty(),
+                "include {include} selects nothing:\n{shown}"
+            );
+            reached.extend(files);
+        } else {
+            panic!("folded row without a way to show it: {hint}\n{text}");
+        }
+    }
+    for index in 0..9 {
+        let log = format!("logs/r{index}/app{index}.log.1");
+        assert!(reached.contains(&log), "{log} is not reachable:\n{text}");
+    }
+}

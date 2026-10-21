@@ -836,7 +836,7 @@ pub(crate) fn grep_page_output<'a>(
             let mut block = format!(
                 "Counted only, not shown: {lines} in {in_files}. To show them, pass a file below as path, or a pattern below as include."
             );
-            for row in counted_entries(&counted, &files) {
+            for row in counted_entries(&counted, &files, request.project_root) {
                 block.push('\n');
                 block.push_str(&row);
             }
@@ -1060,7 +1060,8 @@ struct CountedEntry {
     label: String,
     content: ContentKind,
     lines: usize,
-    files: usize,
+    /// The counted files this entry stands for.
+    members: Vec<usize>,
     marker: Option<&'static str>,
 }
 
@@ -1078,7 +1079,11 @@ fn counted_kind_rank(content: ContentKind) -> u8 {
 /// Rows of the counted-only block. Every row names a `path` or an
 /// `include` value that prints its files; a pattern is used only when it
 /// is checked to name every file it stands for.
-fn counted_entries(counted: &[usize], files: &[MatchingFile<'_>]) -> Vec<String> {
+fn counted_entries(
+    counted: &[usize],
+    files: &[MatchingFile<'_>],
+    project_root: &Path,
+) -> Vec<String> {
     let mut entries = Vec::new();
     let mut singles: Vec<usize> = Vec::new();
 
@@ -1093,7 +1098,7 @@ fn counted_entries(counted: &[usize], files: &[MatchingFile<'_>]) -> Vec<String>
     }
     for ((content, name), members) in by_name {
         let label = format!("**/{name}");
-        if members.len() > 1 && pattern_names_all(&label, &members, files) {
+        if members.len() > 1 && pattern_names_all(&label, &members, files, project_root) {
             entries.push(entry_for(label, content, &members, files));
         } else {
             singles.extend(members);
@@ -1127,7 +1132,7 @@ fn counted_entries(counted: &[usize], files: &[MatchingFile<'_>]) -> Vec<String>
             } else {
                 format!("{folder}/*{suffix}")
             };
-            if pattern_names_all(&label, &members, files) {
+            if pattern_names_all(&label, &members, files, project_root) {
                 entries.push(entry_for(label, content, &members, files));
                 continue;
             }
@@ -1153,20 +1158,23 @@ fn counted_entries(counted: &[usize], files: &[MatchingFile<'_>]) -> Vec<String>
     }
     let (listed, rest) = entries.split_at(COUNTED_ENTRIES_LISTED - 1);
     let mut rows: Vec<String> = listed.iter().map(entry_row).collect();
-    // The rest fold into one row per kind and marker, with the include
-    // pattern that prints exactly those files when one exists.
-    let mut folded: Vec<((ContentKind, Option<&'static str>), usize, usize)> = Vec::new();
+    // The rest fold into one row per kind and marker. A row offers an include
+    // pattern only when the pattern is checked to select every folded file;
+    // otherwise it names the files themselves, so every counted line keeps a
+    // value that shows it.
+    let mut folded: Vec<((ContentKind, Option<&'static str>), usize, Vec<usize>)> = Vec::new();
     for entry in rest {
         let key = (entry.content, entry.marker);
         match folded.iter_mut().find(|(existing, _, _)| *existing == key) {
-            Some((_, lines, count)) => {
+            Some((_, lines, members)) => {
                 *lines += entry.lines;
-                *count += entry.files;
+                members.extend(&entry.members);
             }
-            None => folded.push((key, entry.lines, entry.files)),
+            None => folded.push((key, entry.lines, entry.members.clone())),
         }
     }
-    for ((content, marker), lines, count) in folded {
+    for ((content, marker), lines, members) in folded {
+        let count = members.len();
         let what = if count == 1 && content == ContentKind::Lockfile {
             content.label().to_string()
         } else if count == 1 {
@@ -1174,24 +1182,43 @@ fn counted_entries(counted: &[usize], files: &[MatchingFile<'_>]) -> Vec<String>
         } else {
             content.plural().to_string()
         };
-        let include = marker
-            .map(|marker| {
-                if marker.starts_with('.') {
-                    format!("**/*{marker}")
-                } else if content == ContentKind::Lockfile {
-                    format!("**/{marker}")
-                } else {
-                    format!("**/*{marker}*")
-                }
-            })
-            .map(|pattern| format!("; include {pattern}"))
-            .unwrap_or_default();
+        let include = folded_include_candidates(content, marker)
+            .into_iter()
+            .find(|pattern| pattern_names_all(pattern, &members, files, project_root));
+        let hint = match include {
+            Some(pattern) => format!("include {pattern}"),
+            None => format!(
+                "paths {}",
+                members
+                    .iter()
+                    .map(|&index| files[index].display.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         rows.push(format!(
-            "+{count} more {what}: {}{include}",
+            "+{count} more {what}: {}; {hint}",
             plural(lines, "line")
         ));
     }
     rows
+}
+
+/// Include patterns that could select every file of one kind and marker,
+/// most specific first. Files decided by path shape or content have no
+/// marker, so no pattern names them.
+fn folded_include_candidates(content: ContentKind, marker: Option<&'static str>) -> Vec<String> {
+    let Some(marker) = marker else {
+        return Vec::new();
+    };
+    if marker.starts_with('.') {
+        // `**/*.log*` also selects rotated logs (`app.log.1`).
+        vec![format!("**/*{marker}"), format!("**/*{marker}*")]
+    } else if content == ContentKind::Lockfile {
+        vec![format!("**/{marker}")]
+    } else {
+        vec![format!("**/*{marker}*")]
+    }
 }
 
 fn entry_for(
@@ -1208,7 +1235,7 @@ fn entry_for(
             .iter()
             .map(|&index| files[index].matches.len())
             .sum(),
-        files: members.len(),
+        members: members.to_vec(),
         marker: members
             .iter()
             .all(|&index| files[index].kind.marker == marker)
@@ -1218,8 +1245,8 @@ fn entry_for(
 }
 
 fn entry_row(entry: &CountedEntry) -> String {
-    let in_files = if entry.files > 1 {
-        format!(" in {} files", entry.files)
+    let in_files = if entry.members.len() > 1 {
+        format!(" in {} files", entry.members.len())
     } else {
         String::new()
     };
@@ -1231,12 +1258,25 @@ fn entry_row(entry: &CountedEntry) -> String {
     )
 }
 
-/// Whether passing `pattern` as `include` prints every member's lines.
-fn pattern_names_all(pattern: &str, members: &[usize], files: &[MatchingFile<'_>]) -> bool {
-    let pattern = [pattern.to_string()];
-    members
-        .iter()
-        .all(|&index| include_targets(&pattern, &files[index].kind, &files[index].file_name()))
+/// Whether passing `pattern` as `include` prints every member's lines: the
+/// glob selects each member's path (relative to the project root, as grep
+/// matches `include`), and the pattern names its kind (see
+/// [`include_targets`]). An empty member list is never named.
+fn pattern_names_all(
+    pattern: &str,
+    members: &[usize],
+    files: &[MatchingFile<'_>],
+    project_root: &Path,
+) -> bool {
+    let patterns = [pattern.to_string()];
+    let Ok(filters) = build_path_filters(&patterns, &[]) else {
+        return false;
+    };
+    !members.is_empty()
+        && members.iter().all(|&index| {
+            filters.matches(project_root, files[index].file)
+                && include_targets(&patterns, &files[index].kind, &files[index].file_name())
+        })
 }
 
 /// The longest suffix all names share, starting at a dot (`.json`,
@@ -1647,7 +1687,7 @@ mod tests {
         files[8].kind.content = ContentKind::Capture;
         files[8].kind.marker = Some(".log");
         let indexes: Vec<usize> = (0..files.len()).collect();
-        let rows = counted_entries(&indexes, &files);
+        let rows = counted_entries(&indexes, &files, &root());
         assert_eq!(rows.len(), COUNTED_ENTRIES_LISTED + 1, "{rows:?}");
         assert!(rows[0].ends_with(": 1 line (JSON data)"), "{rows:?}");
         assert_eq!(
