@@ -381,6 +381,7 @@ type BindResult = Result<(), BindRoundError>;
 
 struct PendingBind {
     binding: Binding,
+    started: Instant,
     deadline: Instant,
     result: Mutex<Option<BindResult>>,
 }
@@ -444,6 +445,25 @@ fn bind_timeout(path: &Path, started: Instant) -> io::Error {
     )
 }
 
+fn retain_live_binds(members: &mut Vec<Arc<PendingBind>>, path: &Path) -> Option<Instant> {
+    let now = Instant::now();
+    members.retain(|member| {
+        let mut result = member.result.lock().unwrap();
+        if result.is_some() {
+            return false;
+        }
+        if member.deadline <= now {
+            *result = Some(Err(BindRoundError(Arc::new(bind_timeout(
+                path,
+                member.started,
+            )))));
+            return false;
+        }
+        true
+    });
+    members.iter().map(|member| member.deadline).min()
+}
+
 fn bind_lock_error(
     path: &Path,
     started: Instant,
@@ -499,6 +519,7 @@ pub(crate) fn record_bind_until(
             artifact_key: artifact_key.to_owned(),
             last_bound_ms: crate::pins::now_ms(),
         },
+        started,
         deadline,
         result: Mutex::new(None),
     });
@@ -521,6 +542,10 @@ pub(crate) fn record_bind_until(
         if Instant::now() >= deadline {
             let error = BindRoundError(Arc::new(bind_timeout(&path, started)));
             *member.result.lock().unwrap() = Some(Err(error.clone()));
+            state
+                .pending
+                .retain(|pending| !Arc::ptr_eq(pending, &member));
+            queue.changed.notify_all();
             return Err(error.into_io());
         }
         if !state.active {
@@ -544,34 +569,46 @@ pub(crate) fn record_bind_until(
                 state = queue.changed.wait_timeout(state, remaining).unwrap().0;
             }
             leader.members = std::mem::take(&mut state.pending);
+            // A caller may expire before its thread runs again. Give it its own
+            // timeout and exclude it from both publication and deadline choice.
+            let round_deadline = retain_live_binds(&mut leader.members, &path);
+            queue.changed.notify_all();
             drop(state);
-            let round_deadline = leader
-                .members
-                .iter()
-                .map(|member| member.deadline)
-                .fold(deadline, Instant::min);
+            let Some(round_deadline) = round_deadline else {
+                drop(leader);
+                state = queue.state.lock().unwrap();
+                continue;
+            };
             let admission = bind_lock_until(&path, round_deadline, round_started);
+            #[cfg(test)]
+            if admission.is_ok() {
+                test_hook(storage, "bind-round-admitted");
+            }
             state = queue.state.lock().unwrap();
             // Include arrivals during cross-process admission, then freeze the
             // publication snapshot. Later arrivals belong to the next round.
             leader.members.append(&mut state.pending);
+            // Admission can outlast a member, including the leader. Recompute
+            // from live members instead of retaining an expired earlier minimum.
+            let round_deadline = retain_live_binds(&mut leader.members, &path);
+            queue.changed.notify_all();
             drop(state);
-            let round_deadline = leader
-                .members
-                .iter()
-                .map(|member| member.deadline)
-                .fold(round_deadline, Instant::min);
-            leader.result = admission
-                .and_then(|barrier| {
-                    publish_bind_round(
-                        storage,
-                        &leader.members,
-                        round_started,
-                        round_deadline,
-                        barrier,
-                    )
-                })
-                .map_err(|error| BindRoundError(Arc::new(error)));
+            leader.result = if let Some(round_deadline) = round_deadline {
+                admission
+                    .and_then(|barrier| {
+                        publish_bind_round(
+                            storage,
+                            &leader.members,
+                            round_started,
+                            round_deadline,
+                            barrier,
+                        )
+                    })
+                    .map_err(|error| BindRoundError(Arc::new(error)))
+            } else {
+                drop(admission);
+                Ok(())
+            };
             drop(leader);
             state = queue.state.lock().unwrap();
         } else {
@@ -3079,6 +3116,218 @@ fn collect_one_v2_family(
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    fn expired_pending_bind(root: &Path) -> Arc<PendingBind> {
+        let started = Instant::now() - Duration::from_secs(2);
+        Arc::new(PendingBind {
+            binding: Binding {
+                root: fs::canonicalize(root).unwrap(),
+                artifact_key: "0123456789abcdef".into(),
+                last_bound_ms: crate::pins::now_ms(),
+                volume: None,
+                stable_volume: None,
+                linked_worktree: false,
+            },
+            started,
+            deadline: started + Duration::from_secs(1),
+            result: Mutex::new(None),
+        })
+    }
+
+    fn assert_publication_timeout(error: &io::Error, storage: &Path) {
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let wait = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<BindLockError>()
+            .unwrap();
+        assert_eq!(wait.path, storage.join("retention/sweep.lock"));
+        assert!(wait.publication);
+    }
+
+    fn assert_fresh_binding_only(storage: &Path, fresh: &Path, expired: &[&Path]) {
+        let fresh = fs::canonicalize(fresh).unwrap();
+        let key = crate::path_identity::project_scope_key(&fresh);
+        let binding: Binding =
+            read_json(&storage.join(format!("retention/roots/{key}.json"))).unwrap();
+        assert_eq!(binding.root, fresh);
+        assert_eq!(binding.artifact_key, "fedcba9876543210");
+        for root in expired {
+            let key = crate::path_identity::project_scope_key(&fs::canonicalize(root).unwrap());
+            assert!(!storage.join(format!("retention/roots/{key}.json")).exists());
+        }
+    }
+
+    #[test]
+    fn record_bind_timed_out_waiter_leaves_pending_queue() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let expired_root = temp.path().join("expired");
+        let fresh_root = temp.path().join("fresh");
+        fs::create_dir(&expired_root).unwrap();
+        fs::create_dir(&fresh_root).unwrap();
+        let queue = bind_queue(temp.path()).unwrap();
+        // Keep the caller behind an active round without holding sweep.lock.
+        queue.state.lock().unwrap().active = true;
+        let (enqueued, arrival) = mpsc::channel();
+        let _hook = {
+            let queue = queue.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| {
+                    if step == "bind-enqueued" {
+                        enqueued
+                            .send(queue.state.lock().unwrap().pending.last().unwrap().clone())
+                            .unwrap();
+                    }
+                }),
+            )
+        };
+        std::thread::scope(|scope| {
+            let expired = scope.spawn(|| {
+                record_bind_until(
+                    temp.path(),
+                    &expired_root,
+                    "0123456789abcdef",
+                    Instant::now() + Duration::from_millis(200),
+                )
+            });
+            let member = arrival.recv_timeout(Duration::from_secs(5)).unwrap();
+            let error = expired.join().unwrap().unwrap_err();
+            assert_publication_timeout(&error, temp.path());
+            let removed_before_fresh_bind = {
+                let mut state = queue.state.lock().unwrap();
+                let removed = state.pending.is_empty();
+                state.active = false;
+                removed
+            };
+            record_bind(temp.path(), &fresh_root, "fedcba9876543210")
+                .expect("an expired waiter poisoned a fresh binding");
+            assert!(removed_before_fresh_bind, "timed-out caller stayed pending");
+            let result = member.result.lock().unwrap().clone().unwrap();
+            assert_publication_timeout(&result.unwrap_err().into_io(), temp.path());
+        });
+        assert_fresh_binding_only(temp.path(), &fresh_root, &[&expired_root]);
+    }
+
+    #[test]
+    fn record_bind_expired_unscheduled_waiter_does_not_poison_round() {
+        let temp = tempfile::tempdir().unwrap();
+        let expired_root = temp.path().join("expired");
+        let fresh_root = temp.path().join("fresh");
+        fs::create_dir(&expired_root).unwrap();
+        fs::create_dir(&fresh_root).unwrap();
+        let queue = bind_queue(temp.path()).unwrap();
+        let expired = expired_pending_bind(&expired_root);
+        queue.state.lock().unwrap().pending.push(expired.clone());
+        record_bind(temp.path(), &fresh_root, "fedcba9876543210")
+            .expect("an unscheduled expired waiter poisoned the round");
+        let error = expired
+            .result
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .unwrap_err()
+            .into_io();
+        assert_publication_timeout(&error, temp.path());
+        let wait = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<BindLockError>()
+            .unwrap();
+        assert!(
+            wait.waited >= Duration::from_secs(1),
+            "timeout used the leader's clock"
+        );
+        assert_fresh_binding_only(temp.path(), &fresh_root, &[&expired_root]);
+    }
+
+    #[test]
+    fn record_bind_expired_admission_members_do_not_poison_fresh_arrivals() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let leader_root = temp.path().join("leader");
+        let expired_root = temp.path().join("expired");
+        let fresh_root = temp.path().join("fresh");
+        for root in [&leader_root, &expired_root, &fresh_root] {
+            fs::create_dir(root).unwrap();
+        }
+        let queue = bind_queue(temp.path()).unwrap();
+        let expired = expired_pending_bind(&expired_root);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (admitted, admission) = mpsc::channel();
+        let (enqueued, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = Mutex::new(resumed);
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| match step {
+                "bind-round-admitted" => {
+                    admitted.send(()).unwrap();
+                    resumed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                "bind-enqueued" => {
+                    enqueued.send(()).unwrap();
+                }
+                _ => {}
+            }),
+        );
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(|| {
+                record_bind_until(temp.path(), &leader_root, "0123456789abcdef", deadline)
+            });
+            admission.recv_timeout(Duration::from_secs(5)).unwrap();
+            arrival.recv_timeout(Duration::from_secs(5)).unwrap();
+            let fresh = scope.spawn(|| record_bind(temp.path(), &fresh_root, "fedcba9876543210"));
+            arrival.recv_timeout(Duration::from_secs(5)).unwrap();
+            queue.state.lock().unwrap().pending.push(expired.clone());
+            // Admission has finished and the fresh caller is queued. Expire
+            // only the old leader before freezing the publication snapshot.
+            let timer = Condvar::new();
+            let clock = Mutex::new(());
+            drop(
+                timer
+                    .wait_timeout_while(
+                        clock.lock().unwrap(),
+                        deadline.saturating_duration_since(Instant::now()),
+                        |_| Instant::now() < deadline,
+                    )
+                    .unwrap(),
+            );
+            assert!(Instant::now() >= deadline);
+            resume.send(()).unwrap();
+            let leader_error = leader.join().unwrap().unwrap_err();
+            fresh
+                .join()
+                .unwrap()
+                .expect("expired admission members poisoned a fresh arrival");
+            assert_publication_timeout(&leader_error, temp.path());
+        });
+        let error = expired
+            .result
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .unwrap_err()
+            .into_io();
+        assert_publication_timeout(&error, temp.path());
+        assert!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<BindLockError>()
+                .unwrap()
+                .waited
+                >= Duration::from_secs(1)
+        );
+        assert_fresh_binding_only(temp.path(), &fresh_root, &[&leader_root, &expired_root]);
+    }
 
     #[test]
     fn record_bind_parallel_queue_survives_slow_publish() {
