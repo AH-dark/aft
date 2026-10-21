@@ -1,1 +1,1 @@
-Restore idle OpenCode 2 background completion and pattern-match wakes over subc, including bounded recent-session recovery after reloads; thanks @chrisolszewski.
+- On OpenCode 2 with the CortexKit daemon, an idle session is now woken when its background command finishes or a watched pattern appears, including after a reload (#658); thanks @chrisolszewski.
