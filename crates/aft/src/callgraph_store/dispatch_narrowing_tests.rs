@@ -92,16 +92,14 @@ fn write_fixture(root: &Path, matching: usize, unrelated: usize) {
 fn source_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in [root.to_path_buf(), root.join("web")] {
-        files.extend(
-            fs::read_dir(dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| matches!(ext, "rs" | "ts"))
-                }),
-        );
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        files.extend(entries.map(|entry| entry.unwrap().path()).filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| matches!(ext, "rs" | "ts" | "py" | "java" | "cpp"))
+        }));
     }
     files.sort();
     files
@@ -140,6 +138,19 @@ impl Fixture {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
         write_fixture(&root, matching, unrelated);
+        let store = CallGraphStore::open(temp.path().join("incremental"), root.clone()).unwrap();
+        store.cold_build(&source_files(&root)).unwrap();
+        Self { temp, root, store }
+    }
+
+    /// A fixture holding only `files`, written under the project root.
+    fn from_files(files: &[(&str, &str)]) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        for (rel, text) in files {
+            fs::write(root.join(rel), text).unwrap();
+        }
         let store = CallGraphStore::open(temp.path().join("incremental"), root.clone()).unwrap();
         store.cold_build(&source_files(&root)).unwrap();
         Self { temp, root, store }
@@ -410,6 +421,269 @@ fn s3_path_form_lookup_searches_the_partial_index() {
     conn.execute_batch("DROP INDEX idx_refs_unresolved_last_segment;")
         .unwrap();
     assert!(check_path_form_plan(path_form_plan(&conn, sql)).is_err());
+}
+
+/// Name-match and type-match edges, in a stable order, as
+/// `(caller file, call text, target file, target symbol, provenance)`.
+fn dispatch_edges(store: &CallGraphStore) -> Vec<(String, String, String, String, String)> {
+    let conn = store.conn.lock().unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT r.caller_file, r.full_ref, e.target_file, e.target_symbol, e.provenance
+             FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+             WHERE e.provenance IN (?1, ?2)
+             ORDER BY 1, 2, 3, 4, 5",
+        )
+        .unwrap();
+    statement
+        .query_map(
+            params![PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+const RUST_CARGO: (&str, &str) = (
+    "Cargo.toml",
+    "[package]\nname='fixture'\nversion='0.1.0'\n[lib]\npath='lib.rs'\n",
+);
+
+// The edits below change what a type-aware resolver would infer for a caller
+// in another file (a return type, a field type, a base type, a type's name or
+// file) without adding, removing or moving any method in the caller's file.
+// The `CallGraphStore` dispatch pass infers a receiver type only from the
+// caller itself: `self`, a `Type::` path, the caller's own parameter types and
+// a field of a struct declared in the caller's own file (Rust), and locals and
+// fields of the enclosing type in the caller's own file (Java, Kotlin, C++).
+// Other languages fall back to name matching. A candidate is then chosen only
+// from the methods sharing the call's name. The edges asserted unchanged
+// below record that the edit cannot move them; those whose edges do change
+// are selected through the changed method names.
+
+#[test]
+fn s3_cross_file_return_type_change() {
+    let fixture = Fixture::from_files(&[
+        RUST_CARGO,
+        ("lib.rs", "mod a; mod b;\n"),
+        (
+            "a.rs",
+            "pub struct Foo;\npub struct Bar;\nimpl Foo { pub fn run(&self) {} }\nimpl Bar { pub fn run(&self) {} }\npub fn make() -> Foo { Foo }\n",
+        ),
+        (
+            "b.rs",
+            "use crate::a::make;\npub fn caller() { make().run(); let made = make(); made.run(); }\n",
+        ),
+    ]);
+    let before = dispatch_edges(&fixture.store);
+    let path = edit(
+        &fixture.root,
+        "a.rs",
+        "pub fn make() -> Foo { Foo }",
+        "pub fn make() -> Bar { Bar }",
+    );
+    fixture.refresh_and_compare("return-type", &[path]);
+    assert_eq!(dispatch_edges(&fixture.store), before);
+}
+
+#[test]
+fn s3_cross_file_field_type_change() {
+    let fixture = Fixture::from_files(&[
+        RUST_CARGO,
+        ("lib.rs", "mod a; mod b;\n"),
+        (
+            "a.rs",
+            "pub struct Foo;\npub struct Bar;\nimpl Foo { pub fn run(&self) {} }\nimpl Bar { pub fn run(&self) {} }\npub struct S { pub inner: Foo }\n",
+        ),
+        (
+            "b.rs",
+            "use crate::a::S;\npub fn caller(s: &S) { s.inner.run(); }\npub struct Local { inner: crate::a::S }\nimpl Local { pub fn go(&self) { self.inner.run(); } }\n",
+        ),
+    ]);
+    let before = dispatch_edges(&fixture.store);
+    let path = edit(&fixture.root, "a.rs", "inner: Foo", "inner: Bar");
+    fixture.refresh_and_compare("field-type", &[path]);
+    assert_eq!(dispatch_edges(&fixture.store), before);
+}
+
+#[test]
+fn s3_cross_file_java_field_type_change() {
+    // Java receiver inference reads fields of the caller's own class only.
+    let fixture = Fixture::from_files(&[
+        ("Foo.java", "class Foo { void run() {} }\n"),
+        ("Bar.java", "class Bar { void run() {} }\n"),
+        ("Holder.java", "class Holder { Foo inner; }\n"),
+        (
+            "Caller.java",
+            "class Caller { Foo own; void go(Holder h) { h.inner.run(); own.run(); } }\n",
+        ),
+    ]);
+    let before = dispatch_edges(&fixture.store);
+    let path = edit(&fixture.root, "Holder.java", "Foo inner;", "Bar inner;");
+    fixture.refresh_and_compare("java-field-type", &[path]);
+    assert_eq!(dispatch_edges(&fixture.store), before);
+}
+
+#[test]
+fn s3_cross_file_typescript_base_change() {
+    let fixture = Fixture::from_files(&[
+        (
+            "bases.ts",
+            "export class A { run(): void {} }\nexport class C { run(): void {} }\nexport class B extends A {}\n",
+        ),
+        (
+            "caller.ts",
+            "import { B } from './bases';\nexport function use(b: B): void { b.run(); }\n",
+        ),
+    ]);
+    let before = dispatch_edges(&fixture.store);
+    let path = edit(
+        &fixture.root,
+        "bases.ts",
+        "class B extends A",
+        "class B extends C",
+    );
+    fixture.refresh_and_compare("ts-base", &[path]);
+    assert_eq!(dispatch_edges(&fixture.store), before);
+}
+
+#[test]
+fn s3_cross_file_python_base_change() {
+    let fixture = Fixture::from_files(&[
+        (
+            "bases.py",
+            "class A:\n    def run(self):\n        pass\n\n\nclass C:\n    def run(self):\n        pass\n\n\nclass B(A):\n    pass\n",
+        ),
+        (
+            "caller.py",
+            "from bases import B\n\n\ndef use(b: B):\n    b.run()\n",
+        ),
+    ]);
+    let before = dispatch_edges(&fixture.store);
+    let path = edit(&fixture.root, "bases.py", "class B(A):", "class B(C):");
+    fixture.refresh_and_compare("py-base", &[path]);
+    assert_eq!(dispatch_edges(&fixture.store), before);
+}
+
+/// Adding `impl Speak for X` in another file adds the method
+/// `Speak for X::speak`; the trait method name already exists in `Y`'s impl.
+/// `x.speak()` has a known receiver type but no candidate scoped `X::speak`,
+/// so it gets no edge either way. `any.speak()` has no known receiver type and
+/// is name-matched: one `speak` candidate before the edit, two after.
+const TRAIT_FILES: [(&str, &str); 5] = [
+    RUST_CARGO,
+    ("lib.rs", "mod traits; mod impls; mod caller;\n"),
+    (
+        "traits.rs",
+        "pub trait Speak { fn speak(&self) {} }\npub struct X;\npub struct Y;\nimpl Speak for Y { fn speak(&self) {} }\npub fn pick() -> Y { Y }\n",
+    ),
+    ("impls.rs", "use crate::traits::{Speak, X};\npub fn other() {}\n"),
+    (
+        "caller.rs",
+        "use crate::traits::{pick, Speak, X};\npub fn caller(x: &X) { x.speak(); let any = pick(); any.speak(); }\n",
+    ),
+];
+
+const TRAIT_IMPL: &str = "impl Speak for X { fn speak(&self) {} }\n";
+
+#[test]
+fn s3_cross_file_rust_trait_impl_added() {
+    let fixture = Fixture::from_files(&TRAIT_FILES);
+    let before = dispatch_edges(&fixture.store);
+    let path = edit(
+        &fixture.root,
+        "impls.rs",
+        "pub fn other() {}\n",
+        &format!("pub fn other() {{}}\n{TRAIT_IMPL}"),
+    );
+    let stats = fixture.refresh_and_compare("trait-impl-added", &[path]);
+    assert!(stats.dispatch_callers_recomputed.contains("caller.rs"));
+    assert_ne!(dispatch_edges(&fixture.store), before);
+}
+
+#[test]
+fn s3_cross_file_rust_trait_impl_removed() {
+    let fixture = Fixture::from_files(&TRAIT_FILES);
+    let original = dispatch_edges(&fixture.store);
+    let path = edit(
+        &fixture.root,
+        "impls.rs",
+        "pub fn other() {}\n",
+        &format!("pub fn other() {{}}\n{TRAIT_IMPL}"),
+    );
+    fixture.refresh_and_compare("trait-impl-setup", std::slice::from_ref(&path));
+    assert_ne!(dispatch_edges(&fixture.store), original);
+    edit(&fixture.root, "impls.rs", TRAIT_IMPL, "");
+    let stats = fixture.refresh_and_compare("trait-impl-removed", &[path]);
+    assert!(stats.dispatch_callers_recomputed.contains("caller.rs"));
+    assert_eq!(dispatch_edges(&fixture.store), original);
+}
+
+const TYPE_FILES: [(&str, &str); 5] = [
+    RUST_CARGO,
+    ("lib.rs", "mod a; mod c; mod b;\n"),
+    (
+        "a.rs",
+        "pub struct Foo;\nimpl Foo { pub fn run(&self) {} }\n",
+    ),
+    ("c.rs", "pub fn unrelated() {}\n"),
+    (
+        "b.rs",
+        "use crate::a::Foo;\npub fn caller(x: &Foo) { x.run(); }\n",
+    ),
+];
+
+fn type_target(store: &CallGraphStore) -> Vec<(String, String)> {
+    dispatch_edges(store)
+        .into_iter()
+        .filter(|(caller, ..)| caller == "b.rs")
+        .map(|(_, _, file, symbol, _)| (file, symbol))
+        .collect()
+}
+
+#[test]
+fn s3_cross_file_type_renamed() {
+    let fixture = Fixture::from_files(&TYPE_FILES);
+    assert_eq!(
+        type_target(&fixture.store),
+        vec![("a.rs".to_string(), "Foo::run".to_string())]
+    );
+    fs::write(
+        fixture.root.join("a.rs"),
+        "pub struct Baz;\nimpl Baz { pub fn run(&self) {} }\n",
+    )
+    .unwrap();
+    let stats = fixture.refresh_and_compare("type-renamed", &[fixture.root.join("a.rs")]);
+    assert!(stats.dispatch_callers_recomputed.contains("b.rs"));
+    assert_eq!(type_target(&fixture.store), Vec::new());
+}
+
+#[test]
+fn s3_cross_file_type_moved_between_files() {
+    let fixture = Fixture::from_files(&TYPE_FILES);
+    let from = fixture.root.join("a.rs");
+    let to = fixture.root.join("c.rs");
+    fs::write(&from, "pub fn emptied() {}\n").unwrap();
+    fs::write(
+        &to,
+        "pub fn unrelated() {}\npub struct Foo;\nimpl Foo { pub fn run(&self) {} }\n",
+    )
+    .unwrap();
+    let stats = fixture.refresh_and_compare("type-moved", &[from, to]);
+    assert!(stats.dispatch_callers_recomputed.contains("b.rs"));
+    assert_eq!(
+        type_target(&fixture.store),
+        vec![("c.rs".to_string(), "Foo::run".to_string())]
+    );
 }
 
 /// The probe edit of the call-graph incremental-speed study: a leading comment
