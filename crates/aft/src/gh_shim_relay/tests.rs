@@ -100,6 +100,23 @@ fn golden() -> Value {
     .unwrap()
 }
 
+#[test]
+fn gh_shim_shared_relay_unknown_operation_is_not_bot_speech() {
+    let transport = FakeTransport::scoped();
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        "unknown-operation-session",
+        "unknown-operation-call",
+        ".",
+    );
+    let (reply, _) = run(
+        &transport,
+        "gh_shim.unknown",
+        json!({"ticket": ticket.value().unwrap(), "request": envelope()}),
+    );
+    assert_eq!(reply.data["refusal_code"], "operation_unknown");
+    assert!(transport.calls().is_empty());
+}
+
 fn envelope() -> Value {
     golden()["request"]["request"].clone()
 }

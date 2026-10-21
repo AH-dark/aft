@@ -286,6 +286,13 @@ pub async fn relay<T: RelayTransport>(
     let mut task = "-".to_string();
     let mut path = "-";
     let reply = 'reply: {
+        if !is_relay_operation(call.operation) {
+            break 'reply RelayReply::refused(
+                "operation_unknown",
+                "admission",
+                "the gh shim relay does not serve this operation",
+            );
+        }
         if !call.first_party {
             break 'reply RelayReply::refused(
                 "untrusted_principal",
@@ -324,28 +331,21 @@ pub async fn relay<T: RelayTransport>(
                 path = taken;
                 reply
             }
-            SESSION_CONTEXT_OPERATION => {
-                match call.route_scopes.for_session(&redeemed.session_id) {
-                    Some(stamp) if worker_scope(stamp) || head_scope(stamp) => RelayReply::relayed(
-                        json!({"worker": worker_scope(stamp), "head": head_scope(stamp), "repository": redeemed.read_repository}),
-                    ),
-                    _ => RelayReply::refused(
-                        "session_unscoped",
-                        "scope",
-                        "the ticket has no unambiguous daemon-stamped session",
-                    ),
-                }
-            }
+            SESSION_CONTEXT_OPERATION => session_context(
+                &redeemed,
+                call.route_scopes.for_session(&redeemed.session_id),
+            ),
             BINDINGS_READ_OPERATION => {
                 path = PATH_UNSCOPED;
                 bindings_read(transport, &redeemed).await
             }
-            _ => {
+            BOT_REQUEST_OPERATION => {
                 let stamp = call.route_scopes.for_session(&redeemed.session_id);
                 let (reply, taken) = bot_request(transport, &redeemed, stamp, params).await;
                 path = taken;
                 reply
             }
+            _ => RelayReply::refused("operation_unknown", "admission", "unknown relay operation"),
         }
     };
 
@@ -382,7 +382,23 @@ fn head_scope(stamp: &ScopeStamp) -> bool {
         && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
 }
 
-async fn read_request<T: RelayTransport>(
+pub(crate) fn session_context(
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
+) -> RelayReply {
+    match stamp {
+        Some(stamp) if worker_scope(stamp) || head_scope(stamp) => RelayReply::relayed(
+            json!({"worker": worker_scope(stamp), "head": head_scope(stamp), "repository": redeemed.read_repository}),
+        ),
+        _ => RelayReply::refused(
+            "session_unscoped",
+            "scope",
+            "the ticket has no unambiguous daemon-stamped session",
+        ),
+    }
+}
+
+pub(crate) async fn read_request<T: RelayTransport>(
     transport: &T,
     redeemed: &crate::gh_shim_ticket::Redeemed,
     stamp: Option<&ScopeStamp>,
@@ -404,6 +420,23 @@ async fn read_request<T: RelayTransport>(
             );
         }
     };
+    read_validated_request(transport, redeemed, stamp, &parsed).await
+}
+
+/// Check that the typed request targets the repository bound to the redeemed
+/// ticket and require an authenticated worker scope before relaying it.
+pub(crate) async fn read_validated_request<T: RelayTransport>(
+    transport: &T,
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
+    parsed: &crate::gh_shim::read_contract::Request,
+) -> (RelayReply, &'static str) {
+    if let Err(message) = parsed.validate() {
+        return (
+            RelayReply::refused("request_malformed", "request", message),
+            "-",
+        );
+    }
     let Some(stamp) = stamp.filter(|stamp| worker_scope(stamp) && transport.opens_scoped_routes())
     else {
         return (
@@ -440,7 +473,7 @@ async fn read_request<T: RelayTransport>(
     let selector = scope_selector(stamp);
     let body = serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
         name: "github_read".into(),
-        arguments: request,
+        arguments: serde_json::to_value(parsed).expect("a validated read request serializes"),
         tool_call_id: None,
         progress_token: None,
         call_key: None,
