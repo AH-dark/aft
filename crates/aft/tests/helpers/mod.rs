@@ -487,6 +487,15 @@ impl AftProcess {
             command.env_remove(key);
         }
 
+        // Hermetic Git config omits the runner's checkout trust. Fixture files
+        // still belong to that checkout, which may be owned by another UID.
+        // Trust only this exact repository, never arbitrary test repositories.
+        let checkout = canonicalize_like_product(&cargo_manifest_dir().join("../.."));
+        let checkout = checkout.to_string_lossy().replace('\\', "/");
+        command.env(
+            "GIT_CONFIG_PARAMETERS",
+            format!("'safe.directory'='{}'", checkout.replace('\'', "'\\''")),
+        );
         for (key, value) in envs {
             command.env(key, value);
         }

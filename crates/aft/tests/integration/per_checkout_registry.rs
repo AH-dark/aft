@@ -310,7 +310,7 @@ fn a_removed_root_with_a_marker_only_reader_is_kept_until_two_sweeps_after_it_le
     let published = publish(&view, &[("gone.txt", b"protected bytes")], None);
     let view_dir = view.view_dir().to_path_buf();
     drop(view);
-    age_retention_binding(&registry, &root);
+    let _mounted_volume = age_retention_binding(&registry, &root, true);
 
     let reader = registry.register_reader("parent-folder").unwrap();
     let pinned = reader.protect_current("scope-gone").unwrap().unwrap();
@@ -405,7 +405,7 @@ fn an_owner_pin_taken_while_removal_is_pending_keeps_the_member() {
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let view = registry.register_view("scope-gone", &root).unwrap();
     publish(&view, &[("gone.txt", b"owner bytes")], None);
-    age_retention_binding(&registry, &root);
+    let _mounted_volume = age_retention_binding(&registry, &root, true);
     fs::remove_dir_all(&root).unwrap();
 
     // The first sweep only counts the missing root.
@@ -442,7 +442,7 @@ fn a_deregistered_view_cannot_be_pinned() {
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let view = registry.register_view("scope-gone", &root).unwrap();
-    age_retention_binding(&registry, &root);
+    let _mounted_volume = age_retention_binding(&registry, &root, true);
     fs::remove_dir_all(&root).unwrap();
     for _ in 0..2 {
         sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
@@ -463,8 +463,13 @@ fn a_deregistered_view_cannot_be_pinned() {
 }
 
 /// Removal race fixtures model an abandoned checkout, not a volume that went
-/// missing moments after its last bind. Both durable clocks must be aged.
-fn age_retention_binding(registry: &FamilyRegistry, root: &Path) {
+/// missing moments after its last bind. Age both clocks and, when requested,
+/// keep a mounted-volume identity for the fixture's surviving storage anchor.
+fn age_retention_binding(
+    registry: &FamilyRegistry,
+    root: &Path,
+    mounted: bool,
+) -> Box<dyn std::any::Any> {
     let connection =
         aft::db::TrackedConnection::open(registry.path(), aft::db::SqliteStore::BlobStore).unwrap();
     connection
@@ -476,7 +481,77 @@ fn age_retention_binding(registry: &FamilyRegistry, root: &Path) {
         .join(format!("retention/roots/{scope}.json"));
     let mut binding: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     binding["last_bound_ms"] = serde_json::json!(0);
+    #[cfg(debug_assertions)]
+    let guard: Box<dyn std::any::Any> = if mounted {
+        let anchor = fs::canonicalize(registry.storage()).unwrap();
+        let uuid = format!("fixture-volume:{scope}");
+        let guard = registry.test_volume_uuid_guard(&anchor, &uuid).unwrap();
+        binding["volume"] = serde_json::json!([anchor, 0]);
+        binding["stable_volume"]["uuid"] = serde_json::json!(uuid);
+        Box::new(guard)
+    } else {
+        Box::new(())
+    };
+    #[cfg(not(debug_assertions))]
+    let guard: Box<dyn std::any::Any> = {
+        let _ = mounted;
+        Box::new(())
+    };
     fs::write(path, serde_json::to_vec(&binding).unwrap()).unwrap();
+    guard
+}
+
+#[test]
+fn a_missing_root_without_durable_volume_identity_is_kept() {
+    let storage = tempdir().unwrap();
+    let root = storage.path().join("root-gone");
+    fs::create_dir_all(&root).unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let _view = registry.register_view("scope-gone", &root).unwrap();
+    let _unmounted = age_retention_binding(&registry, &root, false);
+    let scope = aft::path_identity::project_scope_key(&root);
+    let path = registry
+        .storage()
+        .join(format!("retention/roots/{scope}.json"));
+    let mut binding: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    binding["volume"] = serde_json::json!([fs::canonicalize(storage.path()).unwrap(), 0]);
+    binding["stable_volume"] = serde_json::Value::Null;
+    fs::write(path, serde_json::to_vec(&binding).unwrap()).unwrap();
+    fs::remove_dir_all(&root).unwrap();
+
+    for _ in 0..2 {
+        let report = sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
+        assert_eq!(report.skipped_mount_mismatch, 1, "{report:?}");
+        assert!(report.deregistered.is_empty(), "{report:?}");
+    }
+    assert!(registry.member("scope-gone").unwrap().is_some());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_fixture_volume_override_is_scoped_and_released_by_its_guard() {
+    let storage = tempdir().unwrap();
+    let root = storage.path().join("root-gone");
+    fs::create_dir_all(&root).unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let _view = registry.register_view("scope-gone", &root).unwrap();
+    assert!(registry
+        .test_volume_uuid_guard(storage.path().parent().unwrap(), "outside")
+        .is_err());
+    let mounted = age_retention_binding(&registry, &root, true);
+    fs::remove_dir_all(&root).unwrap();
+
+    let report = sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
+    assert_eq!(report.skipped_mount_mismatch, 0, "{report:?}");
+    assert_eq!(
+        report.missing_root_retained,
+        vec!["scope-gone"],
+        "{report:?}"
+    );
+    drop(mounted);
+    let report = sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
+    assert_eq!(report.skipped_mount_mismatch, 1, "{report:?}");
+    assert!(registry.member("scope-gone").unwrap().is_some());
 }
 
 /// An unreadable marker is uncertainty, and uncertainty keeps the member.

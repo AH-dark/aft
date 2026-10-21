@@ -405,8 +405,11 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "child trigram index never persisted: {}",
-            root.display()
+            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}",
+            root.display(),
+            ctx.config().indexes.trigram,
+            ctx.cached_artifact_cache_key(root),
+            ctx.degraded_reasons(),
         );
         thread::sleep(Duration::from_millis(20));
     }

@@ -962,7 +962,7 @@ fn mount_matches(binding: &Binding) -> bool {
     let boot_volume = mount_point(Path::new("/")).as_deref() == Some(Path::new("/"));
     #[cfg(not(target_os = "macos"))]
     let boot_volume = false;
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     let uuid_at = |path: &Path| {
         let probe_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(uuid) = test_volume_uuids()
@@ -974,7 +974,7 @@ fn mount_matches(binding: &Binding) -> bool {
         }
         volume_uuid(path)
     };
-    #[cfg(not(test))]
+    #[cfg(not(any(test, debug_assertions)))]
     let uuid_at = volume_uuid;
     mount_matches_with(
         binding,
@@ -985,10 +985,56 @@ fn mount_matches(binding: &Binding) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn test_volume_uuids() -> &'static Mutex<HashMap<PathBuf, String>> {
     static UUIDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
     UUIDS.get_or_init(Default::default)
+}
+
+/// A scoped mounted-volume identity for debug-build integration fixtures.
+/// No environment variable can install an override, and release builds have
+/// neither this guard nor the override lookup.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct TestVolumeUuidGuard {
+    anchor: PathBuf,
+    previous: Option<String>,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for TestVolumeUuidGuard {
+    fn drop(&mut self) {
+        let mut uuids = test_volume_uuids()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = self.previous.take() {
+            uuids.insert(self.anchor.clone(), previous);
+        } else {
+            uuids.remove(&self.anchor);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn test_volume_uuid_guard(
+    storage: &Path,
+    anchor: &Path,
+    uuid: &str,
+) -> io::Result<TestVolumeUuidGuard> {
+    let storage = fs::canonicalize(storage)?;
+    let anchor = fs::canonicalize(anchor)?;
+    if !anchor.starts_with(&storage) || uuid.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a test volume identity needs a named anchor inside its storage root",
+        ));
+    }
+    let previous = test_volume_uuids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(anchor.clone(), uuid.to_owned());
+    Ok(TestVolumeUuidGuard { anchor, previous })
 }
 
 fn mount_matches_with(

@@ -646,7 +646,11 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    // Do not inherit the test runner checkout's safe.directory entry.
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("GIT_CONFIG_PARAMETERS", "".as_ref()),
+    ]);
     let bind = json!({
         "id": "cfg", "command": "configure", "harness": "opencode",
         "project_root": root, "storage_dir": storage.path(),
