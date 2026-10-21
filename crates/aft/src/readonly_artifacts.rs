@@ -609,6 +609,7 @@ mod tests {
             let result = resolve_git_root_from_user_path(
                 &base.join("configured"),
                 &base.join("requested").display().to_string(),
+                |_| false,
             );
             let probe = crate::git_probe::toplevel(&base.join("requested"));
             let standing = crate::scoped_key::resolve_standing_root(
