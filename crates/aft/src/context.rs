@@ -6730,8 +6730,45 @@ impl AppContext {
             .fetch_add(1, Ordering::SeqCst);
         // Status reports the artifact key used by builds without probing Git.
         // Configure uses a separate memo so it still verifies the root identity.
-        keys.insert(canonical_root.to_path_buf(), key.clone());
+        //
+        // A bound root whose identity is provisional has no key yet: configure
+        // published none, and the key derived here comes from Git alone. The
+        // settled identity can key differently, because it may keep an older
+        // path or repository pin from aft.db or the root's identity record
+        // (see `resolve_root_identity_for_bind`). So the caller gets this
+        // derivation, but it is not remembered: a passive reader of the
+        // cache must not mistake it for the bound key. The check runs under
+        // the cache lock, so it pairs with `forget_unsettled_artifact_cache_key`,
+        // which a provisional configure calls after publishing its degraded
+        // reasons.
+        if !self.bound_identity_unsettled(canonical_root) {
+            keys.insert(canonical_root.to_path_buf(), key.clone());
+        }
         key
+    }
+
+    /// True when `root` is this context's bound root and its last bind left
+    /// the identity provisional.
+    fn bound_identity_unsettled(&self, root: &Path) -> bool {
+        if !self.artifact_identity_provisional() {
+            return false;
+        }
+        self.canonical_cache_root_opt().as_deref() == Some(root)
+            || self.config().project_root.as_deref() == Some(root)
+    }
+
+    /// Drop any key cached for a root whose bind just left the identity
+    /// provisional. A key derived while the configure was still publishing
+    /// (before its degraded reasons said provisional) may have been cached by
+    /// a reader on another thread, such as standing-root maintenance.
+    pub(crate) fn forget_unsettled_artifact_cache_key(
+        &self,
+        canonical_root: &Path,
+        raw_root: &Path,
+    ) {
+        let mut keys = self.artifact_cache_keys.lock();
+        keys.remove(canonical_root);
+        keys.remove(raw_root);
     }
 
     pub(crate) fn memoized_readonly_artifact_cache_key(

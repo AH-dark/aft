@@ -4221,6 +4221,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // heavy-work entry point reads the same cheap gate instead of re-deriving
     // directory-scope rules independently.
     ctx.set_degraded_reasons(degraded_reasons.clone());
+    if identity_provisional {
+        // This bind published no key. A reader on another thread may have
+        // cached a Git-derived key for the root before the reasons above
+        // said provisional; the settled identity can key differently.
+        ctx.forget_unsettled_artifact_cache_key(&canonical_cache_root, &root_path);
+    }
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
     if root_too_broad {
         ctx.stop_watcher_runtime();
@@ -14039,6 +14045,137 @@ mod tests {
                     .unwrap()
                     .is_some());
                 assert!(ctx.cached_artifact_cache_key(&root).is_some());
+            },
+        );
+    }
+
+    /// While aft.db is busy, a reader outside configure (standing-root
+    /// maintenance reads every session actor's key) can only derive the
+    /// root's key from Git. With an older standing path pin for the root in
+    /// aft.db, the identity settles on the path key instead, so that Git-only
+    /// key must never be cached as the root's key, and caching it must not
+    /// stop the retry.
+    #[test]
+    fn provisional_root_caches_no_git_only_key_and_still_settles() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("repo");
+        init_git_fixture(&root);
+        let storage = base.join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        {
+            let mut database = crate::db::open(&storage.join("aft.db")).unwrap();
+            crate::db::standing_roots::ensure_standing_root(
+                &mut database,
+                &crate::db::standing_roots::StandingRootRecord {
+                    literal_path: root.display().to_string(),
+                    resolved_target: root.display().to_string(),
+                    resolved_git_toplevel: None,
+                    scoped_relative_path: None,
+                },
+                &[crate::config::IndexKind::Search],
+            )
+            .unwrap();
+        }
+        let lock = hold_aft_db_exclusively(&storage);
+        let ctx = test_context();
+        // A reader that ran before the bind published its degraded reasons.
+        let git_key = ctx.memoized_artifact_cache_key(&root);
+        assert_eq!(
+            ctx.cached_artifact_cache_key(&root).as_deref(),
+            Some(git_key.as_str())
+        );
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                assert!(
+                    has_busy_provisional_reason(&ctx),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert_eq!(
+                    ctx.cached_artifact_cache_key(&root),
+                    None,
+                    "a provisional bind keeps no key cached for its root"
+                );
+                super::drain_deferred_configure_maintenance(&ctx);
+
+                // A standing-maintenance pass reads the key while aft.db is busy.
+                assert_eq!(ctx.memoized_artifact_cache_key(&root), git_key);
+                assert_eq!(ctx.cached_artifact_cache_key(&root), None);
+
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                let settled = ctx
+                    .cached_artifact_cache_key(&root)
+                    .expect("the settled bind publishes its key");
+                assert_eq!(
+                    settled,
+                    crate::search_index::artifact_path_identity_key_for_test(&root)
+                );
+                assert_ne!(
+                    settled, git_key,
+                    "the fixture must settle on a key the Git-only derivation does not produce"
+                );
+                assert_eq!(ctx.memoized_artifact_cache_key(&root), settled);
+            },
+        );
+    }
+
+    /// A replay can resolve and memoize the settled key and still be refused
+    /// before its commit (for example by a storage error at its retention or
+    /// artifact-owner step). The root then stays provisional with the settled
+    /// key already in the context's key caches, and the retry must replay it
+    /// again rather than read the cached key as proof that it settled.
+    #[test]
+    fn identity_retry_replays_again_after_a_replay_refused_past_its_key_step() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+
+                // What the refused replay's key step leaves behind.
+                let key = ctx
+                    .memoized_artifact_cache_key_for_configure(&root, &root, &storage, None)
+                    .unwrap()
+                    .expect("aft.db is free, so the identity settles");
+                assert_eq!(
+                    ctx.cached_artifact_cache_key(&root).as_deref(),
+                    Some(key.as_str())
+                );
+                assert!(has_busy_provisional_reason(&ctx));
+                assert!(ctx.provisional_identity_retry().is_armed());
+
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert_eq!(ctx.cached_artifact_cache_key(&root), Some(key));
             },
         );
     }

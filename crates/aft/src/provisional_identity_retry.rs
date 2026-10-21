@@ -197,8 +197,19 @@ pub(crate) fn cancel(ctx: &AppContext) -> bool {
 /// only for the configure generation that armed it, while the root is bound
 /// and its identity is still provisional because aft.db was busy. Otherwise
 /// the root is unbound, a newer configure superseded the retry, the root is
-/// missing, the identity is no longer provisional for that reason, or it has
-/// already settled and must not be keyed again.
+/// missing, the identity is provisional for a reason a retry cannot fix, or
+/// it has already settled and must not be keyed again.
+///
+/// Settled or not is read only from what the root's last committed configure
+/// published: its degraded reasons, which keep the provisional reason until a
+/// bind that settles the identity commits. The context's general artifact-key
+/// cache is no evidence either way. Readers outside configure (standing-root
+/// maintenance, status, runtime drains) fill it through
+/// `AppContext::memoized_artifact_cache_key` with a key derived from Git
+/// alone, and a replay refused after resolving its key but before its commit
+/// leaves the settled key there while the root is still provisional. Dropping
+/// the retry on either would leave the indexes off until the folder binds
+/// again.
 fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> {
     // A root with no bound route does no indexing.
     if ctx.subc_unbound_quiesced() {
@@ -207,18 +218,15 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
     if retry.generation != ctx.configure_generation() {
         return Some("superseded");
     }
-    if !ctx
-        .degraded_reasons()
-        .iter()
-        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON)
-    {
-        return Some("not_provisional");
+    match ctx.artifact_identity_provisional_reason() {
+        None => return Some("settled"),
+        Some(reason) if reason != PROVISIONAL_IDENTITY_REASON => {
+            return Some("not_provisional");
+        }
+        Some(_) => {}
     }
-    let Some(root) = ctx.canonical_cache_root_opt() else {
+    if ctx.canonical_cache_root_opt().is_none() {
         return Some("no_root");
-    };
-    if ctx.cached_artifact_cache_key(&root).is_some() {
-        return Some("settled");
     }
     None
 }

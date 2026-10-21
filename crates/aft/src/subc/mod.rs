@@ -19024,7 +19024,88 @@ mod tests {
         );
     }
 
-    /// Run the configure-tail maintenance job on the executor, as the module
+    /// A standing-roots pass derives the artifact key of every session actor,
+    /// including one whose bind left the identity provisional because aft.db
+    /// was busy. When that pass runs after aft.db frees but before the
+    /// retry's next attempt, the retry must still settle the root and turn
+    /// its indexes on.
+    #[test]
+    fn standing_pass_over_a_provisional_session_keeps_its_identity_retry() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let standing_dir = tempfile::tempdir().unwrap();
+        std::fs::write(standing_dir.path().join("lib.rs"), "pub fn standing() {}\n").unwrap();
+        let standing_root = std::fs::canonicalize(standing_dir.path()).unwrap();
+
+        // Rollback-journal mode, so the exclusive transaction also blocks the
+        // bind's read of its legacy identity pin.
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-standing",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-standing-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": false },
+                    "index": { "roots": [{ "path": standing_root, "indexes": ["search"] }] },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let bound = crate::commands::configure::handle_configure(&bind, &ctx);
+                assert!(bound.success, "{}", bound.data);
+                assert!(
+                    ctx.artifact_identity_provisional(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(!ctx.config().indexes.trigram);
+                assert_eq!(ctx.config().index.roots.len(), 1);
+                // The bind's own tail; the retry never interleaves with it.
+                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+
+                let standing =
+                    super::standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
+                        .with_startup_storage_dir(configured.storage.path());
+                let derivations = ctx.artifact_cache_key_derivation_count_for_test();
+                standing.tick();
+                assert!(
+                    ctx.artifact_cache_key_derivation_count_for_test() > derivations,
+                    "the standing pass must derive the provisional session's key"
+                );
+                assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
+
+                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert!(ctx.cached_artifact_cache_key(&canonical_root).is_some());
+            },
+        );
+    }
     /// loop's tick does, until the identity retry hands back a bind to replay.
     fn pump_until_identity_replay(
         executor: &Executor,
