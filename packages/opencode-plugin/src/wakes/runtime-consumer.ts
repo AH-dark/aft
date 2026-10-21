@@ -344,6 +344,10 @@ export function createV2RuntimeConsumer(
   getBridge?: (root?: string) => AftProjectTransport,
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
+  // SubC owns acknowledgement retries outside this consumer and does not
+  // expose confirmed retirement here. Preserve its retained deduplication keys
+  // without imposing the standalone path's cap on long-lived SubC sessions.
+  const subcDelivery = new V2SessionDelivery(context.session, Number.POSITIVE_INFINITY);
   const sessions = new Set<string>();
   let subcPool: (() => AftTransportPool) | undefined;
   const pendingMatches = new Map<
@@ -554,7 +558,7 @@ export function createV2RuntimeConsumer(
       }
       const text = formatSystemReminder([completion]);
       const admitted = await Effect.runPromise(
-        delivery.completion({
+        subcDelivery.completion({
           sessionID: completion.session_id,
           taskIDs: [completion.task_id],
           text,
@@ -618,7 +622,7 @@ export function createV2RuntimeConsumer(
       }
       const text = formatPatternMatchReminder([match]);
       const admitted = await Effect.runPromise(
-        delivery.completion({
+        subcDelivery.completion({
           sessionID: match.session_id,
           taskIDs: [match.task_id],
           notificationID: `match\0${match.watch_id}\0${match.match_offset}`,
@@ -835,6 +839,7 @@ export function createV2RuntimeConsumer(
       disposed = true;
       pendingMatches.clear();
       delivery.dispose();
+      subcDelivery.dispose();
       const { routes } = wakeRouteState();
       // Another Location may have registered the session since; leave its route.
       for (const sessionID of sessions) {
