@@ -30,7 +30,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 7;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 8;
 #[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
@@ -1543,16 +1543,6 @@ fn materialize_dead_code_contributions(
                 .extend(facts.initializers.iter().map(|init| init.name.clone()));
         }
     }
-    let rust_initializers = parsed
-        .iter()
-        .filter_map(|c| c.rust_api.as_ref().map(|facts| (c, facts)))
-        .flat_map(|(c, facts)| {
-            facts
-                .initializers
-                .iter()
-                .map(|init| (c.file.clone(), init.name.clone()))
-        })
-        .collect::<BTreeSet<_>>();
     let outbound_calls_by_caller_file =
         group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
     let initializers_by_file = snapshot
@@ -1669,6 +1659,31 @@ fn materialize_dead_code_contributions(
                 &exported_symbols_by_file,
             ));
             if let Some(facts) = &contribution.rust_api {
+                // Export rows use short names, but inline-module callers and
+                // resolved call targets retain their lexical qualification.
+                // Join those identities only for declarations in this file.
+                for item in &facts.items {
+                    if item.owner.is_some() {
+                        continue;
+                    }
+                    let qualified = rust_qualified_item_name(item);
+                    if qualified != item.name {
+                        for (caller, symbol) in [(&qualified, &item.name), (&item.name, &qualified)]
+                        {
+                            internal_calls.push(InternalCall {
+                                caller_symbol: caller.clone(),
+                                file: contribution.file.clone(),
+                                symbol: symbol.clone(),
+                                line: item.line,
+                                provenance: RUST_PATH_LIVENESS_PROVENANCE.into(),
+                                test_origin: Some(is_test_code_file(
+                                    &contribution.file,
+                                    &test_module_files,
+                                )),
+                            });
+                        }
+                    }
+                }
                 internal_calls.extend(
                     resolve_macro_token_liveness_edges(
                         project_root,
@@ -1678,9 +1693,6 @@ fn materialize_dead_code_contributions(
                         &exported_symbols_by_file,
                     )
                     .into_iter()
-                    .filter(|call| {
-                        rust_initializers.contains(&(call.file.clone(), call.symbol.clone()))
-                    })
                     .map(|mut call| {
                         call.test_origin = Some(
                             is_test_code_file(&contribution.file, &test_module_files)
@@ -1870,6 +1882,16 @@ fn exported_symbol_indexes_from_contributions(
                 .entry(export.symbol.clone())
                 .or_default()
                 .insert(contribution.file.clone());
+        }
+        if let Some(facts) = &contribution.rust_api {
+            // Macro calls can pass through private helpers before reaching a
+            // reportable export, so local declarations belong in this index too.
+            let symbols = exported_symbols_by_file
+                .entry(contribution.file.clone())
+                .or_default();
+            for item in &facts.items {
+                symbols.insert(rust_qualified_item_name(item));
+            }
         }
     }
 
@@ -3109,6 +3131,24 @@ fn rust_unresolved_path_call_edges(
             .is_some_and(|symbols| symbols.contains(symbol))
     };
     let mut targets = BTreeSet::new();
+    let mut scope = call
+        .caller_symbol
+        .split("::")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    scope.pop();
+    loop {
+        let mut candidate = scope.clone();
+        candidate.extend(segments.iter().cloned());
+        let qualified = candidate.join("::");
+        if exports_symbol(caller_file, &qualified) {
+            targets.insert((caller_file.to_string(), qualified));
+            break;
+        }
+        if scope.pop().is_none() {
+            break;
+        }
+    }
     if qualifier == "Self" {
         if exports_symbol(caller_file, name) {
             targets.insert((caller_file.to_string(), name.clone()));
@@ -3183,6 +3223,37 @@ fn resolve_macro_token_ref_target(
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<ExportNode> {
     let path = reference.path.as_deref().unwrap_or(&[]);
+    if reference.shape == RUST_MACRO_REF_SHAPE_CALL
+        && path.first().is_none_or(|part| part != "crate")
+    {
+        let mut scope = reference
+            .caller_symbol
+            .split("::")
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        scope.pop();
+        let mut path = path;
+        while let Some(first) = path.first() {
+            match first.as_str() {
+                "self" => {
+                    path = &path[1..];
+                    break;
+                }
+                "super" => {
+                    scope.pop();
+                    path = &path[1..];
+                }
+                _ => break,
+            }
+        }
+        scope.extend(path.iter().cloned());
+        scope.push(reference.name.clone());
+        if let Some(target) =
+            exported_symbol_target(caller_file, &scope.join("::"), exported_symbols_by_file)
+        {
+            return Some(target);
+        }
+    }
     match reference.shape.as_str() {
         RUST_MACRO_REF_SHAPE_CALL => resolve_macro_call_or_struct_ref(
             caller_file,
@@ -3880,6 +3951,46 @@ fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroToke
     let mut refs = BTreeSet::new();
     let mut scope_stack = Vec::new();
     collect_rust_macro_token_refs(source, root, &mut scope_stack, &mut refs);
+    // A callgraph node is keyed by scoped name and keeps only one body when
+    // cfg branches define that name more than once. Preserve calls from every
+    // source variant instead of choosing the host platform's implementation.
+    let mut functions: BTreeMap<String, Vec<tree_sitter::Node>> = BTreeMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item" {
+            if let Some(name) = rust_function_symbol_name(source, &node) {
+                functions.entry(name).or_default().push(node);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    for (caller_symbol, variants) in functions.into_iter().filter(|(_, nodes)| nodes.len() > 1) {
+        for node in variants {
+            for (full, _, line, _, _) in crate::calls::extract_calls_full(
+                source,
+                node,
+                node.start_byte(),
+                node.end_byte(),
+                LangId::Rust,
+            ) {
+                if full.contains('.') || full.ends_with('!') {
+                    continue;
+                }
+                let mut path = rust_path_segments(&full);
+                let Some(name) = path.pop() else {
+                    continue;
+                };
+                refs.insert(MacroTokenRefContribution {
+                    caller_symbol: caller_symbol.clone(),
+                    name,
+                    line,
+                    path: macro_ref_path(path),
+                    shape: RUST_MACRO_REF_SHAPE_CALL.into(),
+                });
+            }
+        }
+    }
     refs.into_iter().collect()
 }
 
@@ -3904,7 +4015,35 @@ fn collect_rust_macro_token_refs(
                 .unwrap_or_else(|| TOP_LEVEL_SYMBOL.to_string());
             let mut tokens = Vec::new();
             collect_rust_macro_tokens(source, token_tree, &mut tokens);
-            extract_rust_macro_token_refs(&tokens, &caller_symbol, refs);
+            let mut shadowed = BTreeSet::new();
+            let mut owner = node.parent();
+            while let Some(parent) = owner {
+                if parent.kind() == "function_item" {
+                    let mut stack = vec![parent];
+                    while let Some(binding) = stack.pop() {
+                        if matches!(binding.kind(), "parameters" | "closure_parameters") {
+                            collect_rust_binding_identifiers(source, binding, &mut shadowed);
+                        } else if let Some(pattern) = binding.child_by_field_name("pattern") {
+                            collect_rust_binding_identifiers(source, pattern, &mut shadowed);
+                        }
+                        let mut cursor = binding.walk();
+                        stack.extend(binding.named_children(&mut cursor));
+                    }
+                    break;
+                }
+                owner = parent.parent();
+            }
+            let mut binding = false;
+            for token in &tokens {
+                if token.text == "let" {
+                    binding = true;
+                } else if token.text == "=" {
+                    binding = false;
+                } else if binding && rust_macro_token_is_identifier(token) {
+                    shadowed.insert(token.text.to_string());
+                }
+            }
+            extract_rust_macro_token_refs(&tokens, &caller_symbol, &shadowed, refs);
         }
     }
 
@@ -3918,6 +4057,21 @@ fn collect_rust_macro_token_refs(
         }
     }
     scope_stack.truncate(scope_len);
+}
+
+fn collect_rust_binding_identifiers(
+    source: &str,
+    node: tree_sitter::Node,
+    names: &mut BTreeSet<String>,
+) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            names.insert(node_text(source, node).to_string());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
 }
 
 fn collect_rust_macro_tokens<'a>(
@@ -3962,6 +4116,7 @@ fn rust_macro_token_node_is_opaque(kind: &str) -> bool {
 fn extract_rust_macro_token_refs(
     tokens: &[RustMacroToken<'_>],
     caller_symbol: &str,
+    shadowed: &BTreeSet<String>,
     refs: &mut BTreeSet<MacroTokenRefContribution>,
 ) {
     for index in 0..tokens.len() {
@@ -3978,6 +4133,24 @@ fn extract_rust_macro_token_refs(
 
         let path = rust_macro_path_before(tokens, index);
         let next = rust_macro_next_after_optional_turbofish(tokens, index + 1);
+        // A single bare argument can be a function item passed to a method
+        // such as is_ok_and. Resolve it only locally or through imports, and
+        // never credit a name bound by the enclosing function or macro body.
+        if index > 0
+            && tokens[index - 1].text == "("
+            && tokens
+                .get(next)
+                .is_some_and(|next| matches!(next.text, ")" | ","))
+            && !shadowed.contains(token.text)
+        {
+            refs.insert(MacroTokenRefContribution {
+                caller_symbol: caller_symbol.to_string(),
+                line: token.line,
+                name: token.text.to_string(),
+                path: macro_ref_path(path.clone()),
+                shape: RUST_MACRO_REF_SHAPE_CALL.into(),
+            });
+        }
         if tokens.get(next).is_some_and(|next| next.text == "(") {
             let shape = if path
                 .last()
@@ -4494,6 +4667,18 @@ struct RustApiItem {
     trait_name: Option<String>,
 }
 
+fn rust_qualified_item_name(item: &RustApiItem) -> String {
+    let mut parts = item.scope.clone();
+    if let Some(owner) = &item.owner {
+        parts.push(match &item.trait_name {
+            Some(trait_name) => format!("{trait_name} for {owner}"),
+            None => owner.clone(),
+        });
+    }
+    parts.push(item.name.clone());
+    parts.join("::")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RustApiModule {
     scope: Vec<String>,
@@ -4522,8 +4707,29 @@ fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiF
     let mut facts = RustApiFacts::default();
     rust_collect_api_facts(source, root, file, &[], &mut facts);
     let mut owners = Vec::new();
+    let mut branch_values = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        // A conditional renderer can return a function path from a branch;
+        // that is a value reference, not a direct call or ordinary argument.
+        if node.kind() == "scoped_identifier"
+            && node.parent().is_some_and(|parent| {
+                (parent.kind() == "block"
+                    && parent.named_child(parent.named_child_count().saturating_sub(1) as u32)
+                        == Some(node))
+                    || (parent.kind() == "match_arm"
+                        && parent.child_by_field_name("value") == Some(node))
+            })
+        {
+            let full = node_text(source, node).to_string();
+            branch_values.push((
+                full.clone(),
+                full.rsplit("::").next().unwrap_or(&full).to_string(),
+                node.start_position().row as u32 + 1,
+                node.start_byte(),
+                node.end_byte(),
+            ));
+        }
         let owner = match node.kind() {
             "function_item" => rust_function_symbol_name(source, &node),
             "static_item" | "const_item" => node.child_by_field_name("name").map(|name| {
@@ -4551,6 +4757,7 @@ fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiF
     }
     facts.initializer_references = crate::calls::extract_rust_value_references(source, root)
         .into_iter()
+        .chain(branch_values)
         .map(|(full, name, line, start, end)| {
             let mut path = rust_path_segments(&full);
             path.pop();
@@ -7386,6 +7593,202 @@ mod tests {
             "{aggregate:#}"
         );
         assert_eq!(aggregate["excluded_test_count"], 2, "{aggregate:#}");
+    }
+
+    #[test]
+    fn own_accuracy_inline_platform_helpers_keep_their_call_chains_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { platform::copy(); }
+mod platform {
+    #[cfg(unix)]
+    pub fn copy() {}
+    #[cfg(windows)]
+    pub fn copy() { verify(); }
+    pub fn verify() { leaf(); }
+    pub fn leaf() {}
+    pub fn unused() {}
+}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_private_generic_read_path_keeps_handle_guard_live() {
+        let aggregate = stored_rust_fixture_scan(&[
+            (
+                "src/main.rs",
+                "mod read; mod guard; fn main() { read::read_exact(); }",
+            ),
+            (
+                "src/read.rs",
+                r#"
+pub fn read_exact() { read_with(|_| ()); }
+fn read_with<T>(consume: impl FnOnce(bool) -> T) -> T { consume(crate::guard::is_live()) }
+"#,
+            ),
+            (
+                "src/guard.rs",
+                "pub(crate) fn is_live() -> bool { false } pub(crate) fn unused() {}",
+            ),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/guard.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_exact_read_handle_guard_has_a_live_source_path() {
+        let aggregate = stored_rust_fixture_scan(&[
+            (
+                "src/main.rs",
+                "mod read; mod db { pub mod file_identity; } fn main() { read::read_exact(); }",
+            ),
+            (
+                "src/read.rs",
+                include_str!("../../commands/file_read_exact.rs"),
+            ),
+            (
+                "src/db/file_identity.rs",
+                "pub(crate) fn is_live_sqlite_handle() {}",
+            ),
+        ]);
+        assert!(
+            !aggregate_has_item(
+                &aggregate,
+                "src/db/file_identity.rs",
+                "is_live_sqlite_handle"
+            ),
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_selected_function_item_keeps_catalog_renderers_live() {
+        let aggregate = stored_rust_fixture_scan(&[
+            (
+                "src/main.rs",
+                r#"
+mod catalog;
+fn main() { let render = if true { catalog::normal } else { catalog::confined }; render(); }
+"#,
+            ),
+            (
+                "src/catalog.rs",
+                r#"
+pub(crate) fn normal() { text(); }
+pub(crate) fn confined() { text(); }
+fn text() {}
+pub(crate) fn unused() {}
+"#,
+            ),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/catalog.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_macro_callback_is_live_but_unused_sibling_is_dead() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { tokio::select! { reply = query() => { if reply.is_ok_and(ends_scope) {} } } }
+pub(crate) fn ends_scope() {}
+pub(crate) fn unused() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_cfg_variants_preserve_nested_and_parent_module_calls() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { replacement::copy(); }
+mod replacement {
+    #[cfg(unix)] pub(super) fn copy() { attrs::verify(); }
+    #[cfg(windows)] pub(super) fn copy() { windows::links(); super::recovery::protect(); }
+    #[cfg(not(any(unix, windows)))] pub(super) fn copy() {}
+    mod attrs {
+        #[cfg(target_os = "linux")] pub(crate) fn verify() {}
+        #[cfg(target_os = "macos")] pub(crate) fn verify() { leaf(); }
+        pub(crate) fn leaf() {}
+    }
+    mod windows { pub(super) fn links() {} }
+}
+mod recovery { pub(super) fn protect() {} }
+pub(crate) fn unused() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_macro_bound_callback_is_not_a_function_reference() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { let callback = false; tokio::select! { reply = query() => { reply.is_ok_and(callback); } } }
+pub(crate) fn callback() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::callback"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_accuracy_private_macro_hop_keeps_handle_guard_live() {
+        // Exercise the source fallback without callgraph edges for the opaque
+        // macros. The private intermediate is not a reportable export.
+        let aggregate = rust_entry_scan(
+            &[
+                (
+                    "src/main.rs",
+                    r#"
+mod guard;
+fn main() { tokio::select! { reply = work() => { read_with(); } } }
+fn read_with() { wrapper!(guard::is_live()); }
+"#,
+                ),
+                (
+                    "src/guard.rs",
+                    "pub(crate) fn is_live() {} pub(crate) fn unused() {}",
+                ),
+            ],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/guard.rs", "is_live", "function"),
+                ("src/guard.rs", "unused", "function"),
+            ],
+        );
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/guard.rs::unused"],
+            "{aggregate:#}"
+        );
     }
 
     #[test]

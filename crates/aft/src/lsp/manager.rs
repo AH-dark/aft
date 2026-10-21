@@ -3238,6 +3238,20 @@ impl LspManager {
         }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         self.send_due_rust_saves();
+        for (key, client) in &self.clients {
+            if client.uses_analysis_progress() {
+                diagnostics_changed |= if client.diagnostics_are_provisional() {
+                    self.diagnostics.mark_provisional_for_server(key)
+                } else if client.has_analysis_progress() {
+                    self.diagnostics.promote_provisional_through_epoch(
+                        key,
+                        client.analysis_progress_completed_epoch().unwrap_or(0),
+                    )
+                } else {
+                    self.diagnostics.promote_provisional_for_server(key)
+                };
+            }
+        }
         for client in self.clients.values_mut() {
             if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
                 && !client.diagnostics_are_provisional()
@@ -4840,9 +4854,26 @@ impl LspManager {
     /// know (never started, or exited since) is not warming and cannot block a
     /// quiescence wait.
     pub fn server_is_warming(&self, server: &ServerKey) -> bool {
+        self.clients.get(server).is_some_and(|client| {
+            client.diagnostics_are_provisional()
+                || (client.has_analysis_progress()
+                    && self.diagnostics.has_provisional_report_for_server(server))
+        })
+    }
+
+    pub(crate) fn analysis_progress_authority(&self, server: &ServerKey) -> Option<&'static str> {
         self.clients
             .get(server)
-            .is_some_and(|client| client.diagnostics_are_provisional())
+            .and_then(|client| client.analysis_progress_authority())
+    }
+
+    pub(crate) fn analysis_progress_certifies_file(&self, server: &ServerKey, file: &Path) -> bool {
+        self.clients.get(server).is_none_or(|client| {
+            !client.uses_analysis_progress()
+                || self
+                    .diagnostic_epoch(server, file)
+                    .is_some_and(|epoch| client.analysis_progress_certifies(epoch))
+        })
     }
 
     /// A producer has settled when it holds a current authoritative report or
@@ -4850,6 +4881,14 @@ impl LspManager {
     /// diagnostics freshness gate both use this predicate so a complete
     /// producer set cannot be judged incomplete by a second, stricter check.
     pub fn producer_has_settled(&self, server: &ServerKey) -> bool {
+        if self
+            .clients
+            .get(server)
+            .is_some_and(|client| client.uses_analysis_progress())
+            && self.server_is_warming(server)
+        {
+            return self.producer_failure(server).is_some();
+        }
         self.producer_failure(server).is_some()
             || self.has_authoritative_report_for_server(server)
             || !self.server_is_warming(server)
@@ -5008,12 +5047,37 @@ impl LspManager {
                 None
             }
             LspEvent::Notification {
-                server_kind: ServerKind::Rust,
+                server_kind,
                 root,
                 method,
                 params: Some(params),
             } if method == "$/progress" => {
-                self.handle_rust_progress(root.clone(), params);
+                if *server_kind == ServerKind::Rust {
+                    self.handle_rust_progress(root.clone(), params);
+                } else if let Some(client) = self.clients.get_mut(&ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                }) {
+                    if client.uses_analysis_progress() {
+                        client.record_analysis_progress(params, self.diagnostics.current_epoch());
+                    }
+                }
+                None
+            }
+            LspEvent::ServerRequest {
+                server_kind,
+                root,
+                method,
+                ..
+            } if method == "window/workDoneProgress/create" => {
+                if let Some(client) = self.clients.get_mut(&ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                }) {
+                    if client.uses_analysis_progress() {
+                        client.note_analysis_progress_support();
+                    }
+                }
                 None
             }
             LspEvent::ServerExited {
@@ -5188,10 +5252,9 @@ impl LspManager {
         // so observation sources can accept only reports that prove which
         // in-memory document state they describe. The earlier
         // `publish_with_kind` path silently dropped both facts.
-        let provisional = self
-            .clients
-            .get(&key)
-            .is_some_and(|client| client.diagnostics_are_provisional());
+        let provisional = self.clients.get(&key).is_some_and(|client| {
+            client.diagnostics_are_provisional() || client.has_analysis_progress()
+        });
         self.diagnostics.publish_full_with_provisional(
             key.clone(),
             file.clone(),

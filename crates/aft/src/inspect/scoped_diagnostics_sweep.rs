@@ -360,18 +360,20 @@ pub(crate) fn sweep_scoped_files(
     }
 
     let rust_producers = involved
-        .into_iter()
+        .iter()
+        .cloned()
         .filter(|key| key.kind == ServerKind::Rust)
         .collect::<Vec<_>>();
     loop {
-        let (checking, unreported) = {
+        let (checking, unreported, analysis_pending) = {
             let mut lsp = ctx.lsp();
             lsp.drain_events();
             waiting.retain(|(file, key, before)| {
                 lsp.has_client(key)
-                    && !lsp
-                        .diagnostic_epoch(key, file)
-                        .is_some_and(|epoch| before.is_none_or(|before| epoch > before))
+                    && (!lsp.analysis_progress_certifies_file(key, file)
+                        || !lsp
+                            .diagnostic_epoch(key, file)
+                            .is_some_and(|epoch| before.is_none_or(|before| epoch > before)))
             });
             let mut checking = Vec::new();
             let mut unreported = Vec::new();
@@ -385,20 +387,35 @@ pub(crate) fn sweep_scoped_files(
                     RustCheckState::Unreported => unreported.push(key.clone()),
                 }
             }
-            (checking, unreported)
+            let analysis_pending = involved
+                .iter()
+                .filter(|key| {
+                    lsp.analysis_progress_authority(key) == Some("analysis_progress_pending")
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            (checking, unreported, analysis_pending)
         };
-        if waiting.is_empty() && checking.is_empty() {
+        if waiting.is_empty() && checking.is_empty() && analysis_pending.is_empty() {
             sweep.still_checking = unreported.into_iter().collect();
             break;
         }
         let now = Instant::now();
         if now >= deadline || cancellation_requested() {
             for (file, key, _) in waiting {
-                sweep
-                    .unanswered
-                    .insert(file, (key, NO_PUBLISH_REASON.to_string()));
+                let reason = if !ctx.lsp().analysis_progress_certifies_file(&key, &file) {
+                    "analysis_progress_pending: the server has not completed analysis after didOpen; retry aft_inspect"
+                } else {
+                    NO_PUBLISH_REASON
+                };
+                sweep.unanswered.insert(file, (key, reason.to_string()));
             }
             sweep.still_checking = checking.into_iter().chain(unreported).collect();
+            for (file, keys) in &selected {
+                if let Some(key) = keys.iter().find(|key| analysis_pending.contains(*key)) {
+                    sweep.unanswered.insert(file.clone(), (key.clone(), "analysis_progress_pending: the server has not completed analysis of its published reports; retry aft_inspect".into()));
+                }
+            }
             break;
         }
         std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));

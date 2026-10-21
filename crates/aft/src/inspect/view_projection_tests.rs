@@ -4,18 +4,25 @@ fn view_projection_fixture() -> (
     InspectJob,
     crate::views::assembly::AssemblyRequest,
 ) {
+    view_projection_fixture_with_files(&[
+        ("main.ts", "import { used } from './target';\nexport function main() { used(); }\nmain();\n"),
+        ("target.ts", "export function used() {}\nexport function dead() {}\n"),
+    ])
+}
+
+fn view_projection_fixture_with_files(files: &[(&str, &str)]) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    InspectJob,
+    crate::views::assembly::AssemblyRequest,
+) {
     let _ = env_logger::builder().is_test(true).try_init();
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(project.path()).unwrap();
-    write_projection_cache_file(
-        &root.join("main.ts"),
-        "import { used } from './target';\nexport function main() { used(); }\nmain();\n",
-    );
-    write_projection_cache_file(
-        &root.join("target.ts"),
-        "export function used() {}\nexport function dead() {}\n",
-    );
+    for (file, source) in files {
+        write_projection_cache_file(&root.join(file), source);
+    }
     for args in [
         vec!["init", "--quiet"],
         vec!["add", "."],
@@ -61,6 +68,46 @@ fn view_projection_fixture() -> (
         callgraph: true,
     };
     (project, storage, job, request)
+}
+
+#[test]
+fn own_accuracy_view_keeps_platform_branches_and_handle_guard_live() {
+    let (_project, _storage, mut job, request) = view_projection_fixture_with_files(&[
+        ("Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        ("src/main.rs", r#"
+mod read; mod edit; mod db { pub mod file_identity; }
+fn main() { platform::copy(); read::read_exact(); edit::atomic_write_source(); }
+mod platform {
+    #[cfg(unix)] pub fn copy() {}
+    #[cfg(windows)] pub fn copy() { verify(); }
+    pub fn verify() { leaf(); }
+    pub fn leaf() {}
+    pub fn unused() {}
+}
+"#),
+        ("src/read.rs", include_str!("../commands/file_read_exact.rs")),
+        ("src/edit.rs", include_str!("../edit.rs")),
+        ("src/db/file_identity.rs", "pub(crate) fn is_live_sqlite_handle() {}"),
+    ]);
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files);
+    assert!(job.callgraph_snapshot.is_some());
+    let result = crate::inspect::scanners::dead_code::run_dead_code_scan(&job);
+    let aggregate = result.outcome.unwrap().aggregate;
+    for (file, symbol) in [
+        ("src/main.rs", "verify"),
+        ("src/main.rs", "leaf"),
+        ("src/db/file_identity.rs", "is_live_sqlite_handle"),
+        ("src/edit.rs", "link_count"),
+        ("src/edit.rs", "copy_platform_security"),
+        ("src/edit.rs", "platform_acls_match"),
+        ("src/edit.rs", "extended_acl_text"),
+        ("src/edit.rs", "clear_extended_acl"),
+        ("src/edit.rs", "copy_protected"),
+    ] {
+        assert!(!aggregate["items"].as_array().unwrap().iter().any(|item| item["file"] == file && item["symbol"] == symbol), "{aggregate:#}");
+    }
+    assert!(aggregate["items"].as_array().unwrap().iter().any(|item| item["file"] == "src/main.rs" && item["symbol"] == "unused"), "{aggregate:#}");
 }
 
 #[test]

@@ -710,8 +710,71 @@ pub(crate) struct RustWorkspaceState {
     check_begins_at_load: u64,
 }
 
+/// Per-server work-done runs used to certify background analysis.
+#[derive(Default)]
+struct WorkDoneAnalysis {
+    active: std::collections::HashSet<String>,
+    observed: bool,
+    opened_at: Option<Instant>,
+    // The manager records the last diagnostics-store epoch when END arrives.
+    // A later publication cannot borrow authority from that earlier END.
+    completed_through_epoch: Option<u64>,
+}
+
+impl WorkDoneAnalysis {
+    // A server that does not implement analysis progress retains first-publish
+    // authority after this negotiation grace. Once progress is observed, an
+    // unfinished or missing run cannot fall back to that weaker rule.
+    const GRACE: Duration = Duration::from_secs(2);
+
+    fn opened(&mut self) {
+        self.opened_at = Some(Instant::now());
+    }
+
+    fn record(&mut self, token: String, kind: &str, diagnostics_epoch: u64) {
+        match kind {
+            "begin" => {
+                self.observed = true;
+                self.active.insert(token);
+            }
+            "end" => {
+                if self.active.remove(&token) {
+                    if self.active.is_empty() {
+                        self.completed_through_epoch = Some(diagnostics_epoch);
+                        self.opened_at = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pending(&self) -> bool {
+        !self.active.is_empty()
+            || self
+                .opened_at
+                .is_some_and(|at| self.observed || at.elapsed() < Self::GRACE)
+    }
+
+    fn authority(&self) -> &'static str {
+        if self.pending() {
+            "analysis_progress_pending"
+        } else if self.observed {
+            "work_done_progress"
+        } else {
+            "first_publish_no_analysis_progress"
+        }
+    }
+
+    fn certifies(&self, epoch: u64) -> bool {
+        !self.pending()
+            && (!self.observed || self.completed_through_epoch.is_some_and(|end| epoch <= end))
+    }
+}
+
 /// A client connected to one language server process.
 pub struct LspClient {
+    analysis_progress: WorkDoneAnalysis,
     pub(crate) runtime_note: Option<String>,
     pub(crate) rust_cargo_disabled_for_worker: bool,
     kind: ServerKind,
@@ -1136,6 +1199,7 @@ impl LspClient {
             diagnostic_caps: None,
             rust_analyzer_quiescent,
             rust_analyzer_failure: None,
+            analysis_progress: WorkDoneAnalysis::default(),
             rust_analyzer_warning: None,
             rust_workspace_check_owed_since: None,
             rust_flycheck_running: HashMap::new(),
@@ -1269,10 +1333,11 @@ impl LspClient {
         if let Some(initialization_options) = initialization_options {
             params_value["initializationOptions"] = initialization_options;
         }
-        if matches!(&self.kind, ServerKind::Rust) {
-            // rust-analyzer reports its `cargo check` runs only to clients that
-            // accept server-initiated progress. Inspect needs those begin/end
-            // events to know when compiler errors have been published.
+        if matches!(&self.kind, ServerKind::Rust | ServerKind::Python)
+            || matches!(&self.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+        {
+            // rust-analyzer's compiler checks and Pyright's background analysis
+            // need server-initiated progress so inspect can wait for completion.
             params_value["capabilities"]["window"] = json!({ "workDoneProgress": true });
         }
 
@@ -1330,12 +1395,49 @@ impl LspClient {
         self.diagnostic_caps.as_ref()
     }
 
-    /// Whether diagnostics from this server instance should be treated as
-    /// provisional because rust-analyzer is warming or reported failed analysis.
+    /// Whether this server is still analyzing: Rust uses workspace/check state;
+    /// enabled background-analysis producers use their work-done progress.
     pub fn diagnostics_are_provisional(&self) -> bool {
         self.is_unresponsive()
+            || (self.uses_analysis_progress() && self.analysis_progress.pending())
             || (matches!(&self.kind, ServerKind::Rust)
                 && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some()))
+    }
+
+    pub(crate) fn uses_analysis_progress(&self) -> bool {
+        matches!(self.kind, ServerKind::Python)
+            || matches!(&self.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+    }
+
+    pub(crate) fn analysis_progress_authority(&self) -> Option<&'static str> {
+        self.uses_analysis_progress()
+            .then(|| self.analysis_progress.authority())
+    }
+
+    pub(crate) fn record_analysis_progress(&mut self, params: &Value, diagnostics_epoch: u64) {
+        if let (Some(token), Some(kind)) = (
+            params.get("token"),
+            params.pointer("/value/kind").and_then(Value::as_str),
+        ) {
+            self.analysis_progress
+                .record(token.to_string(), kind, diagnostics_epoch);
+        }
+    }
+
+    pub(crate) fn analysis_progress_certifies(&self, epoch: u64) -> bool {
+        !self.uses_analysis_progress() || self.analysis_progress.certifies(epoch)
+    }
+
+    pub(crate) fn analysis_progress_completed_epoch(&self) -> Option<u64> {
+        self.analysis_progress.completed_through_epoch
+    }
+
+    pub(crate) fn has_analysis_progress(&self) -> bool {
+        self.uses_analysis_progress() && self.analysis_progress.observed
+    }
+
+    pub(crate) fn note_analysis_progress_support(&mut self) {
+        self.analysis_progress.observed = true;
     }
 
     pub(crate) fn diagnostic_failure(&self) -> Option<&str> {
@@ -1844,7 +1946,11 @@ impl LspClient {
     {
         self.ensure_can_send()?;
         let notification = Notification::new(N::METHOD, Some(serde_json::to_value(params)?));
-        self.writer.send(serde_json::to_string(&notification)?)
+        self.writer.send(serde_json::to_string(&notification)?)?;
+        if N::METHOD == "textDocument/didOpen" && self.uses_analysis_progress() {
+            self.analysis_progress.opened();
+        }
+        Ok(())
     }
 
     /// Write an already serialized notification.
@@ -2521,6 +2627,36 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_progress_end_before_publication_cannot_certify_the_report() {
+        let mut progress = WorkDoneAnalysis::default();
+        progress.record("old".into(), "begin", 0);
+        progress.opened();
+        progress.record("old".into(), "end", 1);
+        assert!(!progress.certifies(2));
+        progress.record("new".into(), "begin", 2);
+        progress.record("new".into(), "end", 2);
+        assert!(progress.certifies(2));
+        assert_eq!(progress.authority(), "work_done_progress");
+    }
+
+    #[test]
+    fn analysis_progress_nested_tokens_and_no_progress_fallback_are_distinct() {
+        let mut progress = WorkDoneAnalysis::default();
+        progress.opened();
+        progress.opened_at = Some(Instant::now() - WorkDoneAnalysis::GRACE);
+        assert_eq!(progress.authority(), "first_publish_no_analysis_progress");
+        progress.record("outer".into(), "begin", 0);
+        progress.record("inner".into(), "begin", 0);
+        progress.record("inner".into(), "end", 1);
+        assert!(progress.pending());
+        progress.record("outer".into(), "end", 1);
+        assert!(!progress.pending());
+        progress.opened();
+        progress.opened_at = Some(Instant::now() - WorkDoneAnalysis::GRACE);
+        assert_eq!(progress.authority(), "analysis_progress_pending");
+    }
     // Only the Unix-gated reap tests below spawn real children and name paths.
     #[cfg(unix)]
     use std::collections::HashMap;

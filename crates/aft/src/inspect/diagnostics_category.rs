@@ -165,6 +165,7 @@ struct DiagnosticsCollection {
     /// change the warm working set's diagnostics authority rules.
     producer_failure_files: HashMap<ServerKey, Vec<PathBuf>>,
     producer_notes: BTreeSet<String>,
+    producer_authority: Vec<(String, PathBuf, String)>,
     /// Servers with a root marker but no file to analyze, keyed by server id.
     /// Informational only: an inapplicable server is neither a failure nor a
     /// gap, so it never makes the payload incomplete.
@@ -203,10 +204,12 @@ struct DiagnosticsCollection {
 ///
 /// The authority halves differ by design. An unscoped request makes a
 /// full-root claim. Rust needs current reports or a completed current compiler
-/// check; an idle pre-begin Current state is not check authority. Non-Rust
-/// producers retain the settlement contract: an authoritative report or a
+/// check; an idle pre-begin Current state is not check authority. Pyright and
+/// basedpyright require a work-done END following each file's publication, or
+/// explicitly disclose first-publish fallback when no progress is supported.
+/// Other producers retain the settlement contract: an authoritative report or a
 /// non-warming successful client certifies the warm working set, not unopened
-/// files. This applies to TypeScript, Biome, oxlint, pyright, YAML and bash.
+/// files. This applies to TypeScript, Biome, oxlint, YAML and bash.
 /// A scoped request
 /// makes per-file claims: every scoped file must either carry an
 /// authoritative producer report or appear as a named gap, because a
@@ -321,6 +324,16 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|(server, reason)| ((server_id(server), server.root.clone()), reason.clone()))
         .collect();
+    for key in expected_producers {
+        if let Some(authority) = ctx.lsp().analysis_progress_authority(key) {
+            collection.producer_authority.push((
+                server_id(key),
+                key.root.clone(),
+                authority.to_string(),
+            ));
+            collection.producer_notes.insert(format!("{} @ {}: diagnostics authority={authority} (servers without analysis progress use first-publish authority after a 2s grace)", server_id(key), display_root(snapshot, &key.root)));
+        }
+    }
     // A producer whose `cargo check` was still running is not indexing. Its
     // gap moves from `indexing_gaps` to `checking_producers`, so it is not
     // treated as a warming server, whose provisional rows would be shown.
@@ -1029,10 +1042,14 @@ impl DiagnosticsCollection {
             }
             // Rust pushes in pull mode carry only compiler results, and
             // TypeScript pushes can carry only syntax results. Neither answers
-            // an explicit diagnostics request that failed during this sweep.
+            // a failed explicit request; unfinished Python analysis is also
+            // a per-file obligation that a provisional push cannot discharge.
             if let Some((key, reason)) = sweep
                 .and_then(|sweep| sweep.unanswered.get(file))
-                .filter(|(key, _)| matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript))
+                .filter(|(key, reason)| {
+                    matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript)
+                        || reason.starts_with("analysis_progress_pending:")
+                })
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
                     file: file.clone(),
@@ -1342,6 +1359,15 @@ impl DiagnosticsCollection {
                     })
                     .collect(),
             );
+        }
+        for (producer, root, rule) in self.producer_authority {
+            let authority = &mut payload["by_producer"][&producer]["authority"];
+            if !authority.is_array() {
+                *authority = serde_json::json!([]);
+            }
+            authority.as_array_mut().unwrap().push(serde_json::json!({
+                "root": display_root(snapshot, &root), "rule": rule, "no_progress_grace_ms": 2000,
+            }));
         }
         payload
     }

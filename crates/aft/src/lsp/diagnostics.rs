@@ -64,9 +64,9 @@ pub struct DiagnosticEntry {
     /// in the store so resultIds and server coverage are not lost, but warm
     /// readers must not count or display them as current diagnostics.
     pub stale: bool,
-    /// True while rust-analyzer has not reported that its workspace analysis is
-    /// quiescent. These diagnostics are useful leads, but are not authoritative
-    /// enough to contribute to counts until the server has settled.
+    /// True until the server has certified its background analysis, through
+    /// Rust workspace/check state or an enabled work-done completion barrier.
+    /// Provisional diagnostics are leads, not authoritative counts.
     pub provisional: bool,
 }
 
@@ -829,14 +829,45 @@ impl DiagnosticsStore {
         true
     }
 
-    /// Promote the latest provisional report for each file when its server reaches
-    /// quiescence. Each store entry is already the server's latest replacement
-    /// publish, so the settle boundary makes it authoritative without requiring a
-    /// later publish. Independent watcher staleness is preserved.
+    /// Keep existing reports provisional while their server analyzes new opens.
+    pub fn mark_provisional_for_server(&mut self, key: &ServerKey) -> bool {
+        let mut changed = false;
+        for ((server, _), entry) in &mut self.entries {
+            if server == key && !entry.provisional {
+                entry.provisional = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        changed
+    }
+
     pub fn promote_provisional_for_server(&mut self, key: &ServerKey) -> bool {
+        self.promote_provisional_through_epoch(key, u64::MAX)
+    }
+
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.next_epoch
+    }
+
+    pub(crate) fn has_provisional_report_for_server(&self, key: &ServerKey) -> bool {
+        self.entries
+            .iter()
+            .any(|((server, _), entry)| server == key && entry.provisional)
+    }
+
+    /// Only publications preceding the server's analysis end are certified by
+    /// that end. A later publication needs a later completed analysis run.
+    pub(crate) fn promote_provisional_through_epoch(
+        &mut self,
+        key: &ServerKey,
+        end_epoch: u64,
+    ) -> bool {
         let mut changed = false;
         for ((stored_key, _), entry) in &mut self.entries {
-            if stored_key == key && entry.provisional {
+            if stored_key == key && entry.provisional && entry.epoch <= end_epoch {
                 entry.provisional = false;
                 changed = true;
             }

@@ -1327,6 +1327,10 @@ pub(crate) fn main() -> io::Result<()> {
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
                 "initialized" => {
+                    if std::env::var("AFT_FAKE_LSP_ANALYSIS_PROGRESS").ok().as_deref() == Some("already_running") {
+                        write_request(&mut writer, 20_000, "window/workDoneProgress/create", json!({"token": 17}))?;
+                        write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "begin", "title": "Analysis"}}))))?;
+                    }
                     let server_status_mode = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok();
                     if cargo_lock_status_mode() {
                         last_load_stale = cargo_lock_is_stale(workspace_root.as_deref());
@@ -1406,6 +1410,35 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if let Ok(mode) = std::env::var("AFT_FAKE_LSP_ANALYSIS_PROGRESS") {
+                        // Model an empty startup report arriving before the
+                        // server's background analysis has even started.
+                        write_publish_diagnostics_versioned(&mut writer, uri.clone(), json!([]), version.clone())?;
+                        if mode != "already_running" {
+                            write_request(&mut writer, 20_000, "window/workDoneProgress/create", json!({"token": 17}))?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "begin", "title": "Analysis"}}))))?;
+                        }
+                        if mode == "end_before_publication" {
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
+                            write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
+                            continue;
+                        }
+                        if mode == "new_begin" {
+                            write_publish_diagnostics_versioned(&mut writer, uri.clone(), opened_diagnostics(), version.clone())?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": "next", "value": {"kind": "begin", "title": "Analysis"}}))))?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
+                            std::thread::sleep(std::time::Duration::from_millis(600));
+                            write_publish_diagnostics_versioned(&mut writer, uri, changed_diagnostics(), version)?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": "next", "value": {"kind": "end"}}))))?;
+                            continue;
+                        }
+                        if mode != "never" {
+                            std::thread::sleep(std::time::Duration::from_millis(600));
+                            write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
+                        }
+                        continue;
+                    }
                     if let Some(uri) = uri.as_str() {
                         open_documents
                             .insert(uri.to_string(), (opened_diagnostics(), version.clone()));

@@ -4776,6 +4776,103 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
     );
 }
 
+fn python_progress_fixture(mode: Option<&str>) -> (tempfile::TempDir, AppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = 'progress-fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("broken.py"), "value: int = 'wrong'\n").unwrap();
+    let ctx = configured_context_with_diagnostics_timeout(&root, 3000);
+    ctx.lsp()
+        .override_binary(ServerKind::Python, fake_server_path());
+    if let Some(mode) = mode {
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_ANALYSIS_PROGRESS", mode);
+    }
+    (dir, ctx)
+}
+
+#[test]
+fn scoped_python_progress_waits_past_startup_empty_publication() {
+    let (_dir, ctx) = python_progress_fixture(Some("finish"));
+    let response = scoped_diagnostics_inspect(&ctx, "python-progress-finish", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
+#[test]
+fn scoped_python_progress_without_end_is_pending_not_clean() {
+    let (_dir, ctx) = python_progress_fixture(Some("never"));
+    let response = scoped_diagnostics_inspect(&ctx, "python-progress-never", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert!(
+        response.to_string().contains("analysis_progress_pending"),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_python_progress_unsupported_retains_first_publication() {
+    let (_dir, ctx) = python_progress_fixture(None);
+    let response = scoped_diagnostics_inspect(&ctx, "python-progress-unsupported", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["python"]["authority"][0]["rule"],
+        "first_publish_no_analysis_progress",
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_python_progress_end_before_post_open_publication_is_pending() {
+    let (_dir, ctx) = python_progress_fixture(Some("end_before_publication"));
+    let response = scoped_diagnostics_inspect(&ctx, "python-progress-early-end", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert!(
+        response.to_string().contains("analysis_progress_pending"),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_python_progress_new_begin_waits_for_its_own_end() {
+    let (_dir, ctx) = python_progress_fixture(Some("new_begin"));
+    let response = scoped_diagnostics_inspect(&ctx, "python-progress-new-begin", "broken.py");
+    assert_eq!(
+        diagnostic_messages_for(&response, "broken.py"),
+        vec!["test diagnostic after change"],
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
+#[test]
+fn scoped_python_progress_existing_run_certifies_later_opened_files() {
+    let (_dir, ctx) = python_progress_fixture(Some("already_running"));
+    let response = scoped_diagnostics_inspect(&ctx, "python-progress-existing-run", "broken.py");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
 /// Drain events until the fake reports the `didClose` and then sends the
 /// publish that follows it.
 fn wait_for_close_reply(ctx: &AppContext) {
