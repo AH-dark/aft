@@ -98,6 +98,59 @@ pub struct PreparedAssembly {
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
+    settlement: Option<StatusSettlement>,
+}
+
+/// The path-status changes a complete assembly computed: pending rows to
+/// clear and call-graph skips to record or drop. They describe the generation
+/// being prepared, so they are applied only once that generation is the one
+/// served: after its publication succeeds, or when the publication is a no-op
+/// because the current generation already has the same manifest. A build that
+/// fails, is cancelled, is dropped uncommitted or loses the publication race
+/// drops them, so status keeps describing the generation still served.
+struct StatusSettlement {
+    view_dir: PathBuf,
+    root: PathBuf,
+    generation: u64,
+    /// Members whose pending rows clear: every member without outstanding
+    /// semantic work.
+    joined: Vec<Vec<u8>>,
+    /// Paths that stay pending because their semantic work is outstanding.
+    /// Every other pending row is settled.
+    keep_pending: BTreeSet<Vec<u8>>,
+    /// Skip outcomes for members whose content was read afresh.
+    fresh_skips: Vec<(Vec<u8>, Option<SkipReason>)>,
+    /// Members of the generation; skips for any other path are dropped.
+    members: std::collections::HashSet<Vec<u8>>,
+}
+
+impl StatusSettlement {
+    fn apply(self) -> std::result::Result<(), crate::path_status::PathStatusError> {
+        let mut status = PathStatusStore::open(&self.view_dir)?;
+        status.clear_many(self.joined.iter().map(Vec::as_slice))?;
+        // Clearing members is not enough: configure schedules every HEAD path
+        // pending, and assembly skips HEAD paths that are not view members
+        // (deleted from the checkout, excluded by the project content rules).
+        // Paths that left HEAD since they were scheduled are not visited at
+        // all. No later publication revisits them, so settle every pending
+        // row whose path has no outstanding semantic work.
+        let settled_non_members = status.clear_pending_except(&self.keep_pending)?;
+        if settled_non_members > 0 {
+            crate::slog_info!(
+                "content-addressed view publication settled {} pending path(s) that are not view members root={}",
+                settled_non_members,
+                self.root.display()
+            );
+        }
+        status.record_skips(
+            self.fresh_skips
+                .iter()
+                .map(|(path, reason)| (path.as_slice(), *reason)),
+            self.generation,
+        )?;
+        status.retain_skips(|path| self.members.contains(path))?;
+        Ok(())
+    }
 }
 
 impl PreparedAssembly {
@@ -134,14 +187,23 @@ impl PreparedAssembly {
                         );
                     }
                     self.profile.outcome = "published";
+                    self.settle_status();
                 }
                 PublishOutcome::Conflict { current_generation } => {
                     self.profile.outcome = "conflict";
+                    // Another generation won; this one's status changes do
+                    // not describe it.
+                    self.settlement = None;
                     return Err(ViewError::InvalidManifest(format!(
                         "publication base changed to {current_generation:?}"
                     )));
                 }
             }
+        } else {
+            // Nothing to publish. A settlement here belongs to a no-op whose
+            // manifest equals the current generation's, so it describes the
+            // generation being served and applies as is.
+            self.settle_status();
         }
         self.profile.finish();
         Ok(AssemblyReport {
@@ -152,6 +214,23 @@ impl PreparedAssembly {
             pending_inputs: std::mem::take(&mut self.report.pending_inputs),
             published: self.report.published,
         })
+    }
+
+    /// Applies the prepared path-status changes once their generation is the
+    /// one served. The generation is already current, so a status write that
+    /// fails does not fail the publication: it is logged, the steps before it
+    /// stay applied and the rest are skipped, and the next publication of the
+    /// view (a no-op included) computes and applies them again.
+    fn settle_status(&mut self) {
+        if let Some(settlement) = self.settlement.take() {
+            let root = settlement.root.clone();
+            if let Err(error) = settlement.apply() {
+                log::warn!(
+                    "views: root={} path status not updated after publication: {error}",
+                    root.display()
+                );
+            }
+        }
     }
 }
 
@@ -520,6 +599,7 @@ pub fn prepare_checkout_deferring(
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
+        settlement: None,
     };
     prepared.profile.enter(1, phase)?;
     timing.phase("assembly_pin");
@@ -590,6 +670,7 @@ pub fn prepare_checkout_deferring(
             generation_number(&next_generation),
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    drop(status);
     prepared.report.pending_inputs = pending_inputs;
     if !blocking_paths.is_empty() {
         prepared.profile.outcome = "pending";
@@ -600,49 +681,26 @@ pub fn prepare_checkout_deferring(
             .collect();
         return Ok(prepared);
     }
-    status
-        .clear_many(
-            candidates
-                .iter()
-                .map(|candidate| candidate.path.as_bytes())
-                .filter(|path| !semantic_pending_paths.contains(*path)),
-        )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    // Clearing candidates is not enough: configure schedules every HEAD path
-    // pending, and the loop above skips HEAD paths that are not view members
-    // (deleted from the checkout, excluded by the project content rules). Paths
-    // that left HEAD since they were scheduled are not visited at all. None of
-    // them is revisited by a later publication, so settle every pending
-    // annotation whose path has no outstanding semantic work.
-    let settled_non_members = status
-        .clear_pending_except(&semantic_pending_paths)
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    if settled_non_members > 0 {
-        crate::slog_info!(
-            "content-addressed view publication settled {} pending path(s) that are not view members root={}",
-            settled_non_members,
-            request.project_root.display()
-        );
-    }
-    // Skips describe members of the generation, so they are recorded only
-    // when a complete generation is assembled, and dropped for paths that
-    // are no longer members.
-    status
-        .record_skips(
-            fresh_skips
-                .iter()
-                .map(|(path, reason)| (path.as_slice(), *reason)),
-            generation_number(&next_generation),
-        )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let members = candidates
-        .iter()
-        .map(|candidate| candidate.path.as_bytes())
-        .collect::<std::collections::HashSet<_>>();
-    status
-        .retain_skips(|path| members.contains(path))
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    drop(members);
+    // A complete generation is assembled. Its status changes wait in the
+    // prepared assembly until the generation is the one served; see
+    // `StatusSettlement`.
+    prepared.settlement = Some(StatusSettlement {
+        view_dir: view.view_dir().to_path_buf(),
+        root: request.project_root.clone(),
+        generation: generation_number(&next_generation),
+        joined: candidates
+            .iter()
+            .map(|candidate| candidate.path.as_bytes())
+            .filter(|path| !semantic_pending_paths.contains(*path))
+            .map(<[u8]>::to_vec)
+            .collect(),
+        keep_pending: semantic_pending_paths.clone(),
+        fresh_skips,
+        members: candidates
+            .iter()
+            .map(|candidate| candidate.path.as_bytes().to_vec())
+            .collect(),
+    });
     timing.phase("path_status");
     prepared.report.pending_paths = semantic_pending_paths;
 
@@ -1838,3 +1896,144 @@ pub(super) mod worker_seed;
 #[cfg(test)]
 #[path = "worker_seed_tests.rs"]
 mod worker_seed_tests;
+
+/// Path status describes the generation being served, so a publication's
+/// status changes land only with the generation they describe.
+#[cfg(test)]
+mod status_settlement_tests {
+    use super::*;
+
+    const FAMILY: &str = "settle-family";
+    const SCOPE: &str = "settle-scope";
+
+    fn git(project: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .current_dir(project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn request(project: &Path, storage: &Path, head: &str) -> AssemblyRequest {
+        AssemblyRequest {
+            storage: storage.to_path_buf(),
+            project_root: project.to_path_buf(),
+            family: FAMILY.into(),
+            scope: SCOPE.into(),
+            desired_head: head.into(),
+            changed_paths: Default::default(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        }
+    }
+
+    fn status(storage: &Path) -> PathStatusStore {
+        let view = ViewStore::open(storage, SCOPE).unwrap();
+        PathStatusStore::open(view.view_dir()).unwrap()
+    }
+
+    fn skips(storage: &Path) -> BTreeMap<String, usize> {
+        status(storage).summary().unwrap().skipped_by_reason
+    }
+
+    fn pending(storage: &Path) -> usize {
+        status(storage).summary().unwrap().pending_count
+    }
+
+    /// A skip recorded for the served generation stays while a publication
+    /// that would clear it is cancelled or dropped before it publishes, and
+    /// so does a pending row it would settle. The first publication that
+    /// succeeds applies both; a later no-op publication settles too, because
+    /// its manifest is the served one.
+    #[test]
+    fn views_status_changes_wait_for_their_generation_to_publish() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        // 0xe9 is "é" in Latin-1 and an invalid byte in UTF-8.
+        fs::write(root.join("latin1.py"), b"def caf\xe9():\n    pass\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "latin1",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        assert!(
+            publish_checkout(&request(&root, storage.path(), "head-1"))
+                .unwrap()
+                .published
+        );
+        let skipped = BTreeMap::from([("non_utf8_source".to_string(), 1)]);
+        assert_eq!(skips(storage.path()), skipped);
+
+        // The file becomes readable, and a scheduled path that is not a
+        // member waits for a complete publication to settle it.
+        fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
+        status(storage.path())
+            .mark_pending(b"gone.ts", "view publication scheduled", 1)
+            .unwrap();
+
+        // Cancelled at the last phase before the pointer swap.
+        let cancelled = prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |phase| {
+            if phase == "cas" {
+                Err(ViewError::InvalidManifest("cancelled".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(
+            skips(storage.path()),
+            skipped,
+            "cancelled build changed status"
+        );
+        assert_eq!(
+            pending(storage.path()),
+            1,
+            "cancelled build settled a pending row"
+        );
+
+        // Fully prepared, then dropped without publishing (for example when
+        // the configuration changes before the prepared build is committed).
+        let prepared =
+            prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |_| Ok(())).unwrap();
+        drop(prepared);
+        assert_eq!(
+            skips(storage.path()),
+            skipped,
+            "unpublished build changed status"
+        );
+        assert_eq!(
+            pending(storage.path()),
+            1,
+            "unpublished build settled a pending row"
+        );
+
+        assert!(
+            publish_checkout(&request(&root, storage.path(), "head-2"))
+                .unwrap()
+                .published
+        );
+        assert!(skips(storage.path()).is_empty());
+        assert_eq!(pending(storage.path()), 0);
+
+        // A no-op publication describes the served generation: it settles.
+        status(storage.path())
+            .mark_pending(b"also_gone.ts", "view publication scheduled", 2)
+            .unwrap();
+        let report = publish_checkout(&request(&root, storage.path(), "head-2")).unwrap();
+        assert!(!report.published, "expected a no-op publication");
+        assert_eq!(pending(storage.path()), 0);
+    }
+}
