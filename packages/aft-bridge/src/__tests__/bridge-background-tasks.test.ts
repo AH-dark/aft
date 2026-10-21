@@ -124,18 +124,12 @@ describe("BinaryBridge background task accounting", () => {
 
 describe("BinaryBridge background task accounting on bridge death", () => {
   function deathInternals(bridge: BinaryBridge): {
-    handleTimeout(
-      trigger: { requestId: string; tool: string; generation: number },
-      triggeringSessionId?: string,
-    ): void;
+    killHungChild(attribution: string, sessionId: string | undefined): void;
     handleCrash(cause?: Error): void;
     rejectAllPending(error: Error): void;
   } {
     return bridge as unknown as {
-      handleTimeout(
-        trigger: { requestId: string; tool: string; generation: number },
-        triggeringSessionId?: string,
-      ): void;
+      killHungChild(attribution: string, sessionId: string | undefined): void;
       handleCrash(cause?: Error): void;
       rejectAllPending(error: Error): void;
     };
@@ -158,7 +152,7 @@ describe("BinaryBridge background task accounting on bridge death", () => {
     expect(bridge.hasOutstandingBackgroundTasks()).toBe(false);
   });
 
-  test("timeout kill clears outstanding task ids", () => {
+  test("hang watchdog kill clears outstanding task ids", () => {
     const bridge = new BinaryBridge("/bin/false", { autoRestart: false });
     deliverResponse(bridge, "bash", {
       success: true,
@@ -167,7 +161,7 @@ describe("BinaryBridge background task accounting on bridge death", () => {
     });
     expect(bridge.hasOutstandingBackgroundTasks()).toBe(true);
 
-    deathInternals(bridge).handleTimeout({ requestId: "1", tool: "bash", generation: 1 });
+    deathInternals(bridge).killHungChild("test attribution", undefined);
     expect(bridge.hasOutstandingBackgroundTasks()).toBe(false);
   });
 });

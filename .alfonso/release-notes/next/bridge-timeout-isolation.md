@@ -1,0 +1,1 @@
+- A tool call that times out on the standalone bridge now fails on its own instead of restarting the shared AFT process and aborting other sessions' calls; AFT restarts only when it has gone completely silent, and a read, outline, zoom, grep, glob, search, callgraph or inspect cut off by that restart is retried once automatically.
