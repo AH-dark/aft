@@ -721,10 +721,13 @@ mod tests {
 
     #[test]
     fn worker_canary_metadata_exceptions_follow_data_denies_for_every_home() {
+        // Seatbelt profiles use macOS-style slash-separated paths. Construct them
+        // without `Path::join` so Windows keeps the same profile text.
         let paths = ["/Users/account", "/Users/daemon"].map(|home| {
-            Path::new(home)
-                .join(aft::worker_jail_canary::CANARY_DIR_FROM_HOME)
-                .join("canary")
+            std::path::PathBuf::from(format!(
+                "{home}/{}/canary",
+                aft::worker_jail_canary::CANARY_DIR_FROM_HOME
+            ))
         });
         let dirs = paths
             .iter()

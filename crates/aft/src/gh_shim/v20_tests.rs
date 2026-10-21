@@ -14,6 +14,70 @@ fn manifest() -> Manifest {
 fn planned(raw: &[&str]) -> Plan {
     plan(&args(raw), "cortexkit/aft").unwrap()
 }
+
+struct TestJqPathGuard {
+    original_path: Option<OsString>,
+    #[cfg(windows)]
+    original_pathext: Option<OsString>,
+}
+
+impl TestJqPathGuard {
+    fn prepend(directory: &std::path::Path) -> Self {
+        let original_path = std::env::var_os("PATH");
+        let mut paths = vec![directory.to_path_buf()];
+        if let Some(path) = &original_path {
+            paths.extend(std::env::split_paths(path));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+        #[cfg(windows)]
+        let original_pathext = {
+            let original = std::env::var_os("PATHEXT");
+            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+            original
+        };
+
+        Self {
+            original_path,
+            #[cfg(windows)]
+            original_pathext,
+        }
+    }
+}
+
+impl Drop for TestJqPathGuard {
+    fn drop(&mut self) {
+        match &self.original_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        #[cfg(windows)]
+        match &self.original_pathext {
+            Some(pathext) => std::env::set_var("PATHEXT", pathext),
+            None => std::env::remove_var("PATHEXT"),
+        }
+    }
+}
+
+fn write_crlf_jq_fixture(directory: &std::path::Path) {
+    #[cfg(windows)]
+    std::fs::write(
+        directory.join("jq.cmd"),
+        "@echo off\r\nmore >nul\r\necho A change\r\n",
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let jq = directory.join("jq");
+        std::fs::write(&jq, "#!/bin/sh\ncat >/dev/null\nprintf 'A change\\r\\n'\n").unwrap();
+        let mut permissions = std::fs::metadata(&jq).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(jq, permissions).unwrap();
+    }
+}
 fn reply(value: Value) -> ReadReply {
     ReadReply::Get(GetReply {
         status: 200,
@@ -441,6 +505,11 @@ fn v20_signed_read_class_cannot_add_unknown_rows_or_change_v19_writes() {
 
 #[test]
 fn v20_native_json_aliases_and_jq_render_from_constrained_gets() {
+    let _env_lock = crate::test_env::process_env_lock();
+    let jq_dir = tempfile::tempdir().unwrap();
+    write_crlf_jq_fixture(jq_dir.path());
+    let _jq_path = TestJqPathGuard::prepend(jq_dir.path());
+
     let (value, requests, _) = run_json(
         &[
             "run",

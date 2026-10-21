@@ -1040,6 +1040,18 @@ fn select_fields(value: &Value, fields: &str) -> Value {
     Value::Object(selected)
 }
 
+// Windows jq can translate LF to CRLF in text mode; gh's --jq output uses LF everywhere.
+fn normalize_jq_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte == b'\n' && normalized.last() == Some(&b'\r') {
+            normalized.pop();
+        }
+        normalized.push(byte);
+    }
+    normalized
+}
+
 fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Result<(), ReadError> {
     let bytes = serde_json::to_vec(value).map_err(|error| failed(error.to_string()))?;
     if let Some(filter) = jq {
@@ -1070,8 +1082,10 @@ fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Resul
             return Err(failed(String::from_utf8_lossy(&result.stderr).into_owned()));
         }
         written.map_err(|error| failed(error.to_string()))?;
+        // Keep filter output byte-for-byte except for CR bytes paired with LF.
+        let stdout = normalize_jq_newlines(&result.stdout);
         output
-            .write_all(&result.stdout)
+            .write_all(&stdout)
             .map_err(|error| failed(error.to_string()))?;
     } else {
         output
@@ -1534,5 +1548,15 @@ impl<W: Write> Write for LogFormatter<'_, W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
+    }
+}
+
+#[cfg(test)]
+mod newline_tests {
+    use super::normalize_jq_newlines;
+
+    #[test]
+    fn jq_crlf_is_normalized_without_changing_other_bytes() {
+        assert_eq!(normalize_jq_newlines(b"A\r\nB\nC\r"), b"A\nB\nC\r");
     }
 }
