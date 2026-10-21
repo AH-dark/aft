@@ -554,13 +554,19 @@ async fn grants_deleted_target_is_not_reprobed_or_regranted() {
     let target = wire.target.clone();
     std::fs::remove_dir_all(&target).unwrap();
     let marker = wire.revived.project_root.join("bash-ran");
-    wire.call_tool(
+    // The assertions below need each shell to finish inside its foreground
+    // reply. With the fixture's default 700 ms caller deadline, a slow sandbox
+    // launcher (seen on macOS CI) gets the call promoted to a background task
+    // before `touch` runs, and the reply arrives with no marker on disk.
+    let bash_deadline_ms = 30_000;
+    wire.call_tool_with_deadline(
         100,
         "bash",
         json!({"command":format!("touch '{}'", marker.display())}),
+        bash_deadline_ms,
     )
     .await;
-    let first = wire.reply(100, Duration::from_secs(5)).await.unwrap();
+    let first = wire.reply(100, Duration::from_secs(15)).await.unwrap();
     let first: Value = serde_json::from_slice(&first.body).unwrap();
     assert!(marker.exists(), "{first}");
     assert_eq!(first["structuredContent"]["success"], true, "{first}");
@@ -582,13 +588,14 @@ async fn grants_deleted_target_is_not_reprobed_or_regranted() {
     std::fs::create_dir(&target).unwrap();
     std::fs::write(target.join("probe.txt"), "replacement object").unwrap();
     std::fs::remove_file(&marker).unwrap();
-    wire.call_tool(
+    wire.call_tool_with_deadline(
         102,
         "bash",
         json!({"command":format!("touch '{}'", marker.display())}),
+        bash_deadline_ms,
     )
     .await;
-    let second = wire.reply(102, Duration::from_secs(5)).await.unwrap();
+    let second = wire.reply(102, Duration::from_secs(15)).await.unwrap();
     let second: Value = serde_json::from_slice(&second.body).unwrap();
     assert!(marker.exists(), "{second}");
     assert_eq!(second["structuredContent"]["success"], true, "{second}");
