@@ -21,7 +21,8 @@
     "annotations": {
       "calls_out": [],
       "called_by": []
-    }
+    },
+    "content_files": []
   },
   "ctx": {
     "agent_args": {

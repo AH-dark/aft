@@ -54,6 +54,10 @@
           }
         }
       }
+    ],
+    "content_files": [
+      "<PROJECT_ROOT>/src/main.ts",
+      "<PROJECT_ROOT>/docs/guide.md"
     ]
   },
   "ctx": {

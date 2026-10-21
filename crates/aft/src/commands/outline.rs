@@ -63,6 +63,7 @@ pub struct OutlineEntry {
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
+    super::read_manifest::normalize_response_content_files(req, ctx, &mut response.data);
     response
 }
 
@@ -71,7 +72,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(reference) = crate::revision_read::requested_ref(req) {
         return handle_revision_outline(req, ctx, reference);
     }
-    let excluded = excluded_read_paths(req);
+    let excluded = excluded_read_paths(req, ctx);
 
     if req
         .params
@@ -414,15 +415,25 @@ fn handle_revision_outline(req: &RawRequest, ctx: &AppContext, reference: &str) 
 
 /// Host adapters can re-render a held outline after applying their own read policy.
 /// This transport-only field is not part of the model-facing tool schema.
-fn excluded_read_paths(req: &RawRequest) -> HashSet<PathBuf> {
-    req.params
+fn excluded_read_paths(req: &RawRequest, ctx: &AppContext) -> HashSet<PathBuf> {
+    let mut excluded = HashSet::new();
+    for raw_path in req
+        .params
         .get("_exclude_read_paths")
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
-        .map(PathBuf::from)
-        .collect()
+    {
+        let path = PathBuf::from(raw_path);
+        excluded.insert(path.clone());
+        // Restricted reads can use a canonical path internally even when the
+        // host denied the file using the project-root path supplied by the caller.
+        if let Ok(canonical) = std::fs::canonicalize(ctx.resolve_relative_path(&path)) {
+            excluded.insert(crate::inspect::job::normalize_path(&canonical));
+        }
+    }
+    excluded
 }
 
 fn include_tests_param(req: &RawRequest) -> bool {
@@ -1392,7 +1403,7 @@ fn handle_outline_files_mode(
     let multiple_targets = targets.len() >= 2;
     let project_root = ctx.config().project_root.clone();
     let include_tests = include_tests_param(req);
-    let excluded = excluded_read_paths(req);
+    let excluded = excluded_read_paths(req, ctx);
 
     let mut file_entries = Vec::new();
     let mut directory_nodes = Vec::new();
@@ -3320,8 +3331,17 @@ mod tests {
                 let response = handle_outline(&request, &ctx);
                 assert!(response.success);
                 let paths = response.data["content_files"].as_array().unwrap();
-                assert!(paths.contains(&serde_json::json!(allowed)));
-                assert_eq!(paths.contains(&serde_json::json!(denied)), !exclude);
+                assert!(
+                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                        &allowed
+                    )))
+                );
+                assert_eq!(
+                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                        &denied
+                    ))),
+                    !exclude
+                );
                 let text = response.data["text"].as_str().unwrap();
                 assert!(text.contains("allowed.ts"));
                 assert_eq!(text.contains("denied.ts"), !exclude);
@@ -3330,6 +3350,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outline_manifest_uses_symlinked_project_root_spelling_and_sorts_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("project");
+        std::fs::create_dir(&real_root).unwrap();
+        let request_root = temp.path().join("project-alias");
+        symlink(&real_root, &request_root).unwrap();
+        let barrel = request_root.join("barrel.ts");
+        let secret = request_root.join("secret.ts");
+        std::fs::write(
+            &real_root.join("barrel.ts"),
+            "export function barrel() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &real_root.join("secret.ts"),
+            "export function secret() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(real_root.clone()),
+                restrict_to_project_root: true,
+                ..crate::config::Config::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "symlinked-outline-manifest", "command": "outline",
+            "files": [secret, barrel],
+        }))
+        .unwrap();
+
+        let response = handle_outline(&request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        let manifest = response.data["content_files"].as_array().unwrap();
+        let expected: Vec<_> = [barrel.clone(), secret.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(response.data["content_files"], serde_json::json!(expected));
+        assert!(manifest
+            .iter()
+            .all(|path| { PathBuf::from(path.as_str().unwrap()).starts_with(&request_root) }));
+        assert!(manifest
+            .windows(2)
+            .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
     }
 
     #[test]
@@ -3362,7 +3435,10 @@ mod tests {
             assert_eq!(response.data["files_shown"], 1);
             assert!(text.contains("a.ts"));
             assert!(!text.contains("z.ts"));
-            assert_eq!(response.data["content_files"], serde_json::json!([shown]));
+            assert_eq!(
+                response.data["content_files"],
+                serde_json::json!([crate::inspect::job::normalize_path(&shown)])
+            );
         }
     }
 
@@ -3754,10 +3830,11 @@ mod tests {
                     "id":"zoom-golden", "success":true, "name":name, "kind":"function",
                     "range":{"start_line":range[0], "start_col":range[1], "end_line":range[2], "end_col":range[3]},
                     "content":content, "context_before":before, "context_after":after,
-                    "annotations":{"calls_out":[], "called_by":[]}
+                    "annotations":{"calls_out":[], "called_by":[]},
+                    "content_files":[path]
                 }
             })).collect::<Vec<_>>();
-            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols});
+            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols, "content_files":[path]});
             let request = serde_json::from_value(serde_json::json!({"id":"zoom-golden", "command":"zoom", "file":path, "symbols":["alpha","beta"], "context_lines":3})).unwrap();
             for _ in 0..2 {
                 assert_eq!(

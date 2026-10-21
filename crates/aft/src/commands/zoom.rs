@@ -636,7 +636,15 @@ fn finalize_zoom_read_paths(
         .filter_map(serde_json::Value::as_str)
         .map(PathBuf::from)
         .collect();
-    match finalize_zoom_read_data(req, ctx, &mut response.data, revision, &excluded) {
+    let manifest_paths = super::read_manifest::ReadManifestPaths::for_request(req, ctx);
+    match finalize_zoom_read_data(
+        req,
+        ctx,
+        &mut response.data,
+        revision,
+        &excluded,
+        &manifest_paths,
+    ) {
         Ok(_) => response,
         Err(refusal) => refusal,
     }
@@ -648,6 +656,7 @@ fn finalize_zoom_read_data(
     data: &mut serde_json::Value,
     revision: Option<&RevisionSession>,
     excluded: &HashSet<PathBuf>,
+    manifest_paths: &super::read_manifest::ReadManifestPaths,
 ) -> Result<BTreeSet<PathBuf>, Response> {
     let mut files = BTreeSet::new();
     let mut refused = false;
@@ -655,7 +664,14 @@ fn finalize_zoom_read_data(
         if let Some(entries) = data.get_mut(key).and_then(serde_json::Value::as_array_mut) {
             for entry in entries {
                 if let Some(inner) = entry.get_mut("response") {
-                    match finalize_zoom_read_data(req, ctx, inner, revision, excluded) {
+                    match finalize_zoom_read_data(
+                        req,
+                        ctx,
+                        inner,
+                        revision,
+                        excluded,
+                        manifest_paths,
+                    ) {
                         Ok(inner_files) => files.extend(inner_files),
                         Err(refusal) => {
                             *inner = serialize_zoom_target_response(req, refusal);
@@ -687,7 +703,12 @@ fn finalize_zoom_read_data(
             });
         }
     }
-    if let Some(denied) = files.iter().find(|file| excluded.contains(*file)) {
+    let manifest_files = manifest_paths.map_set(files.iter());
+    let excluded_manifest_files = manifest_paths.map_set(excluded.iter());
+    if let Some(denied) = manifest_files
+        .iter()
+        .find(|file| excluded_manifest_files.contains(*file))
+    {
         return Err(Response::error(&req.id, "permission_denied", format!(
             "permission_denied: read for {} is denied by this session's permission rules (not a user choice)",
             denied.display(),
@@ -698,7 +719,7 @@ fn finalize_zoom_read_data(
     for file in &files {
         ctx.validate_read_path(&req.id, req.session(), file)?;
     }
-    data["content_files"] = serde_json::json!(files);
+    data["content_files"] = serde_json::json!(manifest_files);
     Ok(files)
 }
 
@@ -3054,6 +3075,59 @@ mod tests {
             "permission_denied"
         );
         assert_eq!(same_file.data["symbols"][1]["response"]["success"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zoom_manifest_uses_symlinked_project_root_spelling_and_sorts_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("project");
+        std::fs::create_dir(&real_root).unwrap();
+        let request_root = temp.path().join("project-alias");
+        symlink(&real_root, &request_root).unwrap();
+        let barrel = request_root.join("barrel.ts");
+        let secret = request_root.join("secret.ts");
+        std::fs::write(
+            &real_root.join("barrel.ts"),
+            "export { hidden } from './secret';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &real_root.join("secret.ts"),
+            "export function hidden() { return 'PRIVATE_BODY'; }\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(real_root.clone()),
+                restrict_to_project_root: true,
+                ..Config::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "symlinked-read-manifest", "command": "zoom",
+            "file": barrel, "symbol": "hidden",
+        }))
+        .unwrap();
+
+        let response = handle_zoom(&request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        let manifest = response.data["content_files"].as_array().unwrap();
+        let expected: Vec<_> = [barrel.clone(), secret.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(response.data["content_files"], serde_json::json!(expected));
+        assert!(manifest
+            .iter()
+            .all(|path| { PathBuf::from(path.as_str().unwrap()).starts_with(&request_root) }));
+        assert!(manifest
+            .windows(2)
+            .all(|pair| pair[0].as_str().unwrap() < pair[1].as_str().unwrap()));
     }
 
     #[test]
