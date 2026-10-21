@@ -409,7 +409,7 @@ export function markExplicitControl(
   if (idx >= 0) {
     const completion = state.pendingCompletions[idx];
     state.pendingCompletions.splice(idx, 1);
-    queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+    queuePendingPatternMatch(state, completionToExitPattern(completion, sessionID, true));
     state.wakeDeferredTaskIds.delete(taskId);
   }
 }
@@ -463,7 +463,10 @@ function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntr
   state.pendingPatternMatches.push(normalized);
 }
 
-function routeExplicitControlCompletions(state: SessionBgState): void {
+function routeExplicitControlCompletions(
+  state: SessionBgState,
+  sessionID: string | undefined,
+): void {
   if (state.pendingCompletions.length === 0) return;
   const remaining: BgCompletion[] = [];
   for (const completion of state.pendingCompletions) {
@@ -474,7 +477,7 @@ function routeExplicitControlCompletions(state: SessionBgState): void {
       state.outstandingTaskIds.delete(completion.task_id);
       state.explicitControlTasks.delete(completion.task_id);
       state.wakeDeferredTaskIds.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+      queuePendingPatternMatch(state, completionToExitPattern(completion, sessionID, true));
     } else {
       remaining.push(completion);
     }
@@ -516,7 +519,7 @@ export function ingestBgCompletions(
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
       state.explicitControlTasks.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+      queuePendingPatternMatch(state, completionToExitPattern(completion, sessionID, true));
       continue;
     }
     // C-#1: skip a task whose delivery is in flight / awaiting ack — a late push
@@ -588,7 +591,7 @@ export async function appendInTurnBgCompletions(
   if (state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted) {
     await drainCompletions(drainContext);
   }
-  routeExplicitControlCompletions(state);
+  routeExplicitControlCompletions(state, drainContext.sessionID);
   if (
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0 &&
@@ -721,7 +724,7 @@ async function deliverDrainedNotifications(
   delivery: BgNotificationDelivery,
 ): Promise<void> {
   const state = stateFor(drainContext.sessionID);
-  routeExplicitControlCompletions(state);
+  routeExplicitControlCompletions(state, drainContext.sessionID);
   const completions = state.pendingCompletions.splice(0);
   const matches = state.pendingPatternMatches.splice(0);
   // Reserve before awaiting admission: an in-turn drain must not deliver the
@@ -1201,7 +1204,7 @@ async function triggerWakeIfPending(
   ) {
     await drainCompletions(drainContext);
   }
-  routeExplicitControlCompletions(state);
+  routeExplicitControlCompletions(state, drainContext.sessionID);
   if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
   // promptAsync creates a synthetic user message. Autonomous pushes and daemon
   // nudges must not send one while OpenCode is already running a turn: doing so
@@ -1965,7 +1968,7 @@ function ingestDrainedBgCompletions(
     state.outstandingTaskIds.delete(completion.task_id);
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.explicitControlTasks.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+      queuePendingPatternMatch(state, completionToExitPattern(completion, sessionID, true));
       continue;
     }
     // Suppress completions for tasks already consumed inline by a
@@ -2019,13 +2022,14 @@ function pruneUnknownCompletions(state: SessionBgState, now: number): void {
 
 function completionToExitPattern(
   completion: BgCompletion,
+  sessionID: string | undefined,
   ackCompletionOnDelivery = false,
 ): PatternMatchEntry {
   const status = formatStatus(completion);
   const preview = formatOutputPreview(completion).replace(/^ {4}/gm, "").slice(-300);
   const entry: PatternMatchEntry = {
     task_id: completion.task_id,
-    session_id: "",
+    session_id: sessionID || DEFAULT_SESSION_ID,
     watch_id: "exit",
     match_text: "",
     match_offset: 0,

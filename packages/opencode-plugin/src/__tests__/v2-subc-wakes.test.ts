@@ -14,6 +14,8 @@ import { DateTime, Effect, Exit, Scope } from "effect";
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
+  ingestBgCompletions,
+  markExplicitControl,
   trackBgTask,
 } from "../bg-notifications.js";
 import { makeServerEffect } from "../entry/server-runtime.mjs";
@@ -160,7 +162,12 @@ function match() {
   };
 }
 
-async function start(root: string, module: ModuleDouble, recent: unknown[] = []) {
+async function start(
+  root: string,
+  module: ModuleDouble,
+  recent: unknown[] = [],
+  sessionState: { revert?: unknown } = {},
+) {
   const synthetic: V2SessionSyntheticInput[] = [];
   let pool!: AftTransportPool;
   let consumer!: V2RuntimeConsumer;
@@ -177,7 +184,7 @@ async function start(root: string, module: ModuleDouble, recent: unknown[] = [])
         }),
     },
     session: {
-      get: () => Effect.succeed({}),
+      get: () => Effect.sync(() => sessionState),
       prompt: () => Effect.void,
       list: (input: unknown) =>
         Effect.sync(() => {
@@ -401,6 +408,161 @@ test("OC2 subc held completion is delivered once on the replacement Location tra
     expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
   } finally {
     await second.stop();
+  }
+});
+
+for (const notice of ["completion", "async-watch exit"] as const) {
+  test(
+    notice === "completion"
+      ? "OC2 subc a completion admitted by a later nudge is not replayed after reload"
+      : "OC2 subc a held completion delivered as an async-watch exit is not replayed after reload",
+    async () => {
+      const root = workspace();
+      const module = new ModuleDouble();
+      const state: { revert?: unknown } = {};
+      const first = await start(root, module, [], state);
+      const warnings = spyOn(logger, "warn").mockImplementation(() => {});
+      try {
+        first.consumer.registerSession?.("s");
+        await first.pool.getBridge(root).send("status", { session_id: "s" });
+        await tick();
+        state.revert = { messageID: "boundary" };
+        module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+        module.nudge("s");
+        await until(() =>
+          warnings.mock.calls.some(([message]) =>
+            String(message).includes("delivery of task task"),
+          ),
+        );
+        expect(first.synthetic).toHaveLength(0);
+        expect(module.events).not.toContain("bash_ack_completions:s");
+        state.revert = undefined;
+        if (notice === "async-watch exit") markExplicitControl("s", "task");
+        module.nudge("s");
+        await until(() => !module.pending.has(module.key(root, "s")));
+        expect(first.synthetic).toHaveLength(1);
+        expect(first.synthetic[0]?.metadata?.kind).toBe(
+          notice === "completion" ? "bash_completion" : "bash_pattern_match",
+        );
+      } finally {
+        warnings.mockRestore();
+        await first.stop();
+      }
+      const drains = module.events.filter((event) => event === "bash_drain_completions:s").length;
+      const second = await start(root, module, [
+        {
+          id: "s",
+          location: { directory: root },
+          time: { updated: DateTime.makeUnsafe(Date.now()) },
+        },
+      ]);
+      try {
+        await until(
+          () =>
+            module.events.filter((event) => event === "bash_drain_completions:s").length > drains,
+        );
+        await tick();
+        expect(second.synthetic).toHaveLength(0);
+        expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+      } finally {
+        await second.stop();
+      }
+    },
+  );
+}
+
+test("OC2 subc next tool call registers a session outside the startup recovery window", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const first = await start(root, module);
+  first.consumer.registerSession?.("s");
+  await first.stop();
+  module.pending.set(module.key(root, "s"), { bg_completions: [completion()] });
+  const second = await start(root, module, [
+    {
+      id: "s",
+      location: { directory: root },
+      time: { updated: DateTime.makeUnsafe(Date.now() - 25 * 3600_000) },
+    },
+  ]);
+  try {
+    await until(() => second.listQueries.length === 1);
+    expect(module.clients).toHaveLength(0);
+    await second.toolAfter();
+    await until(() => !module.pending.has(module.key(root, "s")));
+    expect(second.synthetic).toHaveLength(1);
+    expect(second.synthetic[0]?.sessionID).toBe("s");
+    module.nudge("s");
+    await tick();
+    expect(second.synthetic).toHaveLength(1);
+    expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+  } finally {
+    await second.stop();
+  }
+});
+
+test("OC2 subc locally converted async-watch exit wakes and acks once", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const runtime = await start(root, module);
+  try {
+    runtime.consumer.registerSession?.("s");
+    await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+    await tick();
+    markExplicitControl("s", "watched");
+    module.pending.set(module.key(root, "s"), {
+      bg_completions: [completion("watched")],
+      pending_matches: [{ ...match(), watch_id: "exit", match_offset: 0, reason: "task_exit" }],
+    });
+    module.nudge("s");
+    await until(() => !module.pending.has(module.key(root, "s")));
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(runtime.synthetic[0]?.sessionID).toBe("s");
+    expect(runtime.synthetic[0]?.text).toContain("task watched exited:");
+    expect(runtime.synthetic[0]?.metadata).toMatchObject({
+      kind: "bash_pattern_match",
+      task_ids: ["watched"],
+      watch_id: "exit",
+    });
+    module.nudge("s");
+    await runtime.toolAfter();
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test("OC2 subc retroactive async-watch exit retains its session across admission retry", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const state: { revert?: unknown } = { revert: { messageID: "boundary" } };
+  const runtime = await start(root, module, [], state);
+  const wakes = runtime.consumer.subcWakes(() => runtime.pool, root);
+  try {
+    runtime.consumer.registerSession?.("s");
+    trackBgTask("s", "watched");
+    ingestBgCompletions("s", [completion("watched")]);
+    markExplicitControl("s", "watched", false);
+    module.pending.set(module.key(root, "s"), { bg_completions: [completion("watched")] });
+    await wakes.drainSession("s").catch(() => {});
+    expect(runtime.synthetic).toHaveLength(0);
+    expect(module.events).not.toContain("bash_ack_completions:s");
+    state.revert = undefined;
+    module.pending.set(module.key(root, "s"), {
+      bg_completions: [completion("watched")],
+      pending_matches: [{ ...match(), watch_id: "exit", match_offset: 0, reason: "task_exit" }],
+    });
+    await wakes.drainSession("s");
+    await until(() => !module.pending.has(module.key(root, "s")));
+    module.nudge("s");
+    await runtime.toolAfter();
+    expect(runtime.synthetic).toHaveLength(1);
+    expect(runtime.synthetic[0]?.sessionID).toBe("s");
+    expect(runtime.synthetic[0]?.text).toContain("task watched exited:");
+    expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(1);
+  } finally {
+    await runtime.stop();
   }
 });
 

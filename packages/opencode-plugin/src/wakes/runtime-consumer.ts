@@ -127,6 +127,17 @@ function holdUnrouted(completion: BashCompletedPayload, bridge: AftProjectTransp
   unrouted.set(completion.session_id, tasks);
 }
 
+function forgetUnroutedCompletion(sessionID: string, taskID: string): void {
+  const state = wakeRouteState();
+  const held = state.unrouted.get(sessionID);
+  if (!held) return;
+  held.delete(taskID);
+  if (held.size === 0) {
+    state.unrouted.delete(sessionID);
+    state.warnedUnrouted.delete(sessionID);
+  }
+}
+
 function warnUnroutedOnce(sessionID: string, message: string): void {
   const { warnedUnrouted } = wakeRouteState();
   if (warnedUnrouted.has(sessionID)) return;
@@ -142,7 +153,12 @@ async function routeCompletion(
   const route = wakeRouteState().routes.get(completion.session_id);
   if (route) {
     try {
-      return (await route.completion(completion, bridge, acknowledge)) === true;
+      const admitted = (await route.completion(completion, bridge, acknowledge)) === true;
+      // The held copy is an admission retry, not a second durable notification.
+      // bg-notifications.ts tracks subc acknowledgement retries separately in
+      // deliveredAwaitingAckTaskIds after the host accepts the completion.
+      if (admitted) forgetUnroutedCompletion(completion.session_id, completion.task_id);
+      return admitted;
     } catch (error) {
       // Keep a failed admission for the next session registration or subc nudge
       // instead of dropping it or spinning in a retry loop.
@@ -358,7 +374,10 @@ export function createV2RuntimeConsumer(
           },
         }),
       );
-      if (admitted) detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
+      if (admitted) {
+        detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
+        if (match.reason === "task_exit") forgetUnroutedCompletion(match.session_id, match.task_id);
+      }
       return admitted;
     },
     longRunning: (reminder) =>
@@ -431,7 +450,9 @@ export function createV2RuntimeConsumer(
         },
         drainSession: (sessionID) => {
           if (disposed) return Promise.resolve();
-          return drain(sessionID, undefined, getPool().getBridge(root));
+          const bridge = getPool().getBridge(root);
+          registerSession(sessionID, bridge);
+          return drain(sessionID, undefined, bridge);
         },
         restoreSession: async (sessionID) => {
           if (disposed) return;
