@@ -1,1 +1,1 @@
-Call-graph caches now use substantially less disk space without changing graph or dead-code results.
+- Call-graph caches take about three quarters less disk space, with identical call-graph and dead-code results. After upgrading, AFT re-extracts call graphs once.
