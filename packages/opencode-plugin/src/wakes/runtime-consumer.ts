@@ -370,8 +370,11 @@ export function createV2RuntimeConsumer(
       pendingMatches.set(key, pending);
       const deliver = async () => {
         if (disposed) return;
-        if (await resolveIsSubagent(context, match.session_id)) {
+        const isSubagent = await resolveIsSubagent(context, match.session_id);
+        if (disposed) return;
+        if (isSubagent) {
           await awaitV2ExecutionSettlement(context, match.session_id);
+          if (disposed) return;
           if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return;
         }
         const wake = {
@@ -392,6 +395,7 @@ export function createV2RuntimeConsumer(
           const current = await pending.bridge.send("bash_drain_completions", {
             session_id: match.session_id,
           });
+          if (disposed) return;
           if (current.success === false || !Array.isArray(current.pending_matches)) {
             throw new Error("pattern replay validation failed");
           }
@@ -420,12 +424,10 @@ export function createV2RuntimeConsumer(
               metadata: { source: "aft", kind: "bash_pattern_match", watch_id: match.watch_id },
             }),
           );
-          if (!admitted) {
-            pendingMatches.delete(key);
-            return;
-          }
+          if (disposed || admitted === "not-delivered") return;
           pending.admitted = true;
-          detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
+          if (admitted === "delivered")
+            detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
         }
         // The daemon deletes an acknowledged once-watch, but only clears a
         // sticky watch's pending match so it can keep scanning later output.
@@ -443,6 +445,7 @@ export function createV2RuntimeConsumer(
                 ],
               }),
         });
+        if (disposed) return;
         if (ack.success === false)
           throw new Error(String(ack.message ?? "pattern acknowledgement failed"));
         if (
@@ -490,13 +493,17 @@ export function createV2RuntimeConsumer(
         ).filter(isPatternMatchEntry)) {
           // A drain is scoped to its requesting session, even if a malformed
           // response includes a frame for another registered session.
-          if (match.session_id === sessionID) await routePatternMatch(match, bridge);
+          if (match.session_id === sessionID) {
+            await routePatternMatch(match, bridge);
+            if (disposed) return;
+          }
         }
         for (const completion of Array.isArray(response.bg_completions)
           ? response.bg_completions
           : []) {
           if (isCompletionEntry(completion) && completion.session_id === sessionID) {
             await routeCompletion({ ...completion, type: "bash_completed" }, bridge);
+            if (disposed) return;
           }
         }
       };
@@ -633,13 +640,13 @@ export function createV2RuntimeConsumer(
       if (active) return active;
       const deliver = async () => {
         if (disposed) return;
-        if (await resolveIsSubagent(context, completion.session_id)) {
+        const isSubagent = await resolveIsSubagent(context, completion.session_id);
+        if (disposed) return;
+        if (isSubagent) {
           await awaitV2ExecutionSettlement(context, completion.session_id);
+          if (disposed) return;
         }
-        if (
-          (await resolveIsSubagent(context, completion.session_id)) &&
-          !v2WatchWakeAllowed(context, completion.session_id, completion.task_id)
-        ) {
+        if (isSubagent && !v2WatchWakeAllowed(context, completion.session_id, completion.task_id)) {
           holdBgCompletion(
             completion.session_id,
             completion,
@@ -653,6 +660,7 @@ export function createV2RuntimeConsumer(
         const current = await bridge.send("bash_drain_completions", {
           session_id: completion.session_id,
         });
+        if (disposed) return;
         if (current.success === false || !Array.isArray(current.bg_completions))
           throw new Error("completion replay validation failed");
         const wake = { sessionID: completion.session_id, taskIDs: [completion.task_id] };
@@ -681,13 +689,16 @@ export function createV2RuntimeConsumer(
             },
           }),
         );
+        if (disposed || admitted === "not-delivered") return;
         // An already admitted wake still needs another ACK attempt if its earlier ACK failed.
-        if (admitted) detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
+        if (admitted === "delivered")
+          detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
 
         const ack = await bridge.send("bash_ack_completions", {
           session_id: completion.session_id,
           task_ids: [completion.task_id],
         });
+        if (disposed) return;
         if (
           ack.success === false ||
           !Array.isArray(ack.acked_task_ids) ||

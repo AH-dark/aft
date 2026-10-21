@@ -58,6 +58,8 @@ export interface CompletionWake {
   readonly notificationID?: string;
 }
 
+export type WakeAdmission = "delivered" | "already-delivered" | "not-delivered";
+
 export interface PatternMatchWake extends CompletionWake {
   readonly watchID: string;
   readonly matchOffset: number;
@@ -77,12 +79,12 @@ export interface StatusOnlyUpdate {
  * status does not.
  */
 export class V2SessionDelivery {
-  private readonly admittedWakes = new Set<string>();
+  private readonly admittedWakes = new Map<string, "pending" | "delivered">();
   private disposed = false;
 
   constructor(private readonly session: V2SessionAdmission) {}
 
-  completion(input: CompletionWake): Effect.Effect<boolean, unknown> {
+  completion(input: CompletionWake): Effect.Effect<WakeAdmission, unknown> {
     return this.admitWake(
       input,
       [...new Set(input.taskIDs)].map(
@@ -92,7 +94,7 @@ export class V2SessionDelivery {
     );
   }
 
-  patternMatch(input: PatternMatchWake): Effect.Effect<boolean, unknown> {
+  patternMatch(input: PatternMatchWake): Effect.Effect<WakeAdmission, unknown> {
     // A sticky watch can match repeatedly before the task completes. Neither
     // its later offsets nor the task's completion may share a delivery key.
     return this.admitWake(input, [this.patternKey(input)], "Background bash pattern matched");
@@ -123,11 +125,15 @@ export class V2SessionDelivery {
     input: CompletionWake,
     keys: string[],
     description: string,
-  ): Effect.Effect<boolean, unknown> {
+  ): Effect.Effect<WakeAdmission, unknown> {
     return Effect.suspend(() => {
-      if (this.disposed) return Effect.succeed(false);
-      if (keys.length === 0 || keys.every((key) => this.admittedWakes.has(key))) {
-        return Effect.succeed(false);
+      if (this.disposed || keys.length === 0) return Effect.succeed("not-delivered");
+      if (keys.every((key) => this.admittedWakes.get(key) === "delivered")) {
+        return Effect.succeed("already-delivered");
+      }
+      // An in-flight reservation is not proof that synthetic input was admitted.
+      if (keys.some((key) => this.admittedWakes.get(key) === "pending")) {
+        return Effect.succeed("not-delivered");
       }
       const reserved = keys.filter((key) => !this.admittedWakes.has(key));
       if (this.admittedWakes.size + reserved.length > MAX_ADMITTED_WAKES) {
@@ -142,11 +148,12 @@ export class V2SessionDelivery {
         // Evicting an existing key could admit the same pattern or completion twice.
         return Effect.fail(error);
       }
-      for (const key of reserved) this.admittedWakes.add(key);
+      for (const key of reserved) this.admittedWakes.set(key, "pending");
 
       return Effect.suspend(() =>
         this.session.get({ sessionID: input.sessionID }).pipe(
           Effect.flatMap((session) => {
+            if (this.disposed) return Effect.succeed("not-delivered" as const);
             // A staged revert can later delete synthetic input after its
             // boundary. Keep the wake unacknowledged and retryable instead.
             if (session.revert) {
@@ -154,18 +161,20 @@ export class V2SessionDelivery {
                 new Error("Background bash wake deferred: session has a staged revert"),
               );
             }
-            return this.session.synthetic({
-              sessionID: input.sessionID,
-              text: input.text,
-              description,
-              delivery: "steer",
-              metadata: {
-                ...input.metadata,
-                // Keep the origin marker even if the caller supplies its own source.
-                source: AFT_PROMPT_SOURCE,
-                task_ids: [...new Set(input.taskIDs)],
-              },
-            });
+            return this.session
+              .synthetic({
+                sessionID: input.sessionID,
+                text: input.text,
+                description,
+                delivery: "steer",
+                metadata: {
+                  ...input.metadata,
+                  // Keep the origin marker even if the caller supplies its own source.
+                  source: AFT_PROMPT_SOURCE,
+                  task_ids: [...new Set(input.taskIDs)],
+                },
+              })
+              .pipe(Effect.as("delivered" as const));
           }),
         ),
       ).pipe(
@@ -173,10 +182,13 @@ export class V2SessionDelivery {
           Effect.sync(() => {
             // Reserve while admission is in flight, but a failed or interrupted
             // admission must not suppress the bridge's next delivery attempt.
-            if (Exit.isFailure(exit)) for (const key of reserved) this.admittedWakes.delete(key);
+            if (Exit.isFailure(exit) || exit.value === "not-delivered") {
+              for (const key of reserved) this.admittedWakes.delete(key);
+            } else if (!this.disposed) {
+              for (const key of reserved) this.admittedWakes.set(key, "delivered");
+            }
           }),
         ),
-        Effect.map(() => true),
       );
     });
   }
