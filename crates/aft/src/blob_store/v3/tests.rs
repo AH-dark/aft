@@ -1467,3 +1467,62 @@ fn relocated_v3_database_keeps_the_storage_route_for_floor_and_refusal_scope() {
         (vec![refusal], 0)
     );
 }
+
+#[test]
+fn nested_v3_roots_select_the_inner_owner_floor_without_hiding_outer_refusals() {
+    let _g = serial();
+    let fixture = tempdir().unwrap();
+    let outer = fixture.path().join("outer");
+    let target = fixture.path().join("other-disk");
+    fs::create_dir_all(outer.join("padding")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    let inner = outer.join("inner");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &inner).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&inner)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction creation failed: {output:?}"
+        );
+    }
+    let outer = outer.join("padding/..");
+    let routed_inner = outer.join("inner");
+    seed(&outer, A);
+    seed(&routed_inner, A);
+    let store = PersistedStore::ViewsV3Registry;
+    let outer_floor = UnsupportedPersistedFormat::floor(store, outer.join("reader-floor.json"), 99);
+    let inner_floor =
+        UnsupportedPersistedFormat::floor(store, inner.join("reader-floor.json"), 100);
+    persisted_format::record(&outer_floor, &outer);
+    persisted_format::record(&inner_floor, &inner);
+    let error = LedgerReader::open_existing(&routed_inner, A).err().unwrap();
+    assert!(
+        matches!(error, Error::Incompatible(refusal) if refusal==inner_floor),
+        "the v3 comparison route must use its most specific owner"
+    );
+    let error = LedgerReader::open_existing(&outer, A).err().unwrap();
+    assert!(matches!(error, Error::Incompatible(refusal) if refusal==outer_floor));
+    assert_eq!(
+        persisted_format::refusals_under(&inner),
+        vec![inner_floor.clone()]
+    );
+    assert_eq!(
+        persisted_format::refusals_under(&outer),
+        vec![outer_floor.clone()]
+    );
+    assert_eq!(
+        persisted_format::refusals_for_push(&inner, None),
+        (vec![inner_floor], 0)
+    );
+    assert_eq!(
+        persisted_format::refusals_for_push(&outer, None),
+        (vec![outer_floor], 0)
+    );
+}
