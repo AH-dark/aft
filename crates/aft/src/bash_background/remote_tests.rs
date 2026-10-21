@@ -150,6 +150,32 @@ fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
 }
 
+fn exited_remote_workers() -> &'static Mutex<HashSet<String>> {
+    static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Called by a remote task's worker thread as its last step.
+pub(super) fn note_remote_worker_exit(task: &str) {
+    exited_remote_workers()
+        .lock()
+        .unwrap()
+        .insert(task.to_owned());
+}
+
+/// Wait until the task's remote worker thread has finished, so a test can
+/// assert what the worker did not do afterwards without sleeping.
+async fn remote_worker_exited(task: &str) {
+    wait_for("the remote worker must stop", || {
+        exited_remote_workers()
+            .lock()
+            .unwrap()
+            .contains(task)
+            .then_some(())
+    })
+    .await
+}
+
 pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunch {
     crate::bash_background::RemoteLaunch {
         explicit_runon: false,
@@ -7149,6 +7175,142 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     let done = registry.status(&task, "session", None, None, 0).unwrap();
     assert_eq!(done.info.status, BgTaskStatus::Killed);
     assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+}
+
+/// `bash.kill_scope` pauses the owner while the worker of an accepted job is
+/// reconnecting after the runner's route closed. The worker sends the cancel
+/// once it is connected again, and that settles the pause. From then on the
+/// worker must stop: no further reconnect or `exec.cancel`, and the recorded
+/// `sent` must still stand after the whole recovery deadline has passed.
+#[tokio::test]
+async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let scope = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        "worker",
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    );
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        start_with_launch(
+            &registry,
+            dir.path(),
+            launch,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+        )
+    });
+    // The route closed after acceptance and the runner is away, so the worker
+    // is reconnecting. Hold one reconnect open and pause the owner during it.
+    daemon.after_refused_connects(1).await;
+    daemon.hold_next_connect();
+    daemon.after_held_connect().await;
+    let pausing = registry.clone();
+    let pause_scope = scope.clone();
+    let operation = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":pause_scope}),
+            Some(&pause_scope.owner),
+            &[pausing],
+        )
+    });
+    wait_for("the pause must record its cancellation intent", || {
+        registry
+            .task(&task)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .cancel_requested
+            .then_some(())
+    })
+    .await;
+    // The runner is back when the held reconnect completes, so the worker's
+    // `exec.cancel` reaches it and the pause records `sent`.
+    daemon.restore();
+    daemon.release_held_connect();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("the pause must settle once the cancel is sent")
+        .unwrap();
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(
+        reply.data["killed"][0]["remote"]["cancel"], "sent",
+        "{reply:?}"
+    );
+    let connects_at_settlement = *daemon.connects.borrow();
+    // Pass the job's own limits plus grace: a worker still trying to re-attach
+    // gives up here and records its recovery failure.
+    clock.advance(Duration::from_secs(12 * 60));
+    remote_worker_exited(&task).await;
+    assert_eq!(
+        daemon.methods("exec.cancel").len(),
+        1,
+        "the settled pause must not send the cancel again"
+    );
+    assert_eq!(
+        *daemon.connects.borrow(),
+        connects_at_settlement,
+        "the worker must not reconnect after the pause settled"
+    );
+    assert!(daemon.methods("exec.attach").is_empty());
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+    let recorded = registry
+        .task(&task)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .owner_pause_cancel
+        .clone();
+    assert_eq!(recorded.as_deref(), Some("sent"));
+    let done = registry.status(&task, "session", None, None, 0).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+    drop(clock);
+}
+
+/// Without an owner pause, a reconnect that still finds the runner away is an
+/// ordinary transport failure: the worker keeps reconnecting, never sends a
+/// cancel, and delivers the job's result once the runner is back.
+#[tokio::test]
+async fn exec_remote_reconnect_failure_without_owner_pause_keeps_retrying() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let task = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(1).await;
+    daemon.hold_next_connect();
+    daemon.after_held_connect().await;
+    let refused = *daemon.refused_connects.borrow();
+    // The held reconnect is answered while the runner is still away.
+    daemon.release_held_connect();
+    daemon.after_refused_connects(refused + 3).await;
+    daemon.restore();
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    let stdout = registry.task(&task).unwrap().paths.stdout.clone();
+    assert_eq!(fs::read(stdout).unwrap(), b"AB");
+    remote_worker_exited(&task).await;
+    assert!(daemon.methods("exec.cancel").is_empty());
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+    drop(clock);
 }
 
 #[tokio::test]
