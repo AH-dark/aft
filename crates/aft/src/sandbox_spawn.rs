@@ -2125,6 +2125,9 @@ fn protect_worker_credential_services(
     _home: &Path,
 ) -> Result<(), String> {
     profile.worker_jail = worker_jail_active();
+    if profile.worker_jail {
+        protect_worker_private_temp(profile)?;
+    }
     #[cfg(target_os = "macos")]
     if profile.worker_jail {
         // Security.framework uses the account's home even when the daemon was
@@ -2134,6 +2137,52 @@ fn protect_worker_credential_services(
             macos_account_home()?.join("Library/Keychains"),
             PathBuf::from("/Library/Keychains"),
         ];
+    }
+    Ok(())
+}
+
+/// Filesystem modes do not isolate same-UID commands. Shell profiles deny
+/// shared task scratch except the command's own directory and, on macOS,
+/// metadata for its exact broker socket. The read tool's separate session-scoped
+/// access to retained scratch is unchanged.
+#[cfg(unix)]
+fn protect_worker_private_temp(profile: &mut SandboxProfile) -> Result<(), String> {
+    let root = task_temp::root();
+    let own = &profile.temp_dir;
+    let keep = |paths: &mut Vec<PathBuf>| -> Result<(), String> {
+        let mut retained = Vec::with_capacity(paths.len());
+        for path in paths.drain(..) {
+            let resolved = crate::sandbox_profile::resolve_env_deny_paths(
+                path.clone(),
+                "worker scratch exception",
+            )
+            .map_err(|error| error.to_string())?;
+            if !resolved
+                .iter()
+                .any(|path| path.starts_with(root) && !path.starts_with(own))
+            {
+                retained.push(path);
+            }
+        }
+        *paths = retained;
+        Ok(())
+    };
+    keep(&mut profile.data_policy.read_allow)?;
+    keep(&mut profile.data_policy.write_allow)?;
+    keep(&mut profile.data_policy.read_metadata_allow)?;
+    profile.data_policy.deny.push(root.to_owned());
+    profile.data_policy.read_allow.push(own.clone());
+    profile.data_policy.write_allow.push(own.clone());
+    #[cfg(target_os = "macos")]
+    {
+        let name = own
+            .file_name()
+            .ok_or("worker temp has no name")?
+            .to_string_lossy();
+        profile
+            .data_policy
+            .read_metadata_allow
+            .push(own.with_file_name(format!("{name}.gh-read.sock")));
     }
     Ok(())
 }
@@ -2409,7 +2458,7 @@ fn credential_paths_with_resolver(
         denies.extend(paths(key, ""));
     }
     denies.extend(paths("DOCKER_CONFIG", "config.json"));
-    for suffix in ["gh", "gcloud", "git/credentials"] {
+    for suffix in ["gh", "gcloud", "git/credentials", "cortexkit"] {
         denies.extend(paths("XDG_CONFIG_HOME", suffix));
     }
     if let Some(value) = getenv("KUBECONFIG") {
@@ -10466,5 +10515,109 @@ mod credential_floor_tests {
             (key == "GH_CONFIG_DIR").then(|| loop_path.clone().into_os_string())
         })
         .is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod worker_broker_floor_tests {
+    use super::*;
+
+    #[test]
+    fn worker_gh_read_floor_xdg_config_is_denied_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg-config");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let (denies, _) = credential_floor_paths(&home, None, &[], |key| {
+            (key == "XDG_CONFIG_HOME").then(|| xdg.as_os_str().to_owned())
+        })
+        .unwrap();
+        assert!(denies.contains(&home.join(".config/cortexkit")));
+        assert!(
+            denies.contains(&xdg.join("cortexkit")),
+            "the configured user config must remain credential-floored"
+        );
+    }
+
+    #[test]
+    fn worker_gh_read_floor_home_config_is_denied_when_xdg_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (denies, _) = credential_floor_paths(dir.path(), None, &[], |_| None).unwrap();
+        assert!(denies.contains(&dir.path().join(".config/cortexkit")));
+    }
+
+    #[test]
+    fn worker_gh_read_floor_private_temps_deny_sibling_reads_without_changing_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![dir.path().to_owned()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            dir.path().to_owned(),
+        )
+        .unwrap();
+        let root = if cfg!(target_os = "macos") {
+            PathBuf::from("/private/tmp/aft-w")
+        } else {
+            PathBuf::from("/tmp/aft-w")
+        };
+        profile.temp_dir = root.join("000000000001");
+        profile
+            .data_policy
+            .read_allow
+            .push(profile.temp_dir.clone());
+        let foreign = root.join("000000000002/.gh-read-capability");
+        profile
+            .data_policy
+            .read_allow
+            .push(foreign.parent().unwrap().to_owned());
+        profile.data_policy.write_allow.push(root.clone());
+        let before = profile.data_policy.clone();
+        with_worker_jail(false, || {
+            protect_worker_credential_services(&mut profile, dir.path())
+        })
+        .unwrap();
+        assert_eq!(
+            profile.data_policy, before,
+            "head shell access is unchanged"
+        );
+        with_worker_jail(true, || {
+            protect_worker_credential_services(&mut profile, dir.path())
+        })
+        .unwrap();
+        assert!(
+            profile
+                .data_policy
+                .validate_grants(
+                    [foreign.as_path()],
+                    &profile.data_policy.read_allow,
+                    &profile.writable_files
+                )
+                .is_err(),
+            "a sibling capability must not be readable"
+        );
+        let own = profile.temp_dir.join(".gh-read-capability");
+        assert!(
+            profile
+                .data_policy
+                .validate_grants(
+                    [own.as_path()],
+                    &profile.data_policy.read_allow,
+                    &profile.writable_files
+                )
+                .is_ok(),
+            "the command must retain its own capability"
+        );
+        assert!(profile
+            .data_policy
+            .read_allow
+            .iter()
+            .filter(|path| path.starts_with(&root))
+            .all(|path| path.starts_with(&profile.temp_dir)));
     }
 }
