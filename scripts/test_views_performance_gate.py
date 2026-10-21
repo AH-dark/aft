@@ -36,6 +36,16 @@ class MeasurementContractTests(unittest.TestCase):
                 answer["lanes"] = {} if lane is None else {"semantic": lane}
                 self.assertFalse(gate.semantic_witness(answer, Path(capture["probe_path"]), capture["marker"]))
 
+    def test_prototype_on_requires_active_metric(self):
+        with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": "1"}):
+            for counters in ({}, {"base_ref_prototype": False}, {"base_ref_prototype": 1}):
+                with self.subTest(counters=counters):
+                    with self.assertRaisesRegex(gate.MeasurementError, "base_ref_prototype: true"):
+                        gate.require_base_ref_prototype(counters)
+            gate.require_base_ref_prototype({"base_ref_prototype": True})
+        with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": "0"}):
+            gate.require_base_ref_prototype({})
+
     def test_bad_pid_is_rejected(self):
         with self.assertRaisesRegex(gate.MeasurementError, "PID"):
             gate.validate_subject(123, 456, "registry", "registry")

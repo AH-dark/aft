@@ -56,6 +56,12 @@ def require_counters(counters):
     return counters
 
 
+def require_base_ref_prototype(counters):
+    if (os.environ.get("AFT_VIEWS_BASE_REF_PROTOTYPE") == "1"
+            and counters.get("base_ref_prototype") is not True):
+        raise MeasurementError("prototype-on acquisition did not report metrics.views_work.base_ref_prototype: true")
+
+
 def counter_delta(before, after):
     require_counters(before)
     require_counters(after)
@@ -224,7 +230,7 @@ class Broker:
         self.out = out
         self.buffer = b""
         self.stderr = (out / "broker.log").open("w")
-        env = {key: os.environ[key] for key in ("PATH", "TMPDIR", "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR") if key in os.environ}
+        env = {key: os.environ[key] for key in ("PATH", "TMPDIR", "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "AFT_VIEWS_BASE_REF_PROTOTYPE") if key in os.environ}
         env.update({"RUST_LOG": "info", "RUSTC_WRAPPER": "", "CARGO_BUILD_RUSTC_WRAPPER": ""})
         self.proc = subprocess.Popen([str(broker), str(binary), str(out), str(root)],
                                      env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, start_new_session=True)
@@ -359,6 +365,7 @@ def provision(source, pin, out, count, config):
         roots.append(root)
     for directory in ("home/.config/cortexkit", "config/cortexkit", "home", "data", "cache", "storage"):
         (out / directory).mkdir(parents=True, exist_ok=True)
+    (out / "storage/views-harness.marker").write_text("isolated views performance subject\n")
     dump(out / "config/cortexkit/aft.jsonc", config)
     dump(out / "home/.config/cortexkit/aft.jsonc", config)
     inventory.update({"base_workload_commit": base, "changed_workload_commit": changed,
@@ -642,6 +649,7 @@ def run_arm(args, corpus, count, views, out):
         # Include delayed checkpoint/writeback work in a separate, explicit tail.
         acquisition.idle(max(2, args.quiet_minutes * 60), "quiet")
         final = acquisition.sample("final")
+        require_base_ref_prototype(final["health"]["metrics"]["views_work"])
         result["final"] = final
         result["storage"] = storage_sample(subject / "storage")
         result["counter_delta"] = counter_delta(initial["health"]["metrics"]["views_work"], final["health"]["metrics"]["views_work"])

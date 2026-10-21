@@ -1,7 +1,7 @@
 //! Process-wide work counters and kernel I/O deltas, not per-root counters.
 //! Other roots and background work can contribute to every interval. Overlap
 //! counts flag publications but cannot rule out other concurrent I/O.
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Lifetime totals for measured work sites, shared by every root in this process.
@@ -51,6 +51,9 @@ pub(crate) static WORK: WorkCounters = WorkCounters {
     semantic_files_filled: AtomicU64::new(0),
 };
 
+/// Live harness-selected runtimes, including builders before a base is ready.
+pub(crate) static BASE_REF_PROTOTYPE_USERS: AtomicUsize = AtomicUsize::new(0);
+
 /// Hash source bytes, counting repeated hashes as repeated work. Payload and
 /// embedding-text checksums are not source hashes and must not use this helper.
 pub(crate) fn source_hash(bytes: &[u8]) -> blake3::Hash {
@@ -65,6 +68,7 @@ pub(crate) fn work_snapshot() -> serde_json::Value {
         "schema": 1,
         "pid": std::process::id(),
         "scope": "process_lifetime_instrumented_sites",
+        "base_ref_prototype": BASE_REF_PROTOTYPE_USERS.load(Ordering::Relaxed) > 0,
         "source_hashes": WORK.source_hashes.load(Ordering::Relaxed),
         "source_hash_bytes": WORK.source_hash_bytes.load(Ordering::Relaxed),
         "content_reads": WORK.content_reads.load(Ordering::Relaxed),
