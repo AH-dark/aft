@@ -206,6 +206,7 @@ describe("buildUnifiedDiff", () => {
     const body = diffBody(diff);
     expect(body.split("\n").filter((line) => line.startsWith("+")).length).toBe(3);
     expect(body.split("\n").filter((line) => line.startsWith("-")).length).toBe(3);
+    expect(applyUnifiedDiff(beforeLines.join("\n"), diff)).toBe(afterLines.join("\n"));
     for (const line of [50, 3500, 6900]) {
       expect(body).toContain(`-line ${line}`);
       expect(body).toContain(`+edited line ${line}`);
