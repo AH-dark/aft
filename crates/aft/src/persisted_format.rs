@@ -135,6 +135,8 @@ impl fmt::Display for PersistedStore {
 pub enum RefusalSource {
     /// The artifact's own header or envelope carries the newer version.
     Artifact,
+    /// A schema, application-ID, layout-tag or SQLite PRAGMA check failed.
+    Incompatible(IncompatibleReason),
     /// The storage root's reader floor requires a newer reader for the store,
     /// even if no artifact of the newer format has been written yet.
     Floor,
@@ -143,6 +145,31 @@ pub enum RefusalSource {
     /// and refuses all of them. `found` carries the floor schema, 0 when the
     /// file is not parseable.
     FloorUnreadable,
+}
+
+impl RefusalSource {
+    fn is_artifact(self) -> bool {
+        matches!(self, Self::Artifact | Self::Incompatible(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompatibleReason {
+    SchemaDrift,
+    ApplicationId,
+    Pragma(&'static str),
+    LayoutTag(u32),
+}
+
+impl fmt::Display for IncompatibleReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SchemaDrift => f.write_str("schema_drift"),
+            Self::ApplicationId => f.write_str("application_id"),
+            Self::Pragma(name) => write!(f, "pragma:{name}"),
+            Self::LayoutTag(tag) => write!(f, "layout_tag:{tag}"),
+        }
+    }
 }
 
 /// An on-disk format newer than this build reads.
@@ -159,6 +186,20 @@ pub struct UnsupportedPersistedFormat {
 }
 
 impl UnsupportedPersistedFormat {
+    pub fn incompatible(
+        store: PersistedStore,
+        path: impl Into<PathBuf>,
+        found: u64,
+        reason: IncompatibleReason,
+    ) -> Self {
+        Self {
+            store,
+            path: path.into(),
+            found,
+            supported: store.supported(),
+            source: RefusalSource::Incompatible(reason),
+        }
+    }
     pub fn artifact(store: PersistedStore, path: impl Into<PathBuf>, found: u64) -> Self {
         Self {
             store,
@@ -224,6 +265,11 @@ impl UnsupportedPersistedFormat {
 impl fmt::Display for UnsupportedPersistedFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.source {
+            RefusalSource::Incompatible(reason) => write!(
+                f,
+                "{CODE}: store {} at {} is incompatible with this build: {reason}",
+                self.store, self.path.display()
+            ),
             RefusalSource::Artifact => write!(
                 f,
                 "{CODE}: {} at {} has format version {}; this build reads up to {}",
@@ -255,7 +301,7 @@ impl fmt::Display for UnsupportedPersistedFormat {
                 self.store
             ),
         }?;
-        if self.source != RefusalSource::Artifact && self.store != PersistedStore::AftDb {
+        if !self.source.is_artifact() && self.store != PersistedStore::AftDb {
             write!(
                 f,
                 "; restart AFT after repairing the reader floor to retry this store"
@@ -331,7 +377,7 @@ pub fn clear(store: PersistedStore, scope: &Path) {
     with_registry(|entries| {
         entries.retain(|entry| {
             !(entry.refusal.store == store
-                && entry.refusal.source == RefusalSource::Artifact
+                && entry.refusal.source.is_artifact()
                 && entry.scope == scope)
         })
     });
@@ -341,8 +387,7 @@ pub fn clear(store: PersistedStore, scope: &Path) {
 /// Artifact refusals still require their own format checks before clearing.
 pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersistedFormat]) {
     with_registry(|entries| {
-        entries
-            .retain(|entry| entry.scope != root || entry.refusal.source == RefusalSource::Artifact);
+        entries.retain(|entry| entry.scope != root || entry.refusal.source.is_artifact());
         entries.extend(refusals.iter().map(|refusal| Entry {
             scope: root.to_path_buf(),
             refusal: refusal.clone(),
@@ -357,7 +402,7 @@ pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
     with_registry(|entries| {
         entries.retain(|entry| {
             !(entry.refusal.store == store
-                && entry.refusal.source == RefusalSource::Artifact
+                && entry.refusal.source.is_artifact()
                 && entry.scope.starts_with(root)
                 && std::fs::symlink_metadata(&entry.refusal.path)
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
@@ -388,7 +433,7 @@ pub fn refusals_under(root: &Path) -> Vec<UnsupportedPersistedFormat> {
             .map(|entry| entry.refusal.clone())
             .collect::<Vec<_>>()
     });
-    found.sort_by_key(|refusal| (refusal.source == RefusalSource::Artifact, refusal.store));
+    found.sort_by_key(|refusal| (refusal.source.is_artifact(), refusal.store));
     found.dedup();
     found
 }
@@ -466,7 +511,7 @@ pub fn gate(
             .find(|entry| {
                 entry.refusal.store == store
                     && path.starts_with(&entry.scope)
-                    && entry.refusal.source != RefusalSource::Artifact
+                    && !entry.refusal.source.is_artifact()
             })
             .map(|entry| entry.refusal.clone())
     });
@@ -526,6 +571,38 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompatible_refusals_follow_artifact_lifecycle_not_floor_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("members.sqlite");
+        let store = PersistedStore::ViewsV3Registry;
+        std::fs::write(&path, b"drifted").unwrap();
+        let incompatible = UnsupportedPersistedFormat::incompatible(
+            store,
+            &path,
+            1,
+            IncompatibleReason::SchemaDrift,
+        );
+        let message = incompatible.to_string();
+        assert_eq!(message, format!("{CODE}: store views_v3_registry at {} is incompatible with this build: schema_drift",path.display()));
+        assert!(!message.contains("restart"));
+        record(&incompatible, &path);
+        assert!(gate(store, &path, &path, Some(1)).is_ok());
+        assert!(refusal_covering(store, &path).is_none());
+        record(&incompatible, &path);
+        std::fs::remove_file(&path).unwrap();
+        clear_missing_artifacts(store, root.path());
+        assert!(refusal_covering(store, &path).is_none());
+        let floor =
+            UnsupportedPersistedFormat::floor(store, root.path().join("reader-floor.json"), 2);
+        record(&incompatible, &path);
+        record(&floor, root.path());
+        assert_eq!(gate(store, &path, &path, Some(1)), Err(floor.clone()));
+        clear(store, &path);
+        assert_eq!(refusal_covering(store, &path), Some(floor));
+        assert!(UnsupportedPersistedFormat::is_refusal_message(&message));
+    }
 
     #[test]
     fn artifact_refusal_cannot_shadow_reader_floor() {

@@ -32,8 +32,8 @@ use super::registry::{ReaderRegistration, ViewRegistration};
 use super::snapshot::{OpenGeneration, Snapshot};
 use super::RelPath;
 
-/// Durability boundaries of view construction, in the order a publication
-/// crosses them. Tests park a child process at one of them and kill it; every
+/// Durability boundaries of view construction. V3-only boundaries are appended
+/// after the older publication sequence. Tests park a child process and kill it; every
 /// boundary must leave protected bytes readable and the pointer either on the
 /// old generation or on a complete new one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -54,10 +54,16 @@ pub enum DurabilityStep {
     PointerCas,
     /// The pointer database and directory were synced.
     PointerSynced,
+    /// Both v3 floor entries (registry and store) are durable before publication
+    /// creates a registry or plane database.
+    V3FloorRaised,
+    /// All plane writes in a v3 publication are durable before its ledger commit.
+    ClosureFlushed,
 }
 
 impl DurabilityStep {
-    pub const ALL: [Self; 8] = [
+    pub const V3_ONLY: [Self; 2] = [Self::V3FloorRaised, Self::ClosureFlushed];
+    pub const ALL: [Self; 10] = [
         Self::BlobCommitted,
         Self::SegmentRowRecorded,
         Self::SegmentFileSynced,
@@ -66,6 +72,8 @@ impl DurabilityStep {
         Self::ManifestParentSynced,
         Self::PointerCas,
         Self::PointerSynced,
+        Self::V3FloorRaised,
+        Self::ClosureFlushed,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -78,6 +86,8 @@ impl DurabilityStep {
             Self::ManifestParentSynced => "manifest-parent-synced",
             Self::PointerCas => "pointer-cas",
             Self::PointerSynced => "pointer-synced",
+            Self::V3FloorRaised => "v3-floor-raised",
+            Self::ClosureFlushed => "closure-flushed",
         }
     }
 
