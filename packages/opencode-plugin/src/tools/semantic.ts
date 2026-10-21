@@ -149,7 +149,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
           .string()
           .optional()
           .describe(
-            "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+            "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
           ),
       ),
     },

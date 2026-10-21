@@ -403,7 +403,7 @@ describe("aft_search adapter", () => {
       .properties;
     expect(properties.topK).toMatchObject({ type: "integer", minimum: 1, maximum: 50 });
     expect(properties.offset).toMatchObject({ type: "integer", minimum: 0, maximum: 100000 });
-    expect(properties.path.description).toContain("different Git project");
+    expect(properties.path.description).toContain("different project or plain folder");
     expect(properties.path.description).toContain("not a subdirectory filter");
     expect(tool.description.split("Use `offset`").length - 1).toBe(1);
   });
