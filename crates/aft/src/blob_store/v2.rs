@@ -25,7 +25,7 @@
 //! the GC safety argument depends on. Readers that hold no view get a
 //! read-only handle that never creates or modifies a store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1137,6 +1137,12 @@ impl FamilyStoreReader {
         contains(&self.inner, key)
     }
 
+    /// The keys of `keys` that are stored, probed in key order through the
+    /// payload-free membership index so each index page is visited once.
+    pub fn contains_many(&self, keys: &[FamilyKey]) -> StoreResult<HashSet<FamilyKey>> {
+        contains_many(&self.inner, keys)
+    }
+
     pub fn usage(&self) -> StoreResult<StoreUsage> {
         usage(&self.inner)
     }
@@ -1348,6 +1354,27 @@ fn get(inner: &StoreInner, key: &FamilyKey) -> StoreResult<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(payload))
+}
+
+fn contains_many(inner: &StoreInner, keys: &[FamilyKey]) -> StoreResult<HashSet<FamilyKey>> {
+    let mut sorted = keys
+        .iter()
+        .filter(|key| key.plane() == inner.plane)
+        .copied()
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let connection = lock(&inner.connection);
+    let mut statement = connection.prepare(
+        "SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
+    )?;
+    let mut present = HashSet::new();
+    for key in sorted {
+        if statement.exists(params![key.as_bytes().as_slice()])? {
+            present.insert(key);
+        }
+    }
+    Ok(present)
 }
 
 fn contains(inner: &StoreInner, key: &FamilyKey) -> StoreResult<bool> {

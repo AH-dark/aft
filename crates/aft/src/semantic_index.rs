@@ -10497,6 +10497,29 @@ impl SemanticVectors {
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
     ) -> Result<Self, String> {
+        Self::decode_view_payload_inner(payload, rel_path, producer, None)
+    }
+
+    /// Decodes like [`Self::decode_view_payload`] and also returns the BLAKE3
+    /// digest of each entry's embedded text, in run order. The run itself
+    /// still drops the text; the digests are enough to name the chunk rows
+    /// those texts are stored under.
+    pub(crate) fn decode_view_payload_with_text_digests(
+        payload: &[u8],
+        rel_path: &Path,
+        producer: &ViewPayloadProducer<'_>,
+    ) -> Result<(Self, Vec<blake3::Hash>), String> {
+        let mut digests = Vec::new();
+        let run = Self::decode_view_payload_inner(payload, rel_path, producer, Some(&mut digests))?;
+        Ok((run, digests))
+    }
+
+    fn decode_view_payload_inner(
+        payload: &[u8],
+        rel_path: &Path,
+        producer: &ViewPayloadProducer<'_>,
+        mut text_digests: Option<&mut Vec<blake3::Hash>>,
+    ) -> Result<Self, String> {
         let mut cursor = 0usize;
         let version = take_view_slice(payload, &mut cursor, 1)?[0];
         if version != VIEW_PAYLOAD_VERSION {
@@ -10526,7 +10549,10 @@ impl SemanticVectors {
             let end_line = take_view_u32(payload, &mut cursor)?;
             let exported = take_view_slice(payload, &mut cursor, 1)?[0] != 0;
             let snippet = take_view_string(payload, &mut cursor)?;
-            let _embed_text = take_view_bytes(payload, &mut cursor)?;
+            let embed_text = take_view_bytes(payload, &mut cursor)?;
+            if let Some(digests) = text_digests.as_deref_mut() {
+                digests.push(blake3::hash(embed_text));
+            }
             let vector_bytes = take_view_bytes(payload, &mut cursor)?;
             if vector_bytes.len() % 4 != 0 {
                 return Err("semantic view vector has an invalid byte length".to_string());
@@ -10571,6 +10597,14 @@ impl SemanticVectors {
         for entry in &mut self.entries {
             entry.chunk.embed_text = String::new();
         }
+    }
+
+    /// Each chunk's embedded text and vector, in run order. The text is empty
+    /// once [`Self::strip_embed_text`] ran or the run was decoded.
+    pub(crate) fn embedded_texts_and_vectors(&self) -> impl Iterator<Item = (&str, &Arc<[f32]>)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.chunk.embed_text.as_str(), &entry.vector))
     }
 }
 
