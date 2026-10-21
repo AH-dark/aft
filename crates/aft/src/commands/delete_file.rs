@@ -926,7 +926,9 @@ pub(crate) fn install_unlink_seam_for_test(seam: UnlinkSeam) -> impl Drop {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
-            UNLINK_SEAM.with(|current| current.borrow_mut().take());
+            UNLINK_SEAM.with(|current| {
+                current.borrow_mut().take();
+            });
         }
     }
     UNLINK_SEAM.with(|current| *current.borrow_mut() = Some(seam));
@@ -1454,7 +1456,10 @@ fn delete_directory_without_backups(
             .map(|(_, judged)| judged)
     };
     let mut stopped = delete_recorded_tree(&manifest, &req.id, &mut authorize).err();
-    if let Some(refusal) = stopped.as_mut().and_then(|stopped| stopped.refusal.take()) {
+    if let Some(refusal) = stopped
+        .as_mut()
+        .and_then(|stopped| std::mem::take(&mut stopped.refusal))
+    {
         // The root could not be bound to an authorized location: nothing was
         // deleted.
         return Err(DeleteError::Refused(refusal));
