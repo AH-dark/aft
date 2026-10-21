@@ -535,6 +535,26 @@ test("OC2 subc locally converted async-watch exit wakes and acks once", async ()
   }
 });
 
+test("OC2 subc delivers beyond the standalone wake retention limit", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const runtime = await start(root, module);
+  const wakes = runtime.consumer.subcWakes(() => runtime.pool, root);
+  try {
+    for (let index = 0; index < 4097; index++) {
+      module.pending.set(module.key(root, "s"), {
+        bg_completions: [completion(`task-${index}`)],
+      });
+      await wakes.drainSession("s");
+    }
+    expect(runtime.synthetic).toHaveLength(4097);
+    expect(module.pending.has(module.key(root, "s"))).toBe(false);
+    expect(module.events.filter((event) => event === "bash_ack_completions:s")).toHaveLength(4097);
+  } finally {
+    await runtime.stop();
+  }
+}, 30_000);
+
 test("OC2 subc retroactive async-watch exit retains its session across admission retry", async () => {
   const root = workspace();
   const module = new ModuleDouble();
