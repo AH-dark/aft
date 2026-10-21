@@ -866,47 +866,48 @@ export function registerBashTool(
         // Pi registers this tool directly as well as through the funnel, so
         // bind the call's own cancellation signal here: an outside-access
         // prompt for this call stops on it.
-        response = await withOutsidePermissionOperation(() =>
-          callBashWithPermissionLoop(
-          bridge,
-          {
-            command: bridgeCommand,
-            timeout,
-            workdir: spawnContext.cwd ?? params.workdir,
-            env: spawnContext.env,
-            description: params.description,
-            background: effectiveBackground,
-            notify_on_completion: effectiveBackground,
-            compressed,
-            pty: requestedPty,
-            pty_rows: ptyRows,
-            pty_cols: ptyCols,
-            foreground_orchestrate: true,
-            block_to_completion: blockToCompletion,
-            wait: requestedWait,
-            sandbox: params.sandbox,
-            ...(isPowerShell ? { shell: "powershell" } : {}),
-            ...(params.runon !== undefined ? { runon: params.runon } : {}),
-          },
-          extCtx,
-          {
-            transportTimeoutMs: orchestratedTransportTimeoutMs(
-              blockToCompletion,
-              requestedWait,
-              timeout,
-              foregroundWaitMs,
-              workerWaitMaxMs,
-              params.runon !== undefined,
+        response = await withOutsidePermissionOperation(
+          () =>
+            callBashWithPermissionLoop(
+              bridge,
+              {
+                command: bridgeCommand,
+                timeout,
+                workdir: spawnContext.cwd ?? params.workdir,
+                env: spawnContext.env,
+                description: params.description,
+                background: effectiveBackground,
+                notify_on_completion: effectiveBackground,
+                compressed,
+                pty: requestedPty,
+                pty_rows: ptyRows,
+                pty_cols: ptyCols,
+                foreground_orchestrate: true,
+                block_to_completion: blockToCompletion,
+                wait: requestedWait,
+                sandbox: params.sandbox,
+                ...(isPowerShell ? { shell: "powershell" } : {}),
+                ...(params.runon !== undefined ? { runon: params.runon } : {}),
+              },
+              extCtx,
+              {
+                transportTimeoutMs: orchestratedTransportTimeoutMs(
+                  blockToCompletion,
+                  requestedWait,
+                  timeout,
+                  foregroundWaitMs,
+                  workerWaitMaxMs,
+                  params.runon !== undefined,
+                ),
+                onProgress: ({ text }) => {
+                  streamed = appendBashStreamTail(streamed, text);
+                  // Stream truncated output to avoid overwhelming the UI
+                  const displayText = truncateToVisualLines(streamed, 100);
+                  onUpdate?.(bashResult(displayText, { streaming: true }));
+                },
+              },
+              isPowerShell ? "powershell" : "bash",
             ),
-            onProgress: ({ text }) => {
-              streamed = appendBashStreamTail(streamed, text);
-              // Stream truncated output to avoid overwhelming the UI
-              const displayText = truncateToVisualLines(streamed, 100);
-              onUpdate?.(bashResult(displayText, { streaming: true }));
-            },
-          },
-          isPowerShell ? "powershell" : "bash",
-          ),
           signal,
         );
       } catch (error) {
