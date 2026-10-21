@@ -242,6 +242,25 @@ test("zoom batch authorizes distinct files and keeps allowed lookups after a den
   expect(JSON.stringify(dispatched)).not.toContain("secret-dir");
 });
 
+test("zoom refuses when a manifest source file is outside the project and external reads are denied", async () => {
+  // Only a read-rule denial lets zoom re-render without the file. Any other
+  // refusal of a manifest source refuses the whole zoom, and OpenCode 2 must see
+  // it as a thrown tool error: returned denial text would read as a successful zoom.
+  const source = resolve(process.cwd(), "../external-reexport-source.ts");
+  const { execute, dispatched } = readers(
+    (input, effect) => (input.action === "external_directory" ? "deny" : effect),
+    () => ({
+      success: true,
+      text: "SOURCE_BODY_MUST_NOT_ESCAPE",
+      content_files: [resolve(process.cwd(), "allowed.ts"), source],
+    }),
+  );
+  await expect(execute("aft_zoom", { path: "allowed.ts", symbols: "allowed" })).rejects.toThrow(
+    "external_directory",
+  );
+  expect(dispatched).toHaveLength(1);
+});
+
 test("directory outline holds denied content and re-renders only allowed files", async () => {
   const root = await mkdtemp(resolve(process.cwd(), ".aft-directory-read-"));
   const allowed = resolve(root, "allowed.ts");

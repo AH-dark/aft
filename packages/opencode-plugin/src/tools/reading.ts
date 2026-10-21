@@ -427,7 +427,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           for (const file of files) {
             const denial = checkedReads.get(file);
             if (!denial) continue;
-            if (denial !== permissionRuleDenial("read")) return permissionDeniedResponse(denial);
+            if (denial !== permissionRuleDenial("read"))
+              return permissionDeniedResponse(denial, context);
             if (excluded.has(file))
               throw new Error("Zoom server did not exclude a read-denied file");
             excluded.add(file);
