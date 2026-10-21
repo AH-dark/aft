@@ -7676,9 +7676,12 @@ mod tests {
         let backups = dir.join("backups");
         fs::create_dir_all(&backups).unwrap();
 
-        // Fake a completed legacy entry for an absolute file path.
-        let legacy_key = Path::new("/tmp/migrated_file.txt");
-        let legacy_hash = BackupStore::path_hash(legacy_key);
+        // Fake a completed legacy entry for an absolute file path. Old AFT
+        // keyed history by the canonical path of the edited file, which is
+        // absolute on every platform (`/tmp/...` is not absolute on Windows,
+        // so a literal Unix path would not be a valid legacy entry there).
+        let legacy_key = canonicalize_key(&dir.join("migrated_file.txt"));
+        let legacy_hash = BackupStore::path_hash(&legacy_key);
         let legacy_dir = backups.join(&legacy_hash);
         fs::create_dir_all(&legacy_dir).unwrap();
         fs::write(legacy_dir.join("0.bak"), "original content").unwrap();
@@ -7850,7 +7853,11 @@ mod tests {
     fn root_repair_deferred_migration_retries_after_namespace_unlock() {
         let storage = tempfile::tempdir().unwrap();
         let harness_backups = storage.path().join("opencode/backups");
-        let first_key = storage.path().join("first-legacy.txt");
+        // Old AFT keyed history by the canonical path, the spelling history
+        // lookups resolve to. A temp directory reached through a symlink
+        // (`/var` on macOS) or spelled without the verbatim prefix (Windows)
+        // is not that spelling.
+        let first_key = canonicalize_key(&storage.path().join("first-legacy.txt"));
         let first_legacy_dir = harness_backups.join(BackupStore::path_hash(&first_key));
         fs::create_dir_all(&first_legacy_dir).unwrap();
         fs::write(first_legacy_dir.join("0.bak"), "first original").unwrap();
@@ -7878,7 +7885,7 @@ mod tests {
             .join("meta.json")
             .exists());
 
-        let repaired_key = storage.path().join("repaired-legacy.txt");
+        let repaired_key = canonicalize_key(&storage.path().join("repaired-legacy.txt"));
         let root_entry = storage
             .path()
             .join("backups")
