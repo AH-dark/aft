@@ -3251,10 +3251,6 @@ fn build_health_report_with_indexing(
             .unwrap_or(0),
     );
     let indexing_detail = indexing_detail(&indexing);
-    let indexing_has_rows = !indexing.running.is_empty()
-        || !indexing.queued.is_empty()
-        || indexing.omitted.running > 0
-        || indexing.omitted.queued > 0;
     metrics.insert("indexing".to_string(), json!(indexing));
     metrics.insert(
         "dispatch_liveness".to_string(),
@@ -3289,20 +3285,13 @@ fn build_health_report_with_indexing(
         "write_ledger_folds_deferred_total".to_string(),
         json!(crate::db::write_ledger::folds_deferred_total()),
     );
-    // ck's default health rendering displays top-level scalars. When work rows
-    // exist, selecting the nested indexing block must not hide those defaults.
-    let mut headline = Vec::new();
-    if indexing_has_rows {
-        headline.push(json!("indexing"));
-    }
-    headline.extend(
-        metrics
-            .iter()
-            .filter(|(_, value)| !value.is_object() && !value.is_array())
-            .map(|(key, _)| json!(key)),
-    );
-    // The budget adds this scalar after the headline has been selected.
-    headline.push(json!("metrics_bytes"));
+    // Keep the default health headline focused on root health and freshness.
+    // Include a metric only when this snapshot contains a numeric value.
+    let headline = ["actor_count", "warming_roots", "snapshot_age_ms"]
+        .into_iter()
+        .filter(|key| metrics.get(*key).is_some_and(Value::is_number))
+        .map(|key| json!(key))
+        .collect::<Vec<_>>();
     metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
@@ -4139,16 +4128,13 @@ mod tests {
         let headline = value["headline"]
             .as_array()
             .expect("CLI headline selection");
-        assert!(headline.contains(&json!("indexing")));
-        // Without an explicit headline ck displays top-level scalars. Retain
-        // all those existing defaults when opting into the indexing block.
-        for (key, scalar) in value.as_object().unwrap() {
-            if !scalar.is_object() && !scalar.is_array() {
-                assert!(
-                    headline.contains(&json!(key)),
-                    "missing default scalar {key}"
-                );
-            }
+        let expected_headline =
+            ["actor_count", "warming_roots", "snapshot_age_ms"].map(|key| json!(key));
+        assert_eq!(headline, &expected_headline);
+        for key in headline {
+            let key = key.as_str().expect("headline keys are strings");
+            assert!(value.get(key).is_some(), "headline key {key} is absent");
+            assert!(value[key].is_number(), "headline key {key} is not numeric");
         }
         for row in running.iter().chain(indexing["queued"].as_array().unwrap()) {
             let identity = ["project_root", "id", "name", "module_id", "path", "root"]
@@ -4372,10 +4358,20 @@ mod tests {
         );
         let metrics = report.metrics.unwrap();
         assert!(metrics["indexing"].is_object());
-        assert!(!metrics["headline"]
+        let headline = metrics["headline"]
             .as_array()
-            .unwrap()
-            .contains(&json!("indexing")));
+            .expect("CLI headline selection");
+        let expected_headline =
+            ["actor_count", "warming_roots", "snapshot_age_ms"].map(|key| json!(key));
+        assert_eq!(headline, &expected_headline);
+        for key in headline {
+            let key = key.as_str().expect("headline keys are strings");
+            assert!(metrics.get(key).is_some(), "headline key {key} is absent");
+            assert!(
+                metrics[key].is_number(),
+                "headline key {key} is not numeric"
+            );
+        }
     }
 
     #[test]
