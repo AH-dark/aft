@@ -378,6 +378,42 @@ jobs:
           platform: linux
           shard: "3"
 
+  worker-gh-read-landlock:
+    name: Worker GitHub reads (required Landlock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AFT_REQUIRE_LANDLOCK: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build real AFT for the worker-read jail gate
+        run: cargo build -p agent-file-tools --bin aft
+      - name: Require worker-read test inventory and run the native gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version
+          listing="$(cargo test -p agent-file-tools --test worker_jail -- worker_gh_read --list)"
+          printf '%s\n' "$listing"
+          for test in \
+            worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied \
+            worker_gh_read_t8_live_scope_rebind_refuses_before_upstream \
+            worker_gh_read_t9_policy_matrix_keeps_repository_and_search_fences \
+            worker_gh_read_t10_terminal_revocation_unlinks_endpoint \
+            worker_gh_read_t10_retained_descendants_fail_after_end_cancel_timeout_and_restart \
+            worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply \
+            worker_gh_read_t11_cross_command_capability_file_and_socket_isolation \
+            worker_gh_read_t12_missing_and_stale_endpoint_fail_without_native_gh \
+            worker_gh_read_t12_malformed_peer_reply_and_endpoint_replacement_fail_closed; do
+            [[ "$listing" == *"$test: test"* ]] || { printf 'missing native test: %s\n' "$test" >&2; exit 1; }
+          done
+          cargo test -p agent-file-tools --test worker_jail -- worker_gh_read --test-threads=1 --nocapture
+
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
   # so a kernel without the required ABI cannot turn sandbox coverage into a
