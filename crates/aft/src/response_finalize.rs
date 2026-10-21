@@ -377,6 +377,14 @@ impl<T> PendingResponseReceiver<T> {
     pub fn try_recv(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
         self.receiver.try_recv()
     }
+
+    /// Block for the value at most `timeout`.
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
 }
 
 /// Capture the request's wake before transferring the sender to a producer.

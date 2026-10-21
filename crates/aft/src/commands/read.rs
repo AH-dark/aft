@@ -902,17 +902,34 @@ fn start_github_read_with_view(
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
 }
 
+/// Longest a tool call waits for a live GitHub read, whatever budget it has.
+const GITHUB_READ_WAIT_CEILING: Duration = Duration::from_secs(20);
+/// Time kept back from the call's budget so the reply can still be built.
+const GITHUB_READ_RETURN_MARGIN: Duration = Duration::from_secs(1);
+
+/// Wait for a GitHub read no longer than the call's budget (less a reply
+/// margin) or [`GITHUB_READ_WAIT_CEILING`]. A read still running then is
+/// answered with its cached copy, or as pending; it keeps running and fills
+/// the cache for the next call.
 pub(crate) fn wait_for_github_read(
     start: GithubReadStart,
 ) -> Result<GithubReadCompletion, crate::github_read::GithubReadError> {
     match start {
         GithubReadStart::Immediate(completion) => Ok(completion),
-        GithubReadStart::Deferred(pending) => loop {
-            if let Some(completion) = pending.try_complete() {
-                return completion;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        },
+        GithubReadStart::Deferred(pending) => pending.wait_until(github_read_deadline()),
+    }
+}
+
+fn github_read_deadline() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let ceiling = now + GITHUB_READ_WAIT_CEILING;
+    match crate::bounded_io::current() {
+        Some(budget) => budget
+            .deadline
+            .checked_sub(GITHUB_READ_RETURN_MARGIN)
+            .unwrap_or(now)
+            .clamp(now, ceiling),
+        None => ceiling,
     }
 }
 
