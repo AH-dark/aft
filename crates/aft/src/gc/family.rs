@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, OptionalExtension};
 
 use crate::blob_store::v2::{
-    plane_path, segment_path, FamilyPlane, FamilyStore, StoreError, StoreWriteAccess,
+    plane_path, segment_path, FamilyPlane, FamilyStore, PayloadTotals, StoreError, StoreWriteAccess,
 };
 use crate::pins::{self, PinError};
 use crate::views::registry::{
@@ -267,6 +267,10 @@ pub fn sweep_family_bounded(
 ///
 /// No measurement from the caller is used: the family may have grown since
 /// the caller measured it.
+///
+/// This sweep is the one that sets up a plane store's payload totals (see
+/// [`FamilyStore::ensure_payload_totals`]) when that plane's exact payload
+/// total is needed, so later totals read one row, not every row.
 pub fn sweep_family_remeasured(
     registry: &FamilyRegistry,
     requested_by: Option<&str>,
@@ -274,13 +278,14 @@ pub fn sweep_family_remeasured(
     bounds: SweepBounds,
     observer: Option<&dyn SweepObserver>,
 ) -> Result<FamilySweepReport, FamilySweepError> {
-    sweep_with(
+    sweep_with_maintenance(
         registry,
         requested_by,
         policy,
         bounds,
         observer,
         SmallFamilyCheck::FileWalk,
+        true,
     )
 }
 
@@ -325,6 +330,30 @@ pub(crate) fn sweep_with(
     bounds: SweepBounds,
     observer: Option<&dyn SweepObserver>,
     small: SmallFamilyCheck,
+) -> Result<FamilySweepReport, FamilySweepError> {
+    sweep_with_maintenance(
+        registry,
+        requested_by,
+        policy,
+        bounds,
+        observer,
+        small,
+        false,
+    )
+}
+
+/// [`sweep_with`]; with `set_up_totals`, a plane whose exact payload total
+/// is needed first gets its payload totals (see
+/// [`FamilyStore::ensure_payload_totals`]). Only disk-limit maintenance,
+/// through [`sweep_family_remeasured`], sets them up.
+fn sweep_with_maintenance(
+    registry: &FamilyRegistry,
+    requested_by: Option<&str>,
+    policy: FamilySweepPolicy,
+    bounds: SweepBounds,
+    observer: Option<&dyn SweepObserver>,
+    small: SmallFamilyCheck,
+    set_up_totals: bool,
 ) -> Result<FamilySweepReport, FamilySweepError> {
     let _ = requested_by;
     let lease = registry.begin_sweep()?.ok_or(FamilySweepError::Busy)?;
@@ -395,6 +424,7 @@ pub(crate) fn sweep_with(
             &bounds,
             observer,
             within_budget,
+            set_up_totals,
             &mut report,
         )?;
     }
@@ -451,13 +481,22 @@ fn delete_unmarked(
     bounds: &SweepBounds,
     observer: Option<&dyn SweepObserver>,
     family_within_budget: bool,
+    set_up_totals: bool,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
     // A family whose files all fit in the budget has no plane over it, so
     // there is nothing to delete. Free pages are released either way.
     if !family_within_budget {
         delete_over_budget(
-            registry, store, marked, epoch, policy, bounds, observer, report,
+            registry,
+            store,
+            marked,
+            epoch,
+            policy,
+            bounds,
+            observer,
+            set_up_totals,
+            report,
         )?;
     }
     reclaim_free_pages(store, bounds, report)
@@ -474,6 +513,7 @@ fn delete_over_budget(
     policy: FamilySweepPolicy,
     bounds: &SweepBounds,
     observer: Option<&dyn SweepObserver>,
+    set_up_totals: bool,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
     #[cfg(test)]
@@ -493,7 +533,17 @@ fn delete_over_budget(
     }
     // The total comes from SQLite's own sums, not from the listing, so the
     // budget check stays right when the listing below is cut at its bound.
+    // With the store's payload totals, that sum reads one row instead of
+    // every row.
+    if set_up_totals {
+        ensure_payload_totals(store, bounds);
+    }
     let mut total = store.usage()?.payload_bytes + segment_bytes;
+    // Within the budget the loops below would stop before their first row,
+    // so the listing, which reads every row, is not taken at all.
+    if total <= policy.byte_budget {
+        return Ok(());
+    }
     let rows = store.rows_oldest(bounds.max_rows_per_store)?;
     for row in rows {
         if total <= policy.byte_budget {
@@ -549,6 +599,38 @@ fn delete_over_budget(
         }
     }
     Ok(())
+}
+
+/// Time one payload totals setup may take. A setup that runs out of it is
+/// rolled back and not tried again in this process.
+const TOTALS_SETUP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Sets up `store`'s payload totals when they are missing or incomplete,
+/// as its exact payload total is about to be read. Any failure leaves the
+/// store as it was, and the total is then summed from every row.
+fn ensure_payload_totals(store: &FamilyStore, bounds: &SweepBounds) {
+    let now = Instant::now();
+    // A setup starts only with its whole budget left before the sweep's
+    // deadline, so a pass that is nearly out of time does not give it up.
+    if bounds
+        .deadline
+        .is_some_and(|deadline| deadline.saturating_duration_since(now) < TOTALS_SETUP_BUDGET)
+    {
+        return;
+    }
+    match store.ensure_payload_totals(now + TOTALS_SETUP_BUDGET) {
+        Ok(PayloadTotals::Built { elapsed }) => crate::slog_info!(
+            "family store payload totals set up store={} elapsed_ms={}",
+            store.path().display(),
+            elapsed.as_millis()
+        ),
+        Ok(PayloadTotals::Present | PayloadTotals::Busy | PayloadTotals::GaveUp) => {}
+        Err(error) => crate::slog_warn!(
+            "family store payload totals not set up store={} error={}",
+            store.path().display(),
+            error
+        ),
+    }
 }
 
 /// One bounded incremental-vacuum pass over the store, recorded in `report`.

@@ -1,0 +1,1 @@
+- The background disk-limit check no longer re-reads each large shared index store in full every ten minutes when nothing changed, and returns freed space once a repository is over its disk limit.

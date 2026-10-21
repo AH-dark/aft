@@ -16,6 +16,8 @@ use crate::pins::{self, PinMetadata};
 use crate::root_cache;
 
 pub mod family;
+#[cfg(test)]
+mod family_read_tests;
 
 /// Payloads newer than this stay available even when a store is over budget.
 pub const BLOB_AGE_FLOOR_MS: u64 = 15 * 60 * 1_000;

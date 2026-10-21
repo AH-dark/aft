@@ -713,6 +713,57 @@ impl FamilyStore {
         usage(&self.inner)
     }
 
+    /// Sets up the store's payload totals (see [`TOTALS_TABLE_SQL`]) when they
+    /// are missing or not trustworthy, so later exact payload totals
+    /// read one row instead of every row. Setup reads every row once and
+    /// holds the store's write lock until done, so only disk-limit
+    /// maintenance calls it. It waits at most [`TOTALS_SETUP_BUSY_WAIT`] for
+    /// another writer and otherwise leaves the store for a later pass; a
+    /// setup still running at `deadline` is rolled back and not tried again
+    /// in this process.
+    pub(crate) fn ensure_payload_totals(
+        &self,
+        deadline: std::time::Instant,
+    ) -> StoreResult<PayloadTotals> {
+        let path = self.inner.path.clone();
+        if lock(slow_totals_setups()).contains(&path) {
+            return Ok(PayloadTotals::GaveUp);
+        }
+        let mut connection = lock(&self.inner.connection);
+        if exact_totals(&connection)?.is_some() {
+            return Ok(PayloadTotals::Present);
+        }
+        let started = std::time::Instant::now();
+        let timeout: u64 = connection.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+        connection.busy_timeout(TOTALS_SETUP_BUSY_WAIT)?;
+        let outcome = set_up_payload_totals(&mut connection, deadline);
+        connection.busy_timeout(Duration::from_millis(timeout))?;
+        match outcome {
+            Ok(()) => {
+                // Setup seeded the totals with one sum over every row.
+                count_logical_aggregate();
+                Ok(PayloadTotals::Built {
+                    elapsed: started.elapsed(),
+                })
+            }
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Ok(PayloadTotals::Busy)
+            }
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                lock(slow_totals_setups()).insert(path);
+                Ok(PayloadTotals::GaveUp)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// An upper bound on logical payload bytes, without scanning payload rows.
     /// SQLite's page count includes the connection's current WAL snapshot, not
     /// just pages already checkpointed into the main database file.
@@ -899,6 +950,165 @@ pub(crate) fn take_logical_aggregates() -> usize {
 const DELETE_UNREFERENCED_SQL: &str =
     "DELETE FROM blob_payloads WHERE full_key = ?1 AND ref_epoch < ?2";
 
+/// The exact row count and payload bytes of `blob_payloads`, in a one-row
+/// table that SQLite triggers keep current on every insert, delete and
+/// payload update. Triggers live in the store's schema, so SQLite runs them
+/// for every writer, also for AFT releases that predate them, and the total
+/// stays exact whichever binary wrote last. Epoch-only updates fire none of
+/// them. Stores get the table from disk-limit maintenance
+/// ([`FamilyStore::ensure_payload_totals`]), never on open; a store without
+/// it, or with any part of it missing or altered, is summed row by row.
+const TOTALS_TABLE_SQL: &str = "CREATE TABLE payload_totals (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    row_count INTEGER NOT NULL,
+    payload_bytes INTEGER NOT NULL
+)";
+const TOTALS_SEED_SQL: &str = "INSERT INTO payload_totals (singleton, row_count, payload_bytes)
+    SELECT 1, COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads";
+/// The triggers by name, with the exact text SQLite records for each; a
+/// trigger whose recorded text differs is treated as missing.
+const TOTALS_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "payload_totals_insert",
+        "CREATE TRIGGER payload_totals_insert AFTER INSERT ON blob_payloads BEGIN
+    UPDATE payload_totals SET row_count = row_count + 1,
+        payload_bytes = payload_bytes + length(NEW.payload) WHERE singleton = 1;
+END",
+    ),
+    (
+        "payload_totals_delete",
+        "CREATE TRIGGER payload_totals_delete AFTER DELETE ON blob_payloads BEGIN
+    UPDATE payload_totals SET row_count = row_count - 1,
+        payload_bytes = payload_bytes - length(OLD.payload) WHERE singleton = 1;
+END",
+    ),
+    (
+        "payload_totals_update",
+        "CREATE TRIGGER payload_totals_update AFTER UPDATE OF payload ON blob_payloads BEGIN
+    UPDATE payload_totals SET
+        payload_bytes = payload_bytes - length(OLD.payload) + length(NEW.payload)
+        WHERE singleton = 1;
+END",
+    ),
+];
+/// How long setup waits for another writer before leaving the store for a
+/// later pass.
+pub(crate) const TOTALS_SETUP_BUSY_WAIT: Duration = Duration::from_millis(250);
+/// VM steps between deadline checks while the totals are set up.
+const TOTALS_SETUP_PROGRESS_STEPS: std::ffi::c_int = 10_000;
+
+/// What [`FamilyStore::ensure_payload_totals`] found or did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PayloadTotals {
+    /// The store already had complete totals.
+    Present,
+    /// This call set them up.
+    Built { elapsed: Duration },
+    /// Another connection kept the write lock; nothing was done.
+    Busy,
+    /// A setup did not finish by its deadline in this process, so none is
+    /// tried again until the process restarts.
+    GaveUp,
+}
+
+/// The store's exact row count and payload bytes from its totals table,
+/// or `None` unless the table holds exactly one well-formed row and all
+/// three triggers exist with their expected text. A caller that uses the
+/// value reads it within one transaction, so the triggers and the row come
+/// from one snapshot.
+fn exact_totals(connection: &rusqlite::Connection) -> StoreResult<Option<(u64, u64)>> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql FROM sqlite_schema
+         WHERE (type = 'trigger' AND tbl_name = 'blob_payloads')
+            OR (type = 'table' AND name = 'payload_totals')",
+    )?;
+    let schema = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_table = schema.iter().any(|(kind, _, _)| kind == "table");
+    let has_triggers = TOTALS_TRIGGERS.iter().all(|(name, sql)| {
+        schema.iter().any(|(kind, found, text)| {
+            kind == "trigger" && found == name && text.as_deref() == Some(*sql)
+        })
+    });
+    if !has_table || !has_triggers {
+        return Ok(None);
+    }
+    let rows = connection
+        .prepare("SELECT singleton, row_count, payload_bytes FROM payload_totals LIMIT 2")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(match rows.as_slice() {
+        [(1, count, bytes)] if *count >= 0 && *bytes >= 0 => Some((*count as u64, *bytes as u64)),
+        _ => None,
+    })
+}
+
+/// Store files whose totals setup ran out of time in this process.
+fn slow_totals_setups() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static SLOW: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    SLOW.get_or_init(Mutex::default)
+}
+
+/// Replaces whatever totals table and triggers the store has with fresh
+/// ones, seeded from one scan, in one IMMEDIATE transaction: no write can
+/// land between the scan and the triggers. Interrupted, and so rolled back,
+/// once `deadline` passes.
+fn set_up_payload_totals(
+    connection: &mut rusqlite::Connection,
+    deadline: std::time::Instant,
+) -> rusqlite::Result<()> {
+    unsafe extern "C" fn past_deadline(context: *mut std::ffi::c_void) -> std::ffi::c_int {
+        let deadline = unsafe { &*context.cast::<std::time::Instant>() };
+        std::ffi::c_int::from(std::time::Instant::now() >= *deadline)
+    }
+    // The caller holds the store's connection lock throughout.
+    let db = unsafe { connection.handle() };
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut deadline = Box::new(deadline);
+    // Installed only around the setup statements, so it can never interrupt
+    // the commit or the rollback, and removed before the box is dropped.
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(
+            db,
+            TOTALS_SETUP_PROGRESS_STEPS,
+            Some(past_deadline),
+            std::ptr::from_mut(deadline.as_mut()).cast(),
+        );
+    }
+    let set_up = (|| {
+        for (name, _) in TOTALS_TRIGGERS {
+            tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {name}"))?;
+        }
+        tx.execute_batch("DROP TABLE IF EXISTS payload_totals")?;
+        tx.execute_batch(TOTALS_TABLE_SQL)?;
+        tx.execute(TOTALS_SEED_SQL, [])?;
+        for (_, sql) in TOTALS_TRIGGERS {
+            tx.execute_batch(sql)?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })();
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(db, 0, None, std::ptr::null_mut());
+    }
+    drop(deadline);
+    // On an error the transaction rolls back when dropped.
+    set_up?;
+    tx.commit()
+}
+
 impl FamilyStoreReader {
     /// Opens an existing store read-only. A store that does not exist is
     /// reported as `None`; a reader never creates one.
@@ -1009,6 +1219,13 @@ fn shared_inner(
         )?
     };
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+    // Every insert and delete fires a payload-totals trigger, which makes it
+    // a statement SQLite journals separately inside its transaction; with
+    // temporary files those statement journals spill to disk and more than
+    // triple the bytes a bulk insert writes. Kept in memory, they stay
+    // small. The one temporary b-tree these connections build, for the
+    // oldest-first listing's sort, is bounded by that listing's row limit.
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
     let inner = Arc::new(StoreInner {
         family: family.to_owned(),
         plane,
@@ -1148,27 +1365,40 @@ fn contains(inner: &StoreInner, key: &FamilyKey) -> StoreResult<bool> {
 }
 
 fn usage(inner: &StoreInner) -> StoreResult<StoreUsage> {
-    let connection = lock(&inner.connection);
-    crate::views::io::WORK
-        .logical_aggregates
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(test)]
-    LOGICAL_AGGREGATES.with(|count| count.set(count.get() + 1));
-    let (rows, payload_bytes): (u64, u64) = connection.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let page_count: u64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
-    let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
-    let freelist_pages: u64 =
-        connection.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+    let mut connection = lock(&inner.connection);
+    // One read transaction, so the totals' triggers, their row and the page
+    // counts all come from one snapshot.
+    let read = connection.transaction()?;
+    let (rows, payload_bytes) = match exact_totals(&read)? {
+        Some(totals) => totals,
+        None => {
+            count_logical_aggregate();
+            read.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        }
+    };
+    let page_count: u64 = read.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let page_size: u64 = read.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let freelist_pages: u64 = read.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+    read.commit()?;
     Ok(StoreUsage {
         rows,
         payload_bytes,
         file_bytes: page_count.saturating_mul(page_size),
         freelist_pages,
     })
+}
+
+/// Counts one sum over every payload row.
+fn count_logical_aggregate() {
+    crate::views::io::WORK
+        .logical_aggregates
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    LOGICAL_AGGREGATES.with(|count| count.set(count.get() + 1));
 }
 
 fn read_segment_row(
