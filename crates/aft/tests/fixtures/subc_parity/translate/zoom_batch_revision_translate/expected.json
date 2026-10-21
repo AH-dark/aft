@@ -1,0 +1,15 @@
+{
+  "args": {
+    "callgraph": true,
+    "context_lines": 2,
+    "ref": "HEAD~1",
+    "targets": [
+      {
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "symbol": "run, missing",
+        "target_label": "src/main.ts"
+      }
+    ]
+  },
+  "command": "zoom"
+}

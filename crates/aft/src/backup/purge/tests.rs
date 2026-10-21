@@ -77,6 +77,42 @@ fn key(path: &Path) -> String {
     backup_key_for_path(path).display().to_string()
 }
 
+#[cfg(unix)]
+#[test]
+fn final_directory_symlink_purge_selects_only_the_link_entry() {
+    let fx = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let target_file = outside.path().join("secret.txt");
+    fs::write(&target_file, "secret").unwrap();
+    let link = fx.project.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let live = parking_lot::Mutex::new(fx.store());
+    live.lock().snapshot(S1, &target_file, "edit").unwrap();
+    live.lock().snapshot(S1, &link, "delete").unwrap();
+
+    let selected = session_path_keys(&live, S1, &link, |_| Some(Arc::clone(&fx.db)));
+    assert_eq!(selected, vec![backup_key_for_path(&link)]);
+    let target = PurgeTarget::new(&link);
+    assert_eq!(
+        target.classify(&link.join("secret.txt"), false),
+        SavedPathMatch::Unrelated
+    );
+    assert_eq!(
+        target.classify(&target_file, false),
+        SavedPathMatch::Unrelated
+    );
+
+    let report = purge_backups(
+        &fx.request(Some(&link), Some(S1), false),
+        Some(Arc::clone(&fx.db)),
+        &[&live],
+    );
+    assert!(report.is_complete(), "{:?}", report.failures);
+    assert_eq!(report.removed.stacks, 1);
+    assert_eq!(live.lock().history(S1, &target_file).len(), 1);
+    assert!(live.lock().history(S1, &link).is_empty());
+}
+
 #[test]
 fn dry_run_reports_counts_and_removes_nothing() {
     let fx = Fixture::new();
@@ -384,4 +420,66 @@ fn concurrent_append_during_purge_keeps_the_stack_consistent() {
             Err(error) => assert_eq!(error.code(), "no_undo_history", "{error}"),
         }
     }
+}
+
+#[test]
+fn session_path_purge_removes_only_the_calling_sessions_stacks() {
+    let fx = Fixture::new();
+    let secret = fx.file("conf/secret.env", "token=0");
+    let nearby = fx.file("conf/other.txt", "o0");
+    let live = parking_lot::Mutex::new(fx.store());
+    edit(&mut live.lock(), S1, &secret, "token=1");
+    edit(&mut live.lock(), S1, &secret, "token=2");
+    edit(&mut live.lock(), S1, &nearby, "o1");
+    edit(&mut live.lock(), S2, &secret, "token=3");
+
+    let report = purge_session_path(&live, S1, &secret, |_| None).unwrap();
+
+    assert!(report.is_complete(), "{:?}", report.failures);
+    assert_eq!(report.removed.stacks, 1);
+    assert_eq!(report.removed.entries, 2);
+    assert_eq!(report.removed.sessions, vec![S1.to_string()]);
+    let mut store = live.lock();
+    assert!(store.history(S1, &secret).is_empty());
+    assert_eq!(
+        store.restore_latest(S1, &secret).unwrap_err().code(),
+        "no_undo_history"
+    );
+    assert_eq!(store.history(S1, &nearby).len(), 1);
+    assert_eq!(store.history(S2, &secret).len(), 1);
+    assert!(!fx.stack_dir(S1, &secret).exists());
+    assert!(fx.stack_dir(S2, &secret).join("meta.json").is_file());
+    let mut remaining = fx
+        .db_stacks()
+        .into_iter()
+        .map(|stack| (stack.session_id, stack.file_path))
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec![
+            (S1.to_string(), key(&nearby)),
+            (S2.to_string(), key(&secret)),
+        ]
+    );
+}
+
+#[test]
+fn session_path_purge_of_a_store_without_storage_forgets_memory_stacks() {
+    let fx = Fixture::new();
+    let inside = fx.file("a/x.txt", "x0");
+    let outside = fx.file("b/y.txt", "y0");
+    let live = parking_lot::Mutex::new(BackupStore::new());
+    edit(&mut live.lock(), S1, &inside, "x1");
+    edit(&mut live.lock(), S1, &outside, "y1");
+    edit(&mut live.lock(), S2, &inside, "x2");
+
+    let report = purge_session_path(&live, S1, &fx.project.path().join("a"), |_| None).unwrap();
+
+    assert_eq!(report.removed.stacks, 1);
+    assert_eq!(report.removed.entries, 1);
+    let store = live.lock();
+    assert!(store.history(S1, &inside).is_empty());
+    assert_eq!(store.history(S1, &outside).len(), 1);
+    assert_eq!(store.history(S2, &inside).len(), 1);
 }

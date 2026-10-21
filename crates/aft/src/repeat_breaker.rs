@@ -246,6 +246,8 @@ pub fn semantic_key(tool: &str, input: &Value) -> String {
                 "endLine",
                 "offset",
                 "limit",
+                // A read at a git revision is a different read of the same path.
+                "ref",
             ],
         ),
         "grep" => select_fields(

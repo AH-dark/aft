@@ -43,6 +43,7 @@ export interface ResolvedBashForLiveReload {
   subagent_background: boolean;
   watch_sync_max_ms: number;
   worker_wait_max_ms: number;
+  env: Record<string, string>;
 }
 
 type AnyConfig = Record<string, unknown>;
@@ -113,6 +114,7 @@ export function aftLiveConfigKeys<C>(
   return [
     pathKey<C>("configure_warnings_delivery"),
     pathKey<C>("restrict_to_project_root"),
+    pathKey<C>("revision_reads"),
     pathKey<C>("inspect.diagnostics_timeout_ms"),
     pathKey<C>("inspect.tier2_idle_minutes"),
     pathKey<C>("lsp.idle_minutes"),
@@ -131,6 +133,7 @@ export function aftLiveConfigKeys<C>(
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),
+    bashKey<C>("env", resolveBash),
   ];
 }
 

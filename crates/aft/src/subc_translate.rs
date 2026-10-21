@@ -1672,6 +1672,28 @@ fn resolve_read_range(map_in: &Map<String, Value>) -> Result<ReadRange, Translat
     })
 }
 
+/// Forward the optional git revision (`ref`) that `read`, `outline` and
+/// `zoom` read a file at. A blank value counts as absent, like the other
+/// optional fields models fill with placeholders; whether the revision is
+/// allowed at all is decided by the command (`revision_reads`), so a refusal
+/// names the setting instead of the argument silently vanishing.
+fn insert_revision(
+    out: &mut Map<String, Value>,
+    map_in: &Map<String, Value>,
+) -> Result<(), TranslateError> {
+    match map_in.get("ref") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(reference)) if reference.trim().is_empty() => Ok(()),
+        Some(Value::String(reference)) => {
+            out.insert("ref".into(), Value::String(reference.trim().to_string()));
+            Ok(())
+        }
+        Some(_) => Err(invalid_request(
+            "'ref' must be a git revision string (a branch, tag, commit SHA, or a form like HEAD~2)",
+        )),
+    }
+}
+
 fn translate_read(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let file_path = map_in
@@ -1682,6 +1704,7 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
 
     let mut out = Map::new();
     insert_file_or_github_target(&mut out, project_root, file_path);
+    insert_revision(&mut out, &map_in)?;
 
     let range = resolve_read_range(&map_in)?;
     if let Some(sl) = range.start_line {
@@ -2219,15 +2242,16 @@ fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, Tran
         "checkpoint" => "checkpoint",
         "restore" => "restore_checkpoint",
         "list" => "list_checkpoints",
+        "purge" => "safety_purge",
         other => {
             return Err(invalid_request(format!(
-                "aft_safety: invalid op {other:?}; expected 'undo', 'history', 'checkpoint', 'restore', or 'list'"
+                "aft_safety: invalid op {other:?}; expected 'undo', 'history', 'checkpoint', 'restore', 'list', or 'purge'"
             )));
         }
     };
 
-    if op == "history" && map_in.get("path").and_then(Value::as_str).is_none() {
-        return Err(invalid_request("'path' is required for 'history' op"));
+    if matches!(op, "history" | "purge") && map_in.get("path").and_then(Value::as_str).is_none() {
+        return Err(invalid_request(format!("'path' is required for '{op}' op")));
     }
     if matches!(op, "checkpoint" | "restore")
         && map_in.get("name").and_then(Value::as_str).is_none()
@@ -2529,6 +2553,7 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     }
 
     let mut out = Map::new();
+    insert_revision(&mut out, &map_in)?;
     if let Some(excluded) = map_in.get("_exclude_read_paths").and_then(Value::as_array) {
         out.insert(
             "_exclude_read_paths".into(),
@@ -2740,6 +2765,7 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
     let map_in = agent_args_map(args);
     let batch = map_in.get("batch").expect("normalized zoom batch");
     let mut out = Map::new();
+    insert_revision(&mut out, &map_in)?;
     out.insert(
         "targets".to_string(),
         Value::Array(translate_zoom_targets(batch, project_root)?),

@@ -366,6 +366,13 @@ export type {
   StatusResponse,
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
+// --- reading a file at a git revision (`ref`) ---
+export {
+  REVISION_REF_DESCRIPTION,
+  REVISION_REF_TOOL_NOTE,
+  revisionReadsOffered,
+  revisionRefArg,
+} from "./revision-reads.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
 // --- semantic-index status vocabulary (shared by both plugin hosts) ---
 export type { SemanticBackendDetail, SemanticIndexStatusKind } from "./semantic-status.js";

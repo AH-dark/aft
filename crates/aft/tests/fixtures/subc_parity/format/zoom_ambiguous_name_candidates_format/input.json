@@ -3,6 +3,7 @@
   "native_response_json": {
     "id": "1",
     "success": true,
+    "text": "src/main.ts:1-1 [ambiguous_symbol run]\n\n1: symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body\n2: - run() — function run(): void\n3: - Worker.run() — method run(): Promise<void>",
     "name": "run",
     "kind": "ambiguous_symbol",
     "content": "symbol 'run' is ambiguous (2 candidates) — zoom a qualified name for its body\n- run() — function run(): void\n- Worker.run() — method run(): Promise<void>",
@@ -29,7 +30,7 @@
   },
   "ctx": {
     "agent_args": {
-      "filePath": "src/main.ts",
+      "path": "src/main.ts",
       "symbols": "run"
     },
     "project_root": "<PROJECT_ROOT>"

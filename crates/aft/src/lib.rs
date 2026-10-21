@@ -60,6 +60,7 @@ pub mod backup;
 pub mod bash_background;
 #[cfg(unix)]
 pub(crate) mod bash_db_hints;
+pub(crate) mod bash_env;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod blob_store;
@@ -157,6 +158,7 @@ pub mod reader_floor;
 pub mod readonly_artifacts;
 pub mod refresh;
 pub mod response_finalize;
+pub(crate) mod revision_read;
 pub mod root_cache;
 pub mod run_tool_call;
 pub mod runtime_drain;

@@ -2,11 +2,11 @@
   "agent_args": {
     "targets": [
       {
-        "filePath": "src/main.ts",
+        "path": "src/main.ts",
         "symbol": "run"
       },
       {
-        "filePath": "missing.ts",
+        "path": "missing.ts",
         "symbol": "run"
       }
     ]

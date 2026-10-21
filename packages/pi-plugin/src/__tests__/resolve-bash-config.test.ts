@@ -6,13 +6,23 @@
 
 import { describe, expect, test } from "bun:test";
 import type { AftConfig } from "../config.js";
-import { resolveBashConfig } from "../config.js";
+import { resolveBashConfig, resolveProjectOverridesForConfigure } from "../config.js";
 
 function cfg(overrides: Partial<AftConfig>): AftConfig {
   return overrides as AftConfig;
 }
 
 describe("resolveBashConfig (Pi)", () => {
+  test("bash.env resolves and is forwarded to Rust", () => {
+    const config = cfg({
+      disabled_tools: [],
+      bash: { env: { TZ: "UTC", AFT_TEST_KEY: "private-value" } },
+    });
+    expect(resolveBashConfig(config).env).toEqual({ TZ: "UTC", AFT_TEST_KEY: "private-value" });
+    expect(resolveProjectOverridesForConfigure(config).bash).toEqual({
+      env: { TZ: "UTC", AFT_TEST_KEY: "private-value" },
+    });
+  });
   // ---- Top-level boolean shapes ----------------------------------------
 
   test("bash: true → fully enabled regardless of surface", () => {

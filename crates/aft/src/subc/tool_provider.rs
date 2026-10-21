@@ -121,7 +121,13 @@ pub(super) const METADATA: &[(&str, &str, bool)] = &[
 
 #[cfg(test)]
 pub(super) fn tools(disabled: &[String], powershell_available: bool) -> Vec<CatalogTool> {
-    tools_for_session(CatalogPreset::Head, disabled, powershell_available, false)
+    tools_for_session(
+        CatalogPreset::Head,
+        disabled,
+        powershell_available,
+        false,
+        false,
+    )
 }
 
 /// The named catalog variants AFT serves. A consumer's plan item names one
@@ -194,12 +200,15 @@ pub(super) const PRESET_ONLY_METADATA: &[(&str, &str, bool)] =
 /// tool placed after the head tool it accompanies.
 ///
 /// A session that may run commands on the remote runner (`runon`) also sees
-/// bash's `runon` argument; no other session does.
+/// bash's `runon` argument; no other session does. Likewise only a session
+/// whose `revision_reads` is on sees the `ref` argument of read, outline and
+/// zoom.
 pub(super) fn tools_for_session(
     preset: CatalogPreset,
     disabled: &[String],
     powershell_available: bool,
     runon: bool,
+    revision_reads: bool,
 ) -> Vec<CatalogTool> {
     served_tools(preset)
         .iter()
@@ -208,10 +217,13 @@ pub(super) fn tools_for_session(
         .filter(|tool| {
             tool.catalog.name != "bash_watch" || crate::tool_gate::catalog_keeps("bash", disabled)
         })
-        .map(|tool| match (&tool.with_runon, runon) {
-            (Some(with_runon), true) => with_runon.clone(),
-            _ => tool.catalog.clone(),
-        })
+        .map(
+            |tool| match (&tool.with_runon, runon, &tool.with_ref, revision_reads) {
+                (Some(with_runon), true, _, _) => with_runon.clone(),
+                (_, _, Some(with_ref), true) => with_ref.clone(),
+                _ => tool.catalog.clone(),
+            },
+        )
         .collect()
 }
 
@@ -224,6 +236,11 @@ struct ServedTool {
     /// that may run commands remotely. Admission validates every call against
     /// it, so a call from either kind of session is checked the same way.
     with_runon: Option<CatalogTool>,
+    /// The same entry with the `ref` (git revision) argument of read, outline
+    /// and zoom, served only to a session whose `revision_reads` is on.
+    /// Admission validates those calls against it, and the command refuses
+    /// `ref` by name when the setting is off.
+    with_ref: Option<CatalogTool>,
     validator: OnceLock<jsonschema::Validator>,
 }
 
@@ -231,9 +248,10 @@ static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
     CatalogPreset::ALL.map(|preset| {
         build_tools(preset)
             .into_iter()
-            .map(|(catalog, with_runon)| ServedTool {
+            .map(|(catalog, with_runon, with_ref)| ServedTool {
                 catalog,
                 with_runon,
+                with_ref,
                 validator: OnceLock::new(),
             })
             .collect()
@@ -248,7 +266,9 @@ fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
     }]
 }
 
-fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)> {
+type ServedVariants = (CatalogTool, Option<CatalogTool>, Option<CatalogTool>);
+
+fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
     #[cfg(test)]
     ADMISSION_WORK.with(|count| {
         let (catalogs, validators) = count.get();
@@ -339,7 +359,9 @@ fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)>
             let preset_name = (preset != CatalogPreset::Head).then(|| preset.name());
             let with_runon = manifest::remote_tool(preset_name, &name)
                 .map(|(schema, description)| entry(schema, description));
-            (entry(schema, description), with_runon)
+            let with_ref = manifest::revision_tool(&name)
+                .map(|(schema, description)| entry(schema, description));
+            (entry(schema, description), with_runon, with_ref)
         })
         .collect()
 }
@@ -458,6 +480,7 @@ pub(super) fn catalog_for_session(
         disabled,
         powershell_available,
         runon,
+        false,
         worker_wait_max_ms,
     )
 }
@@ -502,13 +525,15 @@ thread_local! {
 }
 
 /// Render validated arguments under the session's resolved remote policy and
-/// blocking wait limit. Only remotely enabled sessions see bash's `runon` argument.
+/// blocking wait limit. Only remotely enabled sessions see bash's `runon`
+/// argument, and only sessions with `revision_reads` on see `ref`.
 pub(super) fn catalog_for_request(
     request: CatalogRequest,
     preset: CatalogPreset,
     disabled: &[String],
     powershell_available: bool,
     runon: bool,
+    revision_reads: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
     render_catalog(
@@ -516,7 +541,7 @@ pub(super) fn catalog_for_request(
         preset,
         disabled,
         powershell_available,
-        runon,
+        (runon, revision_reads),
         worker_wait_max_ms,
         false,
     )
@@ -528,6 +553,7 @@ pub(super) fn catalog_for_confined_request(
     disabled: &[String],
     powershell_available: bool,
     runon: bool,
+    revision_reads: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
     render_catalog(
@@ -535,28 +561,32 @@ pub(super) fn catalog_for_confined_request(
         preset,
         disabled,
         powershell_available,
-        runon,
+        (runon, revision_reads),
         worker_wait_max_ms,
         true,
     )
 }
 
+/// `offers` is the session's (`runon`, `revision_reads`) pair: which
+/// enabled-only arguments its catalog carries.
 fn render_catalog(
     request: CatalogRequest,
     preset: CatalogPreset,
     disabled: &[String],
     powershell_available: bool,
-    runon: bool,
+    offers: (bool, bool),
     worker_wait_max_ms: u64,
     confined: bool,
 ) -> Result<Value, ErrorBody> {
     #[cfg(test)]
     CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
+    let (runon, revision_reads) = offers;
     let mut answer = CatalogAnswer::new("", "").with_tools(tools_for_session(
         preset,
         disabled,
         powershell_available,
         runon,
+        revision_reads,
     ));
     if confined {
         answer
@@ -2394,8 +2424,14 @@ fn admit_as(
         .find(|tool| tool.catalog.name == call.name)
         .expect("admitted tool has a schema");
     // A bash call is checked against the schema with `runon`: whether the
-    // session may run remotely is decided when the call runs, by name.
-    let tool = served.with_runon.as_ref().unwrap_or(&served.catalog);
+    // session may run remotely is decided when the call runs, by name. A
+    // read, outline or zoom call is checked against the schema with `ref` the
+    // same way; the command refuses `ref` while `revision_reads` is off.
+    let tool = served
+        .with_runon
+        .as_ref()
+        .or(served.with_ref.as_ref())
+        .unwrap_or(&served.catalog);
     // Shared argument validation accepts both shell schemas. Check the behavior
     // version against the caller's preset so a worker wait change does not
     // invalidate calls pinned to the head's unchanged bash behavior.
@@ -2597,7 +2633,7 @@ mod tests {
             );
         }
         for preset in [CatalogPreset::Worker, CatalogPreset::Reader] {
-            for tool in tools_for_session(preset, &[], true, false) {
+            for tool in tools_for_session(preset, &[], true, false, false) {
                 check_modes(&tool).unwrap();
                 assert!(serves_call_mode(&tool, &CallMode::Classic));
                 if tool.name == "bash_watch" {
@@ -2901,9 +2937,38 @@ mod tests {
         }
     }
 
+    /// Only a session with `revision_reads` on is offered `ref`, and only on
+    /// read, outline and zoom; admission accepts a `ref` call from any session
+    /// so the command can refuse it by name when the setting is off.
+    #[test]
+    fn only_revision_read_sessions_are_offered_ref() {
+        for preset in CatalogPreset::ALL {
+            for enabled in [false, true] {
+                for tool in tools_for_session(preset, &[], true, false, enabled) {
+                    let offered = tool.input_schema["properties"].get("ref").is_some();
+                    let eligible = matches!(tool.name.as_str(), "read" | "outline" | "zoom");
+                    assert_eq!(offered, enabled && eligible, "{preset:?} {}", tool.name);
+                }
+            }
+        }
+        // Fill the read schema's required path argument under whatever name
+        // the catalog uses for it, then add `ref`.
+        let read = tools_for_session(CatalogPreset::Head, &[], true, false, true)
+            .into_iter()
+            .find(|tool| tool.name == "read")
+            .unwrap();
+        let mut arguments = serde_json::Map::new();
+        for name in read.input_schema["required"].as_array().unwrap() {
+            arguments.insert(name.as_str().unwrap().into(), json!("src/a.rs"));
+        }
+        arguments.insert("ref".into(), json!("main"));
+        let request = call("read", Value::Object(arguments));
+        assert!(admit(&request, false, &[], true, "session", true).is_ok());
+    }
+
     #[test]
     fn head_bash_calls_with_old_semantics_pins_are_refused() {
-        let tool = tools_for_session(CatalogPreset::Head, &[], true, false)
+        let tool = tools_for_session(CatalogPreset::Head, &[], true, false, false)
             .into_iter()
             .find(|tool| tool.name == "bash")
             .unwrap();
@@ -2939,7 +3004,7 @@ mod tests {
     #[test]
     fn worker_shell_calls_with_old_semantics_pins_are_refused() {
         for name in ["bash", "bash_watch"] {
-            let tool = tools_for_session(CatalogPreset::Worker, &[], true, false)
+            let tool = tools_for_session(CatalogPreset::Worker, &[], true, false, false)
                 .into_iter()
                 .find(|tool| tool.name == name)
                 .unwrap();

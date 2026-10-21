@@ -1199,6 +1199,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
         }
         "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
+        "safety_purge" => aft::commands::safety_purge::handle_safety_purge(&req, ctx),
         "semantic_search" => state.heavy(req.id),
         "subc_test_transport_response" => {
             let bytes = req.params.get("bytes").and_then(Value::as_u64).unwrap_or(0) as usize;

@@ -168,4 +168,84 @@ describe("aft_safety adapter", () => {
     );
     expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "tool_call"]);
   });
+
+  test("purge requires path before bridge dispatch", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge();
+    registerSafetyTool(api, makePluginContext(bridge));
+
+    await expect(executeTool(tools.get("aft_safety")!, { op: "purge" })).rejects.toThrow(
+      "requires 'path'",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test("purge forwards the path through tool_call", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "purged" }));
+    registerSafetyTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_safety")!, { op: "purge", filePath: "secrets" });
+
+    expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths", "tool_call"]);
+    expect(calls[0].params).toMatchObject({ file: "secrets" });
+    expect(calls[1]).toMatchObject({
+      command: "tool_call",
+      params: { name: "safety", arguments: { op: "purge", filePath: "secrets" } },
+    });
+  });
+
+  // A deleted directory is no longer on disk, so only the engine's list of
+  // the saved paths it would remove shows what the purge reaches.
+  for (const restrictToProjectRoot of [true, false]) {
+    test(`purge checks every saved path the engine lists with restriction ${restrictToProjectRoot}`, async () => {
+      const { api, tools } = makeMockApi();
+      const externalFile = resolve(process.cwd(), "../outside/secrets/x");
+      const { bridge, calls } = makeMockBridge((command) =>
+        command === "safety_purge_paths"
+          ? { success: true, paths: [resolve("deleted/x"), externalFile] }
+          : { success: true, text: "purged" },
+      );
+      registerSafetyTool(
+        api,
+        makePluginContext(bridge, { config: { restrict_to_project_root: restrictToProjectRoot } }),
+      );
+      const purge = executeTool(
+        tools.get("aft_safety")!,
+        { op: "purge", filePath: "deleted" },
+        makeExtContext(),
+      );
+      if (restrictToProjectRoot) {
+        await expect(purge).rejects.toThrow(`'${externalFile}' is outside the project root`);
+        expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths"]);
+      } else {
+        await purge;
+        expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths", "tool_call"]);
+      }
+    });
+  }
+
+  for (const restrictToProjectRoot of [true, false]) {
+    test(`purge outside the project root with restriction ${restrictToProjectRoot}`, async () => {
+      const { api, tools } = makeMockApi();
+      const externalDir = resolve(process.cwd(), "../outside/secrets");
+      const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "purged" }));
+      registerSafetyTool(
+        api,
+        makePluginContext(bridge, { config: { restrict_to_project_root: restrictToProjectRoot } }),
+      );
+      const purge = executeTool(
+        tools.get("aft_safety")!,
+        { op: "purge", filePath: externalDir },
+        makeExtContext(),
+      );
+      if (restrictToProjectRoot) {
+        await expect(purge).rejects.toThrow(`'${externalDir}' is outside the project root`);
+        expect(calls).toHaveLength(0);
+      } else {
+        await purge;
+        expect(calls.map((call) => call.command)).toEqual(["safety_purge_paths", "tool_call"]);
+      }
+    });
+  }
 });

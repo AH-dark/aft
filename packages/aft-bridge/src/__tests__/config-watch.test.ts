@@ -36,6 +36,7 @@ function resolveBash(config: TestConfig): ResolvedBashForLiveReload & Record<str
     foreground_wait_window_ms: (object.foreground_wait_window_ms as number) ?? 15_000,
     watch_sync_max_ms: (object.watch_sync_max_ms as number) ?? 120_000,
     worker_wait_max_ms: (object.worker_wait_max_ms as number) ?? 1_800_000,
+    env: (object.env as Record<string, string>) ?? {},
   };
 }
 
@@ -81,6 +82,14 @@ describe("applyLiveConfigKeys", () => {
     expect(result.config.disabled_tools).toEqual([]);
     // The caller's old snapshot is not mutated.
     expect(current.restrict_to_project_root).toBe(false);
+  });
+  test("bash.env changes apply to future commands without a reconnect", () => {
+    const current: TestConfig = { bash: { env: { TZ: "UTC" } } };
+    const next: TestConfig = { bash: { env: { TZ: "Etc/GMT", LANG: "C.UTF-8" } } };
+    const result = applyLiveConfigKeys(current, next, KEYS);
+    expect(result.applied).toContain("bash.env");
+    expect(result.deferred).toEqual([]);
+    expect(result.config).toMatchObject(next);
   });
 
   test("a live bash key keeps every other bash setting as loaded", () => {

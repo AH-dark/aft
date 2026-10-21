@@ -478,7 +478,7 @@ fn resolve_edit_with_offsets(
                 "batch: edit[{}] match '{}' not found in file{}",
                 index,
                 match_str,
-                crate::fuzzy_match::render_nearest_miss_detail(source, match_str),
+                crate::fuzzy_match::render_edit_not_found_detail(source, match_str, replacement),
             );
             return Err(Response::error(req_id, "batch_edit_failed", message));
         }

@@ -1443,7 +1443,7 @@ fn handle_single_file_edit_match(
                 "edit_match: '{}' not found in {}{}",
                 match_str,
                 file,
-                crate::fuzzy_match::render_nearest_miss_detail(&source, match_str),
+                crate::fuzzy_match::render_edit_not_found_detail(&source, match_str, replacement,),
             ),
         );
     }

@@ -5298,7 +5298,7 @@ fn sandboxed_child_environment(
         // arrived through the (otherwise honored) request environment.
         // Workers also drop session-bus discovery; Linux still reports that
         // direct connections to a known bus path are not isolated by Landlock.
-        if is_preexec_hijack_env_key(key.as_str())
+        if crate::bash_env::is_preexec_hijack_env_key(key.as_str())
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
@@ -5338,48 +5338,6 @@ fn sandbox_base_environment_key(key: &OsStr) -> bool {
         matches!(key, "HOME" | "USER" | "LOGNAME" | "SHELL" | "TERM" | "LANG")
             || key.starts_with("LC_")
     })
-}
-
-/// Environment keys that make a process load a library or run code during its
-/// own startup — before a native sandbox is installed in the launcher chain.
-/// These are refused from the request environment regardless of value so an
-/// injected `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / `BASH_ENV` cannot execute
-/// outside confinement. Matching is case-sensitive; POSIX environment names are
-/// case-sensitive and the loaders only honor the exact upper-case spellings.
-fn is_preexec_hijack_env_key(key: &str) -> bool {
-    // Dynamic-loader families (glibc/musl `LD_*`, macdyld `DYLD_*`): the whole
-    // prefix executes/loads at exec time, so block the family, not a fixed set.
-    if key.starts_with("LD_") || key.starts_with("DYLD_") || key.starts_with("BASH_FUNC_") {
-        return true;
-    }
-    matches!(
-        key,
-        // POSIX/bash shell startup + trace hooks (the supervisor is `/bin/sh`).
-        "BASH_ENV"
-            | "ENV"
-            | "SHELLOPTS"
-            | "BASHOPTS"
-            | "PROMPT_COMMAND"
-            | "PS4"
-            | "IFS"
-            // Interpreter auto-run / library-injection hooks.
-            | "PYTHONSTARTUP"
-            | "PYTHONPATH"
-            | "PYTHONHOME"
-            | "PERL5OPT"
-            | "PERL5LIB"
-            | "PERLLIB"
-            | "PERL5DB"
-            | "RUBYOPT"
-            | "RUBYLIB"
-            | "NODE_OPTIONS"
-            // glibc auxiliary loader hooks.
-            | "GCONV_PATH"
-            | "LOCPATH"
-            | "NLSPATH"
-            | "HOSTALIASES"
-            | "RESOLV_HOST_CONF"
-    )
 }
 
 #[cfg(unix)]
@@ -5739,6 +5697,39 @@ pub(crate) mod environment_tests {
         assert!(!sandbox_base_environment_key(OsStr::new(
             "DBUS_SESSION_BUS_ADDRESS"
         )));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_environment_keeps_benign_values_and_strips_injection_and_credentials() {
+        let request = HashMap::from([
+            ("BUILD_LABEL".into(), "configured-value".into()),
+            ("BASH_ENV".into(), "/untrusted/startup".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
+            (
+                crate::privacy_spawn::CONTROL_ENV.into(),
+                "private-control".into(),
+            ),
+            (
+                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+                "private-ticket".into(),
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let worker = with_worker_jail(true, || sandboxed_child_environment(&request, dir.path()));
+        assert_eq!(
+            worker.get(OsStr::new("BUILD_LABEL")),
+            Some(&OsString::from("configured-value"))
+        );
+        for key in request.keys().filter(|key| key.as_str() != "BUILD_LABEL") {
+            assert!(
+                !worker.contains_key(OsStr::new(key)),
+                "worker inherited {key}"
+            );
+        }
     }
 
     const REENTRY: &str = "AFT_TEST_RELAXED_ENV_REENTRY";

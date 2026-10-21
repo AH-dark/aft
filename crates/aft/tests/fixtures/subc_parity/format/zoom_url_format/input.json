@@ -3,6 +3,7 @@
   "native_response_json": {
     "id": "1",
     "success": true,
+    "text": "https://example.com/doc:5-7 [heading Features]\n\n3: Intro paragraph for the document.\n4: \n5: ## Features\n6: \n7: Feature details live here.\n8: ### Fast Path",
     "name": "Features",
     "kind": "heading",
     "range": {

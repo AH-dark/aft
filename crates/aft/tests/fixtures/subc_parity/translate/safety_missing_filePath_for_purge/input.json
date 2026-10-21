@@ -1,0 +1,7 @@
+{
+  "agent_args": {
+    "op": "purge"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "safety"
+}

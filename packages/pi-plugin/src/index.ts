@@ -104,6 +104,7 @@ import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import {
   piHashlineDowngrade,
   piHashlineEffective,
+  refreshPiRevisionReadTools,
   registerPiToolSurface,
   resolvePiToolSurface,
 } from "./tool-registration.js";
@@ -613,8 +614,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     storageDir,
   };
   // Keep the live keys of `ctx.config` current when either config file
-  // changes. Tool handlers read `ctx.config` per call; the tool set and its
-  // descriptions stay as loaded and follow the next restart.
+  // changes. The tool set stays as loaded; live schema gates replace only
+  // the metadata of tools already present in that set.
   const liveConfigReload = startPiLiveConfigReload({
     directory: projectRoot,
     initialSources: bootstrap.sources ?? [],
@@ -631,6 +632,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
     },
     notify: (message) => deliverConfigMigrationWarnings([message]),
+    refreshRevisionReadTools: () => refreshPiRevisionReadTools(pi, ctx, surface),
   });
 
   // ──────────────────────── Session-scoped startup ────────────────────────

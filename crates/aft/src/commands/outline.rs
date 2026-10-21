@@ -68,6 +68,9 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     const MAX_OUTPUT_BYTES: usize = 30 * 1024;
+    if let Some(reference) = crate::revision_read::requested_ref(req) {
+        return handle_revision_outline(req, ctx, reference);
+    }
     let excluded = excluded_read_paths(req);
 
     if req
@@ -257,6 +260,12 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    outline_single_file(req, ctx, path, file)
+}
+
+/// Outline one file already resolved to a readable local `path`; `file` is
+/// the caller's spelling (a URL for a downloaded document).
+fn outline_single_file(req: &RawRequest, ctx: &AppContext, path: PathBuf, file: &str) -> Response {
     let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path) {
         Ok(s) => s,
         Err(e) => {
@@ -337,6 +346,70 @@ fn format_url_outline_with_header(url: &str, text: &str, notice: Option<&str>) -
         None => body.to_string(),
     };
     format_url_outline(url, &contents)
+}
+
+/// Outline one file as it is at the git revision `reference`. Only a single
+/// local file can be outlined at a revision: directories, `files` mode and
+/// URLs read the working tree or the network, never the object store.
+fn handle_revision_outline(req: &RawRequest, ctx: &AppContext, reference: &str) -> Response {
+    if let Err(refusal) = crate::revision_read::check_enabled(req, ctx) {
+        return refusal;
+    }
+    let unsupported = |what: &str| {
+        Response::error(
+            &req.id,
+            "invalid_request",
+            format!("outline: 'ref' outlines a single repository file; {what} cannot be outlined at a revision"),
+        )
+    };
+    if req.params.get("files").is_some() {
+        return unsupported("files mode or several targets");
+    }
+    if req.params.get("directory").is_some() {
+        return unsupported("a directory");
+    }
+    let Some(file) = req
+        .params
+        .get("file")
+        .or_else(|| req.params.get("target"))
+        .and_then(|v| v.as_str())
+    else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "outline: missing required param 'file'",
+        );
+    };
+    if is_http_url(file) || is_github_read_target(file) {
+        return unsupported("a URL or GitHub address");
+    }
+    let requested = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+        Ok(path) => path,
+        Err(refusal) => return refusal,
+    };
+    let session = match crate::revision_read::RevisionSession::open(
+        req,
+        ctx,
+        reference,
+        Some(Path::new(file)),
+    ) {
+        Ok(session) => session,
+        Err(refusal) => return refusal,
+    };
+    let staged = match session.materialize(req, ctx, Path::new(file), file) {
+        Ok(staged) => staged,
+        Err(refusal) => return refusal,
+    };
+    let mut response = outline_single_file(req, ctx, staged, file);
+    // Host adapters authorize the files an outline drew from; name the
+    // requested path, not the private staged copy.
+    if let Some(data) = response.data.as_object_mut() {
+        if data.contains_key("content_files") {
+            data.insert("content_files".into(), serde_json::json!([requested]));
+        }
+    }
+    session.annotate(&mut response);
+    response
 }
 
 /// Host adapters can re-render a held outline after applying their own read policy.
@@ -3338,6 +3411,87 @@ mod tests {
             SOURCE_READS.with(|count| count.get()) - reads,
             tree_parses() - parses,
         )
+    }
+
+    #[test]
+    fn revision_outline_zoom_cache_retains_no_staged_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn historical() {}\n").unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "lib.rs"],
+            vec![
+                "-c",
+                "user.name=AFT",
+                "-c",
+                "user.email=aft@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let provider = TreeSitterProvider::new();
+        let cache = provider.symbol_cache();
+        let ctx = AppContext::new(
+            Box::new(provider),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                revision_reads: true,
+                ..Default::default()
+            },
+        );
+        for _ in 0..3 {
+            for (command, params) in [
+                ("outline", serde_json::json!({"file": root.join("lib.rs")})),
+                (
+                    "zoom",
+                    serde_json::json!({"file": root.join("lib.rs"), "symbol": "historical"}),
+                ),
+            ] {
+                let mut value = params;
+                value["id"] = serde_json::json!(command);
+                value["command"] = serde_json::json!(command);
+                value["ref"] = serde_json::json!("HEAD");
+                let request = serde_json::from_value(value).unwrap();
+                let response = if command == "outline" {
+                    handle_outline(&request, &ctx)
+                } else {
+                    crate::commands::zoom::handle_zoom(&request, &ctx)
+                };
+                assert!(response.success, "{response:?}");
+                assert!(response.data[if command == "outline" {
+                    "text"
+                } else {
+                    "content"
+                }]
+                .as_str()
+                .unwrap()
+                .contains("historical"));
+                assert_eq!(
+                    cache.read().unwrap().len(),
+                    0,
+                    "{command} left a staged cache entry"
+                );
+            }
+        }
     }
 
     #[test]

@@ -505,6 +505,27 @@ fn bash_rejects_blocked_env_vars() {
     assert_eq!(response["code"], "blocked_env_var");
     assert!(response["message"].as_str().unwrap().contains("LD_PRELOAD"));
 
+    let hijack_response = aft.send(
+        &serde_json::json!({
+            "id": "bash-preexec-env",
+            "method": "bash",
+            "params": {
+                "command": "echo should-not-run",
+                "env": { "NODE_OPTIONS": "--require injected" }
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        hijack_response["success"], false,
+        "response: {hijack_response:?}"
+    );
+    assert_eq!(hijack_response["code"], "blocked_env_var");
+    assert!(hijack_response["message"]
+        .as_str()
+        .unwrap()
+        .contains("NODE_OPTIONS"));
+
     assert!(aft.shutdown().success());
 }
 

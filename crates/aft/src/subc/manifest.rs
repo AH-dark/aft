@@ -40,10 +40,11 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 /// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
 ///   registry plumbing for the bg_events wake lane (drain = PureRead,
 ///   ack = Mutating in `command_lane`).
-/// - `undo_preview` / `checkpoint_paths`: read-only permission-preview reads
-///   over the session's own backup/checkpoint state — the plugin safety tool
-///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
-///   permission for. Without them, safety undo/restore fails over subc.
+/// - `undo_preview` / `checkpoint_paths` / `safety_purge_paths`: read-only
+///   permission-preview reads over the session's own backup/checkpoint state —
+///   the plugin safety tool calls them BEFORE `aft_safety undo`/`restore`/
+///   `purge` to know which paths to ask permission for. Without them, safety
+///   undo/restore/purge fails over subc.
 /// - `bash_kill` / `bash_write` / `bash_notify` / `bash_unnotify` /
 ///   `bash_wait_detach`: the rest of the background-bash consumer surface the
 ///   plugins invoke natively (kill a task, drive a PTY, register/remove a
@@ -75,6 +76,7 @@ pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_ack_completions"
             | "undo_preview"
             | "checkpoint_paths"
+            | "safety_purge_paths"
             | "bash_kill"
             | "bash_write"
             | "bash_notify"
@@ -126,6 +128,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "undo_preview"
         | "edit_history"
         | "checkpoint_paths"
+        | "safety_purge_paths"
         | "list_checkpoints"
         | "hashline_preflight"
         | "conflicts"
@@ -170,6 +173,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "undo"
         | "checkpoint"
         | "restore_checkpoint"
+        | "safety_purge"
         | "write"
         | "apply_patch"
         | "delete_file"
@@ -237,6 +241,28 @@ pub(super) fn remote_tool(preset: Option<&str>, name: &str) -> Option<(Value, Op
         .get(preset.unwrap_or("head"))?
         .get(name)?
         .clone();
+    let description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    strip_consumer_only_properties(&mut schema);
+    Some((schema, description))
+}
+
+/// Enabled-only `read`, `outline` and `zoom` schemas carrying the `ref`
+/// (git revision) argument. Kept apart from the default artifacts for the
+/// same reason as the remote bash overrides: a session whose
+/// `revision_reads` is off must never be offered an argument it cannot use.
+static SUBC_REVISION_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../subc_tool_revision_schemas.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_revision_schemas.json: {e}"))
+});
+
+/// The schema and description `name` is served with in a session whose
+/// `revision_reads` is on. No preset rewords these tools, so one override
+/// serves every preset.
+pub(super) fn revision_tool(name: &str) -> Option<(Value, Option<String>)> {
+    let mut schema = SUBC_REVISION_TOOL_SCHEMAS.get(name)?.clone();
     let description = schema
         .get("description")
         .and_then(Value::as_str)
@@ -1089,6 +1115,7 @@ mod tests {
         // these, aft_safety undo/restore breaks over the subc transport.
         assert!(is_subc_native_plumbing_tool("undo_preview"));
         assert!(is_subc_native_plumbing_tool("checkpoint_paths"));
+        assert!(is_subc_native_plumbing_tool("safety_purge_paths"));
         // The rest of the plugins' background-bash consumer surface plus the
         // Tier-2 refresh trigger (each was shipped plugin-side without a gate
         // entry and silently rejected in prod; see subc_plumbing_drift_test).
@@ -1201,6 +1228,49 @@ mod tests {
                     tool.name
                 );
             }
+        }
+    }
+
+    /// `ref` (reading at a git revision) is advertised only by the enabled
+    /// overrides, for read, outline and zoom, never by the default artifacts
+    /// or the HELLO manifest.
+    #[test]
+    fn default_artifacts_omit_ref_and_revision_overrides_add_it_for_read_outline_zoom() {
+        for schema in SUBC_TOOL_SCHEMAS.values() {
+            assert!(schema["properties"].get("ref").is_none());
+        }
+        for preset in SUBC_TOOL_PRESETS.values() {
+            for schema in preset.as_object().unwrap().values() {
+                assert!(schema["properties"].get("ref").is_none());
+            }
+        }
+        for name in ["read", "outline", "zoom"] {
+            let (schema, description) = revision_tool(name).expect("revision override");
+            assert_eq!(schema["properties"]["ref"]["type"], "string", "{name}");
+            assert!(description.unwrap().contains("`ref`"), "{name}");
+            // Apart from `ref`, the override is the default schema.
+            let mut without_ref = schema.clone();
+            without_ref["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("ref");
+            assert_eq!(
+                without_ref["properties"],
+                tool_schema(name)["properties"],
+                "{name}"
+            );
+        }
+        assert_eq!(SUBC_REVISION_TOOL_SCHEMAS.len(), 3);
+        let manifest = build_manifest_for_host(true);
+        let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+            panic!("expected ToolProvider");
+        };
+        for tool in tools {
+            assert!(
+                tool.schema["properties"].get("ref").is_none(),
+                "{}",
+                tool.name
+            );
         }
     }
 

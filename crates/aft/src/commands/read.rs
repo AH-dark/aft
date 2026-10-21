@@ -1128,6 +1128,9 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(reference) = crate::revision_read::requested_ref(req) {
+        return handle_revision_read(req, ctx, reference);
+    }
     if let Some(file) = req.params.get("file").and_then(Value::as_str) {
         if is_github_read_target(file) {
             return handle_github_read(req, ctx, file);
@@ -1302,6 +1305,52 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     }
+    response
+}
+
+/// Read `file` as it is at the git revision `reference`.
+///
+/// The path passes the same read checks as a working-tree read; then the blob
+/// is copied out of the object store and rendered by the ordinary file path,
+/// so ranges, binary detection, media and size limits behave as they do for
+/// a file on disk. No hashline tag is minted: the content is not the working
+/// file an edit would change.
+fn handle_revision_read(req: &RawRequest, ctx: &AppContext, reference: &str) -> Response {
+    if let Err(refusal) = crate::revision_read::check_enabled(req, ctx) {
+        return refusal;
+    }
+    let Some(file) = req.params.get("file").and_then(Value::as_str) else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "read: missing required param 'file'",
+        );
+    };
+    if is_github_read_target(file) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "read: 'ref' reads repository files; a GitHub issue or pull request has no git revision",
+        );
+    }
+    if let Err(refusal) = ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+        return refusal;
+    }
+    let session = match crate::revision_read::RevisionSession::open(
+        req,
+        ctx,
+        reference,
+        Some(Path::new(file)),
+    ) {
+        Ok(session) => session,
+        Err(refusal) => return refusal,
+    };
+    let staged = match session.materialize(req, ctx, Path::new(file), file) {
+        Ok(staged) => staged,
+        Err(refusal) => return refusal,
+    };
+    let mut response = handle_read_path(req, &staged, false, &mut None).into_response(&req.id);
+    session.annotate(&mut response);
     response
 }
 

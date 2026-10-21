@@ -115,6 +115,117 @@ pub fn backup_key_for_path(path: &Path) -> PathBuf {
     canonicalize_key(path)
 }
 
+/// How a saved path relates to a [`PurgeTarget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedPathMatch {
+    /// The saved path is the purged path or lies under it.
+    Selected,
+    /// The saved path is somewhere else.
+    Unrelated,
+    /// The saved path's parent directory no longer exists, so whether it was
+    /// another spelling of the purged path cannot be told. It is kept, and
+    /// the purge must report it rather than claim it removed everything.
+    Unknown,
+}
+
+/// The path a purge removes saved copies of, resolved once so every saved
+/// path is compared by the location it names rather than by its spelling.
+///
+/// A location resolves every parent directory through symlinks but keeps the
+/// final component as written: a symlink is its own entry, distinct from the
+/// file it points at, so purging the link never purges its target's copies.
+#[derive(Debug, Clone)]
+pub struct PurgeTarget {
+    /// The path as the caller gave it.
+    given: PathBuf,
+    /// The path's location: parents resolved, final component kept.
+    location: PathBuf,
+    /// A final symlink is only the link entry, just as it is for undo and
+    /// checkpoint restore. Saved copies of its target or of paths beneath
+    /// the link require a separate purge naming their own location.
+    entry_only: bool,
+    /// For an existing non-directory, its file name. A saved path with any
+    /// other final name can be neither the purged file nor under it.
+    existing_file_name: Option<std::ffi::OsString>,
+}
+
+impl PurgeTarget {
+    pub fn new(path: &Path) -> Self {
+        let location = canonicalize_key(path);
+        let metadata = std::fs::symlink_metadata(path).ok();
+        let entry_only = metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink());
+        let existing_file_name = metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.is_dir())
+            .then(|| path.file_name().map(std::ffi::OsStr::to_os_string))
+            .flatten();
+        Self {
+            given: path.to_path_buf(),
+            location,
+            entry_only,
+            existing_file_name,
+        }
+    }
+
+    /// How `saved` relates to this target. `recorded_resolved` is true for
+    /// undo-backup keys: stores record them with every parent already
+    /// resolved, so the key already is the location it was saved at and is
+    /// compared as stored. Resolving it again would follow symlinks created
+    /// since: a backup of `/repo/old/file.txt`, where `old` was later
+    /// replaced by a link to `/repo/new`, would otherwise be taken for
+    /// `/repo/new/file.txt` and purged with it. A parent that is gone now was
+    /// a real directory then, so such a key still names its location.
+    /// Checkpoint keys keep the caller's spelling. When their parent exists,
+    /// they are resolved here before comparing; when it is missing, the
+    /// result is `Unknown` (or `Unrelated` for a different file name),
+    /// because that parent may have been a symlink to anywhere.
+    pub fn classify(&self, saved: &Path, recorded_resolved: bool) -> SavedPathMatch {
+        if self.entry_only {
+            return if saved == self.given
+                || saved == self.location
+                || (!recorded_resolved && canonicalize_key(saved) == self.location)
+            {
+                SavedPathMatch::Selected
+            } else {
+                SavedPathMatch::Unrelated
+            };
+        }
+        if saved.starts_with(&self.given) || saved.starts_with(&self.location) {
+            return SavedPathMatch::Selected;
+        }
+        let parent_exists = saved
+            .parent()
+            .is_some_and(|parent| std::fs::canonicalize(parent).is_ok());
+        if !parent_exists && !recorded_resolved {
+            let other_name = self
+                .existing_file_name
+                .as_deref()
+                .is_some_and(|name| saved.file_name() != Some(name));
+            return if other_name {
+                SavedPathMatch::Unrelated
+            } else {
+                SavedPathMatch::Unknown
+            };
+        }
+        let saved_location = if recorded_resolved {
+            saved.to_path_buf()
+        } else {
+            canonicalize_key(saved)
+        };
+        if saved_location.starts_with(&self.location) {
+            SavedPathMatch::Selected
+        } else {
+            SavedPathMatch::Unrelated
+        }
+    }
+
+    fn selects(&self, saved: &Path, recorded_resolved: bool) -> bool {
+        self.classify(saved, recorded_resolved) == SavedPathMatch::Selected
+    }
+}
+
 /// Totals for one side of a report: what matched, or what was removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeTotals {
@@ -163,6 +274,9 @@ pub struct PurgeReport {
     pub examined: PurgeExamined,
     pub matched: PurgeTotals,
     pub removed: PurgeTotals,
+    /// Paths of fully removed stacks; unlike samples this is not capped.
+    #[serde(default)]
+    pub removed_paths: Vec<String>,
     /// A few matched paths, for the operator to sanity-check the filter.
     pub samples: Vec<String>,
     pub failures: Vec<PurgeFailure>,
@@ -231,7 +345,7 @@ pub fn purge_backups(
     live_stores: &[LiveStore<'_>],
 ) -> PurgeReport {
     let storage_dir = request.storage_dir.as_path();
-    let path_filter = request.path.as_deref().map(canonicalize_key);
+    let path_filter = request.path.as_deref().map(PurgeTarget::new);
     let mut report = PurgeReport {
         dry_run: request.dry_run,
         storage_dir: storage_dir.display().to_string(),
@@ -254,15 +368,7 @@ pub fn purge_backups(
             .unwrap_or_else(|| UNSCOPED_NAMESPACE.to_string());
         report.examined.namespaces.push(label.clone());
 
-        let mut working = BackupStore::new();
-        // The working store addresses this namespace explicitly; a route
-        // harness installed on the calling thread must not redirect it.
-        working.follow_request_harness = false;
-        working.set_storage_dir_inner(storage_dir.to_path_buf(), namespace.clone(), 0);
-        if let (Some(db), Some(segment)) = (db.as_ref(), namespace.as_ref()) {
-            working.set_db_pool(Arc::clone(db));
-            working.set_db_harness_segment(segment.clone());
-        }
+        let mut working = namespace_working_store(storage_dir, namespace.as_ref(), db.as_ref());
 
         let namespace_stores = stores
             .iter()
@@ -281,7 +387,7 @@ pub fn purge_backups(
             &working,
             &namespace_stores,
             request.session.as_deref(),
-            path_filter.as_deref(),
+            path_filter.as_ref(),
             &mut report.examined,
         );
 
@@ -351,6 +457,7 @@ pub fn purge_backups(
                     }
                     if !measure.is_empty() || memory_entries > 0 {
                         removed.add(&session, &measure);
+                        report.removed_paths.push(key.display().to_string());
                     }
                 }
                 Err(failure) => {
@@ -441,6 +548,149 @@ pub fn purge_as_owner(
     Ok(purge_backups(&request, db, live_stores))
 }
 
+/// Remove one session's undo stacks at or under `path`, for the agent-facing
+/// `aft_safety` purge op.
+///
+/// Only `session` is matched, in every harness namespace of the store's
+/// storage, so another session's stacks are never touched. The database
+/// handle is the store's own (the connection that owns `aft.db` in this
+/// process); `resident_db` is consulted only when the store has none attached
+/// and must likewise return an already-open handle, never open a new one. The
+/// caller must not hold `store`'s mutex: the purge takes it itself.
+pub fn purge_session_path(
+    store: &parking_lot::Mutex<BackupStore>,
+    session: &str,
+    path: &Path,
+    resident_db: impl FnOnce(&Path) -> Option<Arc<Mutex<TrackedConnection>>>,
+) -> Result<PurgeReport, String> {
+    let (storage_dir, own_db) = {
+        let guard = store.lock();
+        (
+            guard.storage_dir.clone(),
+            guard.db_pool.read().ok().and_then(|slot| slot.clone()),
+        )
+    };
+    let Some(storage_dir) = storage_dir else {
+        return Ok(purge_session_path_in_memory(store, session, path));
+    };
+    let request = PurgeRequest {
+        path: Some(path.to_path_buf()),
+        session: Some(session.to_string()),
+        harness: None,
+        dry_run: false,
+        storage_dir,
+    };
+    request.validate()?;
+    let db = own_db.or_else(|| resident_db(&request.storage_dir.join("aft.db")));
+    Ok(purge_backups(&request, db, &[store]))
+}
+
+/// A store with no storage directory keeps its stacks only in memory, so
+/// forgetting them there removes them completely.
+fn purge_session_path_in_memory(
+    store: &parking_lot::Mutex<BackupStore>,
+    session: &str,
+    path: &Path,
+) -> PurgeReport {
+    let target = PurgeTarget::new(path);
+    let mut guard = store.lock();
+    let keys = guard
+        .in_memory_stack_keys()
+        .into_iter()
+        .filter(|(owner, key)| owner == session && key_matches(key, Some(&target)))
+        .collect::<Vec<_>>();
+    let mut removed = TotalsBuilder::default();
+    let mut removed_paths = Vec::new();
+    for (owner, key) in keys {
+        let measure = StackMeasure {
+            entries: guard.in_memory_entry_count(&owner, &key),
+            ..StackMeasure::default()
+        };
+        guard.evict_purged_stack(&owner, &key);
+        removed.add(&owner, &measure);
+        removed_paths.push(key.display().to_string());
+    }
+    let removed = removed.finish();
+    PurgeReport {
+        dry_run: false,
+        matched: removed.clone(),
+        removed,
+        removed_paths,
+        live_stores: 1,
+        ..PurgeReport::default()
+    }
+}
+
+/// The keys of one session's undo stacks at or under `path`: what
+/// [`purge_session_path`] would remove, found the same way and with the same
+/// database rules, without changing anything. Plugins ask permission for
+/// each of these before they run the purge.
+pub fn session_path_keys(
+    store: &parking_lot::Mutex<BackupStore>,
+    session: &str,
+    path: &Path,
+    resident_db: impl FnOnce(&Path) -> Option<Arc<Mutex<TrackedConnection>>>,
+) -> Vec<PathBuf> {
+    let (storage_dir, own_db) = {
+        let guard = store.lock();
+        (
+            guard.storage_dir.clone(),
+            guard.db_pool.read().ok().and_then(|slot| slot.clone()),
+        )
+    };
+    let target = PurgeTarget::new(path);
+    let Some(storage_dir) = storage_dir else {
+        return store
+            .lock()
+            .in_memory_stack_keys()
+            .into_iter()
+            .filter(|(owner, key)| owner == session && key_matches(key, Some(&target)))
+            .map(|(_, key)| key)
+            .collect();
+    };
+    let db = own_db.or_else(|| resident_db(&storage_dir.join("aft.db")));
+    let mut keys = BTreeSet::new();
+    let mut examined = PurgeExamined::default();
+    for namespace in namespaces(&storage_dir, db.as_ref(), None) {
+        let working = namespace_working_store(&storage_dir, namespace.as_ref(), db.as_ref());
+        let live_stores = [store]
+            .into_iter()
+            .filter(|store| {
+                store
+                    .lock()
+                    .uses_namespace(&storage_dir, namespace.as_deref())
+            })
+            .collect::<Vec<_>>();
+        let candidates = collect_candidates(
+            &working,
+            &live_stores,
+            Some(session),
+            Some(&target),
+            &mut examined,
+        );
+        keys.extend(candidates.into_iter().map(|(_, key)| key));
+    }
+    keys.into_iter().collect()
+}
+
+/// A store that reads and writes exactly one namespace of `storage_dir`.
+fn namespace_working_store(
+    storage_dir: &Path,
+    namespace: Option<&String>,
+    db: Option<&Arc<Mutex<TrackedConnection>>>,
+) -> BackupStore {
+    let mut working = BackupStore::new();
+    // The working store addresses this namespace explicitly; a route
+    // harness installed on the calling thread must not redirect it.
+    working.follow_request_harness = false;
+    working.set_storage_dir_inner(storage_dir.to_path_buf(), namespace.cloned(), 0);
+    if let (Some(db), Some(segment)) = (db, namespace) {
+        working.set_db_pool(Arc::clone(db));
+        working.set_db_harness_segment(segment.clone());
+    }
+    working
+}
+
 fn open_purge_db(
     storage_dir: &Path,
     dry_run: bool,
@@ -469,10 +719,11 @@ fn same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn key_matches(key: &Path, path_filter: Option<&Path>) -> bool {
-    // `Path::starts_with` compares whole components, so `/a/b` covers `/a/b`
-    // and `/a/b/c` but not `/a/bc`.
-    path_filter.is_none_or(|filter| key.starts_with(filter))
+fn key_matches(key: &Path, path_filter: Option<&PurgeTarget>) -> bool {
+    // Undo-backup keys are recorded with their parents resolved; see
+    // `PurgeTarget::classify`. `Path::starts_with` compares whole components,
+    // so `/a/b` covers `/a/b` and `/a/b/c` but not `/a/bc`.
+    path_filter.is_none_or(|target| target.selects(key, true))
 }
 
 fn note_skipped(examined: &mut PurgeExamined, what: String) {
@@ -525,7 +776,7 @@ fn collect_candidates(
     working: &BackupStore,
     live_stores: &[LiveStore<'_>],
     session_filter: Option<&str>,
-    path_filter: Option<&Path>,
+    path_filter: Option<&PurgeTarget>,
     examined: &mut PurgeExamined,
 ) -> BTreeSet<(String, PathBuf)> {
     let mut candidates = BTreeSet::new();

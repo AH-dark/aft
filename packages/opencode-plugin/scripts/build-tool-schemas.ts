@@ -9,6 +9,7 @@
 import * as path from "node:path";
 import {
   buildSubcRemoteToolSchemasJson,
+  buildSubcRevisionToolSchemasJson,
   buildSubcToolPresetsJson,
   buildSubcToolSchemasJson,
 } from "../src/subc-tool-schemas.js";
@@ -62,6 +63,22 @@ async function main() {
     await Bun.write(remotePath, remoteJson);
   }
 
+  const revisionPath = path.join(
+    repoRoot,
+    "crates",
+    "aft",
+    "src",
+    "subc_tool_revision_schemas.json",
+  );
+  const revisionJson = buildSubcRevisionToolSchemasJson();
+  if (checkOnly) {
+    if ((await Bun.file(revisionPath).text()) !== revisionJson) {
+      throw new Error(`subc revision-read tool schema byte drift detected at ${revisionPath}`);
+    }
+  } else {
+    await Bun.write(revisionPath, revisionJson);
+  }
+
   // --check-source-only avoids compiling the native library before a train
   // push. The unit CI workflow and release gates still run the full --check.
   // Disable sccache for that native check: its client has hung on the server
@@ -101,6 +118,9 @@ async function main() {
     `✓ subc tool schemas (${count} tools) ${checkOnly ? "match" : "written"}: ${outputPath}`,
   );
   console.log(`✓ enabled-only subc bash schemas ${checkOnly ? "match" : "written"}: ${remotePath}`);
+  console.log(
+    `✓ enabled-only subc revision-read schemas ${checkOnly ? "match" : "written"}: ${revisionPath}`,
+  );
   console.log(
     sourceOnly
       ? "→ governed hashline byte comparison deferred to the native CI/release gate"

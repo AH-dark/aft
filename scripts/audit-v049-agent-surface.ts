@@ -319,7 +319,7 @@ function collapseFileLevelEntries(entries: AllowlistEntry[]): AllowlistEntry[] {
   return collapsed;
 }
 
-function classifyOccurrence(path: string, line: string): { class: string; reason: string } {
+export function classifyOccurrence(path: string, line: string): { class: string; reason: string } {
   const historical = excludedPaths.get(path);
   if (historical) return { class: historical.class, reason: historical.reason };
   const surface = surfaceByPath.get(path);
@@ -329,9 +329,12 @@ function classifyOccurrence(path: string, line: string): { class: string; reason
   // (the record is taken from the raw model stream before any plugin hook can
   // mirror it). This is the single sanctioned exception to the canonical
   // `path` vocabulary; everything else on the agent surface stays prohibited.
+  // OpenCode 1's description rewrite changes path to filePath in examples,
+  // matching the argument schema required by its file-header renderer.
+  const v1HeaderConversion = 'return description.replaceAll("`path`", "`filePath`").replaceAll(\'"path":\', \'"filePath":\');';
   if (
     path === "packages/opencode-plugin/src/tools/hoisted.ts" &&
-    (/filePath: z/.test(line) || /^\s*\/\//.test(line))
+    (/filePath: z/.test(line) || /^\s*\/\//.test(line) || line.trim() === v1HeaderConversion)
   ) {
     return {
       class: "host-display-contract",

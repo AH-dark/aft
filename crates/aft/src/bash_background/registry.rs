@@ -811,6 +811,15 @@ pub struct BgTaskRegistry {
 
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
+
+const MAX_DUPLICATE_COMMAND_TASKS_TO_CHECK: usize = 128;
+
+pub(crate) struct DuplicateRunningTask {
+    pub(crate) task_id: String,
+    pub(crate) age: Duration,
+    pub(crate) same_session: bool,
+}
+
 #[path = "task_access.rs"]
 mod task_access;
 pub use scratch_retention::{RetainedScratchHealth, SCRATCH_RETENTION};
@@ -1059,6 +1068,7 @@ pub(crate) struct RegistryInner {
     /// session has not been told about yet (`cancelled_call_unannounced`), so
     /// a bash-family reply finds them without locking every task.
     cancelled_call_tasks: Mutex<HashMap<String, HashSet<String>>>,
+    bash_env_disclosed_sessions: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -1491,6 +1501,7 @@ impl BgTaskRegistry {
                 wait_detach: Mutex::new(WaitDetachState::default()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
                 cancelled_call_tasks: Mutex::new(HashMap::new()),
+                bash_env_disclosed_sessions: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -1828,6 +1839,13 @@ impl BgTaskRegistry {
             let _hold = self.inner.live_delivery_lock_diagnostics.hold();
             live_sessions.insert(session_id.to_string());
         }
+    }
+
+    pub(crate) fn claim_bash_env_disclosure(&self, session_id: &str) -> bool {
+        self.inner
+            .bash_env_disclosed_sessions
+            .lock()
+            .is_ok_and(|mut sessions| sessions.insert(session_id.to_string()))
     }
 
     pub(crate) fn replace_live_delivery_sessions(&self, sessions: HashSet<String>) {
@@ -8916,6 +8934,62 @@ impl BgTaskRegistry {
             .lock()
             .map(|tasks| tasks.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Find one active task that has the same command and canonical execution
+    /// context. The scan stays in the in-memory watchdog index and checks a
+    /// fixed number of candidates, so task history cannot slow a spawn.
+    pub(crate) fn find_running_duplicate(
+        &self,
+        session_id: &str,
+        command: &str,
+        project_root: &Path,
+        workdir: &Path,
+    ) -> Option<DuplicateRunningTask> {
+        let candidates = match self.inner.watchdog_tasks.try_lock() {
+            Ok(tasks) => tasks
+                .values()
+                .take(MAX_DUPLICATE_COMMAND_TASKS_TO_CHECK)
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(std::sync::TryLockError::Poisoned(poison)) => poison
+                .into_inner()
+                .values()
+                .take(MAX_DUPLICATE_COMMAND_TASKS_TO_CHECK)
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let root = canonicalized_path(project_root);
+        let cwd = canonicalized_path(workdir);
+        candidates
+            .into_iter()
+            .filter_map(|task| {
+                let state = match task.state.try_lock() {
+                    Ok(state) => state,
+                    Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return None,
+                };
+                let metadata = &state.metadata;
+                if metadata.is_terminal()
+                    || metadata.command.trim() != command.trim()
+                    || canonicalized_path(&metadata.workdir) != cwd
+                    || metadata
+                        .project_root
+                        .as_deref()
+                        .map(canonicalized_path)
+                        .as_ref()
+                        != Some(&root)
+                {
+                    return None;
+                }
+                Some(DuplicateRunningTask {
+                    task_id: task.task_id.clone(),
+                    age: task.started.elapsed(),
+                    same_session: task.session_id == session_id,
+                })
+            })
+            .min_by_key(|task| task.age)
     }
 
     /// Find live shell tasks with a persisted daemon scope identity. Keep

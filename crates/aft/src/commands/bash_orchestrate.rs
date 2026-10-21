@@ -451,11 +451,31 @@ fn observe_raw_bash_response(
 pub fn build_bash_outcome(
     req: &RawRequest,
     ctx: &AppContext,
-    spawn_response: Response,
+    mut spawn_response: Response,
 ) -> DispatchOutcome {
     if !spawn_response.success {
         return DispatchOutcome::Immediate(spawn_response);
     }
+
+    let (duplicate_warning, env_keys) = spawn_response
+        .data
+        .as_object_mut()
+        .map(|data| {
+            let warning = data
+                .remove("_bash_duplicate_warning")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            let keys = data.remove("_bash_env_keys").and_then(|value| {
+                value.as_array().map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+            });
+            (warning, keys)
+        })
+        .unwrap_or_default();
 
     let params = parse_params(req).unwrap_or_default();
     let worker_session = req.worker_session();
@@ -494,6 +514,11 @@ pub fn build_bash_outcome(
             ),
         );
         response.data["status"] = spawn_response.data["status"].clone();
+        append_bash_reply_notices(
+            &mut response,
+            duplicate_warning.as_deref(),
+            env_keys.as_deref(),
+        );
         return DispatchOutcome::Immediate(response);
     }
 
@@ -624,6 +649,14 @@ pub fn build_bash_outcome(
                 &task_id_for_poll,
             ))
         };
+        let response = response.map(|mut response| {
+            append_bash_reply_notices(
+                &mut response,
+                duplicate_warning.as_deref(),
+                env_keys.as_deref(),
+            );
+            response
+        });
 
         if response.is_some() {
             wait_registration.take();
@@ -1162,6 +1195,75 @@ fn push_line(output: &mut String, line: &str) {
     output.push_str(line);
 }
 
+fn append_bash_reply_notices(
+    response: &mut Response,
+    duplicate_warning: Option<&str>,
+    env_keys: Option<&[String]>,
+) {
+    if !response.success {
+        return;
+    }
+    let Some(output) = response
+        .data
+        .get_mut("output")
+        .and_then(|value| value.as_str().map(str::to_owned))
+    else {
+        return;
+    };
+    let mut notices = Vec::new();
+    if let Some(warning) = duplicate_warning {
+        notices.push(warning.to_string());
+    }
+    if let Some(keys) = env_keys.filter(|keys| !keys.is_empty()) {
+        notices.push(format!(
+            "Configured bash.env keys applied (values not shown): {}.",
+            keys.join(", ")
+        ));
+    }
+    if notices.is_empty() {
+        return;
+    }
+    // The reply ends with the `[task <id>]` line and, when the output was cut,
+    // the `shown N of M lines (cap)` trailer, which must stay the last line.
+    // Notices go above both.
+    let trailer = response
+        .data
+        .get(crate::list_surfaces::bash::WIRE_KEY)
+        .and_then(|value| {
+            serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()
+        })
+        .map(|envelope| crate::list_surfaces::bash::envelope_trailer(&envelope));
+    let (body, tail) = split_reply_tail(&output, trailer.as_deref());
+    let mut combined = body.trim_end_matches('\n').to_string();
+    for notice in notices {
+        push_line(&mut combined, &notice);
+    }
+    if !tail.is_empty() {
+        push_line(&mut combined, tail);
+    }
+    if let Some(data) = response.data.as_object_mut() {
+        data.insert("output".to_string(), Value::String(combined));
+    }
+}
+
+/// Split a bash reply into its body and the closing lines AFT adds after the
+/// command output: an optional `[task <id>]` line followed by the optional
+/// list-envelope `trailer`. The tail is returned with its own line breaks.
+fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
+    let mut tail_start = output.len();
+    if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
+        if output.ends_with(trailer) {
+            tail_start -= trailer.len();
+        }
+    }
+    let before = output[..tail_start].trim_end_matches('\n');
+    let last_line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    if is_foreground_task_line(&before[last_line_start..]) {
+        tail_start = last_line_start;
+    }
+    (&output[..tail_start], &output[tail_start..])
+}
+
 fn background_launch_response(
     request_id: &str,
     task_id: &str,
@@ -1321,6 +1423,64 @@ mod tests {
                 assert!(text.contains("[exit code: 7]"), "{text}");
                 assert_eq!(response.data["exit_code"], 7);
             }
+        }
+    }
+
+    #[test]
+    fn background_spawn_notices_preserve_terminal_status_and_guidance() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project.path().into()),
+                storage_dir: Some(storage.path().into()),
+                ..crate::config::Config::default()
+            },
+        );
+        for pty in [false, true] {
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": "terminal-with-notices",
+                "command": "bash",
+                "params": {"command": "exit 7", "background": true, "pty": pty},
+            }))
+            .unwrap();
+            let spawn = Response::success(
+                &request.id,
+                json!({
+                    "task_id": "finished-task",
+                    "status": "failed",
+                    "mode": if pty { "pty" } else { "pipes" },
+                    "_bash_duplicate_warning": "Duplicate running command: earlier-task",
+                    "_bash_env_keys": ["BUILD_LABEL"],
+                }),
+            );
+            let response = match build_bash_outcome(&request, &ctx, spawn) {
+                DispatchOutcome::Immediate(response) => response,
+                DispatchOutcome::Deferred(_) => panic!("background launch must answer immediately"),
+            };
+            assert_eq!(response.data["status"], "failed");
+            let output = response.data["output"].as_str().unwrap();
+            assert!(
+                output.contains(&format_background_launch(
+                    "finished-task",
+                    pty,
+                    false,
+                    false
+                )),
+                "{output}"
+            );
+            assert!(
+                output.contains("Duplicate running command: earlier-task"),
+                "{output}"
+            );
+            assert!(
+                output
+                    .contains("Configured bash.env keys applied (values not shown): BUILD_LABEL."),
+                "{output}"
+            );
+            assert!(response.data.get("_bash_duplicate_warning").is_none());
+            assert!(response.data.get("_bash_env_keys").is_none());
         }
     }
 
@@ -1776,6 +1936,50 @@ mod tests {
             );
             assert_eq!(actual, case.expected, "{}", case.name);
         }
+    }
+
+    /// The `shown N of M lines (cap)` trailer must stay the reply's last line,
+    /// and the `[task <id>]` line stays directly above it, so notices added
+    /// after the reply is built go above both.
+    #[test]
+    fn reply_notices_go_above_the_task_line_and_the_truncation_trailer() {
+        let mut task = snapshot("", false, None, BgTaskStatus::Completed, Some(0));
+        let envelope = crate::list_surfaces::bash::build_bash_output_envelope(2, 10)
+            .expect("two of ten lines is a cut");
+        let trailer = crate::list_surfaces::bash::envelope_trailer(&envelope);
+        task.output_preview = format!("line 1\nline 2\n{trailer}");
+        task.bash_output_list_envelope = Some(envelope);
+        let mut response = foreground_result_response("req", task);
+        let keys = ["API_KEY".to_string()];
+
+        append_bash_reply_notices(
+            &mut response,
+            Some("Same command as the previous call."),
+            Some(&keys),
+        );
+
+        let output = response.data["output"].as_str().expect("output text");
+        assert_eq!(
+            output,
+            format!(
+                "line 1\nline 2\nSame command as the previous call.\n\
+                 Configured bash.env keys applied (values not shown): API_KEY.\n\
+                 [task bash-test]\n{trailer}"
+            )
+        );
+    }
+
+    #[test]
+    fn reply_notices_go_above_the_task_line_without_a_trailer() {
+        let task = snapshot("done", false, None, BgTaskStatus::Completed, Some(0));
+        let mut response = foreground_result_response("req", task);
+
+        append_bash_reply_notices(&mut response, Some("Same command."), None);
+
+        assert_eq!(
+            response.data["output"].as_str(),
+            Some("done\nSame command.\n[task bash-test]")
+        );
     }
 
     #[test]

@@ -175,6 +175,32 @@ fn live_edit_applies_a_group_a_key_without_reconnect() {
 }
 
 #[test]
+fn bash_env_updates_live_for_future_commands() {
+    let fixture = Fixture::new(r#"{ "bash": { "env": { "TZ": "UTC" } } }"#, None);
+    write(
+        &fixture.user_path,
+        r#"{ "bash": { "env": { "TZ": "Etc/GMT", "LANG": "C.UTF-8" } } }"#,
+    );
+
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["bash.env"]);
+    assert_eq!(
+        fixture.ctx.config().bash.env.get("TZ").map(String::as_str),
+        Some("Etc/GMT")
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .config()
+            .bash
+            .env
+            .get("LANG")
+            .map(String::as_str),
+        Some("C.UTF-8")
+    );
+}
+
+#[test]
 fn user_file_edit_applies_live_too() {
     let fixture = Fixture::new(r#"{ "url_fetch_allow_private": false }"#, None);
     write(&fixture.user_path, r#"{ "url_fetch_allow_private": true }"#);

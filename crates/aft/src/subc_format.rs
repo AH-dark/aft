@@ -343,6 +343,15 @@ pub(crate) fn format_response_unbounded(
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
     };
+    if matches!(bare_name, "read" | "outline" | "zoom") {
+        if let Some(header) = revision_header(data) {
+            text = if text.is_empty() {
+                header
+            } else {
+                format!("{header}\n{text}")
+            };
+        }
+    }
     crate::response_finalize::append_watcher_query_notice(&mut text, response);
     if bare_name == "callgraph" {
         crate::response_finalize::append_callgraph_pending_notice(&mut text, response);
@@ -369,6 +378,18 @@ pub(crate) fn format_response_unbounded(
         }
     }
     text
+}
+
+/// The first reply line of a `read`, `outline` or `zoom` that read a file at
+/// a git revision: the revision as written and the commit it resolved to, so
+/// the reader can never mistake the content for the working tree's.
+fn revision_header(data: &Value) -> Option<String> {
+    let revision = data.get("revision")?;
+    let reference = revision.get("ref").and_then(Value::as_str)?;
+    let commit = revision.get("commit").and_then(Value::as_str)?;
+    Some(format!(
+        "Revision `{reference}` = commit {commit} (read from git's object store, not the working tree)"
+    ))
 }
 
 /// The final reply line for an `edit`/`write` call that created a file which
@@ -972,8 +993,66 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
             }
             lines.join("\n")
         }
+        Some("purge") => format_safety_purge(response),
         _ => "No safety result.".to_string(),
     }
+}
+
+/// Reply text for `aft_safety` op `purge`: what was removed, what could not
+/// be, and that none of it can be recovered.
+fn format_safety_purge(response: &serde_json::Map<String, Value>) -> String {
+    let path = import_string_field(response, "path").unwrap_or_else(|| "(path)".to_string());
+    let stacks = number_field(response, "undo_stacks_removed").unwrap_or(0);
+    let entries = number_field(response, "undo_entries_removed").unwrap_or(0);
+    let complete = response.get("complete").and_then(Value::as_bool) != Some(false);
+    let mut lines = vec![if complete {
+        format!("purged {}", shorten_path(&path))
+    } else {
+        format!("purged {} (incomplete)", shorten_path(&path))
+    }];
+    lines.push(if stacks == 0 {
+        "undo: no backups of this session held this path".to_string()
+    } else {
+        format!("undo: removed {entries} backup(s) of {stacks} file(s)")
+    });
+    let pruned = records_field(response, "checkpoints_pruned")
+        .iter()
+        .filter_map(|record| {
+            let name = record.get("name").and_then(Value::as_str)?;
+            let files = record
+                .get("files_removed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(format!("{name} ({files} file(s) removed)"))
+        })
+        .collect::<Vec<_>>();
+    let dropped = string_array(response.get("checkpoints_dropped"));
+    if pruned.is_empty() && dropped.is_empty() {
+        lines.push("checkpoints: none of this session's checkpoints held this path".to_string());
+    } else {
+        if !pruned.is_empty() {
+            lines.push(format!("checkpoints pruned: {}", pruned.join(", ")));
+        }
+        if !dropped.is_empty() {
+            lines.push(format!("checkpoints dropped: {}", dropped.join(", ")));
+        }
+    }
+    for failure in records_field(response, "failures") {
+        let target = failure
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)");
+        let error = failure
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        lines.push(format!("not removed: {target}: {error}"));
+    }
+    lines.push(
+        "This cannot be undone: the removed copies are gone and aft_safety undo or restore cannot bring them back."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 /// Most paths a checkpoint or restore result lists before summarising the rest.
@@ -2575,6 +2654,8 @@ fn format_zoom_batch_result(target_label: &str, symbols: &[String], responses: &
     sections.join("\n\n")
 }
 
+const ZOOM_CALL_ANNOTATION_LIMIT: usize = 15;
+
 fn format_zoom_text(target_label: &str, response: &Value) -> String {
     let range = response.get("range");
     let start_line = range
@@ -2637,10 +2718,11 @@ fn format_zoom_text(target_label: &str, response: &Value) -> String {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if calls_out.is_some_and(|calls| !calls.is_empty()) || other_calls > 0 {
-        out.push(String::new());
-        out.push("──── calls_out".to_string());
-        for call in calls_out.into_iter().flatten() {
-            out.push(format_zoom_call_ref(call));
+        if let Some(calls_out) = calls_out.filter(|calls| !calls.is_empty()) {
+            append_zoom_annotation_calls(&mut out, "calls_out", calls_out);
+        } else {
+            out.push(String::new());
+            out.push("──── calls_out".to_string());
         }
         if other_calls > 0 {
             out.push(format!("  +{other_calls} other calls"));
@@ -2651,14 +2733,24 @@ fn format_zoom_text(target_label: &str, response: &Value) -> String {
         .and_then(|annotations| annotations.get("called_by"))
         .and_then(Value::as_array);
     if let Some(called_by) = called_by.filter(|calls| !calls.is_empty()) {
-        out.push(String::new());
-        out.push("──── called_by".to_string());
-        for call in called_by {
-            out.push(format_zoom_call_ref(call));
-        }
+        append_zoom_annotation_calls(&mut out, "called_by (this file)", called_by);
     }
 
     out.join("\n")
+}
+
+fn append_zoom_annotation_calls(out: &mut Vec<String>, section: &str, calls: &[Value]) {
+    out.push(String::new());
+    out.push(format!("──── {section}"));
+    for call in calls.iter().take(ZOOM_CALL_ANNOTATION_LIMIT) {
+        out.push(format_zoom_call_ref(call));
+    }
+    if calls.len() > ZOOM_CALL_ANNOTATION_LIMIT {
+        out.push(format!(
+            "  +{} more",
+            calls.len() - ZOOM_CALL_ANNOTATION_LIMIT
+        ));
+    }
 }
 
 fn format_zoom_line(line_no: i64, gutter_width: usize, text: &str) -> String {
@@ -4594,6 +4686,46 @@ mod callgraph_format_tests {
         assert_eq!(
             format_callgraph("callers", &borrowed, false),
             "callgraph: borrowed from /owner\ncallgraph: the borrowed graph does not reflect 2 files here\n0 callers · 0 file groups"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zoom_call_annotation_cap_tests {
+    use super::format_zoom_text;
+    use serde_json::json;
+
+    #[test]
+    fn zoom_call_annotation_lists_keep_fifteen_entries_and_count_the_rest() {
+        let calls = |prefix: &str, count: usize| {
+            (1..=count)
+                .map(|line| json!({ "name": format!("{prefix}{line:02}"), "line": line }))
+                .collect::<Vec<_>>()
+        };
+        let response = json!({
+            "kind": "function",
+            "name": "target",
+            "range": { "start_line": 1, "end_line": 1 },
+            "content": "fn target() {}",
+            "annotations": {
+                "calls_out": calls("callee", 17),
+                "called_by": calls("caller", 18),
+            },
+        });
+
+        let rendered = format_zoom_text("src/lib.rs", &response);
+
+        assert!(rendered.contains("callee01 (line 1)"));
+        assert!(rendered.contains("callee15 (line 15)"));
+        assert!(!rendered.contains("callee16"));
+        assert!(rendered.contains("  +2 more"));
+        assert!(rendered.contains("caller01 (line 1)"));
+        assert!(rendered.contains("caller15 (line 15)"));
+        assert!(!rendered.contains("caller16"));
+        assert!(rendered.contains("  +3 more"));
+        assert!(rendered.contains("──── called_by (this file)"));
+        assert!(
+            rendered.find("──── calls_out").unwrap() < rendered.find("──── called_by").unwrap()
         );
     }
 }

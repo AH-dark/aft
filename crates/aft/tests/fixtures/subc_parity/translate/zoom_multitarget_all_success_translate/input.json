@@ -4,11 +4,11 @@
     "contextLines": 2,
     "targets": [
       {
-        "filePath": "src/main.ts",
+        "path": "src/main.ts",
         "symbol": "run"
       },
       {
-        "filePath": "docs/guide.md",
+        "path": "docs/guide.md",
         "symbol": "Guide"
       }
     ]

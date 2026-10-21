@@ -1095,10 +1095,9 @@ fn ensure_parent_dirs(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write bytes through the shared source writer: a synced replacement when
-/// that keeps the file's access metadata, otherwise an in-place rewrite backed
-/// by a recovery copy, so a failed write leaves the original bytes. Returns
-/// the writer's warnings for the file's outcome.
+/// Use the shared source writer's replacement-or-in-place decision so hashline
+/// writes have the same access checks, temporary-file protection and recovery
+/// handling as ordinary edits. Return its per-file warnings.
 fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<Vec<String>> {
     ensure_parent_dirs(path)?;
     crate::edit::atomic_write_source(path, bytes).map(|outcome| outcome.warnings)
@@ -1331,6 +1330,76 @@ mod tests {
         assert!(envelope.success);
         assert!(envelope.complete);
         Ok(fs::read(path).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashline_edit_preserves_existing_unix_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (name, mode) in [("secret.txt", 0o600), ("script.sh", 0o755)] {
+            let path = temp.path().join(name);
+            let original = b"one\ntwo\n";
+            write_file(&path, original);
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+
+            let mut snapshots = SnapshotStore::new();
+            let publication =
+                capture_taggable_read(&mut snapshots, &path, name, ReadSelection::WholeFile)
+                    .unwrap();
+            let ReadPublication::Tagged { snapshot, .. } = publication else {
+                panic!("fixture read must publish a tagged snapshot");
+            };
+            let baseline = Baseline::from_bytes(original.to_vec());
+            let operations = vec![put_text("2", &["TWO"])];
+            let resolved = vec![resolve_one(&snapshot, &operations[0])];
+            let sections = [section_put(
+                &path,
+                name,
+                &baseline,
+                &snapshot,
+                &operations,
+                &resolved,
+            )];
+            let mut backups = backup_store(&temp.path().join("backups"));
+            let mut registers = RegisterStore::new();
+            let plan = plan_transaction(&sections, &registers, true).unwrap();
+            let envelope = {
+                let mut execution = ctx(&mut backups, &mut snapshots, &mut registers, true, None);
+                execute_transaction(plan, &mut execution)
+            };
+
+            assert!(envelope.success, "hashline edit failed for {name}");
+            assert_eq!(fs::read(&path).unwrap(), b"one\nTWO\n");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashline_temp_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let sentinel = temp.path().join("sentinel.txt");
+        let old_temp = temp.path().join(".aft-hashline-target.txt.tmp");
+        write_file(&target, b"old target");
+        write_file(&sentinel, b"keep sentinel");
+        symlink(&sentinel, &old_temp).unwrap();
+
+        durable_write(&target, b"new target").unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep sentinel");
+        assert_eq!(fs::read(&target).unwrap(), b"new target");
+        assert!(fs::symlink_metadata(old_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

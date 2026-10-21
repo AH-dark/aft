@@ -1,0 +1,9 @@
+{
+  "agent_args": {
+    "name": "single-file",
+    "op": "checkpoint",
+    "path": "<PROJECT_ROOT>/src/main.ts"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "safety"
+}

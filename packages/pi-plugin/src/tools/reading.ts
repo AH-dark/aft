@@ -3,7 +3,7 @@
  * Structural overview and symbol/section inspection.
  */
 
-import { coerceBoolean, coerceTargetParam } from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceTargetParam, revisionRefArg } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -22,7 +22,13 @@ import {
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
-import { assertExternalReadPermission, resolvePathArg, whenGhReadEnabled } from "./hoisted.js";
+import {
+  assertExternalReadPermission,
+  resolvePathArg,
+  whenGhReadEnabled,
+  withRevisionRefNote,
+  withRevisionRefParam,
+} from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -138,6 +144,25 @@ function zoomExtraCallSites(call: Record<string, unknown>): string {
     : "";
 }
 
+const ZOOM_CALL_ANNOTATION_LIMIT = 15;
+
+function renderZoomAnnotationSection(
+  label: string,
+  calls: Record<string, unknown>[],
+  theme: Theme,
+): string {
+  const rendered = calls
+    .slice(0, ZOOM_CALL_ANNOTATION_LIMIT)
+    .map(
+      (call) =>
+        `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
+    );
+  if (calls.length > ZOOM_CALL_ANNOTATION_LIMIT) {
+    rendered.push(`  +${calls.length - ZOOM_CALL_ANNOTATION_LIMIT} more`);
+  }
+  return `${theme.fg("muted", label)}\n${rendered.join("\n")}`;
+}
+
 /** Exported for renderer unit tests. */
 export function buildOutlineSections(text: string, theme: Theme): string[] {
   const trimmed = text.trim();
@@ -178,26 +203,10 @@ function renderZoomRecord(
   const callsOut = annotations ? asRecords(annotations.calls_out) : [];
   const calledBy = annotations ? asRecords(annotations.called_by) : [];
   if (callsOut.length > 0) {
-    lines.push(
-      `${theme.fg("muted", "calls out")}`,
-      callsOut
-        .map(
-          (call) =>
-            `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
-        )
-        .join("\n"),
-    );
+    lines.push(renderZoomAnnotationSection("calls out", callsOut, theme));
   }
   if (calledBy.length > 0) {
-    lines.push(
-      `${theme.fg("muted", "called by")}`,
-      calledBy
-        .map(
-          (call) =>
-            `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
-        )
-        .join("\n"),
-    );
+    lines.push(renderZoomAnnotationSection("called_by (this file)", calledBy, theme));
   }
 
   return lines.join("\n");
@@ -386,12 +395,24 @@ export function registerReadingTools(
     ghReadEnabled,
     "Batch targets may use `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms) to inspect GitHub discussion ordinals.",
   );
+  const outlineDescription = `Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with ${zoomEnabled ? "aft_zoom" : "read"}. With \`files: true\`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n${outlineFocusSteer(ctx.config)}\n\nPass a single \`target\`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory${githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""}\n\nWhen a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
+  const zoomDescription =
+    'Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
+    (githubZoomDescription ? `\n\n${githubZoomDescription}` : "");
   if (surface.outline) {
     const outlineTool = withPathAliasPreparation({
       name: "aft_outline",
       label: "outline",
-      description: `Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with ${zoomEnabled ? "aft_zoom" : "read"}. With \`files: true\`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n${outlineFocusSteer(ctx.config)}\n\nPass a single \`target\`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory${githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""}\n\nWhen a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
-      parameters: OutlineParams,
+      get description() {
+        return withRevisionRefNote(
+          outlineDescription,
+          ctx.config,
+          "Only a single file can be outlined at a revision.",
+        );
+      },
+      get parameters() {
+        return withRevisionRefParam(OutlineParams, ctx.config);
+      },
       async execute(
         _toolCallId: string,
         params: Static<typeof OutlineParams>,
@@ -408,10 +429,15 @@ export function registerReadingTools(
         const filesMode = coerceBoolean(params.files);
         const hasIncludeTests = !isEmptyParam(params.includeTests);
         const includeTests = coerceBoolean(params.includeTests);
+        // Forward a caller's `ref` even while `revision_reads` is off and the
+        // schema does not offer it: the engine then refuses it by name instead
+        // of silently reading the working tree.
+        const ref = revisionRefArg((params as Record<string, unknown>).ref);
         const rawArgs: Record<string, unknown> = {
           target,
           ...(filesMode ? { files: true } : {}),
           ...(hasIncludeTests ? { includeTests } : {}),
+          ...(ref !== undefined ? { ref } : {}),
         };
 
         if (Array.isArray(target)) {
@@ -465,10 +491,16 @@ export function registerReadingTools(
       withPathAliasPreparation({
         name: "aft_zoom",
         label: "zoom",
-        description:
-          'Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
-          (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
-        parameters: ZoomParams,
+        get description() {
+          return withRevisionRefNote(
+            zoomDescription,
+            ctx.config,
+            "Every file of the call is read at that revision; URLs do not have revisions.",
+          );
+        },
+        get parameters() {
+          return withRevisionRefParam(ZoomParams, ctx.config);
+        },
         async execute(
           _toolCallId: string,
           params: Static<typeof ZoomParams>,
@@ -479,6 +511,11 @@ export function registerReadingTools(
           const bridge = bridgeFor(ctx, extCtx.cwd);
           if (!Array.isArray(params.batch) || params.batch.length === 0)
             throw new Error("'batch' must be a non-empty array of {target, symbols}");
+          // Forward unadvertised refs too, so the engine refuses stale calls
+          // instead of silently reading the working tree when revision_reads is off.
+          const ref = revisionRefArg((params as Record<string, unknown>).ref);
+          if (ref !== undefined && params.batch.some((entry) => isUrl(entry.target)))
+            throw new Error("'ref' cannot be used with a URL target: a URL has no revision");
           // Remote targets are fetched by Rust; only filesystem locations need
           // external-directory approval before dispatch.
           const paths = params.batch
@@ -497,6 +534,7 @@ export function registerReadingTools(
           );
           if (contextLines !== undefined) rawArgs.contextLines = contextLines;
           if (coerceBoolean(params.callgraph)) rawArgs.callgraph = true;
+          if (ref !== undefined) rawArgs.ref = ref;
           const response = await callToolCall(bridge, "zoom", rawArgs, extCtx);
           if (response.success === false)
             throw new Error(response.text || response.message || "zoom failed");

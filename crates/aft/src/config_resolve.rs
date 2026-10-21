@@ -111,6 +111,7 @@ pub struct RawAftConfig {
     pub schema: Option<String>,
     pub edit_mode: Option<RawEditMode>,
     pub format_on_edit: Option<bool>,
+    pub revision_reads: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
     pub formatter_timeout_secs: Option<u32>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
@@ -448,6 +449,7 @@ pub struct RawBashFeatures {
     pub linux_scope: Option<bool>,
     pub disclaim_privacy: Option<bool>,
     pub powershell_tool: Option<bool>,
+    pub env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -775,6 +777,19 @@ pub fn resolve_config_for_harness(
             raw.disabled_tools = Some(default_disabled());
         }
         apply_harness_override(&mut raw, harness, tier, is_user, &mut warnings);
+        if is_user {
+            if let Some(blocked) = blocked_bash_env_key(&raw) {
+                return ResolveResult {
+                    config: Config::default(),
+                    dropped,
+                    warnings,
+                    errors: vec![format!(
+                        "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
+                        tier.source
+                    )],
+                };
+            }
+        }
         if let Some(RawEditMode::Unknown(value)) = raw.edit_mode.as_ref() {
             warnings.push(ConfigWarning {
                 code: "invalid_edit_mode",
@@ -1013,6 +1028,14 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
             return Some(format!("{} has an invalid setting: {error}", tier.source));
         }
     };
+    if tier.tier == "user" {
+        if let Some(blocked) = blocked_bash_env_key(&raw) {
+            return Some(format!(
+                "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
+                tier.source
+            ));
+        }
+    }
     // The block for the active harness is applied on top of this tier, so it
     // must be as valid as the tier itself. Blocks for other harnesses are
     // never applied here and stay unchecked, as at connect.
@@ -1027,14 +1050,34 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     let mut block = block.clone();
     // A nested `harnesses` key is ignored with a warning at connect as well.
     block.remove("harnesses");
-    serde_json::from_value::<RawAftConfig>(Value::Object(block))
-        .err()
-        .map(|error| {
-            format!(
+    let parsed_block = match serde_json::from_value::<RawAftConfig>(Value::Object(block)) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Some(format!(
                 "{} has an invalid setting in harnesses.{label}: {error}",
                 tier.source
-            )
-        })
+            ));
+        }
+    };
+    if tier.tier == "user" {
+        if let Some(blocked) = blocked_bash_env_key(&parsed_block) {
+            return Some(format!(
+                "{} has blocked bash.env key {blocked} in harnesses.{label}; environment startup hooks and protected variables cannot be configured",
+                tier.source
+            ));
+        }
+    }
+    None
+}
+
+fn blocked_bash_env_key(raw: &RawAftConfig) -> Option<&str> {
+    let env = match raw.bash.as_ref() {
+        Some(RawBash::Features(features)) => features.env.as_ref(),
+        _ => None,
+    }?;
+    env.keys()
+        .find(|key| crate::bash_env::is_blocked_env_key(key))
+        .map(String::as_str)
 }
 
 fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
@@ -1123,6 +1166,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.format_on_edit.is_some() {
         base.format_on_edit = override_config.format_on_edit;
+    }
+    if override_config.revision_reads.is_some() {
+        base.revision_reads = override_config.revision_reads;
     }
     if override_config.formatter_timeout_secs.is_some() {
         base.formatter_timeout_secs = override_config.formatter_timeout_secs;
@@ -1246,6 +1292,11 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     if project.format_on_edit.is_some() {
         base.format_on_edit = project.format_on_edit;
+    }
+    // Reading git objects of the session's own repository grants nothing the
+    // read permission rules do not already allow, so a project may opt in.
+    if project.revision_reads.is_some() {
+        base.revision_reads = project.revision_reads;
     }
     if project.validate_on_edit.is_some() {
         base.validate_on_edit = project.validate_on_edit;
@@ -1552,6 +1603,7 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
         RawBash::Features(mut features) => {
             features.linux_scope = None;
             features.runon_enabled = None;
+            features.env = None;
             // A repository may tighten privacy, never restore inherited grants.
             features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
             RawBash::Features(features)
@@ -1620,6 +1672,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
                 disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
+                env: override_features.env.or(base.env),
             }))
         }
     }
@@ -1647,6 +1700,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             linux_scope: None,
             disclaim_privacy: None,
             powershell_tool: None,
+            env: None,
         },
         RawBash::Features(features) => features.clone(),
     }
@@ -1812,6 +1866,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     }
     if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_enabled.is_some()) {
         push_drop(dropped, "bash.runon_enabled", tier, USER_ONLY_REASON);
+    }
+    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.env.is_some()) {
+        push_drop(dropped, "bash.env", tier, USER_ONLY_REASON);
     }
     if raw.restrict_to_project_root.is_some() {
         push_drop(dropped, "restrict_to_project_root", tier, USER_ONLY_REASON);
@@ -2006,6 +2063,9 @@ fn apply_resolved_config(
     };
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;
+    }
+    if let Some(value) = raw.revision_reads {
+        config.revision_reads = value;
     }
     if let Some(value) = raw.formatter_timeout_secs {
         config.formatter_timeout_secs = value;
@@ -2502,6 +2562,7 @@ struct ResolvedBashConfig {
     linux_scope: bool,
     disclaim_privacy: bool,
     powershell_tool: bool,
+    env: BTreeMap<String, String>,
 }
 
 fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
@@ -2519,6 +2580,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.linux_scope = bash.linux_scope;
     config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
+    config.bash.env = bash.env;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
     config.experimental_bash_background = bash.background;
@@ -2602,6 +2664,7 @@ fn resolve_bash_config(
             .and_then(|features| features.disclaim_privacy)
             .unwrap_or(false),
         powershell_tool: false,
+        env: BTreeMap::new(),
     };
 
     match top {
@@ -2622,6 +2685,7 @@ fn resolve_bash_config(
             subagent_background: top_subagent_background,
             detach_on_user_message: top_detach_on_user_message,
             powershell_tool: top_powershell_tool,
+            env: features.env.clone().unwrap_or_default(),
             ..base
         },
         None => {
@@ -3328,6 +3392,42 @@ mod tests {
             minimum.config.bash.worker_wait_max_ms,
             MIN_BASH_WORKER_WAIT_MAX_MS
         );
+    }
+
+    #[test]
+    fn bash_env_is_user_only_and_project_values_are_dropped() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"bash":{"env":{"TZ":"UTC","AFT_CONFIG_ENV":"from-user"}}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"bash":{"env":{"TZ":"Mars","AFT_PROJECT_ENV":"from-project"}}}"#,
+            ),
+        ]);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let serialized = serde_json::to_value(&result.config).unwrap();
+        assert_eq!(serialized["bash"]["env"]["TZ"], "UTC");
+        assert_eq!(serialized["bash"]["env"]["AFT_CONFIG_ENV"], "from-user");
+        assert!(serialized["bash"]["env"].get("AFT_PROJECT_ENV").is_none());
+        assert!(result.dropped.iter().any(|drop| drop.key == "bash.env"));
+    }
+
+    #[test]
+    fn bash_env_rejects_preexec_hijack_keys_at_config_load() {
+        let user = tier(
+            "user",
+            r#"{"bash":{"env":{"NODE_OPTIONS":"--require evil"}}}"#,
+        );
+        let result = resolve_config(std::slice::from_ref(&user));
+        let error = result.errors.join(" ");
+        assert!(error.contains("bash.env"), "{error}");
+        assert!(error.contains("NODE_OPTIONS"), "{error}");
+        assert!(error.contains("blocked"), "{error}");
+        let strict_error = strict_tier_error(&user, None).unwrap_or_default();
+        assert!(strict_error.contains("NODE_OPTIONS"), "{strict_error}");
     }
 
     #[test]

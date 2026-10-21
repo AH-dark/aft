@@ -2,7 +2,7 @@
   "agent_args": {
     "callgraph": true,
     "contextLines": 2,
-    "filePath": "src/main.ts",
+    "path": "src/main.ts",
     "symbols": "run"
   },
   "project_root": "<PROJECT_ROOT>",

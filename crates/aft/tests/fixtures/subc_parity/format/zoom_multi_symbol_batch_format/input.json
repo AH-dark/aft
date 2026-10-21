@@ -3,6 +3,7 @@
   "native_response_json": {
     "id": "1",
     "success": true,
+    "text": "Incomplete zoom results: one or more symbols failed.\n\nsrc/main.ts:1-3 [function run]\n\n1: function run() {\n2:   return 1;\n3: }\n\nSymbol \"missing\" not found: symbol 'missing' not found",
     "complete": false,
     "symbols": [
       {
@@ -38,8 +39,11 @@
   },
   "ctx": {
     "agent_args": {
-      "filePath": "src/main.ts",
-      "symbols": "run missing"
+      "path": "src/main.ts",
+      "symbols": [
+        "run",
+        "missing"
+      ]
     },
     "project_root": "<PROJECT_ROOT>"
   }

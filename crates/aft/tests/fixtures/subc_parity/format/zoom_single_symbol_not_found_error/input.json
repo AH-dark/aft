@@ -8,7 +8,7 @@
   },
   "ctx": {
     "agent_args": {
-      "filePath": "src/main.ts",
+      "path": "src/main.ts",
       "symbols": "missing"
     },
     "project_root": "<PROJECT_ROOT>"

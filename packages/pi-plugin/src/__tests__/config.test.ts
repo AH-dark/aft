@@ -1039,6 +1039,39 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring");
   });
 
+  test("bash.env is user-only and blocked values are refused at load", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ bash: { env: { TZ: "UTC", AFT_PI_ENV_TEST: "user-value" } } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ bash: { env: { TZ: "Mars", AFT_PI_PROJECT_ENV_TEST: "project-value" } } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).bash.env).toEqual({
+      TZ: "UTC",
+      AFT_PI_ENV_TEST: "user-value",
+    });
+    expect(result.stderr).toContain("bash.env");
+
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ bash: { env: { PYTHONPATH: "/tmp/injected" } } }),
+    );
+    const blocked = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(blocked.stdout).bash.env).toBeUndefined();
+    expect(blocked.stderr).toContain("bash.env key PYTHONPATH is blocked");
+  });
+
   test("project config can override bash.rewrite via legacy experimental block", () => {
     const fixture = createConfigFixture();
     writeFileSync(

@@ -1,4 +1,11 @@
-import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  coerceTargetParam,
+  formatZoomText,
+  REVISION_REF_TOOL_NOTE,
+  revisionReadsOffered,
+  revisionRefArg,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveGithubConfig, toolEnabled } from "../config.js";
@@ -13,7 +20,7 @@ import {
   type ToolRuntime,
 } from "./_shared.js";
 import type { V2DefinitionRuntime } from "./definitions/v2.js";
-import { whenGhReadEnabled } from "./hoisted.js";
+import { revisionRefArgSchema, whenGhReadEnabled } from "./hoisted.js";
 import {
   assertExternalDirectoryPermission,
   assertV2ReadPermission,
@@ -87,39 +94,77 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     ghReadEnabled,
     "Batch targets may use `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms) to inspect GitHub discussion ordinals.",
   );
+  const outlineDescription =
+    "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
+    (zoomEnabled ? "aft_zoom" : "read") +
+    ". With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n" +
+    outlineFocusSteer(ctx.config) +
+    "\n\n" +
+    "Pass a single `target`:\n" +
+    "  • file path → outline that file (with signatures)\n" +
+    "  • directory path → outline source files under it\n" +
+    "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
+    "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
+    (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : "") +
+    "\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.";
+  const outlineArgs = {
+    target: z
+      .union([z.string(), z.array(z.string())])
+      .describe(
+        "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+      ),
+    files: z
+      .boolean()
+      .optional()
+      .describe(
+        "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
+      ),
+    includeTests: z
+      .boolean()
+      .optional()
+      .describe("Directory outline only: include test files. Defaults to false; tests are hidden."),
+  };
+  const zoomDescription =
+    'Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
+    (githubZoomDescription ? `\n\n${githubZoomDescription}` : "");
+  const zoomArgs = {
+    batch: z
+      .array(
+        z.object({
+          target: z
+            .string()
+            .describe(
+              "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+            ),
+          symbols: z
+            .union([z.string(), z.array(z.string())])
+            .describe(
+              "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+            ),
+        }),
+      )
+      .min(1)
+      .describe("One or more lookups; entries may mix file paths and URLs"),
+    contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      "Lines of context before/after each symbol (default: 3)",
+    ),
+    callgraph: z
+      .boolean()
+      .optional()
+      .describe("Include call-graph annotations for every entry (default: false)"),
+  };
+  // `ref` exists only while `revision_reads` is on; the getters below read the
+  // live config each time the host asks, so a reload is reflected.
+  const offered = () => revisionReadsOffered(ctx.config);
   const tools = prepareToolMap({
     aft_outline: {
-      description:
-        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
-        (zoomEnabled ? "aft_zoom" : "read") +
-        ". With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n" +
-        outlineFocusSteer(ctx.config) +
-        "\n\n" +
-        "Pass a single `target`:\n" +
-        "  • file path → outline that file (with signatures)\n" +
-        "  • directory path → outline source files under it\n" +
-        "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
-        "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
-        (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : "") +
-        "\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
-      args: {
-        target: z
-          .union([z.string(), z.array(z.string())])
-          .describe(
-            "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
-          ),
-        files: z
-          .boolean()
-          .optional()
-          .describe(
-            "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
-          ),
-        includeTests: z
-          .boolean()
-          .optional()
-          .describe(
-            "Directory outline only: include test files. Defaults to false; tests are hidden.",
-          ),
+      get description() {
+        return offered()
+          ? `${outlineDescription}\n\n${REVISION_REF_TOOL_NOTE} Only a single file can be outlined at a revision.`
+          : outlineDescription;
+      },
+      get args() {
+        return offered() ? { ...outlineArgs, ...revisionRefArgSchema } : outlineArgs;
       },
       execute: async (args, context): Promise<string> => {
         // Coerce at the boundary: a host may deliver the string|array `target` as
@@ -130,10 +175,15 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const filesMode = coerceBoolean(args.files);
         const hasIncludeTests = !isEmptyParam(args.includeTests);
         const includeTests = coerceBoolean(args.includeTests);
+        // Forward a caller's `ref` even while `revision_reads` is off and the
+        // schema does not offer it: the engine then refuses it by name instead
+        // of silently reading the working tree.
+        const ref = revisionRefArg(args.ref);
         const rawArgs: Record<string, unknown> = {
           target,
           ...(filesMode ? { files: true } : {}),
           ...(hasIncludeTests ? { includeTests } : {}),
+          ...(ref !== undefined ? { ref } : {}),
         };
 
         const checkedReads = new Map<string, string | undefined>();
@@ -235,38 +285,22 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     },
 
     aft_zoom: {
-      description:
-        'Inspect code symbols or documentation sections. Pass lookups in `batch: [{ target, symbols }]`; a single lookup is a one-entry batch. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
-        (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
-      args: {
-        batch: z
-          .array(
-            z.object({
-              target: z
-                .string()
-                .describe(
-                  "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
-                ),
-              symbols: z
-                .union([z.string(), z.array(z.string())])
-                .describe(
-                  "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
-                ),
-            }),
-          )
-          .min(1)
-          .describe("One or more lookups; entries may mix file paths and URLs"),
-        contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "Lines of context before/after each symbol (default: 3)",
-        ),
-        callgraph: z
-          .boolean()
-          .optional()
-          .describe("Include call-graph annotations for every entry (default: false)"),
+      get description() {
+        return offered()
+          ? `${zoomDescription}\n\n${REVISION_REF_TOOL_NOTE} Every file of the call is read at that revision; URLs do not have revisions.`
+          : zoomDescription;
+      },
+      get args() {
+        return offered() ? { ...zoomArgs, ...revisionRefArgSchema } : zoomArgs;
       },
       execute: async (args, context): Promise<ToolResult> => {
         if (!Array.isArray(args.batch) || args.batch.length === 0)
           throw new Error("'batch' must be a non-empty array of {target, symbols}");
+        // Forward unadvertised refs too, so the engine refuses stale calls
+        // instead of silently reading the working tree when revision_reads is off.
+        const ref = revisionRefArg(args.ref);
+        if (ref !== undefined && args.batch.some((entry) => isUrl(entry.target)))
+          throw new Error("'ref' cannot be used with a URL target: a URL has no revision");
         // URLs are fetched by Rust. Authorize each distinct local file before
         // dispatch, retaining rule denials as individual batch outcomes on V2.
         const localPaths = args.batch
@@ -301,6 +335,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           })
           .join("\n");
         const rawArgs: Record<string, unknown> = { batch: allowed };
+        if (ref !== undefined) rawArgs.ref = ref;
         const contextLines = coerceOptionalInt(
           args.contextLines,
           "contextLines",

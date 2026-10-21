@@ -280,3 +280,23 @@ export function registerPiToolSurface(
   if (surface.astSearch || surface.astReplace) registerAstTools(boundPi, ctx, surface);
   if (surface.delete || surface.move) registerFsTools(boundPi, ctx, surface);
 }
+
+/** Replace Pi's captured revision-read schemas without changing the loaded tool set. */
+export function refreshPiRevisionReadTools(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  loadedSurface: PiToolSurface,
+): void {
+  const surface = withLiveRestriction(
+    {
+      ...loadedSurface,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+    },
+    ctx,
+  );
+  const boundPi = bindToolRegistrationFunnel(pi, ctx);
+  registerHoistedTools(boundPi, ctx, surface);
+  registerReadingTools(boundPi, ctx, surface);
+}

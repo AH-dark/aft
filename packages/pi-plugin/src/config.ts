@@ -365,6 +365,8 @@ export interface BashConfig {
   disclaim_privacy?: boolean;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
   powershell_tool?: boolean;
+  /** Fixed extra variables passed to bash; user-tier only. */
+  env?: Record<string, string>;
 }
 
 export interface ResolvedGithubConfig {
@@ -434,6 +436,7 @@ export interface AftConfig {
   /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
   edit_mode?: "default" | "hashline";
   format_on_edit?: boolean;
+  revision_reads?: boolean;
   /** Maximum formatter subprocess wallclock seconds. Bounded 1..=600. Default 10. */
   formatter_timeout_secs?: number;
   validate_on_edit?: "syntax" | "full";
@@ -537,6 +540,8 @@ export interface ResolvedBashConfig {
   worker_wait_max_ms: number;
   /** Manual PowerShell registration fallback. Default false. */
   powershell_tool: boolean;
+  /** User-configured environment; never populated from a project tier. */
+  env: Record<string, string>;
 }
 
 /** Default foreground wait-window before auto-promotion (ms). */
@@ -623,6 +628,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       DEFAULT_WORKER_WAIT_MAX_MS,
     powershell_tool:
       typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
+    env: typeof top === "object" && top !== null ? { ...(top.env ?? {}) } : {},
   };
 
   if (top === false) return base;
@@ -842,6 +848,48 @@ const ExperimentalConfigSchema = z.object({
  * Graduated `bash` config schema. Replaces `experimental.bash.*` in v0.27.2.
  * Three shapes: boolean (true/false) or partial object override.
  */
+const BLOCKED_BASH_ENV_NAMES = new Set([
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "LD_AUDIT",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "BASH_ENV",
+  "ENV",
+  "IFS",
+  "PATH",
+  "SHELLOPTS",
+  "BASHOPTS",
+  "PROMPT_COMMAND",
+  "PS4",
+  "PYTHONSTARTUP",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PERL5OPT",
+  "PERL5LIB",
+  "PERLLIB",
+  "PERL5DB",
+  "RUBYOPT",
+  "RUBYLIB",
+  "NODE_OPTIONS",
+  "GCONV_PATH",
+  "LOCPATH",
+  "NLSPATH",
+  "HOSTALIASES",
+  "RESOLV_HOST_CONF",
+]);
+
+function isBlockedBashEnvKey(key: string): boolean {
+  const normalized = process.platform === "win32" ? key.toUpperCase() : key;
+  return (
+    BLOCKED_BASH_ENV_NAMES.has(normalized) ||
+    normalized.startsWith("LD_") ||
+    normalized.startsWith("DYLD_") ||
+    normalized.startsWith("BASH_FUNC_")
+  );
+}
+
 const BashFeaturesSchema = z.object({
   enabled: z.boolean().optional(),
   rewrite: z.boolean().optional(),
@@ -872,6 +920,21 @@ const BashFeaturesSchema = z.object({
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.
   powershell_tool: z.boolean().optional(),
+  /** Fixed extra variables passed to each bash request; user tier only. */
+  env: z
+    .record(z.string(), z.string())
+    .superRefine((env, context) => {
+      for (const key of Object.keys(env)) {
+        if (isBlockedBashEnvKey(key)) {
+          context.addIssue({
+            code: "custom",
+            path: [key],
+            message: `bash.env key ${key} is blocked because it can alter startup or protected process state`,
+          });
+        }
+      }
+    })
+    .optional(),
 });
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
@@ -1036,6 +1099,12 @@ const AftConfigFieldsSchema = z.object({
    * with `true` if you want AFT to format after edits.
    */
   format_on_edit: z.boolean().optional(),
+  /**
+   * Let `read`, `aft_outline` and `aft_zoom` take a `ref` argument that reads a
+   * file as it is at a git revision, from the repository's object store.
+   * Default: false — the argument is not offered and a call passing it is refused.
+   */
+  revision_reads: z.boolean().optional(),
   formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
   validate_on_edit: z.enum(["syntax", "full"]).optional(),
   formatter: z.record(z.string(), FormatterEnum).optional(),
@@ -1192,6 +1261,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 
   if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
   if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
+  if (config.revision_reads !== undefined) overrides.revision_reads = config.revision_reads;
   if (config.formatter_timeout_secs !== undefined)
     overrides.formatter_timeout_secs = config.formatter_timeout_secs;
   if (config.validate_on_edit !== undefined) overrides.validate_on_edit = config.validate_on_edit;
@@ -1217,7 +1287,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.worker_wait_max_ms !== undefined ||
       config.bash.disclaim_privacy !== undefined ||
-      config.bash.powershell_tool !== undefined)
+      config.bash.powershell_tool !== undefined ||
+      config.bash.env !== undefined)
   ) {
     overrides.bash = {
       ...(config.bash.disclaim_privacy !== undefined
@@ -1245,6 +1316,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       ...(config.bash.powershell_tool !== undefined
         ? { powershell_tool: config.bash.powershell_tool }
         : {}),
+      ...(config.bash.env !== undefined ? { env: config.bash.env } : {}),
     };
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
@@ -1773,6 +1845,8 @@ function getProjectLspStrippedKeys(lsp?: LspConfig): string[] {
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "edit_mode",
   "format_on_edit",
+  // Reads git objects of the session's own repository under the same read rules.
+  "revision_reads",
   "validate_on_edit",
   "configure_warnings_delivery",
   // "indexes" handled separately — a project can only switch an index off.
@@ -1846,6 +1920,8 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   }
   if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)
     stripped.push("bash.disclaim_privacy");
+  if (typeof override.bash === "object" && override.bash.env !== undefined)
+    stripped.push("bash.env");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
 
@@ -1908,7 +1984,10 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   if (typeof projectBash === "object" && projectBash.disclaim_privacy !== true)
     delete projectBash.disclaim_privacy;
   // Strip only the weakening direction before the usual field-wise merge.
-  if (typeof projectBash === "object") delete projectBash.runon_enabled;
+  if (typeof projectBash === "object") {
+    delete projectBash.runon_enabled;
+    delete projectBash.env;
+  }
   const bash = mergeBashConfig(base.bash, projectBash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);

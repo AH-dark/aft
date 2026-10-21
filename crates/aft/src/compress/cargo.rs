@@ -168,6 +168,7 @@ fn is_final_cargo_summary(line: &str) -> bool {
 fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
+    let total = cargo_test_total_line(&lines);
     if !has_failures {
         let has_error_diagnostic = lines.iter().any(|line| is_error_diagnostic(line));
         let has_warning_or_error = lines
@@ -176,7 +177,7 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
         if has_error_diagnostic
             || (matches!(exit_code, Some(code) if code != 0) && has_warning_or_error)
         {
-            return compress_build_like(output);
+            return append_cargo_test_total(compress_build_like(output), total.as_deref());
         }
 
         let result: Vec<String> = lines
@@ -189,10 +190,13 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
             })
             .map(|line| (*line).to_string())
             .collect();
-        return CompressionResult::new(ensure_final_lines(
-            output,
-            &trim_trailing_lines(&result.join("\n")),
-        ));
+        return append_cargo_test_total(
+            CompressionResult::new(ensure_final_lines(
+                output,
+                &trim_trailing_lines(&result.join("\n")),
+            )),
+            total.as_deref(),
+        );
     }
 
     let mut blocks = Vec::new();
@@ -254,8 +258,112 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     }
 
     let capped = cap_classified_blocks(blocks);
-    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
-        .map_text(|text| ensure_final_lines(output, text))
+    append_cargo_test_total(
+        CompressionResult::with_class_drops(
+            trim_trailing_lines(&capped.text),
+            capped.dropped_by_class,
+        )
+        .map_text(|text| ensure_final_lines(output, text)),
+        total.as_deref(),
+    )
+}
+
+fn append_cargo_test_total(
+    compressed: CompressionResult,
+    total: Option<&str>,
+) -> CompressionResult {
+    match total {
+        Some(total) => compressed.map_text(|text| insert_cargo_test_total(text, total)),
+        None => compressed,
+    }
+}
+
+fn insert_cargo_test_total(output: &str, total: &str) -> String {
+    let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
+    let insert_at = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("test result:"))
+        .map_or(lines.len(), |index| index + 1);
+    lines.insert(insert_at, total.to_string());
+    lines.join("\n")
+}
+
+fn cargo_test_total_line(lines: &[&str]) -> Option<String> {
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut ignored = 0usize;
+    let mut binaries = 0usize;
+    let mut unparsed_binaries = 0usize;
+
+    for line in lines {
+        if !line.trim_start().starts_with("test result:") {
+            continue;
+        }
+        binaries += 1;
+        let counts = ["passed", "failed", "ignored"].map(|label| {
+            line.split(';').find_map(|field| {
+                let mut words = field.split_whitespace().rev();
+                (words.next()? == label).then(|| words.next()?.parse::<usize>().ok())?
+            })
+        });
+        match counts {
+            [Some(binary_passed), Some(binary_failed), Some(binary_ignored)] => {
+                passed = passed.saturating_add(binary_passed);
+                failed = failed.saturating_add(binary_failed);
+                ignored = ignored.saturating_add(binary_ignored);
+            }
+            _ => unparsed_binaries += 1,
+        }
+    }
+
+    if binaries < 2 {
+        return None;
+    }
+
+    let mut total = format!(
+        "cargo test total: {passed} passed, {failed} failed, {ignored} ignored across {binaries} binaries"
+    );
+    let mut incomplete = Vec::new();
+    if lines
+        .iter()
+        .any(|line| line.trim_start().starts_with("error: could not compile"))
+    {
+        incomplete.push("one or more test binaries failed to compile".to_string());
+    }
+    let started_binaries = lines
+        .iter()
+        .filter(|line| {
+            let Some(rest) = line.trim_start().strip_prefix("running ") else {
+                return false;
+            };
+            let mut words = rest.split_whitespace();
+            words
+                .next()
+                .is_some_and(|count| count.parse::<usize>().is_ok())
+                && matches!(words.next(), Some("test" | "tests"))
+        })
+        .count();
+    let cut_off_binaries = started_binaries.saturating_sub(binaries);
+    if cut_off_binaries == 1 {
+        incomplete.push("1 test binary was cut off before reporting a result".to_string());
+    } else if cut_off_binaries > 1 {
+        incomplete.push(format!(
+            "{cut_off_binaries} test binaries were cut off before reporting a result"
+        ));
+    }
+    if unparsed_binaries == 1 {
+        incomplete.push("1 test result could not be parsed".to_string());
+    } else if unparsed_binaries > 1 {
+        incomplete.push(format!(
+            "{unparsed_binaries} test results could not be parsed"
+        ));
+    }
+    if !incomplete.is_empty() {
+        total.push_str(" (incomplete: ");
+        total.push_str(&incomplete.join("; "));
+        total.push(')');
+    }
+    Some(total)
 }
 
 fn trim_trailing_lines(input: &str) -> String {
@@ -309,6 +417,7 @@ pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
         } else if is_name
             || is_location
             || trimmed.starts_with("test result:")
+            || trimmed.starts_with("cargo test total:")
             || trimmed.starts_with("Summary [")
             || trimmed.starts_with("error: test failed, to rerun")
         {
@@ -401,6 +510,58 @@ error: could not compile `demo` (lib test) due to 1 previous error
         assert!(result.text.contains("error[E0432]"));
         assert!(result.text.contains("unresolved import"));
         assert!(result.text.contains("error: could not compile"));
+    }
+
+    #[test]
+    fn cargo_test_sums_results_even_when_output_is_wrapped() {
+        let output = "runner: cargo test\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\nrunning 1 test\ntest result: FAILED. 1 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out\n";
+
+        assert!(CargoCompressor.matches_output(output));
+        let result = CargoCompressor.compress_output_match_with_exit_code(output, Some(101));
+
+        assert!(result
+            .text
+            .contains("cargo test total: 3 passed, 1 failed, 3 ignored across 2 binaries"));
+    }
+
+    #[test]
+    fn cargo_test_total_marks_binaries_that_failed_to_compile() {
+        let output = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\nerror: could not compile `broken` (bin test) due to 1 previous error\n";
+
+        let result = compress_test(output, Some(101));
+
+        assert!(result
+            .text
+            .contains("cargo test total: 3 passed, 0 failed, 1 ignored across 2 binaries"));
+        assert!(result
+            .text
+            .contains("incomplete: one or more test binaries failed to compile"));
+    }
+
+    #[test]
+    fn cargo_test_total_marks_binaries_without_a_result_as_incomplete() {
+        let output = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\nrunning 1 test\n";
+
+        let result = compress_test(output, Some(0));
+
+        assert!(result
+            .text
+            .contains("cargo test total: 3 passed, 0 failed, 0 ignored across 2 binaries"));
+        assert!(result
+            .text
+            .contains("incomplete: 1 test binary was cut off before reporting a result"));
+    }
+
+    #[test]
+    fn cargo_verdict_keeps_aggregate_total_for_byte_capped_replies() {
+        let lines = [
+            "running 1 test",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "cargo test total: 1 passed, 0 failed, 0 ignored across 2 binaries",
+        ];
+        let verdict = test_verdict(&lines).expect("cargo test output has a verdict");
+
+        assert!(verdict.required.contains(&2));
     }
 
     #[test]

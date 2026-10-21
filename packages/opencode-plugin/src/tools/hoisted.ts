@@ -15,6 +15,10 @@ import {
   coerceBoolean,
   coerceStringArray,
   isFindReplaceOnlyEdit,
+  REVISION_REF_DESCRIPTION,
+  REVISION_REF_TOOL_NOTE,
+  revisionReadsOffered,
+  revisionRefArg,
   toolErrorFromResponse,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
@@ -480,35 +484,62 @@ function readDescription(ghReadEnabled: boolean): string {
 /**
  * Creates the simple read tool. Registers as "read" when hoisted, "aft_read" when not.
  */
+/**
+ * Add the `ref` sentence to a tool description, before its examples when it
+ * has any so the examples stay last.
+ */
+export function withRevisionNote(description: string): string {
+  if (description.includes("\nExamples:")) {
+    return description.replace("\nExamples:", `\n${REVISION_REF_TOOL_NOTE}\n\nExamples:`);
+  }
+  return `${description}\n\n${REVISION_REF_TOOL_NOTE}`;
+}
+
+/** The optional `ref` argument offered while `revision_reads` is on. */
+export const revisionRefArgSchema: ToolDefinition["args"] = {
+  ref: z.string().optional().describe(REVISION_REF_DESCRIPTION),
+};
+
 export function createReadTool(ctx: PluginContext): ToolDefinition {
+  const baseDescription = v1FileParameterDescription(
+    readDescription(resolveGithubConfig(ctx.config).read),
+  );
+  const baseArgs = {
+    // OpenCode-only exception to the canonical `path` vocabulary: the
+    // hoisted read/write/edit trio overrides OpenCode's built-in tools,
+    // and the host UI renders headers from the recorded model input's
+    // `filePath` verbatim (no fallback, and the record is taken from the
+    // raw model stream before any plugin hook). Advertising `path` here
+    // blanks every file header in the OpenCode UI; `path` is still
+    // accepted silently at runtime.
+    filePath: z
+      .string()
+      .describe("Path to file or directory (absolute or relative to project root)"),
+    startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      "1-based line or directory entry to start reading from",
+    ),
+    endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      "1-based line or directory entry to stop reading at (inclusive)",
+    ),
+    limit: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
+    ),
+    offset: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+      "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
+    ),
+  };
   return prepareToolMap({
     read: {
-      description: v1FileParameterDescription(
-        readDescription(resolveGithubConfig(ctx.config).read),
-      ),
-      args: {
-        // OpenCode-only exception to the canonical `path` vocabulary: the
-        // hoisted read/write/edit trio overrides OpenCode's built-in tools,
-        // and the host UI renders headers from the recorded model input's
-        // `filePath` verbatim (no fallback, and the record is taken from the
-        // raw model stream before any plugin hook). Advertising `path` here
-        // blanks every file header in the OpenCode UI; `path` is still
-        // accepted silently at runtime.
-        filePath: z
-          .string()
-          .describe("Path to file or directory (absolute or relative to project root)"),
-        startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line or directory entry to start reading from",
-        ),
-        endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line or directory entry to stop reading at (inclusive)",
-        ),
-        limit: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
-        ),
-        offset: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
-        ),
+      // Read the live config so reloading revision_reads changes the offered schema.
+      get description() {
+        return revisionReadsOffered(ctx.config)
+          ? withRevisionNote(baseDescription)
+          : baseDescription;
+      },
+      get args() {
+        return revisionReadsOffered(ctx.config)
+          ? { ...baseArgs, ...revisionRefArgSchema }
+          : baseArgs;
       },
       execute: async (args, context): Promise<ToolResult> => {
         const file = args.path as string;
@@ -576,6 +607,11 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         if (endLine !== undefined) rawArgs.endLine = endLine;
         if (offset !== undefined) rawArgs.offset = offset;
         if (limit !== undefined) rawArgs.limit = limit;
+        // Forward a caller's `ref` even while `revision_reads` is off and the
+        // schema does not offer it: the engine then refuses it by name instead
+        // of silently reading the working tree.
+        const ref = revisionRefArg(args.ref);
+        if (ref !== undefined) rawArgs.ref = ref;
 
         // GitHub resources can embed images. For local media extensions, exclude
         // directories before negotiating capability; all other reads dispatch directly.
@@ -635,7 +671,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 
         return { output, title: dp, metadata: { title: dp } };
       },
-    },
+    } as ToolDefinition,
   }).read;
 }
 
