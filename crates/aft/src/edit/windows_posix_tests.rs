@@ -101,13 +101,41 @@ fn windows_posix_unsupported_volume_falls_back() {
 }
 
 #[test]
+fn windows_posix_rename_constraints_fall_back() {
+    for code in [
+        ERROR_ACCESS_DENIED,
+        ERROR_SHARING_VIOLATION,
+        ERROR_LOCK_VIOLATION,
+        ERROR_USER_MAPPED_FILE,
+    ] {
+        assert_fallback(Fault::Rename(code));
+    }
+}
+
+#[test]
 fn windows_posix_failed_rename_keeps_original_and_removes_temp() {
-    let (dir, path) = fixture();
-    let error = with_fault(Fault::Rename(5), || atomic_write_source(&path, b"edited")).unwrap_err();
-    assert_eq!(error.raw_os_error(), Some(5));
-    assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
-    assert_eq!(std::fs::read(&path).unwrap(), b"original");
-    assert_no_temporary(dir.path());
+    use windows_sys::Win32::Foundation::{
+        ERROR_CRC, ERROR_DISK_FULL, ERROR_IO_DEVICE, ERROR_PATH_NOT_FOUND, ERROR_WRITE_FAULT,
+    };
+
+    for code in [
+        ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND,
+        ERROR_DISK_FULL,
+        ERROR_CRC,
+        ERROR_IO_DEVICE,
+        ERROR_WRITE_FAULT,
+    ] {
+        let (dir, path) = fixture();
+        let error = with_fault(Fault::Rename(code), || {
+            atomic_write_source(&path, b"edited")
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(code as i32));
+        assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_no_temporary(dir.path());
+    }
 }
 
 #[test]
@@ -155,6 +183,100 @@ fn windows_posix_verbatim_destination_is_supported() {
     assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
     assert_eq!(std::fs::read(&path).unwrap(), b"edited");
     assert_no_temporary(dir.path());
+}
+
+#[test]
+fn windows_posix_verbatim_trailing_space_preserves_neighbor() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    let destination = parent.join("source.txt ");
+    let neighbor = parent.join("source.txt");
+    std::fs::write(&destination, b"original").unwrap();
+    std::fs::write(&neighbor, b"neighbor").unwrap();
+
+    atomic_write_source(&destination, b"edited").unwrap();
+
+    assert_eq!(std::fs::read(&neighbor).unwrap(), b"neighbor");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"edited");
+    assert_eq!(LAST_METHOD.get(), Some(Method::ReplaceFile));
+    assert!(
+        LAST_REASON.with(|r| r.borrow().contains("verbatim")),
+        "{}",
+        LAST_REASON.with(|r| r.borrow().clone())
+    );
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 2);
+}
+
+#[test]
+fn windows_posix_open_without_delete_sharing_saves_in_place() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let (dir, path) = fixture();
+    atomic_write_source(&path, b"control").unwrap();
+    assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+    FALLBACK_COUNTS.with(|counts| counts.borrow_mut().clear());
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .unwrap();
+
+    atomic_write_source(&path, b"edited").unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+    assert_eq!(LAST_METHOD.get(), Some(Method::InPlace));
+    assert!(FALLBACK_COUNTS.with(|counts| counts
+        .borrow()
+        .keys()
+        .any(|reason| reason.contains("rename failed"))));
+    assert_no_temporary(dir.path());
+    drop(held);
+}
+
+#[test]
+fn windows_posix_verbatim_name_conversion_rejects_normalization() {
+    let long_path = format!(r"\\?\C:\{}\source.txt", ["segment"; 36].join(r"\"));
+    assert!(rename_name(Path::new(&long_path)).is_err());
+    for path in [
+        r"\\?\C:\normal\source.txt ",
+        r"\\?\C:\normal\source.txt.",
+        r"\\?\C:\parent.\source.txt",
+        r"\\?\C:\parent \source.txt",
+        r"\\?\C:\normal\CON",
+        r"\\?\C:\normal\con.txt",
+        r"\\?\C:\normal\CON .txt",
+        r"\\?\C:\normal\PRN",
+        r"\\?\C:\normal\AUX.txt",
+        r"\\?\C:\normal\NUL",
+        r"\\?\C:\normal\COM1.txt",
+        r"\\?\C:\normal\LPT9",
+        r"\\?\C:\normal\COM¹",
+        r"\\?\C:\normal\lpt².txt",
+        r"\\?\C:\normal\COM³",
+        r"\\?\C:\normal\CONIN$",
+        r"\\?\C:\normal\CONOUT$",
+        r"\\?\C:\normal\source.txt:stream",
+        r"\\?\C:\normal\file/name.txt",
+        r"\\?\C:\normal\file?name.txt",
+        r"\\?\C:\normal\file\..\source.txt",
+        r"\\?\C:\normal\.\source.txt",
+        r"\\?\C:\normal\\source.txt",
+        "\\\\?\\C:\\normal\\file\u{1}.txt",
+        r"\\?\UNC\server\share\parent.\source.txt",
+        r"\\?\UNC\server\share \source.txt",
+    ] {
+        assert!(rename_name(Path::new(path)).is_err(), "{path:?}");
+    }
+    for path in [
+        r"\\?\C:\normal\source.txt",
+        r"\\?\C:\normal\COM10.txt",
+        r"\\?\C:\normal\CONSOLE.txt",
+        r"\\?\C:\normal\日本語.txt",
+        r"\\?\UNC\server\share\normal\source.txt",
+    ] {
+        assert!(rename_name(Path::new(path)).is_ok(), "{path:?}");
+    }
 }
 
 #[test]

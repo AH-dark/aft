@@ -8,8 +8,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{
-    LocalFree, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION,
-    ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    LocalFree, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION,
+    ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NOT_SUPPORTED, ERROR_SHARING_VIOLATION,
+    ERROR_USER_MAPPED_FILE, GENERIC_WRITE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
@@ -359,14 +360,62 @@ fn eligible(
     prepare_metadata(destination, source, temp)
 }
 
+fn ordinary_component_preserves_name(component: &str) -> bool {
+    if component.is_empty()
+        || component.ends_with([' ', '.'])
+        || component
+            .chars()
+            .any(|c| c <= '\u{1f}' || matches!(c, '<' | '>' | ':' | '"' | '/' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    // The device-name check ignores extensions and trims spaces from the stem.
+    // Win32 also recognizes superscript 1/2/3 in COM and LPT device names.
+    let stem = component.split('.').next().unwrap_or("").trim_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    !matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) && !["COM", "LPT"].iter().any(|prefix| {
+        upper.strip_prefix(*prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
+}
+
 fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
     // SetFileInformationByHandle accepts DOS/UNC names, not the verbatim
     // namespace returned by canonicalize. Keep unsupported namespaces on the
     // ReplaceFileW path instead of changing their meaning.
     use std::path::{Component, Prefix};
     let absolute = std::path::absolute(destination)?;
-    if absolute.to_str().is_none() {
-        return Err(io::Error::other("rename namespace is unsupported"));
+    let text = absolute
+        .to_str()
+        .ok_or_else(|| io::Error::other("rename namespace is unsupported"))?;
+    if let Some(Component::Prefix(prefix)) = absolute.components().next() {
+        let tail = match prefix.kind() {
+            Prefix::VerbatimDisk(_) => text
+                .strip_prefix(r"\\?\")
+                .and_then(|drive| drive.get(2..).and_then(|tail| tail.strip_prefix('\\'))),
+            Prefix::VerbatimUNC(..) => text.get(8..),
+            Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+                return Err(io::Error::other("rename namespace is unsupported"));
+            }
+            _ => None,
+        };
+        if matches!(
+            prefix.kind(),
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
+        ) && (text.contains('/')
+            || !tail.is_some_and(|tail| tail.split('\\').all(ordinary_component_preserves_name)))
+        {
+            // Removing the prefix enables Win32 parsing and can select a different
+            // destination. ReplaceFileW can use the original verbatim spelling.
+            return Err(io::Error::other("destination requires verbatim spelling"));
+        }
     }
     let path = crate::windows_path::normalize_windows_path(&absolute);
     if matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(
@@ -374,7 +423,17 @@ fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
     )) {
         return Err(io::Error::other("rename namespace is unsupported"));
     }
-    Ok(path.as_os_str().encode_wide().collect())
+    let name: Vec<_> = path.as_os_str().encode_wide().collect();
+    // Without the verbatim prefix, Win32 may impose the 260-code-unit path
+    // limit (including NUL). Keep longer names on ReplaceFileW.
+    if name.len() >= 260
+        && matches!(absolute.components().next(), Some(Component::Prefix(prefix)) if matches!(
+            prefix.kind(), Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
+        ))
+    {
+        return Err(io::Error::other("destination requires verbatim spelling"));
+    }
+    Ok(name)
 }
 
 fn posix_rename(temp: &File, destination: &Path, _fault: Fault) -> io::Result<()> {
@@ -449,10 +508,23 @@ pub(super) fn replace(destination: &Path, replacement: &Path, parent: &Path) -> 
             Err(error)
                 if matches!(
                     error.raw_os_error().map(|code| code as u32),
-                    Some(ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION)
+                    Some(
+                        ERROR_NOT_SUPPORTED
+                            | ERROR_INVALID_PARAMETER
+                            | ERROR_INVALID_FUNCTION
+                            | ERROR_ACCESS_DENIED
+                            | ERROR_SHARING_VIOLATION
+                            | ERROR_LOCK_VIOLATION
+                            | ERROR_USER_MAPPED_FILE
+                    )
                 ) =>
             {
-                record(Method::ReplaceFile, &format!("rename unsupported: {error}"));
+                // Unsupported rename APIs, delete-access restrictions, sharing,
+                // locks and mappings can prohibit replacement but permit writing
+                // the existing file. Try ReplaceFileW, then the caller's in-place
+                // rewrite with a recovery copy. Other errors (such as missing
+                // paths or disk/I/O failures) still abort without another method.
+                record(Method::ReplaceFile, &format!("rename failed: {error}"));
             }
             Err(error) => {
                 record(Method::PosixRename, &format!("rename failed: {error}"));
