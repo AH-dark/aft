@@ -3014,6 +3014,14 @@ echo TWO_READS_OK
     }
     assert!(!jail.worktree.join("native-gh.log").exists());
     let trace = std::fs::read_to_string(jail.base.join("daemon.log")).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("gh_shim worker_read:") && line.contains("read=true"))
+            .count(),
+        2,
+        "both reads need their own audit record: {trace}"
+    );
     let task_id = response["structuredContent"]["task_id"]
         .as_str()
         .expect("command task id");
@@ -3452,6 +3460,15 @@ PY
             jail.child.kill().unwrap();
             jail.child.wait().unwrap();
             let replacement = gh_read_jail().await;
+            assert_eq!(
+                Path::new(socket).parent(),
+                Some(aft::sandbox_spawn::managed_task_temp_root()),
+                "restart must reuse the original endpoint namespace"
+            );
+            assert!(
+                !Path::new(socket).exists(),
+                "restart must unlink the SIGKILLed generation's endpoint"
+            );
             assert!(replacement.read_holder.lock().unwrap().calls.is_empty());
         } else {
             tokio::time::timeout(Duration::from_secs(15), async {
@@ -3517,7 +3534,7 @@ echo MALFORMED_BROKER_REPLY_REFUSED
 }
 
 #[tokio::test]
-async fn worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply() {
+async fn worker_gh_read_t10_cancel_midflight_terminates_reader_without_output() {
     assert!(native_available());
     let mut jail = gh_read_jail().await;
     let hold = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -3799,4 +3816,71 @@ async fn gh_shim_router_host_lookup_transport_failures_record_their_stage() {
         );
     }
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn worker_gh_read_revocation_suppresses_reply_to_surviving_observer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    assert!(native_available());
+    let mut jail = gh_read_jail().await;
+    let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+    jail.read_holder.lock().unwrap().hold_reads = Some(hold.clone());
+    let ready = jail.worktree.join("observer-ready");
+    let finish = jail.worktree.join("observer-finish");
+    let corr=jail.submit_held_bash(json!({"command":format!("printf '%s' \"$TMPDIR\" > {}; while ! test -f {}; do sleep .02; done",quote(&ready),quote(&finish)),"timeout":30_000})).await;
+    let temp = wait_test_file(&ready).await;
+    let socket = Path::new(&temp).with_file_name(format!(
+        "{}.gh-read.sock",
+        Path::new(&temp).file_name().unwrap().to_string_lossy()
+    ));
+    let capability = std::fs::read_to_string(Path::new(&temp).join(".gh-read-capability")).unwrap();
+    let mut observer = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let body=serde_json::to_vec(&json!({"capability":capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":""}}}})).unwrap();
+    observer.write_u32(body.len() as u32).await.unwrap();
+    observer.write_all(&body).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while jail.read_holder.lock().unwrap().calls.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("observer read must be forwarded before revocation");
+    std::fs::write(finish, "finish").unwrap();
+    let frame = jail.reply_frame(1, corr).await;
+    let terminal: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(
+        terminal["structuredContent"]["exit_code"], 0,
+        "end the command naturally, not by killing its reader: {terminal}"
+    );
+    hold.notify_one();
+    let received = tokio::time::timeout(Duration::from_secs(5), observer.read_u32())
+        .await
+        .expect("broker must close or refuse a revoked in-flight request");
+    if let Ok(size) = received {
+        assert!(size <= 2_097_152);
+        let mut response = vec![0; size as usize];
+        observer.read_exact(&mut response).await.unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_ne!(
+            response["status"], "ok",
+            "the surviving observer must not receive the held result: {response}"
+        );
+        assert!(!response.to_string().contains("worker-bound-read"));
+    }
+    assert_eq!(jail.read_holder.lock().unwrap().calls.len(), 1);
+}
+
+#[tokio::test]
+async fn worker_gh_read_common_git_config_is_write_denied() {
+    assert!(native_available());
+    let mut jail = gh_read_jail().await;
+    let common = jail.main.join(".git/config");
+    let before = std::fs::read(&common).unwrap();
+    let output=jail.bash(&format!("set -eu; if printf '\\n# forbidden\\n' >> {}; then echo COMMON_CONFIG_WRITABLE; exit 91; fi; if git config --file {} remote.origin.url https://github.com/cortexkit/other.git; then echo COMMON_CONFIG_RETARGETED; exit 92; fi; echo COMMON_CONFIG_DENIED",quote(&common),quote(&common))).await;
+    assert!(output.contains("COMMON_CONFIG_DENIED"), "{output}");
+    assert_eq!(
+        std::fs::read(common).unwrap(),
+        before,
+        "the next ticket's repository source must stay unchanged"
+    );
 }
