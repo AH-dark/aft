@@ -71,7 +71,14 @@ pub struct UrlFetchOptions {
     /// Test hook: observes the temp path immediately before the atomic rename.
     #[doc(hidden)]
     pub atomic_write_observer: Option<Arc<dyn Fn(&Path, &Path) + Send + Sync>>,
+    /// Test hook: answers host name lookups in place of the system resolver,
+    /// so a test can stall or redirect name resolution without a network.
+    #[doc(hidden)]
+    pub lookup_override: Option<HostLookup>,
 }
+
+/// A host name lookup: the host's addresses, or the lookup's error.
+pub type HostLookup = Arc<dyn Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync>;
 
 /// The part of a fetch that was running when its deadline or a stall limit
 /// stopped it.
@@ -213,7 +220,8 @@ pub fn fetch_url_to_cache(
     let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
     let deadline = FetchDeadline::for_current_call();
     let fetch_url = rewrite_url_for_fetch(&parsed);
-    validate_public_url(&fetch_url, &options)?;
+    let approved = Arc::new(ApprovedHosts::default());
+    validate_public_url(&fetch_url, &options, &deadline, &approved)?;
 
     let dir = cache_dir(storage_dir);
     crate::private_storage::open_dir(storage_dir, &dir).map_err(|error| {
@@ -229,7 +237,7 @@ pub fn fetch_url_to_cache(
         return Ok(cached);
     }
 
-    let response = fetch_with_redirects(&fetch_url, url, &options, &deadline)?;
+    let response = fetch_with_redirects(&fetch_url, url, &options, &deadline, approved)?;
     if !response.status().is_success() {
         return Err(UrlFetchError::new(format!(
             "HTTP {} {} fetching {url}",
@@ -584,13 +592,15 @@ fn fetch_with_redirects(
     original_url: &str,
     options: &UrlFetchOptions,
     deadline: &FetchDeadline,
+    approved: Arc<ApprovedHosts>,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let client = build_client(options)?;
+    let progress = Arc::new(ConnectProgress::default());
+    let client = build_client(options, Arc::clone(&approved), Arc::clone(&progress))?;
     let mut current_url = start_url.clone();
 
     for redirect_count in 0..=MAX_REDIRECTS {
-        validate_public_url(&current_url, options)?;
-        let response = send_with_transient_retries(&client, &current_url, deadline)?;
+        validate_public_url(&current_url, options, deadline, &approved)?;
+        let response = send_with_transient_retries(&client, &current_url, deadline, &progress)?;
 
         if !response.status().is_redirection() {
             return Ok(response);
@@ -640,6 +650,7 @@ fn send_with_transient_retries(
     client: &Client,
     target: &Url,
     deadline: &FetchDeadline,
+    progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
     let mut attempt = 0;
     loop {
@@ -649,6 +660,7 @@ fn send_with_transient_retries(
         }
         // A per-request timeout replaces reqwest's default 30 s, which would
         // otherwise let one silent server hold each attempt for 30 s.
+        progress.begin_attempt();
         let result = client
             .get(target.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
@@ -672,7 +684,7 @@ fn send_with_transient_retries(
             continue;
         }
         if error.is_timeout() {
-            return Err(request_timeout_error(&error, deadline, target));
+            return Err(request_timeout_error(&error, deadline, target, progress));
         }
         return Err(UrlFetchError::new(format!(
             "Failed to fetch {}: {}",
@@ -682,15 +694,19 @@ fn send_with_transient_retries(
     }
 }
 
-/// Name the phase a timed-out request was in. reqwest marks a timeout that
-/// stopped connection setup as a connect error; any other request timeout
-/// fired while waiting for the response headers.
+/// Name the phase a timed-out request was in. A lookup still running in the
+/// resolver means the name lookup; reqwest marks a timeout that stopped
+/// connection setup as a connect error; any other request timeout fired
+/// while waiting for the response headers.
 fn request_timeout_error(
     error: &reqwest::Error,
     deadline: &FetchDeadline,
     target: &Url,
+    progress: &ConnectProgress,
 ) -> UrlFetchError {
-    let phase = if error.is_connect() {
+    let phase = if progress.lookup_pending() {
+        FetchPhase::Dns
+    } else if error.is_connect() {
         FetchPhase::Connect
     } else {
         FetchPhase::Headers
@@ -722,14 +738,21 @@ fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout() || error.is_request()
 }
 
-fn build_client(options: &UrlFetchOptions) -> Result<Client, UrlFetchError> {
-    let mut builder = Client::builder()
+fn build_client(
+    options: &UrlFetchOptions,
+    approved: Arc<ApprovedHosts>,
+    progress: Arc<ConnectProgress>,
+) -> Result<Client, UrlFetchError> {
+    let resolver = GuardedResolver {
+        approved,
+        connect_overrides: options.connect_overrides.clone(),
+        lookup_override: options.lookup_override.clone(),
+        progress,
+    };
+    let builder = Client::builder()
         .redirect(Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT);
-
-    for (host, address) in &options.connect_overrides {
-        builder = builder.resolve(host, *address);
-    }
+        .connect_timeout(CONNECT_TIMEOUT)
+        .dns_resolver(Arc::new(resolver));
 
     let tls_config = crate::platform_tls::client_config().map_err(|error| {
         UrlFetchError::new(format!("Failed to configure URL fetch TLS: {error}"))
@@ -741,7 +764,151 @@ fn build_client(options: &UrlFetchOptions) -> Result<Client, UrlFetchError> {
         .map_err(|error| UrlFetchError::new(format!("Failed to build URL fetch client: {error}")))
 }
 
-fn validate_public_url(url: &Url, options: &UrlFetchOptions) -> Result<(), UrlFetchError> {
+/// Host names the SSRF check resolved and approved during one fetch, with
+/// the addresses it approved. The resolver hands reqwest exactly these, so
+/// the connection cannot reach an address that a second lookup returned (a
+/// DNS-rebinding answer), and a redirect back to the same host needs no new
+/// lookup.
+#[derive(Default)]
+struct ApprovedHosts(std::sync::Mutex<HashMap<String, Vec<IpAddr>>>);
+
+impl ApprovedHosts {
+    fn get(&self, host: &str) -> Option<Vec<IpAddr>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(host)
+            .cloned()
+    }
+
+    fn insert(&self, host: &str, addresses: Vec<IpAddr>) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(host.to_string(), addresses);
+    }
+}
+
+/// Connection-setup progress of the current request attempt, read when the
+/// request times out to name the phase it was in. A step that a timeout
+/// abandoned never reports its end, so each attempt starts from a clean
+/// state and a step reports its end only to the attempt that started it.
+#[derive(Default)]
+struct ConnectProgress(std::sync::Mutex<AttemptProgress>);
+
+#[derive(Default)]
+struct AttemptProgress {
+    attempt: u64,
+    lookup_pending: bool,
+}
+
+impl ConnectProgress {
+    fn state(&self) -> std::sync::MutexGuard<'_, AttemptProgress> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_attempt(&self) {
+        let mut state = self.state();
+        state.attempt += 1;
+        state.lookup_pending = false;
+    }
+
+    /// Returns the attempt the lookup belongs to.
+    fn lookup_started(&self) -> u64 {
+        let mut state = self.state();
+        state.lookup_pending = true;
+        state.attempt
+    }
+
+    fn lookup_answered(&self, attempt: u64) {
+        let mut state = self.state();
+        if state.attempt == attempt {
+            state.lookup_pending = false;
+        }
+    }
+
+    fn lookup_pending(&self) -> bool {
+        self.state().lookup_pending
+    }
+}
+
+/// The resolver reqwest uses for every connection of a fetch.
+///
+/// A host the SSRF check approved gets exactly the approved addresses. Any
+/// other host is looked up here without the SSRF check: that is a proxy host,
+/// or any host when private addresses are allowed. The lookup runs on its own
+/// thread so the request's timeout can abandon it; the request timeout is the
+/// fetch deadline, so the name lookup cannot outlive the fetch.
+struct GuardedResolver {
+    approved: Arc<ApprovedHosts>,
+    connect_overrides: Vec<(String, SocketAddr)>,
+    lookup_override: Option<HostLookup>,
+    progress: Arc<ConnectProgress>,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        // Port 0 tells reqwest to use the URL's port.
+        let ready = |addresses: Vec<SocketAddr>| -> reqwest::dns::Resolving {
+            Box::pin(std::future::ready(Ok(
+                Box::new(addresses.into_iter()) as reqwest::dns::Addrs
+            )))
+        };
+        if let Some((_, address)) = self
+            .connect_overrides
+            .iter()
+            .find(|(override_host, _)| *override_host == host)
+        {
+            return ready(vec![*address]);
+        }
+        if let Some(addresses) = self.approved.get(&host) {
+            return ready(
+                addresses
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect(),
+            );
+        }
+        let progress = Arc::clone(&self.progress);
+        let attempt = progress.lookup_started();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let lookup = self.lookup_override.clone();
+        thread::spawn(move || {
+            let _ = sender.send(lookup_host(&host, lookup.as_ref()));
+        });
+        Box::pin(async move {
+            let answer: Result<io::Result<Vec<IpAddr>>, _> = receiver.await;
+            progress.lookup_answered(attempt);
+            let addresses = answer
+                .unwrap_or_else(|_| Err(io::Error::other("host lookup stopped before answering")))
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
+            Ok(
+                Box::new(addresses.into_iter().map(|ip| SocketAddr::new(ip, 0)))
+                    as reqwest::dns::Addrs,
+            )
+        })
+    }
+}
+
+fn lookup_host(host: &str, lookup_override: Option<&HostLookup>) -> io::Result<Vec<IpAddr>> {
+    if let Some(lookup) = lookup_override {
+        return lookup(host);
+    }
+    Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
+}
+
+/// Refuse a URL that is not http(s) or that points at a private address.
+/// A host name is resolved under the fetch deadline and its approved
+/// addresses are recorded in `approved` for the resolver.
+fn validate_public_url(
+    url: &Url,
+    options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
+    approved: &ApprovedHosts,
+) -> Result<(), UrlFetchError> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(UrlFetchError::new(format!(
             "Only http:// and https:// URLs are supported, got: {}:",
@@ -770,29 +937,30 @@ fn validate_public_url(url: &Url, options: &UrlFetchOptions) -> Result<(), UrlFe
             "Blocked private URL host {host} ({host_for_parse})"
         )));
     }
+    if approved.get(host_for_parse).is_some() {
+        return Ok(());
+    }
 
-    let addresses = resolve_host_ips(host_for_parse, url.port_or_known_default(), options)?;
+    let addresses = resolve_host_ips(host_for_parse, url.as_str(), options, deadline)?;
     if addresses.is_empty() {
         return Err(UrlFetchError::new(format!(
             "Failed to resolve URL host {host}"
         )));
     }
-    for ip in addresses {
-        reject_private_ip(host, ip)?;
+    for ip in &addresses {
+        reject_private_ip(host, *ip)?;
     }
-
-    // We validate all resolved addresses before issuing the request. Reqwest's
-    // default resolver runs again during TCP connect, leaving the same small
-    // DNS-rebinding window the old Bun fallback accepted. A custom per-request
-    // resolver hook would close that window but adds complexity for marginal
-    // value in this opt-in agent-tooling surface.
+    approved.insert(host_for_parse, addresses);
     Ok(())
 }
 
+/// Resolve `host` on a helper thread and wait for it no longer than the
+/// fetch deadline; the system resolver itself has no timeout.
 fn resolve_host_ips(
     host: &str,
-    port: Option<u16>,
+    url: &str,
     options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
 ) -> Result<Vec<IpAddr>, UrlFetchError> {
     if let Some((_, ips)) = options
         .public_host_overrides
@@ -802,11 +970,26 @@ fn resolve_host_ips(
         return Ok(ips.clone());
     }
 
-    let port = port.unwrap_or(80);
-    let addrs = (host, port).to_socket_addrs().map_err(|error| {
-        UrlFetchError::new(format!("Failed to resolve URL host {host}: {error}"))
-    })?;
-    Ok(addrs.map(|addr| addr.ip()).collect())
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Err(deadline.timeout_error(FetchPhase::Dns, url));
+    }
+    let (sender, receiver) = mpsc::channel();
+    let owned_host = host.to_string();
+    let lookup = options.lookup_override.clone();
+    thread::spawn(move || {
+        let _ = sender.send(lookup_host(&owned_host, lookup.as_ref()));
+    });
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(error)) => Err(UrlFetchError::new(format!(
+            "Failed to resolve URL host {host}: {error}"
+        ))),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(deadline.timeout_error(FetchPhase::Dns, url)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(UrlFetchError::new(format!(
+            "Failed to resolve URL host {host}: lookup stopped before answering"
+        ))),
+    }
 }
 
 fn reject_private_ip(host: &str, ip: IpAddr) -> Result<(), UrlFetchError> {

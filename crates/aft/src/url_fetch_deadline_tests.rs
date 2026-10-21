@@ -220,3 +220,113 @@ fn outline_reports_the_typed_timeout_and_its_phase() {
     assert_eq!(response.data["phase"], "headers", "{:?}", response.data);
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+fn stalled_lookup() -> HostLookup {
+    Arc::new(|_host: &str| {
+        thread::sleep(SERVER_STALL);
+        Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    })
+}
+
+#[test]
+fn stalled_name_lookup_times_out_in_the_dns_phase_before_the_ssrf_check_answers() {
+    let storage = tempfile::tempdir().unwrap();
+    let options = UrlFetchOptions {
+        lookup_override: Some(stalled_lookup()),
+        ..UrlFetchOptions::default()
+    };
+    let (result, elapsed) = fetch_within(
+        Duration::from_secs(3),
+        "http://slow-dns.test/doc.md",
+        storage.path(),
+        options,
+    );
+    let error = result.expect_err("a lookup that never answers must fail");
+    assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+    assert_eq!(error.phase(), Some(FetchPhase::Dns), "{error}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[test]
+fn stalled_name_lookup_inside_the_connection_times_out_in_the_dns_phase() {
+    // With private addresses allowed there is no SSRF lookup first, so the
+    // connection's own lookup is the one that stalls.
+    let storage = tempfile::tempdir().unwrap();
+    let options = UrlFetchOptions {
+        allow_private: true,
+        lookup_override: Some(stalled_lookup()),
+        ..UrlFetchOptions::default()
+    };
+    let (result, elapsed) = fetch_within(
+        Duration::from_secs(3),
+        "http://slow-dns.test/doc.md",
+        storage.path(),
+        options,
+    );
+    let error = result.expect_err("a lookup that never answers must fail");
+    assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+    assert_eq!(error.phase(), Some(FetchPhase::Dns), "{error}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[test]
+fn host_resolving_to_a_private_address_is_refused() {
+    let storage = tempfile::tempdir().unwrap();
+    let options = UrlFetchOptions {
+        lookup_override: Some(Arc::new(|_host: &str| {
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))])
+        })),
+        ..UrlFetchOptions::default()
+    };
+    let (result, _) = fetch_within(
+        Duration::from_secs(3),
+        "http://intranet.test/doc.md",
+        storage.path(),
+        options,
+    );
+    let error = result.expect_err("a private answer must be refused");
+    assert!(
+        error.to_string().contains("Blocked private URL host"),
+        "{error}"
+    );
+}
+
+#[test]
+fn connection_uses_the_addresses_the_ssrf_check_approved_without_a_second_lookup() {
+    // The first answer is public; any later answer is loopback, as a
+    // DNS-rebinding server would reply. The connection must get the first.
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&lookups);
+    let approved_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+    let options = UrlFetchOptions {
+        lookup_override: Some(Arc::new(move |_host: &str| {
+            let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+            Ok(vec![if first {
+                approved_ip
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            }])
+        })),
+        ..UrlFetchOptions::default()
+    };
+    let deadline = FetchDeadline::for_current_call();
+    let approved = Arc::new(ApprovedHosts::default());
+    let target = Url::parse("http://rebind.test/doc.md").unwrap();
+    validate_public_url(&target, &options, &deadline, &approved).expect("public answer");
+
+    let resolver = GuardedResolver {
+        approved,
+        connect_overrides: Vec::new(),
+        lookup_override: options.lookup_override.clone(),
+        progress: Arc::new(ConnectProgress::default()),
+    };
+    let name: reqwest::dns::Name = "rebind.test".parse().unwrap();
+    let addresses: Vec<SocketAddr> = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(reqwest::dns::Resolve::resolve(&resolver, name))
+        .expect("approved host resolves")
+        .collect();
+    assert_eq!(addresses, vec![SocketAddr::new(approved_ip, 0)]);
+    assert_eq!(lookups.load(Ordering::SeqCst), 1, "no second lookup");
+}
