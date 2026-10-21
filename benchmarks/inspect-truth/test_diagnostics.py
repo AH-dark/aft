@@ -79,10 +79,15 @@ class DiagnosticsComparisonTests(unittest.TestCase):
         no_summary = {"repo": "x", "languages": languages,
                       "project_diagnostics": {"success": True, "complete": True}}
         self.assertTrue(diagnostics.capture_incomplete(no_summary))
+        # The server's real shape: a complete summary has no "complete" key.
         complete = {"repo": "x", "languages": languages,
-                    "project_diagnostics": {"success": True, "complete": True,
-                                            "summary": {"diagnostics": {"complete": True}}}}
+                    "project_diagnostics": {"success": True, "summary": {"diagnostics": {
+                        "errors": 0, "warnings": 2, "by_producer": {}, "gaps": []}}}}
         self.assertFalse(diagnostics.capture_incomplete(complete))
+        partial = {"repo": "x", "languages": languages,
+                   "project_diagnostics": {"success": True, "complete": False, "summary": {
+                       "diagnostics": {"complete": False, "gaps": [{"producer": "rust"}]}}}}
+        self.assertTrue(diagnostics.capture_incomplete(partial))
 
 
 if __name__ == "__main__":

@@ -229,8 +229,10 @@ def capture_incomplete(record: dict) -> bool:
         return True
     if project.get("complete") is False:
         return True
+    # The server writes summary.diagnostics.complete only as false; a complete
+    # summary omits the flag. A missing summary still fails the gate.
     summary = (project.get("summary") or {}).get("diagnostics")
-    if not isinstance(summary, dict) or summary.get("complete") is not True:
+    if not isinstance(summary, dict) or summary.get("complete") is False:
         return True
     return any(value["comparison"]["status"] == "unknown"
                for value in record.get("languages", {}).values())
