@@ -721,8 +721,7 @@ impl FamilyStore {
         max_pages: u64,
     ) -> StoreResult<super::reclaim::ReclaimReport> {
         let connection = lock(&self.inner.connection);
-        let mut report =
-            super::reclaim::reclaim_all_free_pages(&connection, deadline, max_pages)?;
+        let mut report = super::reclaim::reclaim_all_free_pages(&connection, deadline, max_pages)?;
         checkpoint_after_reclaim(&self.inner, &connection, &mut report)?;
         Ok(report)
     }
