@@ -14,6 +14,10 @@ pub(crate) struct Scope {
     /// When the earliest capability claimed for this dispatch was first
     /// approved. Renewed continuations never outlive [`MAX_CHAIN`] from it.
     first_approved: Option<Instant>,
+    /// Capabilities this dispatch presented whose tokens had expired. A new
+    /// ask for one of them says so, so the host knows the user answered too
+    /// late rather than the approval being refused.
+    expired: Vec<AccessGrant>,
 }
 
 impl Scope {
@@ -31,7 +35,16 @@ impl Scope {
             session: session.into(),
             tool: String::new(),
             first_approved: None,
+            expired: Vec::new(),
         }
+    }
+
+    /// Whether this dispatch presented an expired token for `grant`'s
+    /// operation on the same path.
+    pub(crate) fn presented_expired(&self, grant: &AccessGrant) -> bool {
+        self.expired
+            .iter()
+            .any(|expired| expired.operation == grant.operation && expired.path == grant.path)
     }
 }
 
@@ -75,6 +88,13 @@ struct Issued {
 static TOKENS: LazyLock<Mutex<HashMap<String, Issued>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 const TTL: Duration = Duration::from_secs(5 * 60);
+/// How long an expired token is still recognised as expired (and not as an
+/// unknown token) when it is presented. It never authorizes anything.
+const EXPIRED_GRACE: Duration = Duration::from_secs(60 * 60);
+
+fn retained(token: &Issued, now: Instant) -> bool {
+    token.expires + EXPIRED_GRACE > now && token.scope.route.strong_count() > 0
+}
 /// How long one approval can be carried forward by preview-to-apply
 /// continuations. Past this, the host must ask the user again.
 pub(crate) const MAX_CHAIN: Duration = Duration::from_secs(30 * 60);
@@ -90,8 +110,8 @@ fn issue_until(
     origin: Option<Instant>,
 ) -> String {
     let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
-    tokens
-        .retain(|_, token| token.expires > Instant::now() && token.scope.route.strong_count() > 0);
+    let now = Instant::now();
+    tokens.retain(|_, token| retained(token, now));
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).expect("operating system random source for plugin approval tokens");
     let id = format!(
@@ -116,15 +136,21 @@ fn issue_until(
 /// Claim at admission, once per dispatch. Repeated path checks within that
 /// dispatch share the claimed capability, but replaying the token cannot.
 /// The scope records the earliest first-approval time among the claimed
-/// tokens, which bounds any continuation issued for this dispatch.
+/// tokens, which bounds any continuation issued for this dispatch. An
+/// expired token authorizes nothing; it is consumed and its capability is
+/// remembered on the scope so the next ask for it can say it expired.
 pub(crate) fn claim(scope: &mut Scope, ids: &[String]) -> Vec<AccessGrant> {
     let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    tokens.retain(|_, token| token.expires > now && token.scope.route.strong_count() > 0);
+    tokens.retain(|_, token| retained(token, now));
     let mut grants = Vec::new();
     for id in ids {
         if tokens.get(id).is_some_and(|token| token.scope == *scope) {
             if let Some(token) = tokens.remove(id) {
+                if token.expires <= now {
+                    scope.expired.push(token.grant);
+                    continue;
+                }
                 let origin = token.origin.unwrap_or(now);
                 scope.first_approved = Some(
                     scope
@@ -158,10 +184,49 @@ fn continuation_at(scope: &Scope, grants: &[AccessGrant], now: Instant) -> Vec<S
         .collect()
 }
 
+/// Make an issued token expire now, to test what a late approval does.
+#[cfg(test)]
+pub(crate) fn expire_for_test(id: &str) {
+    if let Some(token) = TOKENS.lock().unwrap().get_mut(id) {
+        token.expires = Instant::now() - Duration::from_secs(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::access_policy::{AccessOperation, GrantKind};
+
+    /// An expired token authorizes nothing and is used up, but the dispatch
+    /// that presented it knows it expired. An unknown or foreign token says
+    /// nothing about expiry.
+    #[test]
+    fn plugin_expired_tokens_are_remembered_not_honoured() {
+        let owner = Arc::new(());
+        let fresh = || Scope::new(&owner, "session").for_tool("read", &serde_json::Value::Null);
+        let grant = AccessGrant {
+            path: "/outside/late".into(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let token = issue(&fresh(), &grant);
+        expire_for_test(&token);
+        // Other dispatches issue and claim meanwhile; the expired token stays
+        // recognisable within the grace period.
+        let _ = issue(&fresh(), &grant);
+        let mut late = fresh();
+        assert!(claim(&mut late, std::slice::from_ref(&token)).is_empty());
+        assert!(late.presented_expired(&grant));
+        let mut replayed = fresh();
+        assert!(claim(&mut replayed, &[token]).is_empty());
+        assert!(
+            !replayed.presented_expired(&grant),
+            "the expired token is used up"
+        );
+        let mut unknown = fresh();
+        assert!(claim(&mut unknown, &["outside:unknown".to_string()]).is_empty());
+        assert!(!unknown.presented_expired(&grant));
+    }
 
     #[test]
     fn plugin_tokens_bind_route_session_and_expiry_and_are_single_use() {

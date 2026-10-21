@@ -275,6 +275,10 @@ export function withHostPermissionGrants(args: Record<string, unknown>, grants: 
  * the final run; this is far above any real batch. */
 export const MAX_OUTSIDE_PERMISSION_ROUNDS = 256;
 
+/** How many times one operation and path may be asked again because the
+ * user's approval arrived after its token expired. */
+export const MAX_EXPIRED_REASKS_PER_PATH = 2;
+
 /** The engine owns containment; Pi only presents its exact outside-path asks. */
 export async function withOutsidePermissions<T extends Record<string, unknown>>(
   args: Record<string, unknown>,
@@ -295,6 +299,9 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   // retrying while each round approves something new; the engine asking
   // again for something already approved means retrying cannot finish.
   const approvedThisCall = new Set<string>();
+  // Re-asks the engine marked `approval_expired`, per operation and path:
+  // the user said yes after the token expired, so asking again is progress.
+  const expiredReasks = new Map<string, number>();
   for (let round = 0; ; round++) {
     // Before every send, including an approved retry: a call cancelled
     // while it waited for an answer must not run.
@@ -319,7 +326,13 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       return response;
     }
     const asks = response.asks as
-      | Array<{ kind: string; grant_id?: string; path?: string; operation?: string }>
+      | Array<{
+          kind: string;
+          grant_id?: string;
+          path?: string;
+          operation?: string;
+          reason?: string;
+        }>
       | undefined;
     if (
       !asks?.length ||
@@ -342,12 +355,24 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       ask.path === undefined
         ? JSON.stringify(["grant", ask.grant_id])
         : JSON.stringify([ask.operation ?? "", ask.path]);
-    const repeated = asks.find((ask) => approvedThisCall.has(askKey(ask)));
-    if (repeated)
-      throw new BridgeError(
-        `outside access to ${repeated.path ?? "an outside path"} was refused again after it was approved`,
-        "outside_permission_stalled",
-      );
+    for (const ask of asks) {
+      const key = askKey(ask);
+      if (!approvedThisCall.has(key)) continue;
+      const where = ask.path ?? "an outside path";
+      // An approval the engine refuses for any other reason cannot finish.
+      if (ask.reason !== "approval_expired")
+        throw new BridgeError(
+          `outside access to ${where} was refused again after it was approved`,
+          "outside_permission_stalled",
+        );
+      const reasked = expiredReasks.get(key) ?? 0;
+      if (reasked >= MAX_EXPIRED_REASKS_PER_PATH)
+        throw new BridgeError(
+          `outside access to ${where} kept expiring before it was approved`,
+          "outside_permission_stalled",
+        );
+      expiredReasks.set(key, reasked + 1);
+    }
     for (const ask of asks) {
       throwIfCancelled(signals);
       const approved = await extCtx.ui.confirm(

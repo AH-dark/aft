@@ -14611,6 +14611,18 @@ impl AppContext {
             } else {
                 identity.parent().unwrap_or(identity).join("*")
             };
+            let mut ask = serde_json::json!({
+                "kind": "external_directory", "patterns": [pattern], "always": [pattern],
+                "grant_id": id, "path": identity, "operation": operation,
+                "parentDir": if is_dir { identity } else { identity.parent().unwrap_or(identity) },
+            });
+            // The host sent an approval for this exact operation and path,
+            // but its token had expired (the prompt stayed open too long).
+            // Saying so lets the host ask again instead of treating the
+            // repeated ask as an approval the engine refused.
+            if scope.presented_expired(&grant) {
+                ask["reason"] = serde_json::json!("approval_expired");
+            }
             return Err(crate::protocol::Response::error_with_data(
                 req_id,
                 crate::protocol::ERROR_PERMISSION_REQUIRED,
@@ -14618,11 +14630,7 @@ impl AppContext {
                     "path '{}' needs outside-access permission",
                     original.display()
                 ),
-                serde_json::json!({"asks": [{
-                    "kind": "external_directory", "patterns": [pattern], "always": [pattern],
-                    "grant_id": id, "path": identity, "operation": operation,
-                    "parentDir": if is_dir { identity } else { identity.parent().unwrap_or(identity) },
-                }]}),
+                serde_json::json!({"asks": [ask]}),
             ));
         }
         Err(crate::protocol::Response::error_with_data(

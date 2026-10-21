@@ -45,6 +45,10 @@ export function withHostPermissionGrants(args: Record<string, unknown>, grants: 
  * the final run; this is far above any real batch. */
 export const MAX_OUTSIDE_PERMISSION_ROUNDS = 256;
 
+/** How many times one operation and path may be asked again because the
+ * user's approval arrived after its token expired. */
+export const MAX_EXPIRED_REASKS_PER_PATH = 2;
+
 /** The engine asked again for outside access that was already approved in
  * this call, or the ceiling was reached: retrying would not make progress. */
 export class OutsidePermissionStalled extends Error {
@@ -96,6 +100,9 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   // retrying while each round approves something new; the engine asking
   // again for something already approved means retrying cannot finish.
   const approvedThisCall = new Set<string>();
+  // Re-asks the engine marked `approval_expired`, per operation and path:
+  // the user said yes after the token expired, so asking again is progress.
+  const expiredReasks = new Map<string, number>();
   for (let round = 0; ; round++) {
     // Before an approved retry: a call cancelled while it waited for an
     // answer must not run.
@@ -128,6 +135,7 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
           path?: string;
           parentDir?: string;
           operation?: string;
+          reason?: string;
         }>
       | undefined;
     if (
@@ -149,11 +157,22 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       ask.path === undefined
         ? JSON.stringify(["grant", ask.grant_id])
         : JSON.stringify([ask.operation ?? "", ask.path]);
-    const repeated = asks.find((ask) => approvedThisCall.has(askKey(ask)));
-    if (repeated)
-      throw new OutsidePermissionStalled(
-        `outside access to ${repeated.path ?? repeated.parentDir ?? "an outside path"} was refused again after it was approved`,
-      );
+    for (const ask of asks) {
+      const key = askKey(ask);
+      if (!approvedThisCall.has(key)) continue;
+      const where = ask.path ?? ask.parentDir ?? "an outside path";
+      // An approval the engine refuses for any other reason cannot finish.
+      if (ask.reason !== "approval_expired")
+        throw new OutsidePermissionStalled(
+          `outside access to ${where} was refused again after it was approved`,
+        );
+      const reasked = expiredReasks.get(key) ?? 0;
+      if (reasked >= MAX_EXPIRED_REASKS_PER_PATH)
+        throw new OutsidePermissionStalled(
+          `outside access to ${where} kept expiring before it was approved`,
+        );
+      expiredReasks.set(key, reasked + 1);
+    }
     for (const ask of asks) {
       throwIfCancelled();
       try {

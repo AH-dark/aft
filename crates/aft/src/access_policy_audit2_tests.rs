@@ -1764,3 +1764,46 @@ fn audit8_native_tool_call_strips_approvals_from_other_tools() {
         );
     }
 }
+
+/// A host that approved an outside read after the token expired gets a new
+/// ask for that read marked `approval_expired`; an ordinary ask carries no
+/// reason.
+#[test]
+fn audit9_ask_after_an_expired_approval_says_so() {
+    let f = Fixture::new();
+    let target = f.outside.join("late.txt");
+    std::fs::write(&target, "late").unwrap();
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("read", &Value::Null);
+    let ask_for = |scope: plugin::Scope, once: Vec<AccessGrant>| {
+        let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+        f.ctx
+            .validate_read_path("audit9", "audit-session", &target)
+            .unwrap_err()
+    };
+    let first = ask_for(scope.clone(), Vec::new());
+    assert_eq!(
+        first.data["code"], "permission_required",
+        "{:?}",
+        first.data
+    );
+    assert!(
+        first.data["asks"][0].get("reason").is_none(),
+        "{:?}",
+        first.data
+    );
+    let token = first.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    plugin::expire_for_test(&token);
+    let mut late = scope.clone();
+    let once = plugin::claim(&mut late, &[token]);
+    assert!(once.is_empty());
+    let again = ask_for(late, once);
+    assert_eq!(
+        again.data["code"], "permission_required",
+        "{:?}",
+        again.data
+    );
+    assert_eq!(again.data["asks"][0]["reason"], "approval_expired");
+}

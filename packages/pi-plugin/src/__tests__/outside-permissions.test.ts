@@ -286,3 +286,66 @@ describe("outside-access batches", () => {
     expect(engine.sends).toHaveLength(2);
   });
 });
+
+/**
+ * A scripted engine for one outside path whose first `expiries` approvals
+ * arrive after their token expired: each such retry is asked again, marked
+ * `approval_expired`, as the engine does.
+ */
+function expiringEngine(expiries: number, reason: string | null = "approval_expired") {
+  const sends: Array<Record<string, unknown>> = [];
+  let issued = 0;
+  const send = async (args: Record<string, unknown>) => {
+    sends.push(structuredClone(args));
+    const granted = (args.permissions_granted as string[] | undefined) ?? [];
+    const latest = `outside:late-${issued}`;
+    if (granted.includes(latest) && issued >= expiries)
+      return { success: true, text: "written" } as Record<string, unknown>;
+    const presented = granted.includes(latest);
+    if (presented) issued++;
+    return {
+      success: false,
+      code: "permission_required",
+      asks: [
+        {
+          kind: "external_directory",
+          grant_id: `outside:late-${issued}`,
+          path: "/outside/late",
+          operation: "write",
+          ...(presented && reason ? { reason } : {}),
+        },
+      ],
+    } as Record<string, unknown>;
+  };
+  return { send, sends };
+}
+
+describe("outside-access approvals that expire", () => {
+  test("an approval that arrives after its token expired is asked once more", async () => {
+    const engine = expiringEngine(1);
+    const confirm = mock(async () => true);
+    const result = await withOutsidePermissions({}, context(confirm), engine.send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(engine.sends).toHaveLength(3);
+  });
+
+  test("an approval refused again without expiry still stalls", async () => {
+    const engine = expiringEngine(1, null);
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  test("a path that keeps expiring stops at the re-ask limit", async () => {
+    const engine = expiringEngine(10);
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(engine.sends).toHaveLength(4);
+  });
+});
