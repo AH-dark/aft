@@ -262,8 +262,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           // Directory results are held until every contributing file is authorized.
           // Exclusions can reveal more rows under the output budget, so check each render.
           // File outlines are checked too: the targets were authorized under their
-          // requested spelling, and the manifest names each file at its real
-          // location, which differs when the request goes through a symlink.
+          // requested spelling, and the manifest names each file after resolving
+          // symlinks (spelled with the configured project root when the file is
+          // under it), which differs when the request goes through a symlink.
           // GitHub targets carry no manifest because they read no local file.
           const contentFiles = response.content_files;
           if (!directoryOutline && contentFiles === undefined) return withDenials(response.text);

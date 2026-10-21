@@ -436,9 +436,11 @@ fn excluded_read_paths(req: &RawRequest, ctx: &AppContext) -> HashSet<PathBuf> {
     excluded
 }
 
-/// Read manifests name each file at its real location, so a host excludes that
-/// spelling. A walk through a symlinked directory reaches the same file under
-/// another spelling, which must be excluded too.
+/// Read manifests spell a file beneath the project root with the configured
+/// root, after resolving symlinks, so a host's exclusion names that resolved
+/// file. A walk through a symlinked directory reaches the same file under
+/// another spelling, so exclusions must also match the walked file's canonical
+/// path.
 fn is_read_excluded(excluded: &HashSet<PathBuf>, path: &Path) -> bool {
     if excluded.is_empty() {
         return false;
