@@ -27,8 +27,8 @@ pub const SKIPPED_PATH_SAMPLE_CAP: usize = 5;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SkipReason {
     /// The file is in a call-graph language but is not valid UTF-8, so the
-    /// parser cannot read it. It is published with an empty call graph, the
-    /// way the legacy call graph leaves such files out.
+    /// parser cannot read it. It is published with an empty call graph; the
+    /// call graph built without views also leaves such files out.
     NonUtf8Source,
 }
 

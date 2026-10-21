@@ -1492,8 +1492,9 @@ fn missing_callgraph_payload(
     } else {
         // A source that is not valid UTF-8 cannot be parsed. Failing here
         // would fail the whole publication, so it gets the call graph of an
-        // empty file instead: no symbols, like the legacy call graph, which
-        // leaves unreadable files out. Assembly records the path as skipped.
+        // empty file instead: no symbols, as the call graph built without
+        // views leaves unreadable files out. Assembly records the path as
+        // skipped.
         CallgraphBlob::extract(
             std::str::from_utf8(source).unwrap_or(""),
             language,

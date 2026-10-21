@@ -11548,7 +11548,7 @@ mod tests {
     /// Every HEAD path a first views-on configure schedules must leave the
     /// pending ledger once the publication finishes, including paths the
     /// publication does not make view members: tracked files deleted from the
-    /// checkout (the search-quality evidence copy drops HEAD's binary assets),
+    /// checkout (binary assets here, as a copy of a tree can leave them out),
     /// tracked files the project content rules exclude, and tracked symlinks
     /// deleted from the checkout. A path left pending here is never revisited,
     /// so status would report it pending for the life of the view.
