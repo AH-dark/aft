@@ -766,6 +766,34 @@ mod tests {
         );
     }
 
+    /// A consumer may select `write` without `edit`, so the manifest's write
+    /// description cannot send it to the `edit` tool; nor may grep's send it to
+    /// `read`. The rest of each description stays.
+    #[test]
+    fn manifest_descriptions_do_not_send_a_lone_tool_to_its_siblings() {
+        let write = manifest_tool_description("write").unwrap();
+        assert!(!write.contains("`edit`"), "{write}");
+        assert!(
+            write.contains("Use it to create files or replace whole contents. Write very large"),
+            "{write}"
+        );
+        let grep = manifest_tool_description("grep").unwrap();
+        assert!(!grep.contains("`read`"), "{grep}");
+        assert!(grep.contains("Always case-sensitive."), "{grep}");
+        let edit = manifest_tool_description("edit").unwrap();
+        assert!(!edit.contains("`write` tool"), "{edit}");
+        assert!(
+            edit.contains("`edit` requires an explicit edit mode"),
+            "{edit}"
+        );
+        // A self reference stays.
+        let apply_patch = manifest_tool_description("apply_patch").unwrap();
+        assert!(
+            apply_patch.starts_with("Use the `apply_patch` tool to edit files."),
+            "{apply_patch}"
+        );
+    }
+
     /// A session starter finds tool providers by this catalog field, so a
     /// manifest without it leaves every worker without a plan or preset.
     #[test]

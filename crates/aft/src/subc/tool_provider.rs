@@ -579,6 +579,18 @@ pub(super) fn catalog_for_confined_request(
 /// (or `aft_outline` on a confined route), and may leave some out.
 const TOOL_REFERENCE_PREFIX: &str = "aft_";
 
+/// The phrases a description uses to name a tool by its bare name, as
+/// (text before the name, text after it): "the `edit` tool", "the grep tool",
+/// "use `read` for that". A bare name anywhere else is not a tool reference:
+/// `callgraph` is also one of zoom's arguments, and "read" and "edit" are
+/// ordinary words.
+const BARE_TOOL_REFERENCE_FORMS: [(&str, &str); 4] = [
+    ("the `", "` tool"),
+    ("the ", " tool"),
+    ("use `", "`"),
+    ("Use `", "`"),
+];
+
 /// Rewrites every served description for the tool set this catalog serves.
 /// A reference to a served tool takes the name the tool is served under. A
 /// reference to a tool this catalog does not serve (the preset leaves it out,
@@ -590,14 +602,12 @@ fn render_tool_references(tools: &mut [CatalogTool]) {
     let served: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
     for tool in tools.iter_mut() {
         if let Some(description) = tool.description.as_mut() {
-            if description.contains(TOOL_REFERENCE_PREFIX) {
-                *description = resolve_tool_references(description, &served);
-            }
+            *description = resolve_tool_references(description, &served);
         }
     }
 }
 
-/// One `aft_<name>` reference to an AFT tool, as a byte range of the text.
+/// One reference to an AFT tool: the byte range of its name in the text.
 struct ToolReference {
     start: usize,
     end: usize,
@@ -606,16 +616,43 @@ struct ToolReference {
     served: Option<String>,
 }
 
-/// Every reference in `text` to a tool AFT defines. `aft_` followed by any
-/// other name is ordinary text and is left alone.
+/// Whether `at` begins a word in `text`.
+fn starts_word(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Every reference in `text` to a tool AFT defines, in text order: an
+/// `aft_<name>` spelling, or a bare name in one of
+/// [`BARE_TOOL_REFERENCE_FORMS`]. `aft_` followed by any other name is
+/// ordinary text and is left alone.
 fn tool_references(text: &str, served: &[String]) -> Vec<ToolReference> {
     let mut found = Vec::new();
+    for (name, _, _) in METADATA.iter().chain(PRESET_ONLY_METADATA) {
+        for (before, after) in BARE_TOOL_REFERENCE_FORMS {
+            for (at, _) in text.match_indices(&format!("{before}{name}{after}")) {
+                if !starts_word(text, at) {
+                    continue;
+                }
+                let start = at + before.len();
+                found.push(ToolReference {
+                    start,
+                    end: start + name.len(),
+                    served: served
+                        .iter()
+                        .find(|served| {
+                            served.as_str() == *name
+                                || served.strip_prefix(TOOL_REFERENCE_PREFIX) == Some(*name)
+                        })
+                        .cloned(),
+                });
+            }
+        }
+    }
     for (start, _) in text.match_indices(TOOL_REFERENCE_PREFIX) {
-        let starts_word = text[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
-        if !starts_word {
+        if !starts_word(text, start) {
             continue;
         }
         let name_start = start + TOOL_REFERENCE_PREFIX.len();
@@ -640,6 +677,7 @@ fn tool_references(text: &str, served: &[String]) -> Vec<ToolReference> {
                 .cloned(),
         });
     }
+    found.sort_by_key(|reference| reference.start);
     found
 }
 
@@ -714,6 +752,7 @@ fn drop_absent_sentences(line: &str, served: &[String]) -> String {
             continue;
         }
         let sentence = drop_absent_parentheticals(sentence, served);
+        let sentence = drop_absent_dash_lead(&sentence, served);
         if !names_absent_tool(&sentence, served) {
             out.push_str(&sentence);
         } else if let Some(kept) = drop_absent_clauses(&sentence, served) {
@@ -721,6 +760,29 @@ fn drop_absent_sentences(line: &str, served: &[String]) -> String {
         }
     }
     out
+}
+
+/// `sentence` without its lead when only the part before its first " — "
+/// names an absent tool: "To overwrite a file, use the `write` tool — `edit`
+/// requires an explicit mode." keeps what follows the dash. An absent tool
+/// after the dash removes nothing here, because the lead may depend on it
+/// ("STOP — use the grep tool instead.").
+fn drop_absent_dash_lead(sentence: &str, served: &[String]) -> String {
+    let Some(at) = sentence.find(" — ") else {
+        return sentence.to_string();
+    };
+    let (lead, tail) = (&sentence[..at], &sentence[at + " — ".len()..]);
+    if !names_absent_tool(lead, served) || names_absent_tool(tail, served) {
+        return sentence.to_string();
+    }
+    let indent = &lead[..lead.len() - lead.trim_start().len()];
+    let mut tail = tail.to_string();
+    if let Some(first) = tail.chars().next() {
+        if first.is_ascii_lowercase() && !tail.starts_with(TOOL_REFERENCE_PREFIX) {
+            tail.replace_range(..1, &first.to_ascii_uppercase().to_string());
+        }
+    }
+    format!("{indent}{tail}")
 }
 
 /// `sentence` without each parenthetical that names an absent tool, and the
@@ -3799,6 +3861,40 @@ mod tests {
         ));
     }
 
+    /// Descriptions also name tools by their bare name, in two reference
+    /// forms: "the `edit` tool" / "the grep tool", and "use `read`". A
+    /// session that disabled `edit` but kept `write` must not be told to use
+    /// the `edit` tool; a call to it would be refused.
+    #[test]
+    fn bare_tool_references_follow_the_served_set() {
+        const WRITE_ADVICE: &str =
+            "Use it to create files or replace whole contents; for partial edits, use the `edit` tool.";
+        let reply = catalog(json!({}), &["edit".into()], true).unwrap();
+        assert!(!names(&reply).contains(&"edit".to_string()));
+        let write = description(&reply, "write");
+        assert!(!write.contains("`edit` tool"), "{write}");
+        assert!(
+            write.contains("Use it to create files or replace whole contents. Write very large"),
+            "{write}"
+        );
+        let reply = catalog(json!({}), &["read".into()], true).unwrap();
+        let grep = description(&reply, "grep");
+        assert!(!grep.contains("`read`"), "{grep}");
+        assert!(
+            grep.contains("Returns matching lines with file paths and line numbers. Always"),
+            "{grep}"
+        );
+        // Control: with `edit` served, the advice stays word for word.
+        let reply = catalog(json!({}), &[], true).unwrap();
+        assert!(description(&reply, "write").contains(WRITE_ADVICE));
+        assert!(description(&reply, "grep").contains("use `read` for that"));
+        // A backticked tool name that is not in a reference form is an
+        // argument, not a tool: zoom's `callgraph` stays with callgraph off.
+        let reply = catalog(json!({}), &["aft_callgraph".into()], true).unwrap();
+        assert!(description(&reply, "zoom")
+            .contains("Top-level `contextLines` and `callgraph` apply to every entry"));
+    }
+
     #[test]
     fn absent_tool_references_drop_the_smallest_readable_unit() {
         let served = ["zoom".to_string(), "outline".to_string()];
@@ -3834,6 +3930,18 @@ mod tests {
             (
                 "Consider an aft_zoom pass, then an aft_outline.",
                 "Consider a zoom pass, then an outline.",
+            ),
+            // Bare names count only in their reference forms.
+            (
+                "Rewrite it; for edits, use the `edit` tool. Pass `edit` or `callgraph` as text.",
+                "Rewrite it. Pass `edit` or `callgraph` as text.",
+            ),
+            ("Lines only (use `read` for that).", "Lines only."),
+            ("STOP — use the grep tool instead. Next.", "Next."),
+            // An absent tool before a dash drops only the lead.
+            (
+                "To overwrite, use the `write` tool — `zoom` needs a mode. Next.",
+                "`zoom` needs a mode. Next.",
             ),
         ];
         for (text, expected) in cases {
