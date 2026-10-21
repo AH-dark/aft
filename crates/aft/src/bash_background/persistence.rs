@@ -1437,8 +1437,65 @@ fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Resul
 }
 
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
+    #[cfg(all(test, unix))]
+    if let Some(error) = take_injected_read_task_replacement_error_for_test() {
+        return Err(error);
+    }
     let mut file = open_validated_path(path, false)?;
     read_task_file(&mut file, path)
+}
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static READ_TASK_REPLACEMENT_FAILURES_FOR_TEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+fn inject_read_task_replacement_failures_for_test(count: u32) {
+    READ_TASK_REPLACEMENT_FAILURES_FOR_TEST.with(|remaining| remaining.set(count));
+}
+
+#[cfg(all(test, unix))]
+fn take_injected_read_task_replacement_error_for_test() -> Option<io::Error> {
+    READ_TASK_REPLACEMENT_FAILURES_FOR_TEST.with(|remaining| {
+        let count = remaining.get();
+        if count == 0 {
+            None
+        } else {
+            remaining.set(count - 1);
+            Some(io::Error::new(
+                io::ErrorKind::Interrupted,
+                ARTIFACT_CONCURRENTLY_REPLACED,
+            ))
+        }
+    })
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn read_task_retrying_replacement_for_test(path: &Path) -> io::Result<PersistedTask> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match read_task(path) {
+            Err(error)
+                if attempts < METADATA_OPEN_ATTEMPTS
+                    && error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) =>
+            {
+                if attempts <= 2 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50 << (attempts - 3).min(5)));
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+fn injected_read_task_replacement_failures_for_test() -> u32 {
+    READ_TASK_REPLACEMENT_FAILURES_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// Terminal status describes the leader's outcome, not the lifetime of its
@@ -3661,6 +3718,89 @@ mod tests {
         let counts = work_counts::get();
         eprintln!("task lifecycle work: {counts:?}");
         assert!(read_task_at(&task).unwrap().is_terminal());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_task_retry_helper_retries_injected_errors_up_to_attempt_limit() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        let expected_task_id = metadata.task_id.clone();
+
+        inject_read_task_replacement_failures_for_test(3);
+        let read = read_task_retrying_replacement_for_test(&task.paths.json).unwrap();
+        assert_eq!(read.task_id, expected_task_id);
+        assert_eq!(injected_read_task_replacement_failures_for_test(), 0);
+
+        inject_read_task_replacement_failures_for_test(METADATA_OPEN_ATTEMPTS);
+        let error = read_task_retrying_replacement_for_test(&task.paths.json).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), ARTIFACT_CONCURRENTLY_REPLACED);
+        assert_eq!(injected_read_task_replacement_failures_for_test(), 0);
+    }
+
+    /// Manual check: race real metadata readers against atomic replacement writes.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual real-race stress check"]
+    fn read_task_replacement_retry_handles_concurrent_metadata_writes() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        let path = task.paths.json.clone();
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_writing = writing.clone();
+        let writer_path = path.clone();
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_started = started.clone();
+        let writer = std::thread::spawn(move || {
+            write_task(&writer_path, &metadata).unwrap();
+            writer_started.wait();
+            while writer_writing.load(std::sync::atomic::Ordering::Relaxed) {
+                write_task(&writer_path, &metadata).unwrap();
+                std::thread::yield_now();
+            }
+        });
+        started.wait();
+
+        let mut replacement_error = None;
+        let mut other_error = None;
+        let read_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut plain_reads = 0;
+        while replacement_error.is_none() && std::time::Instant::now() < read_deadline {
+            plain_reads += 1;
+            if let Err(error) = read_task(&path) {
+                if error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED)
+                {
+                    replacement_error.get_or_insert_with(|| error.to_string());
+                } else {
+                    other_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+
+        let mut retry_error = None;
+        for _ in 0..plain_reads.max(3_000) {
+            if let Err(error) = read_task_retrying_replacement_for_test(&path) {
+                retry_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+
+        writing.store(false, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            other_error.is_none(),
+            "unexpected read error: {other_error:?}"
+        );
+        assert!(
+            replacement_error.is_some(),
+            "plain read_task never observed a transient metadata replacement"
+        );
+        assert!(
+            retry_error.is_none(),
+            "retrying metadata read failed: {retry_error:?}"
+        );
+        eprintln!("plain read_task observed {replacement_error:?}; retrying reads succeeded");
     }
 
     #[test]
