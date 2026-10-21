@@ -85,6 +85,9 @@ benchmarks/aft-search/.bench/
 # Local investigations can contain private corpus questions, reports and paths.
 /.cortexkit/internal-docs/
 
+# Maintainer-only measurement tools are carried separately from releases.
+/.cortexkit/scripts/
+
 # Qartez index (local code intelligence cache)
 .qartez/
 

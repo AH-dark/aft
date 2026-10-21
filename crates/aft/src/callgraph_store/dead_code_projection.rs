@@ -23,6 +23,10 @@ use super::{
     PROVENANCE_VALUE_REF, TOP_LEVEL_SYMBOL,
 };
 
+#[cfg(test)]
+#[path = "payload_parity_tests.rs"]
+mod payload_parity_tests;
+
 /// How a dead-code snapshot was produced: by splicing the previous snapshot
 /// with the caller delta journal, or by re-reading the whole store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

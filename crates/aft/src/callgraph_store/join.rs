@@ -28,6 +28,10 @@ pub(crate) mod extraction_work;
 #[path = "extraction_tests.rs"]
 mod extraction_tests;
 
+#[cfg(test)]
+#[path = "payload_tests.rs"]
+mod payload_tests;
+
 #[path = "extraction_index.rs"]
 mod extraction_index;
 
@@ -118,8 +122,8 @@ pub trait ManifestBlobReader {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AstPreorderNode {
     pub ordinal: u32,
-    /// Grammar names are static during extraction; decoding owns the same text
-    /// without changing the persisted JSON representation.
+    /// Grammar names are static during extraction; legacy payload decoding owns
+    /// the same text.
     pub kind: Cow<'static, str>,
     pub byte_start: usize,
     pub byte_end: usize,
@@ -199,6 +203,10 @@ pub struct ParseBlob {
     pub dispatch: dispatch::DispatchFacts,
     pub extractor_version: String,
     pub language: String,
+    /// Extraction uses node spans to assign ordinals. All later readers use the
+    /// ordinals already copied into symbols, imports, references and dispatch.
+    /// Keep accepting older payloads, but do not persist the temporary index.
+    #[serde(skip_serializing, default)]
     pub ast_nodes: Vec<AstPreorderNode>,
     pub symbols: Vec<BlobSymbol>,
     pub default_export_symbol: Option<String>,
