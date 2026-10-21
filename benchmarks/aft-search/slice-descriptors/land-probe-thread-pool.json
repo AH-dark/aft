@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "probe-thread-pool"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/search_index.rs, and every change there is test-only: the AuditWork counters derive PartialEq, and a cfg(test) scope resets the grep audit counters and hooks for each job on a reused filesystem helper thread. Filesystem probes reuse a pool of helper threads instead of spawning one per probe; deadlines and error codes are unchanged. Query routing, admission and ranking are unchanged, and ranked rows must remain byte-identical to the committed reference."
+}

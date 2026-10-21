@@ -118,6 +118,139 @@ impl Drop for BlockDirectory {
 }
 
 #[test]
+fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
+    use crate::commands::read::{
+        IMAGE_PROCESSING_DELAY, LEGACY_HASHLINE_READ, LEGACY_READ_RENDER_BYTES,
+    };
+    use crate::hashline::snapshot::{SOURCE_AFTER_READ, SOURCE_READS};
+    use crate::inspect::job::CANONICALIZE_CALLS;
+    use crate::search_index::{
+        audit_record, audit_work, AuditWork, AUDIT_CANCEL_ELAPSED, AUDIT_IO_PROBE,
+    };
+
+    let pool = Limiter::new(1);
+    let nested_pool = pool.clone();
+    let first = run_with_limiter(Path::new("first"), None, pool.clone(), move |_| {
+        SOURCE_READS.with(|count| count.set(count.get() + 1));
+        LEGACY_READ_RENDER_BYTES.with(|count| count.set(count.get() + 7));
+        LEGACY_HASHLINE_READ.with(|flag| flag.set(true));
+        IMAGE_PROCESSING_DELAY.with(|delay| delay.set(Duration::from_secs(1)));
+        SOURCE_AFTER_READ.with(|hook| *hook.borrow_mut() = Some(Box::new(|| panic!("old hook"))));
+        CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(vec![PathBuf::from("old")]));
+        AUDIT_IO_PROBE.with(|probe| *probe.borrow_mut() = Some(Box::new(|| panic!("old probe"))));
+        AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.set(Some(Duration::from_secs(1))));
+        audit_record(|work| {
+            work.cancel_probes += 1;
+            work.corpus_opens += 1;
+            work.sort_stats += 1;
+            work.sort_canonicalizes += 1;
+            work.watcher_global += 1;
+            work.watcher_head += 1;
+            work.filter_keys += 1;
+            work.presence_checks += 1;
+        });
+        MUTATION_ADMISSION.with(|flag| flag.set(true));
+        DIRECTORIES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.0 = 42;
+            cache
+                .1
+                .insert(PathBuf::from("old"), Access { direct: true });
+        });
+        let thread = std::thread::current().id();
+        run_with_limiter(Path::new("nested"), None, nested_pool, move |_| {
+            assert_eq!(std::thread::current().id(), thread);
+            assert_eq!(SOURCE_READS.with(|count| count.get()), 1);
+            assert_eq!(LEGACY_READ_RENDER_BYTES.with(|count| count.get()), 7);
+            assert_eq!(audit_work().filter_keys, 1);
+            Ok(())
+        })?;
+        Ok(std::thread::current().id())
+    })
+    .unwrap();
+    let second = run_with_limiter(Path::new("second"), None, pool, |_| {
+        Ok((
+            std::thread::current().id(),
+            SOURCE_READS.with(|count| count.get()),
+            LEGACY_READ_RENDER_BYTES.with(|count| count.get()),
+            LEGACY_HASHLINE_READ.with(|flag| flag.get()),
+            IMAGE_PROCESSING_DELAY.with(|delay| delay.get()),
+            SOURCE_AFTER_READ.with(|hook| hook.borrow().is_none()),
+            DIRECTORIES.with(|cache| cache.borrow().1.is_empty()),
+            audit_work(),
+            MUTATION_ADMISSION.with(|flag| flag.get()),
+            CANONICALIZE_CALLS.with(|calls| calls.borrow().is_none()),
+            AUDIT_IO_PROBE.with(|probe| probe.borrow().is_none()),
+            AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.get()),
+        ))
+    })
+    .unwrap();
+    assert_eq!(first, second.0, "both jobs must use the same helper");
+    assert_eq!((second.1, second.2), (0, 0), "per-job counters leaked");
+    assert!(!second.3, "legacy read flag leaked");
+    assert_eq!(second.4, Duration::ZERO, "image delay leaked");
+    assert!(second.5, "source-read hook leaked");
+    assert!(second.6, "directory cache leaked");
+    assert_eq!(second.7, AuditWork::default(), "grep work counters leaked");
+    assert!(!second.8, "mutation admission leaked");
+    assert!(second.9, "canonicalization collector leaked");
+    assert!(second.10, "grep I/O probe leaked");
+    assert_eq!(second.11, None, "grep cancellation clock leaked");
+}
+
+#[test]
+fn helper_job_scope_restores_state_after_unwind() {
+    use crate::commands::read::LEGACY_READ_RENDER_BYTES;
+    use crate::hashline::snapshot::SOURCE_READS;
+
+    let previous_reads = SOURCE_READS.with(|count| count.replace(11));
+    let previous_render = LEGACY_READ_RENDER_BYTES.with(|count| count.replace(13));
+    let unwound = std::panic::catch_unwind(|| {
+        let _state = HelperJobScope::enter();
+        assert_eq!(SOURCE_READS.with(|count| count.get()), 0);
+        assert_eq!(LEGACY_READ_RENDER_BYTES.with(|count| count.get()), 0);
+        SOURCE_READS.with(|count| count.set(1));
+        LEGACY_READ_RENDER_BYTES.with(|count| count.set(7));
+        panic!("unwind a helper job");
+    });
+    let reads = SOURCE_READS.with(|count| count.replace(previous_reads));
+    let render = LEGACY_READ_RENDER_BYTES.with(|count| count.replace(previous_render));
+    assert!(unwound.is_err());
+    assert_eq!((reads, render), (11, 13));
+}
+
+#[test]
+fn helper_health_does_not_start_an_unused_pool() {
+    let helpers = OnceLock::new();
+    let health = helper_health_from(&helpers);
+    assert_eq!(health["status"], "not_started");
+    assert_eq!(health["pool_size"], IO_POOL_SIZE);
+    assert_eq!(health["thread_cap"], MAX_IO_THREADS);
+    assert_eq!(health["live"], 0);
+    assert!(helpers.get().is_none(), "health started the helper factory");
+}
+
+#[test]
+fn helper_health_does_not_wait_for_the_state_lock() {
+    let pool = Limiter::new(1);
+    let state = pool.state.lock().unwrap();
+    let reader = pool.clone();
+    let (tx, rx) = channel();
+    let thread = std::thread::spawn(move || tx.send(reader.health()).unwrap());
+    let health = rx.recv_timeout(Duration::from_secs(1));
+    drop(state);
+    thread.join().unwrap();
+    let health = health.expect("health waited for the helper state lock");
+    assert_eq!(health["status"], "unavailable");
+    assert_eq!(health["reason"], "state_busy");
+    assert!(
+        health.get("live").is_none(),
+        "unavailable counts are unknown"
+    );
+    assert_eq!(pool.health()["status"], "ready");
+}
+
+#[test]
 fn metadata_and_canonicalize_do_not_enumerate_an_ancestor() {
     let dir = tempfile::tempdir().unwrap();
     let ancestor = std::fs::canonicalize(dir.path()).unwrap();
@@ -406,7 +539,7 @@ fn unscheduled_helper_is_queue_timeout_and_never_runs_late() {
         run_with_limiter(
             &path,
             Some(Instant::now() + Duration::from_millis(80)),
-            Arc::new(Limiter::new(1)),
+            Limiter::new(1),
             move |_| {
                 let _dropped = dropped;
                 work_fired.fetch_add(1, Ordering::Relaxed);
@@ -434,7 +567,7 @@ fn unscheduled_helper_is_queue_timeout_and_never_runs_late() {
 
 #[test]
 fn saturated_limiter_is_queue_timeout_and_does_not_start_work() {
-    let limiter = Arc::new(Limiter::new(1));
+    let limiter = Limiter::new(1);
     let _permit = limiter.acquire(Instant::now() + IO_BUDGET).unwrap();
     let fired = Arc::new(AtomicUsize::new(0));
     let work_fired = Arc::clone(&fired);
@@ -479,7 +612,7 @@ fn queued_time_does_not_consume_running_access_budget() {
                     run_with_timeout(
                         &path,
                         None,
-                        Arc::new(Limiter::new(1)),
+                        Limiter::new(1),
                         Duration::from_secs(1),
                         None,
                         move |_| {
@@ -520,7 +653,7 @@ fn running_access_keeps_shorter_request_deadline() {
             run_with_timeout(
                 Path::new("running-past-request"),
                 None,
-                Arc::new(Limiter::new(1)),
+                Limiter::new(1),
                 Duration::from_secs(1),
                 None,
                 move |_| {
@@ -566,7 +699,7 @@ fn queued_time_without_request_budget_does_not_consume_running_access_budget() {
             .send(run_with_timeout(
                 &path,
                 None,
-                Arc::new(Limiter::new(1)),
+                Limiter::new(1),
                 Duration::from_secs(1),
                 None,
                 move |_| {
@@ -724,17 +857,12 @@ fn running_helper_timeout_has_only_native_platform_hint() {
     let (started_tx, started_rx) = channel();
     let (finished_tx, finished_rx) = channel();
     let caller = std::thread::spawn(move || {
-        run_with_limiter(
-            Path::new("running"),
-            None,
-            Arc::new(Limiter::new(1)),
-            move |_| {
-                started_tx.send(()).unwrap();
-                let _ = release_rx.recv();
-                finished_tx.send(()).unwrap();
-                Ok(())
-            },
-        )
+        run_with_limiter(Path::new("running"), None, Limiter::new(1), move |_| {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            finished_tx.send(()).unwrap();
+            Ok(())
+        })
     });
     let started = started_rx.recv_timeout(IO_BUDGET);
     let error = caller.join().unwrap().unwrap_err();
@@ -864,4 +992,73 @@ fn read_admission_keeps_the_queue_cap_outside_mutations() {
     drop(gate);
     assert_eq!(timeout_code(&error), "read_io_queue_timeout", "{error}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+/// A fixed, in-process read/grep/edit workload, excluding context construction.
+/// Process CPU includes helper creation and teardown, not just filesystem calls.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "manual performance measurement"]
+fn probe_pool_workload() {
+    fn cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+            0
+        );
+        let usage = unsafe { usage.assume_init() };
+        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..3)
+        .map(|n| fixture.path().join(format!("root-{n}")))
+        .collect();
+    let contexts: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            for directory in 0..4 {
+                let path = root.join(format!("src-{directory}"));
+                std::fs::create_dir_all(&path).unwrap();
+                for file in 0..8 {
+                    std::fs::write(path.join(format!("file-{file}.txt")), "needle alpha\n")
+                        .unwrap();
+                }
+            }
+            delete_context(root)
+        })
+        .collect();
+    let spawns = THREAD_SPAWNS.load(Ordering::Relaxed);
+    let cpu = cpu_seconds();
+    let wall = Instant::now();
+    let mut totals = [[0usize; 4]; 3];
+    for iteration in 0..100 {
+        for (root, ctx) in roots.iter().zip(&contexts) {
+            let file = root.join("src-0/file-0.txt");
+            for (kind, params) in [
+                serde_json::json!({"command": "read", "file": file}),
+                serde_json::json!({"command": "grep", "path": root, "pattern": "needle"}),
+                serde_json::json!({"command": "edit_match", "file": file, "match": if iteration % 2 == 0 {"alpha"} else {"beta"}, "replacement": if iteration % 2 == 0 {"beta"} else {"alpha"}}),
+            ].into_iter().enumerate() {
+                let mut params = params;
+                params["id"] = serde_json::json!("probe-load");
+                let request: RawRequest = serde_json::from_value(params).unwrap();
+                let budget = Budget::after(Duration::from_secs(25));
+                let response = with_budget(Some(budget.clone()), || command(&request, ctx, |req, ctx| match kind {
+                    0 => crate::commands::read::handle_read(req, ctx),
+                    1 => crate::commands::grep::handle_grep(req, ctx),
+                    _ => crate::commands::edit_match::handle_edit_match(req, ctx),
+                }));
+                assert!(response.success, "{}: {:?}", request.command, response);
+                totals[kind][0] += 1;
+                totals[kind][1] += budget.measurements.directory_probes.load(Ordering::Relaxed);
+                totals[kind][2] += budget.measurements.traversal_probes.load(Ordering::Relaxed);
+                totals[kind][3] += budget.measurements.round_trips.load(Ordering::Relaxed);
+            }
+        }
+    }
+    let wall = wall.elapsed().as_secs_f64();
+    let cpu = cpu_seconds() - cpu;
+    let spawns = THREAD_SPAWNS.load(Ordering::Relaxed) - spawns;
+    let probes: usize = totals.iter().map(|row| row[3]).sum();
+    println!("PROBE_LOAD calls/directory/traversal/dispatch={totals:?} wall_s={wall:.6} cpu_s={cpu:.6} spawns={spawns} threads_per_s={:.3} cpu_us_per_probe={:.3}", spawns as f64 / wall, cpu * 1_000_000.0 / probes as f64);
 }

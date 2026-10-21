@@ -1393,9 +1393,28 @@ struct CapturedRead {
 
 #[cfg(test)]
 thread_local! {
-    static LEGACY_HASHLINE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static LEGACY_READ_RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static IMAGE_PROCESSING_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    pub(crate) static LEGACY_HASHLINE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static LEGACY_READ_RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static IMAGE_PROCESSING_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+#[cfg(test)]
+pub(crate) struct HelperStateScope(bool, usize, Duration);
+#[cfg(test)]
+impl Drop for HelperStateScope {
+    fn drop(&mut self) {
+        LEGACY_HASHLINE_READ.with(|flag| flag.set(self.0));
+        LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(self.1));
+        IMAGE_PROCESSING_DELAY.with(|delay| delay.set(self.2));
+    }
+}
+#[cfg(test)]
+pub(crate) fn helper_state_scope() -> HelperStateScope {
+    HelperStateScope(
+        LEGACY_HASHLINE_READ.with(|flag| flag.replace(false)),
+        LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.replace(0)),
+        IMAGE_PROCESSING_DELAY.with(|delay| delay.replace(Duration::ZERO)),
+    )
 }
 
 fn handle_read_local(
