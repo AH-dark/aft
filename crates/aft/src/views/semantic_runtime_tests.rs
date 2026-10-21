@@ -1742,6 +1742,78 @@ fn many_unreconciled_edits_take_cold_slot_before_reconciling() {
     );
 }
 
+/// A fill that leaves work for another budgeted round releases its cold-build
+/// slot between rounds. When another request is queued by then, the fill's next
+/// round queues behind it instead of retaking the slot it just freed.
+#[test]
+fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[
+            ("first.rs", "pub fn first_round() {}\n"),
+            ("second.rs", "pub fn second_round() {}\n"),
+        ],
+    );
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let model = Arc::new(Model::default());
+    let mut queued_waiter = None;
+    let outcome = catch_up(
+        &Arc::downgrade(&slot),
+        epoch,
+        &runtime,
+        &schedule,
+        FillBudget {
+            max_files: 1,
+            ..FillBudget::default()
+        },
+        &mut |texts| {
+            if queued_waiter.is_none() {
+                // While the first round holds the only slot, queue another
+                // maintenance request and record how many rounds had embedded
+                // when it was admitted.
+                let waiter_limiter = Arc::clone(&limiter);
+                let waiter_model = Arc::clone(&model);
+                queued_waiter = Some(std::thread::spawn(move || {
+                    let permit = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                        &waiter_limiter,
+                        "queued maintenance",
+                        || true,
+                    )
+                    .expect("queued request is admitted");
+                    let calls_at_admission = waiter_model.calls();
+                    drop(permit);
+                    calls_at_admission
+                }));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !limiter
+                    .census()
+                    .queued
+                    .iter()
+                    .any(|job| job.kind == "queued maintenance")
+                {
+                    assert!(Instant::now() < deadline, "the other request never queued");
+                    std::thread::yield_now();
+                }
+            }
+            model.embed(texts)
+        },
+    );
+    assert!(matches!(outcome, FillOutcome::Settled));
+    assert_eq!(model.calls(), 2, "each file takes its own round");
+    let calls_at_admission = queued_waiter
+        .expect("the first round queued another request")
+        .join()
+        .unwrap();
+    assert_eq!(
+        calls_at_admission, 1,
+        "the fill retook the slot for its second round ahead of the queued request"
+    );
+}
+
 fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {

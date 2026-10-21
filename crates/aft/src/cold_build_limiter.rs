@@ -169,9 +169,10 @@ impl ColdBuildAdmissionRequest {
 
 /// A structured record of a successful cold-build admission.
 ///
-/// `admission_order` records the order in which permits were admitted, not the
-/// order in which waiters arrived. Arrival-order and overtake checks require a
-/// separate ticketed-ordering design.
+/// `admission_order` records the order in which permits were granted, which can
+/// differ from the order in which waiters arrived. Within one class a queued
+/// waiter is eligible by queue rank (see `try_acquire_classified`); classes
+/// still alternate on the last free slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColdBuildAdmissionEvent {
     pub(crate) request_id: String,
@@ -202,7 +203,7 @@ pub(crate) fn try_acquire_classified_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     request: &ColdBuildAdmissionRequest,
 ) -> Option<ColdBuildPermit> {
-    limiter.try_acquire_classified(request, &request.request_id, || true)
+    limiter.try_acquire_classified(request, &request.request_id, None, || true)
 }
 
 /// Acquire a limiter permit for a classified request while it remains admitted
@@ -259,7 +260,8 @@ fn acquire_blocking_while_inner(
     admitted: impl Fn() -> bool,
     cancelled: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
-    let _waiter = request.map(|request| AdmissionWaiter::register(limiter, request, kind));
+    let waiter = request.map(|request| AdmissionWaiter::register(limiter, request, kind));
+    let ticket = waiter.as_ref().map(|waiter| waiter.census_id);
     let started = Instant::now();
     let mut logged = false;
     loop {
@@ -276,7 +278,7 @@ fn acquire_blocking_while_inner(
         }
         let revoked_after_acquire = std::cell::Cell::new(false);
         let permit = match request {
-            Some(request) => limiter.try_acquire_classified(request, kind, || {
+            Some(request) => limiter.try_acquire_classified(request, kind, ticket, || {
                 let still_admitted = admitted()
                     && !cancelled()
                     && (request.class != ColdBuildAdmissionClass::Standing
@@ -465,10 +467,20 @@ impl ColdBuildLimiter {
         Some(self.install_permit_locked(&mut state, "unclassified", None, None, "unclassified"))
     }
 
+    /// `ticket` is the census id of the caller's queued waiter, when it has
+    /// one. Within a class, waiters are eligible by queue rank: a waiter may
+    /// take a slot only while fewer same-class waiters queued before it than
+    /// there are free slots. With one free slot that means oldest first. A
+    /// caller that releases its slot and asks again (a fill between budgeted
+    /// rounds) registers a new, younger waiter, so it goes behind the requests
+    /// already queued in its class instead of retaking the slot it just freed.
+    /// A caller without a queued waiter (`ticket` is `None`) skips the rank
+    /// check; slot availability and class alternation still apply.
     fn try_acquire_classified(
         self: &Arc<Self>,
         request: &ColdBuildAdmissionRequest,
         kind: &str,
+        ticket: Option<u64>,
         admitted_after_acquire: impl FnOnce() -> bool,
     ) -> Option<ColdBuildPermit> {
         let mut state = self
@@ -492,10 +504,21 @@ impl ColdBuildLimiter {
             }
         }
 
+        let available = self.available.load(Ordering::Acquire);
+        if let Some(ticket) = ticket {
+            let class = request.class.label();
+            let older_same_class = state
+                .queued
+                .range(..ticket)
+                .filter(|(_, record)| record.domain == class)
+                .count();
+            if older_same_class >= available {
+                return None;
+            }
+        }
         // Class alternation arbitrates the final released slot. When several
         // slots are free, admitting both classes is not starvation and avoids
         // stranding independent roots behind an artificial one-at-a-time turn.
-        let available = self.available.load(Ordering::Acquire);
         if available <= 1
             && self.has_waiter_from_another_class(request.class)
             && state.last_admitted_class == Some(request.class)
@@ -1011,6 +1034,32 @@ mod tests {
         for waiter in waiters {
             waiter.join().expect("admission waiter joins");
         }
+    }
+
+    #[test]
+    fn same_class_waiters_are_admitted_oldest_first() {
+        let limiter = test_limiter(1);
+        let held = limiter.try_acquire().expect("hold the only slot");
+        let older = ColdBuildAdmissionRequest::new("older", ColdBuildAdmissionClass::Maintenance);
+        let older_waiter = AdmissionWaiter::register(&limiter, &older, "older");
+        let newer = ColdBuildAdmissionRequest::new("newer", ColdBuildAdmissionClass::Maintenance);
+        let newer_waiter = AdmissionWaiter::register(&limiter, &newer, "newer");
+        drop(held);
+
+        assert!(
+            limiter
+                .try_acquire_classified(&newer, "newer", Some(newer_waiter.census_id), || true)
+                .is_none(),
+            "a younger waiter took the free slot ahead of an older one"
+        );
+        let permit = limiter
+            .try_acquire_classified(&older, "older", Some(older_waiter.census_id), || true)
+            .expect("the oldest waiter takes the free slot");
+        drop(older_waiter);
+        drop(permit);
+        assert!(limiter
+            .try_acquire_classified(&newer, "newer", Some(newer_waiter.census_id), || true)
+            .is_some());
     }
 
     #[test]
