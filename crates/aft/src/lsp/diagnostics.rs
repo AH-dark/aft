@@ -551,6 +551,16 @@ impl DiagnosticsStore {
             .collect()
     }
 
+    /// Current reports retain producer identity and provisional state, including empty reports.
+    pub(crate) fn current_reports(
+        &self,
+    ) -> impl Iterator<Item = (&ServerKey, &Path, &DiagnosticEntry)> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| !entry.stale)
+            .map(|((server, file), entry)| (server, file.as_path(), entry))
+    }
+
     /// Current authoritative reports retain producer identity, including empty reports.
     pub(crate) fn authoritative_reports(
         &self,

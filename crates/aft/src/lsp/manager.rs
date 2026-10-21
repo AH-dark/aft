@@ -4035,6 +4035,49 @@ impl LspManager {
         pull
     }
 
+    pub(crate) fn begin_scoped_typescript_diagnostics(
+        &mut self,
+        key: &ServerKey,
+        file: &Path,
+        deadline: Instant,
+    ) -> Result<super::typescript_diagnostics::TypescriptDiagnosticsRequest, LspError> {
+        let file = canonicalize_for_lsp(file)?;
+        let uri = uri_for_path(&file)?;
+        let version = self
+            .documents
+            .get(key)
+            .and_then(|store| store.version(&file));
+        let client = self
+            .clients
+            .get_mut(key)
+            .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?;
+        Ok(
+            super::typescript_diagnostics::TypescriptDiagnosticsRequest::start(
+                client,
+                key.clone(),
+                file,
+                version,
+                &uri,
+                deadline,
+            ),
+        )
+    }
+
+    pub(crate) fn finish_scoped_typescript_diagnostics(
+        &self,
+        reply: super::typescript_diagnostics::TypescriptDiagnosticsReply,
+    ) -> Result<Vec<StoredDiagnostic>, super::typescript_diagnostics::CertificationFailure> {
+        let current = self.documents.get(&reply.key).is_some_and(|store| {
+            reply.version.is_some()
+                && store.version(&reply.file) == reply.version
+                && !store.is_stale_on_disk(&reply.file)
+        });
+        if !current {
+            return Err(super::typescript_diagnostics::CertificationFailure::DocumentChanged);
+        }
+        reply.result
+    }
+
     /// Store the reply of a pull started by [`Self::begin_file_pulls`] or
     /// [`Self::begin_document_pull`] and return its outcome. A pull that was
     /// not waited for yet is waited for here, with the manager locked.
@@ -4741,6 +4784,12 @@ impl LspManager {
 
     pub fn get_all_diagnostics_with_provisional(&self) -> Vec<(&StoredDiagnostic, bool)> {
         self.diagnostics.all_with_provisional()
+    }
+
+    pub(crate) fn current_diagnostic_reports(
+        &self,
+    ) -> impl Iterator<Item = (&ServerKey, &Path, &DiagnosticEntry)> {
+        self.diagnostics.current_reports()
     }
 
     /// True if any LSP server has a current diagnostic report, including an

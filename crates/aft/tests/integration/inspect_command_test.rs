@@ -4846,6 +4846,126 @@ fn scoped_inspect_reopen_ignores_the_late_reply_to_the_earlier_close() {
     );
 }
 
+#[test]
+fn scoped_typescript_sync_empty_then_real_reports_the_semantic_error() {
+    let (_temp, root, _file) = external_typescript_fixture();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "empty_then_real");
+
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-error", "broken.ts");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
+#[test]
+fn scoped_typescript_sync_clean_file_is_authoritative() {
+    let (_temp, root, file) = external_typescript_fixture();
+    std::fs::write(file, "export const clean: number = 1;\n").unwrap();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "clean");
+
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-clean", "broken.ts");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 0,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 1,
+        "{response:#}"
+    );
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+}
+
+#[test]
+fn scoped_typescript_sync_unsupported_is_pending_not_clean() {
+    let (_temp, root, _file) = external_typescript_fixture();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "unsupported");
+
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-unsupported", "broken.ts");
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
+        "{response:#}"
+    );
+    assert_eq!(uncovered_files(&response).len(), 1, "{response:#}");
+    assert!(
+        response.to_string().contains("typescript_sync_unsupported"),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_typescript_sync_collects_every_category_without_changing_warm_counts() {
+    let (_temp, root, file) = external_typescript_fixture();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "categories");
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-categories", "broken.ts");
+    let diagnostics = &response["summary"]["diagnostics"];
+    assert_eq!(diagnostics["errors"], 1, "{response:#}");
+    assert_eq!(diagnostics["warnings"], 1, "{response:#}");
+    assert_eq!(diagnostics["hints"], 1, "{response:#}");
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+    assert!(
+        ctx.lsp().get_diagnostics_for_file(&file).is_empty(),
+        "request-local answers must not replace the empty push store"
+    );
+}
+
+#[test]
+fn scoped_typescript_sync_malformed_is_pending_not_clean() {
+    let (_temp, root, _file) = external_typescript_fixture();
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "malformed");
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-malformed", "broken.ts");
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
+        "{response:#}"
+    );
+    assert_eq!(uncovered_files(&response).len(), 1, "{response:#}");
+    assert!(
+        response
+            .to_string()
+            .contains("typescript_sync_invalid_response"),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn scoped_typescript_sync_timeout_is_pending_not_clean() {
+    let (_temp, root, _file) = external_typescript_fixture();
+    let ctx = configured_context_with_diagnostics_timeout(&root, 3000);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "timeout");
+    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-timeout", "broken.ts");
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
+        "{response:#}"
+    );
+    assert_eq!(uncovered_files(&response).len(), 1, "{response:#}");
+    assert!(
+        response.to_string().contains("typescript_sync_timeout"),
+        "{response:#}"
+    );
+}
+
 /// A server that answers `textDocument/diagnostic` is asked directly. The
 /// fake pushes nothing useful here (an empty list on open), so only the pull
 /// can produce its diagnostic.

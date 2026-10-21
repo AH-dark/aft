@@ -314,6 +314,7 @@ pub(crate) fn run_diagnostics_category(
             scoped
                 .as_ref()
                 .map(|(candidates, _)| candidates.files.as_slice()),
+            sweep.as_ref(),
         )
     };
     collection.indexing_gaps = indexing_gaps
@@ -518,6 +519,7 @@ fn collect_warm_working_set(
     expected_producers: &[ServerKey],
     scope_producers: Option<&HashSet<ServerKey>>,
     scoped_files: Option<&[PathBuf]>,
+    sweep: Option<&ScopedSweep>,
 ) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
@@ -532,6 +534,11 @@ fn collect_warm_working_set(
                 .as_ref()
                 .is_some_and(|files| files.contains(&file))
     };
+    let replaced_by_typescript_request = |server: &ServerKey, file: &Path| {
+        sweep
+            .and_then(|sweep| sweep.typescript_reports.get(file))
+            .is_some_and(|(key, _)| key == server)
+    };
     {
         let mut lsp = ctx.lsp();
         // Live language-server diagnostics come from queued events and the
@@ -541,8 +548,10 @@ fn collect_warm_working_set(
         collection.server_ran = lsp.has_any_diagnostic_reports();
         collection.producer_reports = lsp
             .authoritative_diagnostic_reports()
-            .filter(|(_, file, _)| {
-                accepts_file(file) && !tsconfig_membership.should_skip_diagnostics(file)
+            .filter(|(server, file, _)| {
+                !replaced_by_typescript_request(server, file)
+                    && accepts_file(file)
+                    && !tsconfig_membership.should_skip_diagnostics(file)
             })
             .map(|(server, file, diagnostics)| {
                 (
@@ -638,13 +647,37 @@ fn collect_warm_working_set(
         collection.producers_settled =
             !producers.is_empty() && collection.servers_pending.is_empty();
         collection.diagnostics = lsp
-            .get_all_diagnostics_with_provisional()
-            .into_iter()
-            .map(|(diagnostic, provisional)| CollectedDiagnostic {
-                diagnostic: diagnostic.clone(),
-                provisional,
+            .current_diagnostic_reports()
+            .filter(|(server, file, _)| !replaced_by_typescript_request(server, file))
+            .flat_map(|(_, _, entry)| {
+                entry
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| CollectedDiagnostic {
+                        diagnostic: diagnostic.clone(),
+                        provisional: entry.provisional,
+                    })
             })
             .collect();
+    }
+
+    if let Some(sweep) = sweep {
+        for (file, (server, result)) in &sweep.typescript_reports {
+            if let Ok(diagnostics) = result {
+                let rows = diagnostics
+                    .iter()
+                    .map(|diagnostic| CollectedDiagnostic {
+                        diagnostic: diagnostic.clone(),
+                        provisional: false,
+                    })
+                    .collect::<Vec<_>>();
+                collection.server_ran = true;
+                collection.diagnostics.extend(rows.clone());
+                collection
+                    .producer_reports
+                    .push((server_id(server), file.clone(), rows));
+            }
+        }
     }
 
     collection.diagnostics.retain(|diagnostic| {
@@ -941,6 +974,21 @@ impl DiagnosticsCollection {
             if self.saved_files.contains(file) {
                 continue;
             }
+            if let Some((key, result)) = sweep.and_then(|sweep| sweep.typescript_reports.get(file))
+            {
+                if let Err(failure) = result {
+                    self.scope_coverage_gaps.push(ScopedCoverageGap {
+                        file: file.clone(),
+                        reason: "the reporting LSP server has not answered the diagnostics request for this file",
+                        cause: CoverageCause {
+                            producer: Some(server_id(key)), root: Some(key.root.clone()), reason: failure.to_string(),
+                        },
+                    });
+                }
+                // A successful synchronous answer certifies this file even if
+                // its last push was empty, partial, or has not arrived yet.
+                continue;
+            }
             let coverage = if !file.starts_with(&snapshot.project_root)
                 && tsconfig_membership.should_skip_diagnostics(file)
             {
@@ -974,12 +1022,12 @@ impl DiagnosticsCollection {
                 });
                 continue;
             }
-            // In pull mode Rust pushes only compiler results. Even an
-            // authoritative push cannot answer a native analysis request that
-            // failed during this sweep, so preserve that file's obligation.
+            // Rust pushes in pull mode carry only compiler results, and
+            // TypeScript pushes can carry only syntax results. Neither answers
+            // an explicit diagnostics request that failed during this sweep.
             if let Some((key, reason)) = sweep
                 .and_then(|sweep| sweep.unanswered.get(file))
-                .filter(|(key, _)| key.kind == ServerKind::Rust)
+                .filter(|(key, _)| matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript))
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
                     file: file.clone(),
@@ -1596,7 +1644,8 @@ mod payload_count_tests {
             kind,
             root: PathBuf::from("/repo"),
         });
-        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None, None);
+        let collection =
+            super::collect_warm_working_set(&ctx, &snapshot(), &expected, None, None, None);
         assert!(!collection.is_complete());
         let payload = collection.into_payload(&snapshot());
         assert!(payload["errors"].is_null(), "{payload:#}");
@@ -1630,13 +1679,14 @@ mod payload_count_tests {
                 .publish_with_kind(ServerKind::Rust, file.clone(), vec![diagnostic]);
         }
         let files = [outside.clone()];
-        let scoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files));
+        let scoped =
+            super::collect_warm_working_set(&ctx, &snapshot(), &[], None, Some(&files), None);
         assert_eq!(scoped.diagnostics.len(), 1);
         assert_eq!(scoped.diagnostics[0].diagnostic.file, outside);
         assert_eq!(scoped.producer_reports.len(), 1);
         assert_eq!(scoped.producer_reports[0].1, outside);
 
-        let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None);
+        let unscoped = super::collect_warm_working_set(&ctx, &snapshot(), &[], None, None, None);
         assert!(unscoped.diagnostics.is_empty());
         assert!(unscoped.producer_reports.is_empty());
     }
