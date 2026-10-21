@@ -1263,30 +1263,43 @@ fn reconcile_pending_roots(storage: &PinnedDir, history: &mut History) -> io::Re
     for pending in std::mem::take(&mut history.pending) {
         if recorded_root_matches(&pending.root).is_ok() {
             let root = PinnedDir::repair_open_path(&pending.root.path)?;
-            let marker = read_marker_identity(root.repair_read_file(std::ffi::OsStr::new(OWNER))?)?;
-            if Some(pinned_identity(&root)?) != pending.root.identity
-                || marker.owner != owner
-                || Some(marker.registration.as_str()) != pending.root.registration.as_deref()
-            {
-                return Err(io::Error::other("pending artifact registration changed"));
-            }
-            add_published_root(history, pending.root);
-            changed = true;
-        } else {
-            match fs::symlink_metadata(&pending.staging) {
-                Ok(metadata)
-                    if metadata.is_dir()
-                        && !metadata.file_type().is_symlink()
-                        && Some(real_directory(&pending.staging)?) == pending.root.identity =>
-                {
-                    // A surviving staging folder is not published history, but
-                    // cleanup must still protect it, including through aliases.
-                    history.pending.push(pending);
-                }
-                Ok(_) => changed = true,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => changed = true,
+            // Enrollment writes and syncs the ownership marker in the staging
+            // folder before it records the pending root, so a published root
+            // always carries one. A folder at the published path with a
+            // matching identity but no marker is a foreign folder that reused
+            // the deleted staging folder's inode (ext4 and tmpfs do this
+            // readily). It is not adopted; the staging check below decides
+            // the record, as for any other unpublished root.
+            let marker = match root.repair_read_file(std::ffi::OsStr::new(OWNER)) {
+                Ok(file) => Some(read_marker_identity(file)?),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error),
+            };
+            if let Some(marker) = marker {
+                if Some(pinned_identity(&root)?) != pending.root.identity
+                    || marker.owner != owner
+                    || Some(marker.registration.as_str()) != pending.root.registration.as_deref()
+                {
+                    return Err(io::Error::other("pending artifact registration changed"));
+                }
+                add_published_root(history, pending.root);
+                changed = true;
+                continue;
             }
+        }
+        match fs::symlink_metadata(&pending.staging) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && Some(real_directory(&pending.staging)?) == pending.root.identity =>
+            {
+                // A surviving staging folder is not published history, but
+                // cleanup must still protect it, including through aliases.
+                history.pending.push(pending);
+            }
+            Ok(_) => changed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => changed = true,
+            Err(error) => return Err(error),
         }
     }
     Ok(changed)

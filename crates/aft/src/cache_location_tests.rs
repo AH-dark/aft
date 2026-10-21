@@ -646,6 +646,44 @@ fn cache_location_cleanup_drops_pending_with_missing_staging_without_adopting_fo
     assert!(precious.is_file());
 }
 
+/// Same crash as above, but the foreign folder created at the publication path
+/// gets the deleted staging folder's inode, as ext4 and tmpfs readily do for a
+/// directory created right after another is removed. Path and identity then
+/// match the pending record, yet the folder has no ownership marker, so it is
+/// not our publication: cleanup must drop the record instead of failing with
+/// NotFound on every later doctor run.
+#[test]
+fn cache_location_cleanup_drops_pending_when_a_foreign_root_reuses_the_staging_inode() {
+    use crate::bash_background::persistence::REPAIR_IDENTITIES;
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = unenrolled_cache_config(temp.path());
+    crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|| panic!("simulated publication crash")));
+    });
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prepare_cache_root(&mut config)
+    }))
+    .is_err());
+    let storage = config.storage_dir.clone().unwrap();
+    let before = read_root_history(&storage).unwrap();
+    let pending = &before.pending[0];
+    fs::remove_dir_all(&pending.staging).unwrap();
+    let precious = canary(&pending.root.path, "index/foreign");
+    let reused = pending.root.identity.unwrap();
+    REPAIR_IDENTITIES.with(|ids| {
+        ids.borrow_mut()
+            .insert(pending.root.path.clone(), (reused.device, reused.inode));
+    });
+    assert_eq!(identity(&pending.root.path).unwrap(), reused);
+    let report = remove_inactive_cache_roots(&storage, &[]);
+    REPAIR_IDENTITIES.with(|ids| ids.borrow_mut().clear());
+    assert!(report.error.is_none(), "{report:?}");
+    let after = read_root_history(&storage).unwrap();
+    assert!(after.pending.is_empty());
+    assert!(after.roots.is_empty());
+    assert!(precious.is_file());
+}
+
 #[test]
 fn cache_location_concurrent_first_enrollments_do_not_poison_doctor_cleanup() {
     let temp = tempfile::tempdir().unwrap();
