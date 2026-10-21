@@ -1848,6 +1848,36 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
             metrics.insert("storage_retention_reports_omitted".into(), json!(omitted));
             continue;
         }
+        // Cache-root paths are user-chosen and may be long; drop them last,
+        // unavailable entries first because their paths repeat ones listed in
+        // cache_roots, counting each one dropped.
+        let mut trimmed_cache_path = false;
+        for (field, omitted_field) in [
+            ("cache_unavailable", "cache_unavailable_omitted"),
+            ("cache_roots", "cache_roots_omitted"),
+        ] {
+            let removed = match metrics.get_mut(field) {
+                Some(Value::Object(entries)) => {
+                    let last = entries.keys().next_back().cloned();
+                    last.is_some_and(|key| entries.remove(&key).is_some())
+                }
+                Some(Value::Array(entries)) => entries.pop().is_some(),
+                _ => false,
+            };
+            if removed {
+                let omitted = metrics
+                    .get(omitted_field)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                metrics.insert(omitted_field.into(), json!(omitted));
+                trimmed_cache_path = true;
+                break;
+            }
+        }
+        if trimmed_cache_path {
+            continue;
+        }
         return;
     }
 }
@@ -3392,9 +3422,27 @@ fn build_health_diagnostic_rollup_from_actors(
     rollup_mark!(timer, "storage retention snapshots");
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
     rollup_mark!(timer, "bash retention database count");
+    // Every context normally shares one cache root, but each context may name
+    // its own, so these lists grow with the root count. The size-budgeted
+    // reply carries at most HEALTH_ROOT_DETAIL_CAP entries of each plus an
+    // omitted count; the uncapped memory census above keeps the full lists.
+    let cache_roots_omitted = cache_roots.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
+    let cache_roots = cache_roots
+        .into_iter()
+        .take(HEALTH_ROOT_DETAIL_CAP)
+        .collect::<Vec<_>>();
+    let cache_unavailable_omitted = cache_unavailable
+        .len()
+        .saturating_sub(HEALTH_ROOT_DETAIL_CAP);
+    let cache_unavailable = cache_unavailable
+        .into_iter()
+        .take(HEALTH_ROOT_DETAIL_CAP)
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut metrics = json!({
         "cache_roots": cache_roots,
+        "cache_roots_omitted": cache_roots_omitted,
         "cache_unavailable": cache_unavailable,
+        "cache_unavailable_omitted": cache_unavailable_omitted,
         "actor_count": actor_count,
         "root_count": root_count,
         "warming_roots": warming_roots,
@@ -3876,6 +3924,37 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn health_budget_drops_long_cache_root_paths_and_counts_them() {
+        use serde_json::json;
+        let long = |index: usize| format!("/{}/{index}", "cache-volume".repeat(200));
+        let mut metrics = json!({
+            "cache_roots": (0..8).map(long).collect::<Vec<_>>(),
+            "cache_roots_omitted": 0,
+            "cache_unavailable": (0..4)
+                .map(|index| (long(index), "cache_dir_unavailable"))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            "cache_unavailable_omitted": 0,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        super::budget_health_metrics(&mut metrics);
+        let bytes = serde_json::to_vec(&metrics).unwrap().len();
+        assert!(bytes <= super::HEALTH_METRICS_BUDGET_BYTES, "{bytes}");
+        assert_eq!(metrics["metrics_bytes"].as_u64(), Some(bytes as u64));
+        let listed = metrics["cache_roots"].as_array().unwrap().len() as u64;
+        assert_eq!(listed + metrics["cache_roots_omitted"].as_u64().unwrap(), 8);
+        let unavailable = metrics["cache_unavailable"].as_object().unwrap().len() as u64;
+        assert_eq!(
+            unavailable + metrics["cache_unavailable_omitted"].as_u64().unwrap(),
+            4
+        );
+        // Unavailable roots are trimmed first: they repeat paths already
+        // counted in cache_roots.
+        assert_eq!(unavailable, 0);
     }
 
     #[test]
@@ -7458,6 +7537,20 @@ mod tests {
         assert!(report_metrics["metrics_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes <= HEALTH_METRICS_BUDGET_BYTES as u64));
+        // Each test context has its own storage, so there are fifty distinct
+        // cache roots; the reply lists a bounded number and counts the rest.
+        let listed_cache_roots = report_metrics["cache_roots"]
+            .as_array()
+            .expect("cache roots")
+            .len();
+        assert!(listed_cache_roots <= HEALTH_ROOT_DETAIL_CAP);
+        assert_eq!(
+            listed_cache_roots as u64
+                + report_metrics["cache_roots_omitted"]
+                    .as_u64()
+                    .expect("omitted cache root count"),
+            50
+        );
         assert_eq!(report_metrics["memory"]["roots_total"].as_u64(), Some(50));
         assert_eq!(
             report_metrics["memory"]["roots"]
