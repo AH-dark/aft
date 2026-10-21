@@ -30,7 +30,8 @@ Non-negotiated servers retain the separately disclosed progress/push fallback.
   unopened-neighbor analysis was introduced.
 - Producer details report `authority=document_pull` and
   `no_progress_grace_ms=0`; the prose now describes a file response rather than
-  the fallback timing rule. The fallback still requires END after publication
+  the fallback timing rule. The fallback still requires the server's
+  analysis-progress end event (`$/progress`, `kind: end`) after publication
   for an announced/begun run.
 
 ### Real protocol evidence
@@ -69,8 +70,10 @@ changing negotiation or certificate behavior.
 
 ### Final FastAPI diagnostics: three fresh processes
 
-Same source pin, dependency freeze and seeded **52-file** domain as the preceding
-progress captures: FastAPI `26dbe0b00e1211b99446500fc6e402cfec6a3b99`, Python
+Same source pin, dependency freeze and seeded **52-file** domain as the
+[progress-liveness captures](#progress-liveness-and-warm-feedback-follow-up)
+(retained as `inspect-progress-liveness/raw/fastapi-{1,2,3}/results.json` in the
+investigation directory): FastAPI `26dbe0b00e1211b99446500fc6e402cfec6a3b99`, Python
 **3.14.4**, Pyright **1.1.414**, Pydantic **2.14.1**, Starlette **1.9.0**.
 
 | Fresh process | AFT E/W | Reference E/W | Agreements | AFT-only / reference-only | Authoritative files | Authority |
@@ -79,8 +82,10 @@ progress captures: FastAPI `26dbe0b00e1211b99446500fc6e402cfec6a3b99`, Python
 | 2 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
 | 3 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
 
-Each page has full coverage (20/20, 20/20, 12/12), no Python gaps, and zero
-timing grace. Diagnostic totals by page remain **14, 11, 37** (61 errors and one
+The collector issues three scoped diagnostic requests for batches of 20, 20 and
+12 files. Each reply has full file coverage (20/20, 20/20, 12/12 authoritative
+files/examined files), no Python gaps, and zero timing grace. Diagnostic totals
+by reply remain **14, 11, 37** (61 errors and one
 warning overall). The collector still exits **1** for named project-wide
 Bash/TypeScript/YAML producer gaps; these are not Python-sample incompleteness.
 The historical reference of 50 is not silently replaced: its complete dependency
@@ -109,8 +114,10 @@ this protocol follow-up does not change liveness scoring or exclusions.
   `unchanged_pull_cannot_certify_a_startup_push_cache` fail: expected
   **RequestFailed(no_cache_for_unchanged)**. The intervening-push/request-cache
   sibling passes.
-- Each deliberate break was marked `NON-VACUITY BREAK`, applied after staging the
-  live state, recorded with a non-empty diff, and restored with checkout/touch
+- Each deliberate production-code mutation tested that removing a repair makes
+  its regression fail. The mutation carried the `NON-VACUITY BREAK` marker, was
+  applied after staging the live state, recorded with a non-empty diff, and
+  restored with checkout/touch
   to an empty unstaged diff. No break remains. Logs and exact diff pairs are in
   the investigation's `verification/` directory.
 - Eight dynamic-pull integration cases cover registration, delayed registration,
