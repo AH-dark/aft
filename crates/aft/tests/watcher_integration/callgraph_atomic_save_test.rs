@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::helpers::AftProcess;
+use crate::test_helpers::canonical_git_path;
 
 const ALPHA_SOURCE: &str = "export function probe_alpha(): number { return 1; }\n\
 export function probe_beta(): number { return 2; }\n\
@@ -36,21 +37,6 @@ fn git(root: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-/// Canonicalize `path` into a form `git worktree add` accepts. On Windows,
-/// canonicalize returns a verbatim path (`\\?\C:\...`), and git fails to create
-/// a worktree there ("could not create leading directories ... Invalid
-/// argument"), so the verbatim prefix of a local drive path is dropped.
-fn canonical_git_path(path: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(path).unwrap();
-    #[cfg(windows)]
-    if let Some(rest) = canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        if !rest.starts_with("UNC\\") {
-            return PathBuf::from(rest);
-        }
-    }
-    canonical
 }
 
 fn commit_all(root: &Path) {

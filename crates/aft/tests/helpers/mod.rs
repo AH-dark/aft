@@ -22,6 +22,20 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+/// Canonicalize a fixture root for Git path arguments. Git's Windows worktree
+/// creation rejects verbatim local-drive paths, even though Rust accepts them.
+pub fn canonical_git_path(path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).unwrap();
+    #[cfg(windows)]
+    if let Some(rest) = canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\" {
+            return PathBuf::from(rest);
+        }
+    }
+    canonical
+}
+
 /// Releases a shell fixture when its owning test scope unwinds.
 ///
 /// Several integration fixtures keep a child shell behind a sentinel file.

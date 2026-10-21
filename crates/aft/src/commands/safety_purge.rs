@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::backup::purge::{purge_session_path, session_path_keys, PurgeTarget, SavedPathMatch};
+use crate::backup::purge::{
+    backup_key_for_path, purge_session_path, session_path_keys, PurgeTarget, SavedPathMatch,
+};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -48,8 +50,7 @@ pub fn handle_safety_purge(req: &RawRequest, ctx: &AppContext) -> Response {
 /// directory still exists, so the path itself is not enough to ask for.
 ///
 /// Params: `file` (string, required).
-/// Returns: `{ path, paths }`, `paths` sorted: the checkpoint copies'
-/// spellings and the undo-backup keys.
+/// Returns: `{ path, paths }`, with sorted, distinct agent-facing locations.
 pub fn handle_safety_purge_paths(req: &RawRequest, ctx: &AppContext) -> Response {
     match handle_safety_purge_paths_impl(req, ctx) {
         Ok(response) | Err(response) => response,
@@ -67,19 +68,37 @@ fn handle_safety_purge_paths_impl(
         ctx.app().db_for_path(db_path)
     })
     .into_iter()
+    .map(|path| reported_path(&path))
     .collect::<BTreeSet<_>>();
     let (selected, _unknown) = classify_checkpoint_copies(req, ctx, &target)?;
-    paths.extend(selected.into_iter().map(|(_, path)| path));
+    paths.extend(
+        selected
+            .into_iter()
+            .map(|(_, path)| reported_location(&path)),
+    );
     Ok(Response::success(
         &req.id,
         json!({
-            "path": path.display().to_string(),
-            "paths": paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>(),
+            "path": reported_location(&path),
+            "paths": paths,
         }),
     ))
+}
+
+/// Resolve caller-spelled checkpoint paths for display only. Backup key
+/// resolution preserves a final symlink and resolves the nearest existing
+/// ancestor of a deleted path, including macOS /var and Windows short names.
+fn reported_location(path: &Path) -> String {
+    reported_path(&backup_key_for_path(path))
+}
+
+/// Undo paths already name their saved location. Do not resolve them again:
+/// a parent may since have been replaced by a symlink to a different file.
+/// Strip Windows' verbatim prefix only in the reply, never in storage keys.
+fn reported_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let path = crate::windows_path::normalize_windows_path(path);
+    path.display().to_string()
 }
 
 /// The validated location `file` names: inside the project root when the
@@ -164,7 +183,7 @@ fn handle_safety_purge_impl(req: &RawRequest, ctx: &AppContext) -> Result<Respon
         .iter()
         .map(|failure| {
             json!({
-                "target": format!("undo backups of {}", failure.path),
+                "target": format!("undo backups of {}", reported_path(Path::new(&failure.path))),
                 "error": failure.error,
             })
         })
@@ -181,7 +200,7 @@ fn handle_safety_purge_impl(req: &RawRequest, ctx: &AppContext) -> Result<Respon
             .filter(|(name, _)| !checkpoints.dropped.contains(name))
             .map(|(name, stored)| {
                 json!({
-                    "target": format!("checkpoint {name} copy of {}", stored.display()),
+                    "target": format!("checkpoint {name} copy of {}", reported_location(stored)),
                     "error": "its parent directory no longer exists, so whether it is another spelling of the purged path cannot be told; it was kept",
                 })
             }),
@@ -190,11 +209,15 @@ fn handle_safety_purge_impl(req: &RawRequest, ctx: &AppContext) -> Result<Respon
     Ok(Response::success(
         &req.id,
         json!({
-            "path": path.display().to_string(),
+            "path": reported_location(&path),
             "undo_stacks_removed": backups.removed.stacks,
             "undo_entries_removed": backups.removed.entries,
-            "undo_paths_removed": backups.removed_paths,
-            "checkpoint_paths_removed": checkpoints.paths,
+            "undo_paths_removed": backups.removed_paths.iter()
+                .map(|path| reported_path(Path::new(path)))
+                .collect::<BTreeSet<_>>(),
+            "checkpoint_paths_removed": checkpoints.paths.iter()
+                .map(|path| reported_location(path))
+                .collect::<BTreeSet<_>>(),
             "checkpoints_pruned": checkpoints
                 .pruned
                 .iter()
@@ -214,6 +237,95 @@ mod tests {
     use crate::config::Config;
     use crate::language::StubProvider;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn safety_purge_reports_one_location_for_parent_aliases() {
+        let container = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let parent = container.path().join("parent");
+        let linked_parent = container.path().join("linked-parent");
+        fs::create_dir(&parent).unwrap();
+        std::os::unix::fs::symlink(&parent, &linked_parent).unwrap();
+        let project = linked_parent.join("project");
+        fs::create_dir(&project).unwrap();
+        let real = project.join("real");
+        let alias = project.join("alias");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let secret = real.join("secret.env");
+        let alias_secret = alias.join("secret.env");
+        let unrelated = project.join("unrelated.env");
+        fs::write(&secret, "saved").unwrap();
+        fs::write(&unrelated, "unrelated saved").unwrap();
+        let ctx = AppContext::new(
+            Box::new(StubProvider),
+            Config {
+                project_root: Some(project.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        ctx.backup()
+            .lock()
+            .snapshot_with_op("s1", &alias_secret, "fixture", Some("op"))
+            .unwrap();
+        ctx.checkpoint()
+            .lock()
+            .create_for_files(
+                "s1",
+                "saved",
+                vec![secret.clone(), alias_secret.clone(), unrelated.clone()],
+            )
+            .unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot_with_op("s1", &unrelated, "fixture", Some("other-op"))
+            .unwrap();
+        let link_req: RawRequest = serde_json::from_value(json!({
+            "id": "link-entry", "command": "safety_purge", "session_id": "s1", "file": alias,
+        }))
+        .unwrap();
+        // Even below a symlinked parent, a final directory link is only its
+        // own entry. Its target's saved descendants must survive this purge.
+        let link_preview =
+            serde_json::to_value(handle_safety_purge_paths(&link_req, &ctx)).unwrap();
+        assert_eq!(link_preview["paths"], json!([]), "{link_preview}");
+        let link_purge = serde_json::to_value(handle_safety_purge(&link_req, &ctx)).unwrap();
+        assert_eq!(link_purge["undo_stacks_removed"], 0, "{link_purge}");
+        assert_eq!(
+            link_purge["checkpoint_paths_removed"],
+            json!([]),
+            "{link_purge}"
+        );
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "aliases", "command": "safety_purge", "session_id": "s1", "file": alias_secret,
+        }))
+        .unwrap();
+        let expected = json!([fs::canonicalize(&secret).unwrap()]);
+        let preview = serde_json::to_value(handle_safety_purge_paths(&req, &ctx)).unwrap();
+        assert_eq!(preview["paths"], expected, "{preview}");
+        let purged = serde_json::to_value(handle_safety_purge(&req, &ctx)).unwrap();
+        assert_eq!(purged["complete"], true, "{purged}");
+        assert_eq!(purged["undo_paths_removed"], expected, "{purged}");
+        assert_eq!(purged["checkpoint_paths_removed"], expected, "{purged}");
+        assert_eq!(purged["undo_stacks_removed"], 1, "{purged}");
+        assert_eq!(
+            purged["checkpoints_pruned"],
+            json!([{ "name": "saved", "files_removed": 2 }]),
+            "{purged}"
+        );
+        assert!(ctx.backup().lock().history("s1", &secret).is_empty());
+        assert!(!ctx.backup().lock().history("s1", &unrelated).is_empty());
+        assert_eq!(
+            ctx.checkpoint().lock().session_file_paths("s1").unwrap(),
+            vec![("saved".to_string(), unrelated.clone())]
+        );
+        fs::write(&unrelated, "changed").unwrap();
+        ctx.checkpoint().lock().restore("s1", "saved").unwrap();
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "unrelated saved");
+    }
 
     #[test]
     fn safety_purge_late_checkpoint_failure_reports_undo_removals() {
@@ -268,9 +380,9 @@ mod tests {
         assert_eq!(response["complete"], false, "{response}");
         assert_eq!(response["undo_stacks_removed"], 1, "{response}");
         assert_eq!(response["undo_entries_removed"], 1, "{response}");
-        // Undo history is keyed by the resolved path (on macOS /var resolves
-        // to /private/var), so compare against that form.
         let resolved_secret = fs::canonicalize(&secret).unwrap();
+        #[cfg(windows)]
+        let resolved_secret = crate::windows_path::normalize_windows_path(&resolved_secret);
         assert_eq!(
             response["undo_paths_removed"],
             json!([resolved_secret]),

@@ -910,15 +910,6 @@ fn pty_spawn_honors_requested_terminal_dimensions() {
     assert!(aft.shutdown().success());
 }
 
-// POSIX-only harness: hold_until_release_command uses a `sh` while-loop +
-// `printf`, which are not Windows PowerShell commands. Skip on Windows — the
-// running->completed status transition is covered on Unix here, and the real
-// Windows background spawn/status path is exercised by the Windows native E2E
-// job (real OpenCode + bridge + hoisted bash through PowerShell).
-#[cfg_attr(
-    windows,
-    ignore = "POSIX-only harness (`sh` loop); Unix + Windows native E2E cover this"
-)]
 #[cfg(unix)]
 #[test]
 fn duplicate_running_bash_warns_only_for_same_project_root_and_workdir() {
@@ -1111,6 +1102,12 @@ fn user_bash_env_is_applied_and_disclosed_once_without_values() {
     assert!(aft.shutdown().success());
 }
 
+// This marker/release fixture uses POSIX shell syntax, not Windows' default
+// cmd.exe. Keep it Unix-only; Windows native E2E covers spawn/status there.
+#[cfg_attr(
+    windows,
+    ignore = "POSIX-only harness (`sh` loop); Unix + Windows native E2E cover this"
+)]
 #[test]
 fn background_spawn_status_running_and_completion() {
     let mut aft = AftProcess::spawn();

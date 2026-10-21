@@ -2836,8 +2836,12 @@ fn purge_final_directory_symlink(restricted: bool) {
     } else {
         "purge_link_allowed"
     });
-    let root = container.join("project");
-    let outside = container.join("outside");
+    let parent = container.join("parent");
+    let linked_parent = container.join("linked-parent");
+    fs::create_dir_all(&parent).unwrap();
+    std::os::unix::fs::symlink(&parent, &linked_parent).unwrap();
+    let root = linked_parent.join("project");
+    let outside = linked_parent.join("outside");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&outside).unwrap();
     let secret = outside.join("secret.txt");
@@ -2885,6 +2889,15 @@ fn purge_final_directory_symlink(restricted: bool) {
         serde_json::json!([{ "name": "copies", "files_removed": 1 }])
     );
     assert_eq!(purge["complete"], true);
+    let reported_link = fs::canonicalize(&root).unwrap().join("link");
+    assert_eq!(
+        purge["undo_paths_removed"],
+        serde_json::json!([reported_link])
+    );
+    assert_eq!(
+        purge["checkpoint_paths_removed"],
+        serde_json::json!([reported_link])
+    );
 
     if restricted {
         let refused = session_send(
@@ -3151,7 +3164,12 @@ fn purge_preview(aft: &mut AftProcess, session: &str, path: &str) -> Vec<String>
 #[cfg(unix)]
 #[test]
 fn purge_matches_checkpoints_saved_through_a_symlinked_parent() {
-    let dir = temp_dir("purge_alias");
+    let container = temp_dir("purge_alias");
+    let parent = container.join("parent");
+    let linked_parent = container.join("linked-parent");
+    fs::create_dir_all(&parent).unwrap();
+    std::os::unix::fs::symlink(&parent, &linked_parent).unwrap();
+    let dir = linked_parent.join("project");
     let real = dir.join("real");
     fs::create_dir_all(&real).unwrap();
     std::os::unix::fs::symlink(&real, dir.join("alias")).unwrap();
@@ -3184,11 +3202,16 @@ fn purge_matches_checkpoints_saved_through_a_symlinked_parent() {
     fs::remove_dir_all(dir.join("scratch")).unwrap();
 
     let real_secret = secret.display().to_string();
+    let reported_secret = fs::canonicalize(&secret).unwrap().display().to_string();
     assert_eq!(
         purge_preview(&mut aft, "s1", &real_secret),
-        vec![dir.join("alias/secret.env").display().to_string()]
+        vec![reported_secret.clone()]
     );
     let purge = session_purge(&mut aft, "s1", &real_secret);
+    assert_eq!(
+        purge["checkpoint_paths_removed"],
+        serde_json::json!([reported_secret])
+    );
     assert_eq!(purge["checkpoints_dropped"], serde_json::json!(["aliased"]));
     assert_eq!(purge["complete"], false, "{purge:?}");
     let failures = purge["failures"].as_array().unwrap();
@@ -3202,7 +3225,7 @@ fn purge_matches_checkpoints_saved_through_a_symlinked_parent() {
     );
 
     assert!(aft.shutdown().success());
-    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&container);
 }
 
 /// A deleted directory is no longer on disk, but its saved copies are; the
@@ -3234,26 +3257,32 @@ fn purge_preview_lists_saved_copies_under_a_deleted_directory() {
     fs::remove_dir_all(dir.join("secrets")).unwrap();
 
     let canonical_dir = fs::canonicalize(&dir).unwrap();
+    #[cfg(windows)]
+    let canonical_dir = aft::windows_path::normalize_windows_path(&canonical_dir);
     let preview = purge_preview(&mut aft, "s1", "secrets");
-    let expected_secret = [
-        secret.display().to_string(),
-        canonical_dir.join("secrets/x").display().to_string(),
+    let mut expected = vec![
+        canonical_dir
+            .join("secrets")
+            .join("x")
+            .display()
+            .to_string(),
+        canonical_dir
+            .join("secrets")
+            .join("deep")
+            .join("y")
+            .display()
+            .to_string(),
     ];
-    let expected_nested = [
-        nested.display().to_string(),
-        canonical_dir.join("secrets/deep/y").display().to_string(),
-    ];
-    assert!(
-        preview.iter().any(|path| expected_secret.contains(path)),
-        "{preview:?}"
+    expected.sort();
+    assert_eq!(preview, expected);
+    let purge = session_purge(&mut aft, "s1", "secrets");
+    assert_eq!(
+        purge["undo_paths_removed"],
+        serde_json::json!([canonical_dir.join("secrets").join("x")])
     );
-    assert!(
-        preview.iter().any(|path| expected_nested.contains(path)),
-        "{preview:?}"
-    );
-    assert!(
-        preview.iter().all(|path| !path.ends_with("public.txt")),
-        "{preview:?}"
+    assert_eq!(
+        purge["checkpoint_paths_removed"],
+        serde_json::json!([canonical_dir.join("secrets").join("deep").join("y")])
     );
 
     assert!(aft.shutdown().success());

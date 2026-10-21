@@ -9,6 +9,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 use super::helpers::{user_config_tier, AftProcess};
+use crate::test_helpers::canonical_git_path;
 
 const V1_LIB: &str = "pub fn version() -> u32 {\n    1\n}\n\npub fn only_in_v1() -> &'static str {\n    \"tagged\"\n}\n";
 const MAIN_LIB: &str = "pub fn version() -> u32 {\n    2\n}\n";
@@ -61,7 +62,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// change, so every revision's content differs from the working file.
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let base = fs::canonicalize(dir.path()).unwrap();
+    let base = canonical_git_path(dir.path());
     let repo = base.join("repo");
     fs::create_dir_all(repo.join("src")).unwrap();
     git(&repo, &["init", "--quiet", "--initial-branch=main"]);
@@ -457,6 +458,9 @@ fn revision_reads_work_from_a_linked_worktree_of_the_repository() {
             "feature",
         ],
     );
+    // Git needs an ordinary drive path to create the worktree, but the product
+    // must also accept the verbatim path returned by Windows canonicalize.
+    let linked = fs::canonicalize(&linked).unwrap();
     let mut aft = AftProcess::spawn();
     let resp = aft.send(
         &json!({
