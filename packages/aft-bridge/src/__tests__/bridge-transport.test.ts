@@ -190,7 +190,6 @@ process.stdin.on("data", chunk => {
     );
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1000,
-      hangThreshold: 1,
       maxRestarts: 0,
     });
     try {
@@ -821,7 +820,7 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test("many silent timeouts in a row keep the bridge warm (hangThreshold is ignored)", async () => {
+  test("many silent timeouts in a row keep the bridge warm", async () => {
     const script = writeExecutable(
       "hang-threshold-five.js",
       `#!/usr/bin/env node
@@ -848,7 +847,6 @@ process.stdin.on("data", (chunk) => {
     );
     const bridge = new BinaryBridge(script, workDir, {
       timeoutMs: 1_000,
-      hangThreshold: 5,
       maxRestarts: 0,
     });
 

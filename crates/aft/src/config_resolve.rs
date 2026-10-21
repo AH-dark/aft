@@ -549,8 +549,6 @@ impl RawIdle {
 pub struct RawBridge {
     #[serde(deserialize_with = "deserialize_opt_bridge_request_timeout_ms")]
     pub request_timeout_ms: Option<u64>,
-    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
-    pub hang_threshold: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -4245,7 +4243,7 @@ mod tests {
                   "formatter_timeout_secs": 11,
                   "type_checker_timeout_secs": 33,
                   "auto_update": true,
-                  "bridge": { "request_timeout_ms": 3000, "hang_threshold": 3 },
+                  "bridge": { "request_timeout_ms": 3000 },
                   "semantic": {
                     "backend": "openai_compatible",
                     "base_url": "https://user.example.test",
@@ -4273,7 +4271,7 @@ mod tests {
                   "formatter_timeout_secs": 22,
                   "type_checker_timeout_secs": 44,
                   "auto_update": false,
-                  "bridge": { "request_timeout_ms": 4000, "hang_threshold": 4 },
+                  "bridge": { "request_timeout_ms": 4000 },
                   "semantic": {
                     "backend": "ollama",
                     "base_url": "https://project.example.test",

@@ -702,6 +702,7 @@ current equivalents, and those then follow the usual user/project rules:
 | `gh_read.enabled`, `gh_shim.enabled` | `github.read`, `github.shim` (`gh_shim.binary_path` stays) |
 | `idle.lsp_ttl_minutes` | `lsp.idle_minutes` |
 | `inspect.tier2_soft_deadline_ms`, `inspect.max_drill_down_items` | removed (they had no effect) |
+| `bridge.hang_threshold` | removed (no effect: see [Bridge request timeouts](#bridge-request-timeouts)) |
 | `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
 
 Translation rules: an explicit `tool_surface` in the user base is a complete
@@ -951,6 +952,24 @@ defense above only protects against post-cache-warmup tampering; the very first 
 any tag is accepted as-is once it passes the grace window and TLS verification. Supply-chain
 attacks faster than the grace window are a residual risk. A fully-vetted allowlist is on the
 roadmap.
+
+## Bridge request timeouts
+
+`bridge.request_timeout_ms` (user config only, default 30000) is the transport
+budget for one request to the shared `aft` process. A request that runs out of
+it fails on its own, with a note that a timed-out edit may still have been
+applied; other requests and the shared process are not affected. Timeouts never
+restart the shared process. Its hang watchdog restarts it when requests are
+waiting and it has written nothing at all for twice the longest budget among
+the requests it has not answered (at least 60 seconds). A call to a read-only
+tool (`read`, `outline`, `zoom`, `grep`, `glob`, `search`, `callgraph`,
+`inspect`) cut off by that restart is retried once, unless it was cancelled.
+
+`bridge.hang_threshold` used to count timeouts toward that restart and no longer
+does anything. It is retired like the keys in
+[Feature-based configuration](#feature-based-configuration-v058): loading drops
+it with a one-line notice, the user file is rewritten automatically, and
+`npx @cortexkit/aft doctor --fix` removes it from a project file.
 
 ## Durable logs and performance ticks
 

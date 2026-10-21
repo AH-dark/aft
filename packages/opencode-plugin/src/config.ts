@@ -446,15 +446,6 @@ const BridgeConfigSchema = z.object({
     .int()
     .min(1000, { message: "bridge.request_timeout_ms must be at least 1000" })
     .optional(),
-  /**
-   * Consecutive silent request timeouts before the bridge is killed and respawned.
-   * Default: 2. Raise when many editor windows share one bridge process.
-   */
-  hang_threshold: z
-    .number()
-    .int()
-    .min(1, { message: "bridge.hang_threshold must be at least 1" })
-    .optional(),
 });
 
 const SubcConfigSchema = z.object({
@@ -1976,7 +1967,6 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
 
 /** Defaults for bridge transport when omitted from config. */
 export const DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS = 30_000;
-export const DEFAULT_BRIDGE_HANG_THRESHOLD = 2;
 
 /** Default the client-side root reaper to disabled when no user configuration is provided; production deployments may enable it through their own configuration. */
 export const DEFAULT_SUBC_CLIENT_REAPER = false;
@@ -1986,14 +1976,12 @@ export function resolveSubcClientReaper(config: AftConfig): boolean {
   return config.subc?.client_reaper ?? DEFAULT_SUBC_CLIENT_REAPER;
 }
 
-/** Resolved pool/bridge options from `config.bridge` (defaults 30000 / 2). */
+/** Resolved pool/bridge options from `config.bridge` (default 30000). */
 export function resolveBridgePoolTransportOptions(config: AftConfig): {
   timeoutMs: number;
-  hangThreshold: number;
 } {
   return {
     timeoutMs: config.bridge?.request_timeout_ms ?? DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS,
-    hangThreshold: config.bridge?.hang_threshold ?? DEFAULT_BRIDGE_HANG_THRESHOLD,
   };
 }
 

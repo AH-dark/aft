@@ -1,0 +1,6 @@
+{
+  "bridge": {
+    "request_timeout_ms": 45000,
+    "hang_threshold": 3
+  }
+}

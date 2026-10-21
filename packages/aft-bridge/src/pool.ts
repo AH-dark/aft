@@ -158,7 +158,6 @@ export class BridgePool implements AftTransportPool {
     this.projectConfigLoader = options.projectConfigLoader;
     this.bridgeOptions = {
       timeoutMs: options.timeoutMs,
-      hangThreshold: options.hangThreshold,
       maxRestarts: options.maxRestarts,
       minVersion: options.minVersion,
       onVersionMismatch: options.onVersionMismatch,

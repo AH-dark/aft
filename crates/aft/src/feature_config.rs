@@ -161,6 +161,17 @@ pub const REMOVED_INSPECT_LSP_PATHS: [(&str, &str); 3] = [
     ("inspect.max_drill_down_items", "aft_inspect.topK"),
 ];
 
+/// Retired paths that no longer do anything and have no replacement. They are
+/// dropped on load and removed by `doctor --fix`, and the notice says so.
+/// `bridge.hang_threshold` counted request timeouts toward restarting the
+/// bridge; a timeout now fails only its own request, and the bridge's hang
+/// watchdog judges a stuck child by its silence instead.
+pub const REMOVED_NO_EFFECT_PATHS: [(&str, &str); 1] = [("bridge.hang_threshold", "")];
+
+/// Notice sentence for a retired `bridge.hang_threshold`. Mirrors the
+/// TypeScript `RETIRED_HANG_THRESHOLD_NOTE`.
+pub const RETIRED_HANG_THRESHOLD_NOTE: &str = "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.";
+
 /// Index leaf, its immediate legacy key and (when one exists) the older
 /// experimental alias, in precedence order after the canonical leaf.
 pub const INDEX_INPUTS: [(&str, &str, Option<&str>); 3] = [
@@ -427,6 +438,18 @@ fn translate_inspect_lsp_paths(
     }
 }
 
+/// Drop the retired keys that no longer do anything
+/// ([`REMOVED_NO_EFFECT_PATHS`]), exactly as `doctor --fix` removes them.
+fn drop_no_effect_paths(map: &mut Map<String, Value>, prefix: &str, out: &mut DocumentTranslation) {
+    for (path, _) in REMOVED_NO_EFFECT_PATHS {
+        if let Some((container, leaf)) = path.split_once('.') {
+            if take_nested(map, container, leaf).is_some() {
+                record_retired(out, prefix, path);
+            }
+        }
+    }
+}
+
 /// What a retired `enabled: false` no longer does. The translation only hides
 /// tools; indexing continues, so a user who relied on it to keep AFT out of a
 /// repository must also switch the indexes off. Mirrors the TypeScript
@@ -560,6 +583,7 @@ fn translate_block(
     };
     translate_github_aliases(map, &prefix, out);
     translate_inspect_lsp_paths(map, &prefix, out);
+    drop_no_effect_paths(map, &prefix, out);
     translate_experimental_paths(map, &prefix, out);
     if let Some(Value::Object(sandbox)) = map.get_mut("sandbox") {
         if let Some(enabled) = sandbox.remove("enabled") {
@@ -842,19 +866,31 @@ fn has_enabled_false_note(translation: &DocumentTranslation) -> bool {
         .any(|warning| warning.code == "legacy_enabled_false_indexes_still_build")
 }
 
-fn with_enabled_false_note(text: String, translation: &DocumentTranslation) -> String {
+/// Whether some block of the document set the retired `bridge.hang_threshold`.
+fn has_hang_threshold(translation: &DocumentTranslation) -> bool {
+    translation
+        .retired_keys
+        .iter()
+        .any(|key| key == "bridge.hang_threshold" || key.ends_with(".bridge.hang_threshold"))
+}
+
+/// Append the sentences that explain what a retired key no longer does.
+fn with_retirement_notes(text: String, translation: &DocumentTranslation) -> String {
+    let mut text = text;
     if has_enabled_false_note(translation) {
-        format!("{text} {RETIRED_ENABLED_FALSE_INDEXES_NOTE}")
-    } else {
-        text
+        text = format!("{text} {RETIRED_ENABLED_FALSE_INDEXES_NOTE}");
     }
+    if has_hang_threshold(translation) {
+        text = format!("{text} {RETIRED_HANG_THRESHOLD_NOTE}");
+    }
+    text
 }
 
 /// Notice for a project config file whose retired keys were translated in
 /// memory. The file itself is never written: it is shared through the
 /// repository. Mirrors the TypeScript `retiredKeysNoticeMessage`.
 pub fn project_retired_keys_notice(path: &str, translation: &DocumentTranslation) -> String {
-    with_enabled_false_note(
+    with_retirement_notes(
         format!(
             "{path} uses retired keys ({}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file.",
             translation.retired_keys.join(", ")
@@ -869,7 +905,7 @@ pub fn user_config_migrated_notice(
     backup: &str,
     translation: &DocumentTranslation,
 ) -> String {
-    with_enabled_false_note(
+    with_retirement_notes(
         format!(
             "AFT updated {path}: its retired keys ({}) now use their current equivalents. The previous file is saved as {backup}.",
             translation.retired_keys.join(", ")
@@ -885,7 +921,7 @@ pub fn user_config_not_migrated_notice(
     reason: &str,
     translation: &DocumentTranslation,
 ) -> String {
-    with_enabled_false_note(
+    with_retirement_notes(
         format!(
             "{path} uses retired keys ({}); AFT applied their current equivalents but could not update the file ({reason}). Run `npx @cortexkit/aft doctor --fix` to update it.",
             translation.retired_keys.join(", ")
@@ -1461,6 +1497,40 @@ mod tests {
             user_config_not_migrated_notice("/u/aft.jsonc", "read-only", &out)
                 .ends_with(RETIRED_ENABLED_FALSE_INDEXES_NOTE)
         );
+    }
+
+    #[test]
+    fn retired_hang_threshold_is_dropped_and_the_notice_says_it_does_nothing() {
+        let (value, out) = translate(json!({
+            "bridge": {"hang_threshold": 3, "request_timeout_ms": 45000},
+            "harnesses": {"pi": {"bridge": {"hang_threshold": 5}}}
+        }));
+        assert_eq!(
+            value,
+            json!({"bridge": {"request_timeout_ms": 45000}, "harnesses": {"pi": {}}})
+        );
+        assert!(out.legacy_input);
+        assert_eq!(
+            out.retired_keys,
+            vec![
+                "bridge.hang_threshold",
+                "harnesses.pi.bridge.hang_threshold"
+            ]
+        );
+        for notice in [
+            project_retired_keys_notice("/repo/.cortexkit/aft.jsonc", &out),
+            user_config_migrated_notice("/u/aft.jsonc", "/u/aft.jsonc.bak-1", &out),
+            user_config_not_migrated_notice("/u/aft.jsonc", "read-only", &out),
+        ] {
+            assert!(notice.ends_with(RETIRED_HANG_THRESHOLD_NOTE), "{notice}");
+            assert!(!notice.contains('\n'), "{notice}");
+        }
+
+        // Only the retired leaf goes; an emptied bridge block goes with it.
+        let (value, _) = translate(json!({"bridge": {"hang_threshold": 2}}));
+        assert_eq!(value, json!({}));
+        let (_, out) = translate(json!({"search_index": false}));
+        assert!(!project_retired_keys_notice("/p", &out).contains("hang_threshold"));
     }
     #[test]
     fn resolved_validation_reports_sorted_paths_and_containers_only() {

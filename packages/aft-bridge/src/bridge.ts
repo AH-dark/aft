@@ -417,13 +417,6 @@ export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
   /**
-   * @deprecated Ignored. Request timeouts no longer count toward killing the
-   * bridge: a timeout rejects only its own request, and a separate hang
-   * watchdog restarts a child that stays silent (see `hangWindowMs`). Still
-   * accepted so existing `bridge.hang_threshold` configs keep loading.
-   */
-  hangThreshold?: number;
-  /**
    * Floor of the hang watchdog's silence window in milliseconds. Default:
    * 60000. Tests lower it to exercise the watchdog quickly.
    */

@@ -312,6 +312,27 @@ describe("feature-config policy", () => {
     expect(conflict.warnings.every((warning) => warning.once !== true)).toBe(true);
   });
 
+  test("a retired bridge.hang_threshold is dropped and the notice says it does nothing", () => {
+    const doc: Record<string, unknown> = {
+      bridge: { hang_threshold: 3, request_timeout_ms: 45_000 },
+      harnesses: { pi: { bridge: { hang_threshold: 5 } } },
+    };
+    const out = translateConfigDocument(doc, "project");
+    expect(doc).toEqual({ bridge: { request_timeout_ms: 45_000 }, harnesses: { pi: {} } });
+    expect(out.legacyInput).toBe(true);
+    expect(out.retiredKeys).toEqual([
+      "bridge.hang_threshold",
+      "harnesses.pi.bridge.hang_threshold",
+    ]);
+    expect(legacyConfigNoticeMessage("/repo/.cortexkit/aft.jsonc", out)).toBe(
+      "/repo/.cortexkit/aft.jsonc uses retired keys (bridge.hang_threshold, harnesses.pi.bridge.hang_threshold); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.",
+    );
+
+    const only: Record<string, unknown> = { bridge: { hang_threshold: 2 } };
+    translateConfigDocument(only, "user");
+    expect(only).toEqual({});
+  });
+
   test("the project notice names the file and its retired keys", () => {
     const out = translateConfigDocument(
       { search_index: false, hoist_builtin_tools: true },
