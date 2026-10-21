@@ -341,3 +341,103 @@ fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
     );
     assert!(!again.contains("cancelled by owner"));
 }
+
+fn read_pid(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// A module restart leaves a project's saved tasks out of every live registry
+/// until that project binds again, while their processes keep running. The
+/// owner's pause before that bind must find the scope's saved task, stop its
+/// process now, and say in the reply that the task came from its saved
+/// record. A saved task of another scope is left running.
+#[test]
+fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // Saved under a harness namespace, as configured routes store them.
+    let harness_dir = storage.path().join("opencode");
+    let previous = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+    let start = |stamp: &ScopeStamp, session: &str, pid_file: &std::path::Path| {
+        with_scope_spawn(Some(stamp.clone()), || {
+            previous.spawn_with_shell_in_slot(
+                SpawnPlan::Unsandboxed,
+                &format!("sh -c 'sleep 30 & echo $! > {}; wait'", pid_file.display()),
+                crate::bash_background::BashShell::Bash,
+                crate::bash_background::registry::resolve_posix_shell(),
+                session.into(),
+                project.path().into(),
+                HashMap::new(),
+                HardKill::After(Duration::from_secs(30)),
+                harness_dir.clone(),
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.path().into()),
+            )
+        })
+        .unwrap()
+    };
+    let stamp = scope("restarted-worker");
+    let other = scope("other-worker");
+    let paused_pid_file = project.path().join("paused");
+    let other_pid_file = project.path().join("other");
+    let task = start(&stamp, "session", &paused_pid_file);
+    let other_task = start(&other, "other-session", &other_pid_file);
+    wait_for(|| paused_pid_file.exists() && other_pid_file.exists());
+    let paused_pid = read_pid(&paused_pid_file);
+    let other_pid = read_pid(&other_pid_file);
+    // The module exits: its registry lets go of the tasks without stopping
+    // them, and no project has bound since.
+    previous.detach();
+    assert!(crate::bash_background::process::is_process_alive(
+        paused_pid
+    ));
+
+    let reply = handle_bash_kill_scope_with_saved_tasks(
+        json!({"scope": stamp}),
+        Some(&stamp.owner),
+        &[],
+        Some(storage.path()),
+    );
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(
+        reply.data["killed"],
+        json!([{
+            "task_id": task,
+            "session_id": "session",
+            "remote": null,
+            "from_saved_record": true,
+        }]),
+        "{reply:?}"
+    );
+    wait_for(|| !crate::bash_background::process::is_process_alive(paused_pid));
+    assert!(crate::bash_background::process::is_process_alive(other_pid));
+
+    // The project binds later: its replay restores the task as stopped by its
+    // owner, never as a running command to resume.
+    let rebound = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+    rebound.replay_session(&harness_dir, "session").unwrap();
+    let restored = rebound.status(&task, "session", None, None, 0).unwrap();
+    assert_eq!(restored.info.status, BgTaskStatus::Killed, "{restored:?}");
+    assert_eq!(
+        restored.info.status_reason.as_deref(),
+        Some("paused_by_owner")
+    );
+    rebound.detach();
+
+    // Stop the other scope's command the same way, so the test leaves
+    // nothing running.
+    let other_reply = handle_bash_kill_scope_with_saved_tasks(
+        json!({"scope": other}),
+        Some(&other.owner),
+        &[],
+        Some(storage.path()),
+    );
+    assert_eq!(other_reply.data["killed"][0]["task_id"], other_task);
+    wait_for(|| !crate::bash_background::process::is_process_alive(other_pid));
+}
