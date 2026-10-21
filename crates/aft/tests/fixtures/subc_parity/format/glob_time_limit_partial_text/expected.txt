@@ -1,0 +1,7 @@
+1 file matching **/*.ts
+
+src/main.ts
+
+(Fallback directory walk reached its time limit after examining 3 entries; results may be incomplete.)
+
+shown 1 of ≥1 files (time limit) · narrow: path

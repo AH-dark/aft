@@ -4,7 +4,8 @@
 //! - Unit: files
 //! - Narrow: path
 //! - Causes:
-//!   - `walk` (Bounding): `walk_truncated` or `skipped_foreign_mounts > 0`
+//!   - `time_limit` (Bounding): the fallback walk's time budget expired
+//!   - `walk` (Bounding): the walk was otherwise truncated or skipped a mount
 //!   - `cap` (Selecting): `DEFAULT_MAX_RESULTS`, `MAX_DISPLAY_FILES_PER_DIRECTORY`, `MAX_DISPLAY_DIRECTORIES`
 
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
@@ -32,10 +33,33 @@ pub fn build_glob_envelope(
     walk_truncated: bool,
     skipped_foreign_mounts: usize,
 ) -> Option<ListEnvelope> {
+    build_glob_envelope_with_time_limit(
+        shown,
+        total,
+        executor_capped,
+        walk_truncated,
+        false,
+        skipped_foreign_mounts,
+    )
+}
+
+/// Builds a glob envelope that can distinguish an exhausted time budget from
+/// other reasons a filesystem walk stopped early.
+pub fn build_glob_envelope_with_time_limit(
+    shown: usize,
+    total: usize,
+    executor_capped: bool,
+    walk_truncated: bool,
+    time_limit_reached: bool,
+    skipped_foreign_mounts: usize,
+) -> Option<ListEnvelope> {
     let mut causes = Vec::new();
 
     let has_walk = walk_truncated || skipped_foreign_mounts > 0;
-    if has_walk {
+    if time_limit_reached {
+        causes.push(Reason::TimeLimit);
+    }
+    if skipped_foreign_mounts > 0 || (walk_truncated && !time_limit_reached) {
         causes.push(Reason::Walk);
     }
 
@@ -53,7 +77,6 @@ pub fn build_glob_envelope(
     } else {
         Total::Exact(total)
     };
-
     Some(ListEnvelope::new(
         shown,
         total_bound,

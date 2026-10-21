@@ -6,8 +6,8 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::list_envelope::{derive_wire_key, render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::glob::{
-    build_glob_envelope, DEFAULT_MAX_RESULTS, GLOB_LIST_ID, GLOB_NARROW, GLOB_UNIT,
-    MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY,
+    build_glob_envelope, build_glob_envelope_with_time_limit, DEFAULT_MAX_RESULTS, GLOB_LIST_ID,
+    GLOB_NARROW, GLOB_UNIT, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY,
 };
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
@@ -619,6 +619,17 @@ fn surface_registration_constants_and_types() {
     assert_eq!(env_mounts.total, Total::AtLeast(12));
     assert_eq!(env_mounts.reason, Some(Reason::Walk));
     assert_eq!(env_mounts.causes, vec![Reason::Walk]);
+
+    // A time-limited walk has its own cause and a lower-bound total.
+    let env_time = build_glob_envelope_with_time_limit(1, 1, false, true, true, 0).unwrap();
+    assert_eq!(env_time.shown, 1);
+    assert_eq!(env_time.total, Total::AtLeast(1));
+    assert_eq!(env_time.reason, Some(Reason::TimeLimit));
+    assert_eq!(env_time.causes, vec![Reason::TimeLimit]);
+    assert_eq!(
+        render_trailer(&env_time).as_deref(),
+        Some("shown 1 of ≥1 files (time limit) · narrow: path")
+    );
 
     // Walk + Cap
     let env_both = build_glob_envelope(5, 105, true, true, 0).unwrap();

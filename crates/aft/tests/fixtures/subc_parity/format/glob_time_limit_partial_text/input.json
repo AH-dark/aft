@@ -1,0 +1,37 @@
+{
+  "tool_name": "glob",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "text": "1 file matching **/*.ts\n\nsrc/main.ts\n\n(Fallback directory walk reached its time limit after examining 3 entries; results may be incomplete.)\n\nshown 1 of ≥1 files (time limit) · narrow: path",
+    "files": [
+      "src/main.ts"
+    ],
+    "total": 1,
+    "complete": false,
+    "truncated": false,
+    "walk_truncated": true,
+    "walk_entries_examined": 3,
+    "files_list_envelope": {
+      "shown": 1,
+      "total": {
+        "kind": "at_least",
+        "value": 1
+      },
+      "unit": "files",
+      "reason": "time_limit",
+      "causes": [
+        "time_limit"
+      ],
+      "narrow": [
+        "path"
+      ]
+    }
+  },
+  "ctx": {
+    "agent_args": {
+      "pattern": "**/*.ts"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

@@ -819,6 +819,10 @@ src/auth/ (4 files)
 
 Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path).
 
+When a filesystem fallback walk reaches its time limit, `glob` returns matches found so far
+with `complete: false`, reports `walk_entries_examined`, and includes a `time limit` trailer.
+Narrow the search with a smaller `path` or a more specific `pattern` to continue.
+
 ---
 
 ### aft_search

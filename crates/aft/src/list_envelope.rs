@@ -6,7 +6,7 @@ pub const R23_MAX_DISPLAY_TOTAL: usize = 999_999_999;
 pub const R23_CLAMP_THRESHOLD: usize = 1_000_000_000;
 
 /// Reason why a list-shaped surface was cut short.
-/// Precedence ordering: Walk > Depth > Budget > Cap.
+/// Precedence ordering: TimeLimit > Walk > Depth > Budget > Cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -14,12 +14,14 @@ pub enum Reason {
     Budget,
     Depth,
     Walk,
+    TimeLimit,
 }
 
 impl Reason {
     /// Numerical precedence rank: higher value means higher precedence.
     pub const fn precedence(self) -> u8 {
         match self {
+            Self::TimeLimit => 5,
             Self::Walk => 4,
             Self::Depth => 3,
             Self::Budget => 2,
@@ -29,6 +31,7 @@ impl Reason {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::TimeLimit => "time limit",
             Self::Walk => "walk",
             Self::Depth => "depth",
             Self::Budget => "budget",
