@@ -506,6 +506,7 @@ fn fake_task(
     }
     // This synthetic task has no child environment credentials.
     metadata.completion_has_env_secrets = Some(false);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
     metadata.completion_delivered = completion_delivered;
     write_task(&paths.json, &metadata).unwrap();
     fs::write(&paths.stdout, "stdout").unwrap();
@@ -3414,7 +3415,7 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
     let release_guard = ReleaseOnDrop::new(release.clone());
     let ticket_path = project.path().join("seen-ticket");
     let command = format!(
-        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s\\n' \"$AFT_GH_SHIM_TICKET\"",
+        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
         shell_quote_path(&ticket_path),
         shell_quote_path(&release),
     );
@@ -3429,6 +3430,11 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
     let persisted = read_json(storage.path(), SESSION, &id);
     assert_eq!(persisted["completion_has_env_secrets"], true);
     assert_eq!(persisted["completion_has_non_ticket_env_secrets"], false);
+    assert_eq!(
+        persisted["completion_ticket_digest"],
+        blake3::hash(ticket.as_bytes()).to_hex().to_string()
+    );
+    assert!(!persisted.to_string().contains(&ticket));
     sigkill_aft(owner);
 
     let mut restored = AftProcess::spawn();
@@ -3443,7 +3449,10 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
         .find(|completion| completion["task_id"] == id)
         .unwrap();
     let preview = completion["output_preview"].as_str().unwrap();
-    assert_eq!(preview, "ticket=<REDACTED_SECRET>\n");
+    assert_eq!(
+        preview,
+        "ticket=<REDACTED_SECRET> md5=0123456789abcdef0123456789abcdef\n"
+    );
     assert!(!preview.contains(&ticket));
     assert!(!preview.contains("secret values aren't available after the daemon restarted"));
     assert!(restored.shutdown().success());

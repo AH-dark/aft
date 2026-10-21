@@ -66,8 +66,7 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 static GITHUB_PAT: LazyLock<Regex> = LazyLock::new(|| compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"));
 static GITHUB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"));
-// AFT's in-memory gh-shim capability is a 128-bit lowercase hexadecimal ticket.
-static GH_SHIM_TICKET: LazyLock<Regex> = LazyLock::new(|| compile(r"\b[0-9a-f]{32}\b"));
+static HEX_32_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| compile(r"\b[0-9a-fA-F]{32}\b"));
 static SK_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
     compile(r"\bsk-(?:live-[A-Za-z0-9][A-Za-z0-9_-]{7,}|[A-Za-z0-9][A-Za-z0-9_-]{19,})\b")
 });
@@ -92,6 +91,47 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     redact_with_range(text, None)
+}
+
+/// Redact only a 32-hex candidate whose BLAKE3 digest matches this task's stored
+/// ticket digest. This keeps ordinary hashes and identifiers unchanged in previews.
+pub(crate) fn redact_ticket_digest<'a>(text: &'a str, digest: Option<&str>) -> Cow<'a, str> {
+    redact_ticket_digest_with_range(text, None, digest)
+}
+
+/// Range-aware form used when a watch match is anchored in captured output.
+pub(crate) fn redact_ticket_digest_range<'a>(
+    text: &'a str,
+    range: &mut std::ops::Range<usize>,
+    digest: Option<&str>,
+) -> Cow<'a, str> {
+    redact_ticket_digest_with_range(text, Some(range), digest)
+}
+
+fn redact_ticket_digest_with_range<'a>(
+    text: &'a str,
+    range: Option<&mut std::ops::Range<usize>>,
+    digest: Option<&str>,
+) -> Cow<'a, str> {
+    let Some(digest) = digest else {
+        return Cow::Borrowed(text);
+    };
+    if text.len() < 32 {
+        return Cow::Borrowed(text);
+    }
+    replace_in(
+        Cow::Borrowed(text),
+        range,
+        &HEX_32_CANDIDATE,
+        |captures: &Captures<'_>| {
+            let candidate = captures.get(0).unwrap().as_str();
+            if blake3::hash(candidate.as_bytes()).to_hex().as_str() == digest {
+                SECRET_PLACEHOLDER.to_string()
+            } else {
+                candidate.to_string()
+            }
+        },
+    )
 }
 
 fn redact_with_range<'a>(
@@ -139,14 +179,6 @@ fn redact_with_range<'a>(
     }
     if text.contains("github_pat_") {
         out = replace_in(out, range.as_deref_mut(), &GITHUB_PAT, SECRET_PLACEHOLDER);
-    }
-    if text.len() >= 32 {
-        out = replace_in(
-            out,
-            range.as_deref_mut(),
-            &GH_SHIM_TICKET,
-            SECRET_PLACEHOLDER,
-        );
     }
     if needs_github_token_scan(text) {
         out = replace_in(out, range.as_deref_mut(), &GITHUB_TOKEN, SECRET_PLACEHOLDER);

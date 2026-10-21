@@ -62,6 +62,11 @@ impl BgTaskRegistry {
             ..lossy_watch_offset(bytes, range.end, true);
         align_watch_range(&text, &mut range);
         let task = self.task(task_id);
+        let ticket_digest = task.as_ref().and_then(|task| {
+            task.lock_state()
+                .ok()
+                .and_then(|state| state.metadata.completion_ticket_digest.clone())
+        });
         let guard = task.as_ref().map(|task| {
             task.completion_secrets
                 .lock()
@@ -75,7 +80,12 @@ impl BgTaskRegistry {
         };
         // The scanner finds the watch on raw bytes. Only its presentation is
         // masked, before the context window can split a credential.
-        let masked = secrets.redact_range(&text, Some(&mut range));
+        let masked_values = secrets.redact_range(&text, Some(&mut range));
+        let masked = crate::log_redact::redact_ticket_digest_range(
+            &masked_values,
+            &mut range,
+            ticket_digest.as_deref(),
+        );
         align_watch_range(&masked, &mut range);
         let Some(matched) = masked.get(range.clone()) else {
             return (
@@ -103,9 +113,9 @@ impl BgTaskRegistry {
         });
         let empty_secrets = crate::log_redact::SecretValues::default();
         let secrets = guard.as_deref().and_then(Option::as_ref).or_else(|| {
-            (metadata.completion_has_non_ticket_env_secrets == Some(false)
-                || metadata.completion_has_env_secrets == Some(false))
-            .then_some(&empty_secrets)
+            metadata
+                .has_safe_completion_redaction_after_restart()
+                .then_some(&empty_secrets)
         });
         let Some(secrets) = secrets else {
             return withheld_preview(RESTART_PREVIEW_WITHHELD, cache);
@@ -129,11 +139,20 @@ impl BgTaskRegistry {
         };
         let mut raw = combine_streams(&stdout, &stderr);
         normalize_piped_display_output(&mut raw);
-        let masked = secrets.redact(&raw);
+        let masked_values = secrets.redact(&raw);
+        let masked = crate::log_redact::redact_ticket_digest(
+            &masked_values,
+            metadata.completion_ticket_digest.as_deref(),
+        );
         let mut safe_cache = cache.clone();
         if let Some(recovery) = &mut safe_cache.recovery {
             for line in &mut recovery.final_lines {
-                *line = secrets.redact(line).into_owned();
+                let masked_values = secrets.redact(line);
+                *line = crate::log_redact::redact_ticket_digest(
+                    &masked_values,
+                    metadata.completion_ticket_digest.as_deref(),
+                )
+                .into_owned();
             }
         }
         if let Cow::Owned(masked) = masked {
@@ -146,7 +165,12 @@ impl BgTaskRegistry {
                 // a restored line carries placeholders, never the credential.
                 let [stdout, stderr] = [stdout, stderr].map(|mut stream| {
                     normalize_piped_display_output(&mut stream);
-                    secrets.redact(&stream).into_owned()
+                    let masked_values = secrets.redact(&stream);
+                    crate::log_redact::redact_ticket_digest(
+                        &masked_values,
+                        metadata.completion_ticket_digest.as_deref(),
+                    )
+                    .into_owned()
                 });
                 let endings = stream_endings([&stdout, &stderr]);
                 let mut text = self
@@ -181,12 +205,22 @@ impl BgTaskRegistry {
                 task.as_ref().map(|task| &task.paths),
             );
         }
-        safe_cache.output_preview = secrets.redact(&safe_cache.output_preview).into_owned();
+        let masked_values = secrets.redact(&safe_cache.output_preview);
+        safe_cache.output_preview = crate::log_redact::redact_ticket_digest(
+            &masked_values,
+            metadata.completion_ticket_digest.as_deref(),
+        )
+        .into_owned();
         completion_preview_for_cache(&safe_cache, metadata.exit_code)
     }
 
     pub(super) fn mask_completion_text(&self, task_id: &str, text: &mut String) {
         let task = self.task(task_id);
+        let ticket_digest = task.as_ref().and_then(|task| {
+            task.lock_state()
+                .ok()
+                .and_then(|state| state.metadata.completion_ticket_digest.clone())
+        });
         let guard = task.as_ref().map(|task| {
             task.completion_secrets
                 .lock()
@@ -196,6 +230,7 @@ impl BgTaskRegistry {
             Some(secrets) => secrets.redact(text),
             None => aft_redactor(text),
         };
+        let masked = crate::log_redact::redact_ticket_digest(&masked, ticket_digest.as_deref());
         if let Cow::Owned(masked) = masked {
             *text = masked;
         }

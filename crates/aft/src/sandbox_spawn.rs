@@ -5235,11 +5235,12 @@ fn isolated_environment_for_plan(
     }
 }
 
-/// Stores literal secret values for output masking and whether any non-ticket
-/// secret remains sensitive after AFT's short-lived gh-shim ticket is revoked.
+/// Stores live output secrets and whether any non-ticket secret must remain
+/// withheld after restart. The ticket digest lets previews redact that exact value.
 pub(crate) struct CompletionSecrets {
     pub(crate) values: crate::log_redact::SecretValues,
     pub(crate) has_non_ticket_secrets: bool,
+    pub(crate) ticket_digest: Option<String>,
 }
 
 /// Snapshot the environment selected for the child, not the daemon's ambient
@@ -5268,16 +5269,26 @@ pub(crate) fn completion_secrets(
         !key.to_str().is_some_and(|key| {
             crate::agent_child_env::is_subc_credential_env_key(key)
                 || key == crate::privacy_spawn::CONTROL_ENV
-                || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
         })
     });
     let has_non_ticket_secrets = !crate::log_redact::SecretValues::from_environment(
         environment
             .iter()
+            .filter(|(key, _)| {
+                !key.to_str().is_some_and(|key| {
+                    key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+                })
+            })
             .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
     )
     .is_empty();
-    if let Some(ticket) = memory_only_ticket(request_environment) {
+    environment.retain(|key, _| {
+        !key.to_str()
+            .is_some_and(|key| key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV))
+    });
+    let ticket = memory_only_ticket(request_environment);
+    let ticket_digest = ticket.map(|ticket| blake3::hash(ticket.as_bytes()).to_hex().to_string());
+    if let Some(ticket) = ticket {
         environment.insert(
             crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
             ticket.into(),
@@ -5290,6 +5301,7 @@ pub(crate) fn completion_secrets(
                 .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
         ),
         has_non_ticket_secrets,
+        ticket_digest,
     }
 }
 

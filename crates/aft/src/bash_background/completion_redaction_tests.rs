@@ -53,11 +53,27 @@ fn bash_background_completion_uses_the_selected_child_environment() {
 }
 
 #[test]
+fn bash_background_completion_ignores_a_planned_ticket_when_counting_other_secrets() {
+    let plan = SpawnPlan::Host {
+        shell_path: PathBuf::from("bash"),
+        environment: std::collections::BTreeMap::from([(
+            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+            "0123456789abcdef0123456789abcdef".into(),
+        )]),
+    };
+    let secrets = crate::sandbox_spawn::completion_secrets(&plan, &HashMap::new());
+    assert!(!secrets.has_non_ticket_secrets);
+    assert!(secrets.ticket_digest.is_none());
+    assert!(secrets.values.is_empty());
+}
+
+#[test]
 fn bash_background_completion_replay_shows_ticket_only_output_and_masks_ticket() {
     const TICKET: &str = "0123456789abcdef0123456789abcdef";
+    const MD5_SHAPED: &str = "fedcba9876543210fedcba9876543210";
     let fixture = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
-    let raw_output = format!("ticket={TICKET}\n");
+    let raw_output = format!("ticket={TICKET} md5={MD5_SHAPED}\n");
     let (task_id, task) = tests::insert_terminal_piped_task(
         &registry,
         &fixture,
@@ -70,6 +86,8 @@ fn bash_background_completion_replay_shows_ticket_only_output_and_masks_ticket()
         let mut state = task.lock_state().unwrap();
         state.metadata.completion_has_env_secrets = Some(true);
         state.metadata.completion_has_non_ticket_env_secrets = Some(false);
+        state.metadata.completion_ticket_digest =
+            Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
         crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata).unwrap();
     }
 
@@ -80,12 +98,16 @@ fn bash_background_completion_replay_shows_ticket_only_output_and_masks_ticket()
         .unwrap();
     let replayed = restarted.task(&task_id).unwrap();
     let completion = restarted.completion_snapshot_for_task(&replayed).unwrap();
-    assert_eq!(completion.output_preview, "ticket=<REDACTED_SECRET>\n");
+    assert_eq!(
+        completion.output_preview,
+        format!("ticket=<REDACTED_SECRET> md5={MD5_SHAPED}\n")
+    );
     assert!(!completion.output_preview.contains(TICKET));
     let (match_text, context) =
         restarted.render_watch_preview(&task_id, raw_output.as_bytes(), 7..(7 + TICKET.len()));
     assert_eq!(match_text, "<REDACTED_SECRET>");
     assert!(!context.contains(TICKET));
+    assert!(context.contains(MD5_SHAPED));
 }
 
 #[test]
@@ -241,9 +263,15 @@ fn bash_background_completion_replay_withholds_output_and_keeps_pointers() {
         "",
         false,
     );
-    let metadata: PersistedTask =
+    let mut metadata: PersistedTask =
         serde_json::from_str(&std::fs::read_to_string(&task.paths.json).unwrap()).unwrap();
-    assert_eq!(metadata.completion_has_env_secrets, None);
+    // Older metadata could report no secrets because its check did not include
+    // AFT's ticket.
+    metadata.completion_has_env_secrets = Some(false);
+    crate::bash_background::persistence::write_task(&task.paths.json, &metadata).unwrap();
+    assert_eq!(metadata.completion_has_env_secrets, Some(false));
+    assert_eq!(metadata.completion_has_non_ticket_env_secrets, None);
+    assert_eq!(metadata.completion_ticket_digest, None);
     assert!(metadata.completion_preview.is_none());
     let replayed = BgTaskRegistry::default();
     replayed

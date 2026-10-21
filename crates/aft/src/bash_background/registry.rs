@@ -3706,6 +3706,7 @@ impl BgTaskRegistry {
         metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
         metadata.completion_has_non_ticket_env_secrets =
             Some(completion_secrets.has_non_ticket_secrets);
+        metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
@@ -4062,6 +4063,7 @@ impl BgTaskRegistry {
         metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
         metadata.completion_has_non_ticket_env_secrets =
             Some(completion_secrets.has_non_ticket_secrets);
+        metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -4330,6 +4332,7 @@ impl BgTaskRegistry {
         metadata.completion_has_env_secrets = Some(!completion_secrets.values.is_empty());
         metadata.completion_has_non_ticket_env_secrets =
             Some(completion_secrets.has_non_ticket_secrets);
+        metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -9054,9 +9057,9 @@ impl BgTaskRegistry {
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let task = Arc::new(BgTask {
             completion_secrets: Mutex::new(
-                (metadata.completion_has_non_ticket_env_secrets == Some(false)
-                    || metadata.completion_has_env_secrets == Some(false))
-                .then(Default::default),
+                metadata
+                    .has_safe_completion_redaction_after_restart()
+                    .then(Default::default),
             ),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
