@@ -23,6 +23,69 @@ pub(super) fn before_rerun_for_test(hook: Option<Box<dyn FnOnce() + Send>>) {
     *BEFORE_RERUN.lock().unwrap() = hook;
 }
 
+/// Per-call (by correlation id) approval waits for tests.
+#[cfg(test)]
+pub(super) static APPROVAL_WAIT_FOR_TEST: LazyLock<Mutex<HashMap<u64, Duration>>> =
+    LazyLock::new(Default::default);
+
+/// I/O budget deadlines given to approved reruns, newest last, for tests.
+#[cfg(test)]
+pub(super) static RERUN_BUDGETS_FOR_TEST: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn note_rerun_budget_for_test(deadline: Instant) {
+    RERUN_BUDGETS_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(deadline);
+}
+
+/// How long a consumer may take to answer one outside-path request.
+fn approval_wait(corr: u64) -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = APPROVAL_WAIT_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&corr)
+    {
+        return *wait;
+    }
+    let _ = corr;
+    bash_elicitation_timeout()
+}
+
+/// When waiting for an answer must stop: the consumer's answer window, but
+/// never so late that the approved run has less than
+/// [`consent::RERUN_MARGIN`] before the caller stops waiting for the reply.
+pub(super) fn approval_deadline(now: Instant, reply_deadline: Instant, wait: Duration) -> Instant {
+    (now + wait)
+        .min(
+            reply_deadline
+                .checked_sub(consent::RERUN_MARGIN)
+                .unwrap_or(now),
+        )
+        .max(now)
+}
+
+/// The answer for a call whose outside-path request was not answered in
+/// time: the same typed `access_pending` outcome a consent hold gives, with
+/// the capability that was asked for. Nothing was run.
+fn unanswered(call: &consent::HeldCall, grant: &crate::access_policy::AccessGrant) -> Response {
+    Response::error_with_data(
+        &call.request_id,
+        "access_pending",
+        format!(
+            "Permission to {} {} was not answered in time, so nothing was done. Run this same call again to ask again.",
+            match grant.operation {
+                crate::access_policy::AccessOperation::Read => "read",
+                crate::access_policy::AccessOperation::Write => "write",
+            },
+            grant.path.display()
+        ),
+        json!({"ask": grant}),
+    )
+}
+
 struct Registration(ReverseCorrKey);
 impl Drop for Registration {
     fn drop(&mut self) {
@@ -79,7 +142,11 @@ where
     Fut: std::future::Future<Output = (Response, String)>,
 {
     let route_hold = consent::RouteHold::new(call.route);
-    let deadline = Instant::now() + bash_elicitation_timeout();
+    let deadline = approval_deadline(
+        Instant::now(),
+        call.reply_deadline,
+        approval_wait(call.corr),
+    );
     let mut result = first;
     let mut once = Vec::new();
     while let Some(grant) = consent::requested_ask(&result.0) {
@@ -136,7 +203,12 @@ where
         let allowed = loop {
             tokio::select! {
                 answer = &mut received => break answer.unwrap_or(false),
-                _ = tokio::time::sleep_until(deadline.into()) => break false,
+                // Unanswered within the reply budget: the typed pending
+                // outcome, not a refusal and not a run that would miss its
+                // own deadline.
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    return Some((unanswered(&call, &grant), None));
+                }
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {
                     if stopped(&call, &route_hold) {
                         return None;

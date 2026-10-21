@@ -8361,6 +8361,27 @@ async fn submit_provider_read(
     Ok(())
 }
 
+/// The I/O budget one plain tool-call run gets.
+fn plain_run_io_budget(corr: u64) -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = PLAIN_RUN_IO_BUDGET_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&corr)
+    {
+        return *budget;
+    }
+    let _ = corr;
+    Duration::from_secs(25)
+}
+
+/// Per-call (by correlation id) I/O budgets for tests that need a run's
+/// budget to run out quickly.
+#[cfg(test)]
+pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, Duration>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Everything one plain (non-deferred) tool-call run needs, kept so a call
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
@@ -8375,6 +8396,10 @@ struct PlainToolRun {
     request_id: String,
     ledger_key: Option<crate::db::call_ledger::Key>,
     io_budget: crate::bounded_io::Budget,
+    /// When the caller stops waiting for this call's reply. A call held for an
+    /// approval can wait past `io_budget`, so a rerun gets a fresh I/O budget
+    /// that ends no later than this.
+    reply_deadline: Instant,
 }
 
 impl PlainToolRun {
@@ -8400,6 +8425,7 @@ impl PlainToolRun {
                 request_id: request_id_for_force,
                 ledger_key,
                 io_budget,
+                reply_deadline: _,
             } = run_spec;
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 ctx.mark_standalone_plugin_host();
@@ -8560,8 +8586,20 @@ async fn hold_for_consent(
     ver: u8,
     flags: Flags,
 ) -> Option<(Response, String)> {
+    // A consumer answering a reverse elicitation can take longer than the
+    // first run's I/O budget; its wait is bounded by the reply deadline
+    // instead. A Cingulate hold keeps its existing bound.
+    let elicitation = matches!(
+        access_grants::ask_route(&plain_run.identity),
+        crate::access_policy::AskRoute::Elicitation { .. }
+    );
+    let reply_deadline = if elicitation {
+        plain_run.reply_deadline
+    } else {
+        plain_run.io_budget.deadline
+    };
     let held = consent::HeldCall {
-        reply_deadline: plain_run.io_budget.deadline,
+        reply_deadline,
         identity: plain_run.identity.clone(),
         tool: plain_run.bare_name.clone(),
         arguments: plain_run.arguments.clone(),
@@ -8575,7 +8613,18 @@ async fn hold_for_consent(
     };
     let rerun = |ask_route| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
-        let job = plain_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
+        // The approved run gets its own I/O budget: the first run's may have
+        // been spent waiting for the answer. It still ends by the deadline the
+        // held call answers within.
+        let mut approved_run = plain_run.clone();
+        approved_run.io_budget = crate::bounded_io::Budget::after(
+            reply_deadline
+                .saturating_duration_since(Instant::now())
+                .min(plain_run_io_budget(corr)),
+        );
+        #[cfg(test)]
+        standalone::note_rerun_budget_for_test(approved_run.io_budget.deadline);
+        let job = approved_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
         let rx = resubmit_active_tool_call(
             executor,
             active_tool_calls,
@@ -8603,10 +8652,7 @@ async fn hold_for_consent(
             (response, text)
         }
     };
-    let result = if matches!(
-        access_grants::ask_route(&plain_run.identity),
-        crate::access_policy::AskRoute::Elicitation { .. }
-    ) {
+    let result = if elicitation {
         standalone::run_with_elicitation(held, (response, text), rerun, writer, metrics, ver, flags)
             .await
     } else {
@@ -9554,7 +9600,8 @@ async fn handle_tool_call(
             bind_trust,
             request_id: request_id.clone(),
             ledger_key: ledger_key.clone(),
-            io_budget: crate::bounded_io::Budget::after(Duration::from_secs(25)),
+            io_budget: crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr)),
+            reply_deadline: reply_budget.deadline,
         });
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         let completion_wake = deferred_response_tx.wake.clone();
@@ -9943,7 +9990,8 @@ async fn handle_tool_call(
         bind_trust,
         request_id: request_id.clone(),
         ledger_key,
-        io_budget: crate::bounded_io::Budget::after(Duration::from_secs(25)),
+        io_budget: crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr)),
+        reply_deadline: reply_budget.deadline,
     };
     let job = plain_run.job(
         access_grants::ask_route_for_call(&identity, &plain_run.bare_name, &plain_run.arguments),

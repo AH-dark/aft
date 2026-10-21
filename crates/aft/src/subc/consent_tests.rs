@@ -4504,3 +4504,156 @@ async fn consent_stamped_head_search_of_filesystem_root_keeps_todays_behavior() 
     assert_eq!(reply["structuredContent"]["success"], true, "{reply}");
     assert!(f.fake.calls("consent.request").is_empty());
 }
+
+/// Removes per-call test overrides when a test ends.
+struct CallOverrides(u64);
+impl Drop for CallOverrides {
+    fn drop(&mut self) {
+        crate::subc::PLAIN_RUN_IO_BUDGET_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+        standalone::APPROVAL_WAIT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
+fn allow_frame(ask: &WriterFrame) -> Frame {
+    Frame::build_with_version(
+        ask.header.ver,
+        FrameType::Response,
+        ask.header.flags,
+        41,
+        1,
+        ask.header.corr,
+        serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A consumer that answers after the first run's I/O budget has run out, but
+/// well within the caller's reply deadline, gets the approved work done: the
+/// approved run has its own, renewed I/O budget.
+#[tokio::test]
+async fn standalone_late_approval_reruns_with_a_renewed_io_budget() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let corr = 9_100_001;
+    let _overrides = CallOverrides(corr);
+    crate::subc::PLAIN_RUN_IO_BUDGET_FOR_TEST
+        .lock()
+        .unwrap()
+        .insert(corr, Duration::from_millis(1_500));
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"path": f.head_root.join("shared.txt")}),
+            corr,
+            read_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // Answer only after the first run's whole I/O budget has passed.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let approved_at = Instant::now();
+    assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    let result = standalone_reply(&mut replies).await;
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(text(&result).contains("head-owned contents"), "{result}");
+    let renewed = *standalone::RERUN_BUDGETS_FOR_TEST
+        .lock()
+        .unwrap()
+        .last()
+        .expect("the approved run was given a budget");
+    assert!(
+        renewed > approved_at,
+        "the approved run's budget was renewed"
+    );
+    f.connection_cancel.cancel();
+}
+
+/// When the consumer does not answer within the time the reply budget allows,
+/// the call ends with the typed `access_pending` outcome a consent hold gives,
+/// nothing runs, and a late answer is not accepted.
+#[tokio::test]
+async fn standalone_unanswered_approval_ends_with_access_pending() {
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counted_read(request: RawRequest, ctx: &AppContext) -> Response {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        read_dispatch(request, ctx)
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    RUNS.store(0, Ordering::SeqCst);
+    let f = fixture(FakeCingulate::up());
+    let corr = 9_100_002;
+    let _overrides = CallOverrides(corr);
+    standalone::APPROVAL_WAIT_FOR_TEST
+        .lock()
+        .unwrap()
+        .insert(corr, Duration::from_millis(300));
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"path": f.head_root.join("shared.txt")}),
+            corr,
+            counted_read,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = standalone_reply(&mut replies).await;
+    // Untrusted consumers receive errors as text; the outcome is the typed
+    // pending answer, not the denial's path error.
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        text(&result).contains("was not answered in time"),
+        "{result}"
+    );
+    assert!(
+        !text(&result).contains("outside the project root"),
+        "{result}"
+    );
+    assert!(!standalone::reply(&writer, &allow_frame(&ask)));
+    assert_eq!(RUNS.load(Ordering::SeqCst), 1, "nothing ran after the ask");
+    f.connection_cancel.cancel();
+}
+
+/// The approval wait never runs into the time the approved run needs.
+#[test]
+fn standalone_approval_deadline_leaves_the_rerun_margin() {
+    let now = Instant::now();
+    let far = now + Duration::from_secs(600);
+    assert_eq!(
+        standalone::approval_deadline(now, far, Duration::from_secs(60)),
+        now + Duration::from_secs(60)
+    );
+    let near = now + Duration::from_secs(20);
+    assert_eq!(
+        standalone::approval_deadline(now, near, Duration::from_secs(60)),
+        near - RERUN_MARGIN
+    );
+    let past = now + Duration::from_secs(1);
+    assert_eq!(
+        standalone::approval_deadline(now, past, Duration::from_secs(60)),
+        now
+    );
+}

@@ -46,7 +46,7 @@ const MAX_AWAIT: Duration = Duration::from_millis(120_000);
 /// (the shortest supported transport deadline).
 const UNDECLARED_REPLY_BUDGET: Duration = Duration::from_secs(25);
 /// Time kept back from the reply budget to run the approved call and deliver it.
-const RERUN_MARGIN: Duration = Duration::from_secs(5);
+pub(super) const RERUN_MARGIN: Duration = Duration::from_secs(5);
 /// No call is held longer than this, whatever its reply budget.
 const MAX_HOLD: Duration = Duration::from_secs(100);
 /// How often a held call checks for cancellation, route close and scope end.
