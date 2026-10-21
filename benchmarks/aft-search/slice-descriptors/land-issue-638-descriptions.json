@@ -1,0 +1,16 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "search-capability-schema-digest"
+  ],
+  "fenced_files": [
+    "packages/opencode-plugin/src/tools/semantic.ts",
+    "packages/pi-plugin/src/tools/semantic.ts"
+  ],
+  "note": "The aft_search.path description and generated schema/catalog copies now advertise the shipped bounded scan for unindexed external plain folders and refuse filesystem roots, home, and its ancestors. Only capability.schema_sha256 in real-query-baseline.json and manifest.sha256's reference_sha256 binding to that baseline's bytes are refreshed; engine behavior, ranking, and routing are unchanged, and every ranked row must remain byte-identical."
+}

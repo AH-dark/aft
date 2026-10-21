@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bf3a6a3f897e5a6b5290544ced5cbc0b0b7b67f38c1d6570cd2f446933e019bc",
-      "catalog_digest": "bf3a6a3f897e5a6b5290544ced5cbc0b0b7b67f38c1d6570cd2f446933e019bc",
+      "generation": "215e467c6ea47f6d62eea977046cf8d799d163ab6afc070ee229f978ed85b546",
+      "catalog_digest": "215e467c6ea47f6d62eea977046cf8d799d163ab6afc070ee229f978ed85b546",
       "tools": [
         {
           "name": "status",
@@ -418,7 +418,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -1189,8 +1189,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "47342c6edb1bc57ee382306cc5dd5ece6df4fd49e5c3c2244674f727fc0d5a4a",
-      "catalog_digest": "47342c6edb1bc57ee382306cc5dd5ece6df4fd49e5c3c2244674f727fc0d5a4a",
+      "generation": "b8c77dedbc0f5bf272e515e5a82cf7c5dea21dc46d8b36d2b6718ee080eefaf2",
+      "catalog_digest": "b8c77dedbc0f5bf272e515e5a82cf7c5dea21dc46d8b36d2b6718ee080eefaf2",
       "tools": [
         {
           "name": "status",
@@ -1591,7 +1591,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -2364,8 +2364,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fbbc8d335698f189fef1d112d675cdf8d634be237cccdc2dead42a2c59159691",
-      "catalog_digest": "fbbc8d335698f189fef1d112d675cdf8d634be237cccdc2dead42a2c59159691",
+      "generation": "a9c0ad8077030fe471fdd3a5e59180fb35311cc0955ce7770b698545f3783722",
+      "catalog_digest": "a9c0ad8077030fe471fdd3a5e59180fb35311cc0955ce7770b698545f3783722",
       "tools": [
         {
           "name": "status",
@@ -2686,7 +2686,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -3458,8 +3458,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "846404b4020123485e4839d8476bb98b1f2732e2302526fdee577a596297d9be",
-      "catalog_digest": "846404b4020123485e4839d8476bb98b1f2732e2302526fdee577a596297d9be",
+      "generation": "2310145ccef2c9f8716755239884dd1076077cee115c17ff5b69d2a623223e43",
+      "catalog_digest": "2310145ccef2c9f8716755239884dd1076077cee115c17ff5b69d2a623223e43",
       "tools": [
         {
           "name": "status",
@@ -3860,7 +3860,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -5714,8 +5714,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "cbd2a5a06d8aa46602a83295dd2a5befc4c1a16c841ae4ff34995d6b8a6175d7",
-      "catalog_digest": "cbd2a5a06d8aa46602a83295dd2a5befc4c1a16c841ae4ff34995d6b8a6175d7",
+      "generation": "15cb454bdd32c775a7e9d955ce1561732429ebf4e42cdfa2aff0311f7ea18263",
+      "catalog_digest": "15cb454bdd32c775a7e9d955ce1561732429ebf4e42cdfa2aff0311f7ea18263",
       "tools": [
         {
           "name": "status",
@@ -6116,7 +6116,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -7851,8 +7851,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bf3a3d3c76f241bfef2f03aa181f4e7c4d6ab6645fea552857f12333bf075f87",
-      "catalog_digest": "bf3a3d3c76f241bfef2f03aa181f4e7c4d6ab6645fea552857f12333bf075f87",
+      "generation": "e40a3e70e56e1ae4e3876adb8617f35929360657e843e5fce39caad344da61bb",
+      "catalog_digest": "e40a3e70e56e1ae4e3876adb8617f35929360657e843e5fce39caad344da61bb",
       "tools": [
         {
           "name": "status",
@@ -8253,7 +8253,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -9973,8 +9973,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "aefe5b500909ba347c20a3f82216d06a81eb8dd97097160d82b14a955fde6ac1",
-      "catalog_digest": "aefe5b500909ba347c20a3f82216d06a81eb8dd97097160d82b14a955fde6ac1",
+      "generation": "459163a940b5da6241b7cee9a6e4512686f0155d30c417bfba3e45f82a30ce25",
+      "catalog_digest": "459163a940b5da6241b7cee9a6e4512686f0155d30c417bfba3e45f82a30ce25",
       "tools": [
         {
           "name": "status",
@@ -10448,7 +10448,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -11220,8 +11220,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a2e318affb3268d0b5dbca421f727259e25c71e18cc7b56fbb4426775665c1ab",
-      "catalog_digest": "a2e318affb3268d0b5dbca421f727259e25c71e18cc7b56fbb4426775665c1ab",
+      "generation": "a2685a514d789be1bda44ed595bb9f78b246ae794cb98ddcd84aa6a3bf0293b1",
+      "catalog_digest": "a2685a514d789be1bda44ed595bb9f78b246ae794cb98ddcd84aa6a3bf0293b1",
       "tools": [
         {
           "name": "status",
@@ -11695,7 +11695,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -12469,8 +12469,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d50c8f9db6b825a3a081fa8aec4f18f9f3e8eb93852473124daed8c40754c417",
-      "catalog_digest": "d50c8f9db6b825a3a081fa8aec4f18f9f3e8eb93852473124daed8c40754c417",
+      "generation": "afec22ca14849a83660a1dade13d1a71dfe32b6897355b26a82910e447d113a7",
+      "catalog_digest": "afec22ca14849a83660a1dade13d1a71dfe32b6897355b26a82910e447d113a7",
       "tools": [
         {
           "name": "status",
@@ -12864,7 +12864,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -13637,8 +13637,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "52cc5a5f593fa93f9b655178d8693af5af180337e53ca2b828edcd2f28bbbeaa",
-      "catalog_digest": "52cc5a5f593fa93f9b655178d8693af5af180337e53ca2b828edcd2f28bbbeaa",
+      "generation": "b12a23a5b285ad14d4f5febad8a16a6127e50f6600b8a5db9aa04e7c209bbecb",
+      "catalog_digest": "b12a23a5b285ad14d4f5febad8a16a6127e50f6600b8a5db9aa04e7c209bbecb",
       "tools": [
         {
           "name": "status",
@@ -14112,7 +14112,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -16041,8 +16041,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bea3d591c87b6cf561647bac7855408c2054d3060b0fd68bf76945c3ce681816",
-      "catalog_digest": "bea3d591c87b6cf561647bac7855408c2054d3060b0fd68bf76945c3ce681816",
+      "generation": "d08f5bf8e15a1782939839f1d173ffd44acda1be336be86ad524129f06c30d97",
+      "catalog_digest": "d08f5bf8e15a1782939839f1d173ffd44acda1be336be86ad524129f06c30d97",
       "tools": [
         {
           "name": "status",
@@ -16516,7 +16516,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
@@ -18326,8 +18326,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b173c846964ab8f9d4cb665e6b270b1c6e057f606568bf85fa925d033528e3d6",
-      "catalog_digest": "b173c846964ab8f9d4cb665e6b270b1c6e057f606568bf85fa925d033528e3d6",
+      "generation": "3f2315a64249c008d642c881298adfaa900f63fde6b356922cadbe11d2c5ed56",
+      "catalog_digest": "3f2315a64249c008d642c881298adfaa900f63fde6b356922cadbe11d2c5ed56",
       "tools": [
         {
           "name": "status",
@@ -18801,7 +18801,7 @@
                 "type": "boolean"
               },
               "path": {
-                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "description": "Only set this to search a different project or plain folder (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external folders use a bounded lexical fallback; filesystem roots, home and its ancestors are refused.",
                 "type": "string"
               }
             }
