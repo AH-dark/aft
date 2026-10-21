@@ -551,6 +551,12 @@ When OpenCode 2's rules resolve a tool call to "ask", AFT calls the host's in-pr
 
 The removed `opencode.server_url` and `opencode.server_password_env` settings now fail configuration loading with `removed_config_key`. Run `npx @cortexkit/aft doctor --fix` to remove them; no replacement setting is needed.
 
+## OpenCode 2 background wakes over subc
+
+With `subc.connection_file` set, background shell completions and pattern matches wake their owning OpenCode 2 session through a session-scoped subscription. Notifications remain unacknowledged until the host admits the wake.
+
+After a Location reload or host restart, AFT restores subscriptions in the background for up to 20 of that Location directory's newest sessions whose last update was within 24 hours. Recovery is sequential and does not delay Location startup or inspect another workspace's sessions. Sessions outside that window or cap recover on their next tool call or prompt.
+
 ## Git co-authorship
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.

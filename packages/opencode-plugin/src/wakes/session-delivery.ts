@@ -44,6 +44,8 @@ export interface CompletionWake {
   readonly taskIDs: readonly string[];
   readonly text: string;
   readonly metadata?: Readonly<Record<string, unknown>>;
+  /** Distinguish a watch match from the later terminal completion of the same task. */
+  readonly notificationID?: string;
 }
 
 export interface StatusOnlyUpdate {
@@ -66,7 +68,9 @@ export class V2SessionDelivery {
   completion(input: CompletionWake): Effect.Effect<boolean, unknown> {
     return Effect.suspend(() => {
       if (this.disposed) return Effect.succeed(false);
-      const keys = [...new Set(input.taskIDs)].map((taskID) => `${input.sessionID}\0${taskID}`);
+      const keys = [...new Set(input.taskIDs)].map(
+        (taskID) => `${input.sessionID}\0${taskID}\0${input.notificationID ?? "completion"}`,
+      );
       if (keys.length === 0 || keys.every((key) => this.admittedCompletions.has(key))) {
         return Effect.succeed(false);
       }
