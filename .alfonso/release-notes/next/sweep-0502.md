@@ -1,1 +1,0 @@
-- Background cleanup and file watching use less CPU when idle: a scratch folder that cannot be removed is retried with growing waits, the task sweep stops rereading unchanged running tasks, and a watcher whose dispatch queue is full holds and merges changes instead of spinning.

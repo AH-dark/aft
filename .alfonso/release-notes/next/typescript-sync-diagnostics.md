@@ -1,1 +1,0 @@
-- Scoped `aft_inspect` on TypeScript 5 no longer reports a file as clean before its type check finishes; it asks the TypeScript server for the file's complete diagnostics, and reports the file as pending if that request fails.

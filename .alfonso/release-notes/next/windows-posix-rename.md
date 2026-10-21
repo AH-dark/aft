@@ -1,1 +1,0 @@
-- On Windows, saving a file no longer makes it briefly disappear for other programs reading it; AFT replaces it in one step when the file's owner, permissions and attributes allow, and uses the previous method otherwise.

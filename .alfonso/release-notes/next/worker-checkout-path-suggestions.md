@@ -1,1 +1,0 @@
-Worker path refusals suggest an existing counterpart in the worker's own checkout when a missing absolute path can be resolved there. Existing outside paths still require permission. Worker searches of a filesystem root fail directly with guidance to search the checkout, without opening a permission prompt.

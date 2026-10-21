@@ -1,1 +1,0 @@
-- When glob's fallback directory scan runs out of time, it now returns the matches found so far, marked incomplete, and says how many entries it checked.

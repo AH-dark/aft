@@ -1,1 +1,0 @@
-- On Linux, a project opened at a bind-mount target, such as a dev container's `/workspace`, is no longer refused as too broad, so watching, indexing and search work again (#670); thanks @OlegAndreych.

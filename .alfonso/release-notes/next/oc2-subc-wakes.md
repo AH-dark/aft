@@ -1,1 +1,0 @@
-- On OpenCode 2 with the CortexKit daemon, an idle session is now woken when its background command finishes or a watched pattern appears, including after a reload (#658); thanks @chrisolszewski.

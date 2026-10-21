@@ -1,1 +1,0 @@
-Worker launch grants can resolve the same head's policy across reconnect epochs. Unknown head policy is distinguished from a head that does not hold the requested access; confirmed scope ends prevent fallback to older live policy.

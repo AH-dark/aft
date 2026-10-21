@@ -188,13 +188,13 @@ const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.61.0";
+const ANNOUNCEMENT_VERSION = "0.62.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "OpenCode 2 now hands every AFT permission decision to OpenCode, so your permission rules and plugins apply to AFT tools too.",
-  "Shell sandboxing has per-role profiles: `sandbox.profile` (`off`, `relaxed`, `strict`) replaces `sandbox.enabled`, and `npx @cortexkit/aft doctor --fix` migrates your config.",
-  "Edits keep files' permissions and ownership, replacing them atomically when that is safe, and `apply_patch` rejects malformed or ambiguous patches before writing anything.",
-  "Much lighter background work: less CPU, disk and memory use, and no indexing of your home folder or drive roots.",
-  "Long shell waits keep their replies, remote `runon` jobs survive build-server restarts, and many reported issues are fixed.",
+  "Linux dev containers work again: a project at a bind-mount target such as `/workspace` is no longer refused as too broad.",
+  "Read a file as it is at any git revision with the opt-in `ref` argument on `read`, `aft_outline` and `aft_zoom` (set `revision_reads: true`).",
+  "`aft_safety` has a `purge` op that permanently removes a file from this session's undo backups and checkpoints, such as a secret written by mistake.",
+  "`aft_zoom` takes one `batch` of lookups mixing files and URLs, and OpenCode shows diffs for edits to files over 5,000 lines.",
+  "Idle OpenCode 2 sessions wake again when a background command finishes, and many reported issues are fixed.",
 ];
 
 /**

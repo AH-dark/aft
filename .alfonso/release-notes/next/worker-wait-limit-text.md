@@ -1,1 +1,0 @@
-- A blocking bash call (`wait: true`) that reaches the worker wait limit now always replies with the wait-limit guidance, never the background-promotion text.
