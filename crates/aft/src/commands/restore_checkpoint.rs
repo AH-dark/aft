@@ -188,6 +188,19 @@ fn validate_restore_paths(
     file_paths: &[std::path::PathBuf],
 ) -> Result<Vec<std::path::PathBuf>, Response> {
     for path in file_paths {
+        // The restore writes to the stored keys themselves, so each must be
+        // the absolute location the validator checks. A relative key would be
+        // checked at the project root but written relative to the daemon's cwd.
+        if !path.is_absolute() {
+            return Err(Response::error(
+                req_id,
+                "invalid_checkpoint_key",
+                format!(
+                    "restore_checkpoint: stored checkpoint path '{}' is not absolute; nothing was restored",
+                    path.display()
+                ),
+            ));
+        }
         ctx.validate_write_location(req_id, path)?;
     }
 

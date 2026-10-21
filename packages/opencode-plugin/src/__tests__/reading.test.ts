@@ -10,6 +10,7 @@ import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { readingTools } from "../tools/reading.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 import { noopAsk, toolResultText } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
@@ -171,11 +172,14 @@ describe("reading tool adapters", () => {
     await mkdir(project, { recursive: true });
     await mkdir(external, { recursive: true });
     const askCalls: AskCall[] = [];
-    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
-      success: true,
-      text: "external files",
-      content_files: [],
-    }));
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(
+      (_command, args) =>
+        engineOutsideAsk(external, args, true) ?? {
+          success: true,
+          text: "external files",
+          content_files: [],
+        },
+    );
 
     await tools.aft_outline.execute(
       { target: external, files: true },
@@ -186,7 +190,7 @@ describe("reading tool adapters", () => {
     expect(externalAsks).toHaveLength(1);
     expect(externalAsks[0]?.patterns).toEqual([join(external, "*").replaceAll("\\", "/")]);
     expect(externalAsks[0]?.metadata?.filepath).toBe(external);
-    expect(sendCalls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
+    expect(sendCalls).toEqual([]);
     expect(toolCallCalls[0]).toMatchObject({
       sessionId: "reading-session",
       name: "outline",
@@ -204,11 +208,15 @@ describe("reading tool adapters", () => {
     await mkdir(first, { recursive: true });
     await mkdir(second, { recursive: true });
     const askCalls: AskCall[] = [];
-    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
-      success: true,
-      text: "external files",
-      content_files: [],
-    }));
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(
+      (_command, args) =>
+        engineOutsideAsk(first, args, true) ??
+        engineOutsideAsk(second, args, true) ?? {
+          success: true,
+          text: "external files",
+          content_files: [],
+        },
+    );
 
     await tools.aft_outline.execute(
       { target: [first, second], files: true },
@@ -221,10 +229,7 @@ describe("reading tool adapters", () => {
       join(first, "*").replaceAll("\\", "/"),
       join(second, "*").replaceAll("\\", "/"),
     ]);
-    expect(sendCalls.map((call) => call.command)).toEqual([
-      "bash_artifact_owned",
-      "bash_artifact_owned",
-    ]);
+    expect(sendCalls).toEqual([]);
     expect(toolCallCalls[0]).toMatchObject({
       sessionId: "reading-session",
       name: "outline",

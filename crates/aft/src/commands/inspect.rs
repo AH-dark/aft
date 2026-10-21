@@ -863,7 +863,9 @@ fn handle_inspect_payload(
         let (tx, rx) = std::sync::mpsc::channel();
         let cancellation = crate::executor::current_job_cancellation();
         let grant_scope = crate::access_policy::current_scope();
+        let ask_route = crate::access_policy::capture_ask_route();
         std::thread::spawn(move || {
+            let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             let outcome = if use_checkout_view {

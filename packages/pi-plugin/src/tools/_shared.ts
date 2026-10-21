@@ -2,6 +2,7 @@
  * Shared helpers used by every Pi tool wrapper.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import type {
   AftProjectTransport,
@@ -220,6 +221,97 @@ export class BridgeError extends Error {
   }
 }
 
+const hostPermissionGrants = new WeakMap<object, readonly string[]>();
+const permissionOperations = new AsyncLocalStorage<Map<string, string[]>>();
+
+export function withOutsidePermissionOperation<T>(run: () => T): T {
+  return permissionOperations.run(new Map(), run);
+}
+
+function permissionOperation(tool: string, args: Record<string, unknown>): string {
+  if (["hashline_preflight", "hashline_edit", "edit", "edit_symbol"].includes(tool)) return "edit";
+  if (["undo_preview", "undo"].includes(tool)) return "safety:undo";
+  if (["checkpoint_paths", "restore_checkpoint"].includes(tool)) return "safety:restore";
+  if (tool === "checkpoint") return "safety:checkpoint";
+  if (tool === "safety") return `safety:${String(args.op ?? "")}`;
+  return (
+    ({ read_file: "read", write_file: "write", delete_file: "delete" } as Record<string, string>)[
+      tool
+    ] ?? tool
+  );
+}
+
+export function withHostPermissionGrants(args: Record<string, unknown>, grants: readonly string[]) {
+  const { permissions_granted: _untrusted, ...clean } = args;
+  hostPermissionGrants.set(clean, [...grants]);
+  return clean;
+}
+
+/** The engine owns containment; Pi only presents its exact outside-path asks. */
+export async function withOutsidePermissions<T extends Record<string, unknown>>(
+  args: Record<string, unknown>,
+  extCtx: ExtensionContext | undefined,
+  send: (args: Record<string, unknown>) => Promise<T>,
+  preview = false,
+  operation = "",
+  sessionId = "",
+): Promise<T> {
+  const { permissions_granted: _untrusted, ...clean } = args;
+  const inherited = hostPermissionGrants.get(args) ?? [];
+  const continuations = permissionOperations.getStore();
+  const key = JSON.stringify([sessionId, permissionOperation(operation, clean)]);
+  let granted = [...(continuations?.get(key) ?? [])];
+  continuations?.delete(key);
+  for (let round = 0; round < 32; round++) {
+    extCtx?.signal?.throwIfAborted();
+    const approvals = [...inherited, ...granted];
+    const response = await send(
+      approvals.length ? { ...clean, permissions_granted: approvals } : clean,
+    );
+    granted = Array.isArray(response.permissions_continuation)
+      ? response.permissions_continuation.filter(
+          (id): id is string => typeof id === "string" && id.startsWith("outside:"),
+        )
+      : [];
+    delete response.permissions_continuation;
+    if (response.success !== false || response.code !== "permission_required") {
+      if (preview && response.success !== false && granted.length) continuations?.set(key, granted);
+      return response;
+    }
+    const asks = response.asks as
+      | Array<{ kind: string; grant_id?: string; path?: string; operation?: string }>
+      | undefined;
+    if (
+      !asks?.length ||
+      !asks.every(
+        (ask) => ask.kind === "external_directory" && ask.grant_id?.startsWith("outside:"),
+      )
+    ) {
+      if (granted.length) continuations?.set(key, granted);
+      return response;
+    }
+    if (!extCtx?.hasUI || typeof extCtx.ui?.confirm !== "function") {
+      throw new BridgeError(
+        "Permission denied: outside access requires an interactive UI.",
+        "permission_denied",
+      );
+    }
+    for (const ask of asks) {
+      const approved = await extCtx.ui.confirm(
+        "Allow outside access?",
+        `${ask.operation ?? "access"}: ${ask.path ?? ""}`,
+        { signal: extCtx.signal },
+      );
+      extCtx.signal?.throwIfAborted();
+      if (!approved)
+        throw new BridgeError("Permission denied: outside access was denied.", "permission_denied");
+      const id = ask.grant_id;
+      if (id && !granted.includes(id)) granted.push(id);
+    }
+  }
+  throw new Error("outside-access permission retry failed: too many rounds");
+}
+
 /**
  * Call a bridge command and throw a BridgeError on failure.
  * Every tool handler should guard with `if (response.success === false)`
@@ -237,6 +329,8 @@ export async function callBridge(
 ): Promise<Record<string, unknown>> {
   const timeoutMs = timeoutForCommand(command);
   const merged: Record<string, unknown> = { ...params };
+  const trustedGrants = hostPermissionGrants.get(params);
+  if (trustedGrants) hostPermissionGrants.set(merged, trustedGrants);
   const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
   if (sessionId) {
     merged.session_id = sessionId;
@@ -255,10 +349,18 @@ export async function callBridge(
   try {
     const pool = bridgePools.get(bridge);
     if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, command === "bash");
-    response = await bridge.send(
-      command,
+    response = await withOutsidePermissions(
       merged,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+      extCtx,
+      (approved) =>
+        bridge.send(
+          command,
+          approved,
+          Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+        ),
+      ["undo_preview", "checkpoint_paths", "hashline_preflight"].includes(command),
+      command,
+      sessionId,
     );
   } catch (error) {
     // Host fallback and gate-off propagation both require the untouched bridge
@@ -325,11 +427,20 @@ export async function callToolCallForSession(
   try {
     const pool = bridgePools.get(bridge);
     if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, name === "bash");
-    response = await bridge.toolCall(
-      sessionId,
-      name,
+    response = await withOutsidePermissions(
       rawArgs,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+      extCtx,
+      (approved) =>
+        bridge.toolCall(
+          sessionId,
+          name,
+          approved,
+          Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+        ),
+      options?.preview === true ||
+        ["undo_preview", "checkpoint_paths", "hashline_preflight"].includes(name),
+      name,
+      sessionId,
     );
   } catch (error) {
     const noFallbackOption =

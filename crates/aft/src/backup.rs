@@ -671,6 +671,18 @@ impl TryFrom<BackupRow> for BackupEntry {
     }
 }
 
+/// What an operation undo would restore, chosen under the stack locks:
+/// the operation, its keys, the backup on top of each key's stack, and every
+/// path the undo writes or removes (`touched`: the keys plus the directories
+/// a tombstone's undo removes). Two plans are equal only if all of that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationPlan {
+    pub op_id: String,
+    pub keys: Vec<PathBuf>,
+    pub tops: Vec<String>,
+    pub touched: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RestoredOperation {
     pub op_id: String,
@@ -1314,6 +1326,50 @@ impl BackupStore {
         save_external: &mut ExternalChangeSaver<'_>,
     ) -> Result<RestoredOperation, AftError> {
         self.run_process_maintenance_once();
+        let (disk_locks, plan) = self.select_last_operation_locked(session)?;
+        let restored = self.apply_planned_operation_locked(session, &plan, save_external);
+        drop(disk_locks);
+        restored
+    }
+
+    /// Choose what an operation undo would restore right now, without
+    /// restoring anything. The stack locks are held only while choosing and
+    /// are released before this returns, so the caller can authorize the plan
+    /// (which may wait for a person) without blocking other edits or undos.
+    pub fn plan_last_operation(&mut self, session: &str) -> Result<OperationPlan, AftError> {
+        self.run_process_maintenance_once();
+        let (disk_locks, plan) = self.select_last_operation_locked(session)?;
+        drop(disk_locks);
+        Ok(plan)
+    }
+
+    /// Restore the operation `plan` describes, if it is still exactly what an
+    /// operation undo would restore: the same operation, keys, stack tops and
+    /// removed directories. Returns `Ok(None)`, having restored nothing, when
+    /// anything changed since the plan was made; the caller must authorize
+    /// the new plan before trying again.
+    pub fn restore_planned_operation(
+        &mut self,
+        session: &str,
+        plan: &OperationPlan,
+        save_external: &mut ExternalChangeSaver<'_>,
+    ) -> Result<Option<RestoredOperation>, AftError> {
+        let (disk_locks, current) = self.select_last_operation_locked(session)?;
+        if current != *plan {
+            drop(disk_locks);
+            return Ok(None);
+        }
+        let restored = self.apply_planned_operation_locked(session, &current, save_external);
+        drop(disk_locks);
+        restored.map(Some)
+    }
+
+    /// Lock the stacks of the newest operation and describe what undoing it
+    /// would touch. The returned guards keep those stacks locked.
+    fn select_last_operation_locked(
+        &mut self,
+        session: &str,
+    ) -> Result<(Vec<crate::fs_lock::LockGuard>, OperationPlan), AftError> {
         let mut candidate_keys = self.restore_operation_candidate_keys(session)?;
         if candidate_keys.is_empty() {
             self.load_latest_operation_from_db_or_log(session);
@@ -1355,42 +1411,74 @@ impl BackupStore {
                 });
             };
 
-            let keys_to_restore = self.operation_keys_for_top_op(session, &op_id);
-            if keys_to_restore.is_empty() {
+            let mut keys = self.operation_keys_for_top_op(session, &op_id);
+            if keys.is_empty() {
                 return Err(AftError::NoUndoHistory {
                     path: "operation".to_string(),
                 });
             }
-            if !keys_to_restore.iter().all(|key| locked_keys.contains(key)) {
+            if !keys.iter().all(|key| locked_keys.contains(key)) {
                 drop(disk_locks);
-                candidate_keys.extend(keys_to_restore);
+                candidate_keys.extend(keys);
                 candidate_keys.sort();
                 candidate_keys.dedup();
                 continue;
             }
 
-            let (restored, warnings, external_change_checkpoint) = self
-                .apply_operation_restore_locked(session, &op_id, &keys_to_restore, save_external)?;
-            if let Some(skips) = self.skipped_backups.get_mut(session) {
-                skips.retain(|skip| skip.op_id.as_deref() != Some(op_id.as_str()));
-                if skips.is_empty() {
-                    self.skipped_backups.remove(session);
+            keys.sort();
+            let mut touched = keys.clone();
+            let mut tops = Vec::with_capacity(keys.len());
+            for key in &keys {
+                if let Some(entry) = self
+                    .entries
+                    .get(session)
+                    .and_then(|files| files.get(key))
+                    .and_then(|stack| stack.last())
+                {
+                    tops.push(entry.backup_id.clone());
+                    if entry.kind == BackupEntryKind::Tombstone {
+                        touched.extend(entry.created_dirs.iter().cloned());
+                    }
                 }
             }
-            self.touch_session(session);
-            drop(disk_locks);
-
-            return Ok(RestoredOperation {
-                op_id,
-                restored,
-                warnings,
-                external_change_checkpoint,
-            });
+            return Ok((
+                disk_locks,
+                OperationPlan {
+                    op_id,
+                    keys,
+                    tops,
+                    touched,
+                },
+            ));
         }
 
         Err(AftError::IoError {
             path: "operation".to_string(),
             message: "backup stack changing under concurrent activity; retry".to_string(),
+        })
+    }
+
+    /// Restore `plan`, whose stacks the caller has locked.
+    fn apply_planned_operation_locked(
+        &mut self,
+        session: &str,
+        plan: &OperationPlan,
+        save_external: &mut ExternalChangeSaver<'_>,
+    ) -> Result<RestoredOperation, AftError> {
+        let (restored, warnings, external_change_checkpoint) =
+            self.apply_operation_restore_locked(session, &plan.op_id, &plan.keys, save_external)?;
+        if let Some(skips) = self.skipped_backups.get_mut(session) {
+            skips.retain(|skip| skip.op_id.as_deref() != Some(plan.op_id.as_str()));
+            if skips.is_empty() {
+                self.skipped_backups.remove(session);
+            }
+        }
+        self.touch_session(session);
+        Ok(RestoredOperation {
+            op_id: plan.op_id.clone(),
+            restored,
+            warnings,
+            external_change_checkpoint,
         })
     }
 
@@ -1936,6 +2024,28 @@ impl BackupStore {
                 path: path.display().to_string(),
             })
         }
+    }
+
+    /// Record one more directory as created by the newest entry for `key`, to
+    /// test that undo authorizes every directory it would remove.
+    #[cfg(test)]
+    pub(crate) fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
+        let entry = self
+            .entries
+            .get_mut(session)
+            .and_then(|files| files.get_mut(key))
+            .and_then(|stack| stack.last_mut())
+            .expect("key has a backup");
+        entry.created_dirs.push(dir);
+    }
+
+    /// Move a session's backups to a different key, to test how undo treats a
+    /// key it did not write itself.
+    #[cfg(test)]
+    pub(crate) fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
+        let files = self.entries.get_mut(session).expect("session has backups");
+        let stack = files.remove(from).expect("key has backups");
+        files.insert(to, stack);
     }
 
     /// Preview the paths that `restore_last_operation` would touch for `session`.

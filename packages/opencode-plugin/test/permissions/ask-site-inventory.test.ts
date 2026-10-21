@@ -22,8 +22,8 @@ const ASK_SITE_FIXTURE = {
     "context.ask(",
     "context.ask(",
     "context.ask(",
-    "context.ask(",
   ],
+  "src/tools/outside-permissions.ts": ["runtime.ask("],
 } as const;
 
 function askSites(source: string): string[] {

@@ -32,6 +32,12 @@ pub fn handle_with_dispatch(
     ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
 ) -> Response {
+    crate::access_policy::with_native_route(req.clone(), ctx, |req, ctx| {
+        handle_on_route(&req, ctx, dispatch)
+    })
+}
+
+fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>) -> Response {
     let Some(name) = req
         .params
         .get("name")

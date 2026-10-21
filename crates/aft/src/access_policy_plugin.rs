@@ -1,0 +1,250 @@
+//! Short-lived, route-bound capabilities for standalone host permission loops.
+
+use super::AccessGrant;
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub(crate) struct Scope {
+    route: Weak<dyn Any + Send + Sync>,
+    session: String,
+    tool: String,
+    /// When the earliest capability claimed for this dispatch was first
+    /// approved. Renewed continuations never outlive [`MAX_CHAIN`] from it.
+    first_approved: Option<Instant>,
+}
+
+impl Scope {
+    pub(crate) fn session(&self) -> &str {
+        &self.session
+    }
+    pub(crate) fn for_tool(mut self, tool: &str, arguments: &serde_json::Value) -> Self {
+        self.tool = tool_family(tool, arguments);
+        self
+    }
+    pub(crate) fn new<T: Any + Send + Sync>(route: &Arc<T>, session: &str) -> Self {
+        let route: Arc<dyn Any + Send + Sync> = route.clone();
+        Self {
+            route: Arc::downgrade(&route),
+            session: session.into(),
+            tool: String::new(),
+            first_approved: None,
+        }
+    }
+}
+
+impl PartialEq for Scope {
+    fn eq(&self, other: &Self) -> bool {
+        self.route.ptr_eq(&other.route) && self.session == other.session && self.tool == other.tool
+    }
+}
+
+/// Only the preflight and apply names of one logical operation share authority.
+pub(crate) fn tool_family(tool: &str, arguments: &serde_json::Value) -> String {
+    match tool {
+        "hashline_preflight" | "hashline_edit" | "edit" | "edit_symbol" => "edit".into(),
+        "undo_preview" | "undo" => "safety:undo".into(),
+        "checkpoint_paths" | "restore_checkpoint" => "safety:restore".into(),
+        "checkpoint" => "safety:checkpoint".into(),
+        "safety" => format!(
+            "safety:{}",
+            arguments
+                .get("op")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        ),
+        "read_file" => "read".into(),
+        "write_file" => "write".into(),
+        "delete_file" => "delete".into(),
+        other => other.to_owned(),
+    }
+}
+impl Eq for Scope {}
+
+struct Issued {
+    scope: Scope,
+    grant: AccessGrant,
+    expires: Instant,
+    /// The first approval this token continues, or `None` for a fresh ask
+    /// whose approval happens when it is first claimed.
+    origin: Option<Instant>,
+}
+
+static TOKENS: LazyLock<Mutex<HashMap<String, Issued>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const TTL: Duration = Duration::from_secs(5 * 60);
+/// How long one approval can be carried forward by preview-to-apply
+/// continuations. Past this, the host must ask the user again.
+pub(crate) const MAX_CHAIN: Duration = Duration::from_secs(30 * 60);
+
+pub(crate) fn issue(scope: &Scope, grant: &AccessGrant) -> String {
+    issue_until(scope, grant, Instant::now() + TTL, None)
+}
+
+fn issue_until(
+    scope: &Scope,
+    grant: &AccessGrant,
+    expires: Instant,
+    origin: Option<Instant>,
+) -> String {
+    let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    tokens
+        .retain(|_, token| token.expires > Instant::now() && token.scope.route.strong_count() > 0);
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).expect("operating system random source for plugin approval tokens");
+    let id = format!(
+        "outside:{}",
+        nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    tokens.insert(
+        id.clone(),
+        Issued {
+            scope: scope.clone(),
+            grant: grant.clone(),
+            expires,
+            origin,
+        },
+    );
+    id
+}
+
+/// Claim at admission, once per dispatch. Repeated path checks within that
+/// dispatch share the claimed capability, but replaying the token cannot.
+/// The scope records the earliest first-approval time among the claimed
+/// tokens, which bounds any continuation issued for this dispatch.
+pub(crate) fn claim(scope: &mut Scope, ids: &[String]) -> Vec<AccessGrant> {
+    let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    tokens.retain(|_, token| token.expires > now && token.scope.route.strong_count() > 0);
+    let mut grants = Vec::new();
+    for id in ids {
+        if tokens.get(id).is_some_and(|token| token.scope == *scope) {
+            if let Some(token) = tokens.remove(id) {
+                let origin = token.origin.unwrap_or(now);
+                scope.first_approved = Some(
+                    scope
+                        .first_approved
+                        .map_or(origin, |earlier| earlier.min(origin)),
+                );
+                grants.push(token.grant);
+            }
+        }
+    }
+    grants
+}
+
+/// Re-issue claimed capabilities for the apply half of a preview. Each
+/// renewal gets a fresh short TTL, but never past [`MAX_CHAIN`] from the
+/// first approval; once that passes nothing is renewed and the host asks again.
+pub(crate) fn continuation(scope: &Scope, grants: &[AccessGrant]) -> Vec<String> {
+    continuation_at(scope, grants, Instant::now())
+}
+
+fn continuation_at(scope: &Scope, grants: &[AccessGrant], now: Instant) -> Vec<String> {
+    let origin = scope.first_approved.unwrap_or(now);
+    let deadline = origin + MAX_CHAIN;
+    if now >= deadline {
+        return Vec::new();
+    }
+    let expires = (now + TTL).min(deadline);
+    grants
+        .iter()
+        .map(|grant| issue_until(scope, grant, expires, Some(origin)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access_policy::{AccessOperation, GrantKind};
+
+    #[test]
+    fn plugin_tokens_bind_route_session_and_expiry_and_are_single_use() {
+        let owner = Arc::new(());
+        let mut scope = Scope::new(&owner, "session").for_tool("read", &serde_json::Value::Null);
+        let grant = AccessGrant {
+            path: "/outside/a".into(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let token = issue(&scope, &grant);
+        assert!(claim(
+            &mut Scope::new(&Arc::new(()), "session").for_tool("read", &serde_json::Value::Null),
+            &[token.clone()]
+        )
+        .is_empty());
+        assert!(claim(
+            &mut Scope::new(&owner, "other").for_tool("read", &serde_json::Value::Null),
+            &[token.clone()]
+        )
+        .is_empty());
+        assert!(claim(
+            &mut Scope::new(&owner, "session").for_tool("write", &serde_json::Value::Null),
+            &[token.clone()]
+        )
+        .is_empty());
+        assert_eq!(claim(&mut scope, &[token.clone()]), vec![grant.clone()]);
+        assert!(claim(&mut scope, &[token]).is_empty());
+        assert!(claim(
+            &mut scope,
+            &[format!(
+                "outside:{}",
+                serde_json::to_string(&grant).unwrap()
+            )]
+        )
+        .is_empty());
+        let expired = issue(&scope, &grant);
+        TOKENS.lock().unwrap().get_mut(&expired).unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
+        assert!(claim(&mut scope, &[expired]).is_empty());
+    }
+
+    /// Each preview-to-apply renewal gets a fresh short TTL, but a chain of
+    /// renewals cannot keep one approval alive past the absolute cap.
+    #[test]
+    fn plugin_continuations_stop_renewing_after_the_absolute_cap() {
+        let owner = Arc::new(());
+        let fresh = || Scope::new(&owner, "session").for_tool("edit", &serde_json::Value::Null);
+        let grant = AccessGrant {
+            path: "/outside/b".into(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Write,
+        };
+        let mut scope = fresh();
+        let token = issue(&scope, &grant);
+        assert_eq!(claim(&mut scope, &[token]), vec![grant.clone()]);
+        let approved = scope.first_approved.unwrap();
+
+        // A renewal carries the original approval time, so claiming it in a
+        // later dispatch keeps the chain anchored to the first approval.
+        let renewed = continuation(&scope, std::slice::from_ref(&grant));
+        assert_eq!(renewed.len(), 1);
+        assert_eq!(
+            TOKENS.lock().unwrap().get(&renewed[0]).unwrap().origin,
+            Some(approved)
+        );
+        let mut next = fresh();
+        assert_eq!(claim(&mut next, &renewed), vec![grant.clone()]);
+        assert_eq!(next.first_approved, Some(approved));
+
+        // Just inside the cap a renewal is issued, but it expires at the cap
+        // rather than a full TTL later.
+        let late = approved + MAX_CHAIN - Duration::from_secs(60);
+        let last = continuation_at(&next, std::slice::from_ref(&grant), late);
+        assert_eq!(last.len(), 1);
+        assert_eq!(
+            TOKENS.lock().unwrap().get(&last[0]).unwrap().expires,
+            approved + MAX_CHAIN
+        );
+
+        // At the cap nothing is renewed: the apply half must ask again.
+        assert!(
+            continuation_at(&next, std::slice::from_ref(&grant), approved + MAX_CHAIN).is_empty()
+        );
+    }
+}

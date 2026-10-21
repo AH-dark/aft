@@ -307,16 +307,27 @@ fn move_file_cross_fs_copy_delete_failure_reports_partial_success() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, src_tmp.path());
 
-    let resp = aft.send_with_timeout(
-        &json!({
-            "id": "move-partial-delete",
-            "command": "move_file",
-            "file": src_path.display().to_string(),
-            "destination": dst_path.display().to_string(),
-        })
-        .to_string(),
-        std::time::Duration::from_secs(120),
-    );
+    let request = json!({
+        "id": "move-partial-delete",
+        "command": "move_file",
+        "file": src_path.display().to_string(),
+        "destination": dst_path.display().to_string(),
+    });
+    // This root is configured for an OpenCode host, whose outside-access
+    // decision the engine owns: the destination outside the project first
+    // comes back as a two-phase ask, and the plugin retries with the echoed
+    // grant id once the user allows it.
+    let ask = aft.send_with_timeout(&request.to_string(), std::time::Duration::from_secs(120));
+    assert_eq!(ask["code"], "permission_required", "{ask:?}");
+    assert!(!dst_path.exists(), "nothing is written before approval");
+    let mut approved = request.clone();
+    approved["permissions_granted"] = json!(ask["asks"]
+        .as_array()
+        .expect("asks")
+        .iter()
+        .map(|ask| ask["grant_id"].clone())
+        .collect::<Vec<_>>());
+    let resp = aft.send_with_timeout(&approved.to_string(), std::time::Duration::from_secs(120));
 
     std::fs::set_permissions(src_parent, std::fs::Permissions::from_mode(original_mode))
         .expect("restore source parent permissions");

@@ -286,7 +286,7 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 
 /// Routes attested as prefrontal-core heads, workers or runs send access asks
 /// to Cingulate, the consent service, never to a plugin prompt. Other routes
-/// retain compatibility behavior: an outside-root ask is treated as allow.
+/// use their plugin UI or reverse elicitation, never the consent service.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
     // No path yet carries a codemode call's question to the head agent's
     // user, so such a call is refused rather than asked or allowed.
@@ -298,8 +298,46 @@ pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRo
             once: Vec::new(),
             launch: launch_key(identity, "worker"),
         }
+    } else if matches!(identity.trust, super::BindTrust::FirstParty)
+        && matches!(identity.harness.as_str(), "opencode" | "pi")
+    {
+        crate::access_policy::AskRoute::Plugin {
+            scope: crate::access_policy::plugin::Scope::new(&identity.0, &identity.session),
+            once: Vec::new(),
+        }
+    } else if matches!(identity.trust, super::BindTrust::Untrusted)
+        && identity.consumer_elicitation_capable
+    {
+        crate::access_policy::AskRoute::Elicitation { once: Vec::new() }
     } else {
-        crate::access_policy::AskRoute::Lowered
+        crate::access_policy::AskRoute::Deny
+    }
+}
+
+pub(super) fn ask_route_for_call(
+    identity: &RouteIdentity,
+    tool: &str,
+    arguments: &Value,
+) -> crate::access_policy::AskRoute {
+    match ask_route(identity) {
+        crate::access_policy::AskRoute::Plugin { .. } => {
+            let mut scope =
+                crate::access_policy::plugin::Scope::new(&identity.0, &identity.session)
+                    .for_tool(tool, arguments);
+            let tokens: Vec<String> = arguments
+                .get("permissions_granted")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let once = crate::access_policy::plugin::claim(&mut scope, &tokens);
+            crate::access_policy::AskRoute::Plugin { scope, once }
+        }
+        other => other,
     }
 }
 

@@ -28,6 +28,7 @@ import { resolveIsSubagent, resolveSubagentStatus } from "../shared/subagent-det
 import type { PluginContext } from "../types.js";
 import { trackV2BackgroundTask, v2StopEpoch } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
+import { withHostPermissionGrants } from "./outside-permissions.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -367,10 +368,14 @@ async function withPermissionLoop(
   bridgeCall: BridgeCaller,
   options?: BridgeRequestOptions,
 ): ReturnType<BridgeCaller> {
-  const granted = Array.isArray(params.permissions_granted)
-    ? params.permissions_granted.filter((value): value is string => typeof value === "string")
-    : [];
-  let response = await bridgeCall(ctx, runtime, "bash", params, options);
+  const granted: string[] = [];
+  let response = await bridgeCall(
+    ctx,
+    runtime,
+    "bash",
+    withHostPermissionGrants(params, granted),
+    options,
+  );
 
   for (let round = 0; round < 8; round++) {
     if (response.success !== false || response.code !== "permission_required") return response;
@@ -404,7 +409,7 @@ async function withPermissionLoop(
       ctx,
       runtime,
       "bash",
-      { ...params, permissions_granted: granted },
+      withHostPermissionGrants(params, granted),
       options,
     );
   }

@@ -507,7 +507,7 @@ pub(super) struct RouteHold {
 }
 
 impl RouteHold {
-    fn new(route: RouteChannel) -> Self {
+    pub(super) fn new(route: RouteChannel) -> Self {
         let closed = Arc::new(AtomicBool::new(false));
         HELD.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -517,7 +517,7 @@ impl RouteHold {
         Self { route, closed }
     }
 
-    fn closed(&self) -> bool {
+    pub(super) fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 }
@@ -594,6 +594,19 @@ where
     F: FnMut(AskRoute) -> Fut,
     Fut: Future<Output = (Response, String)>,
 {
+    if !matches!(
+        access_grants::ask_route(&call.identity),
+        AskRoute::Consent { .. }
+    ) {
+        return Some((
+            Response::error(
+                &call.request_id,
+                "path_outside_root",
+                "outside-path access needs a permission-capable route",
+            ),
+            None,
+        ));
+    }
     let Some(mut grant) = requested_ask(&first.0) else {
         return Some((first.0, Some(first.1)));
     };

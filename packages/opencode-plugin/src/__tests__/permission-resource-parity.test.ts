@@ -226,11 +226,10 @@ describe("filesystem mutations state one permission resource shape", () => {
 
       const { edit, asks } = await statedResources(mutation, project, source, destination);
 
-      // An outside path has no project-relative form, so it must stay
-      // absolute — and the external-directory permission that guards it has to
-      // keep firing.
+      // The edit resource stays absolute. The mock engine allows the call,
+      // so the plugin must not invent a second outside-access decision.
       expect(edit).toEqual(mutation.outsideResources(source, destination));
-      expect(asks.some((call) => call.permission === "external_directory")).toBe(true);
+      expect(asks.some((call) => call.permission === "external_directory")).toBe(false);
     });
   }
 

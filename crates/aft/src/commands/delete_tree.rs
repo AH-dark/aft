@@ -132,6 +132,27 @@ impl UnsupportedKind {
 pub(crate) struct TreeEntry {
     pub(crate) path: PathBuf,
     pub(crate) kind: NodeKind,
+    /// Device and inode of the entry itself (never a link's target) when the
+    /// walk recorded it. On Unix every entry, directories and the root
+    /// included, is deleted only while it is still this object; Windows has
+    /// no portable identity here and binds children through handles instead.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) identity: Option<(u64, u64)>,
+}
+
+/// The identity a recursive delete records for an entry, from metadata read
+/// without following a final symlink.
+#[cfg(unix)]
+pub(crate) fn recorded_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// The identity a recursive delete records for an entry: none on platforms
+/// without a portable device and inode.
+#[cfg(not(unix))]
+pub(crate) fn recorded_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// Everything a recursive delete will back up and remove.
@@ -174,9 +195,11 @@ pub(crate) fn walk_tree(
         seen_files: HashSet::new(),
     };
     walk.count_entry()?;
+    let identity = recorded_identity(&std::fs::symlink_metadata(root)?);
     walk.manifest.entries.push(TreeEntry {
         path: root.to_path_buf(),
         kind: NodeKind::Directory,
+        identity,
     });
     walk.walk_dir(root)?;
     Ok(walk.manifest)
@@ -230,11 +253,14 @@ impl Walk<'_> {
             // symlinks, so a link is recorded as a link and never entered.
             let file_type = entry.file_type()?;
             self.count_entry()?;
+            // `DirEntry::metadata` does not follow a symlink either.
+            let identity = recorded_identity(&entry.metadata()?);
             if file_type.is_dir() {
                 if self.boundary.should_descend(&path)? {
                     self.manifest.entries.push(TreeEntry {
                         path: path.clone(),
                         kind: NodeKind::Directory,
+                        identity,
                     });
                     self.walk_dir(&path)?;
                 } else {
@@ -247,6 +273,7 @@ impl Walk<'_> {
                     None => self.manifest.entries.push(TreeEntry {
                         path,
                         kind: NodeKind::Symlink,
+                        identity,
                     }),
                     Some(kind) => self.manifest.unsupported.push((path, kind)),
                 }
@@ -259,12 +286,14 @@ impl Walk<'_> {
                 self.manifest.entries.push(TreeEntry {
                     path,
                     kind: NodeKind::File { dev, ino, nlink },
+                    identity,
                 });
             } else {
                 match special_file_kind(&file_type) {
                     None => self.manifest.entries.push(TreeEntry {
                         path,
                         kind: NodeKind::Socket,
+                        identity,
                     }),
                     Some(kind) => self.manifest.unsupported.push((path, kind)),
                 }
@@ -367,6 +396,40 @@ pub(crate) struct DeleteStopped {
     pub(crate) cancelled: bool,
     pub(crate) files_deleted: usize,
     pub(crate) directories_deleted: usize,
+    /// An entry was no longer the object the walk recorded, so it and
+    /// everything holding it were left in place.
+    pub(crate) changed: bool,
+    /// The tree's root could not be bound to an authorized location, so
+    /// nothing was deleted: the response to return instead of a partial
+    /// delete report.
+    pub(crate) refusal: Option<crate::protocol::Response>,
+}
+
+/// Authorizes the located tree root and returns the identity the access
+/// policy judged (the canonical parent plus the root's own name).
+pub(crate) type AuthorizeRoot<'a> =
+    &'a mut dyn FnMut(&Path) -> Result<PathBuf, crate::protocol::Response>;
+
+/// The tree root's location changed between finding it and authorizing it.
+#[cfg(any(unix, windows))]
+fn root_changed(req_id: &str, root: &Path) -> DeleteStopped {
+    refused(
+        root,
+        crate::protocol::Response::error(
+            req_id,
+            "path_changed",
+            format!(
+                "delete_file: '{}' changed while it was being deleted; nothing was deleted",
+                root.display()
+            ),
+        ),
+    )
+}
+
+fn refused(root: &Path, response: crate::protocol::Response) -> DeleteStopped {
+    let mut error = stopped(root, "the tree root was not authorized");
+    error.refusal = Some(response);
+    error
 }
 
 /// Deletes are incremental, not an atomic commit: keep the job cancellable
@@ -414,7 +477,19 @@ thread_local! {
 /// never followed. A directory that is not empty once its recorded entries
 /// are gone held something created after the walk: the delete stops there
 /// and leaves it, and everything above it, in place.
-pub(crate) fn delete_recorded_tree(manifest: &TreeManifest) -> Result<(), DeleteStopped> {
+///
+/// The root is bound first, the same way a single-entry delete is: the
+/// directory holding it (on Windows, the root itself) is opened and held,
+/// its real location is passed to `authorize`, and the held object is
+/// checked to still be the one the policy judged. Every removal then goes
+/// through held handles. A refusal there deletes nothing and comes back in
+/// [`DeleteStopped::refusal`]. The contract this implements is described on
+/// [`crate::commands::delete_file::handle_delete_file`].
+pub(crate) fn delete_recorded_tree(
+    manifest: &TreeManifest,
+    req_id: &str,
+    authorize: AuthorizeRoot<'_>,
+) -> Result<(), DeleteStopped> {
     let Some(root) = manifest.entries.first() else {
         return Ok(());
     };
@@ -431,7 +506,7 @@ pub(crate) fn delete_recorded_tree(manifest: &TreeManifest) -> Result<(), Delete
     }
     #[cfg(test)]
     crate::commands::delete_file::delete_gate_for_test(&root.path);
-    platform::delete_tree(&root.path, &children, &mut progress).map_err(|mut error| {
+    platform::delete_tree(root, &children, &mut progress, req_id, authorize).map_err(|mut error| {
         error.files_deleted = progress.files;
         error.directories_deleted = progress.directories;
         error
@@ -445,12 +520,30 @@ fn stopped(path: &Path, reason: impl std::fmt::Display) -> DeleteStopped {
         cancelled: false,
         files_deleted: 0,
         directories_deleted: 0,
+        changed: false,
+        refusal: None,
     }
+}
+
+/// `path` is no longer the object the walk recorded.
+#[cfg(any(unix, windows))]
+fn replaced(path: &Path) -> DeleteStopped {
+    let mut error = stopped(
+        path,
+        "it was replaced after the delete started, so it and what holds it were left in place",
+    );
+    error.changed = true;
+    error
 }
 
 #[cfg(unix)]
 mod platform {
-    use super::{stopped, DeleteProgress, DeleteStopped, NodeKind, TreeEntry};
+    use super::{
+        refused, root_changed, stopped, AuthorizeRoot, DeleteProgress, DeleteStopped, NodeKind,
+        TreeEntry,
+    };
+    #[cfg(test)]
+    use crate::commands::delete_file::UnlinkStage;
     use std::collections::HashMap;
     use std::ffi::{CString, OsStr};
     use std::io;
@@ -509,10 +602,11 @@ mod platform {
         Ok(stat)
     }
 
-    /// Whether the entry on disk is still the one the walk recorded.
-    fn matches_record(stat: &libc::stat, kind: NodeKind) -> bool {
+    /// Whether the entry on disk is still the one the walk recorded: the same
+    /// type and, where the walk recorded one, the same device and inode.
+    fn matches_record(stat: &libc::stat, entry: &TreeEntry) -> bool {
         let format = stat.st_mode & libc::S_IFMT;
-        match kind {
+        let same_kind = match entry.kind {
             NodeKind::File { dev, ino, .. } => {
                 format == libc::S_IFREG && stat.st_dev as u64 == dev && stat.st_ino as u64 == ino
             }
@@ -520,16 +614,36 @@ mod platform {
             NodeKind::Socket => format == libc::S_IFSOCK,
             NodeKind::Directory => format == libc::S_IFDIR,
             NodeKind::Unbacked => format != libc::S_IFDIR,
+        };
+        same_kind && same_identity(stat, entry)
+    }
+
+    fn same_identity(stat: &libc::stat, entry: &TreeEntry) -> bool {
+        entry
+            .identity
+            .is_none_or(|(dev, ino)| stat.st_dev as u64 == dev && stat.st_ino as u64 == ino)
+    }
+
+    fn fstat(fd: &OwnedFd) -> io::Result<libc::stat> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: live descriptor and a writable stat out-parameter.
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(stat)
     }
 
     pub(super) fn delete_tree(
-        root: &Path,
+        root_entry: &TreeEntry,
         children: &HashMap<&Path, Vec<&TreeEntry>>,
         progress: &mut DeleteProgress,
+        req_id: &str,
+        authorize: AuthorizeRoot<'_>,
     ) -> Result<(), DeleteStopped> {
+        use std::os::unix::fs::MetadataExt;
+        let root = root_entry.path.as_path();
         progress.checkpoint(root)?;
-        let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        let (Some(parent), Some(root_name)) = (root.parent(), root.file_name()) else {
             return Err(stopped(root, "cannot delete a filesystem root"));
         };
         let parent = if parent.as_os_str().is_empty() {
@@ -538,19 +652,76 @@ mod platform {
             parent
         };
         let parent_name = c_name(parent.as_os_str()).map_err(|e| stopped(parent, e))?;
-        // The parent was validated by the caller and may legitimately be
-        // reached through a symlink (such as /tmp on macOS); the tree itself,
-        // from its root down, is never entered through one.
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::BeforePin);
+        // The parent may legitimately be reached through a symlink (such as
+        // /tmp on macOS), so it is opened by path and then bound below; the
+        // tree itself, from its root down, is never entered through one.
         let parent_fd =
             open_dir(libc::AT_FDCWD, &parent_name, false).map_err(|e| stopped(parent, e))?;
-        let name = c_name(name).map_err(|e| stopped(root, e))?;
+        // Bind the held parent to an authorized location, as a single-entry
+        // delete does: find where it is, authorize the root there, then check
+        // that the policy judged that directory and that it is still the one
+        // held open.
+        let pinned = fstat(&parent_fd).map_err(|e| stopped(parent, e))?;
+        let held = |path: &Path| {
+            std::fs::metadata(path).is_ok_and(|current| {
+                current.dev() == pinned.st_dev as u64 && current.ino() == pinned.st_ino as u64
+            })
+        };
+        let located = std::fs::canonicalize(parent).map_err(|_| root_changed(req_id, root))?;
+        if !held(&located) {
+            return Err(root_changed(req_id, root));
+        }
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::BeforeAuthorize);
+        let judged =
+            authorize(&located.join(root_name)).map_err(|response| refused(root, response))?;
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::AfterAuthorize);
+        if judged.parent() != Some(located.as_path()) || !held(&located) {
+            return Err(root_changed(req_id, root));
+        }
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::BeforeUnlink);
+        // The held parent may since have been moved, or its tree swapped for
+        // another under the same name. Only the root the walk recorded (and
+        // backed up) is deleted: anything else is refused before any unlink.
+        let name = c_name(root_name).map_err(|e| stopped(root, e))?;
         let root_fd = open_dir(parent_fd.as_raw_fd(), &name, true).map_err(|e| stopped(root, e))?;
+        let opened = fstat(&root_fd).map_err(|e| stopped(root, e))?;
+        if !same_identity(&opened, root_entry) {
+            return Err(root_changed(req_id, root));
+        }
         delete_contents(&root_fd, root, children, progress)?;
         drop(root_fd);
         progress.checkpoint(root)?;
-        unlink(&parent_fd, &name, true).map_err(|e| stopped(root, not_empty_reason(e)))?;
-        progress.directories += 1;
+        if remove_recorded_dir(&parent_fd, &name, root_entry)? {
+            progress.directories += 1;
+        }
         Ok(())
+    }
+
+    /// Remove the empty directory `name` under `parent` only if it is still
+    /// the recorded directory. The check and the removal are two system
+    /// calls; within the held parent nothing narrower exists.
+    /// Returns whether a directory was removed.
+    fn remove_recorded_dir(
+        parent: &OwnedFd,
+        name: &CString,
+        entry: &TreeEntry,
+    ) -> Result<bool, DeleteStopped> {
+        match stat_entry(parent, name) {
+            Ok(stat) if !matches_record(&stat, entry) => return Err(super::replaced(&entry.path)),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(stopped(&entry.path, e)),
+        }
+        match unlink(parent, name, true) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(stopped(&entry.path, not_empty_reason(e))),
+        }
     }
 
     fn not_empty_reason(error: io::Error) -> String {
@@ -563,6 +734,12 @@ mod platform {
         }
     }
 
+    /// Remove the recorded entries under the held directory `dir_fd`. Each
+    /// entry, unbacked leaves included, is removed only while it is still the
+    /// recorded object (type and, where recorded, device and inode); a
+    /// directory is also checked once opened, so a swap between the check and
+    /// the open is never entered. The first entry that is not the recorded
+    /// object stops the delete there.
     fn delete_contents(
         dir_fd: &OwnedFd,
         dir: &Path,
@@ -575,28 +752,14 @@ mod platform {
                 continue;
             };
             let name = c_name(file_name).map_err(|e| stopped(&entry.path, e))?;
-            // unlinkat does not follow a leaf symlink, and without AT_REMOVEDIR
-            // refuses a directory swapped in after preflight. No leaf stat or
-            // readlink is needed when there is no backup identity to preserve.
-            if entry.kind == NodeKind::Unbacked {
-                match unlink(dir_fd, &name, false) {
-                    Ok(()) => progress.files += 1,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(stopped(&entry.path, e)),
-                }
-                continue;
-            }
             let stat = match stat_entry(dir_fd, &name) {
                 Ok(stat) => stat,
                 // Already gone: nothing left to remove.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(stopped(&entry.path, e)),
             };
-            if !matches_record(&stat, entry.kind) {
-                return Err(stopped(
-                    &entry.path,
-                    "it was replaced after the delete started, and the new entry has no backup",
-                ));
+            if !matches_record(&stat, entry) {
+                return Err(super::replaced(&entry.path));
             }
             if entry.kind == NodeKind::Directory {
                 let child_fd = match open_dir(dir_fd.as_raw_fd(), &name, true) {
@@ -604,16 +767,13 @@ mod platform {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(stopped(&entry.path, e)),
                 };
+                let child_stat = fstat(&child_fd).map_err(|e| stopped(&entry.path, e))?;
+                if !same_identity(&child_stat, entry) {
+                    return Err(super::replaced(&entry.path));
+                }
                 // Recheck the opened directory's device as well as preflight:
                 // a mount introduced during the walk must never be entered.
-                let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
-                let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
-                // SAFETY: both descriptors are live directories; stat out-parameters are valid.
-                if unsafe { libc::fstat(child_fd.as_raw_fd(), &mut child_stat) } != 0
-                    || unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut parent_stat) } != 0
-                {
-                    return Err(stopped(&entry.path, io::Error::last_os_error()));
-                }
+                let parent_stat = fstat(dir_fd).map_err(|e| stopped(&entry.path, e))?;
                 if child_stat.st_dev != parent_stat.st_dev {
                     return Err(stopped(
                         &entry.path,
@@ -623,12 +783,12 @@ mod platform {
                 delete_contents(&child_fd, &entry.path, children, progress)?;
                 drop(child_fd);
                 progress.checkpoint(&entry.path)?;
-                match unlink(dir_fd, &name, true) {
-                    Ok(()) => progress.directories += 1,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(stopped(&entry.path, not_empty_reason(e))),
+                if remove_recorded_dir(dir_fd, &name, entry)? {
+                    progress.directories += 1;
                 }
             } else {
+                // unlinkat does not follow a leaf symlink, and without
+                // AT_REMOVEDIR refuses a directory swapped in since the check.
                 match unlink(dir_fd, &name, false) {
                     Ok(()) => progress.files += 1,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -640,67 +800,337 @@ mod platform {
     }
 }
 
-#[cfg(not(unix))]
-mod platform {
-    use super::{stopped, DeleteProgress, DeleteStopped, NodeKind, TreeEntry};
-    use std::collections::HashMap;
-    use std::path::Path;
+/// Windows: every entry is opened by handle without following a final link
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`) and removed by setting a delete
+/// disposition on that handle. A tree's entries are opened relative to their
+/// parent's handle, never by path. Nothing is removed by path.
+#[cfg(windows)]
+pub(crate) mod win {
+    use std::fs::File;
+    use std::io;
+    use std::path::{Path, PathBuf};
 
-    /// Path-based fallback: each entry is checked without following links
-    /// right before it is removed, and a directory is removed only once it is
-    /// empty, so an entry created after the walk still stops the delete.
-    pub(super) fn delete_tree(
-        root: &Path,
-        children: &HashMap<&Path, Vec<&TreeEntry>>,
-        progress: &mut DeleteProgress,
-    ) -> Result<(), DeleteStopped> {
-        delete_dir(root, children, progress)
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_SHARE_ALL: u32 = 0x0000_0007;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_DISPOSITION_INFO: i32 = 4;
+    const FILE_DISPOSITION_INFO_EX: i32 = 21;
+    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+    const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetFileInformationByHandle(
+            file: std::os::windows::io::RawHandle,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
     }
 
-    fn delete_dir(
-        dir: &Path,
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: std::os::windows::io::RawHandle,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status_or_pointer: usize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtOpenFile(
+            handle: *mut std::os::windows::io::RawHandle,
+            access: u32,
+            object: *mut ObjectAttributes,
+            io_status: *mut IoStatusBlock,
+            share: u32,
+            options: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    /// Open the entry `name` inside the open directory `parent`, resolved by
+    /// the kernel relative to that handle, never through a path. A final
+    /// link is opened itself (`FILE_OPEN_REPARSE_POINT`), with the access a
+    /// delete needs; directories open too (`FILE_OPEN_FOR_BACKUP_INTENT`).
+    pub(crate) fn open_child(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        if wide.is_empty()
+            || wide
+                .iter()
+                .any(|&unit| unit == u16::from(b'\\') || unit == u16::from(b'/'))
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let bytes = u16::try_from(wide.len() * 2)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut unicode = UnicodeString {
+            length: bytes,
+            maximum_length: bytes,
+            buffer: wide.as_mut_ptr(),
+        };
+        let mut object = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: parent.as_raw_handle(),
+            object_name: &mut unicode,
+            attributes: 0,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        let mut io_status = std::mem::MaybeUninit::<IoStatusBlock>::uninit();
+        // SAFETY: every pointer refers to a live local for the duration of
+        // the call; `parent` stays open, and `name` is a single component.
+        let status = unsafe {
+            NtOpenFile(
+                &mut handle,
+                DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                &mut object,
+                io_status.as_mut_ptr(),
+                FILE_SHARE_ALL,
+                FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_FOR_BACKUP_INTENT
+                    | FILE_OPEN_REPARSE_POINT,
+            )
+        };
+        if status < 0 {
+            // SAFETY: plain status conversion.
+            return Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ));
+        }
+        // SAFETY: NtOpenFile succeeded and returned an owned handle.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    /// Open the entry at `path` itself, never a link's target, with the
+    /// access a delete needs. Directories open too (`BACKUP_SEMANTICS`).
+    pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    /// Where the open entry is now, in the form the access policy uses for
+    /// its identities (no `\\?\` prefix). With the link itself opened, this
+    /// names the link entry, not what it points at.
+    pub(crate) fn location(entry: &File) -> io::Result<PathBuf> {
+        crate::commands::file_read_exact::opened_location(entry)
+            .map(|path| crate::inspect::job::normalize_path(&path))
+    }
+
+    /// Delete the open entry through its handle: POSIX semantics where the
+    /// volume supports them (the name goes away now), otherwise
+    /// delete-on-close (the name goes away when the handle is dropped).
+    ///
+    /// The disposition applies to the object the handle holds, wherever it is
+    /// now. That object was the one authorized; if it was renamed since the
+    /// last check, deleting it is still within the delete contract (objects
+    /// are authorized, not pathnames at the instant of unlink).
+    pub(crate) fn dispose(entry: &File) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let handle = entry.as_raw_handle();
+        let mut flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+        // SAFETY: `entry` is open for the call and the buffer matches the
+        // size given for FILE_DISPOSITION_INFO_EX.
+        let posix = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FILE_DISPOSITION_INFO_EX,
+                (&mut flags as *mut u32).cast(),
+                std::mem::size_of_val(&flags) as u32,
+            )
+        };
+        if posix != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // ERROR_NOT_SUPPORTED or ERROR_INVALID_PARAMETER: no POSIX delete on
+        // this volume. Anything else (access, sharing, not empty) is real.
+        if !matches!(error.raw_os_error(), Some(50 | 87)) {
+            return Err(error);
+        }
+        let mut delete_file = 1_u8;
+        // SAFETY: as above; FILE_DISPOSITION_INFO is a single BOOLEAN.
+        let legacy = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FILE_DISPOSITION_INFO,
+                (&mut delete_file as *mut u8).cast(),
+                std::mem::size_of_val(&delete_file) as u32,
+            )
+        };
+        if legacy == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::win::{dispose, location, open_child, open_entry};
+    use super::{
+        refused, replaced, root_changed, stopped, AuthorizeRoot, DeleteProgress, DeleteStopped,
+        NodeKind, TreeEntry,
+    };
+    #[cfg(test)]
+    use crate::commands::delete_file::UnlinkStage;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::path::Path;
+
+    /// The root is opened by handle, its real location authorized, and the
+    /// handle checked to still sit at the judged location. Each entry below is
+    /// then opened relative to its parent's handle and removed through its own
+    /// handle; directories once empty.
+    pub(super) fn delete_tree(
+        root_entry: &TreeEntry,
+        children: &HashMap<&Path, Vec<&TreeEntry>>,
+        progress: &mut DeleteProgress,
+        req_id: &str,
+        authorize: AuthorizeRoot<'_>,
+    ) -> Result<(), DeleteStopped> {
+        let root = root_entry.path.as_path();
+        progress.checkpoint(root)?;
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::BeforePin);
+        let root_handle = open_entry(root).map_err(|e| stopped(root, e))?;
+        let metadata = root_handle.metadata().map_err(|e| stopped(root, e))?;
+        if !metadata.is_dir() {
+            return Err(root_changed(req_id, root));
+        }
+        let located = location(&root_handle).map_err(|_| root_changed(req_id, root))?;
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::BeforeAuthorize);
+        let judged = authorize(&located).map_err(|response| refused(root, response))?;
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::AfterAuthorize);
+        if crate::inspect::job::normalize_path(&judged) != located
+            || location(&root_handle).ok().as_deref() != Some(located.as_path())
+        {
+            return Err(root_changed(req_id, root));
+        }
+        #[cfg(test)]
+        crate::commands::delete_file::unlink_seam(UnlinkStage::BeforeUnlink);
+        delete_contents(&root_handle, root, children, progress)?;
+        progress.checkpoint(root)?;
+        #[cfg(test)]
+        crate::commands::delete_file::count_unlink_for_test();
+        dispose(&root_handle).map_err(|e| stopped(root, not_empty_reason(e)))?;
+        drop(root_handle);
+        progress.directories += 1;
+        Ok(())
+    }
+
+    fn not_empty_reason(error: std::io::Error) -> String {
+        // ERROR_DIR_NOT_EMPTY
+        if error.raw_os_error() == Some(145) {
+            "it contains an entry created after the delete started, which has no backup".to_string()
+        } else {
+            error.to_string()
+        }
+    }
+
+    /// Remove the entries recorded under `recorded` through `dir`, the open
+    /// handle of that directory. Each child is opened relative to `dir`, so a
+    /// path swapped elsewhere in the tree cannot redirect it.
+    fn delete_contents(
+        dir: &File,
+        recorded: &Path,
         children: &HashMap<&Path, Vec<&TreeEntry>>,
         progress: &mut DeleteProgress,
     ) -> Result<(), DeleteStopped> {
-        progress.checkpoint(dir)?;
-        for entry in children.get(dir).into_iter().flatten() {
+        for entry in children.get(recorded).into_iter().flatten() {
             progress.checkpoint(&entry.path)?;
-            let metadata = match std::fs::symlink_metadata(&entry.path) {
-                Ok(metadata) => metadata,
+            let Some(name) = entry.path.file_name() else {
+                continue;
+            };
+            let handle = match open_child(dir, name) {
+                Ok(handle) => handle,
+                // Already gone: nothing left to remove.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(stopped(&entry.path, e)),
             };
+            let metadata = handle.metadata().map_err(|e| stopped(&entry.path, e))?;
             let is_link = metadata.file_type().is_symlink();
             match entry.kind {
                 NodeKind::Directory if metadata.is_dir() && !is_link => {
-                    delete_dir(&entry.path, children, progress)?;
+                    delete_contents(&handle, &entry.path, children, progress)?;
+                    progress.checkpoint(&entry.path)?;
+                    #[cfg(test)]
+                    crate::commands::delete_file::count_unlink_for_test();
+                    dispose(&handle).map_err(|e| stopped(&entry.path, not_empty_reason(e)))?;
+                    progress.directories += 1;
                 }
-                NodeKind::Directory => {
-                    return Err(stopped(
-                        &entry.path,
-                        "it was replaced after the delete started",
-                    ));
-                }
-                _ if metadata.is_dir() && !is_link => {
-                    return Err(stopped(
-                        &entry.path,
-                        "it was replaced after the delete started",
-                    ));
-                }
+                NodeKind::Directory => return Err(replaced(&entry.path)),
+                _ if metadata.is_dir() && !is_link => return Err(replaced(&entry.path)),
                 _ => {
                     #[cfg(test)]
                     crate::commands::delete_file::count_unlink_for_test();
-                    std::fs::remove_file(&entry.path).map_err(|e| stopped(&entry.path, e))?;
+                    dispose(&handle).map_err(|e| stopped(&entry.path, e))?;
                     progress.files += 1;
                 }
             }
         }
-        progress.checkpoint(dir)?;
-        #[cfg(test)]
-        crate::commands::delete_file::count_unlink_for_test();
-        std::fs::remove_dir(dir).map_err(|e| stopped(dir, e))?;
-        progress.directories += 1;
         Ok(())
+    }
+}
+
+/// Targets that are neither Unix nor Windows have no handle-bound delete, so
+/// a recursive delete is refused rather than done by path.
+#[cfg(not(any(unix, windows)))]
+mod platform {
+    use super::{refused, AuthorizeRoot, DeleteProgress, DeleteStopped, TreeEntry};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    pub(super) fn delete_tree(
+        root_entry: &TreeEntry,
+        _children: &HashMap<&Path, Vec<&TreeEntry>>,
+        _progress: &mut DeleteProgress,
+        req_id: &str,
+        _authorize: AuthorizeRoot<'_>,
+    ) -> Result<(), DeleteStopped> {
+        let root = root_entry.path.as_path();
+        Err(refused(
+            root,
+            crate::protocol::Response::error(
+                req_id,
+                "delete_unsupported",
+                format!(
+                    "delete_file: '{}' cannot be deleted safely on this platform",
+                    root.display()
+                ),
+            ),
+        ))
     }
 }
 
@@ -854,7 +1284,8 @@ mod tests {
         let manifest = walk(&root, BackupPolicy::default(), 100, 1_000).unwrap();
         std::fs::write(root.join("a/late.txt"), "created after the walk").unwrap();
 
-        let stopped = delete_recorded_tree(&manifest).unwrap_err();
+        let stopped = delete_recorded_tree(&manifest, "test", &mut |root| Ok(root.to_path_buf()))
+            .unwrap_err();
         assert_eq!(stopped.path, root.join("a"), "{stopped:?}");
         assert_eq!(
             std::fs::read_to_string(root.join("a/late.txt")).unwrap(),
@@ -874,7 +1305,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
 
         let manifest = walk(&root, BackupPolicy::default(), 100, 1_000).unwrap();
-        delete_recorded_tree(&manifest).unwrap();
+        delete_recorded_tree(&manifest, "test", &mut |root| Ok(root.to_path_buf())).unwrap();
         assert!(!root.exists());
         assert_eq!(
             std::fs::read_to_string(outside.path().join("keep.txt")).unwrap(),

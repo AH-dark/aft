@@ -32,6 +32,7 @@ import {
 } from "../../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
 import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 import { bridgeLogger } from "../../logger.js";
+import { e2eBinaryRequired } from "./binary-requirement.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
 // "[aft] invalidated 7 files") into the process-private test log namespace instead of
@@ -260,6 +261,7 @@ export interface PreparedBinary {
 export type HarnessTransport = "ndjson" | "subc";
 
 export interface CreateHarnessOptions {
+  childEnvironmentRoot?: string;
   fixtureNames?: string[];
   timeoutMs?: number;
   tempPrefix?: string;
@@ -416,7 +418,7 @@ export async function createHarness(
       timeoutMs,
       ...(options.bridgeOptions ?? {}),
       childEnv: hermeticGitChildEnv({
-        ...isolatedAftEnvironment(join(tempDir, ".aft-env"), {
+        ...isolatedAftEnvironment(options.childEnvironmentRoot ?? join(tempDir, ".aft-env"), {
           ...process.env,
           ...(options.bridgeOptions?.childEnv ?? {}),
         }),
@@ -802,7 +804,10 @@ async function resolveAftBinaryPath(candidates: string[]): Promise<string | unde
 }
 
 function debugBinaryCandidates(): string[] {
-  return [TARGET_DEBUG_BINARY];
+  const configured = process.env.CARGO_TARGET_DIR;
+  return configured
+    ? [resolve(PROJECT_ROOT, configured, "debug", AFT_BINARY_NAME), TARGET_DEBUG_BINARY]
+    : [TARGET_DEBUG_BINARY];
 }
 
 function fallbackBinaryCandidates(): string[] {
@@ -854,9 +859,9 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
   // In CI the aft binary is always built before the Bun suites run, so a missing
   // binary there means the build/setup broke — fail loud instead of letting 25+
   // e2e files silently `describe.skipIf(!binaryPath)` into a false green. Locally
-  // (CI unset) keep the quiet-skip behavior so contributors without a built
+  // (no CI flag) keep the quiet-skip behavior so contributors without a built
   // binary can still run the non-e2e suites.
-  if (process.env.CI === "true") {
+  if (e2eBinaryRequired(process.env)) {
     throw new Error(
       `e2e setup failed: ${skipReason}\n` +
         "The aft binary must be present in CI (built before Bun tests run). " +

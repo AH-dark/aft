@@ -63,6 +63,7 @@ import {
   optionalInt,
   resolveSessionId,
   textResult,
+  withHostPermissionGrants,
 } from "./_shared.js";
 import { asString, collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
@@ -554,16 +555,14 @@ async function callBashWithPermissionLoop(
   options?: BridgeRequestOptions,
   bridgeCommand = "bash",
 ): Promise<Record<string, unknown>> {
-  const granted = Array.isArray(params.permissions_granted)
-    ? params.permissions_granted.filter((value): value is string => typeof value === "string")
-    : [];
+  const granted: string[] = [];
 
   for (let round = 0; round < 8; round++) {
     try {
       return await callBashBridge(
         bridge,
         bridgeCommand,
-        { ...params, ...(granted.length > 0 ? { permissions_granted: granted } : {}) },
+        withHostPermissionGrants(params, granted),
         extCtx,
         options,
       );

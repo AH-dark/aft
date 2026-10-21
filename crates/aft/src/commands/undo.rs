@@ -88,14 +88,94 @@ fn save_external_change(
     Ok(name)
 }
 
+/// How many times an operation undo re-plans after the operation changed
+/// while its authorization was pending, before refusing.
+const MAX_UNDO_PLAN_ATTEMPTS: usize = 3;
+
+/// Authorize stored backup keys that an operation undo will write or remove.
+///
+/// Stored keys are just as untrusted as explicit tool arguments: authority
+/// may have changed since the snapshot was taken. The restore works on the
+/// stored keys themselves, so each must already be the absolute location the
+/// validator checks; a relative one would be checked at the project root but
+/// written relative to the daemon's working directory.
+fn authorize_stored_keys(
+    ctx: &AppContext,
+    req_id: &str,
+    paths: &[PathBuf],
+) -> Result<(), Response> {
+    #[cfg(test)]
+    authorization_hook_for_test(req_id);
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(Response::error(
+                req_id,
+                "invalid_backup_key",
+                format!(
+                    "undo: stored backup path '{}' is not absolute; nothing was restored",
+                    path.display()
+                ),
+            ));
+        }
+        ctx.validate_write_location(req_id, path)?;
+    }
+    Ok(())
+}
+
+/// A test hook run at the start of each authorization pass of the request
+/// with this id, used to block an authorization or to change the backups
+/// while one is pending.
+#[cfg(test)]
+type AuthorizationHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static AUTHORIZATION_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, AuthorizationHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Install `hook` for the request with this id until the returned guard is
+/// dropped.
+#[cfg(test)]
+pub(crate) fn install_authorization_hook_for_test(
+    req_id: &str,
+    hook: AuthorizationHook,
+) -> impl Drop {
+    struct Remove(String);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            AUTHORIZATION_HOOKS.lock().unwrap().remove(&self.0);
+        }
+    }
+    AUTHORIZATION_HOOKS
+        .lock()
+        .unwrap()
+        .insert(req_id.to_string(), hook);
+    Remove(req_id.to_string())
+}
+
+#[cfg(test)]
+fn authorization_hook_for_test(req_id: &str) {
+    // Released before the hook runs: a hook that blocks must not stop other
+    // requests from looking up their own.
+    let hook = AUTHORIZATION_HOOKS.lock().unwrap().get(req_id).cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Handle the `undo` command: restore the latest operation, or one file when requested.
 ///
 /// Params: `file` (string, optional) — path to a single file to undo.
 /// Returns: `{ path, backup_id }` on success, or `no_undo_history` error. When
 /// the file had changed outside AFT, its content is first saved as a
 /// checkpoint, named in `external_change_checkpoint` and in `warning`.
+///
+/// Authorization can ask a person and wait for the answer, so it never runs
+/// while the backup store or its stack locks are held: other edits and undos
+/// would queue behind the person. An operation undo plans under the locks,
+/// releases them, authorizes the plan, then restores only if the plan is
+/// still current, planning again (a bounded number of times) if not.
 pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut backup = ctx.backup().lock();
     let session = req.session();
     let mut save = |paths: &[PathBuf]| save_external_change(ctx, session, paths);
 
@@ -105,49 +185,46 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         .or_else(|| req.params.get("filePath"))
         .and_then(|v| v.as_str())
     else {
-        let intent_paths = backup
-            .preview_last_operation_paths(req.session())
-            .unwrap_or_default();
-        // Stored backup keys are just as untrusted as explicit tool arguments:
-        // authority may have changed since the snapshot was taken.
-        for path in &intent_paths {
-            if let Err(response) = ctx.validate_write_location(&req.id, path) {
-                return response;
-            }
-        }
-        if let Some(reason) = backup.take_latest_skipped_reason_for_undo(req.session(), None) {
+        if let Some(reason) = ctx
+            .backup()
+            .lock()
+            .take_latest_skipped_reason_for_undo(req.session(), None)
+        {
             return backup_skipped_response(req, reason);
         }
-        let _mutation = crate::runtime_drain::record_file_mutation(
-            ctx,
-            intent_paths.iter().map(|path| path.as_path()),
-        );
-        return match backup.restore_last_operation_preserving(req.session(), &mut save) {
-            Ok(operation) => {
-                let mut result = serde_json::json!({
-                    "operation": true,
-                    "op_id": operation.op_id,
-                    "restored_count": operation.restored.len(),
-                    "restored": operation.restored.into_iter().map(|file| {
-                        let mut restored = serde_json::json!({
-                            "path": file.path.display().to_string(),
-                            "backup_id": file.backup_id,
-                        });
-                        if let Some(checkpoint) = file.external_change_checkpoint {
-                            restored["external_change_checkpoint"] =
-                                serde_json::Value::String(checkpoint);
-                        }
-                        restored
-                    }).collect::<Vec<_>>(),
-                    "warnings": operation.warnings,
-                });
-                if let Some(checkpoint) = operation.external_change_checkpoint {
-                    result["external_change_checkpoint"] = serde_json::Value::String(checkpoint);
-                }
-                Response::success(&req.id, result)
+        for _ in 0..MAX_UNDO_PLAN_ATTEMPTS {
+            let plan = match ctx.backup().lock().plan_last_operation(req.session()) {
+                Ok(plan) => plan,
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            };
+            // No backup lock is held here: this may wait for a person.
+            if let Err(response) = authorize_stored_keys(ctx, &req.id, &plan.touched) {
+                return response;
             }
-            Err(e) => Response::error(&req.id, e.code(), e.to_string()),
-        };
+            let _mutation = crate::runtime_drain::record_file_mutation(
+                ctx,
+                plan.touched.iter().map(|path| path.as_path()),
+            );
+            let restored =
+                ctx.backup()
+                    .lock()
+                    .restore_planned_operation(req.session(), &plan, &mut save);
+            match restored {
+                // The operation changed while it was being authorized: that
+                // decision was about something else, so plan and ask again.
+                Ok(None) => continue,
+                Ok(Some(operation)) => return operation_response(req, operation),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            }
+        }
+        return Response::error_with_data(
+            &req.id,
+            "undo_plan_changed",
+            format!(
+                "undo: the latest operation kept changing while its permission was being checked ({MAX_UNDO_PLAN_ATTEMPTS} attempts); nothing was restored. Retry the undo."
+            ),
+            serde_json::json!({"retryable": true}),
+        );
     };
 
     // Resolve relative paths against the bound project root BEFORE validation so
@@ -155,11 +232,13 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     // passed straight to `canonicalize_key` would be joined against the daemon's
     // cwd, missing the stack and reporting a false `no_undo_history`.
     let input = ctx.resolve_relative_path(Path::new(file));
+    // Validated before the backup store is locked: this may wait for a person.
     let resolved = match ctx.validate_write_location(&req.id, &input) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
 
+    let mut backup = ctx.backup().lock();
     if let Some(reason) =
         backup.take_latest_skipped_reason_for_undo(req.session(), Some(resolved.as_path()))
     {
@@ -183,6 +262,30 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
+}
+
+fn operation_response(req: &RawRequest, operation: crate::backup::RestoredOperation) -> Response {
+    let mut result = serde_json::json!({
+        "operation": true,
+        "op_id": operation.op_id,
+        "restored_count": operation.restored.len(),
+        "restored": operation.restored.into_iter().map(|file| {
+            let mut restored = serde_json::json!({
+                "path": file.path.display().to_string(),
+                "backup_id": file.backup_id,
+            });
+            if let Some(checkpoint) = file.external_change_checkpoint {
+                restored["external_change_checkpoint"] =
+                    serde_json::Value::String(checkpoint);
+            }
+            restored
+        }).collect::<Vec<_>>(),
+        "warnings": operation.warnings,
+    });
+    if let Some(checkpoint) = operation.external_change_checkpoint {
+        result["external_change_checkpoint"] = serde_json::Value::String(checkpoint);
+    }
+    Response::success(&req.id, result)
 }
 
 fn backup_skipped_response(

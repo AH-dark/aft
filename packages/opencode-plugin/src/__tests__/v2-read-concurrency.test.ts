@@ -8,6 +8,7 @@ import { projectV2Tool } from "../tools/definitions/v2.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
 import { readingTools } from "../tools/reading.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 import { permissionHost } from "./v2-permission-host.js";
 
 const execution = {
@@ -18,7 +19,10 @@ const execution = {
   progress: () => Effect.void,
 };
 
-function heldHost(evaluate?: NonNullable<Parameters<typeof permissionHost>[0]>["evaluate"]) {
+function heldHost(
+  evaluate?: NonNullable<Parameters<typeof permissionHost>[0]>["evaluate"],
+  releaseReads = false,
+) {
   const fixture = permissionHost({
     agentRules: [{ action: "*", resource: "*", effect: "allow" }],
     evaluate,
@@ -44,7 +48,7 @@ function heldHost(evaluate?: NonNullable<Parameters<typeof permissionHost>[0]>["
         () =>
           new Promise<void>((allow, reject) => {
             waiting.set(index, { allow, reject });
-            if (autoRelease) allow();
+            if (autoRelease || (releaseReads && input.action === "read")) allow();
             for (const observer of observers)
               if (started.length >= observer.count) observer.resolve();
           }),
@@ -119,6 +123,10 @@ async function fixture(
   const dispatched: Record<string, unknown>[] = [];
   const bridge = {
     toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
+      if (external) {
+        const ask = engineOutsideAsk(files[0]!, args);
+        if (ask) return ask;
+      }
       dispatched.push(args);
       const excluded = args._exclude_read_paths as string[] | undefined;
       return {
@@ -147,11 +155,11 @@ async function fixture(
   return { root, files, dispatched, effect: projected.execute(args, execution) };
 }
 
-async function firstWave(host: ReturnType<typeof heldHost>) {
+async function firstWave(host: ReturnType<typeof heldHost>, count = 8) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      host.waitForStarts(8),
+      host.waitForStarts(count),
       new Promise<void>((resolve) => {
         timer = setTimeout(resolve, 2000);
       }),
@@ -288,21 +296,22 @@ for (const name of ["aft_outline", "aft_zoom"] as const) {
 }
 
 test("zoom rejection during external authorization never launches subsequent read prompts", async () => {
-  const host = heldHost();
+  const host = heldHost(undefined, true);
   const f = await fixture("aft_zoom", host, 17, true);
   const rejected = new Error("stop outside access");
   const pending = Effect.runPromiseExit(f.effect);
   try {
-    await firstWave(host);
-    expect(host.started).toHaveLength(8);
-    expect(host.started.every((input) => input.action === "external_directory")).toBe(true);
-    host.reject(0, rejected);
+    await firstWave(host, 18);
+    expect(host.started).toHaveLength(18);
+    expect(host.started.slice(0, 17).every((input) => input.action === "read")).toBe(true);
+    expect(host.started[17]?.action).toBe("external_directory");
+    host.reject(17, rejected);
     const result = await pending;
     expect(result._tag).toBe("Failure");
     if (result._tag === "Failure") expect(Cause.squash(result.cause)).toBe(rejected);
-    expect(host.started).toHaveLength(8);
+    expect(host.started).toHaveLength(18);
     expect(host.active).toBe(0);
-    expect(host.interrupted).toBe(7);
+    expect(host.interrupted).toBe(0);
     expect(f.dispatched).toEqual([]);
   } finally {
     host.releaseAll();

@@ -428,15 +428,9 @@ export const _permissionsInternalsForTest = {
 };
 
 /**
- * Trigger OpenCode's host-side `external_directory` permission check when the
- * target path falls outside the current project's directory and worktree.
- * Mirrors `opencode/src/tool/external-directory.ts::assertExternalDirectoryEffect`.
- *
- * Why this exists: AFT hoisted tools previously only called `permission: "edit"`,
- * which bypassed OpenCode's separate `external_directory` rule (default `ask`).
- * This helper keeps that rule active for ordinary out-of-root paths while
- * suppressing asks for system temp directories, which are unstable world-writable
- * scratch space.
+ * Preserve the plugin's hard restriction during configuration reloads. Outside
+ * access prompts are decided by the engine and presented by the bridge loop;
+ * lexical plugin containment must not approve a symlink's outside target.
  *
  * Returns `undefined` on allow (or when target is inside project), or a
  * denial message string on deny so callers can wrap with
@@ -454,9 +448,7 @@ export async function assertExternalDirectoryPermission(
   if (!target) return undefined;
 
   const resolved = resolveAbsolutePath(context, target);
-  // `tool_call` trusts this plugin-side permission decision. The Rust default
-  // validator may keep lexical path strings, so canonicalize containment here
-  // and assert the ask decision rather than plugin/server string equality.
+  // Canonicalize the hard restriction as well as the engine's later check.
   const absoluteTarget = normalizePath(resolved);
 
   const root = projectRootFor(context);
@@ -508,47 +500,7 @@ export async function assertExternalDirectoryPermission(
     return restrictDenialMessage(absoluteTarget);
   }
 
-  if (isSystemTempPath(absoluteTarget)) return undefined;
-
-  // A session's own bash task output: skip the external prompt for reads
-  // only. The check is the Rust registry's exact, session-scoped ownership
-  // test, so another session's output, unregistered files beside an artifact
-  // and every other path under the storage root still prompt.
-  if (
-    options?.serverValidatedRead === true &&
-    (await isSessionOwnedBashArtifact(ctx, context, absoluteTarget))
-  ) {
-    return undefined;
-  }
-
-  if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
-
-  const kind = options?.kind ?? "file";
-  const parentDir = kind === "directory" ? absoluteTarget : path.dirname(absoluteTarget);
-  const rawGlob =
-    process.platform === "win32"
-      ? normalizePathPattern(path.join(parentDir, "*"))
-      : path.join(parentDir, "*").replaceAll("\\", "/");
-
-  try {
-    await runAsk(
-      context.ask({
-        permission: "external_directory",
-        patterns: [rawGlob],
-        always: [rawGlob],
-        metadata: {
-          filepath: absoluteTarget,
-          parentDir,
-        },
-      }),
-    );
-    return undefined;
-  } catch (error) {
-    const failure = classifyPermissionError(error, "Permission denied (external directory).");
-    return failure.kind === "rule_denied"
-      ? permissionRuleDenial("external_directory", parentDir)
-      : failure.message;
-  }
+  return undefined;
 }
 
 /** Spawned `git rev-parse` probes; tests use it to pin when the probe is needed. */
