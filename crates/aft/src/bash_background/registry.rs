@@ -36,11 +36,10 @@ use std::os::windows::process::CommandExt;
 
 use super::buffer::{combine_streams, BgBuffer, DiskTruncation, StreamKind, TokenCountInput};
 use super::output::{
-    cap_completion_output, completion_preview_threshold, json_output_pointer, quote_path,
-    retained_json_output_pointer, COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES,
-    COMPRESS_INPUT_TAIL_BYTES, FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES,
-    RAW_PASSTHROUGH_HEAD_BYTES, RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES,
-    STRUCTURED_OUTPUT_CAP_BYTES,
+    completion_preview_threshold, json_output_pointer, quote_path, retained_json_output_pointer,
+    COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
+    FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
+    RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
 };
 use super::persistence::{
     allocate_task_layout, delete_resolved_task, delete_task_bundle,
@@ -6329,11 +6328,13 @@ impl BgTaskRegistry {
                             .read_range(source.start as u64, source.len() as u64)
                             .ok()?;
                         (bytes.len() == source.len()).then(|| {
-                            self.render_watch_preview(
+                            self.render_watch_preview_window(
                                 task_id,
                                 &bytes,
                                 range.start as usize - source.start
                                     ..range.end as usize - source.start,
+                                source.start == 0,
+                                source.end == len as usize,
                             )
                         })
                     })
@@ -11449,12 +11450,23 @@ fn strip_plain_truncation_marker_lines(input: &str) -> String {
         .join("\n")
 }
 
-fn strip_recovery_marker_lines(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| !is_recovery_marker(line.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The cache without its recovery marker lines, remembering where each kept
+/// line sits in the cache. The text equals joining the kept lines with `\n`.
+fn strip_recovery_marker_line_pieces(input: &str) -> super::output::PiecedText {
+    let mut body = super::output::PiecedText::default();
+    let mut kept = 0;
+    for line in input.lines() {
+        if is_recovery_marker(line.trim()) {
+            continue;
+        }
+        if kept > 0 {
+            body.insert("\n");
+        }
+        kept += 1;
+        let start = line.as_ptr() as usize - input.as_ptr() as usize;
+        body.copy(input, start..start + line.len());
+    }
+    body
 }
 
 fn is_plain_truncation_marker(line: &str) -> bool {
@@ -11621,10 +11633,13 @@ fn append_bash_output_envelope(
         .and_then(|total| crate::list_surfaces::bash::append_envelope_trailer(output, total))
 }
 
-fn completion_preview_for_cache(
+/// The completion preview of `cache`, with the cache byte range every copied
+/// run came from. Ticket masking checks a displayed line at that position.
+fn completion_preview_pieces_for_cache(
     cache: &TerminalOutputCache,
     exit_code: Option<i64>,
-) -> (String, bool) {
+) -> (super::output::PiecedText, bool) {
+    use super::output::PiecedText;
     // Reminder previews are sized by exit status: success gets a short tail,
     // failure keeps head+tail context (see output.rs completion caps).
     let exit_ok = exit_code == Some(0);
@@ -11632,38 +11647,49 @@ fn completion_preview_for_cache(
     if cache.kind == TerminalOutputKind::Structured && cache.output_preview.len() > threshold {
         if let Some(path) = cache.output_path.as_deref() {
             return (
-                structured_output_pointer(
+                PiecedText::inserted(&structured_output_pointer(
                     cache.output_preview.len() as u64,
                     path,
                     0,
                     &cache.artifact_access,
-                ),
+                )),
                 true,
             );
         }
-        return (cache.output_preview.clone(), cache.output_truncated);
+        return (
+            PiecedText::whole(&cache.output_preview),
+            cache.output_truncated,
+        );
     }
 
     if let Some(recovery) = cache.recovery.as_ref() {
         if cache.output_preview.len() <= threshold {
-            return (cache.output_preview.clone(), cache.output_truncated);
+            return (
+                PiecedText::whole(&cache.output_preview),
+                cache.output_truncated,
+            );
         }
-        let body = strip_recovery_marker_lines(&cache.output_preview);
+        let body = strip_recovery_marker_line_pieces(&cache.output_preview);
         let mut completion_recovery = recovery.clone();
         completion_recovery.byte_truncated = true;
         if let Some(marker) = recovery_marker(&completion_recovery) {
-            let capped = super::output::cap_completion_output_preserving(
-                &body,
+            let (capped, _) = super::output::cap_completion_output_preserving_pieces(
+                &body.text,
                 Some(&marker),
                 exit_ok,
                 &recovery.final_lines,
             );
-            return (capped.text, true);
+            return (capped.through(&body), true);
         }
     }
 
-    let capped = cap_completion_output(&cache.output_preview, exit_ok);
-    (capped.text, cache.output_truncated || capped.truncated)
+    let (capped, truncated) = super::output::cap_completion_output_preserving_pieces(
+        &cache.output_preview,
+        None,
+        exit_ok,
+        &[],
+    );
+    (capped, cache.output_truncated || truncated)
 }
 
 fn is_gh_structured_command(command: &str) -> bool {
@@ -21618,7 +21644,9 @@ mod tests {
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
         registry.inner.shutdown.store(true, Ordering::SeqCst);
         let go = storage.join("go");
-        let command = format!("while [ ! -e '{}' ]; do sleep 0.01; done; head -c 196608 /dev/zero; printf LATE; sleep 30", go.display());
+        // The line break keeps LATE's line within the watch preview's mask cap;
+        // LATE still arrives in the fourth 64 KiB scan chunk.
+        let command = format!("while [ ! -e '{}' ]; do sleep 0.01; done; head -c 196608 /dev/zero; printf '\\nLATE'; sleep 30", go.display());
         let id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,
@@ -21733,8 +21761,12 @@ mod tests {
         let noisy_task = registry.task_for_session(&noisy, "session").unwrap();
         let other_task = registry.task_for_session(&other, "session").unwrap();
         let mut burst = vec![b'x'; 1024 * 1024 - 5];
-        burst.extend_from_slice(b"CROSS-CHUNK");
-        burst.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        // Line breaks keep the match's line within the watch preview's mask
+        // cap; CROSS-CHUNK still straddles the 1 MiB tick boundary.
+        let line_break = burst.len() - 200;
+        burst[line_break] = b'\n';
+        burst.extend_from_slice(b"CROSS-CHUNK\n");
+        burst.extend(std::iter::repeat_n(b'x', 1024 * 1024 - 1));
         std::fs::OpenOptions::new()
             .append(true)
             .open(&noisy_task.paths.stdout)

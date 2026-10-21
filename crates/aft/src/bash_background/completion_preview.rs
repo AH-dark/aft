@@ -10,7 +10,15 @@ pub(super) const TRUNCATED_PREVIEW_WITHHELD: &str =
     "Output preview withheld because intact output is unavailable for credential masking; use bash_status.";
 
 const WATCH_SECRET_HALO_BYTES: usize = 1024;
-pub(super) const WATCH_PREVIEW_SOURCE_BYTES: usize = 8 * 1024;
+/// A watch preview is masked over whole lines (see `watch_mask_region`). When
+/// those lines exceed this many bytes, the preview is withheld instead.
+pub(super) const WATCH_PREVIEW_LINE_CAP_BYTES: usize = 8 * 1024;
+/// Bytes read beyond the largest maskable region on each side, so a JSON field
+/// or private-key block that crosses a line break into the region can be seen
+/// whole and the region widened to include it.
+const WATCH_CROSS_LINE_HALO_BYTES: usize = 8 * 1024;
+pub(super) const WATCH_PREVIEW_SOURCE_BYTES: usize =
+    2 * (WATCH_PREVIEW_LINE_CAP_BYTES + WATCH_CROSS_LINE_HALO_BYTES);
 
 impl BgTaskRegistry {
     pub(super) fn saved_completion_preview(
@@ -60,6 +68,8 @@ impl BgTaskRegistry {
         preview
     }
 
+    /// Render a watch match over `bytes`, the task's complete capture.
+    #[cfg(test)]
     pub(super) fn render_watch_preview(
         &self,
         task_id: &str,
@@ -71,7 +81,26 @@ impl BgTaskRegistry {
         };
         let range = range.start.min(bytes.len()).saturating_sub(source.start)
             ..range.end.min(bytes.len()).saturating_sub(source.start);
-        let bytes = &bytes[source];
+        self.render_watch_preview_window(
+            task_id,
+            &bytes[source.clone()],
+            range,
+            source.start == 0,
+            source.end == bytes.len(),
+        )
+    }
+
+    /// Render a watch match from `bytes`, a window of the capture read with
+    /// [`watch_preview_source_range`]. `starts_capture` and `ends_capture` say
+    /// whether the window reaches the capture's first or last byte.
+    pub(super) fn render_watch_preview_window(
+        &self,
+        task_id: &str,
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
+        starts_capture: bool,
+        ends_capture: bool,
+    ) -> (String, String) {
         let text = String::from_utf8_lossy(bytes);
         // A scan window can end inside a character that is intact in the full
         // capture. Decode the expanded source neighborhood rather than separate
@@ -99,9 +128,15 @@ impl BgTaskRegistry {
         if secrets.longest_value_len() > WATCH_SECRET_HALO_BYTES {
             return withheld_watch_preview();
         }
+        let Some(region) = watch_mask_region(&text, &range, secrets, starts_capture, ends_capture)
+        else {
+            return withheld_watch_preview();
+        };
+        let mut range = range.start - region.start..range.end - region.start;
+        let text = &text[region];
         // Exact environment values need their complete spelling before the
         // smaller ticket-only window is selected.
-        let masked_values = secrets.redact_range(&text, Some(&mut range));
+        let masked_values = secrets.redact_range(text, Some(&mut range));
         let text = masked_values.as_ref();
         // Hash the displayed context plus 31 bytes on either side, enough to
         // include any 32-hex ticket crossing a display boundary.
@@ -241,19 +276,15 @@ impl BgTaskRegistry {
         }
         let masked_values = secrets.redact(&safe_cache.output_preview);
         safe_cache.output_preview = masked_values.into_owned();
-        let (preview, truncated) = completion_preview_for_cache(&safe_cache, metadata.exit_code);
+        let (preview, truncated) =
+            completion_preview_pieces_for_cache(&safe_cache, metadata.exit_code);
         let Some(digest) = metadata.completion_ticket_digest.as_deref() else {
-            return (preview, truncated);
+            return (preview.text, truncated);
         };
         let intact_cache = !safe_cache
             .recovery
             .as_ref()
             .is_some_and(|recovery| recovery.byte_truncated);
-        let marker = safe_cache.recovery.as_ref().and_then(|recovery| {
-            let mut completion_recovery = recovery.clone();
-            completion_recovery.byte_truncated = true;
-            recovery_marker(&completion_recovery)
-        });
         match mask_rendered_ticket_preview(
             &masked_raw,
             &safe_cache.output_preview,
@@ -263,7 +294,6 @@ impl BgTaskRegistry {
                 .as_ref()
                 .map(|recovery| recovery.final_lines.as_slice())
                 .unwrap_or(&[]),
-            marker.as_deref(),
             &preview,
             digest,
         ) {
@@ -307,21 +337,158 @@ impl BgTaskRegistry {
     }
 }
 
+/// The window of the capture to read for rendering a watch match at `range`:
+/// enough to find the whole lines of the largest maskable region around it
+/// plus a halo for credentials that cross a line break. `None` when the match
+/// alone is larger than that region.
 pub(super) fn watch_preview_source_range(
     range: std::ops::Range<usize>,
     len: usize,
 ) -> Option<std::ops::Range<usize>> {
-    let start = range
-        .start
-        .min(len)
-        .saturating_sub(100 * 4 + WATCH_SECRET_HALO_BYTES + 4);
-    let end = range
-        .end
-        .min(len)
-        .max(range.start.min(len))
-        .saturating_add(500 * 4 + WATCH_SECRET_HALO_BYTES + 4)
-        .min(len);
-    (end - start <= WATCH_PREVIEW_SOURCE_BYTES).then_some(start..end)
+    let start = range.start.min(len);
+    let end = range.end.min(len).max(start);
+    if end - start > WATCH_PREVIEW_LINE_CAP_BYTES {
+        return None;
+    }
+    // Any region of at most the cap that contains the match lies between
+    // end - cap and start + cap.
+    let reach = WATCH_PREVIEW_LINE_CAP_BYTES + WATCH_CROSS_LINE_HALO_BYTES;
+    let window = end.saturating_sub(reach)..start.saturating_add(reach).min(len);
+    debug_assert!(window.len() <= WATCH_PREVIEW_SOURCE_BYTES);
+    Some(window)
+}
+
+/// The part of `text` (a capture window) to mask for a watch preview of
+/// `matched`. Masking a cut slice can miss a credential whose label or start
+/// lies outside it, and the displayed context would then show the rest of the
+/// value. So the region covers the displayed context extended to whole lines:
+/// every redactor pattern but two stops at a newline (see `log_redact`). The
+/// region is widened further for the two that do not, JSON secret fields and
+/// private-key blocks, and for exact credential values containing a newline.
+/// `None` means the preview must be withheld: the lines holding the match
+/// would exceed [`WATCH_PREVIEW_LINE_CAP_BYTES`] or reach past the window, or
+/// the window cannot show whether the region starts inside a key block or ends
+/// inside a JSON secret value. Context lines that cannot be included this way
+/// are left out of the preview instead.
+fn watch_mask_region(
+    text: &str,
+    matched: &std::ops::Range<usize>,
+    secrets: &crate::log_redact::SecretValues,
+    starts_capture: bool,
+    ends_capture: bool,
+) -> Option<std::ops::Range<usize>> {
+    let shown = super::super::watches::context_range(text, matched.start, matched.end);
+    // Prefer the full displayed context, side by side; a context side whose
+    // line runs out of the window falls back to the match's own line.
+    let start = if whole_lines(text, shown.start..matched.end, starts_capture, true).is_some() {
+        shown.start
+    } else {
+        matched.start
+    };
+    let end = if whole_lines(text, matched.start..shown.end, true, ends_capture).is_some() {
+        shown.end
+    } else {
+        matched.end
+    };
+    let spanning = {
+        let mut spans = crate::log_redact::json_secret_field_spans(text);
+        spans.extend(secrets.cross_line_spans(text));
+        spans
+    };
+    let key_blocks = crate::log_redact::private_key_spans(text);
+    [start..end, matched.clone()].into_iter().find_map(|seed| {
+        mask_region_from(
+            text,
+            seed,
+            &spanning,
+            &key_blocks,
+            starts_capture,
+            ends_capture,
+        )
+    })
+}
+
+fn mask_region_from(
+    text: &str,
+    mut region: std::ops::Range<usize>,
+    spanning: &[std::ops::Range<usize>],
+    key_blocks: &[std::ops::Range<usize>],
+    starts_capture: bool,
+    ends_capture: bool,
+) -> Option<std::ops::Range<usize>> {
+    loop {
+        region = whole_lines(text, region, starts_capture, ends_capture)?;
+        if region.len() > WATCH_PREVIEW_LINE_CAP_BYTES {
+            return None;
+        }
+        let mut widened = region.clone();
+        for span in spanning {
+            if span.start < widened.start && span.end > widened.start {
+                widened.start = span.start;
+            }
+            if span.start < widened.end && span.end > widened.end {
+                widened.end = span.end;
+            }
+        }
+        // A key block that opens inside the region and runs past its end is
+        // still masked to the region's end, so only its start matters.
+        for span in key_blocks {
+            if span.start < widened.start && span.end > widened.start {
+                widened.start = span.start;
+            }
+        }
+        if widened == region {
+            break;
+        }
+        region = widened;
+    }
+    // A JSON secret value still open at the window's end may close beyond it;
+    // its visible part would not be recognized.
+    if !ends_capture && crate::log_redact::json_secret_value_open_at_end(text, region.end) {
+        return None;
+    }
+    // With no BEGIN or END line before the region in the window, a key block
+    // that began before the window could still be open. Its body lines are the
+    // secret, so withhold a region showing a body-shaped line before any marker.
+    if !starts_capture && !crate::log_redact::has_private_key_marker(&text[..region.start]) {
+        let unmarked = &text[region.clone()];
+        let unmarked = unmarked
+            .find("PRIVATE KEY-----")
+            .map_or(unmarked, |marker| &unmarked[..marker]);
+        if unmarked
+            .lines()
+            .any(crate::log_redact::looks_like_private_key_body)
+        {
+            return None;
+        }
+    }
+    Some(region)
+}
+
+/// Extend `range` to the start and end of the lines it touches, including the
+/// last line's newline. `None` when a needed newline lies outside the window
+/// and the window does not reach that end of the capture.
+fn whole_lines(
+    text: &str,
+    range: std::ops::Range<usize>,
+    starts_capture: bool,
+    ends_capture: bool,
+) -> Option<std::ops::Range<usize>> {
+    let start = match text[..range.start].rfind('\n') {
+        Some(newline) => newline + 1,
+        None if starts_capture => 0,
+        None => return None,
+    };
+    let end = if range.end > range.start && text.as_bytes()[range.end - 1] == b'\n' {
+        range.end
+    } else {
+        match text[range.end..].find('\n') {
+            Some(newline) => range.end + newline + 1,
+            None if ends_capture => text.len(),
+            None => return None,
+        }
+    };
+    Some(start..end.max(start))
 }
 
 fn withheld_watch_preview() -> (String, String) {
@@ -336,23 +503,22 @@ fn mask_rendered_ticket_preview(
     cache: &str,
     intact_cache: bool,
     final_lines: &[String],
-    marker: Option<&str>,
-    preview: &str,
+    preview: &super::super::output::PiecedText,
     digest: &str,
 ) -> Result<String, crate::log_redact::TicketRedactionBudgetExceeded> {
+    use super::super::output::CapPiece;
     use crate::log_redact::{
         TicketRedactionBudgetExceeded, TICKET_HALO_BYTES, TICKET_REDACTION_BYTES,
         TICKET_REDACTION_WINDOWS,
     };
-    if preview.len() > TICKET_REDACTION_BYTES || cache.len() > TICKET_REDACTION_BYTES {
+    if preview.text.len() > TICKET_REDACTION_BYTES || cache.len() > TICKET_REDACTION_BYTES {
         return Err(TicketRedactionBudgetExceeded);
     }
     // Locate whole bounded raw head/tail slices in the terminal cache first.
-    // Mapping the preview's cache offsets through those slices avoids confusing
-    // an identical fragment elsewhere in the capture with the displayed one.
-    // A middle line can use the cache itself only if no byte cut destroyed its
-    // neighboring bytes; otherwise withhold rather than guess.
-    let width = preview.len() + TICKET_HALO_BYTES;
+    // A displayed line inside one of them has its raw neighbors at a known
+    // offset. A line elsewhere can use its cache neighbors only if no byte cut
+    // destroyed them; otherwise withhold rather than guess.
+    let width = preview.text.len() + TICKET_HALO_BYTES;
     let head_end = crate::compress::generic::ceil_char_boundary(raw, width.min(raw.len()));
     let tail_start =
         crate::compress::generic::floor_char_boundary(raw, raw.len().saturating_sub(width));
@@ -367,26 +533,44 @@ fn mask_rendered_ticket_preview(
     });
     let mut remaining = TICKET_REDACTION_WINDOWS;
     let mut output = String::new();
-    for line in preview.split_inclusive('\n') {
-        let newline = line.ends_with('\n');
-        let line = line.strip_suffix('\n').unwrap_or(line);
-        if line.is_empty() {
-            output.push('\n');
-            continue;
-        }
-        let edge_hex = line.as_bytes()[0].is_ascii_hexdigit()
-            || line.as_bytes()[line.len() - 1].is_ascii_hexdigit();
-        let (slice, mut range) =
-            if let Some(cache_start) = cache.find(line) {
-                // If a line starts or ends with a hex digit and occurs repeatedly,
-                // its neighbors may differ and change the 32-hex ticket candidates.
-                // Withhold rather than choose an occurrence with the wrong neighbors.
-                if edge_hex && cache.match_indices(line).nth(1).is_some() {
-                    return Err(TicketRedactionBudgetExceeded);
-                }
+    let mut mask = |slice: &str,
+                    mut range: std::ops::Range<usize>,
+                    output: &mut String|
+     -> Result<(), TicketRedactionBudgetExceeded> {
+        remaining = remaining
+            .checked_sub(crate::log_redact::ticket_digest_windows(slice))
+            .ok_or(TicketRedactionBudgetExceeded)?;
+        let masked =
+            crate::log_redact::redact_ticket_digest_range(slice, &mut range, Some(digest))?;
+        output.push_str(&masked[range]);
+        Ok(())
+    };
+    for piece in &preview.pieces {
+        let piece_range = match piece {
+            CapPiece::Input(range) => range.clone(),
+            // Markers and separators the cap wrote have no capture neighbors.
+            CapPiece::Inserted(text) => {
+                mask(text, 0..text.len(), &mut output)?;
+                continue;
+            }
+        };
+        let Some(copied) = cache.get(piece_range.clone()) else {
+            return Err(TicketRedactionBudgetExceeded);
+        };
+        // Each displayed line is checked at the cache position it was copied
+        // from, so an identical line elsewhere never decides its masking.
+        let mut cache_start = piece_range.start;
+        for line in copied.split_inclusive('\n') {
+            let line_start = cache_start;
+            cache_start += line.len();
+            let newline = line.ends_with('\n');
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            if !line.is_empty() {
+                let edge_hex = line.as_bytes()[0].is_ascii_hexdigit()
+                    || line.as_bytes()[line.len() - 1].is_ascii_hexdigit();
                 let origin = mappings.iter().flatten().find_map(
                     |(source, mapped_start, cut_start, cut_end)| {
-                        let start = cache_start.checked_sub(*mapped_start)?;
+                        let start = line_start.checked_sub(*mapped_start)?;
                         let end = start + line.len();
                         if end > source.len()
                             || (*cut_start && start < TICKET_HALO_BYTES)
@@ -413,7 +597,7 @@ fn mask_rendered_ticket_preview(
                     .flatten();
                 let (source, start) = match origin.or(ending_origin) {
                     Some(origin) => origin,
-                    None if intact_cache || !edge_hex => (cache, cache_start),
+                    None if intact_cache || !edge_hex => (cache, line_start),
                     None => return Err(TicketRedactionBudgetExceeded),
                 };
                 let from = crate::compress::generic::floor_char_boundary(
@@ -424,26 +608,15 @@ fn mask_rendered_ticket_preview(
                     source,
                     (start + line.len() + TICKET_HALO_BYTES).min(source.len()),
                 );
-                (&source[from..to], start - from..start - from + line.len())
-            } else {
-                let truncation_marker = line
-                    .strip_prefix("...<truncated ")
-                    .and_then(|line| line.strip_suffix(" bytes>..."))
-                    .is_some_and(|count| count.parse::<usize>().is_ok());
-                // These exact generated markers have no missing source neighbors.
-                if marker != Some(line) && !truncation_marker {
-                    return Err(TicketRedactionBudgetExceeded);
-                }
-                (line, 0..line.len())
-            };
-        remaining = remaining
-            .checked_sub(crate::log_redact::ticket_digest_windows(slice))
-            .ok_or(TicketRedactionBudgetExceeded)?;
-        let masked =
-            crate::log_redact::redact_ticket_digest_range(slice, &mut range, Some(digest))?;
-        output.push_str(&masked[range]);
-        if newline {
-            output.push('\n');
+                mask(
+                    &source[from..to],
+                    start - from..start - from + line.len(),
+                    &mut output,
+                )?;
+            }
+            if newline {
+                output.push('\n');
+            }
         }
     }
     Ok(output)
@@ -460,11 +633,48 @@ mod ticket_preview_tests {
         let raw = format!("{fragment}\n{}{ticket}\n", "x".repeat(10_000));
         let cache = format!("unrelated compressed head\n[cut]\n{fragment}\n");
         let digest = blake3::hash(ticket.as_bytes()).to_hex().to_string();
+        let at = cache.find(fragment).unwrap();
+        let preview = crate::bash_background::output::PiecedText {
+            text: fragment.to_string(),
+            pieces: vec![crate::bash_background::output::CapPiece::Input(
+                at..at + fragment.len(),
+            )],
+        };
         // A matching fragment at the start of raw output is not evidence for
         // the bytes neighboring the displayed, already-truncated occurrence.
-        assert!(
-            mask_rendered_ticket_preview(&raw, &cache, false, &[], None, fragment, &digest)
-                .is_err()
+        assert!(mask_rendered_ticket_preview(&raw, &cache, false, &[], &preview, &digest).is_err());
+    }
+
+    #[test]
+    fn completion_ticket_fragment_is_checked_where_it_was_copied_from() {
+        use crate::bash_background::output::{CapPiece, PiecedText};
+        let ticket = "d34db33f89ab01cd7654ef2098ac1357";
+        let fragment = &ticket[16..];
+        // The same 16 hex digits stand alone on the first line and end the
+        // ticket on the second.
+        let cache = format!("{fragment}\n{}{fragment}\n", &ticket[..16]);
+        let digest = blake3::hash(ticket.as_bytes()).to_hex().to_string();
+        let copied_from = |at: usize| PiecedText {
+            text: fragment.to_string(),
+            pieces: vec![CapPiece::Input(at..at + fragment.len())],
+        };
+        let in_ticket = cache.rfind(fragment).unwrap();
+        assert_eq!(
+            mask_rendered_ticket_preview(
+                &cache,
+                &cache,
+                true,
+                &[],
+                &copied_from(in_ticket),
+                &digest
+            )
+            .unwrap(),
+            crate::log_redact::SECRET_PLACEHOLDER
+        );
+        assert_eq!(
+            mask_rendered_ticket_preview(&cache, &cache, true, &[], &copied_from(0), &digest)
+                .unwrap(),
+            fragment
         );
     }
 }
