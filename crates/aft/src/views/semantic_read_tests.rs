@@ -895,6 +895,45 @@ fn restart_after_a_chunk_row_is_replaced_seeds_nothing_and_reads_the_new_row() {
 }
 
 #[test]
+fn a_fill_never_vouches_with_chunk_checks_from_before_a_delete() {
+    use crate::views::semantic_arena::ChunkNaming;
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let source = large_source();
+    write_tree(root.path(), &[("src/large.rs", &source)]);
+    let plane = new_plane(storage.path(), "model-a");
+    let checkout = ready_checkout(storage.path(), root.path(), &plane);
+    let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+    let chunks = crate::semantic_index::chunk_view_file(
+        root.path(),
+        &Path::new("src").join("large.rs"),
+        source.as_bytes(),
+        plane.producer.caps,
+    )
+    .unwrap()
+    .unwrap();
+    // This process still indexes the old floats of the replaced row, checked
+    // before the delete; an edit in the same process reuses them.
+    replace_chunk_row(&store, &plane.producer, &chunks[7].embed_text);
+    let edited = source.replace("input + 149\n", "input * 149\n");
+    let snapshot = edit_snapshot(&checkout, &edited);
+    let report = checkout.fill(&snapshot, &Model::default(), "model-a");
+    assert_eq!(report.embedded_keys, 1, "{report:?}");
+    let payload = store
+        .get(&plane.producer.key(edited.as_bytes(), &large_rel_path()))
+        .unwrap()
+        .unwrap();
+    let marker = plane.producer.verified_run_marker(
+        &blake3::hash(&payload),
+        &store.deletion_epoch().unwrap().unwrap(),
+    );
+    assert!(
+        !store.contains(&marker).unwrap(),
+        "a run checked against chunk rows before a delete was vouched for"
+    );
+}
+
+#[test]
 fn restart_with_a_damaged_deletion_epoch_seeds_nothing_and_still_fills() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
