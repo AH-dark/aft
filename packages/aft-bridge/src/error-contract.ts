@@ -359,9 +359,10 @@ export function isBashTransportDeadError(error: unknown): error is Error {
 }
 
 /**
- * Attach recovery guidance to unknown outcomes without changing their error
- * Tools without host fallback receive a typed refusal for a known pre-dispatch
- * module outage; other errors continue through the existing adaptation logic.
+ * Attach recovery guidance to unknown outcomes without changing the error's
+ * class, code or retry behavior. A tool call that never reached the AFT module
+ * gets a typed, safe-to-retry refusal, since nothing ran; other errors keep the
+ * existing adaptation.
  */
 export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;

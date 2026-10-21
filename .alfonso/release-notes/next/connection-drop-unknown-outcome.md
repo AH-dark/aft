@@ -1,1 +1,1 @@
-Calls that lose the AFT connection now distinguish uncertain execution from requests never sent, preventing unsafe reruns and clarifying when retrying is safe.
+When the connection to AFT drops during a tool call, the error now says the outcome is unknown and the call must not be rerun (a bash command keeps running and reports its completion), instead of a bare "subc closed the connection"; a call that never reached AFT says nothing ran and it is safe to retry.
