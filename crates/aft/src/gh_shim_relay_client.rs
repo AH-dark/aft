@@ -53,7 +53,9 @@ const BINDINGS_CHECK_FILE: &str = "relay-bindings-check.json";
 /// Everything the relay needs from the process, gathered once so tests can
 /// supply a fake daemon and ticket without touching the environment.
 pub(super) struct RelayContext {
-    pub(super) worker_broker: Option<Result<crate::gh_shim_worker_broker::Client, String>>,
+    pub(super) worker_broker: Option<
+        Result<crate::gh_shim_worker_broker::Client, crate::gh_shim_worker_broker::ClientError>,
+    >,
     pub(super) connection_file: Option<PathBuf>,
     pub(super) ticket: Option<String>,
     pub(super) transient_delays: [Duration; 2],
@@ -1104,7 +1106,7 @@ pub(super) fn worker_repository(relay: &RelayContext) -> Result<String, String> 
 
 fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, String> {
     if let Some(client) = &relay.worker_broker {
-        let client = client.as_ref().map_err(Clone::clone)?;
+        let client = client.as_ref().map_err(ToString::to_string)?;
         let data = crate::gh_shim_worker_broker::request(
             client,
             crate::gh_shim_worker_broker::Operation::SessionContext,
@@ -1177,7 +1179,7 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
 /// relay. Tool refusals remain Response bodies; Error frames are transport errors.
 pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Value, String> {
     if let Some(client) = &relay.worker_broker {
-        let client = client.as_ref().map_err(Clone::clone)?;
+        let client = client.as_ref().map_err(ToString::to_string)?;
         let request =
             serde_json::from_value(request.clone()).map_err(|_| "invalid worker read request")?;
         return crate::gh_shim_worker_broker::request(

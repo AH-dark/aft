@@ -386,6 +386,25 @@ use crate::gh_shim_relay::RelayTransport;
 
 /// Client discovery never opens user configuration or a general connection file.
 /// In worker mode, absent paths are an error rather than a discovery fallback.
+#[derive(Clone, Debug)]
+pub(crate) enum ClientError {
+    #[cfg(not(unix))]
+    UnsupportedPlatform(&'static str),
+    #[cfg(unix)]
+    MissingPath(&'static str),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(not(unix))]
+            Self::UnsupportedPlatform(platform) => write!(f, "gh_shim_worker_read_platform_unsupported_{platform}: worker read broker is unavailable on {platform}"),
+            #[cfg(unix)]
+            Self::MissingPath(key) => write!(f, "worker read broker requires {key}"),
+        }
+    }
+}
+
 pub(crate) struct Client {
     #[cfg(unix)]
     socket: PathBuf,
@@ -393,22 +412,34 @@ pub(crate) struct Client {
     capability_file: PathBuf,
 }
 impl Client {
-    pub(crate) fn from_process() -> Result<Self, String> {
-        #[cfg(windows)]
-        return Err("gh_shim_worker_read_platform_unsupported_windows: worker read broker is unavailable on Windows".into());
-        #[cfg(not(windows))]
+    pub(crate) fn from_process() -> Result<Self, ClientError> {
+        #[cfg(not(unix))]
+        return Err(ClientError::UnsupportedPlatform(std::env::consts::OS));
+        #[cfg(unix)]
         {
-            let path = |key| {
+            let path = |key: &'static str| {
                 std::env::var_os(key)
                     .map(PathBuf::from)
                     .filter(|p| p.is_absolute())
-                    .ok_or_else(|| format!("worker read broker requires {key}"))
+                    .ok_or(ClientError::MissingPath(key))
             };
             Ok(Self {
                 socket: path(SOCKET_ENV)?,
                 capability_file: path(CAPABILITY_FILE_ENV)?,
             })
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[test]
+    fn gh_shim_broker_windows_has_a_typed_platform_refusal() {
+        assert!(matches!(
+            Client::from_process(),
+            Err(ClientError::UnsupportedPlatform("windows"))
+        ));
     }
 }
 
