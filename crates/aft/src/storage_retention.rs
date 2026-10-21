@@ -3720,12 +3720,18 @@ mod storage_retention_tests {
             .to_string()
             .contains("injected directory sync failure"));
         assert_eq!(fs::read_dir(&directory).unwrap().count(), roots.len());
-        for (index, root) in roots.iter().enumerate() {
-            let key = crate::path_identity::project_scope_key(root);
+        // Derive keys while the checkouts exist. After removal the key falls
+        // back to a lexical form, which on Windows differs from the verbatim
+        // canonical path the binding was recorded under.
+        let keys: Vec<String> = roots
+            .iter()
+            .map(|root| crate::path_identity::project_scope_key(root))
+            .collect();
+        for (index, (root, key)) in roots.iter().zip(&keys).enumerate() {
             let path = directory.join(format!("{key}.json"));
             let before: Binding = read_json(&path).unwrap();
             if index == 0 {
-                record_bind(temp.path(), root, &key).unwrap();
+                record_bind(temp.path(), root, key).unwrap();
             }
             let after: Binding = read_json(&path).unwrap();
             assert_eq!(before.root, after.root);
@@ -3735,8 +3741,7 @@ mod storage_retention_tests {
         }
         assert_eq!(fs::read_dir(&directory).unwrap().count(), roots.len());
         assert_eq!(run_pass_entry_bound(temp.path()).removed_roots, 0);
-        for root in &roots {
-            let key = crate::path_identity::project_scope_key(root);
+        for key in &keys {
             let path = directory.join(format!("{key}.json"));
             let mut binding: Binding = read_json(&path).unwrap();
             binding.last_bound_ms = 0;
