@@ -8,6 +8,8 @@ import {
   legacyConfigNoticeMessage,
   noticeDigest,
   noticeProjection,
+  RETIRED_ENABLED_FALSE_INDEXES_NOTE,
+  RETIRED_HANG_THRESHOLD_NOTE,
   removedConfigKeyErrors,
   SEMANTIC_COST_NOTICE,
   semanticCostNotice,
@@ -324,9 +326,41 @@ describe("feature-config policy", () => {
       "bridge.hang_threshold",
       "harnesses.pi.bridge.hang_threshold",
     ]);
+    // Nothing is applied for a key that no longer does anything, so a file
+    // whose only retired keys are such keys gets just their sentence.
     expect(legacyConfigNoticeMessage("/repo/.cortexkit/aft.jsonc", out)).toBe(
-      "/repo/.cortexkit/aft.jsonc uses retired keys (bridge.hang_threshold, harnesses.pi.bridge.hang_threshold); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.",
+      "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.",
     );
+    const inert = translateConfigDocument(
+      { inspect: { tier2_soft_deadline_ms: 50, max_drill_down_items: 20 } },
+      "project",
+    );
+    expect(legacyConfigNoticeMessage("/p", inert)).toBe(
+      "inspect.max_drill_down_items never had an effect, so the setting can be removed. inspect.tier2_soft_deadline_ms never had an effect, so the setting can be removed.",
+    );
+
+    // Mixed with keys that have equivalents: the generic sentence names only
+    // those keys, and the no-effect sentence follows.
+    const mixed = translateConfigDocument(
+      {
+        search_index: false,
+        bridge: { hang_threshold: 3 },
+        harnesses: { pi: { bridge: { hang_threshold: 5 } } },
+      },
+      "project",
+    );
+    expect(legacyConfigNoticeMessage("/repo/.cortexkit/aft.jsonc", mixed)).toBe(
+      `/repo/.cortexkit/aft.jsonc uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${RETIRED_HANG_THRESHOLD_NOTE}`,
+    );
+    const withEnabled = translateConfigDocument(
+      { enabled: false, bridge: { hang_threshold: 3 } },
+      "project",
+    );
+    expect(
+      legacyConfigNoticeMessage("/p", withEnabled).endsWith(
+        `${RETIRED_ENABLED_FALSE_INDEXES_NOTE} ${RETIRED_HANG_THRESHOLD_NOTE}`,
+      ),
+    ).toBe(true);
 
     const only: Record<string, unknown> = { bridge: { hang_threshold: 2 } };
     translateConfigDocument(only, "user");

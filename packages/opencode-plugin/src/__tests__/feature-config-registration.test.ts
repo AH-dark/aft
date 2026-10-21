@@ -234,10 +234,26 @@ describe("OpenCode feature-config registration", () => {
     expect(config.bridge).toEqual({ request_timeout_ms: 45_000 });
     expect(getConfigValidationErrors()).toEqual([]);
     const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
-    expect(notices).toHaveLength(1);
-    expect(notices[0]?.message.split("\n")).toHaveLength(1);
-    expect(notices[0]?.message).toContain("uses retired keys (bridge.hang_threshold)");
-    expect(notices[0]?.message.endsWith(RETIRED_HANG_THRESHOLD_NOTE)).toBe(true);
+    // Nothing was applied, so the notice is only the no-effect sentence.
+    expect(notices.map((notice) => notice.message)).toEqual([
+      "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.",
+    ]);
+  });
+
+  test("a project file mixing translated keys with bridge.hang_threshold names only the translated keys, then says the threshold does nothing", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(
+      projectFile,
+      JSON.stringify({ search_index: false, bridge: { hang_threshold: 4 } }),
+    );
+    const config = loadWithUserConfig({});
+    expect(config.indexes?.trigram).toBe(false);
+    expect(getConfigValidationErrors()).toEqual([]);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${projectFile} uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${RETIRED_HANG_THRESHOLD_NOTE}`,
+    ]);
   });
 
   test("a false runtime gate only switches its behaviour off", () => {

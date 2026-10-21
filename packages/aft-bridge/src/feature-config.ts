@@ -649,25 +649,53 @@ export const RETIRED_HANG_THRESHOLD_NOTE =
   "bridge.hang_threshold no longer does anything: a timed-out request no longer restarts AFT, so the setting can be removed.";
 
 /**
+ * Retired keys that no longer do anything, each with the notice sentence that
+ * says so. Nothing is applied for them, so a notice never counts them among
+ * the keys whose "current equivalents" were applied. Kept in key order;
+ * mirrors `NO_EFFECT_RETIRED_NOTES` in `crates/aft/src/feature_config.rs`.
+ */
+export const NO_EFFECT_RETIRED_NOTES: ReadonlyArray<readonly [string, string]> = [
+  ["bridge.hang_threshold", RETIRED_HANG_THRESHOLD_NOTE],
+  [
+    "inspect.max_drill_down_items",
+    "inspect.max_drill_down_items never had an effect, so the setting can be removed.",
+  ],
+  [
+    "inspect.tier2_soft_deadline_ms",
+    "inspect.tier2_soft_deadline_ms never had an effect, so the setting can be removed.",
+  ],
+];
+
+/** The no-effect sentence for a retired key, which may carry a `harnesses.<id>.` prefix. */
+function noEffectNote(key: string): string | undefined {
+  return NO_EFFECT_RETIRED_NOTES.find(([path]) => key === path || key.endsWith(`.${path}`))?.[1];
+}
+
+/**
  * The once-per-identity notice for a project config file whose retired keys
  * were translated in memory. The file itself is never written: it is shared
- * through its repository. Mirrors `project_retired_keys_notice` in
- * `crates/aft/src/feature_config.rs`.
+ * through its repository. Keys that no longer do anything get only their own
+ * sentence, after the sentence about the keys whose current equivalents were
+ * applied (omitted when there are none). Mirrors `project_retired_keys_notice`
+ * in `crates/aft/src/feature_config.rs`.
  */
 export function legacyConfigNoticeMessage(
   configPath: string,
   translation: Pick<DocumentTranslation, "retiredEnabledFalse" | "retiredKeys">,
 ): string {
-  const base = `${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`;
-  const notes = [
-    ...(translation.retiredEnabledFalse ? [RETIRED_ENABLED_FALSE_INDEXES_NOTE] : []),
-    ...(translation.retiredKeys.some(
-      (key) => key === "bridge.hang_threshold" || key.endsWith(".bridge.hang_threshold"),
-    )
-      ? [RETIRED_HANG_THRESHOLD_NOTE]
-      : []),
-  ];
-  return [base, ...notes].join(" ");
+  const equivalents = translation.retiredKeys.filter((key) => noEffectNote(key) === undefined);
+  const noEffect = new Set(translation.retiredKeys.map(noEffectNote));
+  const parts: string[] = [];
+  if (equivalents.length > 0) {
+    parts.push(
+      `${configPath} uses retired keys (${equivalents.join(", ")}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
+    );
+    if (translation.retiredEnabledFalse) parts.push(RETIRED_ENABLED_FALSE_INDEXES_NOTE);
+  }
+  for (const [, note] of NO_EFFECT_RETIRED_NOTES) {
+    if (noEffect.has(note)) parts.push(note);
+  }
+  return parts.join(" ");
 }
 
 /**
