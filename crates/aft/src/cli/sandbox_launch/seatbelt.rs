@@ -1202,3 +1202,35 @@ mod session_read_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod broker_root_render_tests {
+    use super::*;
+    #[test]
+    fn gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = aft::sandbox_spawn::managed_task_temp_root();
+        let own = root.join("0123456789ab");
+        let mut profile = SandboxProfile::build(
+            vec![fixture.path().to_owned()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            fixture.path().to_owned(),
+        )
+        .unwrap();
+        profile.worker_jail = true;
+        profile.temp_dir = own.clone();
+        let source = render_profile(&profile).unwrap();
+        let expected=format!("(deny network-outbound (require-all (remote unix-socket (path-regex #\"^{}/[^/]+[.]gh-read[.]sock$\")) (require-not (path \"{}\"))))",regex::escape(root.to_str().unwrap()),escape_path(&own.with_file_name("0123456789ab.gh-read.sock")).unwrap());
+        assert!(source.lines().any(|line|line==expected),"rendered worker socket rule must match the allocator namespace and exact own endpoint: {source}");
+        profile.worker_jail = false;
+        assert!(
+            !render_profile(&profile).unwrap().contains("gh-read[.]sock"),
+            "head profiles must not receive the worker socket restriction"
+        );
+    }
+}

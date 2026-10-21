@@ -223,6 +223,31 @@ fn landlock_available() -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn launcher_fd_probe_required_mode_cannot_silently_skip() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "launcher_closes_late_inherited_listener_above_marker_slots",
+            "--nocapture",
+        ])
+        .env("AFT_REQUIRE_LANDLOCK", "1")
+        .env("AFT_PROBE_FORCE_NO_LANDLOCK", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "mandatory fd probe must fail when the backend is unavailable, not return success"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AFT_REQUIRE_LANDLOCK=1 but Landlock ABI is unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 macro_rules! skip_if_landlock_absent {
     () => {
         #[cfg(target_os = "linux")]
@@ -1699,18 +1724,17 @@ fn launcher_closes_late_inherited_listener_above_marker_slots() {
     let listener =
         std::os::unix::net::UnixListener::bind(fixture.project.join("listener.sock")).unwrap();
     let source = listener.as_raw_fd();
+    let profile_fd = fixture.profile.fd();
     fixture.profile.rewind();
-    let script="import errno,os\ntry:\n os.fstat(128)\nexcept OSError as e:\n assert e.errno == errno.EBADF\n print('LATE_LISTENER_CLOSED')\nelse:\n raise AssertionError('inherited broker listener remained open')\n";
-    let mut command = launcher_command(fixture.profile.fd(), &["python3", "-c", script]);
+    let script="import errno,os\nfor fd in [5,10,128]:\n try:\n  os.fstat(fd)\n except OSError as e:\n  assert e.errno == errno.EBADF\n else:\n  raise AssertionError('inherited broker listener remained open')\nprint('LATE_LISTENERS_CLOSED')\n";
+    let mut command = launcher_command(131, &["python3", "-c", script]);
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(source, 128) < 0 {
-                return Err(std::io::Error::last_os_error());
+            if libc::dup2(profile_fd,131)<0 || libc::fcntl(131,libc::F_SETFD,0)<0 {return Err(std::io::Error::last_os_error());}
+            for target in [5,10,128] {
+                if libc::dup2(source,target)<0 || libc::fcntl(target,libc::F_SETFD,0)<0 {return Err(std::io::Error::last_os_error());}
             }
-            if libc::fcntl(128, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::close(source);
+            if ![5,10,128,131].contains(&source) {libc::close(source);}
             Ok(())
         });
     }
@@ -1720,7 +1744,7 @@ fn launcher_closes_late_inherited_listener_above_marker_slots() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("LATE_LISTENER_CLOSED"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("LATE_LISTENERS_CLOSED"));
 }
 
 #[test]
@@ -1776,29 +1800,4 @@ fn launcher_failure_marker_cannot_be_forged_by_jailed_exec() {
             "the supervisor's marker must remain unforgeable"
         );
     }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn launcher_fd_probe_required_mode_cannot_silently_skip() {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "launcher_closes_late_inherited_listener_above_marker_slots",
-            "--nocapture",
-        ])
-        .env("AFT_REQUIRE_LANDLOCK", "1")
-        .env("AFT_PROBE_FORCE_NO_LANDLOCK", "1")
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "mandatory fd probe must fail when the backend is unavailable, not return success"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("AFT_REQUIRE_LANDLOCK=1 but Landlock ABI is unavailable"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
