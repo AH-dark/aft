@@ -1041,7 +1041,10 @@ fn project_block(block: &Map<String, Value>) -> Value {
     let mut projected = Map::new();
 
     let mut legacy_paths = Map::new();
-    for (path, _) in RETIRED_PATHS {
+    // Retired keys with no replacement are projected too: otherwise adding one
+    // to a file whose notice was already acknowledged would keep the old
+    // digest and the saved record would hide the new notice.
+    for (path, _) in RETIRED_PATHS.into_iter().chain(REMOVED_NO_EFFECT_PATHS) {
         let value = match path.split_once('.') {
             Some((container, leaf)) => block
                 .get(container)
@@ -1631,6 +1634,37 @@ mod tests {
             "indexes": {"trigram": true, "semantic": false, "callgraph": true}
         }))
         .is_ok());
+    }
+
+    #[test]
+    fn adding_a_no_effect_key_changes_the_notice_identity_and_nothing_else_does() {
+        let digest = |doc: Value| notice_digest(&notice_projection(doc.as_object()));
+        let acknowledged = digest(json!({"search_index": false}));
+        // Nothing a notice depends on changed: same identity, no repeat.
+        assert_eq!(acknowledged, digest(json!({"search_index": false})));
+        assert_eq!(
+            acknowledged,
+            digest(json!({"search_index": false, "bridge": {"request_timeout_ms": 45000}}))
+        );
+        // Adding the retired key, in the base or a harness block, is a new
+        // identity, so a saved record for the old one cannot hide it.
+        let added = json!({"search_index": false, "bridge": {"hang_threshold": 3}});
+        assert_ne!(acknowledged, digest(added.clone()));
+        assert_ne!(
+            acknowledged,
+            digest(
+                json!({"search_index": false, "harnesses": {"pi": {"bridge": {"hang_threshold": 5}}}})
+            )
+        );
+        // The notice for the new identity names it.
+        let Value::Object(mut map) = added else {
+            panic!("object")
+        };
+        let out = translate_document(&mut map, DocumentTier::Project);
+        assert_eq!(
+            project_retired_keys_notice("/p", &out),
+            format!("/p uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. {RETIRED_HANG_THRESHOLD_NOTE}")
+        );
     }
 
     #[test]

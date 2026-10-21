@@ -770,7 +770,10 @@ const ABSENT = { absent: true } as const;
 
 function projectBlock(block: JsonRecord): JsonRecord {
   const legacyPaths: JsonRecord = {};
-  for (const [path] of RETIRED_PATHS) {
+  // Retired keys with no replacement are projected too: otherwise adding one
+  // to a file whose notice was already acknowledged would keep the old digest
+  // and the saved record would hide the new notice.
+  for (const path of [...RETIRED_PATHS.map(([retired]) => retired), ...REMOVED_NO_EFFECT_PATHS]) {
     const dot = path.indexOf(".");
     if (dot < 0) {
       if (Object.hasOwn(block, path)) legacyPaths[path] = block[path];

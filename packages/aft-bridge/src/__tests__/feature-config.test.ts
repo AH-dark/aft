@@ -410,6 +410,43 @@ describe("feature-config policy", () => {
 });
 
 describe("migration notice delivery", () => {
+  test("a project that acknowledged one retired key is notified again when it adds bridge.hang_threshold", () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-notice-hang-"));
+    roots.push(root);
+    const storePath = join(root, "state", "migration-notices.json");
+    const configPath = join(root, ".cortexkit", "aft.jsonc");
+    const delivered: string[] = [];
+    // The plugin loaders build the digest from the raw document and the
+    // message from its translation, exactly like this.
+    const load = (doc: Record<string, unknown>): boolean =>
+      deliverMigrationNoticeOnce({
+        configPath,
+        digest: noticeDigest(noticeProjection(structuredClone(doc))),
+        message: legacyConfigNoticeMessage(
+          configPath,
+          translateConfigDocument(structuredClone(doc), "project"),
+        ),
+        deliver: (message) => delivered.push(message),
+        storePath,
+      });
+
+    expect(load({ search_index: false })).toBe(true);
+    // Nothing that a notice depends on changed: no repeat.
+    expect(load({ search_index: false })).toBe(false);
+    expect(load({ search_index: false, bridge: { request_timeout_ms: 45_000 } })).toBe(false);
+    // Adding the retired key is a new identity with a notice that names it.
+    expect(load({ search_index: false, bridge: { hang_threshold: 3 } })).toBe(true);
+    expect(load({ search_index: false, bridge: { hang_threshold: 3 } })).toBe(false);
+    expect(
+      load({ search_index: false, harnesses: { pi: { bridge: { hang_threshold: 5 } } } }),
+    ).toBe(true);
+    expect(delivered).toHaveLength(3);
+    expect(delivered[1]).toBe(
+      `${configPath} uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${RETIRED_HANG_THRESHOLD_NOTE}`,
+    );
+    expect(delivered[2]?.endsWith(RETIRED_HANG_THRESHOLD_NOTE)).toBe(true);
+  });
+
   test("an unchanged identity is delivered once; a changed identity again", () => {
     const root = mkdtempSync(join(tmpdir(), "aft-notice-"));
     roots.push(root);
