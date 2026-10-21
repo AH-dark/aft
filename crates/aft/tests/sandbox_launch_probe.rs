@@ -946,7 +946,7 @@ fn linux_vanished_listed_read_grant_launches_without_broadening_access() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
+fn task_store_paths_are_denied_while_explicit_stdin_remains_readable() {
     let root = tempfile::tempdir().expect("create task-store probe root");
     let store = root.path().join("bash-tasks/session");
     let own_control = store.join("bash-0000000000000001/control");

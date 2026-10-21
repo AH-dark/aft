@@ -101,6 +101,14 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class LightPREventGateTests(unittest.TestCase):
+    def test_worker_payload_probe_label_names_the_explicit_stdio_contract(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "crates/aft/tests/sandbox_launch_probe.rs").read_text()
+        self.assertTrue("fn task_store_paths_are_denied_while_explicit_stdin_remains_readable()" in source,
+                        "the payload probe must name its explicit-stdin contract")
+        self.assertFalse("fn task_store_paths_are_denied_while_held_payload_fd_remains_readable()" in source,
+                         "the old high-FD inheritance label must not overstate this probe")
+
     def test_worker_read_landlock_is_required_and_emitted_for_every_main_event(self) -> None:
         root = Path(__file__).resolve().parents[2]
         required = (root / ".github/required-checks.txt").read_text().splitlines()

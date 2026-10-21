@@ -466,3 +466,22 @@ Worker GET values therefore refuse `&`, `=`, `#` and percent escapes as well as
 control characters. This prevents a value such as `state=open&x=y` from reaching
 that boundary as an extra or truncated parameter. Existing head/operator query
 values retain their previous behavior.
+
+### Regression labels and their actual scope
+
+Two test names changed between the earlier broker implementation and its
+lifecycle fixes; a third payload name was left stale and is corrected now:
+
+- `gh_shim_broker_revocation_discards_in_flight_reply` became
+  `gh_shim_broker_revocation_during_lookup_refuses_before_upstream`: the original
+  case revokes during lookup and requires **zero** upstream calls. Its old name
+  was reused for a separately added test with one held upstream call and a
+  post-revocation discarded result; that is not a third historical rename.
+- `worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply` became
+  `worker_gh_read_t10_cancel_midflight_terminates_reader_without_output`: it kills
+  the reader and observes no output. Independent broker suppression is proved
+  by `worker_gh_read_revocation_suppresses_reply_to_surviving_observer` instead.
+- `task_store_paths_are_denied_while_held_payload_fd_remains_readable` now becomes
+  `task_store_paths_are_denied_while_explicit_stdin_remains_readable`: approved
+  payload bytes arrive deliberately through stdin while sibling-store reads
+  are denied. It does not claim arbitrary high-descriptor inheritance.
