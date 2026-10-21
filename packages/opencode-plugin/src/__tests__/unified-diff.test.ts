@@ -23,6 +23,43 @@ function diffBody(diff: string): string {
   return lines.slice(headerEnd).join("\n");
 }
 
+function applyUnifiedDiff(before: string, diff: string): string {
+  const beforeLines = before.split("\n");
+  const afterLines: string[] = [];
+  let beforeIndex = 0;
+  let inHunk = false;
+
+  for (const line of diff.split("\n")) {
+    const header = line.match(/^@@ -(\d+),(\d+) \+(\d+),(\d+) @@/);
+    if (header) {
+      inHunk = true;
+      const beforeStart = Number(header[1]);
+      const beforeCount = Number(header[2]);
+      const hunkStart = beforeCount === 0 ? beforeStart : beforeStart - 1;
+      while (beforeIndex < hunkStart) afterLines.push(beforeLines[beforeIndex++]);
+      continue;
+    }
+
+    if (!inHunk) continue;
+
+    if (line.startsWith(" ")) {
+      expect(beforeLines[beforeIndex]).toBe(line.slice(1));
+      afterLines.push(beforeLines[beforeIndex++]);
+    } else if (line.startsWith("-")) {
+      expect(beforeLines[beforeIndex++]).toBe(line.slice(1));
+    } else if (line.startsWith("+")) {
+      afterLines.push(line.slice(1));
+    }
+  }
+
+  while (beforeIndex < beforeLines.length) afterLines.push(beforeLines[beforeIndex++]);
+  return afterLines.join("\n");
+}
+
+function hunkHeaders(diff: string): string[] {
+  return diff.split("\n").filter((line) => line.startsWith("@@"));
+}
+
 describe("buildUnifiedDiff", () => {
   test("single-line insertion produces a localized hunk, not whole-file diff", () => {
     // Build a 2000-line file. Insert one line near the top.
@@ -45,6 +82,7 @@ describe("buildUnifiedDiff", () => {
     const deletions = body.split("\n").filter((l) => l.startsWith("-")).length;
     expect(additions).toBe(1);
     expect(deletions).toBe(0);
+    expect(applyUnifiedDiff(before, diff)).toBe(inserted);
   });
 
   test("single-line deletion produces a localized hunk", () => {
@@ -63,6 +101,7 @@ describe("buildUnifiedDiff", () => {
     expect(additions).toBe(0);
     expect(deletions).toBe(1);
     expect(body).toContain("-line 50");
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
   });
 
   test("single-line replacement produces a localized hunk", () => {
@@ -78,6 +117,7 @@ describe("buildUnifiedDiff", () => {
     const deletions = body.split("\n").filter((l) => l.startsWith("-")).length;
     expect(additions).toBe(1);
     expect(deletions).toBe(1);
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
   });
 
   test("two distant changes produce two hunks, not one giant one", () => {
@@ -140,13 +180,145 @@ describe("buildUnifiedDiff", () => {
     expect(deletions).toBe(3);
   });
 
-  test("files with too many lines skip diff computation", () => {
-    // The cost guard is line count, not bytes — LCS is O(n*m) in lines.
-    // A short string with 5001 newlines exceeds the 5000-line cap.
-    const tooManyLines = Array.from({ length: 5001 }, () => "x").join("\n");
-    const diff = buildUnifiedDiff("file.ts", tooManyLines, "small");
-    expect(diff).toContain("(diff skipped");
-    expect(diff).toMatch(/file has \d+ lines/);
+  test("four-line edit in a 7000-line file renders its hunk", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    for (let i = 100; i < 104; i++) afterLines[i] = `edited line ${i + 1}`;
+
+    const diff = buildUnifiedDiff("large.swift", beforeLines.join("\n"), afterLines.join("\n"));
+    const body = diffBody(diff);
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(diff.split("\n").filter((line) => line.startsWith("@@"))).toHaveLength(1);
+    expect(body.split("\n").filter((line) => line.startsWith("+")).length).toBe(4);
+    expect(body.split("\n").filter((line) => line.startsWith("-")).length).toBe(4);
+  });
+
+  test("three distant edits in a 7000-line file render three hunks", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    for (const index of [49, 3499, 6899]) afterLines[index] = `edited line ${index + 1}`;
+
+    const diff = buildUnifiedDiff("large.swift", beforeLines.join("\n"), afterLines.join("\n"));
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(diff.split("\n").filter((line) => line.startsWith("@@"))).toHaveLength(3);
+    const body = diffBody(diff);
+    expect(body.split("\n").filter((line) => line.startsWith("+")).length).toBe(3);
+    expect(body.split("\n").filter((line) => line.startsWith("-")).length).toBe(3);
+    expect(applyUnifiedDiff(beforeLines.join("\n"), diff)).toBe(afterLines.join("\n"));
+    for (const line of [50, 3500, 6900]) {
+      expect(body).toContain(`-line ${line}`);
+      expect(body).toContain(`+edited line ${line}`);
+    }
+  });
+
+  test("Myers renders distant insertions with exact hunk coordinates", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    afterLines.splice(100, 0, "inserted early");
+    afterLines.splice(6901, 0, "inserted late");
+    const before = beforeLines.join("\n");
+    const after = afterLines.join("\n");
+
+    const diff = buildUnifiedDiff("large.swift", before, after);
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(hunkHeaders(diff)).toEqual(["@@ -98,6 +98,7 @@", "@@ -6898,6 +6899,7 @@"]);
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
+  });
+
+  test("Myers renders distant deletions with exact hunk coordinates", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    afterLines.splice(6900, 1);
+    afterLines.splice(100, 1);
+    const before = beforeLines.join("\n");
+    const after = afterLines.join("\n");
+
+    const diff = buildUnifiedDiff("large.swift", before, after);
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(hunkHeaders(diff)).toEqual(["@@ -98,7 +98,6 @@", "@@ -6898,7 +6897,6 @@"]);
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
+  });
+
+  test("Myers tracks shifted coordinates for mixed insertions and deletions", () => {
+    const beforeLines = Array.from({ length: 7000 }, (_, i) => `line ${i + 1}`);
+    const afterLines = [...beforeLines];
+    afterLines.splice(100, 0, "inserted early");
+    afterLines.splice(6901, 1);
+    const before = beforeLines.join("\n");
+    const after = afterLines.join("\n");
+
+    const diff = buildUnifiedDiff("large.swift", before, after);
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(hunkHeaders(diff)).toEqual(["@@ -98,6 +98,7 @@", "@@ -6898,7 +6899,6 @@"]);
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
+  });
+
+  test("Myers preserves repeated identical lines around distant insertions", () => {
+    const beforeLines = Array.from({ length: 7000 }, () => "same");
+    const afterLines = [...beforeLines];
+    afterLines.splice(100, 0, "inserted early");
+    afterLines.splice(6901, 0, "inserted late");
+    const before = beforeLines.join("\n");
+    const after = afterLines.join("\n");
+
+    const diff = buildUnifiedDiff("large.swift", before, after);
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(hunkHeaders(diff)).toEqual(["@@ -98,6 +98,7 @@", "@@ -6898,6 +6899,7 @@"]);
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
+  });
+
+  test("250,000-line large diffs append operations safely", () => {
+    const beforeLines = Array.from({ length: 250_000 }, () => "x");
+    const afterLines = [...beforeLines];
+    afterLines[0] = "first";
+    afterLines[afterLines.length - 1] = "last";
+    const before = beforeLines.join("\n");
+    const after = afterLines.join("\n");
+    expect(new TextEncoder().encode(before).length).toBeLessThan(512_000);
+    expect(new TextEncoder().encode(after).length).toBeLessThan(512_000);
+
+    const originalPush = Array.prototype.push;
+    // Bun accepts larger spreads than some production runtimes; simulate a
+    // conservative argument limit while exercising the real diff path.
+    Array.prototype.push = function <T>(this: T[], ...items: T[]): number {
+      if (items.length > 100_000) {
+        throw new RangeError("simulated JavaScript argument limit exceeded");
+      }
+      return originalPush.apply(this, items);
+    };
+
+    let diff!: string;
+    const started = performance.now();
+    try {
+      diff = buildUnifiedDiff("large.swift", before, after);
+    } finally {
+      Array.prototype.push = originalPush;
+    }
+    const elapsed = performance.now() - started;
+
+    expect(diff).not.toContain("(diff skipped");
+    expect(diff).toContain("+first");
+    expect(diff).toContain("+last");
+    expect(applyUnifiedDiff(before, diff)).toBe(after);
+    expect(elapsed).toBeLessThan(5000);
+  });
+
+  test("large whole-file rewrites skip within the diff work budget", () => {
+    const before = Array.from({ length: 7000 }, (_, i) => `before ${i + 1}`).join("\n");
+    const after = Array.from({ length: 7000 }, (_, i) => `after ${i + 1}`).join("\n");
+
+    const started = performance.now();
+    const diff = buildUnifiedDiff("large.swift", before, after);
+    const elapsed = performance.now() - started;
+
+    expect(diff).toMatch(/diff skipped: changed region exceeds .* diff-work budget/);
+    expect(elapsed).toBeLessThan(250);
   });
 
   test("large-byte minified file with few lines is still diffed", () => {
