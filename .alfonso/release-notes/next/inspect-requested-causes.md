@@ -1,1 +1,0 @@
-The inspect PARTIAL header puts causes for explicitly requested sections first and keeps every requested cause visible before folding other causes into `+N more`. Other header formatting and retry guidance are unchanged.

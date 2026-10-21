@@ -1,1 +1,0 @@
-PTY setup failures close the terminal master before reaping the child, avoiding a macOS terminal-drain hang when later handle setup fails. Cleanup polling has a finite deadline and names children it cannot reap.

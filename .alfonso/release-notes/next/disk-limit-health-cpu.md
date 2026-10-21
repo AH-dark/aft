@@ -1,1 +1,0 @@
-- The background check that keeps index views under their disk limit no longer re-measures unchanged folders on every pass (about 94% fewer file checks), and the health summary does less work per tick.

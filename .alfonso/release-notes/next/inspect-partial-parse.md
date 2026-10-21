@@ -1,1 +1,0 @@
-- When a few files in a project fail to parse, aft_inspect still reports dead code and unused exports for the rest, marked incomplete, and names the files it could not parse.

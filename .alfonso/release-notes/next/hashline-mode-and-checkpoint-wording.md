@@ -1,2 +1,0 @@
-- Hashline edits now preserve file permissions and safely replace files without following planted temporary-file symlinks.
-- Named safety checkpoints persist on disk across restarts for 14 days, and their contents may include secrets.

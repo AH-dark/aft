@@ -1,1 +1,0 @@
-- Sandboxed worker sessions can run read-only GitHub commands (`gh api` GET, run, pr, issue, workflow, release and repo views, and search) through the repository bot, without holding a token. It stays off until the v20 routing manifest is signed.
