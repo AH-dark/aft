@@ -1,0 +1,1 @@
+- Concurrent checkout binds now batch durable retention-record writes in one process, reducing contention while preserving bounded, retryable lock timeouts.

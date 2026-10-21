@@ -649,6 +649,8 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
     })?;
 
     slog_debug!("acquired filesystem lock at {}", path.display());
+    #[cfg(test)]
+    io_ledger::record(|ledger| ledger.acquisitions += 1);
 
     Ok(LockGuard {
         path: path.to_path_buf(),
@@ -1641,15 +1643,16 @@ pub(crate) fn sync_parent(path: &Path) {
     }
 }
 
-/// Per-thread counters of the durable I/O that lease code performs: file
-/// fsyncs, directory fsyncs, newly created files (new inodes) and payload
-/// bytes. Tests read them to prove which paths sync and how much a heartbeat
+/// Per-thread counters of successful acquisitions and lease I/O: file fsyncs,
+/// directory fsyncs, newly created files (new inodes) and payload bytes.
+/// Tests read them to prove which paths sync and how much a heartbeat
 /// writes; outside tests every call compiles to nothing. The counters are
 /// thread-local so tests running in parallel do not see each other's I/O.
 pub(crate) mod io_ledger {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) struct IoLedger {
+        pub(crate) acquisitions: u64,
         pub(crate) file_syncs: u64,
         pub(crate) dir_syncs: u64,
         pub(crate) new_files: u64,
