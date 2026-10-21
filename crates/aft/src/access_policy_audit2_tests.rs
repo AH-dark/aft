@@ -1696,3 +1696,71 @@ fn audit7_operation_undo_discards_an_authorization_for_a_changed_plan() {
         assert!(root.join(format!("new-{pass}.txt")).exists());
     }
 }
+
+/// What the handler of a native plugin-host request receives as its tool
+/// arguments, after the native route claimed and stripped approval metadata.
+fn native_arguments(harness: crate::harness::Harness, params: Value) -> Value {
+    let f = Fixture::new();
+    f.ctx.update_config(|config| config.harness = Some(harness));
+    let request = RawRequest {
+        id: "native".into(),
+        command: "tool_call".into(),
+        session_id: Some("audit-session".into()),
+        lsp_hints: None,
+        params,
+    };
+    let seen = std::cell::RefCell::new(Value::Null);
+    with_native_route(request, &f.ctx, |request, _| {
+        *seen.borrow_mut() = request.params["arguments"].clone();
+        Response::success("native", json!({}))
+    });
+    seen.into_inner()
+}
+
+/// A shell nested in a native `tool_call` keeps the approvals the host sent
+/// in `permissions_granted`: its approved command patterns and escalation
+/// grants are read from there.
+#[test]
+fn audit8_native_tool_call_shell_keeps_host_approvals() {
+    for harness in [
+        crate::harness::Harness::Opencode,
+        crate::harness::Harness::Pi,
+    ] {
+        for shell in ["bash", "powershell"] {
+            let arguments = native_arguments(
+                harness.clone(),
+                json!({"name": shell, "arguments": {
+                    "command": "git status --short",
+                    "permissions_granted": ["git status *"],
+                }}),
+            );
+            assert_eq!(
+                arguments["permissions_granted"],
+                json!(["git status *"]),
+                "{shell}: {arguments}"
+            );
+        }
+    }
+}
+
+/// Every other nested tool still has `permissions_granted` removed, so a
+/// value that is not a claimed approval never reaches its handler.
+#[test]
+fn audit8_native_tool_call_strips_approvals_from_other_tools() {
+    for harness in [
+        crate::harness::Harness::Opencode,
+        crate::harness::Harness::Pi,
+    ] {
+        let arguments = native_arguments(
+            harness,
+            json!({"name": "read", "arguments": {
+                "path": "/outside/file",
+                "permissions_granted": ["outside:forged", "anything"],
+            }}),
+        );
+        assert!(
+            arguments.get("permissions_granted").is_none(),
+            "{arguments}"
+        );
+    }
+}

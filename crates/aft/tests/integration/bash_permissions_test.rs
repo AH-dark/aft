@@ -813,3 +813,62 @@ mod session_owned_artifacts {
         assert!(f.aft.shutdown().success());
     }
 }
+
+/// A plugin host's native `tool_call` for bash: the first call asks, and the
+/// host's approved retry runs without asking again. The approval travels in
+/// `permissions_granted`, which the native route must keep for a shell even
+/// though the outer command is `tool_call`.
+#[test]
+fn native_tool_call_bash_runs_once_approved() {
+    for harness in ["opencode", "pi"] {
+        let root = TempDir::new().unwrap();
+        let mut aft = AftProcess::spawn();
+        let configured = aft.send(
+            &serde_json::to_string(&json!({
+                "id": "cfg",
+                "command": "configure",
+                "harness": harness,
+                "project_root": root.path(),
+                "bash_permissions": true,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(configured["success"], true, "{harness}: {configured:?}");
+        let call = |granted: Option<Vec<serde_json::Value>>| {
+            let mut arguments = json!({"command": "git status --short"});
+            if let Some(granted) = granted {
+                arguments["permissions_granted"] = json!(granted);
+            }
+            serde_json::to_string(&json!({
+                "id": "tool-call-bash",
+                "command": "tool_call",
+                "session_id": "native-shell",
+                "name": "bash",
+                "arguments": arguments,
+            }))
+            .unwrap()
+        };
+        let asked = aft.send(&call(None));
+        assert_eq!(asked["code"], "permission_required", "{harness}: {asked:?}");
+        let approved: Vec<serde_json::Value> = asked["asks"]
+            .as_array()
+            .expect("asks")
+            .iter()
+            .flat_map(|ask| {
+                let always = ask["always"].as_array().cloned().unwrap_or_default();
+                if always.is_empty() {
+                    ask["patterns"].as_array().cloned().unwrap_or_default()
+                } else {
+                    always
+                }
+            })
+            .collect();
+        assert!(!approved.is_empty(), "{harness}: {asked:?}");
+        let ran = aft.send(&call(Some(approved)));
+        assert_ne!(
+            ran["code"], "permission_required",
+            "{harness}: the approved retry asked again: {ran:?}"
+        );
+        assert!(aft.shutdown().success());
+    }
+}

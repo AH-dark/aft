@@ -240,15 +240,7 @@ pub fn with_native_route(
         .get("arguments")
         .or_else(|| request.params.get("args"))
         .unwrap_or(&request.params);
-    let tool = if request.command == "tool_call" {
-        request
-            .params
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-    } else {
-        &request.command
-    };
+    let tool = native_tool_name(&request);
     let mut scope = ctx
         .standalone_approval_scope(request.session())
         .for_tool(tool, args);
@@ -271,8 +263,36 @@ pub fn with_native_route(
     finish_plugin_response(&scope, &once, preview, run(request, ctx))
 }
 
+/// The tool a native request runs: the nested `name` of a `tool_call`,
+/// otherwise the command itself.
+fn native_tool_name(request: &crate::protocol::RawRequest) -> &str {
+    if request.command == "tool_call" {
+        request
+            .params
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    } else {
+        &request.command
+    }
+}
+
+/// Remove `permissions_granted` before a plugin host's native request runs,
+/// after its outside-access tokens were claimed.
+///
+/// On the native wire `permissions_granted` only ever holds the host's own
+/// approvals: both plugins drop the agent's `permissions_granted` from the
+/// tool arguments before adding the approvals they granted
+/// (`withHostPermissionGrants` and `withOutsidePermissions` in
+/// `packages/opencode-plugin/src/tools/outside-permissions.ts` and
+/// `packages/pi-plugin/src/tools/_shared.ts`, each destructuring the field
+/// away as `_untrusted`). A shell reads its approved command patterns and
+/// escalation grants from that field, so it is kept when the tool that
+/// runs is bash or powershell, called directly or nested in a `tool_call`.
+/// Every other tool has no use for it, so it is removed and a forged value
+/// can never reach a handler.
 fn strip_native_approval_metadata(request: &mut crate::protocol::RawRequest) {
-    if matches!(request.command.as_str(), "bash" | "powershell") {
+    if matches!(native_tool_name(request), "bash" | "powershell") {
         return;
     }
     let params = &mut request.params;
