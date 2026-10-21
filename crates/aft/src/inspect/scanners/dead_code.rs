@@ -30,7 +30,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 9;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 10;
 #[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
@@ -314,6 +314,11 @@ impl DeadCodeFileAnalyzer {
             Vec::new()
         };
 
+        let rust_api = (lang == LangId::Rust).then(|| {
+            tree.as_ref()
+                .map(|tree| rust_api_facts(&source, tree.root_node(), relative_file))
+                .unwrap_or_default()
+        });
         let attribute_entry_points = if needs_rust_attribute_entry_points {
             tree.as_ref()
                 .map(|tree| {
@@ -324,7 +329,14 @@ impl DeadCodeFileAnalyzer {
                         roots.insert(entry.name);
                         roots.insert(entry.scoped_name);
                     }
-                    roots.extend(rust_serde_function_references(&source));
+                    roots.extend(rust_serde_function_references(
+                        &source,
+                        tree.root_node(),
+                        rust_api
+                            .as_ref()
+                            .map(|facts| facts.items.as_slice())
+                            .unwrap_or_default(),
+                    ));
                     roots.into_iter().collect()
                 })
                 .unwrap_or_default()
@@ -366,11 +378,7 @@ impl DeadCodeFileAnalyzer {
         };
 
         FileAnalysis {
-            rust_api: (lang == LangId::Rust).then(|| {
-                tree.as_ref()
-                    .map(|tree| rust_api_facts(&source, tree.root_node(), relative_file))
-                    .unwrap_or_default()
-            }),
+            rust_api,
             go_dispatch: (lang == LangId::Go).then(|| {
                 let mut facts = tree
                     .as_ref()
@@ -1619,11 +1627,8 @@ fn materialize_dead_code_contributions(
                 .iter()
                 .copied()
                 .flat_map(|call| {
-                    let test_origin = is_test_code_file(&contribution.file, &test_module_files)
-                        || contribution
-                            .cfg_test_ranges
-                            .iter()
-                            .any(|range| range.contains(call.line));
+                    let test_origin =
+                        contribution.location_is_test_code(&test_module_files, call.line);
                     let projected = match project_internal_call(
                         project_root,
                         call,
@@ -1680,34 +1685,43 @@ fn materialize_dead_code_contributions(
                     &default_export_symbols_by_file,
                 ));
             }
+            // A function call found in source (inside macro tokens, and in
+            // every function body) takes the test status of its own line,
+            // exactly like the stored callgraph edges above, so a call made
+            // only by test code never counts as production usage. References
+            // to types (struct literals, unit and tuple struct values) and to
+            // methods carry no test status: production code uses those through
+            // type positions, plain values and dispatch, which are not call
+            // edges, so labelling only their test uses would wrongly mark
+            // production-used types and methods test-only.
+            let source_call_test_origin = |reference: &MacroTokenRefContribution| {
+                (reference.shape == RUST_MACRO_REF_SHAPE_CALL
+                    && !rust_macro_name_is_upper_camel(&reference.name))
+                .then(|| contribution.location_is_test_code(&test_module_files, reference.line))
+            };
+            // Function values named in source (for example a function passed
+            // as an argument or chosen in a branch) always take the test status
+            // of their line.
+            let value_test_origin = |reference: &MacroTokenRefContribution| {
+                Some(contribution.location_is_test_code(&test_module_files, reference.line))
+            };
             internal_calls.extend(resolve_macro_token_liveness_edges(
                 project_root,
                 &contribution.file,
                 &contribution.macro_token_refs,
                 &contribution.rust_imports,
                 &exported_symbols_by_file,
+                &source_call_test_origin,
             ));
             if let Some(facts) = &contribution.rust_api {
-                internal_calls.extend(
-                    resolve_macro_token_liveness_edges(
-                        project_root,
-                        &contribution.file,
-                        &facts.initializer_references,
-                        &contribution.rust_imports,
-                        &exported_symbols_by_file,
-                    )
-                    .into_iter()
-                    .map(|mut call| {
-                        call.test_origin = Some(
-                            is_test_code_file(&contribution.file, &test_module_files)
-                                || contribution
-                                    .cfg_test_ranges
-                                    .iter()
-                                    .any(|range| range.contains(call.line)),
-                        );
-                        call
-                    }),
-                );
+                internal_calls.extend(resolve_macro_token_liveness_edges(
+                    project_root,
+                    &contribution.file,
+                    &facts.initializer_references,
+                    &contribution.rust_imports,
+                    &exported_symbols_by_file,
+                    &value_test_origin,
+                ));
                 // The parser does not expose private statics as symbols, so
                 // their calls arrive with a top-level owner. Give each static
                 // its own node; only reading that static activates its body.
@@ -2059,12 +2073,7 @@ fn aggregate_materialized_dead_code_contributions(
         for (export, other_lines) in
             exports_deduplicated_by_node(&candidates, contribution.rust_api.as_ref())
         {
-            if !test_code
-                && contribution
-                    .cfg_test_ranges
-                    .iter()
-                    .any(|range| range.contains(export.line))
-            {
+            if !test_code && contribution.line_is_cfg_test(export.line) {
                 *excluded_by_file
                     .entry(contribution.file.clone())
                     .or_default() += 1;
@@ -2436,11 +2445,7 @@ fn test_only_callers_by_target(
             if call.test_origin == Some(true) {
                 let origin = if is_test_code_file(&contribution.file, &test_files) {
                     contribution.file.clone()
-                } else if contribution
-                    .cfg_test_ranges
-                    .iter()
-                    .any(|range| range.contains(call.line))
-                {
+                } else if contribution.line_is_cfg_test(call.line) {
                     format!("{}:{}", contribution.file, call.line)
                 } else {
                     continue;
@@ -2583,7 +2588,12 @@ fn reachability_inputs(
                 .exports
                 .iter()
                 .filter(|export| export.is_entry_point)
-                .map(|export| (contribution.file.clone(), export.symbol.clone())),
+                .map(|export| {
+                    (
+                        contribution.file.clone(),
+                        rust_export_identity(export, contribution.rust_api.as_ref()),
+                    )
+                }),
         );
     }
 
@@ -3041,9 +3051,15 @@ fn rust_globs_parent_module(source: &str, root: tree_sitter::Node) -> bool {
 
 /// Functions named by serde field attributes (`deserialize_with = "f"`,
 /// `serialize_with`, `default`, `skip_serializing_if`). serde calls them from
-/// derived code the callgraph never sees, so they are liveness roots. Only the
-/// last path segment is kept: the root applies to this file's definition.
-fn rust_serde_function_references(source: &str) -> Vec<String> {
+/// derived code the callgraph never sees, so they are liveness roots. Each
+/// root is the declaration identity the path names from the attribute's
+/// module, so `"parse"` inside `mod config` roots `config::parse` (see
+/// `rust_serde_root_identity`).
+fn rust_serde_function_references(
+    source: &str,
+    root: tree_sitter::Node,
+    items: &[RustApiItem],
+) -> Vec<String> {
     static SERDE_FUNCTION_ATTRIBUTE: OnceLock<regex::Regex> = OnceLock::new();
     let pattern = SERDE_FUNCTION_ATTRIBUTE.get_or_init(|| {
         regex::Regex::new(
@@ -3051,11 +3067,72 @@ fn rust_serde_function_references(source: &str) -> Vec<String> {
         )
         .expect("serde function attribute pattern compiles")
     });
+    let identities = items
+        .iter()
+        .filter(|item| item.owner.is_none())
+        .map(rust_qualified_item_name)
+        .collect::<BTreeSet<_>>();
     pattern
         .captures_iter(source)
         .filter_map(|captures| captures.get(1))
-        .filter_map(|path| path.as_str().rsplit("::").next().map(str::to_string))
+        .map(|path| {
+            let scope = root
+                .descendant_for_byte_range(path.start(), path.end())
+                .map(|node| rust_mod_scope_chain(&node, source))
+                .unwrap_or_default();
+            rust_serde_root_identity(path.as_str(), &scope, &identities)
+        })
         .collect()
+}
+
+/// The declaration identity a serde callback path names from module `scope`.
+/// `helpers::parse` inside `mod config` is `config::helpers::parse`; a leading
+/// `self`, `super` or `crate` fixes the starting module. A relative path that
+/// is not declared in `scope` is looked up in each enclosing module in turn,
+/// as a `use super::...` import usually brings it from there, and a bare name
+/// declared exactly once in the file resolves to that declaration. A path
+/// that names no declaration in this file keeps only its last segment.
+fn rust_serde_root_identity(path: &str, scope: &[String], identities: &BTreeSet<String>) -> String {
+    let mut segments = rust_path_segments(path);
+    let short = segments.last().cloned().unwrap_or_default();
+    let mut scope = scope.to_vec();
+    let mut anchored = false;
+    while let Some(first) = segments.first().map(String::as_str) {
+        match first {
+            "self" => {}
+            "super" => {
+                scope.pop();
+            }
+            "crate" => scope.clear(),
+            _ => break,
+        }
+        segments.remove(0);
+        anchored = true;
+    }
+    loop {
+        let candidate = scope
+            .iter()
+            .chain(&segments)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("::");
+        if identities.contains(&candidate) {
+            return candidate;
+        }
+        if anchored || scope.pop().is_none() {
+            break;
+        }
+    }
+    if !anchored && segments.len() == 1 {
+        let suffix = format!("::{short}");
+        let mut matches = identities
+            .iter()
+            .filter(|identity| identity.ends_with(&suffix));
+        if let (Some(only), None) = (matches.next(), matches.next()) {
+            return only.clone();
+        }
+    }
+    short
 }
 
 /// Names of the methods defined inside `impl Trait for Type` blocks anywhere
@@ -3212,12 +3289,15 @@ fn rust_unresolved_path_call_edges(
         .collect()
 }
 
+/// Liveness edges for source references found outside the stored callgraph,
+/// each labelled with `test_origin(reference)`.
 fn resolve_macro_token_liveness_edges(
     _project_root: &Path,
     caller_file: &str,
     refs: &[MacroTokenRefContribution],
     rust_imports: &[RawImportContribution],
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    test_origin: &dyn Fn(&MacroTokenRefContribution) -> Option<bool>,
 ) -> Vec<InternalCall> {
     let mut calls = Vec::new();
     for reference in refs {
@@ -3235,7 +3315,7 @@ fn resolve_macro_token_liveness_edges(
             symbol,
             line: reference.line,
             provenance: MACRO_TOKEN_LIVENESS_PROVENANCE.to_string(),
-            test_origin: None,
+            test_origin: test_origin(reference),
         });
     }
     sort_dedup_internal_calls(&mut calls);
@@ -3737,11 +3817,20 @@ fn rust_raw_import_contributions(
         .collect()
 }
 
+/// Line ranges compiled only for tests: `#[cfg(test)]` modules, functions and
+/// impls, plus `#[cfg(test)]` statements, blocks and nested items inside a
+/// function body. Calls on these lines are test usage, and declarations on
+/// them are test code.
 fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTestRange> {
     let mut ranges = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "mod_item" | "function_item" | "impl_item")
+        let in_function_body = node.parent().is_some_and(|parent| parent.kind() == "block")
+            && !matches!(
+                node.kind(),
+                "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
+            );
+        if (in_function_body || matches!(node.kind(), "mod_item" | "function_item" | "impl_item"))
             && rust_node_has_cfg_test_attribute(source, node)
         {
             ranges.push(RustCfgTestRange {
@@ -6637,6 +6726,22 @@ struct InternalCallContribution {
 }
 
 impl DeadCodeContribution {
+    /// Whether `line` of this file sits inside a `#[cfg(test)]` item, statement
+    /// or block (see `rust_cfg_test_ranges`).
+    fn line_is_cfg_test(&self, line: u32) -> bool {
+        self.cfg_test_ranges
+            .iter()
+            .any(|range| range.contains(line))
+    }
+
+    /// Whether code at `line` of this file is compiled only for tests: the
+    /// whole file is test code, or the line is under `#[cfg(test)]`. Every
+    /// liveness edge built from a source location takes its test origin from
+    /// this one rule, so a test-only call never counts as production usage.
+    fn location_is_test_code(&self, test_module_files: &BTreeSet<String>, line: u32) -> bool {
+        is_test_code_file(&self.file, test_module_files) || self.line_is_cfg_test(line)
+    }
+
     fn calls(&self) -> impl Iterator<Item = InternalCallContribution> + '_ {
         self.internal_calls
             .iter()
@@ -7819,6 +7924,128 @@ pub(crate) fn ends_scope() {}
 "#,
         )]);
         assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+    }
+
+    fn test_only_symbols(aggregate: &Value) -> Vec<String> {
+        let mut symbols = aggregate["test_only_items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                format!(
+                    "{}::{}",
+                    item["file"].as_str().unwrap_or_default(),
+                    item["symbol"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>();
+        symbols.sort();
+        symbols
+    }
+
+    /// A `#[cfg(test)]` statement or block inside a production function only
+    /// exists in test builds. Its calls are test usage, while the production
+    /// call beside it stays production usage.
+    #[test]
+    fn review_cfg_test_statement_and_block_in_production_function_are_test_only() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    #[cfg(test)]
+    statement_helper();
+    #[cfg(test)]
+    {
+        block_helper();
+    }
+    production_helper();
+}
+pub(crate) fn statement_helper() {}
+pub(crate) fn block_helper() {}
+pub(crate) fn production_helper() {}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert_eq!(
+            test_only_symbols(&aggregate),
+            vec!["src/main.rs::block_helper", "src/main.rs::statement_helper"],
+            "{aggregate:#}"
+        );
+    }
+
+    /// A `#[cfg(test)]` module nested in a production function body: the
+    /// enclosing function's body scan also sees the module's calls, and they
+    /// must keep the module's test status.
+    #[test]
+    fn review_cfg_test_module_in_production_function_is_test_only() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    #[cfg(test)]
+    mod checks {
+        pub(crate) fn probe() { crate::module_helper(); }
+    }
+    production_helper();
+}
+pub(crate) fn module_helper() {}
+pub(crate) fn production_helper() {}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert_eq!(
+            test_only_symbols(&aggregate),
+            vec!["src/main.rs::module_helper"],
+            "{aggregate:#}"
+        );
+    }
+
+    /// serde callbacks named inside an inline module root that module's
+    /// declaration, for a bare name and for a relative path, and do not root a
+    /// same-named function at the file root.
+    #[test]
+    fn review_serde_callbacks_in_inline_module_root_their_declarations() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { let _ = config::Git { author: None, email: None }; }
+mod config {
+    #[derive(serde::Deserialize)]
+    pub(crate) struct Git {
+        #[serde(deserialize_with = "deserialize_author")]
+        pub author: Option<String>,
+        #[serde(deserialize_with = "helpers::parse")]
+        pub email: Option<String>,
+    }
+    fn deserialize_author() { normalize_author(); }
+    pub(crate) fn normalize_author() {}
+    mod helpers {
+        pub(crate) fn parse() { leaf(); }
+        pub(crate) fn leaf() {}
+    }
+    pub(crate) fn planted_dead() {}
+}
+pub(crate) fn deserialize_author() {}
+"#,
+        )]);
+        let mut headline = aggregate["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                format!(
+                    "{}:{}",
+                    item["symbol"].as_str().unwrap_or_default(),
+                    item["line"]
+                )
+            })
+            .collect::<Vec<_>>();
+        headline.sort();
+        assert_eq!(
+            headline,
+            vec!["deserialize_author:19", "planted_dead:17"],
+            "{aggregate:#}"
+        );
     }
 
     #[test]
