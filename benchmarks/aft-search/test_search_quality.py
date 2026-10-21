@@ -11,7 +11,7 @@ from typing import Any
 from unittest import mock
 
 from run_real_query import load_capability
-from run_search_quality import selected_profile
+from run_search_quality import parser as quality_runner_parser, run as quality_runner_run, selected_profile
 from search_quality import (
     diff_paths,
     run as quality_run,
@@ -25,10 +25,12 @@ from search_quality_lib import (
     PAGE_SIZE,
     REFERENCE_NOT_PAGE_INVARIANT_FIELD,
     SPLIT_ROWS_NOT_APPLICABLE_REASON,
+    SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD,
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     UNREACHABLE_SPLIT_ROWS_FIELD,
     apply_unreachable_split_rows,
+    aggregate_real_query,
     derive_slice_class,
     included_manifest_ids,
     real_query_behavior_diff,
@@ -316,6 +318,162 @@ class ProfileSelectionTests(unittest.TestCase):
         profile, capability = self.profile_for_schema({"properties": {}})
         self.assertEqual(profile, "single_page")
         validate_profile_score({"profile": profile, "capability": capability, "rows": []})
+
+
+class ViewsOptionPropagationTests(unittest.TestCase):
+    def test_views_flag_is_forwarded_to_real_query_only_when_enabled(self) -> None:
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                argv = [
+                    "--corpus", str(root / "corpus.toml"),
+                    "--binary", str(root / "aft"),
+                    "--profile", "single_page",
+                    "--score-output", str(root / "score.json"),
+                ]
+                if enabled:
+                    argv.append("--views")
+                args = quality_runner_parser().parse_args(argv)
+                commands: list[list[str]] = []
+
+                with (
+                    mock.patch("run_search_quality.parse_corpus_toml", return_value=({}, [])),
+                    mock.patch("run_search_quality.clone_root_for", return_value=root / "clones"),
+                    mock.patch("run_search_quality.ensure_binary"),
+                    mock.patch("run_search_quality.command", side_effect=lambda arguments, **kwargs: commands.append(list(arguments))),
+                ):
+                    quality_runner_run(args)
+
+                real_query = next(command for command in commands if command[1].endswith("run_real_query.py"))
+                self.assertEqual("--views" in real_query, enabled)
+
+
+class SemanticBuildingNotApplicableTests(unittest.TestCase):
+    def documents(self) -> tuple[dict, dict, dict, dict]:
+        metrics = {"mrr_at_10": 1.0, "hit_at_1": 1.0, "hit_at_5": 1.0}
+        scored_row = {
+            "episode_id": "followup-census:1",
+            "request": {"query": "q", "topK": PAGE_SIZE, "includeTests": False},
+            "requests": [{"query": "q", "topK": PAGE_SIZE, "includeTests": False}],
+            "request_count": 1,
+            "include_tests": False,
+            "include_tests_source": "default",
+            "pages_fetched": 1,
+            "collapse_stop_reason": "exhausted",
+            "retrieval_depth": 1,
+            "ranked_paths": ["src/opened.py"],
+            "metrics": dict(metrics),
+            "pinned_shape": "identifier",
+            "mechanism": "topk_cut",
+            "census_stratum": "identifier",
+        }
+        building_manifest_row = {
+            "episode_id": "followup-census:2",
+            "query": "q",
+            "opened_file": "src/building.py",
+            "include_tests": False,
+            "include_tests_source": "default",
+            "mechanism": "topk_cut",
+            "semantic_state": "building",
+        }
+        manifest = {
+            "rows": [
+                {
+                    "episode_id": "followup-census:1",
+                    "query": "q",
+                    "opened_file": "src/opened.py",
+                    "include_tests": False,
+                    "include_tests_source": "default",
+                    "mechanism": "topk_cut",
+                },
+                building_manifest_row,
+            ]
+        }
+
+        def document(rows: list[dict]) -> dict:
+            aggregate = aggregate_real_query(rows)
+            return {
+                "schema": "aft-search-score-v1",
+                "model_id": "fixture",
+                "profile": "single_page",
+                "views_enabled": True,
+                "capability": {
+                    "schema_path": "fixture.json",
+                    "schema_sha256": "0" * 64,
+                    "offset_declared": False,
+                },
+                "families": {
+                    "exact_recall": dict(metrics),
+                    "concept_recall": dict(metrics),
+                    "real_query": aggregate["family"],
+                },
+                "fixture_groups": {"exact_recall": {}, "concept_recall": {}},
+                "paired_deltas": {},
+                "shapes": aggregate["shapes"],
+                "mechanisms": aggregate["mechanisms"],
+                "census_weighted_mrr_report_only": aggregate[
+                    "census_weighted_mrr_report_only"
+                ],
+                "fixture_results": {"harness-goldens": True},
+                "rows": copy.deepcopy(rows),
+            }
+
+        reference_building_row = copy.deepcopy(scored_row)
+        reference_building_row.update(
+            episode_id=building_manifest_row["episode_id"],
+            request={"query": "q", "topK": PAGE_SIZE, "includeTests": False},
+            requests=[{"query": "q", "topK": PAGE_SIZE, "includeTests": False}],
+            ranked_paths=["src/wrong.py"],
+            metrics={"mrr_at_10": 0.0, "hit_at_1": 0.0, "hit_at_5": 0.0},
+        )
+        reference = document([scored_row, reference_building_row])
+        candidate = document([scored_row])
+        placeholder = {
+            "episode_id": building_manifest_row["episode_id"],
+            "semantic_state": "building",
+            "not_applicable_reason": "views-enabled semantic index was ready before the held-embedding fixture reached the building state",
+        }
+        candidate["rows"].append(placeholder)
+        candidate[SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD] = {
+            "reason": placeholder["not_applicable_reason"],
+            "rows": [placeholder["episode_id"]],
+        }
+        descriptor = {
+            "kind": "harness",
+            "slice_class": "non_ranking",
+            "targeted_mechanism": "none",
+            "fixtures": ["harness-goldens"],
+        }
+        return manifest, reference, candidate, descriptor
+
+    def test_views_score_with_building_not_applicable_rows_is_accepted(self) -> None:
+        manifest, reference, candidate, descriptor = self.documents()
+        self.assertIs(candidate["views_enabled"], True)
+        result = total_gate(reference, candidate, manifest, descriptor, [])
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            result.notes,
+            (
+                "semantic_building_rows_skipped:followup-census:2:"
+                "views-enabled semantic index was ready before the held-embedding fixture reached the building state",
+            ),
+        )
+
+    def test_non_views_score_with_building_not_applicable_rows_is_refused(self) -> None:
+        manifest, reference, candidate, descriptor = self.documents()
+        candidate.pop("views_enabled")
+        result = total_gate(reference, candidate, manifest, descriptor, [])
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(
+            result.reasons,
+            ("semantic_building_rows_not_applicable_requires_views_enabled:true",),
+        )
+
+    def test_non_building_rows_cannot_be_excluded_as_not_applicable(self) -> None:
+        manifest, _reference, candidate, _descriptor = self.documents()
+        manifest["rows"][1].pop("semantic_state")
+        with self.assertRaisesRegex(InputFault, "semantic_building_not_applicable_mismatch"):
+            validate_scored_population(manifest, candidate)
 
 
 class PageZeroProjectionTests(unittest.TestCase):

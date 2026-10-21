@@ -7,6 +7,7 @@ validate benchmark inputs without installing packages or consulting a network.
 
 from __future__ import annotations
 
+import copy
 import difflib
 import hashlib
 import json
@@ -440,6 +441,8 @@ def validate_profile_score(score: Mapping[str, Any]) -> None:
     if not offset_declared and "probe_pages_differ" in capability:
         raise InputFault("capability_probe_inconsistency")
     for row in score.get("rows", []):
+        if "not_applicable_reason" in row:
+            continue
         requests = row.get("requests")
         if requests is None:
             request = row.get("request")
@@ -594,10 +597,39 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
     foreign = sorted(set(observed) - set(expected))
     if duplicates or missing or foreign:
         raise InputFault(f"scored_population_mismatch:duplicate={duplicates}:missing={missing}:foreign={foreign}")
-    for expected_id, row in zip(sorted(expected, key=episode_number), sorted(score_rows, key=lambda item: episode_number(str(item["episode_id"])))):
+    not_applicable = semantic_building_rows_not_applicable(score)
+    if not_applicable and score.get("views_enabled") is not True:
+        raise InputFault(
+            "semantic_building_rows_not_applicable_requires_views_enabled:true"
+        )
+    not_applicable_ids = set(not_applicable["rows"]) if not_applicable else set()
+    building_ids = {
+        str(row["episode_id"])
+        for row in manifest.get("rows", [])
+        if "excluded_reason" not in row and row.get("semantic_state") == "building"
+    }
+    if not_applicable_ids and not_applicable_ids != building_ids:
+        raise InputFault(
+            f"semantic_building_not_applicable_mismatch:declared={sorted(not_applicable_ids)}:"
+            f"expected={sorted(building_ids)}"
+        )
+    for expected_id, row in zip(
+        sorted(expected, key=episode_number),
+        sorted(score_rows, key=lambda item: episode_number(str(item["episode_id"]))),
+    ):
         if expected_id != row["episode_id"]:
             raise InputFault("scored_population_mismatch")
         manifest_row = next(item for item in manifest["rows"] if item["episode_id"] == expected_id)
+        if "not_applicable_reason" in row:
+            if (
+                set(row) != {"episode_id", "semantic_state", "not_applicable_reason"}
+                or row.get("semantic_state") != "building"
+                or manifest_row.get("semantic_state") != "building"
+                or not isinstance(row.get("not_applicable_reason"), str)
+                or not row["not_applicable_reason"].strip()
+            ):
+                raise InputFault(f"malformed_semantic_building_not_applicable:{expected_id}")
+            continue
         sent = row.get("request", {}).get("includeTests")
         if sent is not manifest_row.get("include_tests") or row.get("include_tests_source") != manifest_row.get("include_tests_source"):
             raise InputFault(
@@ -894,6 +926,11 @@ def _first_value_difference(reference: Any, score: Any, path: str = "") -> str |
 
 def real_query_behavior_diff(reference: Mapping[str, Any], score: Mapping[str, Any]) -> str:
     """Build an artifact-friendly diff of rows and normalized score metadata."""
+    not_applicable = semantic_building_rows_not_applicable(score)
+    if not_applicable:
+        excluded_ids = set(not_applicable["rows"])
+        reference = _project_real_query_population(reference, excluded_ids)
+        score = _project_real_query_population(score, excluded_ids)
     old = _real_query_score_document(reference)
     new = _real_query_score_document(score)
     old["rows"] = reference.get("rows")
@@ -988,6 +1025,104 @@ SPLIT_ROWS_NOT_APPLICABLE_REASON = (
     "its split rows were replayed joined into one query, which measures the "
     "single-query surface, not query/pattern fusion"
 )
+
+SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD = "semantic_building_rows_not_applicable"
+
+
+def semantic_building_rows_not_applicable(score: Mapping[str, Any]) -> dict[str, Any] | None:
+    placeholders = [
+        row
+        for row in score.get("rows", [])
+        if isinstance(row, Mapping) and "not_applicable_reason" in row
+    ]
+    declared = score.get(SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD)
+    if not placeholders:
+        if declared is not None:
+            raise InputFault("semantic_building_not_applicable_mismatch:no_placeholder_rows")
+        return None
+    reasons = {str(row.get("not_applicable_reason", "")).strip() for row in placeholders}
+    if "" in reasons or len(reasons) != 1:
+        raise InputFault("semantic_building_not_applicable_mismatch:reason")
+    rows = sorted(
+        (str(row.get("episode_id", "")) for row in placeholders),
+        key=episode_number,
+    )
+    summary = {"reason": next(iter(reasons)), "rows": rows}
+    if declared != summary:
+        raise InputFault("semantic_building_not_applicable_mismatch:summary")
+    return summary
+
+
+def _project_real_query_population(
+    document: Mapping[str, Any], excluded_ids: set[str]
+) -> dict[str, Any]:
+    projected = copy.deepcopy(dict(document))
+    rows = [
+        row
+        for row in document.get("rows", [])
+        if str(row.get("episode_id", "")) not in excluded_ids
+    ]
+    aggregate = aggregate_real_query(rows)
+    projected["rows"] = rows
+    projected["families"]["real_query"] = aggregate["family"]
+    projected["shapes"] = aggregate["shapes"]
+    projected["mechanisms"] = aggregate["mechanisms"]
+    projected["census_weighted_mrr_report_only"] = aggregate[
+        "census_weighted_mrr_report_only"
+    ]
+    paired = [row for row in rows if "input_form" in row]
+    fixture_groups = projected.get("fixture_groups")
+    if isinstance(fixture_groups, dict):
+        if paired:
+            fixture_groups["real_query"] = {
+                "split": mean_metrics([row["metrics"] for row in paired])
+            }
+        else:
+            fixture_groups.pop("real_query", None)
+    projected["paired_deltas"] = {
+        row["episode_id"]: row["paired_mrr_delta"] for row in paired
+    }
+    projected.pop(SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD, None)
+    split_not_applicable = split_rows_not_applicable(projected)
+    if split_not_applicable:
+        projected["split_rows_not_applicable"] = split_not_applicable
+    else:
+        projected.pop("split_rows_not_applicable", None)
+    return projected
+
+
+def project_semantic_building_rows_not_applicable(
+    reference: Mapping[str, Any],
+    score: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    not_applicable = semantic_building_rows_not_applicable(score)
+    if not not_applicable:
+        return dict(reference), dict(score), dict(manifest), None
+    validate_scored_population(manifest, score)
+    excluded_ids = set(not_applicable["rows"])
+    reference_ids = {
+        str(row.get("episode_id", ""))
+        for row in reference.get("rows", [])
+        if isinstance(row, Mapping)
+    }
+    if not excluded_ids <= reference_ids:
+        raise InputFault(
+            f"semantic_building_reference_rows_missing:{sorted(excluded_ids - reference_ids)}"
+        )
+    manifest_rows = [
+        row for row in manifest.get("rows", []) if str(row.get("episode_id", "")) not in excluded_ids
+    ]
+    if not manifest_rows:
+        raise InputFault("semantic_building_not_applicable_empty_population")
+    projected_manifest = dict(manifest)
+    projected_manifest["rows"] = manifest_rows
+    return (
+        _project_real_query_population(reference, excluded_ids),
+        _project_real_query_population(score, excluded_ids),
+        projected_manifest,
+        not_applicable,
+    )
 
 
 def split_rows_not_applicable(score: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1293,6 +1428,15 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
     notes: list[str] = []
     try:
         resolved, missing = resolve_descriptor(descriptor, diff_paths, schema_blobs=schema_blobs, notes=notes)
+        not_applicable = semantic_building_rows_not_applicable(score)
+        if not_applicable:
+            skip_summary = not_applicable
+            reference, score, manifest, _ = project_semantic_building_rows_not_applicable(
+                reference, score, manifest
+            )
+            notes.append(
+                f"semantic_building_rows_skipped:{','.join(skip_summary['rows'])}:{skip_summary['reason']}"
+            )
         validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
         if resolved["slice_class"] == "engine_unwired":
             difference = _engine_unwired_difference(reference, score, diff_paths, resolved.get("presentation_rows"))

@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -14,12 +15,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Mapping
+from unittest import mock
 
 from embedding_fixture_server import Server, corpus_key, query_key
 from evidence_tree import evidence_tree_sha256
 from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
-from run_real_query import ROOT, assemble_score, load_capability, load_inputs, score_manifest_rows, probe_pattern_capability
+import bench_rerank
+from run_real_query import ROOT, NdjsonClient, assemble_score, attach_pinned_git_metadata, load_capability, load_inputs, parser as real_query_parser, score_manifest_rows, probe_pattern_capability
 from search_quality_lib import (
     D_0,
     EVIDENCE_SHA,
@@ -362,6 +365,97 @@ class CapabilitySchemaTests(unittest.TestCase):
                 changed = copy.deepcopy(self.JSON_SCHEMA)
                 changed["properties"][name] = value
                 self.assertNotEqual(original, self.digest(json.dumps(changed)))
+
+
+class ViewsOptionTests(unittest.TestCase):
+    def test_real_query_views_flag_is_opt_in(self) -> None:
+        self.assertFalse(real_query_parser().parse_args([]).views)
+        self.assertTrue(real_query_parser().parse_args(["--views"]).views)
+
+    def test_views_runtime_metadata_points_to_the_pinned_evidence_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tree"
+            root.mkdir()
+            (root / "fixture.py").write_text("def fixture(): pass\n")
+            attach_pinned_git_metadata(root)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True
+            )
+            entries = subprocess.run(
+                ["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root, capture_output=True, check=True
+            )
+        self.assertEqual(head.stdout.strip(), EVIDENCE_SHA)
+        self.assertIn(b"crates/aft/src/config.rs", entries.stdout)
+
+    def configure_document(self, views_enabled: bool) -> str:
+        captured: dict[str, Any] = {}
+        client = object.__new__(NdjsonClient)
+        client.project_root = Path("/fixture/project")
+        client.storage_dir = Path("/fixture/storage")
+
+        def call(
+            command: str,
+            params: Mapping[str, Any] | None = None,
+            timeout: float = 120.0,
+        ) -> dict[str, Any]:
+            self.assertEqual(command, "configure")
+            captured.update(params or {})
+            return {"success": True}
+
+        with (
+            mock.patch.dict("os.environ", {bench_rerank.CONFIG_ENV: ""}),
+            mock.patch.object(client, "call", side_effect=call),
+        ):
+            client.configure(None, "fixture-model", 4.5, views_enabled=views_enabled)
+        return str(captured["config"][0]["doc"])
+
+    def test_default_configure_document_is_byte_identical_and_views_adds_only_its_key(self) -> None:
+        default = self.configure_document(False)
+        self.assertEqual(
+            default,
+            '{"indexes": {"trigram": true, "semantic": true, "callgraph": false}, '
+            '"semantic": {"backend": "fastembed", "model": "fixture-model", '
+            '"timeout_ms": 4500, "query_timeout_ms": 4500, "max_batch_size": 64, "max_files": 20000}}',
+        )
+
+        enabled = self.configure_document(True)
+        default_value = json.loads(default)
+        enabled_value = json.loads(enabled)
+        self.assertEqual(set(enabled_value) - set(default_value), {"views"})
+        self.assertEqual(enabled_value["views"], {"enabled": True})
+
+    def test_missing_views_work_counters_are_unavailable_not_zero(self) -> None:
+        client = object.__new__(NdjsonClient)
+        self.assertEqual(
+            client.views_work(),
+            {
+                "status": "unavailable",
+                "reason": "standalone_ndjson_status_and_health_digest_do_not_expose_metrics.views_work",
+            },
+        )
+
+    def test_wait_ready_waits_for_pinned_quiescent_views_without_sleeping(self) -> None:
+        client = object.__new__(NdjsonClient)
+        client.views_enabled = True
+        statuses = [
+            {
+                "search_index": {"status": "ready"},
+                "semantic_index": {"status": "ready"},
+                "views": {"pinned": True, "pending_paths": 4, "failed_paths": 0},
+            },
+            {
+                "search_index": {"status": "ready"},
+                "semantic_index": {"status": "ready"},
+                "views": {"pinned": True, "pending_paths": 0, "failed_paths": 0},
+            },
+        ]
+        with (
+            mock.patch.object(client, "call", side_effect=statuses) as call,
+            mock.patch("run_real_query.time.sleep", side_effect=AssertionError("views readiness must not sleep")),
+            mock.patch("run_real_query.bench_rerank.settle", side_effect=AssertionError("views readiness uses status")),
+        ):
+            client.wait_ready(5.0)
+        self.assertEqual(call.call_count, 2)
 
 
 class RealQueryRunnerTests(unittest.TestCase):

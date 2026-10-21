@@ -44,6 +44,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--to-profile")
     result.add_argument("--dry-run", action="store_true")
     result.add_argument("--profile", choices=("single_page", "paged"))
+    result.add_argument("--views", action="store_true", help="Enable content-addressed views for the real-query replay.")
     result.add_argument("--binary", default=os.environ.get("AFT_BINARY_PATH", str(ROOT / "target/release/aft")))
     result.add_argument("--schema", default=str(ROOT / "packages/pi-plugin/src/tools/semantic.ts"))
     result.add_argument("--corpus", default=str(HERE / "corpus/corpus.toml"))
@@ -170,30 +171,31 @@ def run(args: argparse.Namespace) -> int:
             str(args.ready_timeout),
         ]
     )
-    command(
-        [
-            sys.executable,
-            str(HERE / "run_real_query.py"),
-            "--manifest",
-            args.manifest,
-            "--profile",
-            selected_profile(args),
-            "--binary",
-            str(binary),
-            "--schema",
-            args.schema,
-            "--exact-score",
-            str(exact_score),
-            "--concept-score",
-            str(concept_score),
-            "--reference",
-            args.reference,
-            "--output",
-            str(score_path),
-            "--ready-timeout",
-            str(args.ready_timeout),
-        ]
-    )
+    real_query_arguments = [
+        sys.executable,
+        str(HERE / "run_real_query.py"),
+        "--manifest",
+        args.manifest,
+        "--profile",
+        selected_profile(args),
+        "--binary",
+        str(binary),
+        "--schema",
+        args.schema,
+        "--exact-score",
+        str(exact_score),
+        "--concept-score",
+        str(concept_score),
+        "--reference",
+        args.reference,
+        "--output",
+        str(score_path),
+        "--ready-timeout",
+        str(args.ready_timeout),
+    ]
+    if args.views:
+        real_query_arguments.append("--views")
+    command(real_query_arguments)
     command(gate_arguments(args, score_path))
     return 0
 

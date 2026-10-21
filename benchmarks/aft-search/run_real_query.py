@@ -28,12 +28,14 @@ from search_quality_lib import (
     INVARIANCE_DEPTH,
     METRICS,
     PAGE_INVARIANCE_FAILED_FIELD,
+    SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD,
     InputFault,
     aggregate_real_query,
     canonical_json,
     choose_stop,
     collapse_paths,
     excused_page_invariance,
+    episode_number,
     invariance_requests,
     mean_metrics,
     profile_requests,
@@ -145,10 +147,18 @@ class NdjsonClient:
                 self.proc.wait(timeout=5)
         self._stderr.close()
 
-    def call(self, command: str, params: Optional[Mapping[str, Any]] = None, timeout: float = 120.0) -> JsonObject:
-        # Only extend how long the client waits; do not change the engine's
-        # query-work limits or ranking parameters.
-        timeout = max(timeout, float(os.environ.get("AFT_SEARCH_BENCH_RPC_TIMEOUT", "0")))
+    def call(
+        self,
+        command: str,
+        params: Optional[Mapping[str, Any]] = None,
+        timeout: float = 120.0,
+        *,
+        cap_timeout: bool = True,
+    ) -> JsonObject:
+        # Only extend ordinary RPC waits; readiness polling can opt out so its
+        # status requests remain inside the caller's single deadline.
+        if cap_timeout:
+            timeout = max(timeout, float(os.environ.get("AFT_SEARCH_BENCH_RPC_TIMEOUT", "0")))
         self._next_id += 1
         request_id = str(self._next_id)
         request: JsonObject = {"id": request_id, "command": command}
@@ -175,7 +185,14 @@ class NdjsonClient:
         self._stderr.seek(position)
         return text.strip()
 
-    def configure(self, endpoint: Optional[str], model_id: str, timeout: float) -> None:
+    def configure(
+        self,
+        endpoint: Optional[str],
+        model_id: str,
+        timeout: float,
+        *,
+        views_enabled: bool = False,
+    ) -> None:
         semantic: JsonObject = {
             "backend": "openai_compatible" if endpoint else "fastembed",
             "model": model_id,
@@ -190,6 +207,8 @@ class NdjsonClient:
             "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "semantic": semantic,
         })
+        if views_enabled:
+            doc["views"] = {"enabled": True}
         response = self.call(
             "configure",
             {
@@ -200,27 +219,67 @@ class NdjsonClient:
             },
             timeout,
         )
+        self.views_enabled = views_enabled
         if response.get("success") is not True:
             raise AftProtocolError(f"configure_failed:{response}")
+
+    def views_work(self) -> JsonObject:
+        """The standalone NDJSON status and health digest omit `views_work`."""
+        return {
+            "status": "unavailable",
+            "reason": "standalone_ndjson_status_and_health_digest_do_not_expose_metrics.views_work",
+        }
 
     def wait_ready(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         last: JsonObject = {}
-        while time.monotonic() < deadline:
-            last = self.call("status", timeout=min(30.0, timeout))
+        last_views: Any = object()
+        while True:
+            if self.views_enabled:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.25:
+                    break
+                last = self.call("status", timeout=remaining, cap_timeout=False)
+            else:
+                if time.monotonic() >= deadline:
+                    break
+                last = self.call("status", timeout=min(30.0, timeout))
             semantic = last.get("semantic_index", {})
             lexical = last.get("search_index", {})
             semantic_status = semantic.get("status") if isinstance(semantic, Mapping) else None
             lexical_status = lexical.get("status") if isinstance(lexical, Mapping) else None
             if semantic_status == "failed":
                 raise AftProtocolError(f"semantic_index_failed:{semantic}:{self.stderr_text()}")
-            if semantic_status == "ready" and lexical_status == "ready":
-                settled = bench_rerank.settle(lambda: self.call("status", timeout=30.0))
-                if settled is not None:
-                    print(f"semantic_settled:{json.dumps(settled, sort_keys=True)}", flush=True)
+            views = last.get("views")
+            if self.views_enabled and views != last_views:
+                print(f"views_readiness:{json.dumps(views, sort_keys=True)}", flush=True)
+                last_views = views
+            if self.views_enabled and isinstance(views, Mapping) and views.get("failed_paths", 0) > 0:
+                raise AftProtocolError(f"views_runtime_failed:{views}")
+            # Standalone status has no `ready` flag; regard views as ready
+            # only when pinned and both pending and failed path counts are zero.
+            views_ready = (
+                not self.views_enabled
+                or (
+                    isinstance(views, Mapping)
+                    and views.get("pinned") is True
+                    and views.get("pending_paths") == 0
+                    and views.get("failed_paths") == 0
+                )
+            )
+            if semantic_status == "ready" and lexical_status == "ready" and views_ready:
+                if not self.views_enabled:
+                    settled = bench_rerank.settle(lambda: self.call("status", timeout=30.0))
+                    if settled is not None:
+                        print(f"semantic_settled:{json.dumps(settled, sort_keys=True)}", flush=True)
                 return
-            time.sleep(0.1)
+            if not self.views_enabled:
+                time.sleep(0.1)
+        if self.views_enabled:
+            print(f"views_readiness_timeout:{json.dumps(last, sort_keys=True)}", flush=True)
+            raise AftProtocolError(f"views_runtime_not_ready:timeout={timeout}:{last}")
         raise AftProtocolError(f"index_ready_timeout:{last}:{self.stderr_text()}")
+
 
     def search(self, arguments: Mapping[str, Any]) -> JsonObject:
         started = time.perf_counter()
@@ -231,6 +290,18 @@ class NdjsonClient:
         bench_rerank.observe("search", arguments, response, (time.perf_counter() - started) * 1000.0)
         allowed_statuses = {"ready", "building"} if self.allow_building else {"ready"}
         if response.get("success") is not True or response.get("status") not in allowed_statuses:
+            if getattr(self, "views_enabled", False) and response.get("status") == "partial":
+                try:
+                    status_at_failure: JsonObject = self.call("status")
+                except (AftProtocolError, OSError) as error:
+                    status_at_failure = {"status": "unavailable", "reason": type(error).__name__}
+                detail = {
+                    "reply": response,
+                    "status_at_failure": status_at_failure,
+                }
+                raise AftProtocolError(
+                    f"aft_search_failed:views_partial:{json.dumps(detail, sort_keys=True)}"
+                )
             raise AftProtocolError(f"aft_search_failed:success={response.get('success')}:status={response.get('status')}:code={response.get('code')}")
         if not isinstance(response.get("results"), list):
             raise AftProtocolError("aft_search_failed:results_not_array")
@@ -667,29 +738,74 @@ def load_inputs(
 
 
 @contextmanager
-def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
+def runtime_evidence_tree(tree: Path, *, views_enabled: bool = False) -> Iterator[Path]:
     """Copy the verified tree outside its parent checkout before starting AFT."""
     with tempfile.TemporaryDirectory(prefix="aft-real-query-tree-") as directory:
         root = Path(directory) / "tree"
         shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
+        if views_enabled:
+            attach_pinned_git_metadata(root)
         copy_answer_key_ignore(root)
         copy_evidence_root_ignore(root)
         yield root
+
+
+def attach_pinned_git_metadata(root: Path) -> None:
+    """Expose the pinned commit's tree to content-addressed views in the copy."""
+    objects_result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "objects"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if objects_result.returncode:
+        detail = objects_result.stderr.strip()
+        raise InputFault(f"views_git_objects_unavailable:{detail}")
+    objects_path = Path(objects_result.stdout.strip())
+    if not objects_path.is_absolute():
+        objects_path = ROOT / objects_path
+    objects_path = objects_path.resolve()
+
+    init_result = subprocess.run(
+        ["git", "init", "--quiet", str(root)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if init_result.returncode:
+        detail = init_result.stderr.strip()
+        raise InputFault(f"views_git_init_failed:{detail}")
+    alternates = root / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(f"{objects_path}\n", encoding="utf-8")
+    head_result = subprocess.run(
+        ["git", "update-ref", "--no-deref", "HEAD", EVIDENCE_SHA],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if head_result.returncode:
+        detail = head_result.stderr.strip()
+        raise InputFault(f"views_git_head_unavailable:{detail}")
 
 
 # Where the answer-key ignore list is copied inside the evidence tree, which is
 # a projection of this repository and so has the same relative layout.
 BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
 
-# First line of the copy's root .aftignore. The evidence copy has no .git, and
-# AFT applies .gitignore files (and the machine's global git excludes file) in
-# folders that are not git repositories too. The benchmark's candidate pool is
-# the tracked tree, including files that were force-added despite matching a
-# .gitignore (plans and reports under .alfonso/, benchmark results), so the root
-# .aftignore re-includes every entry before its own exclusions. An .aftignore
-# outranks .gitignore and the global excludes file, later lines in the same
-# file still win, and the deeper benchmarks/aft-search/.aftignore is consulted
-# first, so every exclusion the benchmark writes still applies.
+# First line of the copy's root .aftignore. The default evidence copy has no .git;
+# views-enabled copies attach the pinned commit's metadata. AFT applies .gitignore
+# files and the machine's global git excludes file whether or not the copy is a
+# Git repository. The benchmark's candidate pool is the tracked tree, including
+# files that were force-added despite matching a .gitignore (plans and reports
+# under .alfonso/, benchmark results), so the root .aftignore re-includes every
+# entry before its own exclusions. An .aftignore outranks .gitignore and the
+# global excludes file, later lines in the same file still win, and the deeper
+# benchmarks/aft-search/.aftignore is consulted first, so every exclusion the
+# benchmark writes still applies.
 #
 # The pattern re-includes only names that do not start with a dot. A
 # re-included entry also bypasses the hidden-file filter, so `!*` would add
@@ -798,6 +914,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reference", default=str(HERE / "real-query-baseline.json"))
     result.add_argument("--output", default=str(HERE / ".bench/search-quality/score.json"))
     result.add_argument("--ready-timeout", type=float, default=600.0)
+    result.add_argument("--views", action="store_true", help="Enable content-addressed views and record AFT views-work counters.")
     result.add_argument(
         "--live-model",
         action="store_true",
@@ -831,7 +948,9 @@ def run(args: argparse.Namespace) -> int:
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
-    with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(provisioned_tree) as project_root:
+    with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(
+        provisioned_tree, views_enabled=args.views
+    ) as project_root:
         runtime = Path(run_dir)
         log_path = runtime / "embedding-requests.log"
         stderr_path = runtime / "aft.stderr"
@@ -847,8 +966,9 @@ def run(args: argparse.Namespace) -> int:
             configured_model = FIXTURE_PROVIDER_MODEL
         with endpoint_context as endpoint:
             client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env)
+            views_work: JsonObject = {}
             try:
-                client.configure(endpoint, configured_model, args.ready_timeout)
+                client.configure(endpoint, configured_model, args.ready_timeout, views_enabled=args.views)
                 client.wait_ready(args.ready_timeout)
                 bench_rerank.report_warm_up("real_query", bench_rerank.warm_up(
                     lambda query: client.search({"query": query, "topK": 50, "includeTests": False}),
@@ -856,29 +976,100 @@ def run(args: argparse.Namespace) -> int:
                     args.ready_timeout,
                 ))
                 capability.update(probe_pattern_capability(client))
-                if any(row.get("semantic_state") == "building" for row in manifest["rows"]):
+                has_building_rows = any(
+                    row.get("semantic_state") == "building" for row in manifest["rows"]
+                )
+                building_rows = [
+                    row for row in manifest["rows"]
+                    if "excluded_reason" not in row and row.get("semantic_state") == "building"
+                ]
+                not_applicable_building_rows: list[JsonObject] = []
+                if has_building_rows:
                     with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:
                         building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
                         building.allow_building = True
                         try:
-                            building.configure(building_endpoint, FIXTURE_PROVIDER_MODEL, args.ready_timeout)
+                            building.configure(
+                                building_endpoint,
+                                FIXTURE_PROVIDER_MODEL,
+                                args.ready_timeout,
+                                views_enabled=args.views,
+                            )
                             deadline = time.monotonic() + args.ready_timeout
+                            status: JsonObject = {}
                             while time.monotonic() < deadline:
-                                status = building.call("status")
+                                status = building.call(
+                                    "status",
+                                    timeout=deadline - time.monotonic() if args.views else 120.0,
+                                    cap_timeout=not args.views,
+                                )
                                 semantic_status = status.get("semantic_index", {}).get("status")
-                                if semantic_status in {"ready", "failed", "unavailable"}:
+                                lexical_status = status.get("search_index", {}).get("status")
+                                if semantic_status in {"failed", "unavailable"}:
                                     raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
-                                if status.get("search_index", {}).get("status") == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
+                                if semantic_status == "ready":
+                                    if args.views and lexical_status == "ready":
+                                        reason = (
+                                            "views-enabled semantic index was ready before the held-embedding "
+                                            "fixture reached the building state"
+                                        )
+                                        not_applicable_building_rows = [
+                                            {
+                                                "episode_id": str(row["episode_id"]),
+                                                "semantic_state": "building",
+                                                "not_applicable_reason": reason,
+                                            }
+                                            for row in building_rows
+                                        ]
+                                        break
+                                    if not args.views:
+                                        raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
+                                if lexical_status == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
                                     break
-                                time.sleep(0.1)
+                                if not args.views:
+                                    time.sleep(0.1)
                             else:
-                                raise InputFault(f"semantic_building_fixture_timeout:lexical={status.get('search_index', {}).get('status')}:semantic={status.get('semantic_index', {}).get('status')}:stage={status.get('semantic_index', {}).get('stage')}")
-                            rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
+                                if args.views:
+                                    reason = (
+                                        "views-enabled semantic-building fixture did not reach the building "
+                                        "state before its readiness timeout"
+                                    )
+                                    not_applicable_building_rows = [
+                                        {
+                                            "episode_id": str(row["episode_id"]),
+                                            "semantic_state": "building",
+                                            "not_applicable_reason": reason,
+                                        }
+                                        for row in building_rows
+                                    ]
+                                else:
+                                    raise InputFault(f"semantic_building_fixture_timeout:lexical={status.get('search_index', {}).get('status')}:semantic={status.get('semantic_index', {}).get('status')}:stage={status.get('semantic_index', {}).get('stage')}")
+                            if not_applicable_building_rows:
+                                scoring_manifest = dict(manifest)
+                                scoring_manifest["rows"] = [
+                                    row for row in manifest["rows"]
+                                    if row not in building_rows
+                                ]
+                                rows = score_manifest_rows(
+                                    scoring_manifest, args.profile, capability, client, project_root
+                                )
+                            else:
+                                rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
+                            if args.views:
+                                views_work["building"] = building.views_work()
                         finally:
+                            if args.views and "building" not in views_work:
+                                views_work["building"] = building.views_work()
                             building.close()
                 else:
                     rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
+                if args.views:
+                    views_work["primary"] = client.views_work()
             finally:
+                if args.views:
+                    if "primary" not in views_work:
+                        views_work["primary"] = client.views_work()
+                    print(f"views_work:{json.dumps(views_work, sort_keys=True)}")
                 client.close()
     score = assemble_score(
         manifest,
@@ -892,6 +1083,22 @@ def run(args: argparse.Namespace) -> int:
         binary,
         Path(args.reference).resolve(),
     )
+    if args.views:
+        score["views_enabled"] = True
+        score["views_work"] = views_work
+    if not_applicable_building_rows:
+        score["rows"].extend(not_applicable_building_rows)
+        manifest_order = {
+            str(row["episode_id"]): index for index, row in enumerate(manifest["rows"])
+        }
+        score["rows"].sort(key=lambda row: manifest_order[str(row["episode_id"])])
+        score[SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD] = {
+            "reason": not_applicable_building_rows[0]["not_applicable_reason"],
+            "rows": sorted(
+                (row["episode_id"] for row in not_applicable_building_rows),
+                key=episode_number,
+            ),
+        }
     if args.tuning_only:
         score["tuning_only"] = True
     else:
@@ -909,6 +1116,9 @@ def run(args: argparse.Namespace) -> int:
     if "split_rows_not_applicable" in score:
         skipped = score["split_rows_not_applicable"]
         print(f"split_rows_not_applicable:{','.join(skipped['rows'])}:{skipped['reason']}")
+    if SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD in score:
+        skipped = score[SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD]
+        print(f"semantic_building_rows_skipped:{','.join(skipped['rows'])}:{skipped['reason']}")
     print(f"real_query_score:{output}")
     print(f"real_query_score_sha256:{sha256_file(output)}")
     return 0
