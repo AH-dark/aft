@@ -7958,8 +7958,10 @@ pub fn artifact_cache_key_memoized_only(project_root: &Path) -> Option<String> {
     map.get(project_root).cloned()
 }
 
+/// `storage_dir` is the cache artifact root (see
+/// [`crate::bash_background::cache_artifact_root`]), not the durable root.
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
-    crate::bash_background::storage_dir(storage_dir)
+    crate::bash_background::cache_artifact_root(storage_dir)
         .join("index")
         .join(project_key)
 }

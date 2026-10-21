@@ -329,6 +329,142 @@ fn cache_root_routes_all_real_writers_and_keeps_metadata_durable() {
     drop((graph, inspect, view, blobs, registry, owner));
 }
 
+/// An operator who redirects durable storage with `AFT_STORAGE_DIR` and also
+/// sets `storage.cache_dir` must get every cache family on the cache volume.
+/// The durable override is only for durable state; reapplying it to a cache
+/// path would move the caches onto the durable disk, where the split-storage
+/// guard refuses to create them.
+///
+/// The override is process-wide, and tests in this binary run concurrently, so
+/// the scenario runs in a child copy of the test binary that alone carries
+/// `AFT_STORAGE_DIR`.
+#[test]
+fn cache_root_wins_over_durable_storage_override_for_every_cache_family() {
+    const TEST: &str = "root_cache::cache_paths_tests::cache_root_wins_over_durable_storage_override_for_every_cache_family";
+    let Some(temp) = std::env::var_os("AFT_TEST_CACHE_OVERRIDE_TEMP").map(PathBuf::from) else {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("AFT_STORAGE_DIR", temp.path().join("durable-override"))
+            .env("AFT_TEST_CACHE_OVERRIDE_TEMP", temp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprint!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "override scenario failed");
+        assert!(
+            stdout.contains("1 passed"),
+            "override scenario did not run in the child"
+        );
+        return;
+    };
+    let durable = temp.join("durable-override");
+    assert_eq!(
+        std::env::var_os("AFT_STORAGE_DIR").map(PathBuf::from),
+        Some(durable.clone())
+    );
+    let wire_storage = temp.join("plugin-storage");
+    let cache_parent = temp.join("cache");
+    fs::create_dir(&cache_parent).unwrap();
+    let project = temp.join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(
+        project.join("main.rs"),
+        "fn main() { leaf(); }\nfn leaf() {}\n",
+    )
+    .unwrap();
+    let project = fs::canonicalize(project).unwrap();
+    let mut config = Config {
+        storage_dir: Some(wire_storage.clone()),
+        cache_dir: Some(cache_parent.clone()),
+        project_root: Some(project.clone()),
+        ..Config::default()
+    };
+    assert!(prepare_cache_root(&mut config).is_none());
+    let cache = cache_root(&config);
+    assert_eq!(cache, cache_parent.join("aft"));
+    assert_eq!(StoragePaths::for_config(&config).durable, durable);
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    ctx.set_canonical_cache_root(project.clone());
+    let key = ctx.memoized_artifact_cache_key(&project);
+    configure_artifact_access(&project, &key, false);
+    let scope = crate::path_identity::project_scope_key(&project);
+    let config = ctx.config();
+    let artifact_root = config.cache_storage_dir().unwrap();
+    assert_eq!(artifact_root, cache);
+
+    let search_dir = crate::search_index::resolve_cache_dir_with_key(
+        &key,
+        config.cache_storage_dir().as_deref(),
+    );
+    assert_eq!(search_dir, cache.join("index").join(&key));
+    let mut search = crate::search_index::SearchIndex::build(&project);
+    assert!(
+        search.write_to_disk(&search_dir, None),
+        "trigram cache write was refused at {}",
+        search_dir.display()
+    );
+    assert!(search_dir.join("cache.bin").is_file());
+    assert_eq!(
+        crate::readonly_artifacts::search_index_artifact_generation_with_key(
+            &key,
+            Some(&artifact_root)
+        )
+        .map(|artifact| artifact.path),
+        Some(search_dir.join("cache.bin"))
+    );
+    let semantic = crate::semantic_index::SemanticIndex::new(project.clone(), 3);
+    assert!(semantic.write_to_disk(&artifact_root, &key));
+    assert_eq!(
+        crate::readonly_artifacts::semantic_index_artifact_generation_with_key(
+            &key,
+            Some(&artifact_root)
+        )
+        .map(|artifact| artifact.path),
+        Some(cache.join("semantic").join(&key).join("semantic.bin"))
+    );
+    let mut symbols = SymbolCache::new();
+    symbols.set_project_root(project.clone());
+    crate::symbol_cache_disk::write_to_disk(&symbols, &artifact_root, &key).unwrap();
+    assert!(crate::symbol_cache_disk::cache_path(&artifact_root, &key).starts_with(&cache));
+    assert_eq!(
+        ctx.callgraph_store_dir(),
+        cache.join("callgraph").join(&key)
+    );
+    let (graph, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+        ctx.callgraph_store_dir(),
+        project.clone(),
+        &[project.join("main.rs")],
+    )
+    .unwrap();
+    assert_eq!(ctx.inspect_dir(), cache.join("inspect").join(&scope));
+    let inspect =
+        crate::inspect::cache::InspectCache::open(ctx.inspect_dir(), project.clone()).unwrap();
+    let view = crate::views::ViewStore::open(&artifact_root, &scope).unwrap();
+    let blobs = crate::blob_store::BlobStore::open(
+        &artifact_root,
+        &key,
+        crate::blob_store::BlobPlane::Semantic,
+    )
+    .unwrap();
+    let registry = crate::views::registry::FamilyRegistry::open(&artifact_root, &key).unwrap();
+    for domain in CACHE_DOMAINS {
+        assert!(
+            cache.join(domain).is_dir(),
+            "missing cache domain: {domain}"
+        );
+        for durable_root in [&durable, &wire_storage] {
+            assert!(
+                !durable_root.join(domain).exists(),
+                "cache domain {domain} leaked into durable storage {}",
+                durable_root.display()
+            );
+        }
+    }
+    drop(config);
+    drop((graph, inspect, view, blobs, registry));
+}
+
 #[test]
 fn cache_root_unavailable_preserves_requested_location_without_fallback() {
     let temp = tempfile::tempdir().unwrap();

@@ -888,7 +888,7 @@ fn strict_verify_current_state(
         IndexKind::Search => {
             let cache_dir = crate::search_index::resolve_cache_dir_with_key(
                 &entry.artifact_key,
-                ctx.config().storage_dir.as_deref(),
+                ctx.config().cache_storage_dir().as_deref(),
             );
             let Some(mut index) = crate::search_index::SearchIndex::read_from_disk(
                 &cache_dir,
@@ -936,7 +936,7 @@ fn build_missing_search_after_strict_check(
     let config = ctx.config();
     let cache_dir = crate::search_index::resolve_cache_dir_with_key(
         &entry.artifact_key,
-        config.storage_dir.as_deref(),
+        config.cache_storage_dir().as_deref(),
     );
     let max_file_size = config.search_index_max_file_size;
     drop(config);

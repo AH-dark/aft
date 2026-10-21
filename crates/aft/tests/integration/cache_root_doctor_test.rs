@@ -308,14 +308,68 @@ fn canary(root: &Path, relative: &str) -> PathBuf {
     path
 }
 
+/// Where the real-volume doctor scenario puts its cache roots. First
+/// enrollment of a cache root needs a second filesystem. `AFT_TEST_CACHE_VOLUME`
+/// names one explicitly (for example an external drive on macOS); otherwise
+/// Linux CI's `/dev/shm` tmpfs is used when it is a different device from the
+/// temporary directory. `Err` carries the reason the scenario cannot run here.
+fn doctor_cache_volume() -> Result<PathBuf, String> {
+    if let Some(volume) = std::env::var_os("AFT_TEST_CACHE_VOLUME").filter(|v| !v.is_empty()) {
+        // An explicit volume is a request to run: a bad one fails in the
+        // child rather than turning into a skip.
+        return Ok(PathBuf::from(volume));
+    }
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return Err("AFT_TEST_CACHE_VOLUME is not set and /dev/shm does not exist".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let temp = std::env::temp_dir();
+        let shm_device = fs::metadata(shm).map_err(|error| format!("stat /dev/shm: {error}"))?;
+        let temp_device =
+            fs::metadata(&temp).map_err(|error| format!("stat {}: {error}", temp.display()))?;
+        if shm_device.dev() == temp_device.dev() {
+            return Err(format!(
+                "AFT_TEST_CACHE_VOLUME is not set and /dev/shm is on the same device as {}",
+                temp.display()
+            ));
+        }
+        Ok(shm.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        Err("AFT_TEST_CACHE_VOLUME is not set and /dev/shm is not a separate volume here".into())
+    }
+}
+
 #[test]
 fn native_doctor_fixes_only_marked_roots_and_old_cache_cleanup_is_explicit() {
-    let output = BoundedChild::spawn(
-        &mut fixture_command("cache_root_doctor_body_child"),
-        "native cache-root doctor scenario",
-    )
-    .output(Duration::from_secs(150));
+    let volume = match doctor_cache_volume() {
+        Ok(volume) => volume,
+        Err(reason) => {
+            // Printed so a skipped run is visible in the test output; set
+            // AFT_TEST_CACHE_VOLUME to a mounted second filesystem to run it.
+            eprintln!("SKIPPED native cache-root doctor scenario: {reason}");
+            return;
+        }
+    };
+    eprintln!(
+        "cache-root doctor: running real-volume scenario on {}",
+        volume.display()
+    );
+    let mut command = fixture_command("cache_root_doctor_body_child");
+    command.env("AFT_TEST_CACHE_VOLUME", &volume);
+    let output = BoundedChild::spawn(&mut command, "native cache-root doctor scenario")
+        .output(Duration::from_secs(150));
     assert!(output.status.success(), "{output:?}");
+    // The child prints these progress lines only after it has created cache
+    // roots on the second volume, so their presence proves the scenario ran.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cache-root doctor: preparing old-volume"),
+        "{output:?}"
+    );
 }
 
 #[test]
@@ -324,13 +378,17 @@ fn cache_root_doctor_body_child() {
     let temp = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     let process_path = process_snapshot_fixture(temp.path(), "");
-    // First enrollment requires a real second filesystem. Linux CI exposes
-    // tmpfs here; other native runners must supply their mounted test volume.
+    // First enrollment requires a real second filesystem, chosen by the
+    // supervising test and passed in AFT_TEST_CACHE_VOLUME.
     let volume = std::env::var_os("AFT_TEST_CACHE_VOLUME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/shm"));
-    let cache_volume = tempfile::tempdir_in(volume)
-        .expect("set AFT_TEST_CACHE_VOLUME to a mounted second filesystem");
+        .expect("the supervising test supplies AFT_TEST_CACHE_VOLUME");
+    let cache_volume = tempfile::tempdir_in(&volume).unwrap_or_else(|error| {
+        panic!(
+            "AFT_TEST_CACHE_VOLUME={} must be a mounted, writable second filesystem: {error}",
+            volume.display()
+        )
+    });
     let storage = temp.path().join("storage");
     let legacy = canary(&storage, "index/old");
     let legacy_harness = canary(&storage, "opencode/callgraph/old");

@@ -5696,6 +5696,11 @@ fn schedule_artifact_loads_admitted(
         semantic_artifact_load_start = Some(start_tx);
         let semantic_root = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
+        // Open the snapshot under the key configure already resolved. Deriving
+        // it again here would re-run the Git probe, and when that probe fails
+        // it falls back to a path-based key, so a linked worktree would look
+        // in its own folder and miss the owner checkout's shared snapshot.
+        let semantic_project_key = project_key.clone();
         let semantic_load_generation = configure_generation;
         let semantic_load_generation_flag = ctx.configure_generation_flag();
         let semantic_load_lifecycle = subc_lifecycle.clone();
@@ -5718,9 +5723,10 @@ fn schedule_artifact_loads_admitted(
             }
             log_ctx::with_session(session_id, || {
                 note_configure_artifact_load_attempt(&semantic_root);
-                let event = match crate::readonly_artifacts::open_semantic_index_read_only(
+                let event = match crate::readonly_artifacts::open_semantic_index_read_only_with_key(
                     &semantic_root,
                     semantic_storage.as_deref(),
+                    &semantic_project_key,
                 ) {
                     crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
                         SemanticIndexEvent::Ready(index)
@@ -16157,6 +16163,137 @@ mod tests {
             },
         );
         assert!(!ctx.config().indexes.trigram);
+    }
+
+    #[test]
+    fn linked_worktree_with_failed_git_probe_opens_owner_semantic_snapshot() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _storage_env = crate::test_env::without_storage_override();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        assert!(git_command(&main)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let common_dir = canonical_main.join(".git");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        // The owner checkout and its linked worktree share the repository key.
+        let key = crate::search_index::artifact_cache_key(&canonical_main);
+        assert_eq!(
+            crate::search_index::artifact_cache_key(&canonical_worktree),
+            key
+        );
+        // A healthy bind of the worktree persists the key memo that a later
+        // bind falls back to when its Git probe fails.
+        assert_eq!(
+            test_context()
+                .memoized_artifact_cache_key_for_configure(
+                    &worktree,
+                    &canonical_worktree,
+                    &storage,
+                    Some(&common_dir),
+                )
+                .unwrap(),
+            key
+        );
+        crate::root_cache::configure_artifact_access(&canonical_main, &key, false);
+        let source = canonical_main.join("tracked.rs");
+        let mut embed =
+            |texts: Vec<String>| Ok::<_, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+        let mut owner_index =
+            crate::semantic_index::SemanticIndex::build(&canonical_main, &[source], &mut embed, 8)
+                .expect("build owner semantic snapshot");
+        owner_index.set_fingerprint(crate::semantic_index::SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "readonly-test".to_string(),
+            base_url: "http://127.0.0.1".to_string(),
+            dimension: 3,
+            chunking_version: 1,
+            ..Default::default()
+        });
+        assert!(owner_index.write_to_disk(&storage, &key));
+
+        let _override =
+            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![worktree.clone(), canonical_worktree.clone()],
+                "spawn failed: Too many open files (os error 24)",
+            );
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(worktree.clone());
+            config.storage_dir = Some(storage.clone());
+            config.indexes.semantic = true;
+            config.views.enabled = false;
+        });
+        // Configure recovers the repository key from the memo ...
+        assert_eq!(
+            ctx.memoized_artifact_cache_key_for_configure(
+                &worktree,
+                &canonical_worktree,
+                &storage,
+                Some(&common_dir),
+            )
+            .unwrap(),
+            key
+        );
+        // ... while a fresh derivation falls back to a path-based key, which
+        // names a folder that holds no snapshot.
+        assert_ne!(
+            crate::search_index::artifact_cache_key(&canonical_worktree),
+            key
+        );
+        ctx.set_canonical_cache_root(canonical_worktree.clone());
+        ctx.set_cache_role(true, Some(common_dir.clone()));
+        crate::root_cache::configure_artifact_access(&canonical_worktree, &key, true);
+        // An interactive session has the worktree open, so a missing snapshot
+        // reports as missing rather than as "not opened".
+        struct OpenedRoot(std::path::PathBuf);
+        impl Drop for OpenedRoot {
+            fn drop(&mut self) {
+                crate::semantic_admission::note_closed("linked-worktree-probe-test", &self.0);
+            }
+        }
+        crate::semantic_admission::note_opened("linked-worktree-probe-test", &canonical_worktree);
+        let _opened = OpenedRoot(canonical_worktree.clone());
+
+        let starts = super::schedule_artifact_loads(&ctx, false, true);
+        assert!(starts.1.is_some(), "the read-only semantic arm must start");
+        let receiver = ctx
+            .semantic_index_rx()
+            .lock()
+            .clone()
+            .expect("semantic load receiver");
+        assert!(super::start_artifact_loads(starts));
+        let cap = Instant::now() + Duration::from_secs(60);
+        let event = loop {
+            let event = receiver
+                .recv_timeout(cap.saturating_duration_since(Instant::now()))
+                .expect("read-only semantic load result");
+            if matches!(
+                &event,
+                crate::context::SemanticIndexEvent::Ready(_)
+                    | crate::context::SemanticIndexEvent::Failed(_)
+            ) {
+                break event;
+            }
+        };
+        match event {
+            crate::context::SemanticIndexEvent::Ready(_) => {}
+            crate::context::SemanticIndexEvent::Failed(reason) => {
+                panic!("linked worktree missed the owner's semantic snapshot: {reason}")
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

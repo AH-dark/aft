@@ -458,6 +458,7 @@ fn borrowed_artifact_generation(path: PathBuf) -> Option<BorrowedArtifactGenerat
     Some(BorrowedArtifactGeneration { path, generation })
 }
 
+#[cfg(test)]
 pub(crate) fn open_semantic_index_read_only(
     project_root: &Path,
     storage_dir: Option<&Path>,
@@ -522,6 +523,9 @@ fn search_cancelled() -> bool {
     crate::executor::current_job_cancelled()
 }
 
+/// Test-only: production openers take the key configure resolved, because
+/// this derivation falls back to a path-based key when the Git probe fails.
+#[cfg(test)]
 fn semantic_index_location(
     project_root: &Path,
     storage_dir: Option<&Path>,
