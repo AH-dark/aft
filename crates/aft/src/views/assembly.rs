@@ -786,8 +786,7 @@ pub fn prepare_checkout_deferring(
             prepared.profile.seed_source = "cold";
             prepared.profile.cold_build_reason = match cold_build.as_ref().map(|(reason, _)| reason)
             {
-                Some(ColdBuildReason::LargeDiff) => "large_diff",
-                Some(_) => "base_unreadable",
+                Some(reason) => reason.as_str(),
                 None => "no_base",
             };
             prepared.derived_checkpoint = Some((derived.clone(), open_derived_keeper(&derived)?));

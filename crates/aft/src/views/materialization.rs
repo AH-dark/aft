@@ -116,7 +116,7 @@ mod resolution_facts;
 // per-reference skip optimization when reference ordinals collide, or Go
 // bindings whose package file listings were not recorded (an added sibling
 // `.go` file would never reselect them).
-const MATERIALIZATION_VERSION: &str = "11";
+const MATERIALIZATION_VERSION: &str = "12";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
@@ -278,9 +278,7 @@ fn materialize_reading(
         "views::materialization::materialize",
     )?;
     configure_materialization_connection(&connection)?;
-    if base.is_none() {
-        initialize_schema(&connection)?;
-    }
+    initialize_schema(&connection)?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if let Some(base_manifest) = base {
@@ -490,7 +488,7 @@ fn materialize_reading(
             |row| row.get::<_, usize>(0),
         )?;
     } else {
-        for table in ["edges", "refs", "nodes", "files"] {
+        for table in ["edges", "refs", "nodes", "files", "dispatch_hints"] {
             stats.deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
     }
@@ -550,7 +548,7 @@ fn materialize_reading(
         }
         let file_nodes = nodes.entry(path.clone()).or_default();
         for symbol in &parse.symbols {
-            let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
+            let id = symbol_node_id(&path, symbol);
             if write_owned {
                 owned_nodes.push(OwnedNodeRow {
                     id: id.clone(),
@@ -1065,9 +1063,9 @@ fn materialize_reading(
                 "INSERT OR REPLACE INTO refs
                  (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
                   import_kind, local_name, requested_name, namespace_alias, wildcard, line,
-                  byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
+                  byte_start, byte_end, status, target_node, target_file, target_symbol, provenance, callee_last_segment)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?17, ?18, ?19, ?20)",
+                         ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )?;
             let mut relinked = 0;
             let mut owned = 0;
@@ -1093,6 +1091,7 @@ fn materialize_reading(
                     row.target_file,
                     row.target_symbol,
                     PROVENANCE_TREESITTER,
+                    row.short_name.as_deref().map(crate::callgraph_store::callee_last_segment),
                 ])?;
                 if row.relink {
                     relinked += written;
@@ -1199,6 +1198,7 @@ fn materialize_reading(
     profile.finish("dispatch");
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
+    crate::callgraph_store::insert_meta(&transaction)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
         [fingerprint(manifest)?],
@@ -1724,7 +1724,7 @@ fn ensure_manifest_path(
     };
     let file_nodes = nodes.entry(path.to_string()).or_default();
     for symbol in &parse.symbols {
-        let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
+        let id = symbol_node_id(&path, symbol);
         file_nodes.insert(symbol.scoped_name.clone(), id.clone());
         file_nodes.entry(symbol.name.clone()).or_insert(id);
     }
@@ -1737,3 +1737,11 @@ fn ensure_manifest_path(
 #[cfg(test)]
 #[path = "materialization/dispatch_proofs.rs"]
 mod dispatch_proofs;
+
+fn symbol_node_id(path: &str, symbol: &join::BlobSymbol) -> String {
+    #[cfg(test)]
+    if crate::callgraph_store::position_identity_tests::pre_s4_output() {
+        return format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
+    }
+    crate::callgraph_store::view_node_id(path, &symbol.kind, &symbol.scoped_name)
+}

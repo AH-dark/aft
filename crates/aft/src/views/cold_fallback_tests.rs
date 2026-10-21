@@ -729,3 +729,123 @@ fn incremental_cutoff_boundaries() {
     }
     const _: () = assert!(INCREMENTAL_CUTOFF_PERCENT_FULL_RESOLUTION < INCREMENTAL_CUTOFF_PERCENT);
 }
+
+#[test]
+fn s4_upgrade_old_own_generation_is_rejected_before_clone() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
+        publish_marked_base(project.path(), storage.path())
+    });
+    {
+        let conn = Connection::open(&owner).unwrap();
+        crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
+        crate::callgraph_store::position_identity_tests::stamp_pre_s4(&conn, true);
+    }
+    assert!(!crate::callgraph_store::manifest_view_database_ready(
+        view.view_dir(),
+        view.current_generation().unwrap().as_deref().unwrap(),
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap());
+    let changed = edit(project.path(), 1);
+    let mut prepared = prepare_checkout(
+        &request(project.path(), storage.path(), "head-2", &[changed]),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert!(!prepared.profile.derived_cloned);
+    assert_eq!(prepared.profile.cold_build_reason, "base_not_ready");
+    let report = prepared.commit().unwrap();
+    let derived = view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    wait_for_no_connections(&derived);
+    assert!(!has_marker(&derived));
+    crate::callgraph_store::position_identity_tests::assert_current_graph(
+        &Connection::open(&derived).unwrap(),
+    );
+    let reader = crate::callgraph_store::ReadonlyCallGraphStore::open_manifest_view(
+        project.path().to_path_buf(),
+        FAMILY.into(),
+        view.view_dir().to_path_buf(),
+        report.generation.as_deref().unwrap(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        !crate::callgraph_store::CallGraphRead::edge_snapshot(&reader)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn s4_upgrade_old_sibling_is_rejected_and_checkout_builds_cold() {
+    let project = repository(4);
+    let sibling = tempfile::tempdir().unwrap();
+    let sibling_root = sibling.path().join("linked");
+    git(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            sibling_root.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let mut donor = request(project.path(), storage.path(), "head-1", &[]);
+    donor.scope = crate::path_identity::project_scope_key(project.path());
+    donor.family = crate::search_index::artifact_cache_key(project.path());
+    let report = crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
+        publish_checkout(&donor)
+    })
+    .unwrap();
+    let view = ViewStore::open(storage.path(), &donor.scope).unwrap();
+    let derived = view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    wait_for_no_connections(&derived);
+    {
+        let conn = Connection::open(&derived).unwrap();
+        crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
+        crate::callgraph_store::position_identity_tests::stamp_pre_s4(&conn, true);
+    }
+    let mut target = donor.clone();
+    target.project_root = sibling_root.clone();
+    target.scope = crate::path_identity::project_scope_key(&sibling_root);
+    assert!(worker_seed::sibling_checkout_seed(
+        &target,
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap()
+    .is_none());
+    let mut prepared = prepare_checkout(&target, &mut |_| Ok(())).unwrap();
+    assert!(!prepared.profile.derived_cloned);
+    assert_eq!(prepared.profile.seed_source, "cold");
+    let report = prepared.commit().unwrap();
+    let target_view = ViewStore::open(storage.path(), &target.scope).unwrap();
+    let database = target_view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    wait_for_no_connections(&database);
+    crate::callgraph_store::position_identity_tests::assert_current_graph(
+        &Connection::open(&database).unwrap(),
+    );
+    let reader = crate::callgraph_store::ReadonlyCallGraphStore::open_manifest_view(
+        sibling_root,
+        target.family,
+        target_view.view_dir().to_path_buf(),
+        report.generation.as_deref().unwrap(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        !crate::callgraph_store::CallGraphRead::edge_snapshot(&reader)
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -1089,7 +1089,8 @@ fn write_differences(
     // Method-call edges.
     {
         let mut current = HashMap::<String, EdgeRow>::new();
-        let columns = "SELECT edge_id, ref_id, target_file, target_symbol, kind, line, provenance
+        let mut current_targets = HashMap::<String, Option<String>>::new();
+        let columns = "SELECT edge_id, ref_id, target_file, target_symbol, kind, line, provenance, target_node
              FROM edges";
         let read_row = |row: &rusqlite::Row<'_>| {
             Ok((
@@ -1105,6 +1106,7 @@ fn write_differences(
                     row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
                 ),
+                row.get::<_, Option<String>>(7)?,
             ))
         };
         // A site's ref ID is `view:{file}:{ordinal}`, so one file's edges are
@@ -1125,7 +1127,7 @@ fn write_differences(
                 )?,
             };
             for row in rows {
-                let (edge_id, edge) = row?;
+                let (edge_id, edge, target_node) = row?;
                 if file.is_some_and(|file| {
                     edge.0
                         .strip_prefix("view:")
@@ -1134,6 +1136,7 @@ fn write_differences(
                 }) {
                     continue;
                 }
+                current_targets.insert(edge_id.clone(), target_node);
                 current.insert(edge_id, edge);
             }
         }
@@ -1174,9 +1177,14 @@ fn write_differences(
                 i64::from(site.site.line),
                 target.provenance.to_string(),
             );
+            // Rewriting a target's positions does not change its identity.
+            // Keep inbound edges only after checking the actual target node,
+            // since a kind change at the same scoped name does change identity.
             if !rewritten(site.file)
-                && !rewritten(&target.file)
                 && current.get(&edge_id) == Some(&expected)
+                && (!rewritten(&target.file)
+                    || current_targets.get(&edge_id)
+                        == Some(&node(transaction, &target.file, &target.symbol)?))
             {
                 current.remove(&edge_id);
                 counts.edges_kept += 1;

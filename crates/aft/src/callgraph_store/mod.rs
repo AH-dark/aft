@@ -1494,8 +1494,11 @@ thread_local! {
 mod dead_code_projection;
 #[cfg(test)]
 mod incremental_parity;
+
 #[cfg(test)]
 mod perf_tests;
+#[cfg(test)]
+pub(crate) mod position_identity_tests;
 mod refresh_wal;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
@@ -5898,8 +5901,14 @@ impl CallGraphStore {
         // A writer lease makes this root/domain's staging generation exclusive.
         // Keep its identity stable so a replacement process adopts committed
         // batches instead of minting a second temp and starting from zero.
-        let temp_path = callgraph_dir.join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let temp_path = callgraph_dir.join(staging_file_name(project_key));
         let staging_guard = crate::db::file_identity::filesystem_guard();
+        // Old binaries resume only this unversioned name. A matching path-only
+        // corpus fingerprint does not establish that its partially written
+        // node ids use the current identity scheme, so never adopt its output.
+        let legacy_staging = callgraph_dir.join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        ensure_sqlite_files_closed(&legacy_staging)?;
+        remove_sqlite_file_set(&legacy_staging);
         ensure_sqlite_files_closed(&temp_path)?;
         let adopting_staging = temp_path.exists();
         if !adopting_staging {
@@ -6590,7 +6599,9 @@ impl CallGraphStore {
         ensure_cold_build_current("staging-admission", 0, 1)?;
         let mut phase = staged_build_phase(&conn)?;
         let staged_fingerprint = staged_string(&conn, STAGED_CORPUS_FINGERPRINT)?;
-        let fingerprint_matches = staged_fingerprint.as_deref() == Some(corpus_fingerprint);
+        let fingerprint_matches = staged_fingerprint.as_deref() == Some(corpus_fingerprint)
+            && staged_string(&conn, "fingerprint")?.as_deref()
+                == Some(schema_fingerprint().as_str());
         if phase.as_deref() == Some("ready") && fingerprint_matches {
             ensure_cold_build_current("completed-staging", 1, 1)?;
             crate::slog_info!(
@@ -11077,6 +11088,7 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             caller_file     TEXT NOT NULL,
             kind            TEXT NOT NULL,
             short_name      TEXT,
+            callee_last_segment TEXT,
             full_ref        TEXT,
             module_path     TEXT,
             import_kind     TEXT,
@@ -11165,12 +11177,37 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             caller_symbol TEXT
         );",
     )?;
+    // CREATE TABLE IF NOT EXISTS leaves older tables untouched. Upgrade the
+    // column before creating indexes that reference it; readiness still forces
+    // old graph output through a cold rebuild rather than migrating identities.
+    let has_last_segment = conn
+        .prepare("PRAGMA table_info(refs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "callee_last_segment");
+    if !has_last_segment {
+        conn.execute_batch("ALTER TABLE refs ADD COLUMN callee_last_segment TEXT;")?;
+    }
     conn.execute_batch(&create_secondary_indexes_sql())?;
-    insert_meta(conn)?;
+    // Shape initialization is not proof that graph rows were produced by this
+    // build. Preserve an existing fingerprint so old identities remain unready.
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version',?1)",
+        [SCHEMA_VERSION.to_string()],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(k,v) VALUES('fingerprint',?1)",
+        [schema_fingerprint()],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(k,v) VALUES('projection_write_revision','0')",
+        [],
+    )?;
     Ok(())
 }
 
-fn insert_meta(conn: &Connection) -> Result<()> {
+pub(crate) fn insert_meta(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -11393,7 +11430,11 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v18-rust-static-value-references";
+const BUILD_OUTPUT_VERSION: &str = "v19-position-independent-node-identities";
+
+fn staging_file_name(project_key: &str) -> String {
+    format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
+}
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -11736,6 +11777,10 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
     ("idx_nodes_name", "nodes(name)"),
     ("idx_nodes_scoped", "nodes(scoped_name)"),
     ("idx_refs_short_name", "refs(short_name)"),
+    (
+        "idx_refs_unresolved_last_segment",
+        "refs(callee_last_segment) WHERE kind = 'call' AND status = 'unresolved'",
+    ),
     ("idx_refs_kind_caller_file", "refs(kind, caller_file)"),
     ("idx_refs_caller_file", "refs(caller_file)"),
     (
@@ -13137,7 +13182,21 @@ fn build_file_extract_with_memo(
     if lang == LangId::Rust {
         extend_rust_imports_with_nested_uses(&source, &mut data);
     }
-    let mut nodes = build_node_records(&rel_path, &source, &data)?;
+    #[cfg(test)]
+    let node_source = if position_identity_tests::shared_range_fixture(project_root, &mut data) {
+        ""
+    } else {
+        &source
+    };
+    #[cfg(not(test))]
+    let node_source = &source;
+    let mut nodes = build_node_records(&rel_path, node_source, &data)?;
+    #[cfg(test)]
+    if position_identity_tests::pre_s4_project(project_root) {
+        nodes = position_identity_tests::with_pre_s4_output(|| {
+            build_node_records(&rel_path, &source, &data)
+        })?;
+    }
     let node_by_scoped: HashMap<String, String> = nodes
         .iter()
         .map(|node| (node.scoped_name.clone(), node.id.clone()))
@@ -13262,7 +13321,17 @@ fn build_node_records(
         let ordinal = ordinal_by_range.entry(range_key).or_insert(0);
         let range_ordinal = *ordinal;
         *ordinal += 1;
-        let id = node_id(rel_path, &range, range_ordinal, scoped_name);
+        let id = node_id(rel_path, symbol_kind_label(&meta.kind), scoped_name);
+        #[cfg(test)]
+        let id = if position_identity_tests::pre_s4_output() && scoped_name != TOP_LEVEL_SYMBOL {
+            let input = format!(
+                "{rel_path}:{}:{}:{}:{}:{range_ordinal}",
+                range.start_line, range.start_col, range.end_line, range.end_col
+            );
+            format!("pos:{}", hash_to_hex(blake3::hash(input.as_bytes())))
+        } else {
+            id
+        };
         let exported = meta.exported || data.exported_symbols.iter().any(|item| item == &name);
         let is_default_export = data
             .default_export_symbol
@@ -13328,15 +13397,21 @@ fn selection_range(source: &str, scoped_name: &str, name: &str, fallback: &Range
     }
 }
 
-fn node_id(rel_path: &str, range: &Range, ordinal: u32, scoped_name: &str) -> String {
+fn node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
     if scoped_name == TOP_LEVEL_SYMBOL {
         return format!("top:{}", hash_to_hex(blake3::hash(rel_path.as_bytes())));
     }
-    let input = format!(
-        "{rel_path}:{}:{}:{}:{}:{ordinal}",
-        range.start_line, range.start_col, range.end_line, range.end_col
-    );
-    format!("pos:{}", hash_to_hex(blake3::hash(input.as_bytes())))
+    // Length-delimited fields avoid aliasing paths or names containing colons.
+    let mut hash = blake3::Hasher::new();
+    for field in [rel_path, kind, scoped_name] {
+        hash.update(&(field.len() as u64).to_le_bytes());
+        hash.update(field.as_bytes());
+    }
+    format!("pos:symbol:{}", hash_to_hex(hash.finalize()))
+}
+
+pub(crate) fn view_node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
+    format!("view:symbol:{}", node_id(rel_path, kind, scoped_name))
 }
 
 fn build_call_refs(
@@ -16566,13 +16641,14 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                     ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
                     import_kind, local_name, requested_name, namespace_alias, wildcard, line,
                     byte_start, byte_end, status, target_node, target_file, target_symbol,
-                    provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                    provenance, callee_last_segment
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                 ON CONFLICT(ref_id) DO UPDATE SET
                     caller_node=excluded.caller_node,
                     caller_file=excluded.caller_file,
                     kind=excluded.kind,
                     short_name=excluded.short_name,
+                    callee_last_segment=excluded.callee_last_segment,
                     full_ref=excluded.full_ref,
                     module_path=excluded.module_path,
                     import_kind=excluded.import_kind,
@@ -16592,6 +16668,7 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                    OR caller_file IS NOT excluded.caller_file
                    OR kind IS NOT excluded.kind
                    OR short_name IS NOT excluded.short_name
+                   OR callee_last_segment IS NOT excluded.callee_last_segment
                    OR full_ref IS NOT excluded.full_ref
                    OR module_path IS NOT excluded.module_path
                    OR import_kind IS NOT excluded.import_kind
@@ -16758,6 +16835,7 @@ fn insert_staged_ref_prepared(
         Option::<String>::None,
         Option::<String>::None,
         ref_provenance(raw),
+        raw.short_name.as_deref().map(callee_last_segment),
     ])?;
     statements
         .staging_ref_context
@@ -16792,6 +16870,7 @@ fn insert_resolved_ref_prepared(
         resolved.target_file,
         resolved.target_symbol,
         ref_provenance(raw),
+        raw.short_name.as_deref().map(callee_last_segment),
     ])?;
     if let Some(edge) = &resolved.edge {
         statements.edge.execute(params![
@@ -16823,6 +16902,20 @@ fn delete_stale_file_extract_rows(tx: &Transaction<'_>, extract: &FileExtract) -
         &node_ids,
     )?;
 
+    // Stable identities can swap or overlap their former positions. Remove
+    // moved rows together before upserting, so the range uniqueness constraint
+    // is never checked against another symbol's obsolete position.
+    let mut delete_moved = tx.prepare_cached("DELETE FROM nodes WHERE id=?1 AND (start_line != ?2 OR start_col != ?3 OR end_line != ?4 OR end_col != ?5 OR range_ordinal != ?6)")?;
+    for node in &extract.nodes {
+        delete_moved.execute(params![
+            node.id,
+            node.range.start_line,
+            node.range.start_col,
+            node.range.end_line,
+            node.range.end_col,
+            node.range_ordinal
+        ])?;
+    }
     sync_file_dependencies(tx, extract, false)?;
 
     let hint_ids = extract
@@ -17121,8 +17214,8 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
             ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
             import_kind, local_name, requested_name, namespace_alias, wildcard, line,
             byte_start, byte_end, status, target_node, target_file, target_symbol,
-            provenance
-        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            provenance, callee_last_segment
+        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             raw.ref_id,
             raw.caller_node,
@@ -17144,6 +17237,7 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
             resolved.target_file,
             resolved.target_symbol,
             ref_provenance(raw),
+            raw.short_name.as_deref().map(callee_last_segment),
         ],
     )?;
     if let Some(edge) = &resolved.edge {
@@ -20494,7 +20588,7 @@ fn reexport_consumer_refs(
 
 /// The name a call's short name ends in: `clone` for `crate::git::clone`,
 /// `save` for `store.save` or `store->save`.
-fn callee_last_segment(short_name: &str) -> &str {
+pub(crate) fn callee_last_segment(short_name: &str) -> &str {
     short_name
         .rsplit(|character| matches!(character, ':' | '.' | '>'))
         .next()
@@ -25748,9 +25842,7 @@ export function leaf() {}
         assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
 
         let project_key = crate::search_index::artifact_cache_key(root.path());
-        let staging = callgraph_dir
-            .path()
-            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staging = callgraph_dir.path().join(staging_file_name(&project_key));
         let staged = Connection::open(&staging).unwrap();
         assert_eq!(
             staged_build_phase(&staged).unwrap().as_deref(),
@@ -25856,7 +25948,7 @@ export function leaf() {}
         let source = root.path().join("lib.rs");
         std::fs::write(&source, "pub fn staged() {}\n").unwrap();
         let key = crate::search_index::artifact_cache_key(root.path());
-        let path = dir.path().join(format!("{key}.staging.sqlite.tmp.resume"));
+        let path = dir.path().join(staging_file_name(&key));
         let connection =
             TrackedConnection::open(&path, SqliteStore::CallgraphColdGeneration).unwrap();
         configure_build_connection(&connection).unwrap();
@@ -25903,9 +25995,7 @@ export function leaf() {}
         std::fs::write(&source, "pub fn staging_marker() {}\n").unwrap();
         let files = vec![source];
         let project_key = crate::search_index::artifact_cache_key(root.path());
-        let staging = callgraph_dir
-            .path()
-            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staging = callgraph_dir.path().join(staging_file_name(&project_key));
         let staging_shm = PathBuf::from(format!("{}-shm", staging.display()));
 
         let held = Arc::new(std::sync::Mutex::new(None::<TrackedConnection>));
@@ -26002,9 +26092,7 @@ export function leaf() {}
         assert!(superseded.load(AtomicOrdering::SeqCst));
 
         let project_key = crate::search_index::artifact_cache_key(root.path());
-        let staging = callgraph_dir
-            .path()
-            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staging = callgraph_dir.path().join(staging_file_name(&project_key));
         assert!(staging.exists(), "supersession must retain durable staging");
         let staged = Connection::open(&staging).unwrap();
         assert_eq!(
@@ -30547,7 +30635,7 @@ mod bounded_build_breaker_tests {
 
     fn staging_path(root: &Path, store: &Path) -> PathBuf {
         let project_key = crate::search_index::artifact_cache_key(root);
-        store.join(format!("{project_key}.staging.sqlite.tmp.resume"))
+        store.join(staging_file_name(&project_key))
     }
 
     fn durable_staging_state(path: &Path) -> (u64, u64) {

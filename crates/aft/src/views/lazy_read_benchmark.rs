@@ -314,7 +314,8 @@ impl LazyGeneration {
             let lookup = symbol_lookup.entry(file.clone()).or_default();
             let file_nodes = nodes_by_file.entry(file.clone()).or_default();
             for symbol in &parse.symbols {
-                let id = format!("view:{file}:{}:{}", symbol.scoped_name, symbol.ordinal);
+                let id =
+                    crate::callgraph_store::view_node_id(file, &symbol.kind, &symbol.scoped_name);
                 let node = LazyNode {
                     id: id.clone(),
                     file: file.clone(),
