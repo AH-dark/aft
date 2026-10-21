@@ -3265,17 +3265,6 @@
     },
     {
       "path": "crates/aft/tests/worker_jail.rs",
-      "line": 651,
-      "column": 41,
-      "token": "filePath",
-      "text": "self.tool_reply(\"read\", json!({\"filePath\":path})).await",
-      "location": "line 651, column 41",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The worker-jail helper submits the served read tool's required V1 filePath key; the live-catalog test executes it and rejects path. This is not a new agent-facing schema spelling."
-    },
-    {
-      "path": "crates/aft/tests/worker_jail.rs",
       "line": 2445,
       "column": 21,
       "token": "filePath",
@@ -3287,25 +3276,14 @@
     },
     {
       "path": "crates/aft/tests/worker_jail.rs",
-      "line": 3704,
-      "column": 58,
-      "token": "filePath",
-      "text": "assert_eq!(read[\"input_schema\"][\"required\"], json!([\"filePath\"]));",
-      "location": "line 3704, column 58",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The real worker catalog regression pins the required V1 read key before executing the call; it verifies the served wire contract, not public agent argument naming."
-    },
-    {
-      "path": "crates/aft/tests/worker_jail.rs",
-      "line": 3705,
+      "line": 3706,
       "column": 53,
       "token": "filePath",
-      "text": "assert!(read[\"input_schema\"][\"properties\"].get(\"filePath\").is_some());",
-      "location": "line 3705, column 53",
+      "text": "assert!(read[\"input_schema\"][\"properties\"].get(\"filePath\").is_none());",
+      "location": "line 3706, column 53",
       "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The real worker catalog regression pins the V1 read property and rejects the unserved path alias; the test intentionally uses the existing wire schema."
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
       "path": "docs/design/opencode-v2-plugin-playbook.md",

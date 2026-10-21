@@ -648,7 +648,7 @@ impl Jail {
     }
 
     async fn read_file(&mut self, path: &Path) -> Value {
-        self.tool_reply("read", json!({"filePath":path})).await
+        self.tool_reply("read", json!({"path":path})).await
     }
 
     async fn head_shell_read(&mut self, path: &Path) -> Value {
@@ -3701,9 +3701,9 @@ async fn gh_shim_router_host_read_uses_served_catalog_arguments() {
         .iter()
         .find(|tool| tool["name"] == "read")
         .expect("served read tool");
-    assert_eq!(read["input_schema"]["required"], json!(["filePath"]));
-    assert!(read["input_schema"]["properties"].get("filePath").is_some());
-    assert!(read["input_schema"]["properties"].get("path").is_none());
+    assert_eq!(read["input_schema"]["required"], json!(["path"]));
+    assert!(read["input_schema"]["properties"].get("path").is_some());
+    assert!(read["input_schema"]["properties"].get("filePath").is_none());
     let fixture = jail.worktree.join("served-read-key.txt");
     std::fs::write(&fixture, "served-read-key-sentinel\n").unwrap();
     let reply = jail.read_file(&fixture).await;
@@ -3716,9 +3716,9 @@ async fn gh_shim_router_host_read_uses_served_catalog_arguments() {
         reply.to_string().contains("served-read-key-sentinel"),
         "{reply}"
     );
-    let refused = jail.tool_reply("read", json!({"path":fixture})).await;
+    let refused = jail.tool_reply("read", json!({"file_path":fixture})).await;
     assert_eq!(refused["code"], "invalid_request", "{refused}");
-    assert_eq!(refused["detail"]["field"], "path", "{refused}");
+    assert_eq!(refused["detail"]["field"], "file_path", "{refused}");
     jail.bind_grant_head().await;
     let head_catalog = jail.catalog_on_channel(2).await;
     let bash = head_catalog["tools"]
