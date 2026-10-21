@@ -2809,6 +2809,74 @@ fn configure_cancelled(req_id: &str) -> Option<Response> {
     })
 }
 
+fn retention_binding_failure(req_id: &str, error: std::io::Error) -> Response {
+    let wait = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<crate::storage_retention::BindLockError>());
+    Response::error_with_data(
+        req_id,
+        "retention_binding_unavailable",
+        format!("cannot protect checkout cache binding: {error}"),
+        json!({
+            "retryable": error.kind() == std::io::ErrorKind::TimedOut,
+            "lock": wait.map(|wait| wait.path.display().to_string()),
+            "waited_ms": wait.map(|wait| wait.waited.as_millis() as u64),
+        }),
+    )
+}
+
+#[test]
+fn configure_retention_timeout_is_retryable_and_names_lock() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = storage.path().join("checkout");
+    std::fs::create_dir(&root).unwrap();
+    let guard = crate::storage_retention::barrier(storage.path()).unwrap();
+    let error = crate::storage_retention::record_bind_until(
+        storage.path(),
+        &root,
+        "0123456789abcdef",
+        Instant::now() + Duration::from_millis(50),
+    )
+    .unwrap_err();
+    let response = retention_binding_failure("bind", error);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "retention_binding_unavailable");
+    assert_eq!(response.data["retryable"], true);
+    assert_eq!(
+        response.data["lock"],
+        storage
+            .path()
+            .join("retention/sweep.lock")
+            .display()
+            .to_string()
+    );
+    assert!(response.data["waited_ms"].as_u64().unwrap() >= 40);
+    assert!(response.data["message"]
+        .as_str()
+        .unwrap()
+        .contains("retention/sweep.lock"));
+    assert!(!storage.path().join("retention/roots").exists());
+    drop(guard);
+
+    let error = crate::storage_retention::record_bind_until(
+        storage.path(),
+        &root,
+        "0123456789abcdef",
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(!storage.path().join("retention/roots").exists());
+    crate::storage_retention::record_bind(storage.path(), &root, "0123456789abcdef").unwrap();
+    assert!(storage.path().join("retention/roots").is_dir());
+
+    let response = retention_binding_failure(
+        "bind",
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only storage"),
+    );
+    assert_eq!(response.data["retryable"], false);
+}
+
 fn configure_maintenance_backpressure(req_id: &str) -> Response {
     Response::error_with_data(
         req_id,
@@ -3805,11 +3873,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     cache_key_profile.retention_bind = retention_started.elapsed();
     if let Err(error) = retention_result {
-        return Response::error(
-            &req.id,
-            "retention_binding_unavailable",
-            format!("cannot protect checkout cache binding: {error}"),
-        );
+        return retention_binding_failure(&req.id, error);
     }
     ctx.begin_configure_ack_step("format_preflight");
     if let Some(project_key) = project_key.as_ref() {

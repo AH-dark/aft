@@ -1,0 +1,1 @@
+- Parallel checkout bindings now have a bounded retention-lock queue budget and report retryable, named lock timeouts instead of losing indexes under contention.

@@ -298,7 +298,74 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 
 /// Called before cache acquisition, on every configure, even a same-key rebind.
 pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io::Result<()> {
-    let _barrier = barrier(storage)?;
+    // This is a queue budget, not a limit on one lock holder. A session can
+    // publish dozens of checkout bindings at once, each requiring durable I/O.
+    // Only binds get the longer wait; pin and cleanup admissions keep their
+    // existing bounds instead of waiting for the full bind queue budget.
+    record_bind_until(
+        storage,
+        root,
+        artifact_key,
+        Instant::now() + BIND_QUEUE_WAIT,
+    )
+}
+
+const BIND_QUEUE_WAIT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+pub(crate) struct BindLockError {
+    pub(crate) path: PathBuf,
+    pub(crate) waited: Duration,
+    source: crate::fs_lock::AcquireError,
+}
+
+impl std::fmt::Display for BindLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "retention binding waited {}ms for {}: {}",
+            self.waited.as_millis(),
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for BindLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) fn record_bind_until(
+    storage: &Path,
+    root: &Path,
+    artifact_key: &str,
+    deadline: Instant,
+) -> io::Result<()> {
+    #[cfg(test)]
+    test_hook(root, "bind-waiting");
+    let started = Instant::now();
+    fs::create_dir_all(storage.join("retention"))?;
+    let path = storage.join("retention/sweep.lock");
+    // Use one absolute deadline, including filesystem preparation. Never renew
+    // it on a busy poll or admit a binding without the sweep barrier.
+    let _barrier = crate::fs_lock::try_acquire_until(&path, deadline).map_err(|source| {
+        let kind = match &source {
+            crate::fs_lock::AcquireError::Timeout => io::ErrorKind::TimedOut,
+            crate::fs_lock::AcquireError::Io(error) => error.kind(),
+        };
+        io::Error::new(
+            kind,
+            BindLockError {
+                path,
+                waited: started.elapsed(),
+                source,
+            },
+        )
+    })?;
+    #[cfg(test)]
+    test_hook(root, "bind-acquired");
     let root = fs::canonicalize(root)?;
     let scope = crate::path_identity::project_scope_key(&root);
     let binding = Binding {
@@ -318,7 +385,11 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
             .join(format!("{scope}.json")),
         &binding,
     )?;
-    clear_unknown_observation(storage, artifact_key)
+    clear_unknown_observation(storage, artifact_key)?;
+    drop(_barrier);
+    #[cfg(test)]
+    test_hook(&binding.root, "bind-released");
+    Ok(())
 }
 
 /// Only a verified linked-worktree Git layout gets the shorter retention age.
@@ -1591,6 +1662,8 @@ impl DueBatch {
             attribute_due(storage, &directory, due_lane, &before, report)?;
         }
         drop(barrier);
+        #[cfg(test)]
+        test_hook(storage, "due-released");
         Ok(())
     }
 }
@@ -2698,6 +2771,159 @@ fn collect_one_v2_family(
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    #[test]
+    fn record_bind_parallel_queue_survives_slow_publish() {
+        use std::sync::{Arc, Barrier, Mutex};
+        const BINDS: usize = 64;
+        for delay in [Duration::ZERO, Duration::from_millis(100)] {
+            let temp = tempfile::tempdir().unwrap();
+            let ready = Arc::new(Barrier::new(BINDS));
+            let measurements = Arc::new(Mutex::new(Vec::new()));
+            let mut hooks = Vec::new();
+            let mut roots = Vec::new();
+            for index in 0..BINDS {
+                let root = temp.path().join(format!("checkout-{index}"));
+                fs::create_dir(&root).unwrap();
+                let root = fs::canonicalize(root).unwrap();
+                let phases = Arc::new(Mutex::new((Instant::now(), Instant::now())));
+                let measurements = measurements.clone();
+                hooks.push(observe_test_hook(
+                    &root,
+                    Arc::new(move |step| match step {
+                        "bind-waiting" => phases.lock().unwrap().0 = Instant::now(),
+                        "bind-acquired" => {
+                            phases.lock().unwrap().1 = Instant::now();
+                            // Model slow durable writes without generating CPU load.
+                            std::thread::sleep(delay);
+                        }
+                        "bind-released" => {
+                            let (waiting, acquired) = *phases.lock().unwrap();
+                            measurements
+                                .lock()
+                                .unwrap()
+                                .push((acquired.duration_since(waiting), acquired.elapsed()));
+                        }
+                        _ => {}
+                    }),
+                ));
+                roots.push(root);
+            }
+            let results = std::thread::scope(|scope| {
+                let workers: Vec<_> = roots
+                    .iter()
+                    .map(|root| {
+                        let ready = &ready;
+                        let storage = temp.path();
+                        scope.spawn(move || {
+                            ready.wait();
+                            record_bind(
+                                storage,
+                                root,
+                                &crate::path_identity::project_scope_key(root),
+                            )
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut measurements = measurements.lock().unwrap().clone();
+            measurements.sort_by_key(|(wait, _)| *wait);
+            eprintln!(
+                "record_bind queue: binds={BINDS} delay={delay:?} published={} wait[min/p50/max]={:?}/{:?}/{:?} hold[max]={:?} errors={:?}",
+                measurements.len(),
+                measurements.first().map(|m| m.0),
+                measurements.get(measurements.len() / 2).map(|m| m.0),
+                measurements.last().map(|m| m.0),
+                measurements.iter().map(|m| m.1).max(),
+                results.iter().filter_map(|r| r.as_ref().err()).collect::<Vec<_>>()
+            );
+            assert!(results.iter().all(Result::is_ok), "queued binds failed");
+            assert_eq!(measurements.len(), BINDS);
+            for root in roots {
+                let scope = crate::path_identity::project_scope_key(&root);
+                let binding: Binding =
+                    read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+                assert_eq!(binding.root, root);
+                assert_eq!(binding.artifact_key, scope);
+            }
+        }
+    }
+
+    #[test]
+    fn record_bind_waits_for_sweep_admission() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let (temp, _, _, _) = due_cache_fixture();
+        let root = temp.path().join("incoming-checkout");
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let (admitted, admission) = mpsc::channel();
+        let completed = admitted.clone();
+        let (waiting, waiter) = mpsc::channel();
+        let waiter = Mutex::new(waiter);
+        let held = Arc::new(Mutex::new(None::<Instant>));
+        let held_hook = held.clone();
+        let _sweep_hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| match step {
+                "due-admitted" => {
+                    *held_hook.lock().unwrap() = Some(Instant::now());
+                    admitted.send(Some(())).unwrap();
+                    waiter
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .unwrap();
+                }
+                "due-released" => {
+                    eprintln!(
+                        "sweep admission holder duration: {:?}",
+                        held_hook.lock().unwrap().unwrap().elapsed()
+                    );
+                }
+                _ => {}
+            }),
+        );
+        let bind_started = Mutex::new(Instant::now());
+        let _bind_hook = observe_test_hook(
+            &root,
+            Arc::new(move |step| match step {
+                "bind-waiting" => {
+                    *bind_started.lock().unwrap() = Instant::now();
+                    waiting.send(()).unwrap();
+                }
+                "bind-acquired" => eprintln!(
+                    "bind waiting on sweep admission (including scheduling): {:?}",
+                    bind_started.lock().unwrap().elapsed()
+                ),
+                _ => {}
+            }),
+        );
+        std::thread::scope(|scope| {
+            let sweep = scope.spawn(|| {
+                let report = run_pass_entry_bound(temp.path());
+                eprintln!("sweep contention report: {report:?}");
+                let _ = completed.send(None);
+                report
+            });
+            assert_eq!(
+                admission.recv_timeout(Duration::from_secs(60)).unwrap(),
+                Some(())
+            );
+            record_bind(temp.path(), &root, "fedcba9876543210").unwrap();
+            let report = sweep.join().unwrap();
+            assert_eq!(report.removed_roots, 1, "{report:?}");
+            eprintln!("sweep phases: {:?}", report.timings_ms);
+        });
+        let scope = crate::path_identity::project_scope_key(&root);
+        assert!(temp
+            .path()
+            .join(format!("retention/roots/{scope}.json"))
+            .is_file());
+    }
 
     #[test]
     fn retention_observation_clears_only_after_last_cache_plane() {
