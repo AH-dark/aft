@@ -239,6 +239,12 @@ impl Request {
                     ),
                 });
             }
+            // The upstream provider constructs the final URL. Do not depend on
+            // query escaping to prevent a worker value from adding/truncating
+            // pairs, including a second decode of an encoded delimiter.
+            if value.contains(['&', '=', '#', '%']) {
+                return Err(WorkerReadRefusal {code:"worker_query_value_ambiguous",key:Some(key.clone()),message:format!("worker GET query value for {key:?} must not contain &, =, # or percent escapes")});
+            }
         }
         Ok(())
     }

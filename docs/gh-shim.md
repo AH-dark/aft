@@ -459,3 +459,10 @@ slash-containing branch, commit or release-tag reference remains encoded as
 change endpoint structure. AFT forwards the canonical checked path, not the
 caller's alternate spelling. This worker-only rule does not alter existing
 head/operator path behavior.
+
+Query pairs are sent to the upstream provider as typed JSON strings; AFT does not
+construct the final GitHub URL and does not attest the downstream URL encoder.
+Worker GET values therefore refuse `&`, `=`, `#` and percent escapes as well as
+control characters. This prevents a value such as `state=open&x=y` from reaching
+that boundary as an extra or truncated parameter. Existing head/operator query
+values retain their previous behavior.
