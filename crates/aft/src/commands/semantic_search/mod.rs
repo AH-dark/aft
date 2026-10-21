@@ -783,6 +783,20 @@ fn handle_semantic_search_with_disk_fallback(
         .filter(|path| !path.is_empty());
     let external_root = if let Some(requested_path) = requested_path {
         let requested = project_root.join(crate::readonly_artifacts::expand_tilde(requested_path));
+        let storage = crate::access_policy::policy_path(&ctx.storage_dir());
+        let scan_root_is_protected = |root: &Path| {
+            // Resolve both sides: storage may be configured through a parent
+            // symlink, including /var on macOS, while the candidate is canonical.
+            crate::access_policy::policy_path(root).starts_with(&storage)
+                || ctx
+                    .validate_search_path(
+                        &req.id,
+                        req.session(),
+                        root,
+                        crate::context::WorkerSearchTool::AftSearch,
+                    )
+                    .is_err_and(|response| response.data["code"] == "denied_floor")
+        };
         if let Err(response) = ctx.validate_search_path(
             &req.id,
             req.session(),
@@ -792,7 +806,11 @@ fn handle_semantic_search_with_disk_fallback(
             // Restricted external searches already have a public refusal message
             // naming the Git root. Keep that spelling while enforcing read policy.
             if response.data["code"] == "path_outside_root" {
-                if let Ok(root) = ctx.resolve_external_git_root(&project_root, requested_path) {
+                if let Ok(root) = ctx.resolve_external_git_root(
+                    &project_root,
+                    requested_path,
+                    scan_root_is_protected,
+                ) {
                     if root != project_root {
                         return Response::error(
                             &req.id,
@@ -807,7 +825,7 @@ fn handle_semantic_search_with_disk_fallback(
             }
             return response;
         }
-        match ctx.resolve_external_git_root(&project_root, requested_path) {
+        match ctx.resolve_external_git_root(&project_root, requested_path, scan_root_is_protected) {
             Ok(root) if root != project_root => {
                 if ctx.config().restrict_to_project_root || ctx.request_force_restrict(&req.id) {
                     return Response::error(
@@ -840,6 +858,13 @@ fn handle_semantic_search_with_disk_fallback(
                 );
             }
             Err(GitRootResolutionError::NotAGitRoot) => {
+                return Response::error(
+                    &req.id,
+                    "not_a_git_root",
+                    format!("aft_search cannot run a bounded lexical scan at this root: {requested_path}. Choose a narrower folder, or use grep or glob with path."),
+                );
+            }
+            Err(GitRootResolutionError::ProtectedScanRoot) => {
                 return Response::error(
                     &req.id,
                     "not_a_git_root",

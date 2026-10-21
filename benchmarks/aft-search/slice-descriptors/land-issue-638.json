@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "aft_search scans a plain folder outside the project (issue #638). Plain-scan admission refuses AFT storage and effective read-floor roots without widening exact artifact authorization; protected plain roots retain their pre-scan refusal response. Tool descriptions, query ranking and query routing are unchanged; benchmark rows must remain byte-identical."
+}

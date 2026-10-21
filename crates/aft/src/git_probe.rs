@@ -57,6 +57,12 @@ pub(crate) fn toplevel_in_directory(root: &Path) -> Result<Vec<u8>, ProbeError> 
     Probe::new(root, ChildDirectory::Root).run(&["rev-parse", "--show-toplevel"])
 }
 
+/// Check the same repository discovery range without requiring a Git executable.
+pub(crate) fn repository_marker_or_uncertainty_in_directory(root: &Path) -> bool {
+    let probe = Probe::new(root, ChildDirectory::Root);
+    repository_marker_or_uncertainty(root, &DiscoveryLimits::from_command(&probe.command()))
+}
+
 /// A probe run with `root` as the child's working directory; see
 /// [`toplevel_in_directory`].
 pub(crate) fn probe_in_directory(root: &Path, args: &[&str]) -> Result<Vec<u8>, ProbeError> {

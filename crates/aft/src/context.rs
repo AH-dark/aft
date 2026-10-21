@@ -6757,6 +6757,7 @@ impl AppContext {
         &self,
         project_root: &Path,
         requested_path: &str,
+        scan_root_is_protected: impl Fn(&Path) -> bool,
     ) -> Result<PathBuf, crate::readonly_artifacts::GitRootResolutionError> {
         let raw_path = Path::new(requested_path);
         let canonical_requested = if raw_path.is_absolute() {
@@ -6767,6 +6768,9 @@ impl AppContext {
         if let Some(root) = canonical_requested
             .as_deref()
             .and_then(|root| self.borrowed_index_cache.lock().resolved_root(root))
+            // A cached plain root may now be protected by the effective policy.
+            // Re-probe it so Git roots retain their existing authorization path.
+            .filter(|root| !scan_root_is_protected(root))
         {
             return Ok(root);
         }
@@ -6774,6 +6778,7 @@ impl AppContext {
         let root = crate::readonly_artifacts::resolve_git_root_from_user_path(
             project_root,
             requested_path,
+            scan_root_is_protected,
         )?;
         if canonical_requested.as_deref() == Some(root.as_path()) {
             self.borrowed_index_cache
