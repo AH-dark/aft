@@ -709,6 +709,23 @@ impl FamilyStore {
         Ok(super::reclaim::reclaim(&connection, deadline, &|| false)?)
     }
 
+    /// Returns up to `max_pages` free pages whatever their share of the
+    /// file, on the store's own connection, in bounded incremental-vacuum
+    /// steps (never a full `VACUUM`). See
+    /// [`super::reclaim::reclaim_all_free_pages`].
+    pub(crate) fn reclaim_all_free_pages(
+        &self,
+        deadline: Option<std::time::Instant>,
+        max_pages: u64,
+    ) -> StoreResult<super::reclaim::ReclaimReport> {
+        let connection = lock(&self.inner.connection);
+        Ok(super::reclaim::reclaim_all_free_pages(
+            &connection,
+            deadline,
+            max_pages,
+        )?)
+    }
+
     pub fn usage(&self) -> StoreResult<StoreUsage> {
         usage(&self.inner)
     }
@@ -1139,6 +1156,24 @@ impl FamilyStoreReader {
 
     pub fn usage(&self) -> StoreResult<StoreUsage> {
         usage(&self.inner)
+    }
+
+    /// Bytes of the store's database file that hold no data: its free pages,
+    /// plus any tail of the main file past the database's last page, which
+    /// returning free pages leaves in place until a checkpoint cuts it off.
+    /// Reads the database header in one read transaction on the store's own
+    /// connection, and the main file's length.
+    pub(crate) fn unused_file_bytes(&self) -> StoreResult<u64> {
+        let mut connection = lock(&self.inner.connection);
+        let read = connection.transaction()?;
+        let page_size: u64 = read.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let pages: u64 = read.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let free: u64 = read.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+        read.commit()?;
+        let main_file = fs::metadata(&self.inner.path)?.len();
+        Ok(free
+            .saturating_mul(page_size)
+            .saturating_add(main_file.saturating_sub(pages.saturating_mul(page_size))))
     }
 }
 

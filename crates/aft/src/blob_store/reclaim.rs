@@ -34,18 +34,35 @@ impl ReclaimReport {
 #[derive(Clone, Copy)]
 struct Policy {
     min_free_bytes: u64,
+    /// Free pages are returned only when they are at least a fifth of the
+    /// database's pages.
+    min_free_share: bool,
     max_pages: u64,
     step_pages: u64,
+}
+
+impl Policy {
+    /// Whether `free` of the database's `pages` are worth returning.
+    fn eligible(&self, free: u64, pages: u64, page_size: u64) -> bool {
+        free > 0
+            && (!self.min_free_share || free >= pages.div_ceil(5))
+            && free * page_size >= self.min_free_bytes
+    }
 }
 
 // Keep reusable free pages unless at least 20% AND 256 MiB can be returned.
 // At the usual 4 KiB page size a pass moves at most 16 MiB, in 64 KiB steps.
 const POLICY: Policy = Policy {
     min_free_bytes: 256 * 1024 * 1024,
+    min_free_share: true,
     max_pages: 4096,
     step_pages: 16,
 };
 pub(crate) const PASS_BUDGET: Duration = Duration::from_secs(1);
+
+/// Free pages one [`reclaim_all_free_pages`] pass returns at most: 64 MiB at
+/// the usual 4 KiB page size.
+pub(crate) const ALL_FREE_PAGES_MAX_PAGES: u64 = 16_384;
 
 pub(crate) fn reclaim(
     connection: &Connection,
@@ -53,6 +70,29 @@ pub(crate) fn reclaim(
     cancelled: &dyn Fn() -> bool,
 ) -> rusqlite::Result<ReclaimReport> {
     reclaim_with_policy(connection, deadline, cancelled, POLICY)
+}
+
+/// Returns free pages whatever their share of the database or their total
+/// size, at most `max_pages` of them and within the same time budget as
+/// [`reclaim`], in the same small incremental-vacuum steps. For a store
+/// whose free pages alone put it over a disk limit: there, keeping them for
+/// reuse keeps the file over the limit.
+pub(crate) fn reclaim_all_free_pages(
+    connection: &Connection,
+    deadline: Option<Instant>,
+    max_pages: u64,
+) -> rusqlite::Result<ReclaimReport> {
+    reclaim_with_policy(
+        connection,
+        deadline,
+        &|| false,
+        Policy {
+            min_free_bytes: 0,
+            min_free_share: false,
+            max_pages,
+            ..POLICY
+        },
+    )
 }
 
 fn reclaim_with_policy(
@@ -98,7 +138,7 @@ fn reclaim_inner(
         report.legacy_stores = 1;
         return Ok(report);
     }
-    if free == 0 || free < pages.div_ceil(5) || free * page_size < policy.min_free_bytes {
+    if !policy.eligible(free, pages, page_size) {
         return Ok(report);
     }
 
@@ -146,8 +186,7 @@ fn reclaim_inner(
     // Judge what remains against the database's current size: reclaiming pages
     // shrinks the file, so the starting page count understates the free share.
     let remaining_pages: u64 = connection.pragma_query_value(None, "page_count", |r| r.get(0))?;
-    report.deferred |=
-        after >= remaining_pages.div_ceil(5) && after * page_size >= policy.min_free_bytes;
+    report.deferred |= policy.eligible(after, remaining_pages, page_size);
     Ok(report)
 }
 
@@ -176,6 +215,7 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             min_free_bytes: 64 * 1024,
+            min_free_share: true,
             max_pages: 32,
             step_pages: 4,
         }
@@ -211,6 +251,7 @@ mod tests {
                 &|| false,
                 Policy {
                     min_free_bytes: 0,
+                    min_free_share: true,
                     max_pages: 8,
                     step_pages: 4,
                 },
@@ -263,6 +304,35 @@ mod tests {
             c.pragma_query_value(None, "auto_vacuum", |r| r.get::<_, u32>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    /// Free pages below both thresholds (50 of 512 pages, 200 KiB) are
+    /// returned when every free page is asked for, at most `max_pages` per
+    /// pass, with the rest reported as remaining work.
+    #[test]
+    fn all_free_pages_ignore_both_thresholds_and_stop_at_the_cap() {
+        let c = fixture("INCREMENTAL", 50);
+        let free: u64 = c
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .unwrap();
+        assert!(free >= 50, "{free}");
+        let usual = reclaim(&c, None, &|| false).unwrap();
+        assert_eq!((usual.steps, usual.reclaimed_pages), (0, 0));
+
+        let before = pages(&c);
+        let capped = reclaim_all_free_pages(&c, None, 20).unwrap();
+        assert_eq!(capped.reclaimed_pages, 20);
+        assert!(capped.deferred);
+        assert!(before - pages(&c) >= 20 && before - pages(&c) <= 21);
+
+        let rest = reclaim_all_free_pages(&c, None, 10_000).unwrap();
+        assert_eq!(rest.reclaimed_pages, free - 20);
+        assert!(!rest.deferred, "{rest:?}");
+        assert_eq!(
+            c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
         );
     }
 

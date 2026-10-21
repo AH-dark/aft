@@ -685,3 +685,251 @@ fn deleted_keys_match_the_listing_rule_for_the_same_store_state() {
         }
     }
 }
+
+/// Bytes of the store's database pages, free or not, as SQLite counts them
+/// on the store's own connection. It is what the main file shrinks to once
+/// the write-ahead log is checkpointed.
+fn database_bytes(store: &FamilyStore) -> u64 {
+    store.payload_bytes_upper_bound().unwrap()
+}
+
+/// A family whose store is over its soft limit only because of free pages.
+/// A third of the rows are unmarked; a sweep under a payload budget
+/// deletes about half of those, which leaves their pages free inside the
+/// file, far below the share and size at which every sweep returns free
+/// pages, and the soft limit then sits between the family's live bytes
+/// (file bytes minus the store's bytes that hold no data, here its free
+/// pages) and its file bytes. Returns the fixture and the
+/// rows still stored.
+fn free_pages_only_family(storage: &Path, rows: u64) -> (Fixture, Vec<FamilyKey>) {
+    let fixture = build(storage, rows, |index| index % 3 != 0);
+    let unmarked = (0..rows)
+        .filter(|index| index % 3 == 0)
+        .map(|index| chunk_payload(index).len() as u64)
+        .sum::<u64>();
+    let freed = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy {
+            byte_budget: written_payload(rows) - unmarked / 2,
+        },
+        SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    assert!(freed.deleted_blobs > 0, "{freed:?}");
+    assert_eq!(
+        freed.space_reclaim.reclaimed_pages, 0,
+        "the free pages must stay below the usual reclaim thresholds"
+    );
+    let stored = (0..rows)
+        .map(chunk_key)
+        .filter(|key| fixture.store.contains(key).unwrap())
+        .collect::<Vec<_>>();
+    let file = file_bytes(&fixture.registry);
+    let free = freelist_pages(&fixture.store) * PAGE as u64;
+    assert!(free > 64 * PAGE as u64, "{free}");
+    fixture
+        .registry
+        .set_disk_budget(crate::views::eviction::DiskBudget {
+            family_store_soft: file - free / 2,
+            family_store_hard: u64::MAX,
+            ..crate::views::eviction::DiskBudget::default()
+        });
+    (fixture, stored)
+}
+
+/// A family store over its soft limit only because of free pages holds no
+/// row that has to go to meet that limit. One enforcement pass lists and
+/// deletes no row and returns free pages to the filesystem. Before live
+/// bytes decided the limit, every such pass collected every unmarked row,
+/// listing every row to do so, and the free pages stayed in the file.
+#[test]
+fn a_store_over_its_soft_limit_only_by_free_pages_deletes_no_rows_and_shrinks() {
+    let storage = tempfile::tempdir().unwrap();
+    let (fixture, stored) = free_pages_only_family(storage.path(), 3_000);
+    let database_before = database_bytes(&fixture.store);
+    let free_before = freelist_pages(&fixture.store);
+
+    let report = crate::views::eviction::enforce(
+        &fixture.registry,
+        crate::views::eviction::EnforceOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.evicted.is_empty(), "{report:?}");
+    let sweep = report.sweep.as_ref().expect("the family sweep ran");
+    assert_eq!(
+        (sweep.deleted_blobs, sweep.examined_blobs),
+        (0, 0),
+        "a pass over a store whose live bytes fit the soft limit deleted or listed rows: \
+         {report:?}"
+    );
+    let missing = stored
+        .iter()
+        .filter(|key| !fixture.store.contains(key).unwrap())
+        .count();
+    assert_eq!(missing, 0, "rows deleted");
+    let database_after = database_bytes(&fixture.store);
+    let free_after = freelist_pages(&fixture.store);
+    assert!(
+        database_after < database_before && free_after < free_before,
+        "database {database_before} -> {database_after} bytes, free pages {free_before} -> \
+         {free_after}"
+    );
+    // The pages returned are free pages, at most one pass's cap of them;
+    // pointer-map pages, one per few hundred pages, may go with them.
+    let returned = &report.free_page_reclaim;
+    let cap = crate::blob_store::reclaim::ALL_FREE_PAGES_MAX_PAGES;
+    assert!(
+        returned.reclaimed_pages > 0 && returned.reclaimed_pages <= cap,
+        "{returned:?}"
+    );
+    assert_eq!(returned.reclaimed_pages, free_before - free_after);
+    let shrunk_pages = (database_before - database_after) / PAGE as u64;
+    assert!(
+        shrunk_pages >= returned.reclaimed_pages
+            && shrunk_pages <= returned.reclaimed_pages + returned.reclaimed_pages / 200 + 2,
+        "{shrunk_pages} pages shrunk for {returned:?}"
+    );
+}
+
+/// Returning free pages regardless of the usual thresholds reads a number
+/// of the store's pages bounded by the pages it returns, not by the store:
+/// a pass capped at 64 pages over a store of thousands of pages, most of
+/// them in use and the free ones scattered between them, reads at most a
+/// few pages per page it moves, and stops at the cap with the rest left
+/// for later.
+#[test]
+fn returning_free_pages_reads_a_bounded_number_of_pages() {
+    let storage = tempfile::tempdir().unwrap();
+    let (fixture, _) = free_pages_only_family(storage.path(), 3_000);
+    let pages = database_bytes(&fixture.store) / PAGE as u64;
+    let free_before = freelist_pages(&fixture.store);
+    let cap = 64;
+    assert!(
+        free_before > cap && pages > 20 * cap,
+        "{free_before} of {pages}"
+    );
+
+    let probe = ReadProbe::start(&fixture.store);
+    let reclaimed = fixture.store.reclaim_all_free_pages(None, cap).unwrap();
+    let counts = probe.finish();
+
+    assert_eq!(reclaimed.reclaimed_pages, cap, "{reclaimed:?}");
+    assert!(reclaimed.deferred, "free pages remain: {reclaimed:?}");
+    assert_eq!(freelist_pages(&fixture.store), free_before - cap);
+    // Per moved page: the page itself, its pointer-map entry and the page
+    // that points to it; plus the header and free-list trunk pages.
+    let bound = 3 * cap as i32 + 16;
+    eprintln!(
+        "returning {cap} free pages read {} of the store's {pages} pages (bound {bound})",
+        counts.misses
+    );
+    assert!(
+        counts.misses <= bound,
+        "returning {cap} free pages read {} of the store's {pages} pages: {:?}",
+        counts.misses,
+        counts.statements
+    );
+}
+
+/// Measurement receipt for a family store over its soft limit only because
+/// of free pages, on the fixture of [`disk_limit_pass_reads_receipt`]
+/// (`AFT_DISK_PASS_ROWS` overrides its 560,000 rows; nine in ten marked):
+/// a sweep under a payload budget deletes about half the unmarked rows,
+/// which leaves their pages free, and the soft limit is set halfway through
+/// those free pages. Three enforcement passes follow; each prints the store
+/// pages it read, the rows it listed and deleted, and the database and
+/// family file bytes after it.
+///
+/// `cargo test -p agent-file-tools --lib -- --ignored --exact --nocapture
+/// gc::family_read_tests::free_pages_only_pass_receipt` (an optimized test
+/// build: `CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_PROFILE_TEST_OPT_LEVEL=3`).
+#[test]
+#[ignore = "builds a store of several gigabytes; run alone with --ignored --exact --nocapture"]
+fn free_pages_only_pass_receipt() {
+    let rows = std::env::var("AFT_DISK_PASS_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(560_000_u64);
+    let storage = tempfile::tempdir().unwrap();
+    let built = std::time::Instant::now();
+    let fixture = build(storage.path(), rows, |index| index % 10 != 0);
+    // Set up the payload totals first, as the first disk-limit pass over
+    // such a store does, so the passes below measure the steady state.
+    fixture
+        .store
+        .ensure_payload_totals(std::time::Instant::now() + std::time::Duration::from_secs(600))
+        .unwrap();
+    let unmarked = (0..rows)
+        .filter(|index| index % 10 == 0)
+        .map(|index| chunk_payload(index).len() as u64)
+        .sum::<u64>();
+    let freed = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy {
+            byte_budget: written_payload(rows) - unmarked / 2,
+        },
+        SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let file = file_bytes(&fixture.registry);
+    let free = freelist_pages(&fixture.store) * PAGE as u64;
+    let soft = file - free / 2;
+    fixture
+        .registry
+        .set_disk_budget(crate::views::eviction::DiskBudget {
+            family_store_soft: soft,
+            ..crate::views::eviction::DiskBudget::default()
+        });
+    eprintln!(
+        "FREE_PASS fixture rows={rows} built_in_s={:.1} setup_deleted_blobs={} \
+         family_file_bytes={file} database_bytes={} free_page_bytes={free} \
+         live_bytes={} soft_limit={soft}",
+        built.elapsed().as_secs_f64(),
+        freed.deleted_blobs,
+        database_bytes(&fixture.store),
+        file - free,
+    );
+    for pass in 1..=3 {
+        let probe = ReadProbe::start(&fixture.store);
+        let started = std::time::Instant::now();
+        let report = crate::views::eviction::enforce(
+            &fixture.registry,
+            crate::views::eviction::EnforceOptions::default(),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let counts = probe.finish();
+        let mut pages = BTreeMap::<&str, i64>::new();
+        for (sql, (_, misses)) in &counts.statements {
+            *pages.entry(step_of(sql)).or_default() += i64::from(*misses);
+        }
+        let sweep = report.sweep.clone().unwrap_or_default();
+        eprintln!(
+            "FREE_PASS pass={pass} elapsed_ms={} store_pages_read={} store_bytes_read={} \
+             examined_blobs={} deleted_blobs={} deleted_bytes={} sweep_error={:?} \
+             family_file_bytes={} database_bytes={} freelist_pages={}",
+            elapsed.as_millis(),
+            counts.misses,
+            i64::from(counts.misses) * PAGE,
+            sweep.examined_blobs,
+            sweep.deleted_blobs,
+            sweep.deleted_bytes,
+            report.sweep_error,
+            file_bytes(&fixture.registry),
+            database_bytes(&fixture.store),
+            freelist_pages(&fixture.store),
+        );
+        for (step, pages) in &pages {
+            eprintln!(
+                "FREE_PASS pass={pass}   step=\"{step}\" pages={pages} bytes={}",
+                pages * PAGE
+            );
+        }
+    }
+    drop(fixture.view);
+}

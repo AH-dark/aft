@@ -11,8 +11,12 @@
 //! - the **family store**: the shared plane databases, trigram segments and
 //!   the registry under `blobs/v2/<family>/`. Each key and segment lives
 //!   there once however many views use it, so it is counted once. Its limits
-//!   are 3 GiB soft and 4 GiB hard; above the soft limit the family sweep
-//!   collects every unreferenced row and returns the space to the filesystem.
+//!   are 3 GiB soft and 4 GiB hard, on live bytes: file bytes minus the
+//!   bytes inside its databases that hold no data (free pages, and a file
+//!   tail a checkpoint has not cut off yet). When its file bytes are over the soft limit
+//!   it first returns free pages to the filesystem, a bounded number per
+//!   pass; above the soft limit in live bytes the family sweep also collects
+//!   every unreferenced row.
 //!
 //! Nothing that is in use is deleted to meet a number. A view is never
 //! evicted while a process holds a session on it, while any pin or protected
@@ -52,8 +56,9 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// soft limit that starts eviction and a hard limit that stops admission.
 pub const VIEW_STORE_SOFT_BYTES: u64 = 4 * GIB;
 pub const VIEW_STORE_HARD_BYTES: u64 = 6 * GIB;
-/// Family-store limits on physical file bytes (plane databases with their
-/// write-ahead logs, segments and the registry).
+/// Family-store limits on live bytes: the bytes of every file (plane
+/// databases with their write-ahead logs, segments and the registry) minus
+/// the free pages inside the plane databases, which hold no data.
 pub const FAMILY_STORE_SOFT_BYTES: u64 = 3 * GIB;
 pub const FAMILY_STORE_HARD_BYTES: u64 = 4 * GIB;
 /// Payload bytes the family sweep keeps unreferenced rows under while the
@@ -143,7 +148,26 @@ pub struct FamilyStoreUsage {
     /// Bytes of every file under `blobs/v2/<family>/`: plane databases with
     /// their write-ahead logs, segment files and the registry.
     pub file_bytes: u64,
+    /// Bytes of the free pages inside the plane databases, with any tail of
+    /// a main database file past its last page that a checkpoint has not cut
+    /// off yet: part of `file_bytes`, but holding no data. The page counts
+    /// are read on each plane store's own connection and the tail from the
+    /// main file's length, only when a complete walk
+    /// finds `file_bytes` over a family-store limit; below the limits live
+    /// bytes are below them too, so measurement opens no plane store and
+    /// this stays zero.
+    pub free_bytes: u64,
     pub complete: bool,
+}
+
+impl FamilyStoreUsage {
+    /// The bytes the family-store limits are compared with: file bytes minus
+    /// `free_bytes`. Those are not counted because no row has to be
+    /// deleted to give them back; a store over a limit only because of them
+    /// returns them instead (see [`enforce`]).
+    pub fn live_bytes(&self) -> u64 {
+        self.file_bytes.saturating_sub(self.free_bytes)
+    }
 }
 
 /// Disk use of one family, per domain.
@@ -275,6 +299,9 @@ pub struct EnforcementReport {
     /// Candidates the pass looked at and kept, with the reason.
     pub held: Vec<(String, Hold)>,
     pub sweep: Option<FamilySweepReport>,
+    /// Free pages returned before the sweep because the family store's file
+    /// bytes were over its soft limit (see [`enforce`]).
+    pub free_page_reclaim: crate::blob_store::reclaim::ReclaimReport,
     /// Why the family sweep did not run or deleted nothing.
     pub sweep_error: Option<String>,
     /// The named reasons new work would be queued after this pass, if any.
@@ -725,20 +752,97 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
     Ok(usage)
 }
 
-/// Measures the family store by its files alone. It opens no plane store:
-/// admission, the hard limit and the recorded totals read only file bytes,
-/// and a logical payload total would cost one aggregate query per plane on
-/// every pass. Reports that want that total call [`family_payload_bytes`].
+/// Measures the family store by its files. A family whose files are within
+/// every family-store limit opens no plane store: admission, the hard limit
+/// and the recorded totals read only file bytes, and a logical payload total
+/// would cost one aggregate query per plane on every pass. Reports that want
+/// that total call [`family_payload_bytes`]. Only when a complete walk finds
+/// the files over a limit are the plane stores' free pages read, so that the
+/// limit is compared with live bytes.
 fn measure_family_store(
     registry: &FamilyRegistry,
     deadline: Option<Instant>,
 ) -> RegistryResult<FamilyStoreUsage> {
     let (file_bytes, complete) =
         family_file_bytes(registry.storage(), registry.family(), deadline)?;
+    let budget = registry.disk_budget();
+    let lowest_limit = budget.family_store_soft.min(budget.family_store_hard);
+    let free_bytes = if complete && file_bytes > lowest_limit {
+        family_free_page_bytes(registry)
+    } else {
+        0
+    };
     Ok(FamilyStoreUsage {
         file_bytes,
+        free_bytes,
         complete,
     })
+}
+
+/// Bytes of every plane store of the family that hold no data (see
+/// [`FamilyStoreUsage::free_bytes`]): page counts read from the database
+/// header through that store's own connection, which is opened without
+/// creating a store, and the main file's length. A store that cannot be read counts nothing, so its whole file
+/// counts toward the limits.
+fn family_free_page_bytes(registry: &FamilyRegistry) -> u64 {
+    let mut free = 0u64;
+    for plane in FamilyPlane::ALL {
+        let read = FamilyStoreReader::open_existing(registry.storage(), registry.family(), plane)
+            .and_then(|store| store.map(|store| store.unused_file_bytes()).transpose());
+        match read {
+            Ok(bytes) => free = free.saturating_add(bytes.unwrap_or(0)),
+            Err(error) => crate::slog_warn!(
+                "view disk limits family={} plane={} free pages not read: {}",
+                registry.family(),
+                plane.as_str(),
+                error
+            ),
+        }
+    }
+    free
+}
+
+/// Returns free pages of the family's plane stores, at most
+/// [`ALL_FREE_PAGES_MAX_PAGES`](crate::blob_store::reclaim::ALL_FREE_PAGES_MAX_PAGES)
+/// for the whole family in one pass, whatever their share of each file.
+/// Each store is reclaimed through its own connection in bounded
+/// incremental-vacuum steps, never a full `VACUUM`. A store that cannot be
+/// opened or is busy is left for a later pass.
+fn reclaim_family_free_pages(
+    registry: &FamilyRegistry,
+    deadline: Option<Instant>,
+) -> crate::blob_store::reclaim::ReclaimReport {
+    let mut report = crate::blob_store::reclaim::ReclaimReport::default();
+    let access = crate::blob_store::v2::StoreWriteAccess::for_registered_view(
+        registry.storage(),
+        registry.family(),
+    );
+    for plane in FamilyPlane::ALL {
+        let cap = crate::blob_store::reclaim::ALL_FREE_PAGES_MAX_PAGES
+            .saturating_sub(report.reclaimed_pages);
+        if cap == 0 || past(deadline) {
+            report.deferred = true;
+            break;
+        }
+        let exists =
+            crate::blob_store::v2::plane_path(registry.storage(), registry.family(), plane)
+                .is_ok_and(|path| path.is_file());
+        if !exists {
+            continue;
+        }
+        let reclaimed = crate::blob_store::v2::FamilyStore::open(&access, plane)
+            .and_then(|store| store.reclaim_all_free_pages(deadline, cap));
+        match reclaimed {
+            Ok(reclaimed) => report.merge(reclaimed),
+            Err(error) => crate::slog_warn!(
+                "view disk limits family={} plane={} free pages not returned: {}",
+                registry.family(),
+                plane.as_str(),
+                error
+            ),
+        }
+    }
+    report
 }
 
 /// Bytes of every file under `blobs/v2/<family>/`, each file once, and
@@ -970,8 +1074,11 @@ fn remove_pointer(view_dir: &Path) -> std::io::Result<()> {
 
 /// One enforcement pass: finish interrupted evictions, evict views without a
 /// hold (least recently bound first) while the view store is over its soft
+/// limit, return free pages of a family store whose files are over its soft
 /// limit, then sweep the family store so that keys only the evicted views
 /// relied on are reclaimed and the freed space returns to the filesystem.
+/// The sweep collects every unreferenced row only after an eviction or when
+/// the family store's live bytes are over its soft limit.
 pub fn enforce(
     registry: &FamilyRegistry,
     options: EnforceOptions<'_>,
@@ -1023,8 +1130,19 @@ pub fn enforce(
         }
     }
 
+    // Free pages count in the family store's file bytes but hold no row, so
+    // a store over its soft limit in file bytes gives them back first,
+    // whatever their share of the file. Only live bytes then decide whether
+    // rows must be deleted: returning free pages leaves live bytes as they
+    // are, so the measurement taken before it still holds.
+    if before.family_store.file_bytes > budget.family_store_soft
+        && before.family_store.free_bytes > 0
+        && !past(deadline)
+    {
+        report.free_page_reclaim = reclaim_family_free_pages(registry, deadline);
+    }
     let collect_all =
-        !report.evicted.is_empty() || before.family_store.file_bytes > budget.family_store_soft;
+        !report.evicted.is_empty() || before.family_store.live_bytes() > budget.family_store_soft;
     let policy = FamilySweepPolicy {
         byte_budget: if collect_all {
             0
@@ -1069,6 +1187,9 @@ pub struct UsageTotals {
     pub held_view_bytes: u64,
     pub largest_view_bytes: u64,
     pub family_store_file_bytes: u64,
+    /// The part of `family_store_file_bytes` in free pages, zero when the
+    /// measurement did not read them (see [`FamilyStoreUsage::free_bytes`]).
+    pub family_store_free_bytes: u64,
     /// False when the measurement behind these totals could not read every
     /// view or the family store to the end. Recorded totals then hold the
     /// previous value of each part that was not read.
@@ -1082,8 +1203,18 @@ impl From<&DiskUsage> for UsageTotals {
             held_view_bytes: usage.held_view_bytes,
             largest_view_bytes: usage.largest_view(),
             family_store_file_bytes: usage.family_store.file_bytes,
+            family_store_free_bytes: usage.family_store.free_bytes,
             complete: usage.complete,
         }
+    }
+}
+
+impl UsageTotals {
+    /// Family-store bytes the hard limit is compared with; see
+    /// [`FamilyStoreUsage::live_bytes`].
+    pub fn family_store_live_bytes(&self) -> u64 {
+        self.family_store_file_bytes
+            .saturating_sub(self.family_store_free_bytes)
     }
 }
 
@@ -1105,11 +1236,20 @@ fn over_hard(totals: UsageTotals, budget: DiskBudget, reserve: u64) -> Vec<Strin
             }
         ));
     }
-    if totals.family_store_file_bytes > budget.family_store_hard {
+    if totals.family_store_live_bytes() > budget.family_store_hard {
         reasons.push(format!(
             "queued: family store disk: {} bytes in use after collecting unreferenced keys, \
-             hard limit {} bytes",
-            totals.family_store_file_bytes, budget.family_store_hard
+             hard limit {} bytes{}",
+            totals.family_store_live_bytes(),
+            budget.family_store_hard,
+            if totals.family_store_free_bytes > 0 {
+                format!(
+                    ", not counting {} bytes of free pages",
+                    totals.family_store_free_bytes
+                )
+            } else {
+                String::new()
+            }
         ));
     }
     reasons
@@ -1125,6 +1265,10 @@ fn over_hard(totals: UsageTotals, budget: DiskBudget, reserve: u64) -> Vec<Strin
 /// as empty. So a view or a family store measured incompletely keeps its
 /// previous row, and `usage_record.complete` is cleared to say the record
 /// is not one complete measurement.
+///
+/// The free-page bytes of a complete family-store measurement go to
+/// [`FAMILY_FREE_USAGE_SCHEMA`], created only when there are any to record,
+/// so a family that never measured free pages keeps the registry it had.
 fn record_usage(registry: &FamilyRegistry, usage: &DiskUsage) -> RegistryResult<()> {
     let now = crate::pins::now_ms() as i64;
     let views_complete = usage.views_complete();
@@ -1157,6 +1301,21 @@ fn record_usage(registry: &FamilyRegistry, usage: &DiskUsage) -> RegistryResult<
                     now
                 ],
             )?;
+            if usage.family_store.free_bytes > 0 {
+                tx.execute_batch(FAMILY_FREE_USAGE_SCHEMA)?;
+                tx.execute(
+                    "INSERT INTO family_free_usage (singleton, free_bytes, measured_at_ms)
+                     VALUES (1, ?1, ?2)
+                     ON CONFLICT(singleton) DO UPDATE SET free_bytes = excluded.free_bytes,
+                         measured_at_ms = excluded.measured_at_ms",
+                    params![
+                        i64::try_from(usage.family_store.free_bytes).unwrap_or(i64::MAX),
+                        now
+                    ],
+                )?;
+            } else if table_exists(tx, "family_free_usage")? {
+                tx.execute("DELETE FROM family_free_usage", [])?;
+            }
         }
         tx.execute(
             "INSERT INTO usage_record (singleton, complete, measured_at_ms) VALUES (1, ?1, ?2)
@@ -1184,15 +1343,30 @@ pub fn recorded_totals(registry: &FamilyRegistry) -> RegistryResult<Option<Usage
         if !measured {
             return Ok(None);
         }
-        let Some(family_store_file_bytes) = connection
+        let Some((family_store_file_bytes, family_measured_at_ms)) = connection
             .query_row(
-                "SELECT file_bytes FROM family_usage WHERE singleton = 1",
+                "SELECT file_bytes, measured_at_ms FROM family_usage WHERE singleton = 1",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?
         else {
             return Ok(None);
+        };
+        // Free pages count only when recorded by the same measurement as the
+        // file bytes; a release that predates them writes file bytes alone.
+        let family_store_free_bytes = if table_exists(connection, "family_free_usage")? {
+            connection
+                .query_row(
+                    "SELECT free_bytes FROM family_free_usage
+                     WHERE singleton = 1 AND measured_at_ms = ?1",
+                    params![family_measured_at_ms],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+        } else {
+            0
         };
         let (view_store_bytes, held_view_bytes, largest_view_bytes) = connection.query_row(
             "SELECT COALESCE(SUM(usage.bytes), 0),
@@ -1231,9 +1405,32 @@ pub fn recorded_totals(registry: &FamilyRegistry) -> RegistryResult<Option<Usage
             held_view_bytes: held_view_bytes.max(0) as u64,
             largest_view_bytes: largest_view_bytes.max(0) as u64,
             family_store_file_bytes: family_store_file_bytes.max(0) as u64,
+            family_store_free_bytes: family_store_free_bytes.max(0) as u64,
             complete,
         }))
     })
+}
+
+/// Free-page bytes of the family store at the last complete measurement
+/// that read them; see [`FamilyStoreUsage::free_bytes`]. Kept out of the
+/// registry's runtime schema so that it is created only for a family that
+/// was ever measured over a limit.
+const FAMILY_FREE_USAGE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS family_free_usage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    free_bytes INTEGER NOT NULL,
+    measured_at_ms INTEGER NOT NULL
+);";
+
+fn table_exists(connection: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            params![name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Admission of a new view under the family's hard limits, on the path that
@@ -1521,7 +1718,8 @@ fn report_line(family: &str, report: &EnforcementReport) -> String {
     let after_views = report.after.views_complete();
     format!(
         "view disk limits family={} view_store_bytes={}->{} held_bytes={} family_store_bytes={}->{} \
-         evicted={} held={} sweep_deleted_bytes={} sweep_error={} stopped_early={}",
+         evicted={} held={} sweep_deleted_bytes={} sweep_error={} stopped_early={} \
+         free_page_bytes_returned={}",
         family,
         shown_bytes(
             report.before.view_store_bytes,
@@ -1541,7 +1739,8 @@ fn report_line(family: &str, report: &EnforcementReport) -> String {
         report.held.len(),
         report.sweep.as_ref().map_or(0, |sweep| sweep.deleted_bytes),
         report.sweep_error.as_deref().unwrap_or("none"),
-        report.stopped_early
+        report.stopped_early,
+        report.free_page_reclaim.reclaimed_bytes
     )
 }
 
@@ -3322,6 +3521,61 @@ mod tests {
                 assert_eq!(actual, GOLDEN_VALUES);
             }
         }
+    }
+
+    /// The hard limit is compared with live bytes as well: a family whose
+    /// files are over it only because of free pages admits a new view and
+    /// reports nothing over the limit, from the measurement and from the
+    /// totals recorded for admission alike. A hard limit below the live
+    /// bytes still refuses, and the refusal names the free pages it left out.
+    #[test]
+    fn free_pages_do_not_count_toward_the_hard_limit() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = two_view_family(storage.path());
+        let access =
+            crate::blob_store::v2::StoreWriteAccess::for_registered_view(storage.path(), FAMILY);
+        let store =
+            crate::blob_store::v2::FamilyStore::open(&access, FamilyPlane::Trigram).unwrap();
+        // 4 MiB of free pages, made on the store's own connection.
+        crate::blob_store::v2::read_tests::set_pragma(
+            &store,
+            "CREATE TABLE free_fixture (data BLOB);
+             INSERT INTO free_fixture VALUES (zeroblob(4194304));
+             DROP TABLE free_fixture;",
+        );
+        let free = store.reader().unused_file_bytes().unwrap();
+        assert!(free >= 4 * 1024 * 1024, "{free}");
+        let (file, complete) = family_file_bytes(storage.path(), FAMILY, None).unwrap();
+        assert!(complete);
+        let hard = file - free / 2;
+        registry.set_disk_budget(DiskBudget {
+            family_store_soft: u64::MAX,
+            family_store_hard: hard,
+            ..DiskBudget::default()
+        });
+
+        let usage = measure(&registry, None).unwrap();
+        assert!(usage.family_store.file_bytes > hard, "{usage:?}");
+        assert_eq!(usage.family_store.free_bytes, free);
+        assert!(usage.family_store.live_bytes() < hard);
+        let totals = recorded_totals(&registry).unwrap().unwrap();
+        assert_eq!(totals.family_store_free_bytes, free);
+        assert!(over_hard(totals, registry.disk_budget(), 0).is_empty());
+        assert_eq!(admission(&registry), "admitted");
+
+        let live = totals.family_store_live_bytes();
+        registry.set_disk_budget(DiskBudget {
+            family_store_soft: u64::MAX,
+            family_store_hard: live - 1,
+            ..DiskBudget::default()
+        });
+        let refused = admission(&registry);
+        wait_for_background_enforcement(&registry);
+        assert!(
+            refused.starts_with("refused: queued: family store disk")
+                && refused.contains(&format!("not counting {free} bytes of free pages")),
+            "{refused}"
+        );
     }
 
     /// Builds a family of two idle views and returns its registry, so tests
