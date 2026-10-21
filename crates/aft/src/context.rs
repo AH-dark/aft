@@ -6797,6 +6797,13 @@ impl AppContext {
                 .cloned()
             {
                 timings.context_cache_hit = true;
+                // The root-only cache feeds artifact loads and the call-graph
+                // directory. After the storage root changes and changes back,
+                // it may still hold the other root's key, so refresh it on a
+                // hit too. The lock order matches the miss path below.
+                let mut current = self.artifact_cache_keys.lock();
+                current.insert(canonical_root.to_path_buf(), key.clone());
+                current.insert(raw_root.to_path_buf(), key.clone());
                 return Ok(Some(key));
             }
         }

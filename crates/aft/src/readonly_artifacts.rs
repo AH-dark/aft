@@ -1320,6 +1320,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(back_in_a.as_bytes(), path_key.as_bytes());
+        // Artifact loads and the call-graph directory read the root-only
+        // cache, so it must follow the storage root back to A as well.
+        assert_eq!(
+            owner.cached_artifact_cache_key(&root),
+            Some(path_key.clone())
+        );
 
         // A fresh context resolves the same bytes from storage A's record.
         let fresh = borrowed_context(&root, storage_a.path());
