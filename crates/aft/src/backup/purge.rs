@@ -274,6 +274,9 @@ pub struct PurgeReport {
     pub examined: PurgeExamined,
     pub matched: PurgeTotals,
     pub removed: PurgeTotals,
+    /// Paths of fully removed stacks; unlike samples this is not capped.
+    #[serde(default)]
+    pub removed_paths: Vec<String>,
     /// A few matched paths, for the operator to sanity-check the filter.
     pub samples: Vec<String>,
     pub failures: Vec<PurgeFailure>,
@@ -454,6 +457,7 @@ pub fn purge_backups(
                     }
                     if !measure.is_empty() || memory_entries > 0 {
                         removed.add(&session, &measure);
+                        report.removed_paths.push(key.display().to_string());
                     }
                 }
                 Err(failure) => {
@@ -596,6 +600,7 @@ fn purge_session_path_in_memory(
         .filter(|(owner, key)| owner == session && key_matches(key, Some(&target)))
         .collect::<Vec<_>>();
     let mut removed = TotalsBuilder::default();
+    let mut removed_paths = Vec::new();
     for (owner, key) in keys {
         let measure = StackMeasure {
             entries: guard.in_memory_entry_count(&owner, &key),
@@ -603,12 +608,14 @@ fn purge_session_path_in_memory(
         };
         guard.evict_purged_stack(&owner, &key);
         removed.add(&owner, &measure);
+        removed_paths.push(key.display().to_string());
     }
     let removed = removed.finish();
     PurgeReport {
         dry_run: false,
         matched: removed.clone(),
         removed,
+        removed_paths,
         live_stores: 1,
         ..PurgeReport::default()
     }

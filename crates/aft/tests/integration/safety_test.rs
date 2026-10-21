@@ -3072,6 +3072,56 @@ fn purge_of_a_directory_then_of_the_project_root() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn purge_unreadable_checkpoint_session_keeps_undo_history() {
+    let dir = temp_dir("purge_unreadable_checkpoints");
+    let secret = dir.join("secret.env");
+    fs::write(&secret, "saved-secret").unwrap();
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-unreadable-purge");
+    session_snapshot(&mut aft, "s1", &secret, "current-secret");
+    let checkpoint = session_send(
+        &mut aft,
+        "s1",
+        "cp-before-purge",
+        "checkpoint",
+        serde_json::json!({ "name": "saved", "files": [secret] }),
+    );
+    assert_eq!(checkpoint["success"], true, "{checkpoint:?}");
+    let checkpoint_dir = std::path::PathBuf::from(checkpoint["storage_path"].as_str().unwrap());
+    let session_dir = checkpoint_dir.parent().unwrap();
+    let aside = session_dir.with_extension("unreadable-test");
+    fs::rename(session_dir, &aside).unwrap();
+    fs::write(session_dir, "not a readable session directory").unwrap();
+    let purge = session_send(
+        &mut aft,
+        "s1",
+        "purge-unreadable",
+        "safety_purge",
+        serde_json::json!({ "file": secret }),
+    );
+    fs::remove_file(session_dir).unwrap();
+    fs::rename(&aside, session_dir).unwrap();
+    let undo = session_undo_code(&mut aft, "s1", &secret);
+    assert_eq!(
+        undo, "ok",
+        "preflight failure must not destroy undo history; purge={purge:?}"
+    );
+    assert_eq!(purge["success"], false, "{purge:?}");
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "saved-secret");
+    let restored = session_send(
+        &mut aft,
+        "s1",
+        "restore-after-unreadable",
+        "restore_checkpoint",
+        serde_json::json!({ "name": "saved" }),
+    );
+    assert_eq!(restored["success"], true, "{restored:?}");
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "current-secret");
+    assert!(aft.shutdown().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn purge_preview(aft: &mut AftProcess, session: &str, path: &str) -> Vec<String> {
     let response = session_send(
         aft,

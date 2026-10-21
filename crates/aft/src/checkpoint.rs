@@ -77,6 +77,8 @@ pub struct CheckpointPurge {
     /// Checkpoints that may still hold purged content because rewriting or
     /// removing them failed, with the error.
     pub failures: Vec<(String, String)>,
+    /// Original paths whose saved bytes were removed, even if another removal failed.
+    pub paths: Vec<PathBuf>,
 }
 
 /// A stored checkpoint: a snapshot of multiple file contents and metadata.
@@ -84,6 +86,7 @@ pub struct CheckpointPurge {
 struct Checkpoint {
     name: String,
     file_contents: HashMap<PathBuf, CheckpointFile>,
+    pending_purge: Vec<DiskCheckpointFileMeta>,
     created_at: u64,
     /// Nanosecond-resolution creation ordering prevents ties from making
     /// retention nondeterministic when callers create several checkpoints in a second.
@@ -114,9 +117,12 @@ struct DiskCheckpointMeta {
     created_at: u64,
     created_order: u64,
     files: Vec<DiskCheckpointFileMeta>,
+    /// Keep the path-to-blob mapping until unlink succeeds, including across restarts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_purge: Vec<DiskCheckpointFileMeta>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiskCheckpointFileMeta {
     original_path: String,
     blob: String,
@@ -125,7 +131,7 @@ struct DiskCheckpointFileMeta {
     target_is_dir: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum DiskCheckpointFileKind {
     Regular,
@@ -641,6 +647,7 @@ impl CheckpointStore {
         let mut captured_paths = file_contents.keys().cloned().collect::<Vec<_>>();
         captured_paths.sort();
         let checkpoint = Checkpoint {
+            pending_purge: Vec::new(),
             name: name.to_string(),
             file_contents,
             created_at,
@@ -781,17 +788,27 @@ impl CheckpointStore {
                 checkpoints
                     .values()
                     .flat_map(|checkpoint| {
-                        checkpoint.file_contents.keys().map(|path| {
-                            (
-                                checkpoint.name.clone(),
-                                absolute_checkpoint_path(path.clone()),
-                            )
-                        })
+                        checkpoint
+                            .file_contents
+                            .keys()
+                            .map(|path| {
+                                (
+                                    checkpoint.name.clone(),
+                                    absolute_checkpoint_path(path.clone()),
+                                )
+                            })
+                            .chain(checkpoint.pending_purge.iter().map(|file| {
+                                (
+                                    checkpoint.name.clone(),
+                                    absolute_checkpoint_path(PathBuf::from(&file.original_path)),
+                                )
+                            }))
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         paths.sort();
+        paths.dedup();
         Ok(paths)
     }
 
@@ -870,11 +887,42 @@ impl CheckpointStore {
             else {
                 continue;
             };
-            let original = checkpoint.clone();
+            if self.durable_checkpoint_dir(session, &name).is_some() {
+                let (paths, failures) =
+                    self.purge_durable_checkpoint_locked(session, &mut checkpoint, matches);
+                if !paths.is_empty() {
+                    report.pruned.push((name.clone(), paths.len()));
+                    report.paths.extend(paths);
+                }
+                report
+                    .failures
+                    .extend(failures.into_iter().map(|error| (name.clone(), error)));
+                if checkpoint.file_contents.is_empty() && checkpoint.pending_purge.is_empty() {
+                    match self.remove_checkpoint_from_disk_locked(session, &name) {
+                        Ok(()) => {
+                            report.pruned.retain(|(pruned, _)| pruned != &name);
+                            report.dropped.push(name);
+                            continue;
+                        }
+                        Err(error) => report.failures.push((name.clone(), error.to_string())),
+                    }
+                }
+                self.checkpoints
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(name, checkpoint);
+                continue;
+            }
             let before = checkpoint.file_contents.len();
-            checkpoint
-                .file_contents
-                .retain(|path, _| !matches(&absolute_checkpoint_path(path.clone())));
+            checkpoint.file_contents.retain(|path, _| {
+                let absolute = absolute_checkpoint_path(path.clone());
+                if matches(&absolute) {
+                    report.paths.push(absolute);
+                    false
+                } else {
+                    true
+                }
+            });
             let removed = before - checkpoint.file_contents.len();
             if removed == 0 {
                 self.checkpoints
@@ -884,47 +932,119 @@ impl CheckpointStore {
                 continue;
             }
 
-            if !checkpoint.file_contents.is_empty() {
-                if let Some(dir) = self.durable_checkpoint_dir(session, &name) {
-                    self.hydrated_checkpoints
-                        .get_mut()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&dir);
-                }
-                match self.persist_checkpoint_locked(session, &checkpoint) {
-                    Ok(()) => {
-                        self.checkpoints
-                            .entry(session.to_string())
-                            .or_default()
-                            .insert(name.clone(), checkpoint);
-                        report.pruned.push((name, removed));
-                        continue;
-                    }
-                    Err(error) => {
-                        self.checkpoints
-                            .entry(session.to_string())
-                            .or_default()
-                            .insert(name.clone(), original);
-                        report.failures.push((name, error.to_string()));
-                        continue;
-                    }
-                }
-            }
-            match self.remove_checkpoint_from_disk_locked(session, &name) {
-                Ok(()) => report.dropped.push(name),
-                Err(error) => {
-                    self.checkpoints
-                        .entry(session.to_string())
-                        .or_default()
-                        .insert(name.clone(), original);
-                    report.failures.push((name, error.to_string()));
-                }
+            if checkpoint.file_contents.is_empty() {
+                report.dropped.push(name);
+            } else {
+                self.checkpoints
+                    .entry(session.to_string())
+                    .or_default()
+                    .insert(name.clone(), checkpoint);
+                report.pruned.push((name, removed));
             }
         }
         if self.checkpoints.get(session).is_some_and(HashMap::is_empty) {
             self.checkpoints.remove(session);
         }
+        report.paths.sort();
+        report.paths.dedup();
         Ok(report)
+    }
+
+    fn purge_durable_checkpoint_locked(
+        &self,
+        session: &str,
+        checkpoint: &mut Checkpoint,
+        matches: &dyn Fn(&Path) -> bool,
+    ) -> (Vec<PathBuf>, Vec<String>) {
+        let dir = self
+            .durable_checkpoint_dir(session, &checkpoint.name)
+            .unwrap();
+        let meta_path = dir.join("meta.json");
+        let io_error = |error: io::Error| format!("{}: {error}", meta_path.display());
+        let mut meta = match fs::read(&meta_path).and_then(|bytes| {
+            serde_json::from_slice::<DiskCheckpointMeta>(&bytes).map_err(io::Error::other)
+        }) {
+            Ok(meta) => meta,
+            Err(error) => return (Vec::new(), vec![io_error(error)]),
+        };
+        let mut retained = Vec::new();
+        let before = meta.files.len();
+        for file in std::mem::take(&mut meta.files) {
+            if matches(&absolute_checkpoint_path(PathBuf::from(
+                &file.original_path,
+            ))) {
+                meta.pending_purge.push(file);
+            } else {
+                retained.push(file);
+            }
+        }
+        let changed = retained.len() != before;
+        meta.files = retained;
+        // Publish deletion intent before unlinking. Surviving blobs are never
+        // rewritten, so a failed metadata save cannot corrupt the old snapshot.
+        if changed {
+            if let Err(error) = save_checkpoint_meta(&dir, &meta) {
+                return (Vec::new(), vec![io_error(error)]);
+            }
+        }
+        checkpoint.pending_purge = meta.pending_purge.clone();
+        let mut failures = Vec::new();
+        let mut removed = Vec::new();
+        let pending_before = meta.pending_purge.len();
+        meta.pending_purge.retain(|file| {
+            if !matches(&absolute_checkpoint_path(PathBuf::from(
+                &file.original_path,
+            ))) {
+                return true;
+            }
+            let blob = dir.join(&file.blob);
+            let existed = blob.exists();
+            match remove_checkpoint_blob(&blob) {
+                Ok(()) => {
+                    if existed {
+                        removed.push(absolute_checkpoint_path(PathBuf::from(&file.original_path)));
+                    }
+                    false
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "copy of {} remains at {}: {error}",
+                        file.original_path,
+                        blob.display()
+                    ));
+                    true
+                }
+            }
+        });
+        checkpoint.file_contents.retain(|path, _| {
+            !matches(&absolute_checkpoint_path(path.clone()))
+                || meta
+                    .pending_purge
+                    .iter()
+                    .any(|file| Path::new(&file.original_path) == path)
+        });
+        // On a failed cleanup save the durable intent remains. Hydration restores
+        // pending copies only while their blobs still exist; retry tolerates absence.
+        if pending_before != meta.pending_purge.len() {
+            if let Err(error) = save_checkpoint_meta(&dir, &meta) {
+                failures.push(io_error(error));
+            } else {
+                checkpoint.pending_purge = meta.pending_purge.clone();
+            }
+        }
+        let referenced = meta
+            .files
+            .iter()
+            .chain(&meta.pending_purge)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = prune_unreferenced_checkpoint_blobs(&dir, &referenced) {
+            failures.push(format!(
+                "failed to remove leftover blobs in {}: {error}",
+                dir.display()
+            ));
+        }
+        (removed, failures)
     }
 
     /// List all checkpoints for this session with metadata, hydrating from the
@@ -1217,6 +1337,7 @@ impl CheckpointStore {
             created_at: checkpoint.created_at,
             created_order: checkpoint.created_order,
             files,
+            pending_purge: checkpoint.pending_purge.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&meta).map_err(|error| AftError::IoError {
             path: checkpoint_dir.join("meta.json").display().to_string(),
@@ -1605,6 +1726,20 @@ fn read_checkpoint_from_disk(
         });
     }
 
+    let mut referenced = meta
+        .files
+        .iter()
+        .map(|file| file.blob.as_str())
+        .collect::<HashSet<_>>();
+    for file in &meta.pending_purge {
+        if !is_safe_blob_name(&file.blob) || !referenced.insert(&file.blob) {
+            return Err(AftError::IoError {
+                path: meta_path.display().to_string(),
+                message: format!("invalid or shared pending purge blob {}", file.blob),
+            });
+        }
+    }
+
     {
         let cache = store
             .hydrated_checkpoints
@@ -1624,7 +1759,12 @@ fn read_checkpoint_from_disk(
     let mut file_contents = HashMap::with_capacity(meta.files.len());
     let mut versions = Vec::with_capacity(meta.files.len());
     let mut cacheable = cfg!(unix);
-    for file in &meta.files {
+    for (file, pending) in meta
+        .files
+        .iter()
+        .map(|file| (file, false))
+        .chain(meta.pending_purge.iter().map(|file| (file, true)))
+    {
         if !is_safe_blob_name(&file.blob) {
             return Err(AftError::IoError {
                 path: meta_path.display().to_string(),
@@ -1635,10 +1775,16 @@ fn read_checkpoint_from_disk(
         let version = DiskFileVersion::of_path(&blob_path);
         #[cfg(test)]
         store.blob_reads.fetch_add(1, Ordering::Relaxed);
-        let blob = fs::read(&blob_path).map_err(|error| AftError::IoError {
-            path: blob_path.display().to_string(),
-            message: format!("failed to read durable checkpoint blob: {error}"),
-        })?;
+        let blob = match fs::read(&blob_path) {
+            Ok(blob) => blob,
+            Err(error) if pending && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(AftError::IoError {
+                    path: blob_path.display().to_string(),
+                    message: format!("failed to read durable checkpoint blob: {error}"),
+                })
+            }
+        };
         if let Some(version) =
             version.filter(|version| DiskFileVersion::of_path(&blob_path) == Some(*version))
         {
@@ -1666,6 +1812,7 @@ fn read_checkpoint_from_disk(
     let checkpoint = Checkpoint {
         name: meta.name,
         file_contents,
+        pending_purge: meta.pending_purge,
         created_at: meta.created_at,
         created_order: meta.created_order,
     };
@@ -1699,11 +1846,57 @@ fn checkpoint_file_bytes(file: &CheckpointFile) -> Cow<'_, [u8]> {
 thread_local! {
     static CHECKPOINT_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CHECKPOINT_FAIL_METADATA_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CHECKPOINT_FAIL_METADATA_WRITE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static CHECKPOINT_FAIL_METADATA_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CHECKPOINT_FAIL_BLOB_DELETE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn remove_checkpoint_blob(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if CHECKPOINT_FAIL_BLOB_DELETE.with(|fail| {
+        let mut fail = fail.borrow_mut();
+        if fail.as_deref() == Some(path) {
+            fail.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected checkpoint blob deletion failure",
+        ));
+    }
+    remove_file_if_exists(path)
+}
+
+fn save_checkpoint_meta(dir: &Path, meta: &DiskCheckpointMeta) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    write_temp_fsync_rename(dir, "meta.json", &bytes)?;
+    #[cfg(test)]
+    if CHECKPOINT_FAIL_METADATA_SYNC.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other(
+            "injected checkpoint metadata sync failure",
+        ));
+    }
+    fsync_dir(dir)
 }
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Result<()> {
     #[cfg(test)]
-    if final_name == "meta.json" && CHECKPOINT_FAIL_METADATA_WRITE.with(|fail| fail.replace(false))
+    if final_name == "meta.json"
+        && (CHECKPOINT_FAIL_METADATA_WRITE.with(|fail| fail.replace(false))
+            || CHECKPOINT_FAIL_METADATA_WRITE_AFTER.with(|fail| match fail.get() {
+                Some(0) => {
+                    fail.set(None);
+                    true
+                }
+                Some(remaining) => {
+                    fail.set(Some(remaining - 1));
+                    false
+                }
+                None => false,
+            }))
     {
         return Err(io::Error::other(
             "injected checkpoint metadata write failure: disk full",
@@ -1748,7 +1941,9 @@ fn prune_unreferenced_checkpoint_blobs(
             || name.contains(".tmp.")
             || name.ends_with(".tmp")
         {
-            let _ = fs::remove_file(path);
+            remove_checkpoint_blob(&path).map_err(|error| {
+                io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+            })?;
         }
     }
     Ok(())
@@ -2683,6 +2878,7 @@ mod tests {
         // checkpoints. Write only the durable checkpoint here to simulate the
         // process exiting after persistence but before retention eviction.
         let checkpoint = Checkpoint {
+            pending_purge: Vec::new(),
             name: "checkpoint-20".to_string(),
             file_contents: HashMap::from([(path, checkpoint_file("newest"))]),
             created_at: current_timestamp(),
@@ -3157,6 +3353,7 @@ mod tests {
             .insert(
                 "old".to_string(),
                 Checkpoint {
+                    pending_purge: Vec::new(),
                     name: "old".to_string(),
                     file_contents: HashMap::new(),
                     created_at: 1000, // far in the past
@@ -3593,6 +3790,7 @@ mod tests {
         let path_b = nested.clone();
 
         let checkpoint = Checkpoint {
+            pending_purge: Vec::new(),
             name: "dir-cleanup".to_string(),
             file_contents: HashMap::from([
                 (path_a.clone(), checkpoint_file("checkpoint-a")),
@@ -3749,6 +3947,208 @@ mod tests {
             assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
             assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
         }
+    }
+
+    #[test]
+    fn purge_paths_retries_failed_blob_deletion_after_restart() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        let keep = project.path().join("keep.txt");
+        fs::write(&secret, "secret").unwrap();
+        fs::write(&keep, "keep").unwrap();
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "both", vec![secret.clone(), keep.clone()])
+            .unwrap();
+        let directory = store.durable_checkpoint_dir("s1", "both").unwrap();
+        let meta: DiskCheckpointMeta =
+            serde_json::from_slice(&fs::read(directory.join("meta.json")).unwrap()).unwrap();
+        let blob = directory.join(
+            &meta
+                .files
+                .iter()
+                .find(|file| Path::new(&file.original_path) == secret)
+                .unwrap()
+                .blob,
+        );
+        CHECKPOINT_FAIL_BLOB_DELETE.with(|fail| *fail.borrow_mut() = Some(blob.clone()));
+        let report = store.purge_paths("s1", &|path| path == secret).unwrap();
+        assert!(blob.exists());
+        assert_eq!(
+            report.failures.len(),
+            1,
+            "purge must be incomplete while secret bytes remain: {report:?}"
+        );
+        assert!(
+            report.failures[0].1.contains(&secret.display().to_string()),
+            "{report:?}"
+        );
+        assert!(
+            report.failures[0].1.contains(&blob.display().to_string()),
+            "{report:?}"
+        );
+
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        assert!(restarted
+            .session_file_paths("s1")
+            .unwrap()
+            .contains(&("both".into(), secret.clone())));
+        fs::write(&secret, "current-secret").unwrap();
+        fs::write(&keep, "changed").unwrap();
+        restarted.restore("s1", "both").unwrap();
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+        CHECKPOINT_FAIL_BLOB_DELETE.with(|fail| *fail.borrow_mut() = Some(blob.clone()));
+        let still_blocked = restarted.purge_paths("s1", &|path| path == secret).unwrap();
+        assert_eq!(still_blocked.failures.len(), 1, "{still_blocked:?}");
+        assert!(blob.exists());
+        let retry = restarted.purge_paths("s1", &|path| path == secret).unwrap();
+        assert!(retry.failures.is_empty(), "{retry:?}");
+        assert!(!blob.exists());
+        assert_eq!(blob_contents(&directory), vec!["keep"]);
+        fs::write(&keep, "changed-again").unwrap();
+        fresh_checkpoint_store(storage.path())
+            .restore("s1", "both")
+            .unwrap();
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+    }
+
+    #[test]
+    fn purge_paths_metadata_failure_after_restart_preserves_every_blob() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let files = (0..3)
+            .map(|index| {
+                let path = project.path().join(format!("file-{index}"));
+                fs::write(&path, format!("bytes-{index}")).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "three", files.clone())
+            .unwrap();
+        let directory = store.durable_checkpoint_dir("s1", "three").unwrap();
+        let read_meta = || -> DiskCheckpointMeta {
+            serde_json::from_slice(&fs::read(directory.join("meta.json")).unwrap()).unwrap()
+        };
+        let first = PathBuf::from(&read_meta().files[2].original_path);
+        drop(store);
+        let report = fresh_checkpoint_store(storage.path())
+            .purge_paths("s1", &|path| path == first)
+            .unwrap();
+        assert!(report.failures.is_empty(), "{report:?}");
+        let meta = read_meta();
+        let second = PathBuf::from(&meta.files[0].original_path);
+        let before = meta
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.blob.clone(),
+                    fs::read(directory.join(&file.blob)).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let metadata = fs::read(directory.join("meta.json")).unwrap();
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        CHECKPOINT_FAIL_METADATA_WRITE.with(|fail| fail.set(true));
+        let report = restarted.purge_paths("s1", &|path| path == second).unwrap();
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.pruned.is_empty(), "{report:?}");
+        assert_eq!(fs::read(directory.join("meta.json")).unwrap(), metadata);
+        for (blob, bytes) in before {
+            assert_eq!(
+                fs::read(directory.join(&blob)).unwrap(),
+                bytes,
+                "referenced blob {blob} was overwritten"
+            );
+        }
+        for mut recoverable in [restarted, fresh_checkpoint_store(storage.path())] {
+            for path in &files {
+                fs::write(path, "changed").unwrap();
+            }
+            recoverable.restore("s1", "three").unwrap();
+            for (index, path) in files.iter().enumerate() {
+                assert_eq!(
+                    fs::read_to_string(path).unwrap(),
+                    if path == &first {
+                        "changed".to_string()
+                    } else {
+                        format!("bytes-{index}")
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn purge_paths_cleanup_metadata_failure_reports_removed_paths_and_retries() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        let keep = project.path().join("keep.txt");
+        fs::write(&secret, "secret").unwrap();
+        fs::write(&keep, "keep").unwrap();
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "both", vec![secret.clone(), keep.clone()])
+            .unwrap();
+        CHECKPOINT_FAIL_METADATA_WRITE_AFTER.with(|fail| fail.set(Some(1)));
+        let report = store.purge_paths("s1", &|path| path == secret).unwrap();
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert_eq!(report.pruned, vec![("both".to_string(), 1)]);
+        assert_eq!(report.paths, vec![secret.clone()]);
+        let directory = store.durable_checkpoint_dir("s1", "both").unwrap();
+        assert_eq!(blob_contents(&directory), vec!["keep"]);
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        fs::write(&secret, "current-secret").unwrap();
+        fs::write(&keep, "changed").unwrap();
+        restarted.restore("s1", "both").unwrap();
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "current-secret");
+        let retry = restarted.purge_paths("s1", &|path| path == secret).unwrap();
+        assert!(retry.failures.is_empty(), "{retry:?}");
+        assert!(
+            retry.paths.is_empty(),
+            "missing blobs must not be counted twice: {retry:?}"
+        );
+        assert!(!restarted
+            .session_file_paths("s1")
+            .unwrap()
+            .contains(&("both".into(), secret)));
+    }
+
+    #[test]
+    fn purge_paths_intent_sync_failure_keeps_original_restorable() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        let keep = project.path().join("keep.txt");
+        fs::write(&secret, "secret").unwrap();
+        fs::write(&keep, "keep").unwrap();
+        let mut store = fresh_checkpoint_store(storage.path());
+        store
+            .create_for_files("s1", "both", vec![secret.clone(), keep.clone()])
+            .unwrap();
+        CHECKPOINT_FAIL_METADATA_SYNC.with(|fail| fail.set(true));
+        let report = store.purge_paths("s1", &|path| path == secret).unwrap();
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.paths.is_empty(), "{report:?}");
+        assert!(report.failures[0].1.contains("metadata sync failure"));
+        for mut recoverable in [store, fresh_checkpoint_store(storage.path())] {
+            fs::write(&secret, "changed-secret").unwrap();
+            fs::write(&keep, "changed-keep").unwrap();
+            recoverable.restore("s1", "both").unwrap();
+            assert_eq!(fs::read_to_string(&secret).unwrap(), "secret");
+            assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+        }
+        let retry = fresh_checkpoint_store(storage.path())
+            .purge_paths("s1", &|path| path == secret)
+            .unwrap();
+        assert!(retry.failures.is_empty(), "{retry:?}");
+        assert_eq!(retry.paths, vec![secret]);
     }
 
     #[test]

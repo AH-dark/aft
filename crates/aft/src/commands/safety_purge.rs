@@ -7,6 +7,11 @@ use crate::backup::purge::{purge_session_path, session_path_keys, PurgeTarget, S
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_UNDO_PURGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Handle the `safety_purge` command (`aft_safety` op `purge`): permanently
 /// remove the calling session's retained copies of `file`, or of everything
 /// under it when it is a directory, up to the project root itself.
@@ -21,6 +26,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Params: `file` (string, required).
 /// Returns: `{ path, undo_stacks_removed, undo_entries_removed,
+/// undo_paths_removed, checkpoint_paths_removed,
 /// checkpoints_pruned: [{ name, files_removed }], checkpoints_dropped,
 /// failures: [{ target, error }], complete, irreversible }`.
 ///
@@ -127,21 +133,31 @@ fn handle_safety_purge_impl(req: &RawRequest, ctx: &AppContext) -> Result<Respon
     let path = purge_location(req, ctx)?;
     let session = req.session();
 
+    let target = PurgeTarget::new(&path);
+    // Load checkpoints before deleting undo history. A later I/O failure still
+    // produces a partial report, since undo removals cannot be rolled back.
+    let (_, unknown) = classify_checkpoint_copies(req, ctx, &target)?;
     let backups = purge_session_path(ctx.backup(), session, &path, |db_path| {
         ctx.app().db_for_path(db_path)
     })
     .map_err(|message| Response::error(&req.id, "invalid_request", message))?;
 
-    let target = PurgeTarget::new(&path);
-    // Copies whose identity is unknown are read before the purge so the
-    // reply can name the checkpoint that still holds each one.
-    let (_, unknown) = classify_checkpoint_copies(req, ctx, &target)?;
+    #[cfg(test)]
+    AFTER_UNDO_PURGE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+
     let matches = |stored: &Path| target.classify(stored, false) == SavedPathMatch::Selected;
     let checkpoints = ctx
         .checkpoint()
         .lock()
         .purge_paths(session, &matches)
-        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
+        .unwrap_or_else(|error| crate::checkpoint::CheckpointPurge {
+            failures: vec![("session".to_string(), error.to_string())],
+            ..Default::default()
+        });
 
     let mut failures = backups
         .failures
@@ -177,6 +193,8 @@ fn handle_safety_purge_impl(req: &RawRequest, ctx: &AppContext) -> Result<Respon
             "path": path.display().to_string(),
             "undo_stacks_removed": backups.removed.stacks,
             "undo_entries_removed": backups.removed.entries,
+            "undo_paths_removed": backups.removed_paths,
+            "checkpoint_paths_removed": checkpoints.paths,
             "checkpoints_pruned": checkpoints
                 .pruned
                 .iter()
@@ -188,4 +206,88 @@ fn handle_safety_purge_impl(req: &RawRequest, ctx: &AppContext) -> Result<Respon
             "irreversible": true,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::language::StubProvider;
+    use std::fs;
+
+    #[test]
+    fn safety_purge_late_checkpoint_failure_reports_undo_removals() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let secret = project.path().join("secret.env");
+        fs::write(&secret, "saved-secret").unwrap();
+        let ctx = AppContext::new(
+            Box::new(StubProvider),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "late-purge", "command": "safety_purge", "session_id": "s1", "file": secret,
+        }))
+        .unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot_with_op("s1", &secret, "fixture", Some("op"))
+            .unwrap();
+        let checkpoint = ctx
+            .checkpoint()
+            .lock()
+            .create_for_files("s1", "saved", vec![secret.clone()])
+            .unwrap();
+        let session_dir = checkpoint
+            .storage_path
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let aside = session_dir.with_extension("unreadable-test");
+        let hook_session = session_dir.clone();
+        let hook_aside = aside.clone();
+        AFTER_UNDO_PURGE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_session, &hook_aside).unwrap();
+                fs::write(&hook_session, "not a directory").unwrap();
+            }))
+        });
+        let response = serde_json::to_value(handle_safety_purge(&req, &ctx)).unwrap();
+        fs::remove_file(&session_dir).unwrap();
+        fs::rename(&aside, &session_dir).unwrap();
+        assert_eq!(
+            response["success"], true,
+            "late failure must be a partial result: {response}"
+        );
+        assert_eq!(response["complete"], false, "{response}");
+        assert_eq!(response["undo_stacks_removed"], 1, "{response}");
+        assert_eq!(response["undo_entries_removed"], 1, "{response}");
+        assert_eq!(
+            response["undo_paths_removed"],
+            json!([secret]),
+            "{response}"
+        );
+        assert_eq!(
+            response["checkpoint_paths_removed"],
+            json!([]),
+            "{response}"
+        );
+        assert!(
+            response["failures"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("failed to read durable checkpoint session"),
+            "{response}"
+        );
+        assert!(ctx.backup().lock().history("s1", &secret).is_empty());
+        fs::write(&secret, "changed").unwrap();
+        ctx.checkpoint().lock().restore("s1", "saved").unwrap();
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "saved-secret");
+    }
 }
