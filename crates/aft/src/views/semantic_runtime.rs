@@ -197,18 +197,22 @@ impl CheckoutSemantic {
     /// `wake` is told about AFT writes under `root`; pass `Weak::new()` when
     /// nothing needs waking.
     pub fn new(
-        storage: &Path,
+        storage: &crate::root_cache::StoragePaths,
         family: &str,
         scope: &str,
         root: &Path,
         producer: SemanticProducer,
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
-        let base_ref_prototype = base_ref_selected(storage);
-        let plane = shared_plane(storage, producer);
-        let registry = FamilyRegistry::open(storage, family).map_err(|error| error.to_string())?;
+        // The harness writes its marker into the storage directory it
+        // configures, which stays the durable root when `storage.cache_dir`
+        // moves the view registry onto another volume.
+        let base_ref_prototype = base_ref_selected(&storage.durable);
+        let plane = shared_plane(&storage.artifacts, producer);
+        let registry =
+            FamilyRegistry::open(&storage.artifacts, family).map_err(|error| error.to_string())?;
         let owner = registry
-            .register_view(scope, root)
+            .register_view_with_storage(&storage.durable, scope, root)
             .map_err(|error| error.to_string())?;
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
@@ -1045,7 +1049,7 @@ impl CheckoutSemanticSlot {
 /// Everything the fill worker needs besides the slot.
 pub(crate) struct WorkerConfig {
     pub root: PathBuf,
-    pub storage: PathBuf,
+    pub storage: crate::root_cache::StoragePaths,
     pub family: String,
     pub scope: String,
     pub semantic: crate::config::SemanticBackendConfig,

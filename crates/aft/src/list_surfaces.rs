@@ -565,8 +565,26 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal corpus census, not a paginated findings list; an incomplete walk reports a named gap, marks scope_files_complete false, and renders the count as a lower bound",
     },
     ExclusionEntry {
+        file: "root_cache.rs",
+        enclosing_item: "sweep_all_read_markers_pinned, sweep_marker_generation, read_marker_protection, marker_file_is_protected",
+        location_or_primitive: "shared repair traversal budget and read-marker byte limit",
+        reason: "internal marker liveness and cleanup, not result lists; incomplete or oversized marker reads protect the cache rather than authorize deletion",
+    },
+    ExclusionEntry {
+        file: "bash_background/persistence.rs",
+        enclosing_item: "RepairBudget, unix_names, repair_names, repair_identities, repair_measure, repair_remove_contents, windows_repair_names, repair_descendant, repair_validate_descendants",
+        location_or_primitive: "repair traversal depth, entry and deadline bounds",
+        reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
+    },
+    ExclusionEntry {
+        file: "cache_location.rs",
+        enclosing_item: "candidates_and_durable, deletion_protections, ensure_cache_idle",
+        location_or_primitive: "RepairBudget",
+        reason: "internal cleanup preflight, not result lists; exhausting the traversal budget refuses all deletion rather than accepting incomplete protection or lock inventories",
+    },
+    ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, write_retirement_witness, verify_retirement_witness",
         location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
         reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed, remaining vanished views and stopped-early counts",
     },

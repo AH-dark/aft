@@ -234,6 +234,68 @@ describe("loadAftConfig", () => {
     expect(JSON.parse(loaded.stdout).format_on_edit).toBe(true);
     expect(loaded.stderr).toContain("Discarded invalid configuration section: inspect");
   });
+
+  test("unrelated unknown user keys retain warning and partial-load behavior", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        format_on_edit: true,
+        future_feature: true,
+        harnesses: { pi: { future_option: true } },
+      }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).format_on_edit).toBe(true);
+    expect(result.stderr).toContain("validation error");
+  });
+
+  test("cache-location load failures still relay the native path and raw tiers", () => {
+    for (const failure of ["number", "missing", "unparseable", "unreadable"]) {
+      const fixture = createConfigFixture();
+      const raw = failure === "number" ? '{"storage":{"cache_dir":123}}' : "{";
+      if (failure === "unreadable") mkdirSync(fixture.userConfigPath);
+      else if (failure !== "missing") writeFileSync(fixture.userConfigPath, raw);
+      const result = spawnConfigLoader(
+        fixture.projectDirectory,
+        { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome },
+        `
+        import { loadAftConfig, buildConfigTierConfigureParams } from "./src/config.ts";
+        const merged = loadAftConfig(process.env.PROJECT_DIR!);
+        console.log(JSON.stringify({merged, params:buildConfigTierConfigureParams(process.env.PROJECT_DIR!)}));
+      `,
+      );
+      expect(result.status).toBe(0);
+      const value = JSON.parse(result.stdout);
+      expect(value.merged.storage).toBeUndefined();
+      expect(value.params.cortexkit_user_config_path).toBe(fixture.userConfigPath);
+      if (failure === "number" || failure === "unparseable")
+        expect(value.params.config[0].doc).toBe(raw);
+      else expect(value.params.config).toEqual([]);
+    }
+  });
+
+  test("rejects user cache-location typos before partial or harness parsing", () => {
+    for (const user of [
+      { storge: { cache_dir: "/cache" } },
+      { storage: { cachedir: "/cache" } },
+      { harnesses: { future: { storge: { cache_dir: "/cache" } } } },
+      { harnesses: { future: { storage: { cachedir: "/cache" } } } },
+    ]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, JSON.stringify(user));
+      const result = spawnConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("invalid_cache_config: unknown field");
+    }
+  });
+
   test("legacy user override cannot relocate a project config file", () => {
     const fixture = createConfigFixture();
     const directory = join(fixture.projectDirectory, ".opencode");

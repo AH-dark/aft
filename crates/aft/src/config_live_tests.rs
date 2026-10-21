@@ -324,6 +324,55 @@ fn deleted_config_file_keeps_the_last_good_config() {
         other => panic!("expected the last good config to stay, got {other:?}"),
     }
     assert!(fixture.ctx.config().restrict_to_project_root);
+    assert!(fixture
+        .ctx
+        .cache_unavailable_reason()
+        .is_some_and(|reason| reason.contains("cache_dir_config_unknown")));
+}
+
+#[test]
+fn invalid_user_config_live_disables_caches_without_changing_security_floor() {
+    for unreadable in [false, true] {
+        let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
+        assert!(fixture.ctx.cache_unavailable_reason().is_none());
+        if unreadable {
+            std::fs::remove_file(&fixture.user_path).unwrap();
+            std::fs::create_dir(&fixture.user_path).unwrap();
+        } else {
+            write(&fixture.user_path, "{");
+        }
+        assert!(matches!(fixture.reload(), ReloadOutcome::Kept { .. }));
+        assert!(fixture.ctx.config().restrict_to_project_root);
+        assert!(fixture
+            .ctx
+            .cache_unavailable_reason()
+            .is_some_and(|reason| reason.contains("cache_dir_config_unknown")));
+        if unreadable {
+            std::fs::remove_dir(&fixture.user_path).unwrap();
+        }
+        write(&fixture.user_path, r#"{"restrict_to_project_root":true}"#);
+        assert_eq!(fixture.reload(), ReloadOutcome::Unchanged);
+        assert!(fixture.ctx.config().cache_config_unknown.is_none());
+        assert!(fixture.ctx.cache_unavailable_reason().is_none());
+    }
+}
+
+#[test]
+fn invalid_unrelated_user_edit_live_keeps_caches_on() {
+    let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
+    write(
+        &fixture.user_path,
+        r#"{"restrict_to_project_root":true,"semantic":{"backend":"openai-compatible"}}"#,
+    );
+    // The invalid edit is still rejected as a whole, but it does not hide
+    // where caches belong, so caches stay on.
+    assert!(matches!(fixture.reload(), ReloadOutcome::Kept { .. }));
+    assert!(fixture.ctx.config().restrict_to_project_root);
+    assert!(
+        fixture.ctx.cache_unavailable_reason().is_none(),
+        "{:?}",
+        fixture.ctx.cache_unavailable_reason()
+    );
 }
 
 #[test]

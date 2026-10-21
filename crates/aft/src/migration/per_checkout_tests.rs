@@ -223,7 +223,9 @@ fn semantic_import_keeps_the_first_vector_payload_and_imports_other_keys() {
     let (bundle, _) = convert_semantic(&snapshot, &root, &producer).unwrap();
     assert!(bundle.entries.len() >= 2);
     let registry = FamilyRegistry::open(&storage, "family").unwrap();
-    let registration = registry.register_view("scope", &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(registry.storage(), "scope", &root)
+        .unwrap();
     let store = registration.open_store(FamilyPlane::Semantic).unwrap();
     let first = &bundle.entries[0];
     let relative = segment_store::rel_path_to_os(&first.rel_path).unwrap();
@@ -257,6 +259,7 @@ fn semantic_import_keeps_the_first_vector_payload_and_imports_other_keys() {
     fs::write(&legacy, &snapshot).unwrap();
     let report = run_import(
         &ImportRequest {
+            durable_storage: storage.clone(),
             storage: storage.clone(),
             family: "family".into(),
             legacy_key: "legacy".into(),
@@ -313,7 +316,9 @@ fn semantic_import_rejects_only_the_unusable_key() {
         let (bundle, _) = convert_semantic(&snapshot, &root, &producer).unwrap();
         assert!(bundle.entries.len() >= 2);
         let registry = FamilyRegistry::open(&storage, "family").unwrap();
-        let registration = registry.register_view("scope", &root).unwrap();
+        let registration = registry
+            .register_view_with_storage(registry.storage(), "scope", &root)
+            .unwrap();
         let store = registration.open_store(FamilyPlane::Semantic).unwrap();
         let first = &bundle.entries[0];
         let key = FamilyKey::new(FamilyPlane::Semantic, first.key);
@@ -329,6 +334,7 @@ fn semantic_import_rejects_only_the_unusable_key() {
         fs::write(&legacy, snapshot).unwrap();
         let report = run_import(
             &ImportRequest {
+                durable_storage: storage.clone(),
                 storage: storage.clone(),
                 family: "family".into(),
                 legacy_key: "legacy".into(),
@@ -532,6 +538,7 @@ fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
     ];
     let producer = producer();
     let request = ImportRequest {
+        durable_storage: storage.clone(),
         storage: storage.clone(),
         family: key.to_owned(),
         legacy_key: key.to_owned(),
@@ -562,7 +569,9 @@ fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
         snapshot_tree(&storage.join("views").join("v2")),
         snapshot_tree(&storage.join("migration")),
     ];
-    crate::search_index::sweep_orphaned_index_dirs(&storage);
+    crate::search_index::sweep_orphaned_index_dirs(&crate::root_cache::StoragePaths::same(
+        &storage,
+    ));
     let _ = crate::artifact_owner::sweep_orphaned_owner_manifests(&storage);
     let old_view = crate::views::ViewStore::open(&storage, "scope").unwrap();
     old_view.sweep_generations().unwrap();

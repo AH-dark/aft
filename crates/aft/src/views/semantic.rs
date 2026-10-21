@@ -2115,7 +2115,9 @@ mod tests {
     impl Checkout {
         fn open(storage: &Path, scope: &str, root: &Path, plane: &Arc<SemanticPlane>) -> Self {
             let registry = FamilyRegistry::open(storage, "family").unwrap();
-            let owner = registry.register_view(scope, root).unwrap();
+            let owner = registry
+                .register_view_with_storage(registry.storage(), scope, root)
+                .unwrap();
             let composite: Arc<dyn CompositePlane> = plane.clone();
             let adapter: Arc<dyn PlaneAdapter> = plane.clone();
             let driver = Arc::new(

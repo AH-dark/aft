@@ -2360,6 +2360,9 @@ pub(crate) fn ripgrep_glob(
 }
 
 fn current_index_status(ctx: &AppContext) -> IndexStatus {
+    if ctx.cache_unavailable_reason().is_some() {
+        return IndexStatus::Fallback;
+    }
     let Some(search_index) =
         try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
     else {

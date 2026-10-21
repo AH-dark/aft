@@ -152,7 +152,9 @@ fn bench_health_rollup_steps() {
         let registry = crate::views::registry::FamilyRegistry::open(&storage, &family).unwrap();
         for view in 0..10 {
             let scope = format!("bench-{i}-{view}");
-            let registration = registry.register_view(&scope, root.as_path()).unwrap();
+            let registration = registry
+                .register_view_with_storage(&storage, &scope, root.as_path())
+                .unwrap();
             let mut status =
                 crate::path_status::PathStatusStore::open(registration.view_dir()).unwrap();
             status.mark_pending(b"src/a.rs", "bench", 1).unwrap();

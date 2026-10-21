@@ -46,8 +46,8 @@ use crate::blob_store::v2::{family_dir, FamilyPlane, FamilyStoreReader};
 use crate::gc::family::{self, FamilySweepPolicy, FamilySweepReport, SweepBounds};
 
 use super::registry::{
-    has_live_session, remove_view_dir, FamilyRegistry, MemberRecord, RegistryError, RegistryResult,
-    STATE_EVICTING,
+    has_live_session, remove_view_dir_with, FamilyRegistry, MemberRecord, RegistryError,
+    RegistryResult, STATE_EVICTING,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1027,19 +1027,25 @@ pub fn evict_view(
             )?;
             return Ok(EvictionOutcome::Held(Hold::OpenInProcess));
         }
-        if let Err(error) = remove_pointer(&current.view_dir) {
-            tx.execute(
-                "UPDATE members SET state = 'active' WHERE scope = ?1",
-                params![scope],
-            )?;
-            return Ok(EvictionOutcome::Held(Hold::Uncertain(format!(
-                "pointer not removable: {error}"
-            ))));
-        }
-        if let Some(observer) = observer {
-            observer.reached(EvictionStep::PointerRemoved);
-        }
-        if let Err(error) = remove_view_dir(&current.view_dir) {
+        let mut pointer_removed = false;
+        let removal = remove_view_dir_with(&current.view_dir, |directory| {
+            remove_pointer(directory)?;
+            pointer_removed = true;
+            if let Some(observer) = observer {
+                observer.reached(EvictionStep::PointerRemoved);
+            }
+            Ok(())
+        });
+        if let Err(error) = removal {
+            if !pointer_removed {
+                tx.execute(
+                    "UPDATE members SET state = 'active' WHERE scope = ?1",
+                    params![scope],
+                )?;
+                return Ok(EvictionOutcome::Held(Hold::Uncertain(format!(
+                    "pointer not removable: {error}"
+                ))));
+            }
             // The pointer is gone, so the view publishes nothing; leave the
             // member `evicting` for the next pass or registration to finish.
             return Ok(EvictionOutcome::Incomplete(error.to_string()));
@@ -1058,18 +1064,45 @@ fn member_in(tx: &rusqlite::Connection, scope: &str) -> RegistryResult<Option<Me
 }
 
 /// Deletes the pointer database set of a view directory, main file first.
-fn remove_pointer(view_dir: &Path) -> std::io::Result<()> {
-    let pointer = view_dir.join(super::POINTER_DATABASE);
+fn remove_pointer(
+    view_dir: &crate::bash_background::persistence::PinnedDir,
+) -> std::io::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
-        let mut name = pointer.as_os_str().to_owned();
-        name.push(suffix);
-        match fs::remove_file(PathBuf::from(name)) {
+        let name = std::ffi::OsString::from(format!("{}{suffix}", super::POINTER_DATABASE));
+        match view_dir.repair_remove_file(&name) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pointer_removal_cannot_follow_a_retargeted_view_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("views");
+    let view = parent.join("scope");
+    fs::create_dir_all(&view).unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(outside.join("scope")).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{suffix}", super::POINTER_DATABASE);
+        fs::write(view.join(&name), "own").unwrap();
+        fs::write(outside.join("scope").join(name), "precious").unwrap();
+    }
+    let pinned = crate::bash_background::persistence::PinnedDir::open(&view).unwrap();
+    fs::rename(&parent, temp.path().join("parked")).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+    remove_pointer(&pinned).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{suffix}", super::POINTER_DATABASE);
+        assert_eq!(
+            fs::read_to_string(outside.join("scope").join(name)).unwrap(),
+            "precious"
+        );
+    }
 }
 
 /// One enforcement pass: finish interrupted evictions, evict views without a
@@ -1859,7 +1892,7 @@ mod tests {
             let root = storage.path().join(format!("checkout-{index}"));
             fs::create_dir(&root).unwrap();
             let view = registry
-                .register_view(&format!("view-{index}"), &root)
+                .register_view_with_storage(storage.path(), &format!("view-{index}"), &root)
                 .unwrap();
             fs::write(view.view_dir().join("derived-owner.sqlite"), vec![0; 8192]).unwrap();
             fs::create_dir_all(view.view_dir().join("readers/current")).unwrap();
@@ -1912,7 +1945,9 @@ mod tests {
             let scope = format!("view-{index}");
             let root = storage.path().join(&scope);
             fs::create_dir(&root).unwrap();
-            let view = registry.register_view(&scope, &root).unwrap();
+            let view = registry
+                .register_view_with_storage(storage.path(), &scope, &root)
+                .unwrap();
             fs::write(view.view_dir().join("derived-owner.sqlite"), vec![0; 8192]).unwrap();
             fs::create_dir_all(view.view_dir().join("readers/current")).unwrap();
             fs::write(view.view_dir().join("progress.marker"), b"reader").unwrap();
@@ -2312,7 +2347,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir(&root).unwrap();
-        let view = registry.register_view("active", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(storage.path(), "active", &root)
+            .unwrap();
         publish(&view, &[("file.txt", text(1, 2_000))], 4);
         for plane in [FamilyPlane::Semantic, FamilyPlane::Callgraph] {
             view.open_store(plane)
@@ -2337,7 +2374,9 @@ mod tests {
             let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
             let root = storage.path().join("root");
             fs::create_dir(&root).unwrap();
-            let view = registry.register_view("active", &root).unwrap();
+            let view = registry
+                .register_view_with_storage(storage.path(), "active", &root)
+                .unwrap();
             let content = text(1, 2_000);
             publish(&view, &[("file.txt", content.clone())], 4);
             let protected = trigram_key(&content);
@@ -2384,7 +2423,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir(&root).unwrap();
-        let view = registry.register_view("active", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(storage.path(), "active", &root)
+            .unwrap();
         let store = view.open_store(FamilyPlane::Semantic).unwrap();
         let oldest = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
         let newest = FamilyKey::new(FamilyPlane::Semantic, [2; 32]);
@@ -2409,7 +2450,9 @@ mod tests {
     fn idle_view(registry: &FamilyRegistry, scope: &str, seed: u64, derived_kib: usize) {
         let root = registry.storage().join("roots").join(scope);
         fs::create_dir_all(&root).unwrap();
-        let view = registry.register_view(scope, &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), scope, &root)
+            .unwrap();
         publish(&view, &[("file.txt", text(seed, 2_000))], derived_kib);
     }
 
@@ -2447,7 +2490,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root-active");
         fs::create_dir_all(&root).unwrap();
-        let active = registry.register_view("active", &root).unwrap();
+        let active = registry
+            .register_view_with_storage(registry.storage(), "active", &root)
+            .unwrap();
         publish(&active, &[("file.txt", text(1, 2_000))], 64);
         idle_view(&registry, "idle", 2, 64);
         set_last_bind(&registry, "active", 1);
@@ -2482,7 +2527,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        let view = registry.register_view("pinned", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "pinned", &root)
+            .unwrap();
         let old = publish(&view, &[("file.txt", text(1, 2_000))], 32);
         let current = publish(&view, &[("file.txt", text(2, 2_000))], 32);
         assert_ne!(old, current);
@@ -2515,7 +2562,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        let assembling = registry.register_view("assembling", &root).unwrap();
+        let assembling = registry
+            .register_view_with_storage(registry.storage(), "assembling", &root)
+            .unwrap();
         publish(&assembling, &[("file.txt", text(1, 2_000))], 16);
         let assembly = AssemblyPin::create_v2(&assembling, "next-generation", &[]).unwrap();
         drop(assembling);
@@ -2555,7 +2604,9 @@ mod tests {
         for (seed, scope) in ["a", "b"].into_iter().enumerate() {
             let root = storage.path().join(scope);
             fs::create_dir_all(&root).unwrap();
-            let view = registry.register_view(scope, &root).unwrap();
+            let view = registry
+                .register_view_with_storage(registry.storage(), scope, &root)
+                .unwrap();
             publish(&view, &[("file.txt", text(seed as u64, 2_000))], 64);
             sessions.push(view);
         }
@@ -2567,7 +2618,9 @@ mod tests {
         let new_root = storage.path().join("c");
         fs::create_dir_all(&new_root).unwrap();
 
-        let refused = registry.register_view("c", &new_root).unwrap_err();
+        let refused = registry
+            .register_view_with_storage(registry.storage(), "c", &new_root)
+            .unwrap_err();
 
         let RegistryError::AdmissionQueued(reason) = &refused else {
             panic!("unexpected error: {refused}");
@@ -2583,7 +2636,7 @@ mod tests {
             "the background pass deleted nothing held"
         );
         let rebound = registry
-            .register_view("a", &storage.path().join("a"))
+            .register_view_with_storage(registry.storage(), "a", &storage.path().join("a"))
             .expect("an existing view re-binds over the limit");
         drop(rebound);
 
@@ -2592,12 +2645,14 @@ mod tests {
         // The last record still shows b held, so this attempt is refused
         // too, and its background pass now finds b idle and evicts it.
         assert!(matches!(
-            registry.register_view("c", &new_root),
+            registry.register_view_with_storage(registry.storage(), "c", &new_root),
             Err(RegistryError::AdmissionQueued(_))
         ));
         wait_for_background_enforcement(&registry);
         assert!(!registered(&registry, "b"), "b was evicted to admit c");
-        let admitted = registry.register_view("c", &new_root).unwrap();
+        let admitted = registry
+            .register_view_with_storage(registry.storage(), "c", &new_root)
+            .unwrap();
         assert!(registered(&registry, "c"));
         drop(admitted);
     }
@@ -2618,14 +2673,22 @@ mod tests {
 
         let before = walks();
         let admitted = registry
-            .register_view("admitted", &storage.path().join("admitted"))
+            .register_view_with_storage(
+                registry.storage(),
+                "admitted",
+                &storage.path().join("admitted"),
+            )
             .unwrap();
         assert_eq!(walks(), before, "admitting walked a directory");
 
         registry.set_disk_budget(budget(0, usage.largest_view() * 3));
         let before = walks();
         let refused = registry
-            .register_view("refused", &storage.path().join("refused"))
+            .register_view_with_storage(
+                registry.storage(),
+                "refused",
+                &storage.path().join("refused"),
+            )
             .unwrap_err();
         assert_eq!(walks(), before, "refusing walked a directory");
         assert!(
@@ -2650,7 +2713,11 @@ mod tests {
             "the background pass evicted every idle view"
         );
         let retried = registry
-            .register_view("refused", &storage.path().join("refused"))
+            .register_view_with_storage(
+                registry.storage(),
+                "refused",
+                &storage.path().join("refused"),
+            )
             .expect("admitted after the background pass");
         drop(retried);
         drop(admitted);
@@ -2671,13 +2738,17 @@ mod tests {
         let root_b = storage.path().join("b");
         fs::create_dir_all(&root_a).unwrap();
         fs::create_dir_all(&root_b).unwrap();
-        let a = registry.register_view("a", &root_a).unwrap();
+        let a = registry
+            .register_view_with_storage(registry.storage(), "a", &root_a)
+            .unwrap();
         publish(
             &a,
             &[("shared.txt", shared.clone()), ("a.txt", only_a.clone())],
             16,
         );
-        let b = registry.register_view("b", &root_b).unwrap();
+        let b = registry
+            .register_view_with_storage(registry.storage(), "b", &root_b)
+            .unwrap();
         publish(
             &b,
             &[("shared.txt", shared.clone()), ("b.txt", only_b.clone())],
@@ -2766,12 +2837,20 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            remove_pointer(&member.view_dir).unwrap();
+            remove_pointer(
+                &crate::bash_background::persistence::PinnedDir::repair_open_path(&member.view_dir)
+                    .unwrap(),
+            )
+            .unwrap();
             assert!(registry.member(scope).unwrap().unwrap().evicting);
         }
         let rebind_dir = registry.member("rebind").unwrap().unwrap().view_dir;
         let rebound = registry
-            .register_view("rebind", &storage.path().join("roots").join("rebind"))
+            .register_view_with_storage(
+                registry.storage(),
+                "rebind",
+                &storage.path().join("roots").join("rebind"),
+            )
             .unwrap();
         let leftovers = fs::read_dir(&rebind_dir)
             .unwrap()
@@ -2842,7 +2921,9 @@ mod tests {
     /// Registers and loads `scope` with the real trigram and callgraph
     /// planes, observes it, and drops every handle, which ends its session.
     fn load_and_observe(registry: &FamilyRegistry, scope: &str, root: &Path) -> PlaneObservation {
-        let owner = registry.register_view(scope, root).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), scope, root)
+            .unwrap();
         let trigram = Arc::new(TrigramBridge::new(
             registry.storage().to_path_buf(),
             policy(),
@@ -2921,7 +3002,9 @@ mod tests {
         write_tree(&root_a, "a");
         write_tree(&root_b, "b");
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        let b_session = registry.register_view("b", &root_b).unwrap();
+        let b_session = registry
+            .register_view_with_storage(registry.storage(), "b", &root_b)
+            .unwrap();
         load_and_observe(&registry, "b", &root_b);
         let first = load_and_observe(&registry, "a", &root_a);
         registry.set_disk_budget(budget(0, u64::MAX));
@@ -2989,7 +3072,7 @@ mod tests {
         root: &Path,
     ) -> crate::views::semantic_runtime::CheckoutSemantic {
         let runtime = crate::views::semantic_runtime::CheckoutSemantic::new(
-            storage,
+            &crate::root_cache::StoragePaths::same(storage),
             FAMILY,
             scope,
             root,
@@ -3065,7 +3148,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("removed-root");
         fs::create_dir_all(&root).unwrap();
-        let view = registry.register_view("removed", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "removed", &root)
+            .unwrap();
         let generation = publish(&view, &[("file.txt", text(5, 2_000))], 16);
         let view_dir = view.view_dir().to_path_buf();
         drop(view);
@@ -3132,7 +3217,11 @@ mod tests {
         for scope in ["main", "feature", "review"] {
             let root = roots.path().join(scope);
             write_tree(&root, scope);
-            sessions.push(registry.register_view(scope, &root).unwrap());
+            sessions.push(
+                registry
+                    .register_view_with_storage(registry.storage(), scope, &root)
+                    .unwrap(),
+            );
             load_and_observe(&registry, scope, &root);
         }
         let usage = measure(&registry, None).unwrap();
@@ -3451,7 +3540,9 @@ mod tests {
         let new_root = storage.path().join("c");
         fs::create_dir_all(&new_root).unwrap();
 
-        let refused = registry.register_view("c", &new_root).unwrap_err();
+        let refused = registry
+            .register_view_with_storage(registry.storage(), "c", &new_root)
+            .unwrap_err();
 
         wait_for_background_enforcement(&registry);
         let RegistryError::AdmissionQueued(reason) = &refused else {

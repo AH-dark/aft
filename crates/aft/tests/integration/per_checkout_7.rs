@@ -142,6 +142,7 @@ fn write_legacy_set(storage: &Path, root: &Path, key: &str, max_file_size: u64) 
 fn full_request(storage: &Path, root: &Path) -> ImportRequest {
     let producer = producer();
     ImportRequest {
+        durable_storage: storage.to_path_buf(),
         storage: storage.to_path_buf(),
         family: KEY.to_owned(),
         legacy_key: KEY.to_owned(),
@@ -161,6 +162,7 @@ fn full_request(storage: &Path, root: &Path) -> ImportRequest {
 fn lane_request(storage: &Path, root: &Path, key: &str) -> ImportRequest {
     let producer = producer();
     ImportRequest {
+        durable_storage: storage.to_path_buf(),
         storage: storage.to_path_buf(),
         family: key.to_owned(),
         legacy_key: key.to_owned(),
@@ -230,7 +232,11 @@ fn assert_same(
 fn current_generation(storage: &Path, root: &Path) -> Option<String> {
     FamilyRegistry::open(storage, KEY)
         .unwrap()
-        .register_view(SCOPE, root)
+        .register_view_with_storage(
+            FamilyRegistry::open(storage, KEY).unwrap().storage(),
+            SCOPE,
+            root,
+        )
         .unwrap()
         .view_store()
         .unwrap()
@@ -602,7 +608,11 @@ fn an_incompatible_cache_is_rebuilt_not_relabelled() {
     assert!(trigram.is_none_or(|store| store.usage().unwrap().rows == 0));
     let registration = FamilyRegistry::open(&storage, KEY)
         .unwrap()
-        .register_view(SCOPE, &root)
+        .register_view_with_storage(
+            FamilyRegistry::open(&storage, KEY).unwrap().storage(),
+            SCOPE,
+            &root,
+        )
         .unwrap();
     let store = registration.view_store().unwrap();
     let manifest = store
@@ -660,7 +670,15 @@ fn result_rows(root: &Path, results: &[aft::semantic_index::SemanticResult]) -> 
 /// Loads and fills the production semantic lane runtime for `root`, and
 /// returns how many texts it embedded and its answer to `query`.
 fn lane_fill(storage: &Path, root: &Path, key: &str, query: &str) -> (usize, Vec<Row>) {
-    let lane = CheckoutSemantic::new(storage, key, SCOPE, root, producer(), Weak::new()).unwrap();
+    let lane = CheckoutSemantic::new(
+        &aft::root_cache::StoragePaths::same(storage),
+        key,
+        SCOPE,
+        root,
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
     lane.load().unwrap();
     let mut embedded = 0;
     let mut counting = |texts: Vec<String>| {

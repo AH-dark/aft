@@ -2333,6 +2333,9 @@ impl SearchIndex {
     /// a reload would read it rather than rebuild. Reads a few header bytes
     /// only; it does not load or verify postings.
     pub(crate) fn disk_cache_header_valid(cache_dir: &Path) -> bool {
+        if crate::root_cache::check_cache_access(cache_dir).is_err() {
+            return false;
+        }
         (|| -> Option<bool> {
             let cache_file = open_cache_file_read(&cache_dir.join("cache.bin")).ok()?;
             if cache_file.metadata().ok()?.len() < 16 {
@@ -2469,6 +2472,7 @@ impl SearchIndex {
         ignore_rules_load_policy: IgnoreRulesLoadPolicy,
         borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
     ) -> Option<(Self, bool)> {
+        crate::root_cache::check_cache_access(cache_dir).ok()?;
         debug_assert!(current_canonical_root.is_absolute());
         // A newer build's cache is refused by name before its payload is read;
         // callers see a miss, and every write path refuses to replace it.
@@ -4933,6 +4937,10 @@ impl PartialOrd for HeapItem {
 type RefreshReadProbe = (Arc<AtomicUsize>, Arc<AtomicBool>);
 #[cfg(test)]
 static REFRESH_READ_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, RefreshReadProbe>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static FAIL_STREAMING_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn note_refresh_read_for_test(root: &Path) {
@@ -4960,6 +4968,10 @@ fn build_streaming_index(
         crate::cold_build_limiter::progress::StartLog::Info,
     );
     crate::cold_build_limiter::progress::phase("enumerating", None);
+    #[cfg(test)]
+    if FAIL_STREAMING_BUILD.replace(false) {
+        return Err(std::io::Error::other("injected streaming cache failure"));
+    }
     crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -8270,9 +8282,9 @@ fn artifact_key_looks_valid(key: &str) -> bool {
 // Retained for isolated cache-lock fixtures; production eviction is scheduled
 // through storage_retention rather than inferring abandonment from payload age.
 #[cfg(test)]
-pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
-    let index_root = storage_root.join("index");
-    let referenced_keys = match referenced_artifact_cache_keys(storage_root) {
+pub(crate) fn sweep_orphaned_index_dirs(storage_root: &crate::root_cache::StoragePaths) {
+    let index_root = storage_root.artifacts.join("index");
+    let referenced_keys = match referenced_artifact_cache_keys(&storage_root.durable) {
         Ok(keys) => keys,
         Err(error) => {
             crate::slog_warn!(
@@ -10543,15 +10555,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let blocked = cache.path().join("not-a-directory");
-        fs::write(&blocked, "blocks streaming cache creation").unwrap();
         fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
+        // A malformed cache path is rejected at admission, before streaming.
+        // Fail after admission so this still exercises cancellation in fallback.
+        FAIL_STREAMING_BUILD.set(true);
         let probes = AtomicUsize::new(0);
         let (result, events) = crate::logging::capture_index_events(|| {
             SearchIndex::build_with_limit_to_cache_dir_cancellable(
                 &root,
                 1024 * 1024,
-                &blocked,
+                cache.path(),
                 &|| probes.fetch_add(1, Ordering::SeqCst) < 2,
             )
         });
@@ -13663,7 +13676,7 @@ mod tests {
         );
         write_cache_key_memo(storage.path(), &memo);
 
-        sweep_orphaned_index_dirs(storage.path());
+        sweep_orphaned_index_dirs(&crate::root_cache::StoragePaths::same(storage.path()));
 
         assert!(
             !aged_orphan.exists(),

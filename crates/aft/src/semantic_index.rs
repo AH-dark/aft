@@ -2953,7 +2953,10 @@ impl SemanticEmbeddingModel {
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
                 SemanticEmbeddingEngine::Local(LocalEmbeddingEngine::new(
-                    Box::new(LocalEmbedder::new(&model)?),
+                    Box::new(LocalEmbedder::with_cache_dir(
+                        &model,
+                        config.local_cache_dir.as_deref(),
+                    )?),
                     Arc::clone(&query_embedding_cache),
                 )?)
             }
@@ -8870,6 +8873,7 @@ impl SemanticIndex {
         expected_fingerprint: Option<&str>,
     ) -> Option<Self> {
         debug_assert!(current_canonical_root.is_absolute());
+        crate::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
         crate::private_storage::tighten_open_dir(
             storage_dir,
             &storage_dir.join("semantic").join(project_key),
@@ -9064,6 +9068,7 @@ impl SemanticIndex {
         project_key: &str,
         current_canonical_root: &Path,
     ) -> Option<Self> {
+        crate::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
         let data_path = storage_dir
             .join("semantic")
             .join(project_key)

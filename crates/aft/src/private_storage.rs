@@ -11,6 +11,12 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 pub(crate) const FILE_MODE: u32 = 0o600;
 
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+        access.directory(true)?;
+        return Ok(());
+    }
+    crate::root_cache::refuse_new_durable_cache_entry(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -22,6 +28,12 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
+    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+        let (parent, name) = access.parent()?;
+        let child = parent.repair_create_dir(&name)?;
+        return child.repair_check_boundary(&access.root, &[]);
+    }
+    crate::root_cache::refuse_new_durable_cache_entry(path)?;
     #[allow(unused_mut)]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -55,6 +67,16 @@ pub(crate) fn executable_options() -> OpenOptions {
 }
 
 pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+        let (parent, name) = access.parent()?;
+        let mut file = parent.repair_create_file(&name)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(DIR_MODE))?;
+        }
+        return file.write_all(contents);
+    }
     executable_options()
         .write(true)
         .create(true)
@@ -64,6 +86,11 @@ pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 pub fn create(path: impl AsRef<Path>) -> io::Result<File> {
+    if let Some(access) = crate::root_cache::pin_cache_path(path.as_ref())? {
+        let (parent, name) = access.parent()?;
+        return parent.repair_create_file(&name);
+    }
+    crate::root_cache::refuse_new_durable_cache_entry(path.as_ref())?;
     options().write(true).create(true).truncate(true).open(path)
 }
 
@@ -74,6 +101,13 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<(
 /// std::fs::copy copies source permissions too, which would expose snapshots of
 /// public files. Stream into an owner-only destination instead on Unix.
 pub(crate) fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
+    if let Some(access) = crate::root_cache::pin_cache_path(to.as_ref())? {
+        let (parent, name) = access.parent()?;
+        return io::copy(
+            &mut File::open(from)?,
+            &mut parent.repair_create_file(&name)?,
+        );
+    }
     #[cfg(unix)]
     {
         io::copy(&mut File::open(from)?, &mut create(to)?)
@@ -218,6 +252,49 @@ fn warn_once(path: &Path, error: &io::Error) {
 /// SQLite derives WAL/SHM modes from the database. Reserve the database before
 /// SQLite's first writable open, but never create a file for a read-only open.
 pub(crate) fn prepare_sqlite(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Result<()> {
+    let access = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY) {
+        None
+    } else {
+        crate::root_cache::pin_cache_path(path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+    };
+    if let Some(access) = access {
+        let result = (|| -> io::Result<()> {
+            access.root.repair_validate_descendants(&access.relative)?;
+            let (parent, name) = access.parent()?;
+            let file = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_CREATE) {
+                match parent.repair_new_file(&name) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        parent.repair_read_file(&name)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                parent.repair_read_file(&name)?
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if file.metadata()?.permissions().mode() & 0o077 != 0 {
+                    file.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = file;
+            Ok(())
+        })();
+        return result.map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+    }
+    crate::root_cache::check_cache_access(path)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if flags.intersects(
+        rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    ) && !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY)
+    {
+        crate::root_cache::refuse_durable_cache_write(path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
     #[cfg(unix)]
     if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY)
         && !path.as_os_str().is_empty()

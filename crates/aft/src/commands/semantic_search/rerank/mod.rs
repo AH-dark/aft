@@ -448,6 +448,9 @@ pub(crate) fn rerank_block_zero(
 /// The backend this search may use, read from the context's slot without I/O
 /// and without waiting. Tests may install one for their own thread instead.
 pub(crate) fn installed_backend(ctx: &crate::context::AppContext) -> slot::Installed {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return slot::Installed::NotReady(format!("cache_dir_unavailable: {reason}"));
+    }
     #[cfg(test)]
     if let Some(selected) = tests::test_backend_override() {
         return slot::Installed::Ready(selected);

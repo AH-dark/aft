@@ -798,6 +798,7 @@ impl ViewStore {
     /// A view directory that already has a pointer database, without creating
     /// or initializing anything. Registry readers use this.
     pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
+        crate::root_cache::check_cache_access(&view_dir).ok()?;
         crate::private_storage::tighten_open_dir(view_storage_root(&view_dir), &view_dir);
         view_dir
             .join(POINTER_DATABASE)

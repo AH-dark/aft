@@ -828,7 +828,7 @@ pub(crate) fn callgraph_unavailable_aggregate_for_job(job: &InspectJob) -> serde
         Some("call graph is disabled (indexes.callgraph=false)")
     } else if job.config.views.enabled
         && crate::views::read::current_generation_lacks_callgraph(
-            &crate::bash_background::storage_dir(job.config.storage_dir.as_deref()),
+            &crate::root_cache::cache_root(&job.config),
             &job.project_root,
         )
     {

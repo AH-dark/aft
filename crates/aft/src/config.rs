@@ -262,6 +262,9 @@ impl SemanticBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticBackendConfig {
+    /// Runtime-only local model location selected with the artifact root.
+    #[serde(skip)]
+    pub local_cache_dir: Option<PathBuf>,
     pub backend: SemanticBackend,
     pub model: String,
     pub base_url: Option<String>,
@@ -333,6 +336,7 @@ impl SemanticBackendConfig {
 impl Default for SemanticBackendConfig {
     fn default() -> Self {
         Self {
+            local_cache_dir: None,
             backend: SemanticBackend::Fastembed,
             model: DEFAULT_SEMANTIC_MODEL.to_string(),
             base_url: None,
@@ -649,6 +653,11 @@ pub struct SearchConfig {
 }
 
 impl Config {
+    /// Optional artifact location for APIs that keep disk persistence opt-in.
+    pub fn cache_storage_dir(&self) -> Option<PathBuf> {
+        (self.cache_dir.is_some() || self.storage_dir.is_some())
+            .then(|| crate::root_cache::cache_root(self))
+    }
     pub fn semantic_backend_label(&self) -> &'static str {
         self.semantic.backend.as_str()
     }
@@ -796,6 +805,27 @@ impl Default for BashConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.
+    #[serde(skip_deserializing)]
+    pub cache_dir: Option<PathBuf>,
+    /// Runtime validation failure; a configured unavailable root never falls back.
+    #[serde(skip_deserializing)]
+    pub cache_unavailable: Option<String>,
+    /// The user document could not establish whether a cache volume was selected.
+    #[serde(skip)]
+    pub cache_config_unknown: Option<String>,
+    /// The user config sets `storage.cache_dir` to null: caches deliberately
+    /// return to the storage root even if it earlier used a cache directory.
+    #[serde(skip)]
+    pub cache_dir_opt_out: bool,
+    /// Runtime cache-volume transition identity, used to retire old handles.
+    #[serde(skip_deserializing)]
+    pub cache_epoch: u64,
+    #[serde(skip)]
+    pub cache_lease: Option<std::sync::Arc<crate::root_cache::CacheLease>>,
+    /// A trusted process lease, never accepted from configuration or tool input.
+    #[serde(skip)]
+    pub storage_lease: Option<std::sync::Arc<crate::root_cache::ProcessStorageLease>>,
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
     /// Legacy serialized setting (default: 1); validation does not consume it.
@@ -948,6 +978,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            cache_dir: None,
+            cache_unavailable: None,
+            cache_config_unknown: None,
+            cache_dir_opt_out: false,
+            cache_epoch: 0,
+            cache_lease: None,
+            storage_lease: None,
             project_root: None,
             validation_depth: 1,
             checkpoint_ttl_hours: 24,

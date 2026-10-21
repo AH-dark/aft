@@ -3045,12 +3045,14 @@ fn build_health_diagnostic_rollup_from_actors(
                     }),
             );
         }
-        crate::storage_retention::schedule(
-            ctx.storage_dir(),
-            ctx.subc_lifecycle_admission(),
-            ctx.configure_generation_flag(),
-            ctx.configure_generation(),
-        );
+        if ctx.cache_unavailable_reason().is_none() {
+            crate::storage_retention::schedule(
+                ctx.storage_paths(),
+                ctx.subc_lifecycle_admission(),
+                ctx.configure_generation_flag(),
+                ctx.configure_generation(),
+            );
+        }
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -3318,6 +3320,20 @@ fn build_health_diagnostic_rollup_from_actors(
         )
     });
     rollup_mark!(timer, "process memory snapshots");
+    let cache_roots = lifecycle_contexts
+        .iter()
+        .map(|ctx| ctx.cache_dir())
+        .collect::<std::collections::BTreeSet<_>>();
+    let cache_unavailable = lifecycle_contexts
+        .iter()
+        .filter(|ctx| ctx.cache_unavailable_reason().is_some())
+        .map(|ctx| {
+            (
+                ctx.cache_dir(),
+                crate::root_cache::unavailable_code(&ctx.cache_unavailable_reason().unwrap()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let measured_census = census_snapshot.map(|census_snapshot| {
         #[cfg(test)]
         cache.census_builds.fetch_add(1, Ordering::Relaxed);
@@ -3330,6 +3346,8 @@ fn build_health_diagnostic_rollup_from_actors(
             &census_snapshot,
             census_rows,
         );
+        memory_census["cache_roots"] = json!(cache_roots);
+        memory_census["cache_unavailable"] = json!(cache_unavailable);
         if let Some(rows) = memory_census
             .get_mut("roots")
             .and_then(Value::as_object_mut)
@@ -3365,7 +3383,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let storage_retention = lifecycle_contexts
         .iter()
         .filter_map(|ctx| {
-            let storage = ctx.storage_dir();
+            let storage = ctx.cache_dir();
             crate::storage_retention::snapshot(&storage)
                 .map(|report| (storage.display().to_string(), report))
         })
@@ -3375,6 +3393,8 @@ fn build_health_diagnostic_rollup_from_actors(
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
     rollup_mark!(timer, "bash retention database count");
     let mut metrics = json!({
+        "cache_roots": cache_roots,
+        "cache_unavailable": cache_unavailable,
         "actor_count": actor_count,
         "root_count": root_count,
         "warming_roots": warming_roots,
@@ -8383,6 +8403,7 @@ fn standing_root_health_value(
 
 fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthSnapshot {
     RootHealthSnapshot {
+        cache_unavailable_reason: None,
         project_root: entry.root_id.as_ref().map_or_else(
             || entry.literal_path.clone(),
             |root_id| root_id.as_path().display().to_string(),

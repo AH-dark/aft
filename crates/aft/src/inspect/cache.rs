@@ -576,6 +576,7 @@ pub trait InspectCacheRead {
 impl InspectCache {
     pub fn open(inspect_dir: PathBuf, project_root: PathBuf) -> Result<Self, InspectCacheError> {
         let writer_deadline = crate::fs_lock::acquisition_now() + INSPECT_WRITER_LEASE_TIMEOUT;
+        crate::root_cache::check_cache_access(&inspect_dir)?;
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let project_inspect_dir = project_inspect_dir(inspect_dir.clone(), &project_key);
         let writer_lease = match acquire_writer_lease(
@@ -653,6 +654,7 @@ impl InspectCache {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyInspectCache>, InspectCacheError> {
+        crate::root_cache::check_cache_access(&inspect_dir)?;
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
         crate::private_storage::tighten_keyed_dir(&inspect_dir, "inspect");

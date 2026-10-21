@@ -998,6 +998,9 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
 #[test]
 fn invalid_backend_configuration_fails_build_with_a_reason() {
     let inputs = |rerank: RerankConfig| slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(rerank),
         },
@@ -1035,6 +1038,9 @@ fn invalid_backend_configuration_fails_build_with_a_reason() {
 
 fn onnx_inputs(model: Option<&str>) -> slot::BuildInputs {
     slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Onnx),
@@ -1091,6 +1097,9 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
         })
     };
     let mut all_inputs = vec![slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig::default(),
         semantic: Default::default(),
         under_subc: false,
@@ -1103,6 +1112,9 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
     ] {
         for under_subc in [false, true] {
             all_inputs.push(slot::BuildInputs {
+                cache_unavailable: false,
+                cache_lease: None,
+                cache_epoch: 0,
                 search: SearchConfig {
                     rerank: Some(RerankConfig {
                         backend: Some(backend),
@@ -1730,6 +1742,9 @@ fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
     let (endpoint, server) =
         remote::tests::serve(r#"[{"index":0,"score":0.7}]"#, 200, Duration::ZERO);
     let inputs = slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Remote),
@@ -1790,6 +1805,9 @@ fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
         true,
     );
     let inputs = slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Synapse),
@@ -1886,4 +1904,61 @@ fn blocked_synapse_connect_never_delays_searches_reading_not_ready() {
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], "models.list");
+}
+
+#[test]
+fn cache_root_unavailable_reranker_never_activates() {
+    let mut inputs = onnx_inputs(None);
+    inputs.cache_unavailable = true;
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&builds);
+    let slot = slot::BackendSlot::with_constructor(Arc::new(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }));
+    assert!(matches!(slot.read(inputs.clone()), slot::Installed::Off));
+    assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(slot::build_backend(&inputs)
+        .err()
+        .unwrap()
+        .contains("cache_dir_unavailable"));
+}
+
+#[test]
+fn cache_root_onnx_factory_passes_configured_model_cache_to_provisioner() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("volume");
+    std::fs::create_dir(&parent).unwrap();
+    let parent = std::fs::canonicalize(parent).unwrap();
+    let model = onnx::ALLOWED_MODELS.last().unwrap().name;
+    let mut config = crate::config::Config {
+        storage_dir: Some(temp.path().join("storage")),
+        cache_dir: Some(parent.clone()),
+        ..Default::default()
+    };
+    config.search.rerank = Some(crate::config::RerankConfig {
+        backend: Some(crate::config::RerankBackendKind::Onnx),
+        model: Some(model.to_string()),
+        ..Default::default()
+    });
+    assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+    let inputs = slot::BuildInputs::from_config(&config, false);
+    let (result, observed) = onnx::with_provision_probe(model, || slot::build_backend(&inputs));
+    assert!(result.err().unwrap().contains("provision path observed"));
+    assert_eq!(observed, vec![parent.join("aft/semantic/models")]);
+    assert!(!temp.path().join("storage/semantic").exists());
+}
+
+#[test]
+fn cache_root_onnx_backends_do_not_share_across_cache_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first-model-cache");
+    let second = temp.path().join("second-model-cache");
+    let one = onnx::shared_onnx_reranker_in(None, Some(first.clone()), None).unwrap();
+    let same = onnx::shared_onnx_reranker_in(None, Some(first.clone()), None).unwrap();
+    let other = onnx::shared_onnx_reranker_in(None, Some(second.clone()), None).unwrap();
+    assert!(Arc::ptr_eq(&one, &same));
+    assert!(!Arc::ptr_eq(&one, &other));
+    assert!(!first.exists());
+    assert!(!second.exists());
 }

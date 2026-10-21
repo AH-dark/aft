@@ -122,7 +122,7 @@ fn lane_paused_view_fingerprint_waits_before_checkout_preparation() {
             let (epoch, wake) = slot.begin();
             let config = WorkerConfig {
                 root: root.path().to_path_buf(),
-                storage: storage.path().to_path_buf(),
+                storage: crate::root_cache::StoragePaths::same(storage.path()),
                 family: "family".into(),
                 scope: "paused-fingerprint".into(),
                 semantic: semantic.clone(),
@@ -446,7 +446,7 @@ fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
         std::thread::spawn(move || {
             let config = WorkerConfig {
                 root: root.clone(),
-                storage,
+                storage: crate::root_cache::StoragePaths::same(&storage),
                 family: "family".into(),
                 scope: "paused-activation".into(),
                 semantic: crate::config::SemanticBackendConfig::default(),
@@ -547,7 +547,7 @@ fn idle_eviction_releases_the_lane_and_trims_only_its_own_runs() {
     let (epoch, wake) = slot.begin();
     let runtime = Arc::new(
         CheckoutSemantic::new(
-            storage.path(),
+            &crate::root_cache::StoragePaths::same(storage.path()),
             "family",
             "idle-evicted",
             evicted_root.path(),
@@ -750,8 +750,15 @@ fn producer() -> SemanticProducer {
 }
 
 fn open(storage: &Path, scope: &str, root: &Path) -> CheckoutSemantic {
-    let runtime =
-        CheckoutSemantic::new(storage, "family", scope, root, producer(), Weak::new()).unwrap();
+    let runtime = CheckoutSemantic::new(
+        &crate::root_cache::StoragePaths::same(storage),
+        "family",
+        scope,
+        root,
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
     runtime.driver().register_write_intent();
     runtime.load().unwrap();
     runtime
@@ -3289,7 +3296,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     let mut model = crate::semantic_index::EmbeddingModel::from_config(&semantic).unwrap();
     let fingerprint = model.fingerprint(&semantic).unwrap();
     let seed = CheckoutSemantic::new(
-        storage.path(),
+        &crate::root_cache::StoragePaths::same(storage.path()),
         "family",
         "scope",
         root.path(),
@@ -3312,7 +3319,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     let drivers = InstalledDriver::default();
     let config = WorkerConfig {
         root: root.path().to_path_buf(),
-        storage: storage.path().to_path_buf(),
+        storage: crate::root_cache::StoragePaths::same(storage.path()),
         family: "family".into(),
         scope: "scope".into(),
         semantic: backend.config(),
@@ -3397,7 +3404,7 @@ fn permanent_fingerprint_failure_does_not_retry() {
     let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled));
     let config = WorkerConfig {
         root: root.path().to_path_buf(),
-        storage: storage.path().to_path_buf(),
+        storage: crate::root_cache::StoragePaths::same(storage.path()),
         family: "family".into(),
         scope: "scope".into(),
         semantic: backend.config(),
@@ -3775,7 +3782,7 @@ fn served_lane(
     let (epoch, wake) = slot.begin();
     let runtime = Arc::new(
         CheckoutSemantic::new(
-            storage,
+            &crate::root_cache::StoragePaths::same(storage),
             "family",
             "scope",
             root,
@@ -3968,7 +3975,7 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
     write_tree(root.path(), FILES);
     let lane = |model: &str, slot: &Arc<CheckoutSemanticSlot>, epoch: u64| {
         let runtime = CheckoutSemantic::new(
-            storage.path(),
+            &crate::root_cache::StoragePaths::same(storage.path()),
             "family",
             "scope",
             root.path(),
@@ -4007,7 +4014,9 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
         "{error}"
     );
     let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
-    let view = registry.register_view("scope", root.path()).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope", root.path())
+        .unwrap();
     let store = view.view_store().unwrap();
     let current = store.current_generation().unwrap().unwrap();
     let manifest = store.load_manifest_v2(&current).unwrap();
@@ -4029,7 +4038,7 @@ fn aft_writes_wake_only_their_own_lane() {
     let slot = Arc::new(CheckoutSemanticSlot::default());
     let (epoch, wake) = slot.begin();
     let runtime = CheckoutSemantic::new(
-        storage.path(),
+        &crate::root_cache::StoragePaths::same(storage.path()),
         "family",
         "scope",
         &root_path,

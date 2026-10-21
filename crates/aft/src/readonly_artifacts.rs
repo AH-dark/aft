@@ -355,6 +355,11 @@ pub(crate) fn open_search_index_cancellable(
     duration: Duration,
     keep_going: &dyn Fn() -> bool,
 ) -> ReadOnlyArtifact<SearchIndex> {
+    if crate::root_cache::check_cache_access(&cache_dir).is_err() {
+        return ReadOnlyArtifact::Degraded(ReadOnlyDegradation {
+            reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
+        });
+    }
     #[cfg(test)]
     let probe = BORROWED_SEARCH_LOAD_PROBES
         .lock()
@@ -484,6 +489,11 @@ fn open_semantic_index_from_location(
     data_path: PathBuf,
     project_key: &str,
 ) -> ReadOnlyArtifact<SemanticIndex> {
+    if crate::root_cache::check_cache_access(&data_path).is_err() {
+        return ReadOnlyArtifact::Degraded(ReadOnlyDegradation {
+            reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
+        });
+    }
     let Some(storage_dir) = storage_dir else {
         return ReadOnlyArtifact::Absent;
     };
@@ -668,6 +678,54 @@ mod tests {
         assert!(!base.path().join("launched").exists());
     }
 
+    #[test]
+    fn borrow_only_checkout_opens_owner_artifacts_from_cache_root() {
+        let (_repo, root) = fixture_project();
+        let (_checkout, checkout) = linked_worktree(&root);
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            project_root: Some(checkout.clone()),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let artifact_root = crate::root_cache::cache_root(&config);
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        build_search_artifact(&root, &artifact_root);
+        build_semantic_artifact(&root, &artifact_root);
+        crate::root_cache::configure_artifact_access(&checkout, &key, true);
+        let claim = crate::artifact_owner::open_read_only_borrow(
+            Some(storage.path()),
+            &checkout,
+            &key,
+            &crate::path_identity::project_scope_key(&checkout),
+        );
+        assert!(claim.lease.is_none());
+        assert_eq!(
+            claim.status.mode,
+            crate::artifact_owner::ArtifactOwnerMode::ReadOnly
+        );
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        assert!(matches!(
+            ctx.open_borrowed_search_index(&checkout, ctx.config().cache_storage_dir().as_deref()),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        assert!(matches!(
+            ctx.open_borrowed_semantic_index(
+                &checkout,
+                ctx.config().cache_storage_dir().as_deref()
+            ),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        assert!(!storage.path().join("index").exists());
+        assert!(!storage.path().join("semantic").exists());
+    }
     use super::*;
     use crate::search_index::{artifact_cache_key_with_memo, resolve_cache_dir};
 
@@ -2036,7 +2094,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("storage");
         let search_cache_dir = build_search_artifact(&root, storage.path());
         build_semantic_artifact(&root, storage.path());
-        artifact_cache_key_with_memo(&root, &root, storage.path(), None)
+        crate::search_index::artifact_cache_key_with_memo(&root, &root, storage.path(), None)
             .expect("seed cache-key memo before read-only snapshot");
         let semantic_cache_dir = storage
             .path()

@@ -727,7 +727,16 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_semantic_search_with_disk_fallback(req, ctx, false)
+    let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        response.data["cache_unavailable_reason"] =
+            serde_json::json!(crate::root_cache::CACHE_DIR_UNAVAILABLE);
+        if let Some(output) = response.data["text"].as_str() {
+            response.data["text"] =
+                serde_json::json!(format!("cache_dir_unavailable: {reason}\n\n{output}"));
+        }
+    }
+    response
 }
 
 /// Parent-folder children may have no publication yet. Their reader engines
@@ -893,13 +902,36 @@ fn handle_semantic_search_with_disk_fallback(
             external_root.as_deref(),
         );
     }
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
+            Ok(params) => params,
+            Err(error) => return Response::error(&req.id, "invalid_request", error.to_string()),
+        };
+        let shape = query_shape::classify(&params.query);
+        let mut response = semantic_unavailable_grep_fallback_response(
+            req,
+            ctx,
+            &params,
+            &shape,
+            crate::root_cache::CACHE_DIR_UNAVAILABLE,
+            format!("cache_dir_unavailable: {reason}"),
+            "cache_dir_unavailable; bounded lexical walk only",
+            false,
+            vec![],
+            external_root.as_deref().unwrap_or(&project_root),
+            params.top_k,
+        );
+        response.data["cache_unavailable_reason"] =
+            serde_json::json!(crate::root_cache::CACHE_DIR_UNAVAILABLE);
+        return response;
+    }
     let (shape, facts) = extensions.classify(&raw_query);
     let variants = extensions.variants(Token {
         index: 0,
         text: raw_query.original_query(),
     });
     let runtime_source = RuntimeReadinessSource { ctx };
-    let storage_dir = ctx.config().storage_dir.clone();
+    let storage_dir = ctx.config().cache_storage_dir();
     let external_source = external_root
         .as_deref()
         .map(|root| ExternalReadinessSource::new(ctx, root, storage_dir.as_deref()));
@@ -2251,7 +2283,7 @@ fn handle_external_search(
         .loaded()
         .expect("external readiness always loads artifacts before execution");
     let mut borrow_metadata = if ctx.daemonless_query_mode() {
-        standing_snapshot_metadata(&external_root, readiness_source.storage_dir)
+        standing_snapshot_metadata(&external_root, Some(&ctx.storage_dir()))
     } else {
         ExternalBorrowMetadata::default()
     };
@@ -7586,7 +7618,7 @@ fn semantic_artifact_persisted(ctx: &AppContext) -> bool {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
-    let Some(storage) = ctx.config().storage_dir.clone() else {
+    let Some(storage) = ctx.config().cache_storage_dir() else {
         return false;
     };
     let Ok(key) = ctx.memoized_readonly_artifact_cache_key(&root, &storage) else {
@@ -8647,7 +8679,7 @@ mod tests {
         let (epoch, _wake) = slot.begin();
         let runtime = Arc::new(
             crate::views::semantic_runtime::CheckoutSemantic::new(
-                storage.path(),
+                &crate::root_cache::StoragePaths::same(storage.path()),
                 "family",
                 "scope",
                 &root,
@@ -12557,7 +12589,7 @@ mod tests {
         let (epoch, _wake) = slot.begin();
         let runtime = Arc::new(
             crate::views::semantic_runtime::CheckoutSemantic::new(
-                storage.path(),
+                &crate::root_cache::StoragePaths::same(storage.path()),
                 "family",
                 "scope",
                 &root,

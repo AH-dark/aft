@@ -468,6 +468,17 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     prepare_uncached(storage_root)
 }
 
+/// A floor lives in durable storage, but its refusal must also cover artifacts
+/// on a separate volume. Register that explicit scope before any cache opens.
+pub(crate) fn prepare_artifact_root(storage: &Path, artifacts: &Path) {
+    prepare(storage);
+    for refusal in persisted_format::refusals_under(storage) {
+        if refusal.source != crate::persisted_format::RefusalSource::Artifact {
+            persisted_format::record(&refusal, artifacts);
+        }
+    }
+}
+
 fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     let path = floor_path(storage_root);
     let observed = read_snapshot(&path);

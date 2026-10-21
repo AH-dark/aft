@@ -243,7 +243,8 @@ pub(super) fn handle(
     root: &Path,
 ) -> Response {
     let config = ctx.config();
-    let source = ExternalReadinessSource::new(ctx, root, config.storage_dir.as_deref());
+    let storage = config.cache_storage_dir();
+    let source = ExternalReadinessSource::new(ctx, root, storage.as_deref());
     let mut readiness = extensions.sample_readiness(&extensions::Root::new(
         root,
         &source as &dyn extensions::ReadinessSource,

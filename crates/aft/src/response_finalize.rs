@@ -1524,7 +1524,7 @@ mod checkout_transport_tests {
         ctx.set_heavy_root_work_allowed(true);
         let owner = crate::views::registry::FamilyRegistry::open(storage, "family")
             .unwrap()
-            .register_view("local", storage)
+            .register_view_with_storage(storage, "local", storage)
             .unwrap();
         let manifest = ManifestV2::new(ManifestHeader {
             producers: Producers {

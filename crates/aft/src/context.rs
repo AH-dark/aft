@@ -967,6 +967,8 @@ pub struct SuspendedDomainHealthSnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootHealthSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_unavailable_reason: Option<&'static str>,
     pub project_root: String,
     pub actor_count: usize,
     pub state: RootHealthState,
@@ -994,6 +996,7 @@ pub struct RootHealthSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootHealthSummary {
+    cache_unavailable: bool,
     state: RootHealthState,
     search_index_status: Option<&'static str>,
     semantic_index: Option<SemanticHealthComponentSnapshot>,
@@ -1013,6 +1016,7 @@ impl RootHealthSummary {
     fn busy() -> Self {
         Self {
             state: RootHealthState::Busy,
+            cache_unavailable: false,
             search_index_status: None,
             semantic_index: None,
             callgraph_store_status: None,
@@ -1073,6 +1077,9 @@ impl RootHealthSummary {
                 _ => (None, None),
             };
         RootHealthSnapshot {
+            cache_unavailable_reason: self
+                .cache_unavailable
+                .then_some(crate::root_cache::CACHE_DIR_UNAVAILABLE),
             project_root: project_root.display().to_string(),
             actor_count: 1,
             state: self.state,
@@ -1104,6 +1111,7 @@ impl RootHealthSummary {
 impl RootHealthSnapshot {
     fn busy(project_root: &Path) -> Self {
         Self {
+            cache_unavailable_reason: None,
             project_root: project_root.display().to_string(),
             actor_count: 1,
             state: RootHealthState::Busy,
@@ -2365,6 +2373,7 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) project_key: String,
     pub(crate) harness: Harness,
     pub(crate) storage_root: PathBuf,
+    pub(crate) artifact_root: PathBuf,
     pub(crate) harness_dir: PathBuf,
     pub(crate) session_id: String,
     pub(crate) root_too_broad: bool,
@@ -4150,6 +4159,10 @@ pub struct AppContext {
     /// config file texts the last configure applied, the pending-reload flag
     /// and the root's own config file watches.
     config_live: crate::config_live::ConfigLiveState,
+    cache_recovery: parking_lot::Mutex<Option<(crate::protocol::RawRequest, Option<Instant>)>>,
+    // Rebinds can leave workers on old paths; keep each distinct root locked
+    // until this context and its in-flight snapshots have been retired.
+    cache_leases: parking_lot::Mutex<Vec<Arc<crate::root_cache::CacheLease>>>,
     /// Last tool/request activity for this root. Standalone idle LSP reclaim
     /// keys off this stamp; the subc reaper uses its own per-root `last_touched`.
     last_request_at: parking_lot::Mutex<Instant>,
@@ -4962,6 +4975,16 @@ impl AppContext {
     ) -> Self {
         #[cfg(test)]
         let config = app.isolate_test_config(config);
+        let mut config = config;
+        if (config.cache_dir.is_some()
+            || config.cache_config_unknown.is_some()
+            || config.cache_unavailable.is_some())
+            && (config.cache_lease.is_none() || config.storage_lease.is_none())
+        {
+            if let Some(warning) = crate::root_cache::prepare_process_cache_root(&mut config) {
+                crate::slog_warn!("{}: {}", warning.code, warning.message);
+            }
+        }
         let bash_compress_enabled = config.experimental_bash_compress;
         let watcher_counters = config
             .project_root
@@ -4999,6 +5022,7 @@ impl AppContext {
         });
         let checkpoint_store = CheckpointStore::new();
         let checkpoint_namespace_request = checkpoint_store.namespace_request();
+        let cache_leases = config.cache_lease.clone().into_iter().collect();
         let context = AppContext {
             app: Arc::clone(&app),
             provider,
@@ -5009,6 +5033,8 @@ impl AppContext {
             config_publication: parking_lot::Mutex::new(()),
             config_pin_identity: next_config_pin_identity(),
             config_live: crate::config_live::ConfigLiveState::default(),
+            cache_recovery: parking_lot::Mutex::new(None),
+            cache_leases: parking_lot::Mutex::new(cache_leases),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             launch_grants_materialized: parking_lot::Mutex::new(HashSet::new()),
@@ -5370,6 +5396,7 @@ impl AppContext {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSummary::busy(),
         };
+        let cache_unavailable = crate::root_cache::cache_unavailable(&config).is_some();
         // Answers from other subsystems are taken before any of this
         // context's guards below. The guards are held until the summary is
         // built, and the frame loop's maintenance probes read the same
@@ -5413,7 +5440,7 @@ impl AppContext {
         };
         // Opens the view status store on disk, so it also stays ahead of the
         // guards.
-        let views = if config.views.enabled {
+        let views = if !cache_unavailable && config.views.enabled {
             self.view_health_snapshot()
         } else {
             None
@@ -5452,7 +5479,9 @@ impl AppContext {
         // read-only disk openers against the shared artifact. Reporting them
         // as "building" would never resolve.
         let borrows_shared_artifacts = self.shared_artifacts_read_only.load(Ordering::SeqCst);
-        let search_index_status = if search_index
+        let search_index_status = if cache_unavailable {
+            crate::root_cache::CACHE_DIR_UNAVAILABLE
+        } else if search_index
             .as_ref()
             .is_some_and(|index| index.ready || index.build_denied)
             || (borrows_shared_artifacts && config.indexes.trigram)
@@ -5466,7 +5495,7 @@ impl AppContext {
         } else {
             "disabled"
         };
-        let semantic_index = if !semantic_backend.available {
+        let mut semantic_index = if !semantic_backend.available {
             SemanticHealthComponentSnapshot {
                 status: if semantic_backend.paused_until_ms.is_some() {
                     "paused"
@@ -5564,7 +5593,13 @@ impl AppContext {
             }
         };
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
-        let callgraph_store_status = if !heavy_root_work_allowed {
+        if cache_unavailable {
+            semantic_index.status = crate::root_cache::CACHE_DIR_UNAVAILABLE;
+            semantic_index.reason = Some(crate::root_cache::CACHE_DIR_UNAVAILABLE.into());
+        }
+        let callgraph_store_status = if cache_unavailable {
+            crate::root_cache::CACHE_DIR_UNAVAILABLE
+        } else if !heavy_root_work_allowed {
             "disabled"
         } else if callgraph_store.as_ref().is_some() {
             "ready"
@@ -5608,7 +5643,9 @@ impl AppContext {
             || !heavy_root_work_allowed
             || !self.inspect_writer.load(Ordering::SeqCst)
             || !self.inspect_manager.automatic_tier2_refresh_enabled();
-        let tier2_status = if tier2_builder_busy {
+        let tier2_status = if cache_unavailable {
+            crate::root_cache::CACHE_DIR_UNAVAILABLE
+        } else if tier2_builder_busy {
             // A registered rebuild is still in flight, including a first scan
             // that has no aggregate yet. Keep the root warming until the
             // registry entry is cleared.
@@ -5650,6 +5687,7 @@ impl AppContext {
         };
 
         RootHealthSummary {
+            cache_unavailable,
             state: RootHealthState::Ready,
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
@@ -7350,6 +7388,13 @@ impl AppContext {
         external_root: &Path,
         storage_dir: Option<&Path>,
     ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>> {
+        if self.cache_unavailable_reason().is_some() {
+            return crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
+                crate::readonly_artifacts::ReadOnlyDegradation {
+                    reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
+                },
+            );
+        }
         let canonical_root =
             std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
         let storage = crate::bash_background::storage_dir(storage_dir);
@@ -7445,6 +7490,13 @@ impl AppContext {
         external_root: &Path,
         storage_dir: Option<&Path>,
     ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>> {
+        if self.cache_unavailable_reason().is_some() {
+            return crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
+                crate::readonly_artifacts::ReadOnlyDegradation {
+                    reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
+                },
+            );
+        }
         let canonical_root =
             std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
         let storage = crate::bash_background::storage_dir(storage_dir);
@@ -8501,6 +8553,12 @@ impl AppContext {
             next.aft_search_registered = next.tool_registered("aft_search");
             #[cfg(test)]
             let next = self.app.isolate_test_config(next);
+            if let Some(lease) = next.cache_lease.as_ref() {
+                let mut leases = self.cache_leases.lock();
+                if !leases.iter().any(|old| old.same_root(lease)) {
+                    leases.push(Arc::clone(lease));
+                }
+            }
             let next = Arc::new(next);
             // Compare the configured spelling, not a normalized equivalent:
             // that spelling is the memo key for containment-root resolution.
@@ -8668,6 +8726,39 @@ impl AppContext {
         crate::bash_background::storage_dir(self.config().storage_dir.as_deref())
     }
 
+    pub fn cache_dir(&self) -> PathBuf {
+        crate::root_cache::cache_root(&self.config())
+    }
+    pub fn storage_paths(&self) -> crate::root_cache::StoragePaths {
+        crate::root_cache::StoragePaths::for_config(&self.config())
+    }
+
+    pub fn cache_unavailable_reason(&self) -> Option<String> {
+        crate::root_cache::cache_unavailable(&self.config())
+    }
+
+    pub(crate) fn retain_cache_recovery_request(&self, request: &crate::protocol::RawRequest) {
+        *self.cache_recovery.lock() = self
+            .config()
+            .cache_dir
+            .as_ref()
+            .map(|_| (request.clone(), None));
+    }
+
+    pub(crate) fn cache_recovery_request_if_due(
+        &self,
+        now: Instant,
+    ) -> Option<crate::protocol::RawRequest> {
+        let mut recovery = self.cache_recovery.lock();
+        let (request, checked) = recovery.as_mut()?;
+        if checked.is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
+        {
+            return None;
+        }
+        *checked = Some(now);
+        Some(request.clone())
+    }
+
     /// Harness-scoped storage directory. Requires configure to have set a harness;
     /// see [`Self::harness`] for the precondition and [`Self::harness_opt`] to check it.
     pub fn harness_dir(&self) -> PathBuf {
@@ -8699,7 +8790,7 @@ impl AppContext {
     ) -> Option<PathBuf> {
         project_key.and_then(|key| {
             let path = self
-                .storage_dir()
+                .cache_dir()
                 .join("callgraph")
                 .join(key)
                 .join("build-breaker.sqlite");
@@ -8734,11 +8825,11 @@ impl AppContext {
             .canonical_cache_root_opt()
             .or_else(|| self.config().project_root.clone())
         {
-            self.storage_dir()
+            self.cache_dir()
                 .join("inspect")
                 .join(crate::path_identity::project_scope_key(&root))
         } else {
-            self.storage_dir().join("inspect").join("unconfigured")
+            self.cache_dir().join("inspect").join("unconfigured")
         }
     }
 
@@ -9716,16 +9807,19 @@ impl AppContext {
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
         if let Some(root) = self.callgraph_project_root() {
+            // The project's identity records live under the durable storage
+            // root, so the key is resolved there even when `storage.cache_dir`
+            // puts the call-graph folders on another volume.
             let storage = self.storage_dir();
             let key = self.cached_artifact_cache_key(&root).or_else(|| {
                 self.memoized_readonly_artifact_cache_key(&root, &storage)
                     .ok()
             });
-            storage
+            self.cache_dir()
                 .join("callgraph")
                 .join(key.as_deref().unwrap_or("unconfigured"))
         } else {
-            self.storage_dir().join("callgraph").join("unconfigured")
+            self.cache_dir().join("callgraph").join("unconfigured")
         }
     }
 
@@ -10258,6 +10352,9 @@ impl AppContext {
         demand: bool,
         capacity_deferred: Option<&mut bool>,
     ) -> CallgraphStoreAccess {
+        if self.cache_unavailable_reason().is_some() {
+            return CallgraphStoreAccess::Unavailable;
+        }
         // HOME roots and unbound roots do no heavy work at all; configure
         // also forces the callgraph off there, so check this first to keep
         // reporting them as unavailable rather than configured off.
@@ -11647,6 +11744,9 @@ impl AppContext {
 
     fn search_index_shutdown_outcome(&self) -> SearchIndexShutdownOutcome {
         use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
+        if self.cache_unavailable_reason().is_some() {
+            return Failed("cache root is unavailable");
+        }
         if self.shared_artifacts_read_only() {
             return Skipped;
         }
@@ -11684,7 +11784,7 @@ impl AppContext {
         let project_key = self.memoized_artifact_cache_key(&canonical_root);
         let cache_dir = crate::search_index::resolve_cache_dir_with_key(
             &project_key,
-            config.storage_dir.as_deref(),
+            config.cache_storage_dir().as_deref(),
         );
 
         let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(

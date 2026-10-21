@@ -233,6 +233,7 @@ pub struct ReaderRecord {
 
 struct RegistryInner {
     storage: PathBuf,
+    durable_storage: Mutex<Option<PathBuf>>,
     family: String,
     path: PathBuf,
     connection: Mutex<TrackedConnection>,
@@ -298,6 +299,7 @@ impl FamilyRegistry {
         path: PathBuf,
         create: bool,
     ) -> RegistryResult<Self> {
+        crate::root_cache::check_cache_access(&path)?;
         let mut registries = lock(open_registries());
         registries.retain(|_, registry| registry.strong_count() > 0);
         if let Some(inner) = registries.get(&path).and_then(Weak::upgrade) {
@@ -317,6 +319,7 @@ impl FamilyRegistry {
         connection.busy_timeout(Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS))?;
         let inner = Arc::new(RegistryInner {
             storage: storage.to_path_buf(),
+            durable_storage: Mutex::new(None),
             family: family.to_owned(),
             path: path.clone(),
             connection: Mutex::new(connection),
@@ -390,6 +393,40 @@ impl FamilyRegistry {
         crate::storage_retention::test_volume_uuid_guard(self.storage(), anchor, uuid)
     }
 
+    pub(crate) fn bind_durable_storage(&self, storage: &Path) -> RegistryResult<()> {
+        crate::root_cache::register_durable_owner(&crate::root_cache::StoragePaths::new(
+            storage.to_path_buf(),
+            self.inner.storage.clone(),
+        ))?;
+        let mut durable = lock(&self.inner.durable_storage);
+        if durable.as_ref().is_some_and(|old| {
+            old != storage
+                && crate::config_live::dir_identity(old)
+                    != crate::config_live::dir_identity(storage)
+        }) {
+            return Err(std::io::Error::other(
+                "family registry attached to another durable storage root",
+            )
+            .into());
+        }
+        *durable = Some(storage.to_path_buf());
+        Ok(())
+    }
+
+    /// Declares the durable storage root that owns this registry's cache
+    /// folders, as a running AFT process does before it evicts anything:
+    /// view-directory removal refuses a cache whose durable owner is unknown.
+    /// Production code binds through [`Self::register_view_with_storage`] or
+    /// storage retention; integration tests that evict from a separate child
+    /// process call this instead of registering a view of their own.
+    #[doc(hidden)]
+    pub fn bind_durable_storage_for_tests(&self, storage: &Path) -> RegistryResult<()> {
+        self.bind_durable_storage(storage)
+    }
+    pub(crate) fn durable_storage(&self) -> Option<PathBuf> {
+        lock(&self.inner.durable_storage).clone()
+    }
+
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
@@ -405,9 +442,19 @@ impl FamilyRegistry {
     /// admitted under the family's disk limits; see
     /// [`super::eviction::admit_new_view`]. Re-binding an existing member is
     /// never refused.
-    pub fn register_view(&self, scope: &str, root: &Path) -> RegistryResult<ViewRegistration> {
+    pub fn register_view_with_storage(
+        &self,
+        durable_storage: &Path,
+        scope: &str,
+        root: &Path,
+    ) -> RegistryResult<ViewRegistration> {
+        self.bind_durable_storage(durable_storage)?;
         if matches!(root.try_exists(), Ok(true)) {
-            crate::storage_retention::record_bind(&self.inner.storage, root, self.family())?;
+            let paths = crate::root_cache::StoragePaths::new(
+                durable_storage.to_path_buf(),
+                self.inner.storage.clone(),
+            );
+            crate::storage_retention::record_bind(&paths, root, self.family())?;
         }
         let view_dir = view_dir(&self.inner.storage, scope)?;
         if self.member(scope)?.is_none() {
@@ -1199,6 +1246,17 @@ pub(crate) fn remove_view_dir(view_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+pub(crate) fn remove_view_dir_with(
+    view_dir: &Path,
+    before_remove: impl FnOnce(&crate::bash_background::persistence::PinnedDir) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match crate::storage_retention::remove_directory_if_closed_with(view_dir, before_remove) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn check_schema(connection: &rusqlite::Connection) -> RegistryResult<()> {
     let version: Option<i64> = connection
         .query_row(
@@ -1262,8 +1320,12 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
         let root = storage.path().join("checkout");
-        registry.register_view("scope-a", &root).unwrap();
-        registry.register_view("scope-a", &root).unwrap();
+        registry
+            .register_view_with_storage(registry.storage(), "scope-a", &root)
+            .unwrap();
+        registry
+            .register_view_with_storage(registry.storage(), "scope-a", &root)
+            .unwrap();
         let members = registry.members().unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].root.as_deref(), Some(root.as_path()));
@@ -1286,7 +1348,7 @@ mod tests {
             .is_none());
         let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
         registry
-            .register_view("scope-a", &storage.path().join("root"))
+            .register_view_with_storage(registry.storage(), "scope-a", &storage.path().join("root"))
             .unwrap();
         let reader = registry.register_reader("parent-folder").unwrap();
         let view = view_dir(storage.path(), "scope-a").unwrap();
@@ -1319,7 +1381,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
         let view = registry
-            .register_view("scope-a", &storage.path().join("root"))
+            .register_view_with_storage(registry.storage(), "scope-a", &storage.path().join("root"))
             .unwrap();
         assert_eq!(registry.sessions().unwrap().len(), 1);
         registry
@@ -1358,7 +1420,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
         let view = registry
-            .register_view("scope-a", &storage.path().join("root"))
+            .register_view_with_storage(registry.storage(), "scope-a", &storage.path().join("root"))
             .unwrap();
         let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
         let pinning = registry

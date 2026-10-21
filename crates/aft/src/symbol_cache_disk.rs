@@ -174,6 +174,7 @@ fn note_cache_write(path: &Path) {
 }
 
 pub fn read_from_disk(storage_dir: &Path, project_key: &str) -> Option<DiskSymbolCache> {
+    crate::root_cache::check_cache_access(&storage_dir.join("symbols")).ok()?;
     crate::private_storage::tighten_open_dir(
         storage_dir,
         &storage_dir.join("symbols").join(project_key),

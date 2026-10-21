@@ -23,7 +23,7 @@ fn resolve_with_fetch(
 ) -> Result<PathBuf, Response> {
     if is_http_url(file) {
         let config = ctx.config();
-        let storage_dir = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let storage_dir = ctx.cache_dir();
         // Trusted configuration sets the private-network ceiling; a request
         // can narrow that permission but cannot grant it.
         let allow_private = config.url_fetch_allow_private

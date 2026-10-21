@@ -88,6 +88,9 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
+  if (merged.storage?.cache_dir !== undefined) {
+    params.cache_dir = merged.storage.cache_dir;
+  }
   // The OpenCode prompt server is read by the plugin itself and is not a
   // configure param either; it is carried here so the Rust resolver's user-only
   // handling of it is compared against the TypeScript loader's.
@@ -180,6 +183,21 @@ const CASES: ParityCase[] = [
   { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
   { name: "malformed_config_document", user: "{" },
   { name: "pi_malformed_config_document", harness: "pi", user: "{" },
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_unrelated_unknown_${harness}`, harness, user: { future_feature: true, format_on_edit: true } },
+    { name: `cache_dir_unrelated_harness_unknown_${harness}`, harness, user: { harnesses: { [harness]: { future_option: true } } } },
+  ]),
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_typo_section_${harness}`, harness, user: { storge: { cache_dir: "/aft-cache" } } },
+    { name: `cache_dir_typo_key_${harness}`, harness, user: { storage: { cachedir: "/aft-cache" } } },
+    { name: `cache_dir_typo_inactive_harness_${harness}`, harness, user: { harnesses: { future: { storge: { cache_dir: "/aft-cache" } } } } },
+    { name: `cache_dir_typo_harness_storage_${harness}`, harness, user: { harnesses: { future: { storage: { cachedir: "/aft-cache" } } } } },
+  ]),
+  { name: "cache_dir_user", user: { storage: { cache_dir: "/aft-cache" } } },
+  { name: "cache_dir_project_dropped", user: { storage: { cache_dir: "/aft-cache" } }, project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_project_only_dropped", project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_harness_attempts_dropped", user: { storage: { cache_dir: "/aft-cache" }, harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, project: { harnesses: { pi: { storage: { cache_dir: "/evil" } } } }, harness: "pi" },
+  { name: "cache_dir_harness_only_dropped", user: { harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, harness: "pi" },
   { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
   { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },

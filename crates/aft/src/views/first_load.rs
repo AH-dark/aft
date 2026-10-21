@@ -494,9 +494,13 @@ mod tests {
     fn loader_retries_edits_and_removes_sibling_members_before_serving() {
         let temp = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
-        let sibling = registry.register_view("sibling", temp.path()).unwrap();
+        let sibling = registry
+            .register_view_with_storage(registry.storage(), "sibling", temp.path())
+            .unwrap();
         publish(&sibling, &manifest(&[("excluded.rs", b"foreign")]));
-        let owner = registry.register_view("local", temp.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", temp.path())
+            .unwrap();
         let driver = Arc::new(Driver {
             owner: owner.clone(),
             revision: AtomicU64::new(0),
@@ -524,7 +528,9 @@ mod tests {
     fn foreign_pointer_reads_do_not_change_database_bytes_or_journal_mode() {
         let temp = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
-        let owner = registry.register_view("foreign", temp.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "foreign", temp.path())
+            .unwrap();
         publish(&owner, &manifest(&[("file.rs", b"hello")]));
         let store = owner.view_store().unwrap();
         // Close each SQLite handle before reading its file: no live WAL file
@@ -591,9 +597,13 @@ mod tests {
     fn seed_pin_survives_sibling_switch_and_family_sweep() {
         let temp = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
-        let sibling = registry.register_view("sibling", temp.path()).unwrap();
+        let sibling = registry
+            .register_view_with_storage(registry.storage(), "sibling", temp.path())
+            .unwrap();
         publish(&sibling, &manifest(&[("old.rs", b"old")]));
-        let owner = registry.register_view("local", temp.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", temp.path())
+            .unwrap();
         let driver = Arc::new(Driver {
             owner: owner.clone(),
             revision: AtomicU64::new(0),
@@ -641,7 +651,9 @@ mod tests {
     fn first_load_child() {
         let storage = std::path::PathBuf::from(std::env::var_os("AFT_FIRST_LOAD_STORAGE").unwrap());
         let registry = FamilyRegistry::open(&storage, "family").unwrap();
-        let owner = registry.register_view("local", &storage).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", &storage)
+            .unwrap();
         let driver = Arc::new(Driver {
             owner: owner.clone(),
             revision: AtomicU64::new(0),
@@ -670,7 +682,9 @@ mod tests {
             for kill in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
-                let sibling = registry.register_view("sibling", temp.path()).unwrap();
+                let sibling = registry
+                    .register_view_with_storage(registry.storage(), "sibling", temp.path())
+                    .unwrap();
                 publish(&sibling, &manifest(&[("excluded.rs", b"foreign")]));
                 let executable = std::env::current_exe().unwrap();
                 let spawn = |pause: &str| {
@@ -756,7 +770,9 @@ mod tests {
     fn query_wait_uses_installed_data_and_one_deadline_despite_edits() {
         let temp = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
-        let owner = registry.register_view("local", temp.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", temp.path())
+            .unwrap();
         let access = ViewAccess::Owner(owner);
         let snapshot =
             LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest(&[]), None))).snapshot();
@@ -911,7 +927,9 @@ mod stat_tests {
 
     fn driver(root: &std::path::Path, storage: &std::path::Path) -> (CheckoutDriver, ViewAccess) {
         let registry = super::super::registry::FamilyRegistry::open(storage, "family").unwrap();
-        let owner = registry.register_view("stat", root).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "stat", root)
+            .unwrap();
         let driver = CheckoutDriver::new(
             owner.clone(),
             Producers {
@@ -1577,7 +1595,9 @@ mod composite_tests {
     ) -> (Arc<CheckoutDriver>, Arc<Walker>, Arc<Plane>, ViewAccess) {
         std::fs::write(root.join("file.rs"), b"strict content").unwrap();
         let registry = super::super::registry::FamilyRegistry::open(storage, "family").unwrap();
-        let owner = registry.register_view("local", root).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", root)
+            .unwrap();
         let walker = Arc::new(Walker {
             fail: AtomicBool::new(false),
             delete_after_listing: AtomicBool::new(false),
@@ -1895,7 +1915,9 @@ mod callgraph_bridge_tests {
         .unwrap();
         let registry =
             super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-        let owner = registry.register_view("local", root.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", root.path())
+            .unwrap();
         let bridge = Arc::new(CallgraphBridge::default());
         let driver = Arc::new(
             CheckoutDriver::new(
@@ -2205,7 +2227,9 @@ mod integrated_plane_tests {
         std::fs::write(&absolute, b"fn before() {}\n").unwrap();
         let registry =
             super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-        let owner = registry.register_view("local", root.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", root.path())
+            .unwrap();
         let policy = crate::blob_store::v2::TrigramPolicy {
             max_file_size: 1 << 20,
         };
@@ -2354,7 +2378,9 @@ mod checkout_kind_tests {
             std::fs::write(root.join("untracked.rs"), b"fn untracked() {}\n").unwrap();
             std::fs::write(root.join(".aftignore"), b"excluded.rs\n").unwrap();
             std::fs::write(root.join("excluded.rs"), b"fn excluded() {}\n").unwrap();
-            let owner = registry.register_view(scope, &root).unwrap();
+            let owner = registry
+                .register_view_with_storage(registry.storage(), scope, &root)
+                .unwrap();
             let policy = crate::blob_store::v2::TrigramPolicy {
                 max_file_size: 1 << 20,
             };

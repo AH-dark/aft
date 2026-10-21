@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   clearMigrationNotices,
   npmInvocation,
@@ -1665,6 +1665,23 @@ function applyConfigMigration(
     }
     for (const line of file.notes) log.warn(`  ${line}`);
   }
+  for (const path of result.cacheCleanup?.removed ?? []) {
+    changed += 1;
+    log.success(`Removed inactive rebuildable cache ${path}`);
+  }
+  for (const skipped of result.cacheCleanup?.skipped ?? [])
+    log.warn(`Inactive cache retained: ${skipped}`);
+  for (const partial of result.cacheCleanup?.partial ?? []) {
+    changed += 1;
+    log.warn(
+      `Partially cleared ${partial.path}: removed ${partial.removed_entries} file/directory entries before repair stopped`,
+    );
+  }
+  for (const warning of result.cacheCleanup?.warnings ?? []) log.warn(warning);
+  if (result.cacheCleanup?.error) {
+    errors += 1;
+    log.error(`Inactive cache cleanup refused: ${result.cacheCleanup.error}`);
+  }
   return { changed, errors };
 }
 
@@ -1692,7 +1709,31 @@ export function formatDoctorStorageStatus(h: DiagnosticReport["harnesses"][numbe
     ? h.storageDir.path
     : `${h.storageDir.path} (${h.pluginRegistered ? "not yet created (lazy — created on first tool call)" : "not created"})`;
   const legacyDuplication = formatLegacyDuplication(h.storageDir.legacyDuplication);
-  return `${state} (${[formatStorageSizes(h.storageDir.sizesByKey), legacyDuplication]
+  let cacheWarning = "";
+  if (h.storageDir.cacheRoot) {
+    try {
+      const parent = realpathSync(dirname(h.storageDir.cacheRoot));
+      let durable = h.storageDir.path;
+      while (!existsSync(durable) && dirname(durable) !== durable) durable = dirname(durable);
+      let registered = false;
+      const history = join(h.storageDir.path, "retention/cache-parents.json");
+      if (existsSync(history)) {
+        const saved = JSON.parse(readFileSync(history, "utf8")) as {
+          parents?: { path?: string }[];
+        };
+        registered = saved.parents?.some((entry) => entry.path === parent) === true;
+      }
+      if (!registered && statSync(parent).dev === statSync(durable).dev) {
+        cacheWarning = "; cache_dir_on_storage_device: first enrollment requires another volume";
+      }
+    } catch {
+      // Native configure owns admission and reports unreadable or absent roots.
+    }
+  }
+  return `${state}${h.storageDir.cacheRoot ? `; cache root: ${h.storageDir.cacheRoot} (configured; unavailable roots disable caches)${cacheWarning}` : ""} (${[
+    formatStorageSizes(h.storageDir.sizesByKey),
+    legacyDuplication,
+  ]
     .filter((part): part is string => Boolean(part))
     .join("; ")})`;
 }

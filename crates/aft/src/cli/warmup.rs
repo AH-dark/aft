@@ -537,6 +537,9 @@ fn print_transition(name: &str, current: &str, previous: &mut String) {
 }
 
 fn search_index_state(ctx: &AppContext) -> SubsystemState {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return SubsystemState::Failed(format!("cache_dir_unavailable: {reason}"));
+    }
     if !ctx.config().indexes.trigram {
         return SubsystemState::Disabled;
     }
@@ -565,6 +568,9 @@ fn search_index_state(ctx: &AppContext) -> SubsystemState {
 }
 
 fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return SubsystemState::Failed(format!("cache_dir_unavailable: {reason}"));
+    }
     if !ctx.config().indexes.semantic {
         return SubsystemState::Disabled;
     }
@@ -613,6 +619,11 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
 /// change by polling (configured-disabled, worktree/unconfigured = terminal no-op,
 /// or a hard build error).
 fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return Some(SubsystemState::Failed(format!(
+            "cache_dir_unavailable: {reason}"
+        )));
+    }
     // A disabled subsystem is terminal. In particular, HOME is never a project
     // root, so its disabled callgraph configuration must not be represented as a retryable miss.
     if !ctx.config().indexes.callgraph {

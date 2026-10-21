@@ -297,6 +297,24 @@ impl ConfigLiveState {
         self.sources.lock().clone()
     }
 
+    pub(crate) fn recovery_tiers(&self) -> Result<Vec<ConfigTier>, String> {
+        let Some(sources) = self.sources() else {
+            return Ok(Vec::new());
+        };
+        let mut tiers = Vec::new();
+        for source in [&sources.user, &sources.project] {
+            match read_tier(source) {
+                TierRead::Use(source) => {
+                    if let Some(tier) = tier_for(&source) {
+                        tiers.push(tier);
+                    }
+                }
+                TierRead::Error(error) => return Err(error),
+            }
+        }
+        Ok(tiers)
+    }
+
     pub fn last_outcome(&self) -> Option<ReloadOutcome> {
         self.last_outcome.lock().clone()
     }
@@ -515,7 +533,11 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 
     let (user, project) = match (read_tier(&sources.user), read_tier(&sources.project)) {
         (TierRead::Use(user), TierRead::Use(project)) => (user, project),
-        (TierRead::Error(reason), _) | (_, TierRead::Error(reason)) => {
+        (TierRead::Error(reason), _) => {
+            ctx.update_config(|config| config.cache_config_unknown = Some(reason.clone()));
+            return keep_last_good(ctx, &root_label, reason);
+        }
+        (_, TierRead::Error(reason)) => {
             return keep_last_good(ctx, &root_label, reason);
         }
     };
@@ -534,6 +556,14 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             record.project.from_file = project.from_file;
         }
         state.last_error.lock().take();
+        // A failed read did not change the last-good text. Restoring those exact
+        // bytes must revalidate the cache root rather than retain its error flag.
+        if ctx.config_unpinned().cache_config_unknown.is_some() {
+            ctx.update_config(|config| {
+                config.cache_config_unknown = None;
+                crate::root_cache::prepare_cache_root(config);
+            });
+        }
         return ReloadOutcome::Unchanged;
     }
     let project_changed = project.text != sources.project.text;
@@ -549,6 +579,13 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
     let harness = ctx.config_unpinned().harness.clone();
     for tier in &tiers {
         if let Some(reason) = crate::config_resolve::strict_tier_error(tier, harness.as_ref()) {
+            // An invalid edit keeps the last good config; caches turn off only
+            // when the edit leaves the cache location itself unknown.
+            if tier.tier == "user" {
+                if let Some(unknown) = crate::config_resolve::cache_location_config_error(tier) {
+                    ctx.update_config(|config| config.cache_config_unknown = Some(unknown));
+                }
+            }
             return keep_last_good(ctx, &root_label, reason);
         }
     }
@@ -920,6 +957,8 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
         bash_long_running_reminder_interval_ms
     );
     // LSP.
+    later!("storage.cache_dir", cache_dir);
+    later!("storage.cache_dir: null", cache_dir_opt_out);
     later!("lsp.servers", lsp_servers);
     later!("lsp.disabled", disabled_lsp);
     later!("experimental.lsp_ty", experimental_lsp_ty);
@@ -978,10 +1017,17 @@ fn classification_is_exhaustive(config: &Config) {
         lsp_auto_install_binaries: _,
         lsp_inflight_installs: _,
         storage_dir: _,
+        storage_lease: _,
+        cache_unavailable: _,
+        cache_config_unknown: _,
+        cache_epoch: _,
+        cache_lease: _,
         harness: _,
         diagnostic_cache_size: _,
         aft_search_registered: _,
         // Classified in `apply_live_config`.
+        cache_dir: _,
+        cache_dir_opt_out: _,
         formatter_timeout_secs: _,
         type_checker_timeout_secs: _,
         format_on_edit: _,
@@ -1057,6 +1103,7 @@ fn classification_is_exhaustive(config: &Config) {
         max_files: _,
         subc_connection_file: _,
         // Set by configure after resolving; process state.
+        local_cache_dir: _,
         route_project_root: _,
         route_harness: _,
     } = semantic;
@@ -1432,7 +1479,7 @@ impl DirAttachment {
 type DirIdentity = (u64, u64);
 
 #[cfg(unix)]
-fn dir_identity(path: &Path) -> Option<DirIdentity> {
+pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path)
         .ok()
@@ -1445,7 +1492,7 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
 /// entry that last had it, so a directory renamed aside and recreated looks
 /// unchanged by that measure.
 #[cfg(windows)]
-fn dir_identity(path: &Path) -> Option<DirIdentity> {
+pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1491,7 +1538,7 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn dir_identity(_path: &Path) -> Option<DirIdentity> {
+pub(crate) fn dir_identity(_path: &Path) -> Option<DirIdentity> {
     None
 }
 

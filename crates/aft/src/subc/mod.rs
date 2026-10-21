@@ -4029,6 +4029,8 @@ fn run_subc_mode_inner(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
+        .map_err(SubcError::StorageLease)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -13283,6 +13285,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn subc_startup_takes_storage_lease_before_connecting() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        crate::private_storage::create_dir_all(&storage).unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        ));
+        let cleanup = crate::root_cache::acquire_cache_cleanup_lease(&storage).unwrap();
+        let result = run_subc_mode(
+            &temp.path().join("missing-connection.json"),
+            Arc::clone(&ctx),
+            Arc::new(Executor::new()),
+            |_, _| unreachable!("no routes have bound"),
+            None,
+        );
+        assert!(
+            matches!(result, Err(SubcError::StorageLease(_))),
+            "{result:?}"
+        );
+        drop(cleanup);
+        let result = run_subc_mode(
+            &temp.path().join("missing-connection.json"),
+            ctx,
+            Arc::new(Executor::new()),
+            |_, _| unreachable!("no routes have bound"),
+            None,
+        );
+        assert!(
+            matches!(result, Err(SubcError::ConnectionFile { .. })),
+            "{result:?}"
+        );
+        // Failed attachment must release the daemon lease too.
+        crate::root_cache::acquire_cache_cleanup_lease(&storage).unwrap();
+    }
+
+    #[test]
     fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood_probe() {
         for batches_after_arrival in [0, 1] {
             let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -17602,6 +17644,7 @@ mod tests {
         ctx.mark_subc_bound();
         let storage_root = ctx.storage_dir();
         ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
+            artifact_root: ctx.cache_dir(),
             generation: ctx.configure_generation(),
             root_path: root_path.clone(),
             canonical_cache_root: root_path.clone(),

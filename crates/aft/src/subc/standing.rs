@@ -127,6 +127,17 @@ impl ReconciliationFailureLog {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ProbeLocation {
+    Identity(u64, u64),
+    Missing(std::path::PathBuf),
+}
+fn probe_location(path: &std::path::Path) -> ProbeLocation {
+    crate::config_live::dir_identity(path).map_or_else(
+        || ProbeLocation::Missing(path.to_path_buf()),
+        |(dev, ino)| ProbeLocation::Identity(dev, ino),
+    )
+}
 pub(super) struct StandingActor {
     app: Arc<App>,
     executor: Arc<Executor>,
@@ -145,6 +156,7 @@ pub(super) struct StandingActor {
     /// Root ids registered solely to host unbound standing work. Session actors
     /// are never removed by this owner.
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
+    cache_checks: Mutex<HashMap<(ProbeLocation, ProbeLocation), std::time::Instant>>,
 }
 
 impl StandingActor {
@@ -196,6 +208,7 @@ impl StandingActor {
             reconciliation_failures: Mutex::new(ReconciliationFailureLog::default()),
             reconciliation_backoff: Mutex::new(ReconciliationBackoff::default()),
             owned_actors: Mutex::new(HashMap::new()),
+            cache_checks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -321,6 +334,94 @@ impl StandingActor {
         }
     }
 
+    /// Probe each storage-wide cache location at most once per minute. Normal
+    /// configure jobs publish recovery under the actor's exclusive bind gate;
+    /// no cache worker is started by the health/standing probe itself.
+    fn refresh_cache_roots(&self, now: std::time::Instant) {
+        let mut groups = HashMap::<(ProbeLocation, ProbeLocation), Vec<_>>::new();
+        for (root, ctx) in self.executor.actor_entries() {
+            if let Some(parent) = &ctx.config().cache_dir {
+                groups
+                    .entry((probe_location(&ctx.storage_dir()), probe_location(parent)))
+                    .or_default()
+                    .push((root, ctx));
+            }
+        }
+        self.cache_checks
+            .lock()
+            .retain(|storage, _| groups.contains_key(storage));
+        for (storage, entries) in groups {
+            {
+                let mut checked = self.cache_checks.lock();
+                if checked.get(&storage).is_some_and(|last| {
+                    now.saturating_duration_since(*last) < std::time::Duration::from_secs(60)
+                }) {
+                    continue;
+                }
+                checked.insert(storage, now);
+            }
+            for (root, ctx) in entries {
+                // Verify this context's configuration rather than borrowing
+                // another context's cache lease or unavailable status.
+                let mut prepared = ctx.config().as_ref().clone();
+                root_cache::prepare_cache_root(&mut prepared);
+                let prepared = Arc::new(prepared);
+                let id = format!(
+                    "subc-bind-cache-recovery-{}",
+                    crate::path_identity::project_scope_key(root.as_path())
+                );
+                if ctx.config().harness.is_none() || ctx.subc_unbound_quiesced() {
+                    let prepared = Arc::clone(&prepared);
+                    let response_id = id.clone();
+                    self.executor.submit_async(
+                        root,
+                        Lane::Mutating,
+                        id,
+                        Box::new(move |ctx| {
+                            ctx.update_config(|config| {
+                                config.cache_unavailable = prepared.cache_unavailable.clone();
+                                config.cache_epoch = prepared.cache_epoch;
+                                config.cache_lease = prepared.cache_lease.clone();
+                                config.semantic.local_cache_dir =
+                                    prepared.semantic.local_cache_dir.clone();
+                            });
+                            crate::protocol::Response::success(
+                                response_id,
+                                serde_json::json!({"cache_rechecked": true}),
+                            )
+                        }),
+                    );
+                    continue;
+                }
+                let Some(mut request) = ctx.cache_recovery_request_if_due(now) else {
+                    continue;
+                };
+                let tiers = match ctx.config_live().recovery_tiers() {
+                    Ok(tiers) => tiers,
+                    Err(error) => {
+                        log::warn!("cache recovery config unavailable: {error}");
+                        continue;
+                    }
+                };
+                request.id.clone_from(&id);
+                let params = if request.params.get("params").is_some() {
+                    &mut request.params["params"]
+                } else {
+                    &mut request.params
+                };
+                params["config"] = serde_json::json!(tiers.into_iter().map(|tier| serde_json::json!({"tier": tier.tier, "source": tier.source, "doc": tier.doc})).collect::<Vec<_>>());
+                let prepared = Arc::clone(&prepared);
+                self.executor.submit_bind_cancellable_async(
+                    root,
+                    id,
+                    Arc::new(move |ctx| {
+                        crate::commands::configure::handle_cache_recovery(&request, ctx, &prepared)
+                    }),
+                );
+            }
+        }
+    }
+
     /// Reconcile the observed snapshot and enqueue one coalesced pass per root.
     /// Entry order and `search`, `semantic`, `callgraph` kind order are retained
     /// by `StandingRoots::entries` and `IndexKind::ALL` respectively.
@@ -329,6 +430,7 @@ impl StandingActor {
     }
 
     fn tick_at(&self, now: std::time::Instant) {
+        self.refresh_cache_roots(now);
         let _reconciliation = self.reconciliation.lock();
         self.reconcile_startup_once();
         self.observe_config_snapshot();
@@ -455,6 +557,13 @@ impl StandingActor {
         let executor_request_id = format!("subc-standing-pass-{}", entry.literal_path);
         let response_request_id = executor_request_id.clone();
         let job = Box::new(move |ctx: &AppContext| {
+            if let Some(reason) = ctx.cache_unavailable_reason() {
+                return crate::protocol::Response::error(
+                    &response_request_id,
+                    root_cache::CACHE_DIR_UNAVAILABLE,
+                    reason,
+                );
+            }
             let Some(admission) = roots.admit_build(&literal_path) else {
                 return crate::protocol::Response::success(
                     response_request_id,
@@ -1008,6 +1117,135 @@ mod tests {
         assert!(storage.path().join("aft.db").exists());
         actor.tick();
         assert_eq!(ctx.artifact_cache_key_derivation_count_for_test(), 0);
+    }
+
+    #[test]
+    fn cache_root_standing_probes_distinct_cache_identities_for_one_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let ready = temp.path().join("ready");
+        let missing = temp.path().join("missing");
+        std::fs::create_dir(&ready).unwrap();
+        let executor = Arc::new(Executor::new());
+        let mut contexts = Vec::new();
+        for (name, parent) in [
+            ("project-a", ready.clone()),
+            ("project-b", missing),
+            ("project-c", ready),
+        ] {
+            let project = temp.path().join(name);
+            std::fs::create_dir(&project).unwrap();
+            let mut config = Config {
+                storage_dir: Some(storage.clone()),
+                cache_dir: Some(parent),
+                project_root: Some(project.clone()),
+                ..Default::default()
+            };
+            if name == "project-c" {
+                config.cache_config_unknown = Some("unreadable user document".into());
+            }
+            root_cache::prepare_cache_root_for_test(&mut config);
+            let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+            let root = ProjectRootId::from_path(&project).unwrap();
+            executor.register_actor(root.clone(), Arc::clone(&ctx));
+            contexts.push((root, ctx));
+        }
+        let standing = StandingActor::new(contexts[0].1.app(), Arc::clone(&executor));
+        standing.refresh_cache_roots(std::time::Instant::now());
+        for (root, _) in &contexts {
+            executor
+                .submit(
+                    root.clone(),
+                    Lane::Mutating,
+                    "probe-barrier".into(),
+                    Box::new(|_| {
+                        crate::protocol::Response::success("barrier", serde_json::json!({}))
+                    }),
+                )
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        assert!(contexts[0].1.config().cache_lease.is_some());
+        assert!(contexts[0].1.cache_unavailable_reason().is_none());
+        assert!(contexts[1].1.config().cache_lease.is_none());
+        assert!(contexts[1].1.cache_unavailable_reason().is_some());
+        assert!(
+            contexts[2].1.config().cache_lease.is_none(),
+            "a healthy context cannot lend its lease to a context with unknown config"
+        );
+        assert!(contexts[2].1.cache_unavailable_reason().is_some());
+        assert_eq!(standing.cache_checks.lock().len(), 2);
+    }
+
+    #[test]
+    fn cache_root_periodic_recovery_is_throttled_and_uses_normal_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        let cache = temp.path().join("offline-volume");
+        std::fs::create_dir(&project).unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config::default(),
+        ));
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id":"initial-cache-bind", "command":"configure", "harness":"opencode", "project_root":project, "storage_dir":storage,
+            "config":[{"tier":"user", "source":"test user", "doc":serde_json::json!({"storage":{"cache_dir":cache}, "indexes":{"trigram":false,"semantic":false,"callgraph":false}}).to_string()}]
+        })).unwrap();
+        assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
+        ctx.mark_subc_bound();
+        let executor = Arc::new(Executor::new());
+        let root = ProjectRootId::from_path(&project).unwrap();
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let standing = StandingActor::new(ctx.app(), Arc::clone(&executor));
+        let now = std::time::Instant::now();
+        let barrier = || {
+            executor
+                .submit(
+                    root.clone(),
+                    Lane::Mutating,
+                    "cache-recovery-barrier".into(),
+                    Box::new(|_| {
+                        crate::protocol::Response::success("barrier", serde_json::json!({}))
+                    }),
+                )
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        };
+        assert!(ctx.cache_unavailable_reason().is_some());
+        std::fs::create_dir(&cache).unwrap();
+        let _mounted_volume =
+            crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
+        standing.refresh_cache_roots(now);
+        barrier();
+        assert!(
+            ctx.cache_unavailable_reason().is_none(),
+            "the first standing probe must recover a volume mounted after configure"
+        );
+        let marker_path = cache.join("aft/.aft-owner.json");
+        let marker = std::fs::read(&marker_path).unwrap();
+        std::fs::remove_file(&marker_path).unwrap();
+        standing.refresh_cache_roots(now + std::time::Duration::from_secs(1));
+        barrier();
+        assert!(
+            ctx.cache_unavailable_reason().is_none(),
+            "unchanged location identities are throttled for one minute"
+        );
+        standing.refresh_cache_roots(now + std::time::Duration::from_secs(60));
+        barrier();
+        assert!(
+            ctx.cache_unavailable_reason().is_some(),
+            "the next scheduled probe verifies each context's ownership"
+        );
+        std::fs::write(marker_path, marker).unwrap();
+        standing.refresh_cache_roots(now + std::time::Duration::from_secs(120));
+        barrier();
+        assert!(ctx.cache_unavailable_reason().is_none());
+        assert!(cache.join("aft").is_dir());
+        assert_eq!(
+            ctx.try_health_snapshot(&project).cache_unavailable_reason,
+            None
+        );
     }
 
     #[test]

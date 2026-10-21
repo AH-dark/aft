@@ -208,6 +208,10 @@ impl LocalEmbedder {
     /// Build the embedder for the named model. Only `all-MiniLM-L6-v2` is
     /// supported as the local backend (matches the prior fastembed surface).
     pub fn new(model: &str) -> Result<Self, String> {
+        Self::with_cache_dir(model, None)
+    }
+
+    pub(crate) fn with_cache_dir(model: &str, cache_dir: Option<&Path>) -> Result<Self, String> {
         match model {
             "all-MiniLM-L6-v2" | "all-minilm-l6-v2" => {}
             other => {
@@ -221,7 +225,7 @@ impl LocalEmbedder {
         // inside dlopen on an incompatible/absent ONNX Runtime.
         pre_validate_onnx_runtime()?;
 
-        let (model_path, tokenizer_path) = resolve_model_files()?;
+        let (model_path, tokenizer_path) = resolve_model_files(cache_dir)?;
 
         let thread_derivation = intra_thread_derivation();
         let threads = thread_derivation.threads;
@@ -461,8 +465,11 @@ fn mask_at(mask: &ndarray::Array2<i64>, row: usize, col: usize) -> i64 {
 
 /// Resolve the MiniLM model.onnx + tokenizer.json, reusing an existing local
 /// download when present (offline-safe) and falling back to an hf-hub fetch.
-fn resolve_model_files() -> Result<(PathBuf, PathBuf), String> {
-    let cache_dir = embedding_cache_dir()?;
+fn resolve_model_files(cache_dir: Option<&Path>) -> Result<(PathBuf, PathBuf), String> {
+    let cache_dir = match cache_dir {
+        Some(path) => path.to_path_buf(),
+        None => embedding_cache_dir()?,
+    };
 
     if let Some(found) = scan_local_snapshot(&cache_dir) {
         return Ok(found);
