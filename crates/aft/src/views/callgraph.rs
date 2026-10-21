@@ -28,10 +28,9 @@ use super::readiness::{plane_readiness, FillMap, PlaneReadiness, PlaneState};
 use super::snapshot::{DiskState, LiveEntry, OpenGeneration, Snapshot};
 use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
-/// Bump when extracted evidence or its interpretation changes. Version 3 adds
-/// receiver facts and precise typed dispatch to the deterministic, single-parse
-/// extraction. Earlier blobs must be rebuilt instead of seeding old call edges.
-pub const PRODUCER: &str = "ruled-callgraph-v8-rust-static-value-references";
+/// Bump when extracted evidence, its encoding or interpretation changes. Version
+/// 9 omits the extraction-only AST index from stored payloads; facts are unchanged.
+pub const PRODUCER: &str = "ruled-callgraph-v9-without-ast-index";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
