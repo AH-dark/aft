@@ -1,5 +1,250 @@
 # aft_inspect truth at scale: campaign report
 
+## Current follow-up: own checkout and seven-repository diagnostics
+
+The latest measurement uses a Linux **release** build of
+`dab88ab951f1216b494bff68f1952c16252fbea6` (AFT 0.61.0), on **eight allocated
+vCPUs**, with serialized Cargo jobs. The benchmark-driver repair
+`29960638e28c8a86cfd1a13b866b7dfd9c692438`, the 43 historical row judgments in
+`judgments/own-repo-close.json`, and the generic analyzer repairs
+`a85ae362057cf0a42f6317fd139192e3ace4f9c8` were already ancestors of this source.
+They were not reimplemented or replaced with exclusions. The actual benchmark
+package passes `./node_modules/.bin/tsc --noEmit --project benchmarks/tsconfig.json`
+(TypeScript 5.9.3); it has no `typecheck` script of its own.
+
+**The seven-repository diagnostics/footer comparison has now executed, but the
+all-producer acceptance gate has not passed.** The following table is the current
+result; all tables in the older sections below remain history for their named
+source revisions, not current acceptance claims.
+
+| Final target | Current measurement | Acceptance |
+|---|---|---|
+| AFT Rust <= rustc + 10 | Rust D12; all-target rustc D0 | **Not met**; three sampled new rows are demonstrable false positives, nine remain unjudged in this capture |
+| Historical 33 Rust / 10 TS row review | All 43 already individually judged; 29 Rust false positives, four allowed-dead Rust helpers; three TS test-only references, seven genuinely unused TS declarations | Historical review complete; existing generic fixtures and explanations retained |
+| Current in-domain AFT TS dead-code review | D7; all seven judged, 0 unjudged | Complete; includes newly unused `bridgeFor`, while historical `OpenCodeHostConfig` was removed |
+| Current AFT unused exports | Project U145; **100 in-domain**, oracle 152, agreements 100; precision 1.000, recall 0.658 | Numeric, not unknown; **100 unjudged in this new capture** (the historical U104 review is not relabeled as a current review) |
+| Seven-repository diagnostics/footer comparison | Seven repos / eight language samples collected; four samples scoreable, four unknown; all seven project footers honestly mask missing producers | **Executed, incomplete**; no unavailable producer counted as zero; Outline numeric project E/W target not established |
+| Overall campaign | New source and dependency environment; no new six-repo liveness before/after comparison | **Not passed**; no monotonicity, TypeORM policy, or scoped-timing claim added |
+
+### Current own-repository capture and source drift
+
+The unchanged collector ran with `--repo aft --aft-bin target/release/aft
+--aft-commit dab88ab951f1216b494bff68f1952c16252fbea6 --diagnostics-sample 0` and
+`--corpus-root target/inspect-follow-up/corpus`. Only the previously documented
+same-mode chmod workaround was applied at runtime: it skips the own config's
+chmod only if the saved full mode already matches, and still restores bytes and
+checks unchanged Git status. Three such no-op calls were recorded. No plugin,
+Rust analyzer, scoring, manifest, or lockfile implementation changed here.
+
+The release reports **project D22/U145**, not the historical Rust D4 / plugin U104
+measurements. D22 comprises Rust 12 and TS 10; only **seven** TS rows are inside
+the two plugin scoring prefixes. U145 similarly includes other packages; the
+unchanged scorer counts **100**, not 145, in the plugin domain. Python coverage
+is explicitly incomplete (130 unsupported files, 1,975 supported files), rather
+than silently implemented. Own collection preserves the before/after Git status
+and config bytes; task harness edits were present on both sides, so this is an
+unchanged-status claim, not a claim of an empty checkout.
+
+The new Rust sample is not evidence that the old repairs regressed:
+
+- `db/file_identity.rs::is_live_sqlite_handle` is called by the exact-read path
+  at `commands/file_read_exact.rs:75,144`, reached by `subc/flow_read.rs:496`.
+  The handle-guard work landed later (`967e667c2d`, `56652ab5e6`). It is a live
+  production helper, not one of the old allowed-dead sweep helpers.
+- `edit.rs::link_count` is a Windows-only helper actually called by
+  `windows::link_count(destination)` at `edit.rs:339`. The Linux rustc oracle
+  cannot decide Windows liveness.
+- `edit.rs::copy_platform_security` has separate macOS and Linux definitions;
+  the replacement path calls it at `edit.rs:384`. Both this and `link_count`
+  belong to newer replacement/security work (`7be96cfa4e`, `864a5c7050`). The
+  sample demonstrates outstanding resolution/platform false positives; it does
+  **not** establish an exhaustive cause diagnosis for the other nine rows.
+
+Those three false positives and the seven current TS decisions are recorded
+individually in `judgments/diagnostics-follow-up.json`, with no oracle-side
+removals. The original 43-row judgments remain attached to their original
+capture. Its four generic causes remain cfg(test) declarations, private trait
+receiver dispatch, referenced static initializers, and cache-busting template
+imports; the minimal store-backed/Oxc fixtures and prior red/mutation records
+are documented in [the earlier repair slice](slices/own-repo-close.md#generic-liveness-repairs-and-row-decisions).
+No new analyzer behavior was changed, so no new release note is needed.
+
+The current source sample was scored through unchanged `run.py::score_repo`
+with an isolated runtime descriptor containing only these ten current judgments.
+The unavailable historical raw-origin files were not synthesized or pointed at
+a newer capture to make `load_judgments` pass. Thus current Rust D is 3 judged / 9
+unjudged, TS D is 7 / 0, and TS U is 0 / 100. Current TS D matches six of 37
+reference rows (precision 0.857, recall 0.162); the additional `bridgeFor` finding
+is source-confirmed dead even though Fallow does not report it. The historical
+three TS oracle removals were not reapplied to this new score.
+
+### Diagnostics comparison command and observed cells
+
+There was no documented seven-repository diagnostics-only command at this base;
+the README's offline command covered three liveness repos with diagnostics off.
+The new [README command](README.md#seven-repository-diagnostics-and-footer-comparison)
+now runs the missing pass without rebuilding a baseline or changing the scorer:
+
+```sh
+bun run --cwd packages/aft-bridge build
+python3 benchmarks/inspect-truth/diagnostics.py \
+  --aft-bin target/release/aft \
+  --corpus-root target/inspect-follow-up/corpus \
+  --output-dir target/inspect-follow-up/diagnostics-final \
+  --sample 60 --same-mode-config-restore
+```
+
+All seven source pins are those in `corpus.json`; the own source is the commit
+above. The runner reuses the campaign's seeded samples, NDJSON session/client,
+reference invocations and parsers, and `(file,line)` matching. It compares
+errors/warnings, not hints. For the own plugin roots only, tsc project arguments
+are made relative to the working directory and diagnostic paths are normalized
+back to repository-relative paths. Cargo reference checks finish before AFT can
+start rust-analyzer. No TypeORM measurement-exclusion policy was changed or
+needed for this diagnostics-only pass.
+
+`unknown` below is not zero. Agreement/disagreement counts for unknown rows are
+also unknown, not zero scores. A zero in a scoreable sample means the scoped
+producer actually returned authoritative reports. It does not imply project-wide
+producer completeness.
+
+| Repository / language | Sampled files | AFT E/W | Reference E/W | Agreed | AFT-only | Reference-only |
+|---|---:|---:|---:|---:|---:|---:|
+| Outline / TS | 60 | 1 | tsc: 0 | 0 | 1 | 0 |
+| TypeORM / TS | 60 | 0 | tsc: 0 | 0 | 0 | 0 |
+| ripgrep / Rust | 60 | unknown | cargo: unavailable | unknown | unknown | unknown |
+| axum / Rust | 60 | unknown | cargo: unavailable | unknown | unknown | unknown |
+| soft-serve / Go | 60 | unknown | go vet: 0 | unknown | unknown | unknown |
+| FastAPI / Python | 52 | 22 | Pyright: 50 | 22 | 0 | 28 |
+| AFT / Rust | 60 | unknown | cargo: 0 | unknown | unknown | unknown |
+| AFT / TS | 60 (58 examined) | 0 | tsc: 0 | 0 | 0 | 0 |
+
+The inherited sampler filters TypeScript extensions but otherwise selects tracked
+paths under the configured scoring prefixes; a Rust/Go sample is not promised to
+contain only source files. The selected paths are retained verbatim. Outline,
+TypeORM and FastAPI examined all sampled files; AFT TS examined 58 of
+60 selected paths. The Rust/Go pages examined zero files and carry explicit
+failed-producer/uncovered-file gaps, rather than authoritative empty lists.
+The matching rule is the existing line-based rule, not a claim that diagnostic
+codes or severity are always identical.
+
+### Named producer gaps and the actual footer
+
+Each row below was rendered by the production OpenCode `coerceAftStatus` parser
+and `formatAftStatusSegment` formatter, not reconstructed from diagnostic counts.
+All project snapshots have `diagnostics: "producer_missing"`; null E/W and
+`E? W?` are correct, including in projects whose sampled TS files were complete.
+The initial footer was `AFT E? W? | D? U? C? | T?` in each fresh process.
+
+| Repository | Unavailable/failed project producers | Final real footer |
+|---|---|---|
+| Outline | `yaml-language-server` | `AFT E? W? \| D74 U245 C173 \| T19` |
+| TypeORM | `bash-language-server`, `yaml-language-server` | `AFT E? W? \| D140 U190 C427 \| T10` |
+| ripgrep | `rust-analyzer`, `bash-language-server`, `yaml-language-server` | `AFT E? W? \| D4 U0 C23 \| T11` |
+| axum | `rust-analyzer` | `AFT E? W? \| D6 U0 C31 \| T7` |
+| soft-serve | `gopls`, `yaml-language-server` | `AFT E? W? \| D29 U0 C11 \| T33` |
+| FastAPI | `bash-language-server`, `yaml-language-server` | `AFT E? W? \| D0 U0 C37 \| T18` |
+| AFT | `rust-analyzer`, `bash-language-server`, `yaml-language-server`, Dockerfile server (`docker-langserver`/`docker-language-server`) | `AFT E? W? \| ~D? U145 C532 \| T0` |
+
+Rust's executable was the rustup proxy, which exited during initialization:
+`Unknown binary 'rust-analyzer' in official toolchain
+'1.99.0-x86_64-unknown-linux-gnu'`. This is a failed producer, not a working
+server with no diagnostics. `gopls` and the named Bash/YAML/Dockerfile binaries
+were unavailable. No producer request hit the runner's 900-second timeout.
+Ripgrep's separate Cargo oracle could not resolve `pcre2`, and axum's could not
+resolve `multer`, in the runner's offline registry. Those reference failures are
+also unknown, not empty Rust reference outputs. The own Cargo oracle completed
+with `Finished`/exit 0; its zero diagnostic/dead-code counts are real results.
+
+### Judged diagnostic examples and remaining uncertainty
+
+There are no agreements or disagreements to sample from a **complete empty**
+TypeORM/AFT-TS comparison, and unknown Rust/Go lists are not evidence of no
+findings. The nonempty observed cells were reviewed against the exact source
+pins:
+
+- **AFT-only, Outline `app/hooks/useShareDataLoader.ts:30`:** the source calls
+  `setLoading(false)` synchronously inside the effect at lines 28-31. The AFT
+  oxlint warning correctly identifies that React Compiler/lint pattern; tsc
+  does not implement that lint. This is a producer-domain difference, not an
+  invented TypeScript type error or a reason to delete an oracle row.
+- **Agreed, FastAPI `fastapi/_compat/v2.py:27`:** both reports name the same
+  private-import diagnostic for `GetJsonSchemaHandler` from Pydantic's internal
+  module. The source has `# type: ignore[attr-defined]`, which does not suppress
+  Pyright's `reportPrivateImportUsage`. The diagnostic is supported for the
+  installed dependency/type-checker combination, not a claim of a runtime bug.
+- **Agreed, FastAPI `fastapi/_compat/v2.py:164`:** both reports flag the dynamic
+  `Annotated[annotated_args]` passed to `TypeAdapter`; the source's explicit
+  `# ty: ignore[invalid-type-form]` is for a different checker. The paired
+  argument-type and invalid-type-form messages are not fabricated agreements.
+- **Reference-only, FastAPI `fastapi/telemetry/_asgi.py:176,178`:** the source
+  directly indexes `config["tracing"]` and `config["tracer_provider"]`, whose
+  declared `TelemetryConfig` is `TypedDict(total=False)` in `_api.py:35`.
+  Pyright's optional-key-access diagnostics have a concrete type-level basis;
+  no preceding membership guard narrows those keys. These are actual missing
+  sampled AFT observations, not oracle rows judged out. The adjacent metrics
+  access at line 183 is the same class.
+
+An earlier retained capture observed **38** FastAPI E/W (38 agreements, 12
+reference-only), while the final fresh process observed **22** (22 agreements,
+28 reference-only), despite the same sampled files, binary and reference total
+50. Both captures' pages claim authoritative coverage. This is unresolved
+observation instability, not an accuracy improvement; no wait loop was added
+until a desired count appeared. The project footer remains correctly unknown
+for the named non-Python producer gaps. Neither this result nor fixture-only
+masking tests establishes the all-repository diagnostic acceptance gate.
+
+### Verification and retained current evidence
+
+The release build finished (`cargo build --release -p agent-file-tools`,
+17m26s; Cargo/rustc 1.99.0). Bun is 1.4.2, Python 3.14.4, Fallow 2.88.3 (verified
+signed binary), Knip 5.85.0, Pyright 1.1.414 and typescript-language-server 6.0.2.
+The Go bootstrap is 1.24.4; soft-serve's `go vet` automatically uses its required
+1.26.5 toolchain. Its unrelated staticcheck/deadcode runs report unsupported
+newer Go types; they are not substituted for the completed empty `go vet`
+diagnostic report. FastAPI uses its own editable virtualenv, with Pydantic
+2.14.1 and Starlette 1.9.0; these freshly resolved dependencies are another
+reason not to treat the old and current diagnostic ratios as a controlled
+before/after product comparison. No tracked manifest or lockfile changed.
+
+The final gates passed: `python3 benchmarks/inspect-truth/test_diagnostics.py -v`
+**7 tests**, `python3 benchmarks/inspect-truth/test_score.py -v` **39 tests**
+(Python 3.12.3 on the non-network runner), and `bun run lint` **751 files**
+(Biome 2.4.7). The benchmarks typecheck above exits 0. Scoped Pyright inspection
+is authoritative for both new Python files with zero errors/warnings; the
+unrelated checkout Tier-2 view is not ready, so that inspection's overall header
+is partial, not a claimed complete repository-health pass.
+
+The diagnostics runner tests cover unknown-vs-zero, omitted successful
+`complete`, reference failure, real footer masking/numbers and the narrowly
+scoped chmod skip. Two staged-state `NON-VACUITY BREAK` controls each reddened
+exactly one test while the other six passed:
+
+- Discarding page coverage failures: `test_missing_producer_is_unknown_not_zero`,
+  `AssertionError: 'scored' != 'unknown'`.
+- Treating an omitted successful `complete` flag as false:
+  `test_complete_flag_may_be_omitted_on_success`,
+  `AssertionError: 'unknown' != 'scored'`.
+
+Each mutation had a non-empty `diagnostics.py` diff and an empty unstaged
+`git diff --stat` after restoration from the staged live state. One queued
+mutation attempt was refused before execution (`queue_wait_exceeded`); it was
+restored immediately and later executed successfully on Linux, not retried on
+macOS. No mutation remains in the delivered source. The corpus command exits **1**, correctly reporting seven
+incomplete project diagnostic/footer coverages, rather than passing all-repo
+acceptance. Earlier runner attempts failed before collection until the bridge
+was built in the same remote job; the first collector's omitted-`complete`
+classification was corrected and tested before the final capture.
+
+Current raw evidence is retained outside regenerable build directories under
+`.cortexkit/internal-docs/investigations/inspect-truth-follow-up/`: both diagnostic
+captures, raw replies, reference output/metadata, own findings/oracles, scored
+current sample and verification logs. The exported archive SHA-256 is
+`86a96f7ed9c244456729f7d161e6a453cb4d9de274b67725ec1c23de5f28a509` (173 extracted
+files); the candidate binary's SHA-256 is
+`bae96f74de7996673b15c5ef2b0bfd3f3d101d191af57d0619eaa40c5ff4833b`.
+The earlier reports and their evidence identities below are retained as history.
+
 ## Acceptance-blocker follow-up: own repository and TypeORM
 
 Seven-corpus release measurements using new Agent File Tools (AFT) processes,

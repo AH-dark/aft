@@ -31,6 +31,60 @@ directory under `$CORPUS_DIR/_reruns/`. It may not be inside a source repository
 or the imported `_results/` tree. Existing captures and judgments are never
 replaced. `PYTHON` optionally selects the interpreter. `--help` prints usage.
 
+## Seven-repository diagnostics and footer comparison
+
+This separate pass needs only the **candidate release binary**, not the historical
+liveness baseline. It reuses `run.py`'s seeded sampling (60 paths per configured
+language domain),
+NDJSON sessions, reference invocations, parsers and diagnostic matcher. It does
+not change liveness scoring or judgments and leaves the four invalid TypeORM
+codemod-fixture exclusions listed in `corpus.json` untouched.
+
+```sh
+bun run --cwd packages/aft-bridge build
+python3 benchmarks/inspect-truth/diagnostics.py \
+  --aft-bin target/release/aft \
+  --corpus-root target/inspect-follow-up/corpus \
+  --output-dir local-ignore/inspect-follow-up/diagnostics \
+  --sample 60
+```
+
+Omitting `--repo` selects all seven entries in `corpus.json`. Fetch/install the
+pinned corpus first with `python3 benchmarks/inspect-truth/run.py fetch
+--corpus-root target/inspect-follow-up/corpus`. Reference tools and language
+servers must be available where `run.py` expects them: Fallow, Pyright and Go
+on PATH; `knip`/fallback `tsc` in `<corpus-root>/.tools/node/node_modules/.bin/`;
+Vulture in `<corpus-root>/.tools/py/bin/`; and staticcheck/deadcode in
+`<corpus-root>/.tools/go-bin/`. TypeScript normally comes from each project's
+installed dependencies. Rust needs Cargo and a working rust-analyzer toolchain. The
+reference invocations also collect their usual liveness outputs, but this runner
+compares **diagnostics only**. Cargo checks are serialized and finish before AFT
+starts rust-analyzer. For AFT plugin references, the collector runs from each
+configured Fallow working directory and converts reported paths back to
+repository-relative paths. The runner may install corpus dependencies with
+`run.py`'s configured install commands; provide external reference tools and
+language-server executables separately.
+
+Output must be a new directory. Each repository retains the sampled paths, raw
+NDJSON replies, reference output/exit metadata, observed agreements/disagreements,
+which diagnostic tools were missing/incomplete and which reference working
+directories failed, and status snapshots before and after an unscoped diagnostic
+read. The footer goes through the production OpenCode `coerceAftStatus` parser
+and `formatAftStatusSegment` formatter via Bun, not a Python reconstruction.
+`results.json` combines all seven records. Exit 1 means at least one diagnostic
+comparison or footer capture is incomplete; unavailable/timed-out producers
+remain named and an observed empty list is **not** reported as an authoritative
+zero. Source review of disagreement examples belongs in the campaign report.
+
+On the remote read-only bind mount only, add `--same-mode-config-restore`. This
+skips chmod exclusively for this checkout's `.cortexkit/aft.jsonc` when its full
+mode already equals the saved mode; all other paths/mode changes still call
+chmod. The skipped calls are recorded. The original config bytes are written
+back, and `run.py` verifies that Git status is unchanged.
+
+Regression checks: `python3 benchmarks/inspect-truth/test_diagnostics.py -v`
+(Python 3.9+, Bun, installed workspace dependencies).
+
 ## Exactly what to copy
 
 Copy these paths from the delivered worktree into `CORPUS_DIR`, preserving the
