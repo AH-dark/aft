@@ -17,30 +17,36 @@ pub const VISIBLE_PATH_CAP: usize = 20;
 /// include paths beyond this limit.
 pub const SKIPPED_PATH_SAMPLE_CAP: usize = 5;
 
-/// Why a view member was published without one of its derived planes.
+/// Why a path ended without one of its derived planes, or outside the
+/// generation, for a reason no retry would change.
 ///
-/// A skip is a terminal state, not a problem state: the path is in the
-/// generation, the view is complete, and no later work will change the
-/// outcome until the file's content changes. It is recorded so status can say
-/// which members a plane left out instead of hiding them. Skips live in their
-/// own table and never count as pending or failed.
+/// A skip is a terminal state, not a problem state: the view is complete, and
+/// no later work will change the outcome until the path's content or Git mode
+/// changes. It is recorded so status can say which paths were left out
+/// instead of hiding them. Skips live in their own table and never count as
+/// pending or failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SkipReason {
     /// The file is in a call-graph language but is not valid UTF-8, so the
     /// parser cannot read it. It is published with an empty call graph; the
     /// call graph built without views also leaves such files out.
     NonUtf8Source,
+    /// HEAD lists the path with a Git mode that is neither a regular file, a
+    /// symlink nor a submodule, which view assembly does not know how to
+    /// publish. The path is left out of the generation.
+    UnsupportedGitMode,
 }
 
 impl SkipReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NonUtf8Source => "non_utf8_source",
+            Self::UnsupportedGitMode => "unsupported_git_mode",
         }
     }
 }
 
-/// One skipped member named in a status summary.
+/// One skipped path named in a status summary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathSkip {
     pub rel_path: Vec<u8>,
@@ -53,7 +59,9 @@ pub struct PathSkip {
 pub(crate) struct StatusIntent {
     /// The generation the intent describes; new skip rows start at it.
     pub generation: u64,
-    /// Every member of the generation.
+    /// Every path the generation accounts for: its members, and HEAD paths
+    /// it leaves out with a recorded skip (an unsupported Git mode). Skips of
+    /// any other path are dropped.
     pub members: std::collections::HashSet<Vec<u8>>,
     /// Paths whose semantic work is still outstanding; they stay pending.
     pub keep_pending: std::collections::BTreeSet<Vec<u8>>,
@@ -260,9 +268,9 @@ pub struct PathStatusSummary {
     pub pending_count: usize,
     pub failed_count: usize,
     pub paths: Vec<PathStatus>,
-    /// Skipped members by reason. Skips are not counted as pending or failed.
+    /// Skipped paths by reason. Skips are not counted as pending or failed.
     pub skipped_by_reason: std::collections::BTreeMap<String, usize>,
-    /// At most `SKIPPED_PATH_SAMPLE_CAP` skipped members, bytewise ordered.
+    /// At most `SKIPPED_PATH_SAMPLE_CAP` skipped paths, bytewise ordered.
     pub skipped_sample: Vec<PathSkip>,
 }
 

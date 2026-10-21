@@ -48,7 +48,7 @@ pub struct AssemblyReport {
     pub published: bool,
 }
 
-/// A missing blob or unsupported tracked-file mode found while assembling a
+/// A missing blob or outstanding semantic work found while assembling a
 /// checkout generation. Retain this evidence so queries can explain what must
 /// arrive or change without reading the blob stores or checkout files again.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -70,6 +70,28 @@ struct Candidate {
 #[cfg(test)]
 thread_local! {
     static RETAINED_CANDIDATE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HEAD_REWRITE: std::cell::RefCell<Option<HeadRewrite>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type HeadRewrite = Box<dyn FnOnce(&mut Vec<crate::alias::TrackedPath>)>;
+
+/// Applies `rewrite` to the HEAD listing the next assembly on this thread
+/// reads, so a test can add entries a real `git ls-tree` does not print, such
+/// as a non-canonical mode.
+#[cfg(test)]
+fn rewrite_next_head_for_test(rewrite: impl FnOnce(&mut Vec<crate::alias::TrackedPath>) + 'static) {
+    HEAD_REWRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(rewrite)));
+}
+
+#[cfg(test)]
+fn rewrite_head_for_test(
+    mut head: Vec<crate::alias::TrackedPath>,
+) -> Vec<crate::alias::TrackedPath> {
+    if let Some(rewrite) = HEAD_REWRITE.with(|slot| slot.borrow_mut().take()) {
+        rewrite(&mut head);
+    }
+    head
 }
 
 pub fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
@@ -490,8 +512,11 @@ pub fn prepare_checkout_deferring(
     let mut semantic_pending_paths = BTreeSet::new();
     let mut pending_inputs = BTreeMap::new();
     let mut fresh_skips = Vec::new();
+    let mut unsupported_mode_paths = Vec::new();
     let mut candidates = Vec::with_capacity(head.len());
 
+    #[cfg(test)]
+    let head = rewrite_head_for_test(head);
     for tracked in head {
         let rel_path = RelPath::new(tracked.rel_path.clone())?;
         let absolute = request
@@ -632,16 +657,23 @@ pub fn prepare_checkout_deferring(
                     source: needs_source.then_some(source),
                 });
             }
-            GitMode::Other(_) => {
-                pending_inputs.insert(
-                    tracked.rel_path.clone(),
-                    PendingInput {
-                        plane: "membership",
-                        reason: "unsupported Git mode",
-                        blob_key: None,
-                    },
+            GitMode::Other(mode) => {
+                // Git's tree reader canonicalizes every entry mode before
+                // `git ls-tree` prints it (canon_mode in Git's tree-walk.c):
+                // to a regular file, symlink, directory (recursed into with
+                // -r, never printed) or submodule (160000, the Gitlink arm
+                // above). So no Git release is known to reach this arm. If one
+                // does, this assembler has no way to publish the entry: leave
+                // the path out with a recorded skip instead of holding back
+                // the whole generation for a mode no retry will change.
+                crate::slog_warn!(
+                    "content-addressed view publication skipped {} with unsupported Git mode {} root={}",
+                    String::from_utf8_lossy(&tracked.rel_path),
+                    String::from_utf8_lossy(&mode),
+                    request.project_root.display()
                 );
-                blocking_paths.insert(tracked.rel_path);
+                unsupported_mode_paths.push(tracked.rel_path.clone());
+                fresh_skips.push((tracked.rel_path, Some(SkipReason::UnsupportedGitMode)));
             }
         }
     }
@@ -790,9 +822,11 @@ pub fn prepare_checkout_deferring(
     // `StatusSettlement`.
     let intent = crate::path_status::StatusIntent {
         generation: generation_number(&next_generation),
+        // HEAD paths left out for their Git mode keep their skips.
         members: candidates
             .iter()
             .map(|candidate| candidate.path.as_bytes().to_vec())
+            .chain(unsupported_mode_paths)
             .collect(),
         keep_pending: semantic_pending_paths.clone(),
         marked_through,
@@ -2160,6 +2194,129 @@ mod status_settlement_tests {
         let report = publish_checkout(&request(&root, storage.path(), "head-2")).unwrap();
         assert!(!report.published, "expected a no-op publication");
         assert_eq!(pending(storage.path()), 0);
+    }
+
+    fn manifest_paths(storage: &Path, report: &AssemblyReport) -> Vec<String> {
+        ViewStore::open(storage, SCOPE)
+            .unwrap()
+            .load_manifest(report.generation.as_deref().unwrap())
+            .unwrap()
+            .entries()
+            .map(|(path, _)| String::from_utf8_lossy(path.as_bytes()).into_owned())
+            .collect()
+    }
+
+    /// A HEAD path whose Git mode is not a regular file, a symlink or a
+    /// submodule is one view assembly cannot publish. It must not hold back
+    /// the generation: the rest publishes, the path is left out with a
+    /// recorded skip, and a pending row scheduled for it settles. Once HEAD no
+    /// longer lists it, the skip is dropped.
+    #[test]
+    fn views_unsupported_git_mode_is_skipped_without_blocking_publication() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        assert!(
+            publish_checkout(&request(&root, storage.path(), "head-1"))
+                .unwrap()
+                .published
+        );
+        status(storage.path())
+            .mark_pending(b"odd/entry", "view publication scheduled", 1)
+            .unwrap();
+
+        // Real repositories cannot produce this entry through `git ls-tree`,
+        // which prints canonical modes, so inject it into the HEAD listing.
+        // 100664 is a legacy group-writable file mode.
+        rewrite_next_head_for_test(|head| {
+            let oid = head[0].git_oid;
+            head.push(
+                crate::alias::TrackedPath::new(
+                    b"odd/entry".to_vec(),
+                    GitMode::Other(b"100664".to_vec()),
+                    oid,
+                )
+                .unwrap(),
+            );
+        });
+        let report = publish_checkout(&request(&root, storage.path(), "head-2")).unwrap();
+        assert!(
+            report.published,
+            "an unsupported mode held back publication"
+        );
+        assert!(
+            report.pending_paths.is_empty(),
+            "{:?}",
+            report.pending_paths
+        );
+        assert_eq!(manifest_paths(storage.path(), &report), vec!["file_0.ts"]);
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert_eq!(
+            summary.skipped_by_reason,
+            BTreeMap::from([("unsupported_git_mode".to_string(), 1)])
+        );
+        assert_eq!(summary.skipped_sample[0].rel_path, b"odd/entry");
+
+        let report = publish_checkout(&request(&root, storage.path(), "head-3")).unwrap();
+        assert!(report.pending_paths.is_empty());
+        assert!(skips(storage.path()).is_empty());
+    }
+
+    /// A submodule is HEAD mode 160000. It is published as a gitlink entry
+    /// (its commit, no content), never pending and never skipped.
+    #[test]
+    fn views_submodule_entry_publishes_as_a_gitlink() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let commit = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        git(
+            &root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},vendor/sub", commit.trim()),
+            ],
+        );
+        // Commit the index as is: `git add .` would stage the submodule's
+        // absent checkout directory as a deletion.
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "submodule",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let report = publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        assert!(report.published);
+        assert!(
+            report.pending_paths.is_empty(),
+            "{:?}",
+            report.pending_paths
+        );
+        let manifest = ViewStore::open(storage.path(), SCOPE)
+            .unwrap()
+            .load_manifest(report.generation.as_deref().unwrap())
+            .unwrap();
+        assert!(manifest.entries().any(|(path, entry)| {
+            path.as_bytes() == b"vendor/sub" && matches!(entry, ManifestEntry::Gitlink { .. })
+        }));
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert!(summary.skipped_by_reason.is_empty());
     }
 
     /// A committed repository with one Python file that is not UTF-8, so
