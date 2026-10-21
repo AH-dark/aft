@@ -177,7 +177,7 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] | null 
     for (let i = 0; i < prefix; i++) {
       ops.push({ tag: "eq", beforeIdx: i, afterIdx: i, line: a[i] });
     }
-    ops.push(...middle);
+    for (const op of middle) ops.push(op);
     for (let i = 0; i < suffix; i++) {
       ops.push({
         tag: "eq",
