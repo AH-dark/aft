@@ -4,8 +4,8 @@ import type {
   AftTransportPool,
   BashCompletedPayload,
   BashLongRunningPayload,
-  BgNudgeRef,
   BashPatternMatchAck,
+  BgNudgeRef,
   BridgeOptions,
 } from "@cortexkit/aft-bridge";
 import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
@@ -19,8 +19,8 @@ import {
   formatSystemReminder,
   handleSubcBgEventsNudge,
   holdBgCompletion,
-  markBgCompletionDelivered,
   isPatternMatchEntry,
+  markBgCompletionDelivered,
   type PatternMatchEntry,
 } from "../bg-notifications.js";
 import type { AftConfig } from "../config.js";
@@ -59,7 +59,10 @@ interface WakeRoute {
     bridge: AftProjectTransport,
     acknowledge?: boolean,
   ): Promise<boolean | undefined>;
-  standaloneCompletion?(completion: BashCompletedPayload, bridge: AftProjectTransport): Promise<void>;
+  standaloneCompletion?(
+    completion: BashCompletedPayload,
+    bridge: AftProjectTransport,
+  ): Promise<void>;
   patternMatch?(match: PatternMatchEntry, bridge: AftProjectTransport): Promise<boolean>;
   /** Record a status-only long-running reminder in its session. */
   longRunning(reminder: BashLongRunningPayload): Promise<void>;
@@ -479,7 +482,10 @@ export function createV2RuntimeConsumer(
       return attempt;
     },
     drainPatterns: async (sessionID, root) => {
-      if (!getBridge || disposed) return;
+      // SubC owns session-event subscriptions and retries pending wakes after
+      // host admission fails. A parallel standalone drain would open streams
+      // outside SubC's recovery window and could deliver the same wake twice.
+      if (!getBridge || disposed || subcPool) return;
       const drainKey = JSON.stringify([sessionID, root]);
       const active = draining.get(drainKey);
       if (active) return active;
@@ -562,8 +568,9 @@ export function createV2RuntimeConsumer(
       );
       // A wake that was not admitted (a staged revert defers it) reaches the
       // agent later, so it must not end a wait now.
-      if (!admitted) return false;
-      detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
+      if (disposed || admitted === "not-delivered") return false;
+      if (admitted === "delivered")
+        detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
 
       if (acknowledge) {
         if (subcPool) {
@@ -624,11 +631,12 @@ export function createV2RuntimeConsumer(
           },
         }),
       );
-      if (admitted) {
+      if (disposed || admitted === "not-delivered") return false;
+      if (admitted === "delivered") {
         detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
         if (match.reason === "task_exit") forgetUnroutedCompletion(match.session_id, match.task_id);
       }
-      return admitted;
+      return true;
     },
     standaloneCompletion: async (completion, bridge) => {
       if (subcPool) {
