@@ -8756,7 +8756,7 @@ mod tests {
                 .count(),
             1
         );
-        let parked = ctx.take_parked_configure_tail().unwrap();
+        let mut parked = ctx.take_parked_configure_tail().unwrap();
         assert_eq!(
             parked.jobs.len(),
             1,
@@ -8766,18 +8766,40 @@ mod tests {
             parked.jobs.front().unwrap().job.session_id,
             "bounded-recovery"
         );
+        let retry_at = parked.jobs.front().unwrap().replay_retry_at.unwrap();
+        parked.replay_retry_cutoff = Some(
+            retry_at
+                .checked_sub(Duration::from_nanos(1))
+                .expect("the backoff deadline must be after the test cutoff"),
+        );
         ctx.park_configure_tail(parked);
         assert!(
             !ctx.configure_tail_has_work(),
-            "a future retry must not occupy a maintenance worker"
+            "a retry before its backoff deadline must not occupy a maintenance worker"
         );
+        let mut parked = ctx.take_parked_configure_tail().unwrap();
         let examined = registry.project_replay_scan_total_examined_for_test();
-        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            !super::drain_deferred_configure_maintenance_unit(&ctx, &mut parked),
+            "another maintenance unit before the deadline must not retry the failed scan"
+        );
         assert_eq!(
             registry.project_replay_scan_total_examined_for_test(),
             examined,
-            "another drain before the deadline must not retry the failed scan"
+            "another maintenance unit before the deadline must not retry the failed scan"
         );
+        ctx.park_configure_tail(parked);
+
+        let mut parked = ctx.take_parked_configure_tail().unwrap();
+        parked.replay_retry_cutoff = Some(retry_at);
+        ctx.park_configure_tail(parked);
+        assert!(
+            ctx.configure_tail_has_work(),
+            "a retry is due at its backoff deadline"
+        );
+        let mut parked = ctx.take_parked_configure_tail().unwrap();
+        parked.replay_retry_cutoff = None;
+        ctx.park_configure_tail(parked);
 
         let make_retry_due = || {
             registry.expire_project_replay_backoff_for_test();
