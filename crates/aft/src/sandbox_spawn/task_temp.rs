@@ -16,6 +16,10 @@ const ROOT: &str = "/tmp/aft-w";
 const SWEEP_BUDGET: usize = 128;
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+pub(super) fn root() -> &'static Path {
+    Path::new(ROOT)
+}
+
 struct Parent {
     file: File,
     path: PathBuf,
