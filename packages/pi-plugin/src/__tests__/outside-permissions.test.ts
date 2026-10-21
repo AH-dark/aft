@@ -155,6 +155,32 @@ describe("engine outside-access asks", () => {
     expect(send).toHaveBeenCalledTimes(2);
   });
 
+  test("a session without Pi's own screen is denied at once, without a prompt", async () => {
+    for (const mode of ["rpc", "json", "print"]) {
+      const send = mock(async () => ask(mode));
+      const confirm = mock(async () => true);
+      const extCtx = { ...context(confirm), mode } as unknown as ExtensionContext;
+      const error = await withOutsidePermissions({}, extCtx, send).catch((e: unknown) => e);
+      expect(error).toMatchObject({ code: "permission_denied" });
+      const message = (error as Error).message;
+      expect(message).toContain("none was possible");
+      // The denial names no path, so it cannot tell the agent what exists.
+      expect(message).not.toContain("/outside/");
+      expect(confirm).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test("Pi's terminal UI still prompts for outside access", async () => {
+    let sends = 0;
+    const send = async () => (++sends === 1 ? ask("tui") : { success: true, text: "allowed" });
+    const confirm = mock(async () => true);
+    const extCtx = { ...context(confirm), mode: "tui" } as unknown as ExtensionContext;
+    const result = await withOutsidePermissions({}, extCtx, send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
   test("cancellation during confirmation never sends the approved retry", async () => {
     const abort = new AbortController();
     const send = mock(async () => ask("cancelled"));

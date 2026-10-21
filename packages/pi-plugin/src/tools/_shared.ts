@@ -279,6 +279,19 @@ export const MAX_OUTSIDE_PERMISSION_ROUNDS = 256;
  * user's approval arrived after its token expired. */
 export const MAX_EXPIRED_REASKS_PER_PATH = 2;
 
+/**
+ * Whether a person can answer an outside-access prompt in this session. Pi
+ * reports dialog-capable UI in RPC mode too, but there the prompt goes to the
+ * RPC client, which may never answer it, so only Pi's own terminal UI counts.
+ * Pi releases without `mode` keep the `hasUI` answer.
+ */
+export function canPromptForOutsideAccess(
+  extCtx: Pick<ExtensionContext, "hasUI" | "ui"> & { mode?: string },
+): boolean {
+  if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") return false;
+  return extCtx.mode === undefined || extCtx.mode === "tui";
+}
+
 /** The engine owns containment; Pi only presents its exact outside-path asks. */
 export async function withOutsidePermissions<T extends Record<string, unknown>>(
   args: Record<string, unknown>,
@@ -343,9 +356,11 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       if (granted.length) continuations?.set(key, granted);
       return response;
     }
-    if (!extCtx?.hasUI || typeof extCtx.ui?.confirm !== "function") {
+    if (!extCtx || !canPromptForOutsideAccess(extCtx)) {
+      // Deny at once rather than wait for an answer nobody can give. The
+      // message names no path, so it says nothing about what exists there.
       throw new BridgeError(
-        "Permission denied: outside access requires an interactive UI.",
+        "Permission denied: outside access needs approval, but this Pi session has no screen to show a prompt on, so none was possible.",
         "permission_denied",
       );
     }
