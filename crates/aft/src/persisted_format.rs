@@ -657,14 +657,21 @@ pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersist
 /// Forget artifact refusals under a swept directory only when the refused
 /// path is confirmed absent. Permission errors and unreadable paths are not
 /// evidence of removal, and a reader floor is never lowered by housekeeping.
-pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
-    let root = storage_root(root);
+pub fn clear_missing_artifacts(store: PersistedStore, scope: &Path) {
     with_registry(|entries| {
-        let roots = known_roots(entries, Some(&root));
+        // A swept directory is only a scope inside its existing owner. Making
+        // it a new owner would let housekeeping bypass the storage-root floor.
+        let roots = known_roots(entries, None);
+        let (owner, key) = owning_route(scope, &roots).map_or_else(
+            || (None, canonical_scope(scope)),
+            |(root, key)| (Some(root), key),
+        );
         entries.retain(|entry| {
+            let (entry_owner, entry_key) = entry_route(entry, &roots);
             !(entry.refusal.store == store
                 && entry.refusal.source.is_artifact()
-                && entry_under_root(entry, &root, &roots).is_some()
+                && same_owner(entry_owner.as_ref(), owner.as_ref())
+                && entry_key.starts_with(&key)
                 && std::fs::symlink_metadata(&entry.refusal.path)
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
         })
@@ -863,6 +870,51 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_scope_does_not_become_a_storage_owner_or_bypass_its_floor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let tasks = fixture.path().join("bash-tasks");
+        let artifact = tasks.join("session/task/control/metadata.json");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"readable task metadata").unwrap();
+        let store = PersistedStore::BashTask;
+        let floor = UnsupportedPersistedFormat::floor(
+            store,
+            fixture.path().join("reader-floor.json"),
+            u64::from(store.supported()) + 1,
+        );
+        record(&floor, fixture.path());
+        let missing = tasks.join("session/missing/control/metadata.json");
+        record(
+            &UnsupportedPersistedFormat::artifact(store, &missing, 99),
+            &missing,
+        );
+        ROOT_RESOLUTIONS.with(|count| count.set(0));
+        clear_missing_artifacts(store, &tasks);
+        ROOT_RESOLUTIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "cleanup must not resolve and register a new owner"
+            )
+        });
+        assert_eq!(
+            gate(
+                store,
+                &artifact,
+                &artifact,
+                Some(u64::from(store.supported()))
+            ),
+            Err(floor.clone())
+        );
+        assert_eq!(refusal_covering(store, &artifact), Some(floor));
+        assert_eq!(
+            refusals_under(fixture.path()).len(),
+            1,
+            "cleanup must still remove a confirmed missing artifact refusal"
+        );
+    }
 
     fn directory_alias(target: &Path, alias: &Path) {
         #[cfg(unix)]
