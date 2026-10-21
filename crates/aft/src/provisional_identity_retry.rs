@@ -296,6 +296,15 @@ impl PreparedReplay {
         format!("subc-bind-identity-retry-{}", self.root.display())
     }
 
+    /// The session whose bind is replayed.
+    pub(crate) fn session(&self) -> String {
+        self.retry
+            .lock()
+            .as_ref()
+            .map(|retry| retry.request.session().to_string())
+            .unwrap_or_default()
+    }
+
     /// Replay the bind. The checks in [`stale_reason`] run again here, at
     /// admission, because a real bind, an unbind or a settle may have
     /// happened since [`poll`] prepared it.
@@ -334,6 +343,13 @@ fn finish_replay(
 ) {
     let timing = timing();
     let slot = ctx.provisional_identity_retry();
+    if ctx.subc_unbound_quiesced() {
+        // The root unbound while the replay ran (a cancelled replay ends
+        // here). An unbound root does no indexing, so it keeps no retry; its
+        // next bind arms a fresh one if aft.db is still busy.
+        slot.0.lock().take();
+        return;
+    }
     let mut rearmed = slot.0.lock();
     match rearmed.take() {
         // The database was taken again between the check and the replay, so

@@ -194,13 +194,25 @@ fn wait_on_configure_semantic_snapshot_gate_for_test(request_id: &str) {
 #[cfg(not(test))]
 fn wait_on_configure_semantic_snapshot_gate_for_test(_request_id: &str) {}
 
-/// Parks a configure of one root in its commit phase, right after the new
-/// configuration is published and before the cache root, artifact access and
-/// degraded reasons follow it. Tests use it to hold the window in which a
-/// reader admitted beside the configure would see a half-published root.
+/// Parks a configure of one root at a fixed point, so a test can hold it
+/// there. `ConfigPublished` is right after the new configuration is
+/// published and before the cache root, artifact access and degraded reasons
+/// follow it: the window in which a reader admitted beside the configure
+/// would see a half-published root. `WriterAdmitted` is right after the
+/// configure is admitted as the root's exclusive writer, before any change
+/// and before the commit seal: where a bind that loses a race with route
+/// teardown must still stop.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigureGateStage {
+    WriterAdmitted,
+    ConfigPublished,
+}
+
 #[cfg(test)]
 struct ConfigureCommitGate {
     root: PathBuf,
+    stage: ConfigureGateStage,
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
 }
@@ -209,13 +221,26 @@ struct ConfigureCommitGate {
 static CONFIGURE_COMMIT_GATE: std::sync::Mutex<Vec<ConfigureCommitGate>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Arm a one-shot commit gate for the next configure of `root`. Returns a
-/// receiver that fires when that configure parks and a sender that releases
-/// it. Gates for other roots, used by tests running in parallel, are
+/// Arm a one-shot gate at `ConfigPublished` for the next configure of `root`.
+/// Returns a receiver that fires when that configure parks and a sender that
+/// releases it. Gates for other roots, used by tests running in parallel, are
 /// independent.
 #[cfg(test)]
 pub(crate) fn gate_configure_commit_for_test(
     root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    gate_configure_stage_for_test(root, ConfigureGateStage::ConfigPublished)
+}
+
+/// Arm a one-shot gate at `stage` for the next configure of `root` that
+/// reaches it.
+#[cfg(test)]
+pub(crate) fn gate_configure_stage_for_test(
+    root: PathBuf,
+    stage: ConfigureGateStage,
 ) -> (
     crossbeam_channel::Receiver<()>,
     crossbeam_channel::Sender<()>,
@@ -227,6 +252,7 @@ pub(crate) fn gate_configure_commit_for_test(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(ConfigureCommitGate {
             root,
+            stage,
             reached: reached_tx,
             release: release_rx,
         });
@@ -234,14 +260,14 @@ pub(crate) fn gate_configure_commit_for_test(
 }
 
 #[cfg(test)]
-fn wait_on_configure_commit_gate_for_test(root: &Path) {
+fn wait_on_configure_gate_for_test(root: &Path, stage: ConfigureGateStage) {
     let gate = {
         let mut gates = CONFIGURE_COMMIT_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         gates
             .iter()
-            .position(|gate| gate.root == root)
+            .position(|gate| gate.root == root && gate.stage == stage)
             .map(|index| gates.swap_remove(index))
     };
     if let Some(gate) = gate {
@@ -250,8 +276,21 @@ fn wait_on_configure_commit_gate_for_test(root: &Path) {
     }
 }
 
+#[cfg(test)]
+fn wait_on_configure_commit_gate_for_test(root: &Path) {
+    wait_on_configure_gate_for_test(root, ConfigureGateStage::ConfigPublished);
+}
+
+#[cfg(test)]
+fn wait_on_configure_writer_gate_for_test(root: &Path) {
+    wait_on_configure_gate_for_test(root, ConfigureGateStage::WriterAdmitted);
+}
+
 #[cfg(not(test))]
 fn wait_on_configure_commit_gate_for_test(_root: &Path) {}
+
+#[cfg(not(test))]
+fn wait_on_configure_writer_gate_for_test(_root: &Path) {}
 
 #[cfg(test)]
 thread_local! {
@@ -3859,6 +3898,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(deferred) = defer_to_exclusive_configure(&req.id) {
         return deferred;
     }
+    wait_on_configure_writer_gate_for_test(&canonical_cache_root);
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }

@@ -1361,6 +1361,11 @@ struct RootMeta {
     /// A ConfigureTail drain for this root is submitted and has not completed.
     /// Counted across roots against `CONFIGURE_TAIL_CONCURRENCY`.
     configure_tail_in_flight: bool,
+    /// Cancellation for the background identity retry's replayed bind while
+    /// it is queued or running. Maintenance treats the root as having a bind
+    /// in flight, and quiescing the root cancels it, as route teardown
+    /// cancels a route's own pending bind.
+    identity_replay: Option<JobCancellation>,
 }
 
 #[derive(Debug)]
@@ -1578,6 +1583,7 @@ impl RootMeta {
             teardown_persist_submitted_at: None,
             ttl_retention_logged: None,
             configure_tail_in_flight: false,
+            identity_replay: None,
         }
     }
 
@@ -1941,6 +1947,18 @@ fn quiesce_unbound_root_with(
         ctx.bash_background()
             .replace_live_delivery_sessions(HashSet::new());
     }
+    // A bind replayed by the identity retry is this root's bind in flight.
+    // Cancel it as route teardown cancels a route's own pending bind: queued,
+    // it is removed; running, it stops at its next checkpoint before the
+    // commit seal and publishes nothing. One that already sealed finishes, and
+    // its completion quiesces the root again (`finish_identity_replay`).
+    if let Some(replay) = meta.identity_replay.as_ref() {
+        let outcome = executor.cancel_job(root_id, replay);
+        log::debug!(
+            "subc attach: cancelled identity retry bind for quiescing root {} ({outcome:?})",
+            root_id.as_path().display()
+        );
+    }
     let cancelled = if root_id.as_path().is_dir() {
         executor.cancel_queued_root_maintenance(root_id)
     } else {
@@ -2244,10 +2262,7 @@ fn reap_idle_roots_with_presence(
     metrics: &DispatchPathMetrics,
     presence: &RootPresence,
 ) -> IdleReapOutcome {
-    let pending_bind_roots = pending_binds
-        .values()
-        .map(|pending| pending.bind_root_id.clone())
-        .collect::<HashSet<_>>();
+    let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let mut census = ReapBlockerCensus::default();
     let mut candidates = Vec::new();
 
@@ -2757,10 +2772,7 @@ fn submit_due_maintenance_jobs(
     maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
-    let pending_bind_roots = pending_binds
-        .values()
-        .map(|pending| pending.bind_root_id.clone())
-        .collect::<HashSet<_>>();
+    let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let (due_jobs, deferred_jobs) = due_maintenance_jobs(
         live_roots,
         Some(executor),
@@ -4822,6 +4834,10 @@ where
     });
     let mut next_standing_pass_at = tokio::time::Instant::now();
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
+    // Completions of binds replayed by the identity retry; see
+    // `finish_identity_replay`.
+    let (identity_replay_done_tx, mut identity_replay_done_rx) =
+        mpsc::unbounded_channel::<IdentityReplayDone>();
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
     let (deferred_response_tx, mut deferred_response_rx) =
@@ -5888,6 +5904,9 @@ where
                     meta.note_activity();
                 }
             }
+            Some(done) = identity_replay_done_rx.recv() => {
+                finish_identity_replay(&done, &mut live_roots, &routes, &executor);
+            }
             Some(completion) = maintenance_rx.recv() => {
                 decrement_counted_channel(&dispatch_path_metrics.maintenance_queued);
                 let root_id = completion.root_id.clone();
@@ -5919,20 +5938,26 @@ where
                 }
                 if let Some(replay) = completion.identity_replay {
                     // An unbound root does no indexing; its retry is dropped.
-                    let bound = live_roots
-                        .get(&root_id)
-                        .is_some_and(|meta| !meta.unbound_quiesced);
-                    if bound {
-                        let replayed = submit_identity_replay_bind(&executor, root_id.clone(), replay);
+                    if let Some(meta) = live_roots
+                        .get_mut(&root_id)
+                        .filter(|meta| !meta.unbound_quiesced && meta.identity_replay.is_none())
+                    {
+                        let session = replay.session();
+                        let replayed =
+                            submit_identity_replay_bind(&executor, meta, root_id.clone(), replay);
+                        let done_tx = identity_replay_done_tx.clone();
+                        let done_root = root_id.clone();
                         tokio::spawn(async move {
-                            if let Ok(response) = replayed.await {
-                                if !response.success {
-                                    log::warn!(
-                                        "subc attach: identity retry bind did not complete: {}",
-                                        response.data
-                                    );
-                                }
-                            }
+                            let response = await_executor_response(
+                                replayed,
+                                "subc-bind-identity-retry".to_string(),
+                            )
+                            .await;
+                            let _ = done_tx.send(IdentityReplayDone {
+                                root_id: done_root,
+                                session,
+                                response,
+                            });
                         });
                     }
                 }
@@ -9983,16 +10008,86 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
 
 /// Submit a replayed bind exactly as the loop submits a route bind, so the
 /// executor gives it a route bind's admission: a shared hold first, and the
-/// exclusive writer barrier once configure asks to change the root.
+/// exclusive writer barrier once configure asks to change the root. The
+/// root's meta keeps the bind's cancellation while it is in flight, so
+/// maintenance defers the root as for any bind in flight and quiescing the
+/// root cancels it (`quiesce_unbound_root_with`).
 fn submit_identity_replay_bind(
     executor: &Executor,
+    meta: &mut RootMeta,
     root_id: ProjectRootId,
     replay: crate::provisional_identity_retry::PreparedReplay,
 ) -> oneshot::Receiver<Response> {
     let request_id = replay.request_id();
-    executor
-        .submit_bind_cancellable_async(root_id, request_id, Arc::new(move |ctx| replay.run(ctx)))
-        .0
+    let (completion, cancellation) = executor.submit_bind_cancellable_async(
+        root_id,
+        request_id,
+        Arc::new(move |ctx| replay.run(ctx)),
+    );
+    meta.identity_replay = Some(cancellation);
+    completion
+}
+
+/// A replayed bind finished (completed, failed, or cancelled).
+struct IdentityReplayDone {
+    root_id: ProjectRootId,
+    session: String,
+    response: Response,
+}
+
+/// Settle the loop's record of a replayed bind. If the root quiesced while
+/// the replay was in flight, quiesce it again, as the loop does for a route
+/// bind whose route was torn down: a replay that sealed its commit before
+/// the cancel landed may have opened semantic admission for its session and
+/// queued a configure tail, and an unbound root keeps neither.
+fn finish_identity_replay(
+    done: &IdentityReplayDone,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    executor: &Arc<Executor>,
+) {
+    let Some(meta) = live_roots.get_mut(&done.root_id) else {
+        return;
+    };
+    meta.identity_replay = None;
+    if !done.response.success {
+        log::debug!(
+            "subc attach: identity retry bind for root {} did not complete: {}",
+            done.root_id.as_path().display(),
+            done.response.data
+        );
+    }
+    if !meta.unbound_quiesced {
+        return;
+    }
+    let session_routed = routes
+        .values()
+        .any(|route| route.root == done.root_id && route.session == done.session);
+    if !session_routed {
+        crate::semantic_admission::note_closed(&done.session, done.root_id.as_path());
+    }
+    quiesce_unbound_root(&done.root_id, live_roots, executor);
+}
+
+/// Roots with a bind in flight: a route's pending bind or a replayed bind
+/// from the identity retry. Maintenance defers these roots and the idle
+/// reaper retains them. Route-teardown quiesce decisions deliberately count
+/// only route binds: a replay must not keep an unrouted root bound; it is
+/// cancelled by that quiesce instead.
+fn roots_with_bind_in_flight(
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+) -> HashSet<ProjectRootId> {
+    pending_binds
+        .values()
+        .map(|pending| pending.bind_root_id.clone())
+        .chain(
+            live_roots
+                .iter()
+                .filter(|(_, meta)| meta.identity_replay.is_some())
+                .map(|(root_id, _)| root_id.clone()),
+        )
+        .collect()
 }
 
 fn submit_maintenance_job(
@@ -18819,8 +18914,13 @@ mod tests {
                     let _ = tail.blocking_recv();
                     if let Ok(outcome) = outcome_rx.try_recv() {
                         if let Some(replay) = outcome.identity_replay {
-                            let replayed =
-                                submit_identity_replay_bind(&executor, root_id.clone(), replay);
+                            let mut meta = RootMeta::new(Instant::now());
+                            let replayed = submit_identity_replay_bind(
+                                &executor,
+                                &mut meta,
+                                root_id.clone(),
+                                replay,
+                            );
                             *replay_response.lock() = replayed.blocking_recv().ok();
                         }
                     }
@@ -18922,6 +19022,161 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Run the configure-tail maintenance job on the executor, as the module
+    /// loop's tick does, until the identity retry hands back a bind to replay.
+    fn pump_until_identity_replay(
+        executor: &Executor,
+        root_id: &ProjectRootId,
+    ) -> crate::provisional_identity_retry::PreparedReplay {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
+            let tail = executor.submit_maintenance_async(
+                root_id.clone(),
+                Lane::MaintenanceCommit,
+                "subc-maintenance-drain-configure-tail-identity-retry".to_string(),
+                Box::new(move |ctx| {
+                    let _ = outcome_tx.send(run_configure_tail_maintenance(ctx));
+                    Response::success("tail", json!({}))
+                }),
+            );
+            let _ = tail.blocking_recv();
+            if let Some(replay) = outcome_rx
+                .try_recv()
+                .ok()
+                .and_then(|outcome| outcome.identity_replay)
+            {
+                return replay;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the identity retry never found aft.db free"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The last route unbinds while a replayed bind is admitted as the root's
+    /// writer but has not sealed its commit. Quiescing the root cancels the
+    /// replay like a route's own pending bind: it publishes nothing, schedules
+    /// and installs no index load, starts no watcher, and the root stays
+    /// quiesced.
+    #[test]
+    fn quiescing_the_root_cancels_an_admitted_identity_retry_bind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root_id = configured.root.clone();
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let mut live_roots = HashMap::from([(root_id.clone(), RootMeta::new(Instant::now()))]);
+
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-unbind-test",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-unbind-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": true },
+                    "views": { "enabled": false },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = configured
+            .submit_bind(&executor, bind)
+            .blocking_recv()
+            .expect("provisional bind completes");
+        assert!(bound.success, "{}", bound.data);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        let replay = pump_until_identity_replay(&executor, &root_id);
+        let watcher_before = ctx.watcher_runtime_thread_id_for_test();
+        let (writer_admitted, release_writer) =
+            crate::commands::configure::gate_configure_stage_for_test(
+                canonical_root.clone(),
+                crate::commands::configure::ConfigureGateStage::WriterAdmitted,
+            );
+        let session = replay.session();
+        let replayed = submit_identity_replay_bind(
+            &executor,
+            live_roots.get_mut(&root_id).unwrap(),
+            root_id.clone(),
+            replay,
+        );
+        assert!(
+            roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id),
+            "maintenance must treat the replay as a bind in flight"
+        );
+        writer_admitted
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the replay is admitted as the root's writer");
+
+        // The last route unbinds: route teardown fences the lifecycle, then
+        // quiesces the root.
+        ctx.mark_subc_unbound();
+        quiesce_unbound_root(&root_id, &mut live_roots, &executor);
+        release_writer.send(()).unwrap();
+        let response = replayed.blocking_recv().expect("replay completes");
+
+        // State the replay left, before `finish_identity_replay` settles its
+        // completion.
+        assert_eq!(
+            response.data["code"], "request_cancelled",
+            "a replay that loses the race to quiesce must not commit: {}",
+            response.data
+        );
+        assert!(!ctx.config().indexes.trigram && !ctx.config().indexes.callgraph);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
+        assert_eq!(
+            crate::root_identity::read(&canonical_root, configured.storage.path()).unwrap(),
+            None
+        );
+        assert_eq!(ctx.watcher_runtime_thread_id_for_test(), watcher_before);
+        assert!(!ctx.configure_tail_has_work());
+
+        finish_identity_replay(
+            &IdentityReplayDone {
+                root_id: root_id.clone(),
+                session,
+                response,
+            },
+            &mut live_roots,
+            &HashMap::new(),
+            &executor,
+        );
+        assert!(ctx.subc_unbound_quiesced());
+        assert!(live_roots[&root_id].unbound_quiesced);
+        assert!(live_roots[&root_id].identity_replay.is_none());
+        assert!(!roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id));
+        assert!(!ctx.config().indexes.trigram);
+        assert_eq!(ctx.watcher_runtime_thread_id_for_test(), watcher_before);
     }
 
     /// A [`ConfiguredRoot`] whose configure tail runs on the executor and is
