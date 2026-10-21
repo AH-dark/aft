@@ -1,0 +1,1 @@
+- Heavy index builds take turns fairly: semantic fills that embed nothing no longer use a build slot, a multi-round fill goes behind work already waiting, and view publication waits in line and no longer holds a slot while waiting on locks.
