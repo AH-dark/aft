@@ -1,7 +1,7 @@
 const LINE_COUNT_BYTES: u64 = 1024 * 1024;
 const ENTRY_BUDGET: usize = 10_000;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1577,7 +1577,9 @@ fn handle_outline_files_mode(
             OutlineTableRow::File(file_id) => Some(file_entries[*file_id].absolute_path.clone()),
             OutlineTableRow::Rollup(_) => None,
         })
-        .collect::<Vec<_>>();
+        // A read manifest is a set: sorted and without duplicates, whatever
+        // order the rows are displayed in.
+        .collect::<BTreeSet<_>>();
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut response_data = serde_json::json!({
         "text": text,
@@ -3155,7 +3157,9 @@ struct RenderedOutline {
     truncated: bool,
     shown: usize,
     footer: String,
-    content_files: Vec<PathBuf>,
+    /// The files whose outlines were rendered, as a sorted set like every
+    /// other read manifest.
+    content_files: BTreeSet<PathBuf>,
 }
 
 fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool) -> String {
@@ -3196,7 +3200,7 @@ fn format_multi_file_tree(
     let mut output = String::new();
     let mut truncated = false;
     let mut files_shown = 0;
-    let mut content_files = Vec::new();
+    let mut content_files = BTreeSet::new();
     // Reserve the real list trailer, not a guessed number of bytes. Rendering
     // files atomically keeps every shown type's preview and exact remainder.
     let trailer_reserve =
@@ -3252,7 +3256,7 @@ fn format_multi_file_tree(
             break;
         }
         output.push_str(&file_output);
-        content_files.push(fo.absolute_path.clone());
+        content_files.insert(fo.absolute_path.clone());
 
         files_shown += 1;
         prev_parts = parts.iter().map(|s| *s).collect();
@@ -3554,6 +3558,66 @@ mod tests {
         assert!(!text.contains("hidden_"));
         assert_eq!(response.data["files_list_envelope"]["shown"], 1);
         assert_eq!(response.data["content_files"], serde_json::json!([shown]));
+    }
+
+    /// Both directory renderers display files in their own order (the table
+    /// lists a directory's own files before its subdirectories; the tree sorts
+    /// relative path text), but the read manifest is always sorted in `Path`
+    /// component order, before and after the response wrapper rewrites it.
+    #[test]
+    fn outline_content_files_are_sorted_whatever_the_display_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        for file in ["z.rs", "a-b.rs", "a/b.rs"] {
+            std::fs::write(root.join(file), "pub fn f() {}\n").unwrap();
+        }
+        let normalized = |value: &serde_json::Value| -> Vec<PathBuf> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|path| crate::inspect::job::normalize_path(Path::new(path.as_str().unwrap())))
+                .collect()
+        };
+        let root = crate::inspect::job::normalize_path(&root);
+        let expected: Vec<_> = ["a/b.rs", "a-b.rs", "z.rs"]
+            .into_iter()
+            .map(|file| crate::inspect::job::normalize_path(&root.join(file)))
+            .collect();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..crate::config::Config::default()
+            },
+        );
+        for files_mode in [true, false] {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "sorted-manifest", "command": "outline", "directory": root, "files": files_mode,
+            }))
+            .unwrap();
+            let inner = handle_outline_inner(&request, &ctx);
+            assert!(inner.success, "{files_mode}: {:?}", inner.data);
+            let text = inner.data["text"].as_str().unwrap();
+            let position = |needle: &str| text.find(needle).unwrap();
+            if files_mode {
+                assert!(position("z.rs") < position("a/b.rs"), "{text}");
+            } else {
+                assert!(position("a-b.rs") < position("a/"), "{text}");
+            }
+            assert_eq!(
+                normalized(&inner.data["content_files"]),
+                expected,
+                "{files_mode}"
+            );
+            let wrapped = handle_outline(&request, &ctx);
+            assert_eq!(
+                normalized(&wrapped.data["content_files"]),
+                expected,
+                "{files_mode}"
+            );
+        }
     }
 
     fn navigation_counts(

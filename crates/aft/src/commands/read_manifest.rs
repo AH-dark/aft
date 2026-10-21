@@ -58,6 +58,10 @@ impl ReadManifestPaths {
     }
 }
 
+/// Rewrites a response's `content_files` into read-manifest spelling. The
+/// manifest is a set: every producer reports it sorted (in `Path` component
+/// order) and without duplicates, so two spellings of one file collapse to a
+/// single entry and the order never depends on how the files were displayed.
 pub(crate) fn normalize_response_content_files(ctx: &AppContext, data: &mut serde_json::Value) {
     let Some(paths) = data
         .get("content_files")
