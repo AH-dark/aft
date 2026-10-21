@@ -364,10 +364,12 @@ fn native_doctor_fixes_only_marked_roots_and_old_cache_cleanup_is_explicit() {
     let output = BoundedChild::spawn(&mut command, "native cache-root doctor scenario")
         .output(Duration::from_secs(150));
     assert!(output.status.success(), "{output:?}");
-    // The child prints these progress lines only after it has created cache
-    // roots on the second volume, so their presence proves the scenario ran.
+    // The child prints this progress line only after it has prepared both
+    // cache roots on the second volume, so its presence proves the scenario
+    // ran rather than stopping early.
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("cache-root doctor: preparing old-volume"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cache-root doctor: acquiring first child storage lease"),
         "{output:?}"
     );
 }

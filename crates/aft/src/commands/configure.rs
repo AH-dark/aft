@@ -16193,8 +16193,8 @@ mod tests {
             crate::search_index::artifact_cache_key(&canonical_worktree),
             key
         );
-        // A healthy bind of the worktree persists the key memo that a later
-        // bind falls back to when its Git probe fails.
+        // A successful configure-time key lookup for the worktree stores the
+        // memo that a later lookup uses when its Git probe fails.
         assert_eq!(
             test_context()
                 .memoized_artifact_cache_key_for_configure(
@@ -16255,8 +16255,8 @@ mod tests {
         ctx.set_canonical_cache_root(canonical_worktree.clone());
         ctx.set_cache_role(true, Some(common_dir.clone()));
         crate::root_cache::configure_artifact_access(&canonical_worktree, &key, true);
-        // An interactive session has the worktree open, so a missing snapshot
-        // reports as missing rather than as "not opened".
+        // Mark the worktree as open, as an interactive session would, so a
+        // missing snapshot reports as missing rather than as "not opened".
         struct OpenedRoot(std::path::PathBuf);
         impl Drop for OpenedRoot {
             fn drop(&mut self) {
