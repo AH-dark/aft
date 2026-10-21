@@ -61,6 +61,7 @@ impl Grant {
 struct Transport {
     calls: AtomicUsize,
     roots: Mutex<Vec<String>>,
+    requests: Mutex<Vec<Value>>,
 }
 impl RelayTransport for Transport {
     fn read_repository(&self, ticket: &crate::gh_shim_ticket::Redeemed) -> Result<String, String> {
@@ -81,6 +82,7 @@ impl RelayTransport for Transport {
         assert_eq!(body["name"], "github_read");
         assert_eq!(body["arguments"]["repository"], "cortexkit/aft");
         assert!(body["arguments"].get("principal").is_none());
+        self.requests.lock().unwrap().push(body);
         Ok(json!({"sentinel":"worker-bound-read"}))
     }
     fn opens_scoped_routes(&self) -> bool {
@@ -833,4 +835,59 @@ fn gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition() {
         !helper.contains("/private/tmp/aft-w"),
         "do not duplicate a platform namespace literal in the network fence"
     );
+}
+
+#[tokio::test]
+async fn gh_shim_broker_encoded_paths_are_canonicalized_before_policy() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    for path in [
+        "gr%61phql",
+        "%67raphql",
+        "%2567raphql",
+        "graphql%2Fquery",
+        "issues%2F..%2Fgraphql",
+        "%2Fgraphql",
+        "issues/%2e%2e/graphql",
+        "issues/../graphql",
+        "issues/./7",
+        "issues/%00",
+    ] {
+        let bytes=serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":path}}}})).unwrap();
+        let reply = call(&grant, &transport, &bytes, Some(stamp())).await;
+        assert!(
+            !reply.ok,
+            "encoded or dot-segment worker path must be refused: {path}"
+        );
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            0,
+            "refuse before upstream: {path}"
+        );
+    }
+    let bytes=serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"br%61nches/feature%2ftopic"}}}})).unwrap();
+    assert!(
+        call(&grant, &transport, &bytes, Some(stamp())).await.ok,
+        "an encoded slash in the one branch-name segment remains supported"
+    );
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        transport.requests.lock().unwrap()[0]["arguments"]["args"]["path"],
+        "branches/feature%2Ftopic"
+    );
+}
+
+#[tokio::test]
+async fn gh_shim_broker_query_control_characters_are_refused() {
+    let grant = Grant::new();
+    let transport = Transport::default();
+    for value in ["open\r\nX-Injected: value", "open\0", "open\u{7f}"] {
+        let bytes=serde_json::to_vec(&json!({"capability":grant.capability,"operation":{"op":"gh_shim.read_request","request":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"issues","query":{"state":value}}}}})).unwrap();
+        let reply = call(&grant, &transport, &bytes, Some(stamp())).await;
+        assert_eq!(
+            reply.data["refusal_code"], "worker_query_value_invalid",
+            "{reply:?}"
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    }
 }

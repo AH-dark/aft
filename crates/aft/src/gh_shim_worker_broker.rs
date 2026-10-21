@@ -598,7 +598,7 @@ where
     S: Fn(String) -> F,
     F: std::future::Future<Output = Result<Option<ScopeStamp>, ()>>,
 {
-    let envelope = match decode(bytes) {
+    let mut envelope = match decode(bytes) {
         Ok(envelope) => envelope,
         Err(reply) => return reply,
     };
@@ -626,6 +626,11 @@ where
         emit,
     };
     let reply = async {
+    if let Operation::ReadRequest { request } = &mut envelope.operation {
+        if let Err(error) = request.canonicalize_worker_path() {
+            return RelayReply {ok:false,data:json!({"refusal_code":error.code,"stage":"worker_read_policy","message":error.message})};
+        }
+    }
     if let Operation::ReadRequest { request } = &envelope.operation {
         if let Err(error) = request.validate_worker_query() {
             return RelayReply { ok:false, data:json!({"refusal_code":error.code,"stage":"worker_read_policy","key":error.key,"allowed_keys":crate::gh_shim::read_contract::WORKER_GET_QUERY_KEYS,"message":error.message}) };
