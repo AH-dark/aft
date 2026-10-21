@@ -184,7 +184,13 @@ const GLOB_REASONS: &[ReasonSpec] = &[
         kind: ReasonKind::Selecting,
     },
 ];
-const WALK_BUDGET: &[ReasonSpec] = &[
+// The outline structure map also stops at the request deadline between
+// files, which leaves requested files unexamined: a Bounding time limit.
+const OUTLINE_REASONS: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::TimeLimit,
+        kind: ReasonKind::Bounding,
+    },
     ReasonSpec {
         reason: Reason::Walk,
         kind: ReasonKind::Bounding,
@@ -266,7 +272,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         list_id: "payload.files",
         unit: Unit::Files,
         narrow: &["path"],
-        reasons: WALK_BUDGET,
+        reasons: OUTLINE_REASONS,
     },
     SurfaceSpec {
         command: "read",
@@ -391,6 +397,17 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
         }
         ("glob", "") if has(Reason::Walk) => build_glob_envelope(12, 12, false, true, 0),
         ("glob", "") => build_glob_envelope(5, 21, false, false, 0),
+        // A deadline stop comes from the structure map's envelope; the
+        // files-mode table has no time bound.
+        ("outline", "files") if has(Reason::TimeLimit) => {
+            aft::list_surfaces::outline::build_outline_structure_envelope(
+                412,
+                1980,
+                has(Reason::Budget),
+                has(Reason::Walk),
+                true,
+            )
+        }
         ("outline", "files") => build_outline_files_envelope(
             412,
             if has(Reason::Budget) { 1568 } else { 0 },
@@ -449,6 +466,7 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
             Total::AtLeast(if has(Reason::Cap) { 105 } else { 12 })
         }
         ("glob", "") => Total::Exact(21),
+        ("outline", "files") if has(Reason::TimeLimit) => Total::AtLeast(1980),
         ("outline", "files") => {
             if has(Reason::Walk) {
                 Total::AtLeast(if has(Reason::Budget) { 1980 } else { 412 })

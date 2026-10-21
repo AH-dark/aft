@@ -61,3 +61,50 @@ pub fn build_outline_files_envelope(
         &["path"],
     ))
 }
+
+/// Build the list envelope for the `aft_outline` structure map (a `files`
+/// list or a directory outline).
+///
+/// Causes:
+/// - `TimeLimit` (Bounding): fires iff outlining stopped near the request
+///   deadline with requested files not yet examined.
+/// - `Walk` (Bounding): fires iff the directory walk was incomplete.
+/// - `Budget` (Selecting): fires iff the output budget or the file-list cap
+///   left files unshown.
+///
+/// Total variant: `AtLeast(total)` if any Bounding cause fired, otherwise
+/// `Exact(total)`.
+#[inline]
+pub fn build_outline_structure_envelope(
+    shown: usize,
+    total: usize,
+    budget_cut: bool,
+    walk_incomplete: bool,
+    time_limit_reached: bool,
+) -> Option<ListEnvelope> {
+    let mut causes = Vec::new();
+    if time_limit_reached {
+        causes.push(Reason::TimeLimit);
+    }
+    if walk_incomplete {
+        causes.push(Reason::Walk);
+    }
+    if budget_cut {
+        causes.push(Reason::Budget);
+    }
+    if causes.is_empty() {
+        return None;
+    }
+    let total = if walk_incomplete || time_limit_reached {
+        Total::AtLeast(total)
+    } else {
+        Total::Exact(total)
+    };
+    Some(ListEnvelope::new(
+        shown,
+        total,
+        Unit::Files,
+        causes,
+        &["path"],
+    ))
+}

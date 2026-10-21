@@ -437,6 +437,13 @@ fn prior_failure() -> Option<io::Error> {
         error
     })
 }
+#[cfg(test)]
+thread_local! {
+    /// Inputs [`command`] probed before running its handler, so tests can
+    /// check that a long `files` list is not probed past what is examined.
+    pub(crate) static COMMAND_INPUT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn command(
     req: &RawRequest,
     ctx: &AppContext,
@@ -455,6 +462,13 @@ pub(crate) fn command(
     for key in ["path", "file", "directory", "target", "files"] {
         match req.params.get(key) {
             Some(serde_json::Value::String(path)) => inputs.push(path.as_str()),
+            // An outline reads at most the first entries of its `files` list,
+            // and none of them for a directory, files-mode or revision
+            // outline; probing the rest would cost one access check each
+            // for entries the handler never opens.
+            Some(serde_json::Value::Array(_)) if key == "files" && req.command == "outline" => {
+                inputs.extend(crate::commands::outline::outline_examined_files(req));
+            }
             Some(serde_json::Value::Array(paths)) => {
                 inputs.extend(paths.iter().filter_map(|p| p.as_str()))
             }
@@ -476,6 +490,8 @@ pub(crate) fn command(
         } else {
             root.join(input)
         };
+        #[cfg(test)]
+        COMMAND_INPUT_PROBES.with(|probes| probes.set(probes.get() + 1));
         if let Err(error) = probe_target(&path) {
             // Missing paths still get the handler's normal validation/error.
             if error.kind() == io::ErrorKind::TimedOut {
