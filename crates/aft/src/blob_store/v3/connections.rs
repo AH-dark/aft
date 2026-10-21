@@ -16,7 +16,6 @@ enum Slot {
 }
 
 pub(super) struct Database {
-    path: PathBuf,
     identity: Option<FileIdentity>,
     kind: Kind,
     slot: Mutex<Slot>,
@@ -51,7 +50,7 @@ impl Database {
         }
         Ok(Guard(slot))
     }
-    fn prepare(&self, create: bool, readonly: bool) -> Result<()> {
+    fn prepare(&self, route: &Path, create: bool, readonly: bool) -> Result<()> {
         let mut slot = self
             .slot
             .lock()
@@ -71,13 +70,13 @@ impl Database {
             // Existing read capabilities still refer to this Database object,
             // so later operations use its replacement connection.
             *slot = Slot::Closed;
-            let connection = open_db(&self.path, self.kind, create, readonly)?;
+            let connection = open_db(route, self.kind, create, readonly)?;
             *slot = Slot::Open {
                 connection,
                 writable: !readonly,
             };
         } else if let Slot::Open { connection, .. } = &*slot {
-            validate(connection, &self.path, self.kind)?;
+            validate(connection, route, self.kind)?;
         }
         Ok(())
     }
@@ -122,15 +121,14 @@ pub(super) fn shared(
         // Never wait for a database connection mutex while holding the global
         // cache: admission can hold one connection while looking up another ledger.
         drop(cache);
-        database.prepare(create, readonly)?;
+        database.prepare(path, create, readonly)?;
         return Ok(database);
     }
     // The cache lock spans creation so two first opens cannot acquire separate
     // handles. Only SQLite opens the database and its companion files.
-    let connection = open_db(&canonical, kind, create, readonly)?;
+    let connection = open_db(path, kind, create, readonly)?;
     let database = Arc::new(Database {
         identity: identity_of(&canonical),
-        path: canonical.clone(),
         kind,
         slot: Mutex::new(Slot::Open {
             connection,

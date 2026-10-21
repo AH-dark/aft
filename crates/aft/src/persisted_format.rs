@@ -325,23 +325,184 @@ impl std::error::Error for UnsupportedPersistedFormat {}
 
 #[derive(Debug, Clone)]
 struct Entry {
-    /// Comparison-only identity; the refusal retains its original path spelling.
+    /// The route used by the caller, not the resolved target of a cache symlink.
     scope: PathBuf,
+    root: Option<std::sync::Arc<StorageRoot>>,
     refusal: UnsupportedPersistedFormat,
 }
 
-fn comparison_scope(path: &Path) -> PathBuf {
+#[derive(Debug)]
+struct StorageRoot {
+    spelling: PathBuf,
+    canonical: PathBuf,
+}
+
+fn absolute_route(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().map_or_else(|_| path.to_path_buf(), |root| root.join(path))
     };
-    // The leaf can be absent after removal or before first publication. Resolve
-    // its existing parent before normalizing '..' and Windows verbatim prefixes.
+    #[cfg(windows)]
+    let absolute = crate::windows_path::normalize_windows_path(&absolute);
+    absolute
+}
+
+fn canonical_scope(path: &Path) -> PathBuf {
+    let absolute = absolute_route(path);
     let resolved = crate::production_storage::canonicalized_with(&absolute, &|path| {
         std::fs::canonicalize(path).ok()
     });
     crate::inspect::job::normalize_path(&resolved)
+}
+
+fn storage_roots() -> &'static std::sync::RwLock<Vec<std::sync::Arc<StorageRoot>>> {
+    static ROOTS: OnceLock<std::sync::RwLock<Vec<std::sync::Arc<StorageRoot>>>> = OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+thread_local! { static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn storage_root(path: &Path) -> std::sync::Arc<StorageRoot> {
+    let spelling = absolute_route(path);
+    {
+        let roots = storage_roots()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = roots.iter().find(|root| root.spelling == spelling) {
+            return root.clone();
+        }
+    }
+    // On a cache miss, resolve the root identity. Later cache hits return
+    // under the read lock without filesystem work or a write lock.
+    #[cfg(test)]
+    ROOT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+    let candidate = std::sync::Arc::new(StorageRoot {
+        canonical: canonical_scope(path),
+        spelling,
+    });
+    let mut roots = storage_roots()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(root) = roots
+        .iter()
+        .find(|root| root.spelling == candidate.spelling)
+    {
+        return root.clone();
+    }
+    // Bound the optimization cache, not ownership evidence. Root-scoped
+    // refusals retain their own identity, and explicit root queries still use
+    // the uncached identity when the cache is full.
+    if roots.len() < 128 {
+        roots.push(candidate.clone());
+    }
+    candidate
+}
+
+/// Cache an owner's root identity, never its cache-directory targets. Warm or
+/// saturated registration is memory-only; explicit root queries still resolve
+/// an uncached root without expanding the bounded cache.
+pub(crate) fn register_storage_root(path: &Path) {
+    let spelling = absolute_route(path);
+    {
+        let roots = storage_roots()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if roots.len() >= 128 || roots.iter().any(|root| root.spelling == spelling) {
+            return;
+        }
+    }
+    let _ = storage_root(path);
+}
+
+fn route_under_root(path: &Path, root: &StorageRoot) -> Option<PathBuf> {
+    let path = absolute_route(path);
+    let finish = |prefix: &Path| {
+        let relative = path.strip_prefix(prefix).ok()?;
+        let key = crate::inspect::job::normalize_path(&root.canonical.join(relative));
+        key.starts_with(&root.canonical).then_some(key)
+    };
+    if path.starts_with(&root.spelling) {
+        return finish(&root.spelling);
+    }
+    if path.starts_with(&root.canonical) {
+        return finish(&root.canonical);
+    }
+    // Resolve aliases above the owner only. Once its boundary is found, the
+    // remainder is lexical; a relocated cache directory cannot escape its floor.
+    let prefixes: Vec<_> = path.ancestors().collect();
+    for prefix in prefixes.into_iter().rev() {
+        if canonical_scope(prefix) == root.canonical {
+            return finish(prefix);
+        }
+    }
+    None
+}
+
+fn owning_route(path: &Path) -> Option<(std::sync::Arc<StorageRoot>, PathBuf)> {
+    let roots = storage_roots()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let path = absolute_route(path);
+    let direct = roots
+        .iter()
+        .flat_map(|root| {
+            [&root.spelling, &root.canonical]
+                .into_iter()
+                .filter_map(|prefix| {
+                    let relative = path.strip_prefix(prefix).ok()?;
+                    let key = crate::inspect::job::normalize_path(&root.canonical.join(relative));
+                    key.starts_with(&root.canonical).then_some((
+                        prefix.components().count(),
+                        root.clone(),
+                        key,
+                    ))
+                })
+        })
+        .min_by_key(|(depth, _, _)| *depth);
+    if let Some((_, root, key)) = direct {
+        return Some((root, key));
+    }
+    let prefixes: Vec<_> = path.ancestors().collect();
+    for prefix in prefixes.into_iter().rev() {
+        let canonical = canonical_scope(prefix);
+        if let Some(root) = roots.iter().find(|root| root.canonical == canonical) {
+            let key = crate::inspect::job::normalize_path(
+                &root.canonical.join(path.strip_prefix(prefix).ok()?),
+            );
+            return key
+                .starts_with(&root.canonical)
+                .then(|| (root.clone(), key));
+        }
+    }
+    None
+}
+
+fn comparison_scope(path: &Path) -> PathBuf {
+    if let Some((_, key)) = owning_route(path) {
+        return key;
+    }
+    // Without a registered owner, use the canonicalized path as the key;
+    // never guess a storage boundary from a directory name or suffix.
+    canonical_scope(path)
+}
+
+fn entry_scope(entry: &Entry) -> PathBuf {
+    entry
+        .root
+        .as_ref()
+        .and_then(|root| route_under_root(&entry.scope, root))
+        .unwrap_or_else(|| comparison_scope(&entry.scope))
+}
+
+fn entry_under_root(entry: &Entry, root: &StorageRoot) -> Option<PathBuf> {
+    if entry.root.is_some() || owning_route(&entry.scope).is_some() {
+        let key = entry_scope(entry);
+        return key.starts_with(&root.canonical).then_some(key);
+    }
+    route_under_root(&entry.scope, root)
 }
 
 fn registry() -> &'static Mutex<Vec<Entry>> {
@@ -362,18 +523,27 @@ fn with_registry<T>(f: impl FnOnce(&mut Vec<Entry>) -> T) -> T {
 /// store whose artifact is a directory of generations (the callgraph) uses
 /// that directory. Floor refusals use the storage root.
 pub fn record(refusal: &UnsupportedPersistedFormat, scope: &Path) {
-    let scope = comparison_scope(scope);
+    let root = if refusal.source.is_artifact() {
+        owning_route(scope).map(|(root, _)| root)
+    } else {
+        Some(storage_root(scope))
+    };
+    let key = root
+        .as_ref()
+        .and_then(|root| route_under_root(scope, root))
+        .unwrap_or_else(|| comparison_scope(scope));
     let inserted = with_registry(|entries| {
         if let Some(existing) = entries
             .iter_mut()
-            .find(|entry| entry.refusal.store == refusal.store && entry.scope == scope)
+            .find(|entry| entry.refusal.store == refusal.store && entry_scope(entry) == key)
         {
             let changed = existing.refusal != *refusal;
             existing.refusal = refusal.clone();
             changed
         } else {
             entries.push(Entry {
-                scope: scope.clone(),
+                scope: scope.to_path_buf(),
+                root,
                 refusal: refusal.clone(),
             });
             true
@@ -404,7 +574,7 @@ pub fn clear(store: PersistedStore, scope: &Path) {
         entries.retain(|entry| {
             !(entry.refusal.store == store
                 && entry.refusal.source.is_artifact()
-                && entry.scope == scope)
+                && entry_scope(entry) == scope)
         })
     });
 }
@@ -412,11 +582,14 @@ pub fn clear(store: PersistedStore, scope: &Path) {
 /// Replace only this root's floor evidence after a successful floor recheck.
 /// Artifact refusals still require their own format checks before clearing.
 pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersistedFormat]) {
-    let root = comparison_scope(root);
+    let identity = storage_root(root);
     with_registry(|entries| {
-        entries.retain(|entry| entry.scope != root || entry.refusal.source.is_artifact());
+        entries.retain(|entry| {
+            entry_scope(entry) != identity.canonical || entry.refusal.source.is_artifact()
+        });
         entries.extend(refusals.iter().map(|refusal| Entry {
-            scope: root.clone(),
+            scope: root.to_path_buf(),
+            root: Some(identity.clone()),
             refusal: refusal.clone(),
         }));
     });
@@ -426,12 +599,12 @@ pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersist
 /// path is confirmed absent. Permission errors and unreadable paths are not
 /// evidence of removal, and a reader floor is never lowered by housekeeping.
 pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
-    let root = comparison_scope(root);
+    let root = storage_root(root);
     with_registry(|entries| {
         entries.retain(|entry| {
             !(entry.refusal.store == store
                 && entry.refusal.source.is_artifact()
-                && entry.scope.starts_with(&root)
+                && entry_under_root(entry, &root).is_some()
                 && std::fs::symlink_metadata(&entry.refusal.path)
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
         })
@@ -442,11 +615,20 @@ pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
 /// recorded at or above `path`, or a floor refusal for the storage root that
 /// contains it.
 pub fn refusal_covering(store: PersistedStore, path: &Path) -> Option<UnsupportedPersistedFormat> {
-    let path = comparison_scope(path);
+    let key = comparison_scope(path);
     with_registry(|entries| {
         entries
             .iter()
-            .find(|entry| entry.refusal.store == store && path.starts_with(&entry.scope))
+            .find(|entry| {
+                entry.refusal.store == store
+                    && entry.root.as_ref().map_or_else(
+                        || key.starts_with(entry_scope(entry)),
+                        |root| {
+                            route_under_root(path, root)
+                                .is_some_and(|path| path.starts_with(entry_scope(entry)))
+                        },
+                    )
+            })
             .map(|entry| entry.refusal.clone())
     })
 }
@@ -455,11 +637,11 @@ pub fn refusal_covering(store: PersistedStore, path: &Path) -> Option<Unsupporte
 /// surfaces use this to list what the storage root holds that this build
 /// cannot read.
 pub fn refusals_under(root: &Path) -> Vec<UnsupportedPersistedFormat> {
-    let root = comparison_scope(root);
+    let root = storage_root(root);
     let mut found = with_registry(|entries| {
         entries
             .iter()
-            .filter(|entry| entry.scope.starts_with(&root))
+            .filter(|entry| entry_under_root(entry, &root).is_some())
             .map(|entry| entry.refusal.clone())
             .collect::<Vec<_>>()
     });
@@ -475,31 +657,41 @@ pub(crate) fn refusals_for_push(
     storage: &Path,
     artifact_key: Option<&str>,
 ) -> (Vec<UnsupportedPersistedFormat>, usize) {
-    let storage_key = comparison_scope(storage);
+    let root = storage_root(storage);
+    let storage_key = &root.canonical;
     let mut owned = Vec::new();
     let mut unattributed = 0;
-    let mut refusals = refusals_under(storage);
+    let mut refusals = with_registry(|entries| {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry_under_root(entry, &root).map(|scope| {
+                    let artifact = route_under_root(&entry.refusal.path, &root).unwrap_or(scope);
+                    (entry.refusal.clone(), artifact)
+                })
+            })
+            .collect::<Vec<_>>()
+    });
     refusals.sort_by(|a, b| {
         (
-            a.store.name(),
-            &a.path,
-            a.source.sort_key(),
-            a.found,
-            a.supported,
+            a.0.store.name(),
+            &a.0.path,
+            a.0.source.sort_key(),
+            a.0.found,
+            a.0.supported,
         )
             .cmp(&(
-                b.store.name(),
-                &b.path,
-                b.source.sort_key(),
-                b.found,
-                b.supported,
+                b.0.store.name(),
+                &b.0.path,
+                b.0.source.sort_key(),
+                b.0.found,
+                b.0.supported,
             ))
     });
-    refusals.dedup();
-    for refusal in refusals {
+    refusals.dedup_by(|a, b| a.0 == b.0);
+    for (refusal, scope) in refusals {
         if refusal.source != RefusalSource::Artifact
-            || (refusal.store == PersistedStore::AftDb
-                && comparison_scope(&refusal.path) == storage_key.join("aft.db"))
+            || (refusal.store == PersistedStore::AftDb && scope == storage_key.join("aft.db"))
         {
             owned.push(refusal);
             continue;
@@ -514,7 +706,7 @@ pub(crate) fn refusals_for_push(
         };
         if let Some(plane) = plane {
             if let Some(key) = artifact_key {
-                if comparison_scope(&refusal.path).starts_with(storage_key.join(plane).join(key)) {
+                if scope.starts_with(storage_key.join(plane).join(key)) {
                     owned.push(refusal);
                 }
             } else {
@@ -537,14 +729,16 @@ pub fn gate(
     scope: &Path,
     found: Option<u64>,
 ) -> Result<(), UnsupportedPersistedFormat> {
-    let path_key = comparison_scope(path);
     let floor = with_registry(|entries| {
         entries
             .iter()
             .find(|entry| {
                 entry.refusal.store == store
-                    && path_key.starts_with(&entry.scope)
                     && !entry.refusal.source.is_artifact()
+                    && entry.root.as_ref().is_some_and(|root| {
+                        route_under_root(scope, root).is_some()
+                            || route_under_root(path, root).is_some()
+                    })
             })
             .map(|entry| entry.refusal.clone())
     });
@@ -568,6 +762,7 @@ pub fn gate(
 /// refusal for each one written in a newer format. Reads headers only; never
 /// changes anything. Absent artifacts are skipped.
 pub fn preflight_project_artifacts(storage_root: &Path, project_key: &str) {
+    register_storage_root(storage_root);
     let _ = crate::search_index::SearchIndex::check_disk_cache_format(
         &storage_root.join("index").join(project_key),
     );
@@ -604,6 +799,142 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn directory_alias(target: &Path, alias: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, alias).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/c", "mklink", "/J"])
+                .arg(alias)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "junction creation failed: {output:?}"
+            );
+        }
+    }
+
+    fn relocated_artifact(namespace: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("parent");
+        let storage = parent.join("storage");
+        let outside = fixture.path().join("another-disk");
+        std::fs::create_dir_all(storage.join("nested")).unwrap();
+        std::fs::create_dir_all(outside.join("key")).unwrap();
+        directory_alias(&outside, &storage.join(namespace));
+        let alias = fixture.path().join("parent-alias");
+        directory_alias(&parent, &alias);
+        let reached_root = alias.join("storage/nested/..");
+        let artifact = reached_root.join(namespace).join("key/cache.bin");
+        std::fs::write(&artifact, b"newer artifact").unwrap();
+        assert!(!std::fs::canonicalize(&artifact)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&storage).unwrap()));
+        (fixture, reached_root, artifact)
+    }
+
+    #[test]
+    fn reader_floor_covers_artifacts_in_relocated_storage_subdirectories() {
+        for (namespace, store) in [
+            ("semantic", PersistedStore::SemanticIndex),
+            ("index", PersistedStore::SearchIndex),
+        ] {
+            let (_fixture, storage, artifact) = relocated_artifact(namespace);
+            let root = std::fs::canonicalize(&storage).unwrap();
+            let floor =
+                UnsupportedPersistedFormat::floor(store, storage.join("reader-floor.json"), 99);
+            record(&floor, &root);
+            assert_eq!(
+                gate(store, &artifact, &artifact, Some(1)),
+                Err(floor.clone()),
+                "the storage owner's floor must cover {namespace} even across a mount alias"
+            );
+            assert_eq!(refusal_covering(store, &artifact), Some(floor.clone()));
+            assert_eq!(refusals_under(&storage), vec![floor.clone()]);
+            assert_eq!(refusals_for_push(&storage, Some("key")), (vec![floor], 0));
+        }
+    }
+
+    #[test]
+    fn relocated_artifact_refusals_remain_owned_by_the_storage_route() {
+        for (namespace, store) in [
+            ("semantic", PersistedStore::SemanticIndex),
+            ("index", PersistedStore::SearchIndex),
+        ] {
+            let (_fixture, storage, artifact) = relocated_artifact(namespace);
+            let refusal = UnsupportedPersistedFormat::artifact(store, &artifact, 99);
+            record(&refusal, &artifact);
+            assert_eq!(
+                refusals_under(&storage),
+                vec![refusal.clone()],
+                "a relocated {namespace} artifact must stay in its owner's inventory"
+            );
+            assert_eq!(
+                refusals_for_push(&storage, Some("key")),
+                (vec![refusal.clone()], 0)
+            );
+            assert_eq!(refusal_covering(store, &artifact), Some(refusal.clone()));
+            assert_eq!(refusals_under(&storage)[0].path, artifact);
+            clear(store, &artifact);
+            assert!(refusals_under(&storage).is_empty());
+        }
+    }
+
+    #[test]
+    fn unregistered_artifacts_keep_the_previous_resolved_identity() {
+        let (_fixture, _storage, artifact) = relocated_artifact("semantic");
+        assert!(owning_route(&artifact).is_none());
+        assert_eq!(comparison_scope(&artifact), canonical_scope(&artifact));
+        assert_eq!(
+            comparison_scope(&artifact),
+            crate::inspect::job::normalize_path(&std::fs::canonicalize(&artifact).unwrap())
+        );
+    }
+
+    #[test]
+    fn bounded_root_registration_has_no_resolution_work_after_saturation() {
+        let fixture = tempfile::tempdir().unwrap();
+        for index in 0..128 {
+            register_storage_root(&fixture.path().join(format!("root-{index}")));
+        }
+        assert!(storage_roots().read().unwrap().len() <= 128);
+        ROOT_RESOLUTIONS.with(|count| count.set(0));
+        let uncached = fixture.path().join("uncached");
+        let _ = storage_root(&uncached);
+        assert!(storage_roots().read().unwrap().len() <= 128);
+        ROOT_RESOLUTIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "the root-resolution counter must observe an explicit uncached query"
+            )
+        });
+        ROOT_RESOLUTIONS.with(|count| count.set(0));
+        register_storage_root(&uncached);
+        register_storage_root(&uncached);
+        ROOT_RESOLUTIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "the saturated registration hook must stay memory-only"
+            )
+        });
+        let (_relocated, storage, artifact) = relocated_artifact("semantic");
+        let floor = UnsupportedPersistedFormat::floor(
+            PersistedStore::SemanticIndex,
+            storage.join("reader-floor.json"),
+            99,
+        );
+        record(&floor, &storage);
+        assert_eq!(
+            gate(PersistedStore::SemanticIndex, &artifact, &artifact, Some(1)),
+            Err(floor)
+        );
+    }
 
     #[test]
     fn refusal_comparisons_resolve_parent_aliases_without_rewriting_returned_paths() {
@@ -683,7 +1014,8 @@ mod tests {
                     UnsupportedPersistedFormat::artifact(PersistedStore::AftDb, &path, 99);
                 refusal.source = source;
                 entries.push(Entry {
-                    scope: comparison_scope(&root.path().join(format!("scope-{index}"))),
+                    scope: root.path().join(format!("scope-{index}")),
+                    root: None,
                     refusal,
                 });
             }
@@ -698,7 +1030,7 @@ mod tests {
             expected
         );
         let root_key = comparison_scope(root.path());
-        with_registry(|entries| entries.retain(|entry| !entry.scope.starts_with(&root_key)));
+        with_registry(|entries| entries.retain(|entry| !entry_scope(entry).starts_with(&root_key)));
     }
 
     #[test]

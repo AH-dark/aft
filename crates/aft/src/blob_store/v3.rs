@@ -236,9 +236,10 @@ impl Kind {
     }
 }
 fn incompatible(kind: Kind, path: &Path, found: u64, reason: IncompatibleReason) -> Error {
-    Error::Incompatible(persisted_format::refuse(
-        UnsupportedPersistedFormat::incompatible(kind.store(), path, found, reason),
-    ))
+    let displayed = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let refusal = UnsupportedPersistedFormat::incompatible(kind.store(), displayed, found, reason);
+    persisted_format::record(&refusal, path);
+    Error::Incompatible(refusal)
 }
 type SchemaRow = (String, String, String, Option<String>);
 fn schema_rows(c: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
@@ -253,7 +254,9 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
             |r| r.get::<_, u64>(0),
         )
         .unwrap_or(0);
-    persisted_format::gate(kind.store(), path, path, Some(version)).map_err(Error::Incompatible)?;
+    let displayed = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    persisted_format::gate(kind.store(), &displayed, path, Some(version))
+        .map_err(Error::Incompatible)?;
     if version == 0 {
         return Err(incompatible(kind, path, 0, IncompatibleReason::SchemaDrift));
     }
@@ -402,6 +405,7 @@ pub struct LedgerReader {
 }
 impl LedgerReader {
     pub fn open_existing(storage: &Path, family: &str) -> Result<Self> {
+        persisted_format::register_storage_root(storage);
         let path = family_dir(storage, family)?.join("members.sqlite");
         Ok(Self {
             database: connections::shared(&path, Kind::Registry, false, true)?,
@@ -572,6 +576,7 @@ impl<'a> RegistryWriter<'a> {
         Self::open(storage, family, lock, false)
     }
     fn open(storage: &Path, family: &str, lock: &'a ReservationLock, create: bool) -> Result<Self> {
+        persisted_format::register_storage_root(storage);
         lock.verify(storage)?;
         let dir = family_dir(storage, family)?;
         if create {
@@ -923,6 +928,7 @@ pub struct PlaneReader {
 }
 impl PlaneReader {
     pub fn open_existing(storage: &Path, family: &str, plane: FamilyPlane) -> Result<Self> {
+        persisted_format::register_storage_root(storage);
         Ok(Self {
             database: connections::shared(
                 &plane_path(storage, family, plane)?,

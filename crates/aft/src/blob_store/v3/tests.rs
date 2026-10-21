@@ -1409,3 +1409,61 @@ fn incomplete_marker_with_application_data_is_not_reset() {
         0
     );
 }
+
+#[test]
+fn relocated_v3_database_keeps_the_storage_route_for_floor_and_refusal_scope() {
+    let _g = serial();
+    let root = tempdir().unwrap();
+    let storage = root.path().join("storage");
+    let moved = root.path().join("another-disk-blobs");
+    seed(&storage, A);
+    let path = db(&storage, A);
+    assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+    fs::rename(storage.join("blobs"), &moved).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&moved, storage.join("blobs")).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(storage.join("blobs"))
+            .arg(&moved)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction creation failed: {output:?}"
+        );
+    }
+    let displayed = fs::canonicalize(&path).unwrap();
+    let floor = UnsupportedPersistedFormat::floor(
+        PersistedStore::ViewsV3Registry,
+        storage.join("reader-floor.json"),
+        99,
+    );
+    persisted_format::record(&floor, &storage);
+    let error = LedgerReader::open_existing(&storage, A)
+        .err()
+        .expect("the owning storage floor must be checked before a relocated v3 database");
+    assert!(matches!(error, Error::Incompatible(refusal) if refusal==floor));
+    persisted_format::replace_floor_refusals(&storage, &[]);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE VIEW extra AS SELECT 1")
+        .unwrap();
+    let error = LedgerReader::open_existing(&storage, A).err().unwrap();
+    let refusal = persisted_format::refusal_covering(PersistedStore::ViewsV3Registry, &path)
+        .expect(
+            "v3 must retain its logical storage route after canonicalizing its connection identity",
+        );
+    assert_eq!(refusal.path, displayed);
+    assert_eq!(error.to_string(), refusal.to_string());
+    assert_eq!(
+        persisted_format::refusals_under(&storage),
+        vec![refusal.clone()]
+    );
+    assert_eq!(
+        persisted_format::refusals_for_push(&storage, None),
+        (vec![refusal], 0)
+    );
+}
