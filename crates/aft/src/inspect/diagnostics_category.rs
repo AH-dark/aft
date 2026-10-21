@@ -333,7 +333,16 @@ pub(crate) fn run_diagnostics_category(
                 key.root.clone(),
                 authority.to_string(),
             ));
-            collection.producer_notes.insert(format!("{} @ {}: diagnostics authority={authority} (post-input publications can settle after a 2s no-run grace; announced or begun runs require END after publication)", server_id(key), display_root(snapshot, &key.root)));
+            let explanation = if authority == "document_pull" {
+                "file authority comes from its document diagnostic response; no timing grace"
+            } else {
+                "post-input publications can settle after a 2s no-run grace; announced or begun runs require END after publication"
+            };
+            collection.producer_notes.insert(format!(
+                "{} @ {}: diagnostics authority={authority} ({explanation})",
+                server_id(key),
+                display_root(snapshot, &key.root)
+            ));
         }
     }
     // A producer whose `cargo check` was still running is not indexing. Its

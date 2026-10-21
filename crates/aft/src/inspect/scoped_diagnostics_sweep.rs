@@ -305,7 +305,9 @@ pub(crate) fn sweep_scoped_files(
                 continue;
             }
             if !pulls {
-                if matches!(key.kind, ServerKind::Python) || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright") {
+                if matches!(key.kind, ServerKind::Python)
+                    || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+                {
                     late_registrations.insert((file.clone(), key.clone()));
                 }
                 waiting.push((file.clone(), key, epoch_before));
@@ -405,7 +407,9 @@ pub(crate) fn sweep_scoped_files(
             lsp.drain_events();
             let mut newly_registered = Vec::new();
             waiting.retain(|(file, key, before)| {
-                if late_registrations.contains(&(file.clone(), key.clone())) && lsp.server_supports_pull_for_file(key, file) {
+                if late_registrations.contains(&(file.clone(), key.clone()))
+                    && lsp.server_supports_pull_for_file(key, file)
+                {
                     late_registrations.remove(&(file.clone(), key.clone()));
                     newly_registered.push((file.clone(), key.clone(), *before));
                     return false;
@@ -443,10 +447,20 @@ pub(crate) fn sweep_scoped_files(
             // pulls here rather than waiting for a push that pull mode stopped.
             for (file, key, before) in newly_registered {
                 match pull_unlocked(ctx, &key, &file, deadline) {
-                    Ok((PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged, diagnostics)) => {
-                        if let Some(diagnostics) = diagnostics { pulled.push((file, key, diagnostics)); }
+                    Ok((
+                        PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged,
+                        diagnostics,
+                    )) => {
+                        if let Some(diagnostics) = diagnostics {
+                            pulled.push((file, key, diagnostics));
+                        }
                     }
-                    Ok((_, _)) => retry_pulls.push((file, key, before, "document pull not ready after registration".into())),
+                    Ok((_, _)) => retry_pulls.push((
+                        file,
+                        key,
+                        before,
+                        "document pull not ready after registration".into(),
+                    )),
                     Err(error) => retry_pulls.push((file, key, before, error.to_string())),
                 }
             }

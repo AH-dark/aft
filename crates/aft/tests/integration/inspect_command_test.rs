@@ -4799,6 +4799,12 @@ fn scoped_python_dynamic_pull_replaces_startup_empty_push_with_real_error() {
         "{response:#}"
     );
     assert!(uncovered_files(&response).is_empty(), "{response:#}");
+    assert!(
+        !response["summary"]["diagnostics"]["notes"]
+            .to_string()
+            .contains("2s"),
+        "document pull must not describe a timing certificate: {response:#}"
+    );
     assert_eq!(
         response["summary"]["diagnostics"]["by_producer"]["python"]["authority"][0]["rule"],
         "document_pull",
@@ -4827,14 +4833,58 @@ fn scoped_python_dynamic_pull_replaces_startup_empty_push_with_real_error() {
 }
 
 #[test]
+fn scoped_python_dynamic_pull_failures_cannot_certify_startup_empty_push() {
+    for failure in [
+        "AFT_FAKE_LSP_PULL_ERROR",
+        "AFT_FAKE_LSP_PULL_METHOD_NOT_FOUND",
+        "AFT_FAKE_LSP_PULL_UNCHANGED",
+        "AFT_FAKE_LSP_PULL_CANCEL",
+    ] {
+        let (_dir, ctx, log) = dynamic_python_pull_fixture();
+        ctx.lsp().set_extra_env(
+            failure,
+            if failure == "AFT_FAKE_LSP_PULL_CANCEL" {
+                "always"
+            } else {
+                "1"
+            },
+        );
+        let response = scoped_diagnostics_inspect(&ctx, "python-pull-failed", "broken.py");
+        let diagnostics = &response["summary"]["diagnostics"];
+        assert_eq!(diagnostics["complete"], false, "{failure}: {response:#}");
+        assert!(diagnostics["errors"].is_null(), "{failure}: {response:#}");
+        assert!(
+            !uncovered_files(&response).is_empty(),
+            "{failure}: {response:#}"
+        );
+        let events = std::fs::read_to_string(log).unwrap();
+        assert!(
+            events.contains("pull registered=true"),
+            "{failure}: {events}"
+        );
+        assert!(
+            !events.contains("pull registered=false"),
+            "{failure}: {events}"
+        );
+    }
+}
+
+#[test]
 fn scoped_python_dynamic_pull_waits_for_registration_after_open() {
     let (_dir, ctx, log) = dynamic_python_pull_fixture();
-    ctx.lsp().set_extra_env("AFT_FAKE_LSP_REGISTER_DIAGNOSTICS_DELAY_MS", "600");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_REGISTER_DIAGNOSTICS_DELAY_MS", "600");
     let response = scoped_diagnostics_inspect(&ctx, "python-late-pull-registration", "broken.py");
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 1, "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
     assert!(uncovered_files(&response).is_empty(), "{response:#}");
     let events = std::fs::read_to_string(log).unwrap();
-    assert!(events.contains("pull registered=true") && !events.contains("pull registered=false"), "{events}");
+    assert!(
+        events.contains("pull registered=true") && !events.contains("pull registered=false"),
+        "{events}"
+    );
 }
 
 #[test]

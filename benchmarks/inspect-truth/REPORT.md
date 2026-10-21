@@ -1,5 +1,136 @@
 # aft_inspect truth at scale: campaign report
 
+## Negotiated Python document pulls: implemented and measured
+
+The scoped Python authority path now uses the document diagnostic protocol
+established in the source investigation below. A successful response certifies
+**that file**, not a whole workspace. An empty startup push, a hover response or
+the passage of two seconds cannot substitute for a negotiated document pull.
+Non-negotiated servers retain the separately disclosed progress/push fallback.
+
+### Registration, coverage and warm feedback
+
+- Pyright/basedpyright clients advertise dynamic document diagnostics unless
+  `disablePullDiagnostics` is true. Registrations are server-instance scoped,
+  match the document selector, carry the negotiated identifier and are removed
+  on unregistration. Static providers remain independent.
+- Scoped inspection opens all selected document bodies before sending analysis
+  requests. It also notices registration arriving after didOpen. Background
+  pulls pause while the scoped sweep owns that transport, preventing a large
+  later didOpen from blocking behind an earlier expensive analysis request.
+- Full and valid unchanged responses supply file authority. The unchanged cache
+  is the exact previous **pull** report sent with the request, not an intervening
+  unsolicited push. Replies for changed documents or replaced server instances
+  are rejected. Failed/cancelled/rejected requests and missing unchanged caches
+  leave coverage unknown; they do not certify startup E0.
+- Normal opens/changes, registration and `workspace/diagnostic/refresh` queue
+  background pulls of open files. Accepted pull snapshots enter the same
+  version-checked alert path as pushes, so users need not invoke inspect to keep
+  warm counts and alert episodes current. No workspace diagnostic request or
+  unopened-neighbor analysis was introduced.
+- Producer details report `authority=document_pull` and
+  `no_progress_grace_ms=0`; the prose now describes a file response rather than
+  the fallback timing rule. The fallback still requires END after publication
+  for an announced/begun run.
+
+### Real protocol evidence
+
+Both the direct protocol driver and AFT were exercised against Pyright **1.1.414**
+and basedpyright **1.40.2**, with isolated installations (basedpyright also ships
+`pyright` command names). Both initialize results omit diagnosticProvider and
+then dynamically register `textDocument/diagnostic` with the correct identifier.
+A direct open and unchanged reopen each returned one assignment error. Pyright
+sent no pushes in that interval; basedpyright sent an empty close-time push,
+which was not used as diagnostic authority.
+
+AFT's real-server captures each returned **E1, coverage 1/1, document_pull, zero
+grace**, both normally and with an explicitly marked startup empty push injected
+by the tracing proxy. Selected wire events from the injected runs:
+
+```text
+Pyright:
+1792591025.2862737 didOpen broken.py
+1792591025.2868865 injected publishDiagnostics []
+1792591025.7459648 textDocument/diagnostic id=3
+1792591025.9207008 response id=3 kind=full items=1
+basedpyright:
+1792591033.9986312 didOpen broken.py
+1792591033.9987884 injected publishDiagnostics []
+1792591034.5320425 textDocument/diagnostic id=3
+1792591034.5607530 response id=3 kind=full items=1
+```
+
+Raw frames, including registration acknowledgements and request identifiers, are
+retained under `.cortexkit/internal-docs/investigations/inspect-document-pull/raw/`.
+The traced binary hash is
+`06779918d6ce61c5820d7ee39336906939e76eb7804616a08e22b5fa383a4aa1`;
+the final binary below additionally corrects the authority explanation, without
+changing negotiation or certificate behavior.
+
+### Final FastAPI diagnostics: three fresh processes
+
+Same source pin, dependency freeze and seeded **52-file** domain as the preceding
+progress captures: FastAPI `26dbe0b00e1211b99446500fc6e402cfec6a3b99`, Python
+**3.14.4**, Pyright **1.1.414**, Pydantic **2.14.1**, Starlette **1.9.0**.
+
+| Fresh process | AFT E/W | Reference E/W | Agreements | AFT-only / reference-only | Authoritative files | Authority |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
+| 2 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
+| 3 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
+
+Each page has full coverage (20/20, 20/20, 12/12), no Python gaps, and zero
+timing grace. Diagnostic totals by page remain **14, 11, 37** (61 errors and one
+warning overall). The collector still exits **1** for named project-wide
+Bash/TypeScript/YAML producer gaps; these are not Python-sample incompleteness.
+The historical reference of 50 is not silently replaced: its complete dependency
+freeze was unavailable, as documented in the original follow-up below. These
+new same-environment triples establish stable observed counts, not equivalence
+to that older environment.
+
+Canonical records are `raw/certified-fastapi-{1,2,3}/results.json`; executable
+SHA-256 is `917049cf6a486305421b7e888bfdb8d699ff72e487a566ebf2d9ce7abdffa1d7`.
+The executable was built from the reviewed working source before the delivery
+commit, not claimed to embed that later SHA. The original twelve-row Rust
+judgment/ablation table below remains the same-source D12-to-D0 measurement;
+this protocol follow-up does not change liveness scoring or exclusions.
+
+### Regression and mutation evidence
+
+- Without pull negotiation,
+  `scoped_python_dynamic_pull_replaces_startup_empty_push_with_real_error`
+  fails with **FRESH/complete E0, expected E1**. The disabled-pull compatibility
+  test and Rust push-only control both remain green.
+- Ignoring server diagnostic refresh makes only
+  `python_dynamic_pull_refresh_updates_warm_counts_and_alerts_without_inspect`
+  fail: **server refresh did not drive a clean open-file pull**. Initial warm
+  status/alert population and scoped-pull controls remain green.
+- Allowing unchanged responses to borrow an unsolicited startup push makes only
+  `unchanged_pull_cannot_certify_a_startup_push_cache` fail: expected
+  **RequestFailed(no_cache_for_unchanged)**. The intervening-push/request-cache
+  sibling passes.
+- Each deliberate break was marked `NON-VACUITY BREAK`, applied after staging the
+  live state, recorded with a non-empty diff, and restored with checkout/touch
+  to an empty unstaged diff. No break remains. Logs and exact diff pairs are in
+  the investigation's `verification/` directory.
+- Eight dynamic-pull integration cases cover registration, delayed registration,
+  large document transport ordering, opt-out, unregistration, warm feedback,
+  dependency refresh and failure honesty. Error, method-not-found, cancellation
+  and missing-cache unchanged replies all remain incomplete/unknown.
+- Final Linux gates (serialized, eight allocated CPUs): LSP units **310 passed,
+  3 existing ignored**; diagnostics-category units **24**; Rust dead-code scanner
+  units **70**; own published-view fixture **1**; Python progress/pull
+  integrations **21**. `cargo check -p agent-file-tools --tests` finished and
+  `cargo fmt --all -- --check` exited 0. Cargo/rustc **1.99.0**, rustfmt
+  **1.10.0-stable**. Existing scoped blocking integrations **13**, status-cache
+  units **11**, and alert target **18** also passed during this follow-up.
+- Benchmark helper regressions: `test_diagnostics.py` **7 passed**,
+  `test_score.py` **39 passed**; Python **3.14.4**. Bridge build (`tsc`, TypeScript
+  **5.9.3**) passed; `bun run lint` checked **751 files** with Biome **2.4.7**.
+- Tool diagnostics were PARTIAL because worker rust-analyzer capacity was
+  exhausted and compiler checks are disabled there; the compiler gates above
+  are the authoritative checks. No Windows/macOS runtime claim is made.
+
 ## Python document-pull protocol: pre-build source findings
 
 Both checked releases implement **per-document pull diagnostics**: Pyright
@@ -24,8 +155,8 @@ the implementation build.
   register `textDocument/diagnostic` through `client/registerCapability`, with
   `interFileDependencies: true`. `workspaceDiagnostics` is conditional on
   workspace diagnostic mode; it is not a prerequisite for a document pull.
-- AFT currently advertises `dynamicRegistration: false`, which opts the client
-  out of dynamic registration, and discovers only static diagnosticProvider.
+- At the source decision, AFT advertised `dynamicRegistration: false`, opting the
+  client out of dynamic registration, and discovered only static diagnosticProvider.
   The missing static initialize field therefore did not establish that either
   server lacks pull support.
 

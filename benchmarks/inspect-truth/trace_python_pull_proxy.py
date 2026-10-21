@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Log a real Python server's JSON-RPC traffic without changing messages."""
+"""Log Python JSON-RPC traffic; optionally inject an explicitly marked startup empty push."""
 import json
 import os
 from pathlib import Path

@@ -1457,10 +1457,10 @@ impl LspClient {
                         "codeDescriptionSupport": true,
                         "dataSupport": true
                     },
-                    // LSP 3.17 textDocument diagnostic pull. dynamicRegistration=false
-                    // because we use static capability discovery from the InitializeResult.
-                    // relatedDocumentSupport=true to receive cascading diagnostics for
-                    // files that became known while analyzing the requested one.
+                    // Static discovery is the default for document diagnostics.
+                    // Python dynamic registration is enabled below unless opted out.
+                    // Related-document support permits cascading diagnostics for
+                    // files discovered while analyzing the requested one.
                     "diagnostic": {
                         "dynamicRegistration": false,
                         "relatedDocumentSupport": true

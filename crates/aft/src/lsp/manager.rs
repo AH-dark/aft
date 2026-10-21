@@ -3181,8 +3181,14 @@ impl LspManager {
             .is_some_and(|caps| caps.pull_diagnostics)
     }
 
-    pub(crate) fn server_supports_pull_for_file(&self, server_key: &ServerKey, file: &Path) -> bool {
-        self.clients.get(server_key).is_some_and(|client| client.uses_document_pull(Some(file)))
+    pub(crate) fn server_supports_pull_for_file(
+        &self,
+        server_key: &ServerKey,
+        file: &Path,
+    ) -> bool {
+        self.clients
+            .get(server_key)
+            .is_some_and(|client| client.uses_document_pull(Some(file)))
     }
 
     /// This server's current stored diagnostics for a file, if it has a report.
