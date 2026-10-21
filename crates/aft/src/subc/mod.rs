@@ -885,6 +885,7 @@ fn submit_active_tool_call(
     request: RequestFrameMeta,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let job = push::routed_progress_job(route, corr, &request_id, job);
     let (rx, cancellation) =
         executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
     active
@@ -921,6 +922,7 @@ fn resubmit_active_tool_call(
     tool: &str,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let job = push::routed_progress_job(route, corr, &request_id, job);
     let (rx, cancellation) =
         executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
     let registered = {

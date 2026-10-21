@@ -352,13 +352,12 @@ fn egress_payload_response(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if let Some(sender) = ctx.progress_sender_handle() {
-        for index in 0..push_count {
-            sender(PushFrame::Progress(ProgressFrame {
-                frame_type: "progress",
-                request_id: format!("{}-push-{index}", req.id),
-                kind: ProgressKind::Stdout,
-                chunk: "p".repeat(256),
-            }));
+        for _ in 0..push_count {
+            sender(PushFrame::Progress(ProgressFrame::new(
+                &req.id,
+                ProgressKind::Stdout,
+                "p".repeat(256),
+            )));
         }
     }
     Response::success(

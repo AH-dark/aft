@@ -540,6 +540,8 @@ pub(super) struct DispatchPathMetrics {
     pub(super) writer_queued: AtomicUsize,
     pub(super) writer_active: AtomicBool,
     pub(super) writer_saturation_count: AtomicU64,
+    root_broadcast_over_1mib_total: AtomicU64,
+    root_broadcast_warned: StdMutex<HashMap<(ProjectRootId, &'static str), Instant>>,
     pub(super) control_completion_queued: AtomicUsize,
     pub(super) maintenance_queued: AtomicUsize,
     pub(super) bash_deferred_queued: AtomicUsize,
@@ -584,6 +586,8 @@ impl DispatchPathMetrics {
             writer_queued: AtomicUsize::new(0),
             writer_active: AtomicBool::new(false),
             writer_saturation_count: AtomicU64::new(0),
+            root_broadcast_over_1mib_total: AtomicU64::new(0),
+            root_broadcast_warned: StdMutex::new(HashMap::new()),
             control_completion_queued: AtomicUsize::new(0),
             maintenance_queued: AtomicUsize::new(0),
             bash_deferred_queued: AtomicUsize::new(0),
@@ -1299,11 +1303,52 @@ impl DispatchPathMetrics {
                 "active": self.writer_active.load(Ordering::Relaxed),
                 "capacity": WRITER_QUEUE_CAPACITY,
                 "saturation_count": self.writer_saturation_count.load(Ordering::Relaxed),
+                "root_broadcast_over_1mib_total": self.root_broadcast_over_1mib_total.load(Ordering::Relaxed),
             },
             "response_tasks": {
                 "live": self.response_tasks_live.load(Ordering::Relaxed),
             },
         })
+    }
+
+    pub(super) fn record_root_broadcast(
+        &self,
+        root: &ProjectRootId,
+        kind: &'static str,
+        body_bytes: usize,
+        routes: usize,
+    ) {
+        self.record_root_broadcast_with(root, kind, body_bytes, routes, Instant::now(), &|line| {
+            log::warn!("{line}");
+        });
+    }
+
+    fn record_root_broadcast_with(
+        &self,
+        root: &ProjectRootId,
+        kind: &'static str,
+        body_bytes: usize,
+        routes: usize,
+        now: Instant,
+        log: &dyn Fn(&str),
+    ) {
+        if body_bytes.saturating_mul(routes) <= 1024 * 1024 {
+            return;
+        }
+        self.root_broadcast_over_1mib_total
+            .fetch_add(1, Ordering::Relaxed);
+        // Count every oversized fan-out, but warn at most once per root/kind
+        // per minute. Warning entries at least one minute old are removed.
+        let mut warned = self
+            .root_broadcast_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warned.retain(|_, last| now.saturating_duration_since(*last) < Duration::from_secs(60));
+        if let std::collections::hash_map::Entry::Vacant(entry) = warned.entry((root.clone(), kind))
+        {
+            entry.insert(now);
+            log(&format!("subc root broadcast exceeds 1 MiB: root={} kind={kind} body_bytes={body_bytes} route_count={routes}", root.as_path().display()));
+        }
     }
 }
 
@@ -3809,6 +3854,62 @@ mod tests {
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
     use super::*;
+
+    #[test]
+    fn root_broadcast_pressure_warns_per_root_and_kind_once_per_minute() {
+        let (_dir_a, a) = test_root("broadcast-warning-a");
+        let (_dir_b, b) = test_root("broadcast-warning-b");
+        let metrics = DispatchPathMetrics::new();
+        let logs = std::cell::RefCell::new(Vec::<String>::new());
+        let capture = |line: &str| logs.borrow_mut().push(line.to_owned());
+        let now = Instant::now();
+        metrics.record_root_broadcast_with(&a, "status_changed", 1024, 1024, now, &capture);
+        assert!(
+            logs.borrow().is_empty(),
+            "threshold is strictly greater than 1 MiB"
+        );
+        metrics.record_root_broadcast_with(&a, "status_changed", 22_000, 50, now, &capture);
+        metrics.record_root_broadcast_with(
+            &a,
+            "status_changed",
+            22_000,
+            50,
+            now + Duration::from_secs(10),
+            &capture,
+        );
+        metrics.record_root_broadcast_with(
+            &a,
+            "status_changed",
+            22_000,
+            50,
+            now + Duration::from_secs(60),
+            &capture,
+        );
+        metrics.record_root_broadcast_with(
+            &a,
+            "configure_warnings",
+            22_000,
+            50,
+            now + Duration::from_secs(60),
+            &capture,
+        );
+        metrics.record_root_broadcast_with(
+            &b,
+            "status_changed",
+            22_000,
+            50,
+            now + Duration::from_secs(60),
+            &capture,
+        );
+        assert_eq!(logs.borrow().len(), 4);
+        assert!(logs.borrow()[0].contains("kind=status_changed body_bytes=22000 route_count=50"));
+        assert!(logs.borrow()[2].contains("kind=configure_warnings"));
+        assert!(logs.borrow()[3].contains(&b.as_path().display().to_string()));
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["writer"]["root_broadcast_over_1mib_total"],
+            5
+        );
+    }
     use serde_json::json;
 
     fn test_health_report(

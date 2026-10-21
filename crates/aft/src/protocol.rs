@@ -32,6 +32,17 @@ pub struct ProgressFrame {
     pub request_id: String,
     pub kind: ProgressKind,
     pub chunk: String,
+    /// Transport-only destination, captured by the request's dispatch scope.
+    /// It is never part of the JSON body consumed by bridges.
+    #[serde(skip)]
+    pub(crate) origin: Option<ProgressOrigin>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ProgressOrigin {
+    pub channel: u16,
+    pub epoch: u32,
+    pub corr: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -178,6 +189,7 @@ impl ProgressFrame {
             request_id: request_id.into(),
             kind,
             chunk: chunk.into(),
+            origin: None,
         }
     }
 }

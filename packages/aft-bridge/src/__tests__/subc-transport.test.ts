@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import {
   type BindIdentity,
+  type RequestOptions,
   type RouteHandle,
   type RouteTarget,
   SocketClosedError,
@@ -87,7 +88,7 @@ class FakeClient implements SubcClientLike {
     route: RouteHandle;
     channel: number;
     body: unknown;
-    options?: { timeoutMs?: number };
+    options?: RequestOptions;
   }[] = [];
   subscriptions: FakeSubscription[] = [];
   closedRoutes: number[] = [];
@@ -109,7 +110,13 @@ class FakeClient implements SubcClientLike {
   /** Simulates subc-client's one ingress dispatcher shared by all subscriptions. */
   private readonly ingress = new EventEmitter();
 
-  constructor(private readonly onRequest: (channel: number, body: unknown) => Promise<unknown>) {}
+  constructor(
+    private readonly onRequest: (
+      channel: number,
+      body: unknown,
+      options?: RequestOptions,
+    ) => Promise<unknown>,
+  ) {}
 
   get ingressListenerCount(): number {
     return this.ingress.listenerCount("frame");
@@ -134,14 +141,10 @@ class FakeClient implements SubcClientLike {
     return fakeRouteHandle(this.nextChannel++);
   }
 
-  async request(
-    route: RouteHandle,
-    body: unknown,
-    options?: { timeoutMs?: number },
-  ): Promise<unknown> {
+  async request(route: RouteHandle, body: unknown, options?: RequestOptions): Promise<unknown> {
     this.assertOpen();
     this.requests.push({ route, channel: route.channel, body, options });
-    return this.onRequest(route.channel, body);
+    return this.onRequest(route.channel, body, options);
   }
 
   subscribe(
@@ -536,6 +539,45 @@ function withoutStructuredText(envelopeResponse: Record<string, unknown>): Recor
 }
 
 describe("SubcTransport.toolCall", () => {
+  test("decodes routed progress chunks in order for only the requesting callback", async () => {
+    const client = new FakeClient(async (channel, _body, options) => {
+      for (const [kind, chunk] of [
+        ["stdout", `route-${channel}:🦀`],
+        ["stderr", "\nend"],
+      ]) {
+        options?.onProgress?.(
+          new TextEncoder().encode(
+            JSON.stringify({
+              type: "progress",
+              request_id: `subc-${channel}-44`,
+              kind,
+              chunk,
+            }),
+          ),
+        );
+      }
+      return envelope({ success: true, text: "done" });
+    });
+    const { pool } = poolWith(client);
+    const a: Array<{ kind: "stdout" | "stderr"; text: string }> = [];
+    const b: Array<{ kind: "stdout" | "stderr"; text: string }> = [];
+    try {
+      const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+      await bridge.toolCall("session-a", "bash", {}, { onProgress: (chunk) => a.push(chunk) });
+      await bridge.toolCall("session-b", "bash", {}, { onProgress: (chunk) => b.push(chunk) });
+      expect(a).toEqual([
+        { kind: "stdout", text: "route-1:🦀" },
+        { kind: "stderr", text: "\nend" },
+      ]);
+      expect(b).toEqual([
+        { kind: "stdout", text: "route-2:🦀" },
+        { kind: "stderr", text: "\nend" },
+      ]);
+    } finally {
+      await pool.shutdown();
+    }
+  });
+
   test("sends {name, arguments} and re-lifts structuredContent to the flat result", async () => {
     const client = new FakeClient(async () =>
       envelope({
