@@ -154,6 +154,41 @@ test("outline refuses a read-denied file and still answers an allowed file", asy
   expect(calls.map((input) => input.resources)).toEqual([["secret-dir/file.ts"], ["allowed.ts"]]);
 });
 
+test("OC2 outline batch keeps allowed outlines and reports each read denial", async () => {
+  for (const target of [
+    ["allowed.ts", "secret-dir/file.ts"],
+    ["secret-dir/file.ts", "allowed.ts", "./allowed.ts"],
+  ]) {
+    const { execute, calls, dispatched } = readers(undefined, (args) => ({
+      success: true,
+      text: (args.target as string[])
+        .map((file) =>
+          file.includes("secret-dir") ? "SECRET_SIGNATURE_MUST_NOT_ESCAPE" : "allowed()",
+        )
+        .join("\n"),
+    }));
+    const result = await execute("aft_outline", { target });
+    expect(String(result.content)).toContain("allowed()");
+    expect(String(result.content)).toContain("secret-dir/file.ts: permission_denied: read");
+    expect(String(result.content)).not.toContain("SECRET_SIGNATURE_MUST_NOT_ESCAPE");
+    expect(dispatched).toEqual([{ target: target.filter((file) => !file.includes("secret-dir")) }]);
+    expect(calls.map((call) => call.resources).sort()).toEqual([
+      ["allowed.ts"],
+      ["secret-dir/file.ts"],
+    ]);
+  }
+});
+
+test("OC2 outline batch reports every read denial when no entry is allowed", async () => {
+  const { execute, dispatched } = readers();
+  const result = await execute("aft_outline", {
+    target: ["secret-dir/first.ts", "secret-dir/second.ts"],
+  });
+  expect(String(result.content)).toContain("secret-dir/first.ts: permission_denied: read");
+  expect(String(result.content)).toContain("secret-dir/second.ts: permission_denied: read");
+  expect(dispatched).toEqual([]);
+});
+
 test("source readers preserve native read resources outside the project", async () => {
   const { execute, calls } = readers();
   const external = resolve(process.cwd(), "../external-source.ts");

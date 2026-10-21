@@ -209,11 +209,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               checkedReads,
             );
             if (denial) {
-              if (
-                (context as ToolRuntime).hostVersion === 2 ||
-                denial !== permissionRuleDenial("read") ||
-                target.length === 1
-              )
+              if (denial !== permissionRuleDenial("read") || target.length === 1)
                 return permissionDeniedResponse(denial, context);
               deniedEntries.push(`${entry}: ${denial}`);
             } else allowedTargets.push(entry);

@@ -243,7 +243,6 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         let mut response = super::url_output::json_preview(req, &source, None);
         super::url_output::disclose_download(&path, &mut response);
-        let complete = response.data["complete"].as_bool().unwrap_or(false);
         let mut text = response.data["content"]
             .as_str()
             .unwrap_or_default()
@@ -254,10 +253,11 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             super::url_output::URL_OUTPUT_BYTES,
             "a filtered URL",
         );
-        return Response::success(
-            &req.id,
-            serde_json::json!({"text": text, "complete": complete}),
-        );
+        // Formatting the preview must not discard its metadata. URL content
+        // does not contribute any local files to read authorization.
+        response.data["text"] = text.into();
+        response.data["content_files"] = serde_json::json!([]);
+        return response;
     }
 
     outline_single_file(req, ctx, path, file)

@@ -938,6 +938,15 @@ fn json_outline_works() {
         resp["success"], true,
         "JSON outline should succeed: {resp:?}"
     );
+    assert_eq!(
+        resp["kind"], "json_keys",
+        "preview metadata must survive outline rendering"
+    );
+    assert_eq!(
+        resp["content_files"],
+        json!([]),
+        "a URL contributes no local files"
+    );
     let text = resp["text"].as_str().expect("outline text");
     assert!(text.contains("name"), "{text}");
     assert!(text.contains("version"), "{text}");

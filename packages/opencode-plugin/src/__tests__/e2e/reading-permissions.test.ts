@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { once } from "node:events";
 import { writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { Effect } from "effect";
@@ -14,6 +17,74 @@ import { cleanupHarnesses, createHarness, type E2EHarness, prepareBinary } from 
 const binary = await prepareBinary();
 const harnesses: E2EHarness[] = [];
 afterEach(() => cleanupHarnesses(harnesses));
+
+async function executeReader(
+  h: E2EHarness,
+  version: number,
+  name: "aft_outline" | "aft_zoom",
+  args: Record<string, unknown>,
+) {
+  const plugin = {
+    pool: { getBridge: () => h.bridge } as unknown as BridgePool,
+    client: {},
+    config: {},
+    storageDir: h.path(".aft-storage"),
+  } as PluginContext;
+  const readPatterns: string[][] = [];
+  const v1: ToolContext = {
+    sessionID: "ses_read_permissions",
+    messageID: "msg_read_permissions",
+    agent: "build",
+    directory: h.tempDir,
+    worktree: h.tempDir,
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: async (...requests) => {
+      expect(requests).toHaveLength(1);
+      const [request] = requests;
+      if (request.permission !== "read") return;
+      readPatterns.push(request.patterns);
+      if (request.patterns.includes("secret.ts")) {
+        throw new Error(
+          "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []",
+        );
+      }
+    },
+  };
+  const host = permissionHost({
+    agentRules: [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "read", resource: "secret.ts", effect: "deny" },
+    ],
+  });
+  const definition = readingTools(plugin)[name];
+  const output =
+    version === 1
+      ? toolResultText(await definition.execute(args, v1))
+      : String(
+          (
+            await Effect.runPromise(
+              projectV2Tool(
+                name,
+                definition,
+                { directory: h.tempDir },
+                hoistedV2ToolConsumers(host.host),
+              ).execute(args, {
+                sessionID: v1.sessionID,
+                messageID: v1.messageID,
+                id: "call_read_permissions",
+                agent: "build",
+                progress: () => Effect.void,
+              }),
+            )
+          ).content,
+        );
+  const patterns =
+    version === 1
+      ? readPatterns
+      : host.calls.filter((call) => call.action === "read").map((call) => call.resources);
+  return { output, patterns };
+}
 
 describe.skipIf(!binary.binaryPath)("reading permissions through real tool_call", () => {
   for (const version of [1, 2]) {
@@ -35,40 +106,6 @@ describe.skipIf(!binary.binaryPath)("reading permissions through real tool_call"
         h.path("allowed.ts"),
         'export function visible() { return "PUBLIC_BODY"; }\n',
       );
-      const plugin = {
-        pool: { getBridge: () => h.bridge } as unknown as BridgePool,
-        client: {},
-        config: {},
-        storageDir: h.path(".aft-storage"),
-      } as PluginContext;
-      const readPatterns: string[][] = [];
-      const v1: ToolContext = {
-        sessionID: "ses_read_permissions",
-        messageID: "msg_read_permissions",
-        agent: "build",
-        directory: h.tempDir,
-        worktree: h.tempDir,
-        abort: new AbortController().signal,
-        metadata: () => {},
-        ask: async (...requests) => {
-          expect(requests).toHaveLength(1);
-          const [request] = requests;
-          if (request.permission !== "read") return;
-          readPatterns.push(request.patterns);
-          if (request.patterns.includes("secret.ts")) {
-            throw new Error(
-              "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []",
-            );
-          }
-        },
-      };
-      const host = permissionHost({
-        agentRules: [
-          { action: "*", resource: "*", effect: "allow" },
-          { action: "read", resource: "secret.ts", effect: "deny" },
-        ],
-      });
-      const definition = readingTools(plugin).aft_zoom;
       const args = {
         batch: [
           { target: "barrel.ts", symbols: ["hidden", "SecretService"] },
@@ -76,38 +113,90 @@ describe.skipIf(!binary.binaryPath)("reading permissions through real tool_call"
         ],
         callgraph: true,
       };
-      const output =
-        version === 1
-          ? toolResultText(await definition.execute(args, v1))
-          : String(
-              (
-                await Effect.runPromise(
-                  projectV2Tool(
-                    "aft_zoom",
-                    definition,
-                    { directory: h.tempDir },
-                    hoistedV2ToolConsumers(host.host),
-                  ).execute(args, {
-                    sessionID: v1.sessionID,
-                    messageID: v1.messageID,
-                    id: "call_read_permissions",
-                    agent: "build",
-                    progress: () => Effect.void,
-                  }),
-                )
-              ).content,
-            );
+      const { output, patterns } = await executeReader(h, version, "aft_zoom", args);
       expect(output).toContain("PUBLIC_BODY");
       expect(output).toContain("secret.ts");
       expect(output).toContain("permission_denied: read");
       expect(output).not.toContain("SECRET_BODY_MUST_NOT_ESCAPE");
       expect(output).not.toContain("privateMember");
       expect(output).not.toContain("content_files");
-      const patterns =
-        version === 1
-          ? readPatterns
-          : host.calls.filter((call) => call.action === "read").map((call) => call.resources);
       expect(patterns.sort()).toEqual([["allowed.ts"], ["barrel.ts"], ["secret.ts"]]);
     }, 60_000);
+  }
+
+  for (const name of ["aft_outline", "aft_zoom"] as const) {
+    test(`OC2 ${name} batch preserves allowed content after a read denial`, async () => {
+      const h = await createHarness(binary, { fixtureNames: [], timeoutMs: 20_000 });
+      harnesses.push(h);
+      await writeFile(h.path("allowed.ts"), "export function visible() {}\n");
+      await writeFile(
+        h.path("secret.ts"),
+        'export function SECRET_SIGNATURE_MUST_NOT_ESCAPE() { return "SECRET_BODY"; }\n',
+      );
+      const { output, patterns } = await executeReader(
+        h,
+        2,
+        name,
+        name === "aft_outline"
+          ? { target: ["allowed.ts", "secret.ts"] }
+          : {
+              batch: [
+                { target: "allowed.ts", symbols: "visible" },
+                { target: "secret.ts", symbols: "SECRET_SIGNATURE_MUST_NOT_ESCAPE" },
+              ],
+            },
+      );
+      expect(output).toContain("visible");
+      expect(output).toContain("secret.ts: permission_denied: read");
+      expect(output).not.toContain("SECRET_SIGNATURE_MUST_NOT_ESCAPE");
+      expect(output).not.toContain("SECRET_BODY");
+      expect(patterns.sort()).toEqual([["allowed.ts"], ["secret.ts"]]);
+    });
+  }
+
+  for (const version of [1, 2]) {
+    for (const mixed of [false, true]) {
+      test(`OC${version} capped ${mixed ? "mixed" : "URL-only"} zoom preserves its read manifest`, async () => {
+        const server = createServer((_request, response) => {
+          response.writeHead(200, { "content-type": "text/markdown" });
+          response.end(`# Large\n\n${"URL_CONTENT ".repeat(6000)}\n`);
+        });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/large.md`;
+        try {
+          const h = await createHarness(binary, { fixtureNames: [], timeoutMs: 20_000 });
+          harnesses.push(h);
+          const userConfig = h.path("aft-user.jsonc");
+          await writeFile(userConfig, '{ "url_fetch_allow_private": true }\n');
+          await h.bridge.send("configure", {
+            project_root: h.tempDir,
+            harness: "opencode",
+            cortexkit_user_config_path: userConfig,
+          });
+          await writeFile(h.path("allowed.ts"), "export function visible() {}\n");
+          const batch = mixed
+            ? [
+                { target: "allowed.ts", symbols: "visible" },
+                { target: url, symbols: "Large" },
+              ]
+            : [{ target: url, symbols: "Large" }];
+          const { output, patterns } = await executeReader(h, version, "aft_zoom", { batch });
+          expect(output).toContain("URL_CONTENT");
+          expect(output).toContain("truncated at");
+          expect(Buffer.byteLength(output)).toBeLessThanOrEqual(50 * 1024);
+          expect(output).not.toContain("Update AFT");
+          expect(patterns).toEqual(mixed ? [["allowed.ts"]] : []);
+          if (mixed) expect(output).toContain("visible");
+          const response = await h.bridge.toolCall("ses_cap_manifest", "zoom", { batch });
+          expect(response.content_files).toEqual(mixed ? [h.path("allowed.ts")] : []);
+          expect(response.complete).toBe(false);
+        } finally {
+          await new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+        }
+      }, 60_000);
+    }
   }
 });
