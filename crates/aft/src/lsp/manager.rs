@@ -909,6 +909,9 @@ pub struct LspManager {
     documents: HashMap<ServerKey, DocumentStore>,
     /// Stored publishDiagnostics payloads across all servers.
     diagnostics: DiagnosticsStore,
+    /// Already accepted observations consumed while ordering a pull response.
+    /// The normal event drain delivers them once to status/alert consumers.
+    pending_diagnostic_observations: Vec<AcceptedDiagnosticSnapshot>,
     /// Unified event channel — all server reader threads send here.
     event_tx: Sender<LspEvent>,
     event_rx: Receiver<LspEvent>,
@@ -1207,6 +1210,7 @@ impl LspManager {
             server_binaries: HashMap::new(),
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
+            pending_diagnostic_observations: Vec::new(),
             event_tx,
             event_rx,
             post_edit_waiters: HashMap::new(),
@@ -3465,7 +3469,7 @@ impl LspManager {
     /// Whether LSP events are waiting to be drained. Cheap channel peek for
     /// the maintenance scheduler's skip probe.
     pub fn has_pending_events(&self) -> bool {
-        !self.event_rx.is_empty()
+        !self.event_rx.is_empty() || !self.pending_diagnostic_observations.is_empty()
     }
 
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
@@ -3479,8 +3483,12 @@ impl LspManager {
     ) -> DrainedLspEvents {
         let mut events = Vec::new();
         let mut deferred_pull_events = Vec::new();
-        let mut diagnostics_changed = false;
-        let mut accepted_snapshots = Vec::new();
+        let mut accepted_snapshots = if preserve_pull_observations {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending_diagnostic_observations)
+        };
+        let mut diagnostics_changed = !accepted_snapshots.is_empty();
         while events.len() < max_events {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
@@ -4467,7 +4475,9 @@ impl LspManager {
                     // returning a full pull response. Apply those older events
                     // first so the full report remains authoritative. An
                     // unchanged response must inspect only a previous pull cache.
-                    self.drain_events_inner(usize::MAX, true);
+                    let drained = self.drain_events_inner(usize::MAX, true);
+                    self.pending_diagnostic_observations
+                        .extend(drained.accepted_snapshots);
                 }
                 self.ingest_document_report(
                     &key,

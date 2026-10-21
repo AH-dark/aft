@@ -713,6 +713,13 @@ impl<'tree> RustValueWalk<'tree, '_> {
                 return false;
             }
             match parent.kind() {
+                "block"
+                    if parent.named_child(parent.named_child_count().saturating_sub(1) as u32)
+                        == Some(current) =>
+                {
+                    return true
+                }
+                "match_arm" if selected("value") => return true,
                 "arguments" | "array_expression" | "tuple_expression" => return true,
                 "let_declaration" if selected("value") => return true,
                 "assignment_expression" if selected("right") => return true,
@@ -885,6 +892,13 @@ fn rust_path_is_value_position(node: &tree_sitter::Node<'_>) -> bool {
                 .is_some_and(|child| same_node(&child, &current))
         };
         match parent.kind() {
+            "block"
+                if parent.named_child(parent.named_child_count().saturating_sub(1) as u32)
+                    == Some(current) =>
+            {
+                return true
+            }
+            "match_arm" if is_selected_field("value") => return true,
             "arguments" | "array_expression" | "tuple_expression" => return true,
             "let_declaration" if is_selected_field("value") => return true,
             "assignment_expression" if is_selected_field("right") => return true,
@@ -906,8 +920,18 @@ fn rust_path_is_value_position(node: &tree_sitter::Node<'_>) -> bool {
 
 #[cfg(test)]
 fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) -> bool {
-    let name = &source[node.byte_range()];
-    let mut current = *node;
+    rust_name_is_shadowed_at(*node, source, &source[node.byte_range()])
+}
+
+/// Whether a binding shadows this name at an expression. Parameters, match/loop
+/// patterns, let conditions and preceding lets in enclosing blocks count;
+/// sibling scopes and later lets do not.
+pub(crate) fn rust_name_is_shadowed_at(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    let mut current = node;
 
     while let Some(parent) = current.parent() {
         match parent.kind() {
@@ -933,7 +957,7 @@ fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) 
                     .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
                     && parent
                         .child_by_field_name("body")
-                        .is_some_and(|body| node_contains(&body, node))
+                        .is_some_and(|body| node_contains(&body, &node))
                 {
                     return true;
                 }
@@ -942,7 +966,7 @@ fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) 
                 let body = parent
                     .child_by_field_name("consequence")
                     .or_else(|| parent.child_by_field_name("body"));
-                if body.is_some_and(|body| node_contains(&body, node))
+                if body.is_some_and(|body| node_contains(&body, &node))
                     && parent
                         .child_by_field_name("condition")
                         .is_some_and(|condition| {
@@ -955,6 +979,7 @@ fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) 
             "block" => {
                 let mut sibling = current.prev_named_sibling();
                 while let Some(previous) = sibling {
+                    #[cfg(test)]
                     VALUE_BINDING_WORK.with(|work| work.set(work.get() + 1));
                     if previous.kind() == "let_declaration"
                         && previous

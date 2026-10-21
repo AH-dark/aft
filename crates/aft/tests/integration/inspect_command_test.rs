@@ -4918,6 +4918,110 @@ fn scoped_python_dynamic_pull_opens_large_documents_before_starting_analysis() {
 }
 
 #[test]
+fn review_python_background_pull_preserves_queued_rust_alert_once() {
+    let (dir, ctx, _log) = dynamic_python_pull_fixture();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'mixed-alerts'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    let rust = root.join("src/lib.rs");
+    std::fs::write(&rust, "pub fn broken() {}\n").unwrap();
+    configure_fake_rust_lsp(&ctx);
+    let config = ctx.config();
+    let rust_key = ctx
+        .lsp()
+        .ensure_file_open(&rust, &config)
+        .unwrap()
+        .server_keys
+        .into_iter()
+        .find(|key| key.kind == ServerKind::Rust)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        ctx.lsp().drain_events();
+        if ctx.lsp().producer_has_settled(&rust_key) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Rust startup did not settle");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let signal = root.join("pull-started");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "500");
+    let python = root.join("broken.py");
+    ctx.lsp().ensure_file_open(&python, &config).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !signal.exists() {
+        ctx.lsp().drain_events();
+        assert!(
+            Instant::now() < deadline,
+            "background Python pull did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
+        server_kind: ServerKind::Rust, root: root.clone(),
+        method: "textDocument/publishDiagnostics".into(),
+        params: Some(json!({"uri":format!("file://{}", rust.display()),"version":0,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
+    });
+    // Do not drain here: the background completion must consume the queued Rust
+    // publication while applying the Python response, then retain the Rust
+    // publication as an accepted snapshot.
+    loop {
+        if ctx
+            .lsp()
+            .get_diagnostics_for_file(&python)
+            .iter()
+            .any(|d| d.message == "test pull diagnostic")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background Python pull did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut accepted = ctx.lsp().drain_events().accepted_snapshots;
+    accepted.extend(ctx.lsp().drain_events().accepted_snapshots);
+    let rust_snapshots = accepted
+        .into_iter()
+        .filter(|s| {
+            s.diagnostics
+                .iter()
+                .any(|d| d.message == "queued Rust alert")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rust_snapshots.len(),
+        1,
+        "the queued publication must reach alert ingestion exactly once"
+    );
+    let mut state = aft::alert_state::AlertDeltaState::default();
+    let mut renderer = aft::response_finalize::alert_render::AlertEngine::default();
+    let first = &rust_snapshots[0];
+    accept_progress_alerts(
+        &root,
+        &mut state,
+        &mut renderer,
+        vec![aft::alert_state::AcceptedDiagnosticSnapshot::new(
+            first.server_key.clone(),
+            first.document_version,
+            Vec::new(),
+        )],
+    );
+    let transitions = accept_progress_alerts(&root, &mut state, &mut renderer, rust_snapshots);
+    assert_eq!(transitions.len(), 1);
+    assert!(renderer
+        .finalize("progress-alerts", &root, "read")
+        .is_some());
+}
+
+#[test]
 fn python_dynamic_pull_populates_status_and_alert_source_without_inspect() {
     let (dir, ctx, log) = dynamic_python_pull_fixture();
     let file = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");

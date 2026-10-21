@@ -30,7 +30,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 8;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 9;
 #[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
@@ -1569,6 +1569,15 @@ fn materialize_dead_code_contributions(
         .flat_map(|facts| facts.receiver_references.iter().cloned())
         .collect::<BTreeSet<_>>();
     let go_live_methods = go_interface_live_methods(&parsed);
+    let rust_items_by_file = parsed
+        .iter()
+        .filter_map(|contribution| {
+            contribution
+                .rust_api
+                .as_ref()
+                .map(|facts| (contribution.file.clone(), facts.items.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let rust_imports_by_file = parsed
         .iter()
         .filter(|contribution| !contribution.rust_imports.is_empty())
@@ -1615,7 +1624,7 @@ fn materialize_dead_code_contributions(
                             .cfg_test_ranges
                             .iter()
                             .any(|range| range.contains(call.line));
-                    match project_internal_call(
+                    let projected = match project_internal_call(
                         project_root,
                         call,
                         &contribution.file,
@@ -1632,7 +1641,27 @@ fn materialize_dead_code_contributions(
                             &exported_symbols_by_file,
                             &files_by_exported_symbol,
                         ),
-                    }
+                    };
+                    projected
+                        .into_iter()
+                        .filter(|call| {
+                            // The stored callgraph can collapse same-named module
+                            // functions to a short callee. Source edges below retain
+                            // the path and are authoritative for ambiguous names.
+                            !rust_items_by_file.get(&call.file).is_some_and(|items| {
+                                !call.symbol.contains("::")
+                                    && items
+                                        .iter()
+                                        .filter(|item| {
+                                            item.owner.is_none() && item.name == call.symbol
+                                        })
+                                        .map(rust_qualified_item_name)
+                                        .collect::<BTreeSet<_>>()
+                                        .len()
+                                        > 1
+                            })
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
             internal_calls.extend(resolve_raw_reexport_liveness_edges(
@@ -1659,31 +1688,6 @@ fn materialize_dead_code_contributions(
                 &exported_symbols_by_file,
             ));
             if let Some(facts) = &contribution.rust_api {
-                // Export rows use short names, but inline-module callers and
-                // resolved call targets retain their lexical qualification.
-                // Join those identities only for declarations in this file.
-                for item in &facts.items {
-                    if item.owner.is_some() {
-                        continue;
-                    }
-                    let qualified = rust_qualified_item_name(item);
-                    if qualified != item.name {
-                        for (caller, symbol) in [(&qualified, &item.name), (&item.name, &qualified)]
-                        {
-                            internal_calls.push(InternalCall {
-                                caller_symbol: caller.clone(),
-                                file: contribution.file.clone(),
-                                symbol: symbol.clone(),
-                                line: item.line,
-                                provenance: RUST_PATH_LIVENESS_PROVENANCE.into(),
-                                test_origin: Some(is_test_code_file(
-                                    &contribution.file,
-                                    &test_module_files,
-                                )),
-                            });
-                        }
-                    }
-                }
                 internal_calls.extend(
                     resolve_macro_token_liveness_edges(
                         project_root,
@@ -1717,6 +1721,20 @@ fn materialize_dead_code_contributions(
                             call.caller_symbol = init.name.clone();
                         }
                     }
+                }
+            }
+            for call in &mut internal_calls {
+                if let Some(items) = rust_items_by_file.get(&contribution.file) {
+                    call.caller_symbol =
+                        rust_function_identity(items, &call.caller_symbol, Some(call.line), None);
+                }
+                if let Some(items) = rust_items_by_file.get(&call.file) {
+                    call.symbol = rust_function_identity(
+                        items,
+                        &call.symbol,
+                        None,
+                        (call.file == contribution.file).then_some(call.caller_symbol.as_str()),
+                    );
                 }
             }
             sort_dedup_internal_calls(&mut internal_calls);
@@ -1795,9 +1813,13 @@ fn materialize_dead_code_contributions(
                     }
                 }
             }
+            let mut root_exports = exports.clone();
+            for export in &mut root_exports {
+                export.symbol = rust_export_identity(export, contribution.rust_api.as_ref());
+            }
             let mut liveness_roots = liveness_roots_for_file(
                 &contribution.file,
-                &exports,
+                &root_exports,
                 &internal_calls,
                 &attribute_entry_points,
                 executable_root_exports_by_file.get(&contribution.file),
@@ -1842,7 +1864,10 @@ fn materialize_dead_code_contributions(
                 }
             }
             for export in &mut exports {
-                export.is_entry_point = liveness_roots.contains(&export.symbol);
+                export.is_entry_point = liveness_roots.contains(&rust_export_identity(
+                    export,
+                    contribution.rust_api.as_ref(),
+                ));
             }
 
             contribution.exports = exports;
@@ -2031,7 +2056,9 @@ fn aggregate_materialized_dead_code_contributions(
             .filter(|export| !export.public_api)
             .cloned()
             .collect::<Vec<_>>();
-        for (export, other_lines) in exports_deduplicated_by_node(&candidates) {
+        for (export, other_lines) in
+            exports_deduplicated_by_node(&candidates, contribution.rust_api.as_ref())
+        {
             if !test_code
                 && contribution
                     .cfg_test_ranges
@@ -2111,7 +2138,8 @@ fn aggregate_materialized_dead_code_contributions(
                     }
                 }
             } else {
-                let node = (contribution.file.clone(), export.symbol.clone());
+                let identity = rust_export_identity(export, contribution.rust_api.as_ref());
+                let node = (contribution.file.clone(), identity);
                 if !test_code
                     && !is_public_api_file
                     && !export.public_api
@@ -2250,20 +2278,18 @@ fn aggregate_materialized_dead_code_contributions(
     aggregate
 }
 
-/// A Rust file can define several exports with one name and kind (a method
-/// `new` on two types, or `#[cfg]` platform variants of one function). Liveness
-/// is tracked per (file, name) node, so they are always alive or dead together;
-/// report the node once at its first definition and list the other definition
-/// lines instead of emitting what reads as a duplicate entry. Exports of a
-/// different kind stay separate because dispatch liveness treats methods and
-/// free functions differently.
-fn exports_deduplicated_by_node(
-    exports: &[ExportContribution],
-) -> Vec<(&ExportContribution, Vec<u32>)> {
+/// Keep separate declarations in separate modules distinct while coalescing
+/// cfg alternatives of the same declaration. Report rows retain their original
+/// short symbol and source line; the qualified identity is used internally for
+/// deduplication and graph lookup.
+fn exports_deduplicated_by_node<'a>(
+    exports: &'a [ExportContribution],
+    rust_api: Option<&RustApiFacts>,
+) -> Vec<(&'a ExportContribution, Vec<u32>)> {
     let mut deduplicated: Vec<(&ExportContribution, Vec<u32>)> = Vec::new();
-    let mut index_by_node: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut index_by_node: HashMap<(String, &str), usize> = HashMap::new();
     for export in exports {
-        match index_by_node.entry((export.symbol.as_str(), export.kind.as_str())) {
+        match index_by_node.entry((rust_export_identity(export, rust_api), export.kind.as_str())) {
             Entry::Occupied(entry) => {
                 let (first, other_lines) = &mut deduplicated[*entry.get()];
                 if first.line != export.line && !other_lines.contains(&export.line) {
@@ -3951,9 +3977,8 @@ fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroToke
     let mut refs = BTreeSet::new();
     let mut scope_stack = Vec::new();
     collect_rust_macro_token_refs(source, root, &mut scope_stack, &mut refs);
-    // A callgraph node is keyed by scoped name and keeps only one body when
-    // cfg branches define that name more than once. Preserve calls from every
-    // source variant instead of choosing the host platform's implementation.
+    // Preserve lexical paths and owners even when the stored callgraph uses a
+    // short name. This also retains every cfg-alternative function body.
     let mut functions: BTreeMap<String, Vec<tree_sitter::Node>> = BTreeMap::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -3965,7 +3990,7 @@ fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroToke
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    for (caller_symbol, variants) in functions.into_iter().filter(|(_, nodes)| nodes.len() > 1) {
+    for (caller_symbol, variants) in functions {
         for node in variants {
             for (full, _, line, _, _) in crate::calls::extract_calls_full(
                 source,
@@ -4016,22 +4041,12 @@ fn collect_rust_macro_token_refs(
             let mut tokens = Vec::new();
             collect_rust_macro_tokens(source, token_tree, &mut tokens);
             let mut shadowed = BTreeSet::new();
-            let mut owner = node.parent();
-            while let Some(parent) = owner {
-                if parent.kind() == "function_item" {
-                    let mut stack = vec![parent];
-                    while let Some(binding) = stack.pop() {
-                        if matches!(binding.kind(), "parameters" | "closure_parameters") {
-                            collect_rust_binding_identifiers(source, binding, &mut shadowed);
-                        } else if let Some(pattern) = binding.child_by_field_name("pattern") {
-                            collect_rust_binding_identifiers(source, pattern, &mut shadowed);
-                        }
-                        let mut cursor = binding.walk();
-                        stack.extend(binding.named_children(&mut cursor));
-                    }
-                    break;
+            for token in &tokens {
+                if rust_macro_token_is_identifier(token)
+                    && crate::calls::rust_name_is_shadowed_at(node, source, token.text)
+                {
+                    shadowed.insert(token.text.to_string());
                 }
-                owner = parent.parent();
             }
             let mut binding = false;
             for token in &tokens {
@@ -4057,21 +4072,6 @@ fn collect_rust_macro_token_refs(
         }
     }
     scope_stack.truncate(scope_len);
-}
-
-fn collect_rust_binding_identifiers(
-    source: &str,
-    node: tree_sitter::Node,
-    names: &mut BTreeSet<String>,
-) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" {
-            names.insert(node_text(source, node).to_string());
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
 }
 
 fn collect_rust_macro_tokens<'a>(
@@ -4679,6 +4679,76 @@ fn rust_qualified_item_name(item: &RustApiItem) -> String {
     parts.join("::")
 }
 
+fn rust_export_identity(export: &ExportContribution, facts: Option<&RustApiFacts>) -> String {
+    if export.kind == "function" {
+        if let Some(item) = facts
+            .into_iter()
+            .flat_map(|facts| &facts.items)
+            .filter(|item| {
+                item.owner.is_none() && item.name == export.symbol && item.line >= export.line
+            })
+            .min_by_key(|item| item.line)
+        {
+            return rust_qualified_item_name(item);
+        }
+    }
+    export.symbol.clone()
+}
+
+fn rust_function_identity(
+    items: &[RustApiItem],
+    symbol: &str,
+    caller_line: Option<u32>,
+    caller: Option<&str>,
+) -> String {
+    if symbol.contains("::") {
+        return symbol.to_string();
+    }
+    let candidates = items
+        .iter()
+        .filter(|item| item.owner.is_none() && item.name == symbol)
+        .collect::<Vec<_>>();
+    if let Some(line) = caller_line {
+        if let Some(item) = candidates
+            .iter()
+            .filter(|item| item.line <= line)
+            .max_by_key(|item| item.line)
+        {
+            return rust_qualified_item_name(item);
+        }
+    }
+    if let Some(caller) = caller {
+        let mut scope = caller.split("::").collect::<Vec<_>>();
+        scope.pop();
+        loop {
+            let qualified = scope
+                .iter()
+                .copied()
+                .chain(std::iter::once(symbol))
+                .collect::<Vec<_>>()
+                .join("::");
+            if candidates
+                .iter()
+                .any(|item| rust_qualified_item_name(item) == qualified)
+            {
+                return qualified;
+            }
+            if scope.pop().is_none() {
+                break;
+            }
+        }
+    }
+    let identities = candidates
+        .into_iter()
+        .map(rust_qualified_item_name)
+        .collect::<BTreeSet<_>>();
+    if identities.len() == 1 {
+        identities.into_iter().next().unwrap()
+    } else {
+        symbol.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RustApiModule {
     scope: Vec<String>,
@@ -4707,29 +4777,8 @@ fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiF
     let mut facts = RustApiFacts::default();
     rust_collect_api_facts(source, root, file, &[], &mut facts);
     let mut owners = Vec::new();
-    let mut branch_values = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        // A conditional renderer can return a function path from a branch;
-        // that is a value reference, not a direct call or ordinary argument.
-        if node.kind() == "scoped_identifier"
-            && node.parent().is_some_and(|parent| {
-                (parent.kind() == "block"
-                    && parent.named_child(parent.named_child_count().saturating_sub(1) as u32)
-                        == Some(node))
-                    || (parent.kind() == "match_arm"
-                        && parent.child_by_field_name("value") == Some(node))
-            })
-        {
-            let full = node_text(source, node).to_string();
-            branch_values.push((
-                full.clone(),
-                full.rsplit("::").next().unwrap_or(&full).to_string(),
-                node.start_position().row as u32 + 1,
-                node.start_byte(),
-                node.end_byte(),
-            ));
-        }
         let owner = match node.kind() {
             "function_item" => rust_function_symbol_name(source, &node),
             "static_item" | "const_item" => node.child_by_field_name("name").map(|name| {
@@ -4757,7 +4806,6 @@ fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiF
     }
     facts.initializer_references = crate::calls::extract_rust_value_references(source, root)
         .into_iter()
-        .chain(branch_values)
         .map(|(full, name, line, start, end)| {
             let mut path = rust_path_segments(&full);
             path.pop();
@@ -6341,7 +6389,9 @@ fn liveness_roots_for_file(
 }
 
 fn is_explicit_liveness_symbol(file_name: &str, symbol: &str) -> bool {
-    let symbol = symbol.rsplit("::").next().unwrap_or(symbol);
+    if symbol.contains("::") {
+        return false;
+    }
     if symbol == "<top-level>" {
         return true;
     }
@@ -7669,6 +7719,106 @@ fn read_with<T>(consume: impl FnOnce(bool) -> T) -> T { consume(crate::guard::is
             ),
             "{aggregate:#}"
         );
+    }
+
+    #[test]
+    fn review_module_declarations_with_same_short_name_stay_separate() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { a::run(); }
+mod a { pub(crate) fn run() {} }
+mod b {
+    pub(crate) fn run() { private_leaf(); }
+    pub(crate) fn private_leaf() {}
+}
+"#,
+        )]);
+        let items = aggregate["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{aggregate:#}");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["symbol"] == "run" && item["line"] == 5),
+            "{aggregate:#}"
+        );
+        assert!(
+            items.iter().any(|item| item["symbol"] == "private_leaf"),
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_bare_function_branch_and_block_values_are_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    let c = true;
+    let render = if c { normal } else { confined }; render();
+    let nested = { { block_tail } }; nested();
+}
+pub(crate) fn normal() {}
+pub(crate) fn confined() {}
+pub(crate) fn block_tail() {}
+pub(crate) fn unused() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_bare_branch_local_binding_shadows_function() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    let normal = || {};
+    let render = if true { normal } else { confined }; render();
+}
+pub(crate) fn normal() {}
+pub(crate) fn confined() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::normal"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_macro_callback_later_binding_does_not_shadow() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    tokio::select! { reply = query() => { reply.is_ok_and(ends_scope); } }
+    let ends_scope = false;
+}
+pub(crate) fn ends_scope() {}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+    }
+
+    #[test]
+    fn review_macro_callback_unrelated_nested_binding_does_not_shadow() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    { let ends_scope = false; }
+    tokio::select! { reply = query() => { reply.is_ok_and(ends_scope); } }
+}
+pub(crate) fn ends_scope() {}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
     }
 
     #[test]
