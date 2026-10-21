@@ -92,6 +92,30 @@ pub(crate) mod work_probe {
 
     static STORE_CAPS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
+    /// Reads of a file to window its long lines, and passes over its bytes
+    /// to find the requested lines.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct FileWork {
+        pub reads: usize,
+        pub line_scans: usize,
+    }
+
+    static FILE_WORK: OnceLock<Mutex<HashMap<PathBuf, FileWork>>> = OnceLock::new();
+
+    pub(crate) fn record(path: &Path, update: impl FnOnce(&mut FileWork)) {
+        if let Ok(mut work) = FILE_WORK.get_or_init(Default::default).lock() {
+            update(work.entry(path.to_path_buf()).or_default());
+        }
+    }
+
+    pub(crate) fn file_work(path: &Path) -> FileWork {
+        FILE_WORK
+            .get_or_init(Default::default)
+            .lock()
+            .map(|work| work.get(path).copied().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
     /// Store cap for searches whose project root is `root`.
     pub(crate) fn set_store_cap(root: &Path, cap: usize) {
         if let Ok(mut caps) = STORE_CAPS.get_or_init(Default::default).lock() {
@@ -1487,10 +1511,23 @@ impl RowTexts {
         }
         for (file, rows) in reread {
             let content = crate::project_content::read_bounded(file, None, false).ok();
+            #[cfg(test)]
+            work_probe::record(file, |work| work.reads += 1);
+            // Every requested line of this file is located in one pass.
+            let lines: Vec<u32> = rows.iter().map(|row| row.line).collect();
+            let spans = content
+                .as_deref()
+                .map(|bytes| {
+                    #[cfg(test)]
+                    work_probe::record(file, |work| work.line_scans += 1);
+                    line_spans(bytes, &lines)
+                })
+                .unwrap_or_default();
             for row in rows {
                 let text = content
                     .as_deref()
-                    .and_then(|bytes| windowed_line(bytes, row.line, row.column))
+                    .zip(spans.get(&row.line))
+                    .map(|(bytes, &(start, end))| windowed_line(&bytes[start..end], row.column))
                     .unwrap_or_else(|| row.line_text.clone());
                 self.texts.insert((row.file.clone(), row.line), text);
             }
@@ -1505,19 +1542,36 @@ impl RowTexts {
     }
 }
 
-/// Line `line` (1-based) of `content`, cut to a window around the
-/// character at 1-based `column`.
-fn windowed_line(content: &[u8], line: u32, column: u32) -> Option<String> {
-    let start = if line <= 1 {
-        0
-    } else {
-        memchr::memchr_iter(b'\n', content)
-            .nth(line as usize - 2)
-            .map(|newline| newline + 1)?
-    };
-    let rest = &content[start..];
-    let end = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
-    let mut bytes = &rest[..end];
+/// Byte ranges (without the newline) of the requested 1-based `lines` of
+/// `content`, found in one pass over it. Lines past the end are left out.
+fn line_spans(content: &[u8], lines: &[u32]) -> HashMap<u32, (usize, usize)> {
+    let mut wanted = lines.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut wanted = wanted.into_iter().peekable();
+    let mut spans = HashMap::new();
+    let mut newlines = memchr::memchr_iter(b'\n', content);
+    let mut line = 1u32;
+    let mut start = 0usize;
+    while let Some(&next) = wanted.peek() {
+        let end = newlines.next().unwrap_or(content.len());
+        if line == next {
+            spans.insert(line, (start, end));
+            wanted.next();
+        }
+        if end >= content.len() {
+            break;
+        }
+        start = end + 1;
+        line += 1;
+    }
+    spans
+}
+
+/// One line's bytes, cut to a window around the character at 1-based
+/// `column`.
+fn windowed_line(line: &[u8], column: u32) -> String {
+    let mut bytes = line;
     if bytes.ends_with(b"\r") {
         bytes = &bytes[..bytes.len() - 1];
     }
@@ -1526,7 +1580,7 @@ fn windowed_line(content: &[u8], line: u32, column: u32) -> Option<String> {
         .char_indices()
         .nth(column.saturating_sub(1) as usize)
         .map_or(text.len(), |(index, _)| index);
-    Some(crate::commands::semantic_search::snippet_bounds::window_snippet_line(&text, anchor))
+    crate::commands::semantic_search::snippet_bounds::window_snippet_line(&text, anchor)
 }
 
 fn index_status_label(status: IndexStatus) -> &'static str {
@@ -1842,6 +1896,49 @@ mod tests {
             kept.sort();
             assert_eq!(kept, expected, "{threads} threads, reversed {reversed}");
         }
+    }
+
+    #[test]
+    fn line_spans_finds_every_requested_line_in_one_pass() {
+        let content = b"a\nbb\r\nccc";
+        let spans = line_spans(content, &[3, 1, 2, 9, 2]);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[&1], (0, 1));
+        assert_eq!(spans[&2], (2, 5));
+        assert_eq!(spans[&3], (6, 9));
+        assert_eq!(windowed_line(&content[2..5], 1), "bb");
+    }
+
+    #[test]
+    fn a_page_of_long_rows_reads_and_scans_its_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let file = root.join("wide.txt");
+        let line = format!("{}needle{}\n", "x".repeat(600), "y".repeat(400));
+        std::fs::write(&file, line.repeat(200)).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "long-rows", "command": "grep", "pattern": "needle",
+            "path": file, "max_results": 100,
+        }))
+        .unwrap();
+        let response = handle_grep(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["matches"].as_array().unwrap().len(), 100);
+        let searched = PathBuf::from(response.data["matches"][0]["file"].as_str().unwrap());
+        assert_eq!(
+            work_probe::file_work(&searched),
+            work_probe::FileWork {
+                reads: 1,
+                line_scans: 1
+            }
+        );
     }
 
     #[test]
