@@ -228,7 +228,9 @@ fn disk_limit_pass_deleting_28000_rows_probe() {
         // The family sweep deletes only rows last touched before the epoch it
         // raises the store to; reset every row's epoch so any row qualifies.
         lock(&store.inner.connection)
-            .execute_batch("UPDATE blob_payloads SET ref_epoch = 0; UPDATE store_meta SET gc_epoch = 0;")
+            .execute_batch(
+                "UPDATE blob_payloads SET ref_epoch = 0; UPDATE store_meta SET gc_epoch = 0;",
+            )
             .unwrap();
         if !counted {
             lock(&store.inner.connection)
