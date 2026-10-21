@@ -730,11 +730,10 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
     // A ticket in this process's own environment belongs to whatever command
     // started this process, never to the child. The child gets a ticket only
     // when its request environment carries one issued for it.
-    if !environment.contains_key(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV) {
-        command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
-    }
-    if !environment.contains_key(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV) {
-        command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
+        if !environment.contains_key(key) {
+            command.env_remove(key);
+        }
     }
     #[cfg(test)]
     for key in
@@ -765,6 +764,9 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
 /// so filtering the builder covers Unix exec and Windows CreateProcess alike.
 pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
     command.env_remove(crate::privacy_spawn::CONTROL_ENV);
+    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
+        command.env_remove(key);
+    }
     let mut credential_keys = std::env::vars_os()
         .map(|(key, _)| key)
         .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key))
@@ -805,6 +807,9 @@ pub fn inject(
     }
 
     let gh_enabled = config.github.shim;
+    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
+        environment.remove(key);
+    }
     environment.remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
     if crate::sandbox_spawn::worker_jail_active() {
         environment.insert(
@@ -813,7 +818,7 @@ pub fn inject(
         );
     }
     environment.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
-    if gh_enabled {
+    if gh_enabled && !crate::sandbox_spawn::worker_jail_active() {
         if let Some(ticket) = gh_shim_ticket {
             environment.insert(
                 crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),

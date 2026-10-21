@@ -5330,6 +5330,8 @@ fn sandboxed_child_environment(
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
+            || key == crate::gh_shim_worker_broker::SOCKET_ENV
+            || key == crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV
             || (worker_jail_active() && key == "DBUS_SESSION_BUS_ADDRESS")
         {
             continue;
@@ -5390,6 +5392,14 @@ pub(crate) fn apply_sandbox_environment(
         if let Some(ticket) = memory_only_ticket(request_environment) {
             command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
         }
+        for key in [
+            crate::gh_shim_worker_broker::SOCKET_ENV,
+            crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+        ] {
+            if let Some(value) = request_environment.get(key) {
+                command.env(key, value);
+            }
+        }
     }
 }
 
@@ -5443,6 +5453,7 @@ pub(crate) fn pty_command_for_plan(
     for arg in args {
         command.arg(arg);
     }
+    crate::agent_child_env::scrub_pty_command(&mut command);
     command.cwd(workdir.as_os_str());
     if let Some(environment) = isolated_environment_for_plan(plan, env) {
         command.env_clear();
@@ -5451,6 +5462,14 @@ pub(crate) fn pty_command_for_plan(
         }
         if let Some(ticket) = memory_only_ticket(env) {
             command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
+        }
+        for key in [
+            crate::gh_shim_worker_broker::SOCKET_ENV,
+            crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+        ] {
+            if let Some(value) = env.get(key) {
+                command.env(key, value);
+            }
         }
     } else {
         // Sandbox-disabled PTYs retain the historical full inheritance and add
@@ -5463,7 +5482,14 @@ pub(crate) fn pty_command_for_plan(
             command.env(key, value);
         }
     }
+    // Scrub credentials after explicit overrides too; only the command's own
+    // governance paths and ticket may be restored from the trusted spawn map.
     crate::agent_child_env::scrub_pty_command(&mut command);
+    for key in crate::gh_shim_worker_broker::CHILD_KEYS {
+        if let Some(value) = env.get(key) {
+            command.env(key, value);
+        }
+    }
     Ok((command, profile_handle))
 }
 

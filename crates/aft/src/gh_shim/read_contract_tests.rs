@@ -389,6 +389,7 @@ fn read_draft_v19_stops_before_the_executor_transport() {
     ))
     .unwrap();
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: None,
         transient_delays: [Duration::ZERO; 2],
@@ -429,6 +430,7 @@ fn read_draft_executor_crosses_real_daemon_framing_without_identity_or_retries()
     ))
     .unwrap();
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: Some(connection),
         ticket: Some("opaque-command-ticket".into()),
         transient_delays: [Duration::ZERO; 2],
@@ -520,6 +522,7 @@ fn audit_search_unclosed_quotes_are_rejected() {
 fn audit_identity_lookup_reports_missing_connection_bad_ticket_and_old_daemon() {
     use std::sync::Arc;
     let missing = RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: Some("bad-ticket".into()),
         transient_delays: [Duration::ZERO; 2],
@@ -544,6 +547,7 @@ fn audit_identity_lookup_reports_missing_connection_bad_ticket_and_old_daemon() 
         let file = dir.path().join("connection.json");
         daemon.write_connection_file(&file);
         let context = RelayContext {
+            worker_broker: None,
             connection_file: Some(file),
             ticket: Some("bad-ticket".into()),
             transient_delays: [Duration::ZERO; 2],
@@ -579,6 +583,7 @@ fn audit_identity_timeout_does_not_claim_the_command_was_not_run() {
     let file = dir.path().join("connection.json");
     daemon.write_connection_file(&file);
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: Some(file),
         ticket: Some("ticket".into()),
         transient_delays: [Duration::ZERO; 2],
@@ -609,6 +614,7 @@ fn audit_native_permission_combines_canary_and_daemon_worker_evidence() {
         let file = root.path().join("connection.json");
         daemon.write_connection_file(&file);
         let context = RelayContext {
+            worker_broker: None,
             connection_file: Some(file),
             ticket: Some("ticket".into()),
             transient_delays: [Duration::ZERO; 2],

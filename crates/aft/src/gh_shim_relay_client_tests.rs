@@ -699,6 +699,7 @@ fn dispatch_comment(harness: &Harness, ticket: Option<&str>, body: &str) -> (i32
             0
         },
         &RelayContext {
+            worker_broker: None,
             connection_file: Some(harness.connection_file.clone()),
             ticket: ticket.map(str::to_string),
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
@@ -832,6 +833,7 @@ fn session_agent_mismatch_names_manifest_repository_and_known_bot_without_lookup
             TEST_NOW,
             &manifest,
             &RelayContext {
+                worker_broker: None,
                 connection_file: Some(harness.connection_file.clone()),
                 ticket: live.value().map(str::to_string),
                 transient_delays: [Duration::from_millis(1); 2],
@@ -923,6 +925,7 @@ fn governed_thread_state_confirmations_match_gh_sentences_on_stderr() {
                 TEST_NOW,
                 &manifest,
                 &RelayContext {
+                    worker_broker: None,
                     connection_file: Some(harness.connection_file.clone()),
                     ticket: live.value().map(str::to_string),
                     transient_delays: [Duration::from_millis(1); 2],
@@ -1045,6 +1048,7 @@ fn unknown_result_status_is_outcome_undetermined_and_never_resent() {
         TEST_NOW,
         &manifest,
         &RelayContext {
+            worker_broker: None,
             connection_file: Some(harness.connection_file.clone()),
             ticket: live.value().map(str::to_string),
             transient_delays: [Duration::from_millis(1); 2],
@@ -1214,6 +1218,7 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
         TEST_NOW,
         |_| panic!("reached upstream gh"),
         &RelayContext {
+            worker_broker: None,
             connection_file: Some(harness.connection_file.clone()),
             ticket: live.value().map(str::to_string),
             transient_delays: [Duration::from_millis(1); 2],
@@ -1265,6 +1270,7 @@ fn dispatch_timed(
         TEST_NOW,
         |_| panic!("reached upstream gh"),
         &RelayContext {
+            worker_broker: None,
             connection_file: Some(harness.connection_file.clone()),
             ticket: ticket.map(str::to_string),
             transient_delays,
@@ -1471,6 +1477,7 @@ fn dispatch_pr_create(harness: &Harness, ticket: Option<&str>) -> (i32, bool) {
             0
         },
         &RelayContext {
+            worker_broker: None,
             connection_file: Some(harness.connection_file.clone()),
             ticket: ticket.map(str::to_string),
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
