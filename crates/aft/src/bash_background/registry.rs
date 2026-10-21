@@ -6271,7 +6271,6 @@ impl BgTaskRegistry {
         // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
-        let mut complete: Option<Vec<u8>> = None;
         loop {
             if !drain && bytes_read >= CHUNK as usize {
                 break;
@@ -6300,35 +6299,53 @@ impl BgTaskRegistry {
             if registry.file_cursor(cursor_key) != cursor {
                 continue;
             }
-            matches.extend(registry.scan_chunk(
+            let mut ranges = Vec::new();
+            let mut found = registry.scan_chunk(
                 cursor_key,
                 task_id,
                 &bytes,
                 start,
                 &mut |_, _, _, from, to| {
-                    // Scan in bounded chunks, but mask the intact capture only
-                    // when a watch fires so neither chunk edge can split a secret.
-                    if complete
-                        .as_ref()
-                        .is_none_or(|bytes| to > bytes.len() as u64)
-                    {
-                        complete = file
-                            .len()
-                            .ok()
-                            .filter(|len| *len < super::buffer::DISK_LIMIT_BYTES)
-                            .and_then(|len| file.read_range(0, len).ok());
-                    }
-                    let Some(complete) = complete.as_ref().filter(|bytes| to <= bytes.len() as u64)
-                    else {
-                        return (
+                    ranges.push(from..to);
+                    (String::new(), String::new())
+                },
+            );
+            drop(registry);
+            // Keep cursor and one-shot updates atomic, but never read presentation
+            // bytes or mask credentials while holding the watch registry lock.
+            for (matched, range) in found.iter_mut().zip(ranges) {
+                let rendered = file
+                    .len()
+                    .ok()
+                    .and_then(|len| {
+                        if len >= super::buffer::DISK_LIMIT_BYTES || range.end > len {
+                            return None;
+                        }
+                        let source = completion_preview::watch_preview_source_range(
+                            range.start as usize..range.end as usize,
+                            len as usize,
+                        )?;
+                        let bytes = file
+                            .read_range(source.start as u64, source.len() as u64)
+                            .ok()?;
+                        (bytes.len() == source.len()).then(|| {
+                            self.render_watch_preview(
+                                task_id,
+                                &bytes,
+                                range.start as usize - source.start
+                                    ..range.end as usize - source.start,
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        (
                             crate::log_redact::SECRET_PLACEHOLDER.to_string(),
                             completion_preview::TRUNCATED_PREVIEW_WITHHELD.to_string(),
-                        );
-                    };
-                    self.render_watch_preview(task_id, complete, from as usize..to as usize)
-                },
-            ));
-            drop(registry);
+                        )
+                    });
+                (matched.match_text, matched.context) = rendered;
+            }
+            matches.extend(found);
             if len < CHUNK as usize {
                 break;
             }
@@ -21643,9 +21660,10 @@ mod tests {
             "late-stream match was not caught in one fair running scan; read {} bytes",
             work.artifact_bytes
         );
-        // Matching stays chunked. A hit rereads the intact capture once so
-        // credential masking precedes both the chunk and context-window cuts.
-        assert_eq!(work.artifact_bytes, 2 * 196612);
+        // Matching stays chunked. Presentation reads only a bounded neighborhood
+        // of the hit instead of rereading the entire capture for masking.
+        assert!(work.artifact_bytes > 196612);
+        assert!(work.artifact_bytes <= 196612 + completion_preview::WATCH_PREVIEW_SOURCE_BYTES);
         assert_eq!(
             work.artifact_opens, 2,
             "fresh validation is shared by all chunks in this pass"

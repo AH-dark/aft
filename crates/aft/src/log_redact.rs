@@ -92,10 +92,27 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     redact_with_range(text, None)
 }
 
+// Separate limits bound byte scanning and expensive candidate hashes. Long
+// non-hex verdict lines need no hashes and can still retain their placeholders.
+pub(crate) const TICKET_REDACTION_BYTES: usize = 50 * 1024;
+pub(crate) const TICKET_REDACTION_WINDOWS: usize = 8 * 1024;
+pub(crate) const TICKET_HALO_BYTES: usize = 31;
+
+#[derive(Debug)]
+pub(crate) struct TicketRedactionBudgetExceeded;
+
 /// Redact only a 32-hex candidate whose BLAKE3 digest matches this task's stored
 /// ticket digest. This keeps ordinary hashes and identifiers unchanged in previews.
-pub(crate) fn redact_ticket_digest<'a>(text: &'a str, digest: Option<&str>) -> Cow<'a, str> {
+pub(crate) fn redact_ticket_digest<'a>(
+    text: &'a str,
+    digest: Option<&str>,
+) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
     redact_ticket_digest_with_range(text, None, digest)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TICKET_HASH_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Range-aware form used when a watch match is anchored in captured output.
@@ -103,7 +120,7 @@ pub(crate) fn redact_ticket_digest_range<'a>(
     text: &'a str,
     range: &mut std::ops::Range<usize>,
     digest: Option<&str>,
-) -> Cow<'a, str> {
+) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
     redact_ticket_digest_with_range(text, Some(range), digest)
 }
 
@@ -111,16 +128,22 @@ fn redact_ticket_digest_with_range<'a>(
     text: &'a str,
     mut range: Option<&mut std::ops::Range<usize>>,
     digest: Option<&str>,
-) -> Cow<'a, str> {
+) -> Result<Cow<'a, str>, TicketRedactionBudgetExceeded> {
     let Some(digest) = digest else {
-        return Cow::Borrowed(text);
+        return Ok(Cow::Borrowed(text));
     };
     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Cow::Borrowed(text);
+        return Ok(Cow::Borrowed(text));
+    }
+    // Refuse before hashing any candidate. A caller must withhold the rendered
+    // region rather than fall back to the unmasked input on budget exhaustion.
+    if text.len() > TICKET_REDACTION_BYTES || ticket_digest_windows(text) > TICKET_REDACTION_WINDOWS
+    {
+        return Err(TicketRedactionBudgetExceeded);
     }
     let bytes = text.as_bytes();
     if bytes.len() < 32 {
-        return Cow::Borrowed(text);
+        return Ok(Cow::Borrowed(text));
     }
     let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
     let mut cursor = 0;
@@ -140,6 +163,12 @@ fn redact_ticket_digest_with_range<'a>(
         for start in run_start..=(run_end - 32) {
             let end = start + 32;
             let candidate = &text[start..end];
+            #[cfg(test)]
+            TICKET_HASH_PROBE.with(|probe| {
+                if let Some(probe) = probe.borrow_mut().as_mut() {
+                    probe();
+                }
+            });
             if blake3::hash(candidate.as_bytes()).to_hex().as_str() != digest {
                 continue;
             }
@@ -153,7 +182,7 @@ fn redact_ticket_digest_with_range<'a>(
         }
     }
     if spans.is_empty() {
-        return Cow::Borrowed(text);
+        return Ok(Cow::Borrowed(text));
     }
     let mut masked = String::with_capacity(text.len());
     let mut copied = 0;
@@ -172,7 +201,14 @@ fn redact_ticket_digest_with_range<'a>(
         copied = span.end;
     }
     masked.push_str(&text[copied..]);
-    Cow::Owned(masked)
+    Ok(Cow::Owned(masked))
+}
+
+pub(crate) fn ticket_digest_windows(text: &str) -> usize {
+    text.as_bytes()
+        .split(|byte| !byte.is_ascii_hexdigit())
+        .map(|run| run.len().saturating_sub(31))
+        .sum()
 }
 
 fn redact_with_range<'a>(
@@ -306,6 +342,9 @@ pub fn is_secret_environment_key(key: &str) -> bool {
 }
 
 impl SecretValues {
+    pub(crate) fn longest_value_len(&self) -> usize {
+        self.0.iter().map(String::len).max().unwrap_or(0)
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -514,6 +553,43 @@ fn map_redacted_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_digest_budget_refuses_before_hashing() {
+        let digest = blake3::hash(b"0123456789abcdef0123456789abcdef")
+            .to_hex()
+            .to_string();
+        TICKET_HASH_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(|| panic!("over-budget input was hashed")))
+        });
+        assert!(
+            redact_ticket_digest(&"a".repeat(TICKET_REDACTION_WINDOWS + 32), Some(&digest))
+                .is_err()
+        );
+        TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+    }
+
+    #[test]
+    fn ticket_digest_hashes_only_complete_hex_windows() {
+        let digest = blake3::hash(b"0123456789abcdef0123456789abcdef")
+            .to_hex()
+            .to_string();
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let probe_count = count.clone();
+        TICKET_HASH_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || probe_count.set(probe_count.get() + 1)))
+        });
+        let text = format!(
+            "{} {} {} {}",
+            "a".repeat(31),
+            "g".repeat(1024),
+            "a".repeat(32),
+            "F".repeat(33)
+        );
+        assert_eq!(redact_ticket_digest(&text, Some(&digest)).unwrap(), text);
+        TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+        assert_eq!(count.get(), 3);
+    }
 
     #[test]
     fn completion_exact_env_values_are_case_sensitive_and_overlap_safe() {

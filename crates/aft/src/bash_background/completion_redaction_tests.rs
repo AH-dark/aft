@@ -1,6 +1,202 @@
 use super::*;
 use crate::log_redact::SECRET_PLACEHOLDER;
 
+#[test]
+fn bash_background_restart_hex_watch_redaction_is_bounded_and_unlocked() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    let fixture = tempfile::tempdir().unwrap();
+    let original = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&original, &fixture, "cmd", "", "", false);
+    let mut bytes = vec![b'a'; 100 * 1024 * 1024 - 1];
+    let end = bytes.len();
+    bytes[end - 38..end - 6].copy_from_slice(TICKET.as_bytes());
+    bytes[end - 6..].copy_from_slice(b" READY");
+    std::fs::write(&task.paths.stdout, &bytes).unwrap();
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.completion_has_env_secrets = Some(true);
+    metadata.completion_has_non_ticket_env_secrets = Some(false);
+    metadata.notify_on_completion = false;
+    metadata.completion_delivered = true;
+    metadata.completion_ticket_digest = Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    let registry = BgTaskRegistry::default();
+    registry
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let recovered = registry.task(&id).unwrap();
+    {
+        let mut watches = registry.inner.watch_registry.lock().unwrap();
+        watches
+            .register(id.clone(), WatchPattern::Substring("READY".into()), true)
+            .unwrap();
+        watches.set_file_cursor(&format!("{id}:stdout"), (end - 1024) as u64);
+    }
+    let probe_registry = registry.clone();
+    let hashes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_hashes = hashes.clone();
+    crate::log_redact::TICKET_HASH_PROBE.with(|probe| {
+        *probe.borrow_mut() = Some(Box::new(move || {
+            assert!(
+                probe_registry.inner.watch_registry.try_lock().is_ok(),
+                "ticket redaction holds watch_registry"
+            );
+            assert!(
+                probe_hashes.fetch_add(1, Ordering::SeqCst) < 4096,
+                "ticket hash budget exceeded"
+            );
+        }));
+    });
+    let (_, unrelated) =
+        tests::insert_terminal_piped_task(&registry, &fixture, "true", "", "", false);
+    {
+        let mut state = unrelated.lock_state().unwrap();
+        state.metadata.status = BgTaskStatus::Running;
+        state.metadata.notify_on_completion = false;
+        state.child_exit_observed = true;
+    }
+    std::fs::write(&unrelated.paths.exit, "0\n").unwrap();
+    {
+        let mut tasks = registry.inner.watchdog_tasks.lock().unwrap();
+        tasks.insert(id.clone(), recovered.clone());
+        tasks.insert(unrelated.task_id.clone(), unrelated.clone());
+    }
+    let started = Instant::now();
+    super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut HashMap::new());
+    crate::log_redact::TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+    assert!(hashes.load(Ordering::SeqCst) > 0);
+    assert_eq!(registry.active_watch_count(&id), 0);
+    assert_eq!(unrelated.snapshot(0).info.status, BgTaskStatus::Completed);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "unrelated exit stalled behind watch rendering"
+    );
+}
+
+#[test]
+fn bash_background_watch_ticket_straddling_context_edge_is_masked() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    const MD5: &str = "fedcba9876543210fedcba9876543210";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&registry, &fixture, "cmd", "", "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest =
+        Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    for offset in [1, 16, 31] {
+        let text = format!(
+            "{TICKET}{}READY {MD5} {}{TICKET}",
+            "x".repeat(100 - offset),
+            "x".repeat(500 - MD5.len() - 2 - offset)
+        );
+        let start = text.find("READY").unwrap();
+        let (matched, context) =
+            registry.render_watch_preview(&id, text.as_bytes(), start..start + 5);
+        assert_eq!(matched, "READY");
+        assert!(context.contains(MD5));
+        assert!(
+            !context.contains(&TICKET[..16]),
+            "ticket prefix survived: {context}"
+        );
+        assert!(
+            !context.contains(&TICKET[16..]),
+            "ticket suffix survived: {context}"
+        );
+    }
+}
+
+#[test]
+fn bash_background_ticket_budget_withholds_previews_and_keeps_pointers() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let output = format!("{} {TICKET}\n", "a".repeat(9000));
+    let (id, task) =
+        tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &output, "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest =
+        Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+    let (matched, context) = registry.render_watch_preview(&id, output.as_bytes(), 0..output.len());
+    assert_eq!(matched, SECRET_PLACEHOLDER);
+    assert!(context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+    let completion = registry.completion_snapshot_for_task(&task).unwrap();
+    assert!(completion.output_truncated);
+    assert!(completion
+        .output_preview
+        .starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+    assert!(completion
+        .output_preview
+        .contains(&task.paths.stdout.display().to_string()));
+    assert!(!completion.output_preview.contains(TICKET));
+    let mut assembled = output;
+    registry.mask_completion_text(&id, &mut assembled);
+    assert!(assembled.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
+    assert!(assembled.contains(&task.paths.stdout.display().to_string()));
+    assert!(!assembled.contains(TICKET));
+}
+
+#[test]
+fn bash_background_completion_ticket_tail_uses_intact_halo() {
+    const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
+    const MD5: &str = "fedcba9876543210fedcba9876543210";
+    for compressed in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let raw = format!(
+            "{}\n{TICKET} {}\nmd5 {MD5}\n",
+            "x\n".repeat(40_000),
+            "y".repeat(540)
+        );
+        let (_, task) =
+            tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &raw, "", compressed);
+        task.lock_state().unwrap().metadata.completion_ticket_digest =
+            Some(blake3::hash(TICKET.as_bytes()).to_hex().to_string());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_count = count.clone();
+        crate::log_redact::TICKET_HASH_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                assert!(
+                    probe_count.fetch_add(1, Ordering::SeqCst) < 8192,
+                    "completion hashed unrendered capture"
+                );
+            }))
+        });
+        let preview = registry
+            .completion_snapshot_for_task(&task)
+            .unwrap()
+            .output_preview;
+        crate::log_redact::TICKET_HASH_PROBE.with(|probe| *probe.borrow_mut() = None);
+        assert!(
+            !preview.contains("withheld"),
+            "bounded tail was withheld (compressed={compressed}): {preview}"
+        );
+        assert!(preview.contains(MD5));
+        assert!(!preview.contains(&TICKET[..16]));
+        assert!(!preview.contains(&TICKET[16..]));
+        assert!(count.load(Ordering::SeqCst) > 0);
+    }
+}
+
+#[test]
+fn bash_background_ticket_budget_preserves_long_masked_classifier_line() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let raw = format!(
+        "{}{{\"api_key\":\"{}\"}}\n",
+        "x".repeat(30_000),
+        "Z".repeat(40_000)
+    );
+    let (_, task) = tests::insert_terminal_piped_task(&registry, &fixture, "cmd", &raw, "", false);
+    task.lock_state().unwrap().metadata.completion_ticket_digest = Some(
+        blake3::hash(b"0123456789abcdef0123456789abcdef")
+            .to_hex()
+            .to_string(),
+    );
+    let preview = registry
+        .completion_snapshot_for_task(&task)
+        .unwrap()
+        .output_preview;
+    assert!(preview.contains(SECRET_PLACEHOLDER));
+    assert!(!preview.contains(&"Z".repeat(64)));
+    assert!(!preview.contains("withheld"));
+}
+
 fn fixture_preview(input: &str, compressed: bool, failed: bool) -> String {
     let fixture = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
@@ -118,13 +314,13 @@ fn bash_background_completion_digest_redacts_embedded_ticket_windows_only() {
 
     let surrounded_by_underscores = format!("prefix_{TICKET}_suffix");
     assert_eq!(
-        crate::log_redact::redact_ticket_digest(&surrounded_by_underscores, Some(&digest)),
+        crate::log_redact::redact_ticket_digest(&surrounded_by_underscores, Some(&digest)).unwrap(),
         "prefix_<REDACTED_SECRET>_suffix"
     );
 
     let longer_hex_run = format!("a{TICKET}b");
     assert_eq!(
-        crate::log_redact::redact_ticket_digest(&longer_hex_run, Some(&digest)),
+        crate::log_redact::redact_ticket_digest(&longer_hex_run, Some(&digest)).unwrap(),
         "a<REDACTED_SECRET>b"
     );
     let mut match_range = 1..(1 + TICKET.len());
@@ -132,15 +328,16 @@ fn bash_background_completion_digest_redacts_embedded_ticket_windows_only() {
         &longer_hex_run,
         &mut match_range,
         Some(&digest),
-    );
+    )
+    .unwrap();
     assert_eq!(redacted_range.get(match_range), Some("<REDACTED_SECRET>"));
     let adjacent_tickets = format!("{TICKET}{TICKET}");
     assert_eq!(
-        crate::log_redact::redact_ticket_digest(&adjacent_tickets, Some(&digest)),
+        crate::log_redact::redact_ticket_digest(&adjacent_tickets, Some(&digest)).unwrap(),
         "<REDACTED_SECRET><REDACTED_SECRET>"
     );
     assert_eq!(
-        crate::log_redact::redact_ticket_digest(MD5_SHAPED, Some(&digest)),
+        crate::log_redact::redact_ticket_digest(MD5_SHAPED, Some(&digest)).unwrap(),
         MD5_SHAPED
     );
 }
