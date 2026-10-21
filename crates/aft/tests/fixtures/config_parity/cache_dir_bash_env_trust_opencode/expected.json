@@ -5,7 +5,7 @@
       "TZ": "Etc/GMT"
     }
   },
-  "cache_dir": "/aft-cache",
+  "cache_dir": "{ABSOLUTE_ROOT}/aft-cache",
   "disabled_tools": [
     "aft_delete",
     "aft_move"

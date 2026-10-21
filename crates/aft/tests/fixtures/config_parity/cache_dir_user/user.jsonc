@@ -1,5 +1,5 @@
 {
   "storage": {
-    "cache_dir": "/aft-cache"
+    "cache_dir": "{ABSOLUTE_ROOT}/aft-cache"
   }
 }

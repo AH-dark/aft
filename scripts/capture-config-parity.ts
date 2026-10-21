@@ -171,6 +171,15 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
   }
 }
 
+// `storage.cache_dir` must be an absolute path, and `/aft-cache` is absolute on
+// macOS and Linux but not on Windows (no drive letter). Fixtures whose cache
+// directory is accepted therefore spell it under this placeholder; the Rust
+// parity test (config_parity_test.rs, `platform_fixture_text`) replaces it
+// with an absolute root for the platform it runs on, in both the tier files
+// and the golden. The TypeScript loader passes the string through unchanged.
+const ABSOLUTE_ROOT = "{ABSOLUTE_ROOT}";
+const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
+
 const CASES: ParityCase[] = [
   { name: "pi_active_harness_ignored_auto_update_hardening", harness: "pi", user: { harnesses: { pi: { auto_update: "opaque", sandbox: { profile: { worker: "strict" } } } } } },
   { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
@@ -187,7 +196,7 @@ const CASES: ParityCase[] = [
     name: `cache_dir_bash_env_trust_${harness}`,
     harness,
     user: {
-      storage: { cache_dir: "/aft-cache" },
+      storage: { cache_dir: USER_CACHE_DIR },
       bash: { env: { TZ: "UTC" } },
       harnesses: {
         [harness]: {
@@ -217,10 +226,10 @@ const CASES: ParityCase[] = [
     { name: `cache_dir_typo_inactive_harness_${harness}`, harness, user: { harnesses: { future: { storge: { cache_dir: "/aft-cache" } } } } },
     { name: `cache_dir_typo_harness_storage_${harness}`, harness, user: { harnesses: { future: { storage: { cachedir: "/aft-cache" } } } } },
   ]),
-  { name: "cache_dir_user", user: { storage: { cache_dir: "/aft-cache" } } },
-  { name: "cache_dir_project_dropped", user: { storage: { cache_dir: "/aft-cache" } }, project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_user", user: { storage: { cache_dir: USER_CACHE_DIR } } },
+  { name: "cache_dir_project_dropped", user: { storage: { cache_dir: USER_CACHE_DIR } }, project: { storage: { cache_dir: "/evil" } } },
   { name: "cache_dir_project_only_dropped", project: { storage: { cache_dir: "/evil" } } },
-  { name: "cache_dir_harness_attempts_dropped", user: { storage: { cache_dir: "/aft-cache" }, harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, project: { harnesses: { pi: { storage: { cache_dir: "/evil" } } } }, harness: "pi" },
+  { name: "cache_dir_harness_attempts_dropped", user: { storage: { cache_dir: USER_CACHE_DIR }, harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, project: { harnesses: { pi: { storage: { cache_dir: "/evil" } } } }, harness: "pi" },
   { name: "cache_dir_harness_only_dropped", user: { harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, harness: "pi" },
   { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
