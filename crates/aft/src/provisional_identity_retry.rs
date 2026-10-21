@@ -15,7 +15,10 @@
 //! attempt first checks, without waiting, whether the pins are readable; once
 //! they are, the same configure request is replayed. That replay is the bind
 //! the folder would otherwise need: it settles and saves the identity and
-//! enables the indexes exactly as a successful first bind does.
+//! enables the indexes exactly as a successful first bind does. Under the
+//! attached daemon it also, like a route bind, takes over from standing-root
+//! maintenance every entry that shares the now settled key before the
+//! session's indexes start loading.
 //!
 //! The replay runs with the admission a bind of the root gets, never inside
 //! the maintenance job that noticed the free database. Configure publishes
@@ -268,10 +271,15 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
 /// Only for callers that run configure requests on the calling thread
 /// themselves (the standalone loop, in-process embedders and tests); the
 /// attached daemon uses [`poll`] and submits the replay as a bind.
+///
+/// The replay hands nothing over from standing-root maintenance: standing
+/// roots are served only by the attached daemon's subc module, which replays
+/// through [`PreparedReplay::run`] with its standing handoff, so these
+/// callers have no standing entry a settled key could share.
 pub(crate) fn drain_inline(ctx: &AppContext) -> bool {
     match poll(ctx) {
         Some(replay) => {
-            replay.run(ctx);
+            replay.run(ctx, |_| {});
             true
         }
         None => false,
@@ -316,7 +324,22 @@ impl PreparedReplay {
     /// Replay the bind. The checks in [`stale_reason`] run again here, at
     /// admission, because a real bind, an unbind or a settle may have
     /// happened since [`poll`] prepared it.
-    pub(crate) fn run(&self, ctx: &AppContext) -> crate::protocol::Response {
+    ///
+    /// `bind_handoff` runs once the replayed configure has committed, still
+    /// inside this bind's admission: the same step a route bind runs after
+    /// its configure. Under the attached daemon it pauses standing-root
+    /// maintenance of every entry whose artifact key now equals the root's
+    /// settled key. The provisional bind could not pause them, because it had
+    /// no key yet and claimed only the standing entry for its own folder, so
+    /// a sibling checkout of the same repository may still be publishing
+    /// into the family the session is about to build. The session's index
+    /// loads start only from its configure tail, which runs after this bind
+    /// returns, so the handoff always precedes the session's first build.
+    pub(crate) fn run(
+        &self,
+        ctx: &AppContext,
+        bind_handoff: impl FnOnce(&AppContext),
+    ) -> crate::protocol::Response {
         let id = self.request_id();
         let Some(retry) = self.retry.lock().clone() else {
             return skipped(id, "already_replayed");
@@ -330,6 +353,9 @@ impl PreparedReplay {
             // A shared-hold run handed its worker back before changing the
             // root; the executor runs this job again as an exclusive writer.
             return response;
+        }
+        if response.success {
+            bind_handoff(ctx);
         }
         if let Some(retry) = self.retry.lock().take() {
             finish_replay(ctx, &self.root, retry, &response);

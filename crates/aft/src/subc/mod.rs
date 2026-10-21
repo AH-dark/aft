@@ -5943,8 +5943,13 @@ where
                         .filter(|meta| !meta.unbound_quiesced && meta.identity_replay.is_none())
                     {
                         let session = replay.session();
-                        let replayed =
-                            submit_identity_replay_bind(&executor, meta, root_id.clone(), replay);
+                        let replayed = submit_identity_replay_bind(
+                            &executor,
+                            meta,
+                            root_id.clone(),
+                            replay,
+                            &standing_actor,
+                        );
                         let done_tx = identity_replay_done_tx.clone();
                         let done_root = root_id.clone();
                         tokio::spawn(async move {
@@ -10012,17 +10017,26 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
 /// root's meta keeps the bind's cancellation while it is in flight, so
 /// maintenance defers the root as for any bind in flight and quiescing the
 /// root cancels it (`quiesce_unbound_root_with`).
+///
+/// Like a route bind, a replay whose configure commits then runs the
+/// standing half of the bind (`StandingActor::begin_session_bind`) before
+/// its admission ends. The provisional bind claimed only the standing entry
+/// for its own folder; once the identity settles, that step pauses every
+/// standing entry sharing the settled key, such as a sibling checkout of the
+/// same repository, so the two never publish into one index family.
 fn submit_identity_replay_bind(
     executor: &Executor,
     meta: &mut RootMeta,
     root_id: ProjectRootId,
     replay: crate::provisional_identity_retry::PreparedReplay,
+    standing_actor: &Arc<standing::StandingActor>,
 ) -> oneshot::Receiver<Response> {
     let request_id = replay.request_id();
+    let standing_actor = Arc::clone(standing_actor);
     let (completion, cancellation) = executor.submit_bind_cancellable_async(
         root_id,
         request_id,
-        Arc::new(move |ctx| replay.run(ctx)),
+        Arc::new(move |ctx| replay.run(ctx, |ctx| standing_actor.begin_session_bind(ctx))),
     );
     meta.identity_replay = Some(cancellation);
     completion
@@ -18892,12 +18906,17 @@ mod tests {
         let (commit_reached, commit_release) =
             crate::commands::configure::gate_configure_commit_for_test(canonical_root.clone());
         let replay_response = Arc::new(parking_lot::Mutex::new(None));
+        let standing = Arc::new(standing::StandingActor::new(
+            ctx.app(),
+            Arc::clone(&executor),
+        ));
         let pump = {
-            let (executor, root_id, stop, replay_response) = (
+            let (executor, root_id, stop, replay_response, standing) = (
                 Arc::clone(&executor),
                 root_id.clone(),
                 Arc::clone(&stop),
                 Arc::clone(&replay_response),
+                Arc::clone(&standing),
             );
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
@@ -18920,6 +18939,7 @@ mod tests {
                                 &mut meta,
                                 root_id.clone(),
                                 replay,
+                                &standing,
                             );
                             *replay_response.lock() = replayed.blocking_recv().ok();
                         }
@@ -19193,6 +19213,159 @@ mod tests {
         );
         assert!(ctx.artifact_identity_provisional());
     }
+
+    /// A bind that finds aft.db busy leaves the session provisional, so its
+    /// standing step claims only the standing entry for its own folder, and a
+    /// standing entry for a sibling checkout of the same repository stays
+    /// active. When the identity retry settles the session, its replayed bind
+    /// must take that sibling over from standing maintenance, inside the
+    /// bind's admission and before the session's first index load starts.
+    /// Otherwise both checkouts publish into one index family and replace
+    /// each other's results.
+    #[test]
+    fn identity_retry_settle_pauses_a_sibling_standing_entry_before_the_session_builds() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root_id = configured.root.clone();
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling = sibling_parent.path().join("sibling");
+        let mut clone = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(&mut clone);
+        assert!(clone
+            .args(["clone", "--quiet"])
+            .arg(configured.dir.path())
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success());
+        let sibling = std::fs::canonicalize(&sibling).unwrap();
+        let sibling_literal = sibling.to_string_lossy().into_owned();
+
+        // Rollback-journal mode, so the exclusive transaction also blocks the
+        // bind's read of its legacy identity pin.
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-sibling",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-sibling-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": false },
+                    "index": { "roots": [{ "path": sibling_literal, "indexes": ["search"] }] },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = configured
+            .submit_bind(&executor, bind)
+            .blocking_recv()
+            .expect("provisional bind completes");
+        assert!(bound.success, "{}", bound.data);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(!ctx.config().indexes.trigram);
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        // The standing half of the provisional bind: with no key yet it claims
+        // only the session's own folder, so the sibling's entry stays active.
+        let standing = Arc::new(
+            standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
+                .with_startup_storage_dir(configured.storage.path()),
+        );
+        standing.begin_session_bind(&ctx);
+        assert!(
+            standing.admits_build_for_test(&sibling_literal),
+            "fixture: the provisional bind leaves the sibling's standing entry active"
+        );
+
+        let loads_before =
+            crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
+                &canonical_root,
+            );
+        let replay = pump_until_identity_replay(&executor, &root_id);
+        let mut meta = RootMeta::new(Instant::now());
+        let replayed =
+            submit_identity_replay_bind(&executor, &mut meta, root_id.clone(), replay, &standing)
+                .blocking_recv()
+                .expect("replayed bind completes");
+        assert!(replayed.success, "{}", replayed.data);
+        assert!(
+            ctx.artifact_identity_provisional_reason().is_none(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(ctx.config().indexes.trigram);
+        let settled_key = ctx
+            .cached_artifact_cache_key(&canonical_root)
+            .expect("the settled bind publishes its key");
+        assert_eq!(
+            standing
+                .entry_artifact_key_for_test(&sibling_literal)
+                .as_deref(),
+            Some(settled_key.as_str()),
+            "fixture: the sibling's standing entry shares the session's settled key"
+        );
+        // The session's index loads start only from its configure tail, which
+        // has not run yet; the sibling must already be paused here.
+        assert_eq!(
+            crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
+                &canonical_root
+            ),
+            loads_before,
+            "the session's index load started before its configure tail ran"
+        );
+        assert!(
+            !standing.admits_build_for_test(&sibling_literal),
+            "the settled session's replayed bind left the sibling's standing entry publishing into its index family"
+        );
+
+        // Run the session's configure tail until its first search load
+        // starts; standing maintenance stays paused through it and after.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
+            &canonical_root,
+        ) == loads_before
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the settled session's search load never started"
+            );
+            let tail = executor.submit_maintenance_async(
+                root_id.clone(),
+                Lane::MaintenanceCommit,
+                "subc-maintenance-drain-configure-tail-identity-retry-sibling".to_string(),
+                Box::new(|ctx| {
+                    run_configure_tail_maintenance(ctx);
+                    Response::success("tail", json!({}))
+                }),
+            );
+            let _ = tail.blocking_recv();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!standing.admits_build_for_test(&sibling_literal));
+        standing.tick();
+        assert!(
+            !standing.admits_build_for_test(&sibling_literal),
+            "maintenance resumed a standing entry the bound session took over"
+        );
+    }
+
+    /// Run the configure-tail maintenance job on the root's actor, as the module
     /// loop's tick does, until the identity retry hands back a bind to replay.
     fn pump_until_identity_replay(
         executor: &Executor,
@@ -19282,11 +19455,16 @@ mod tests {
                 crate::commands::configure::ConfigureGateStage::WriterAdmitted,
             );
         let session = replay.session();
+        let standing = Arc::new(standing::StandingActor::new(
+            ctx.app(),
+            Arc::clone(&executor),
+        ));
         let replayed = submit_identity_replay_bind(
             &executor,
             live_roots.get_mut(&root_id).unwrap(),
             root_id.clone(),
             replay,
+            &standing,
         );
         assert!(
             roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id),
