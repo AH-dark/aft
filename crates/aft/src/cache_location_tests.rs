@@ -171,6 +171,26 @@ fn enrollment_device_comparison_uses_the_pinned_creation_parent() {
     assert!(!config.storage_dir.unwrap().exists());
 }
 
+/// The test helper simulates the cache folder as its own volume. That must hold
+/// however the configured path is spelled: GitHub's Windows runners keep TEMP
+/// under the 8.3 short name `C:\Users\RUNNER~1`, enrollment opens the folder
+/// under its resolved long spelling, and a simulation keyed only by the given
+/// spelling left enrollment comparing the real, shared volume.
+#[test]
+fn test_cache_volume_is_simulated_under_a_non_canonical_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("detour")).unwrap();
+    fs::create_dir(temp.path().join("cache-volume")).unwrap();
+    let mut config = Config {
+        storage_dir: Some(temp.path().join("storage")),
+        cache_dir: Some(temp.path().join("detour").join("..").join("cache-volume")),
+        ..Default::default()
+    };
+    let warning = prepare_cache_root(&mut config);
+    assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
+    assert!(config.cache_lease.is_some());
+}
+
 fn unenrolled_cache_config(temp: &Path) -> Config {
     let parent = temp.join("cache-volume");
     fs::create_dir(&parent).unwrap();
