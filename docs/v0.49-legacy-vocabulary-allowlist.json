@@ -8820,6 +8820,28 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "The denial fixture exercises read's existing served V1 filePath wire without authorizing outside content."
+    },
+    {
+      "path": "packages/pi-plugin/src/tools/safety.ts",
+      "line": 248,
+      "column": 15,
+      "token": "filePath",
+      "text": "if (filePath) previewReq.file = filePath;",
+      "location": "line 248, column 15",
+      "ordinal": 3,
+      "class": "compatibility-boundary",
+      "reason": "The checkpoint-restore preview carries the same file scope as the restore; the spelling is the existing resolved-path variable at the raw-input compatibility boundary."
+    },
+    {
+      "path": "packages/pi-plugin/src/tools/safety.ts",
+      "line": 248,
+      "column": 43,
+      "token": "filePath",
+      "text": "if (filePath) previewReq.file = filePath;",
+      "location": "line 248, column 43",
+      "ordinal": 4,
+      "class": "compatibility-boundary",
+      "reason": "The checkpoint-restore preview carries the same file scope as the restore; the spelling is the existing resolved-path variable at the raw-input compatibility boundary."
     }
   ]
 }

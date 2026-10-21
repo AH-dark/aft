@@ -54,7 +54,7 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   // session, message and call identifiers the host provides, so a
   // continuation never moves to a different operation. It must not include
   // the arguments: a preview and its apply send different arguments
-  // (undo_preview's `file`, then safety's `op` and `filePath`), and OpenCode 1
+  // (undo_preview's `file`, then safety's `op` and its own path argument), and OpenCode 1
   // gives no call ID, so an argument-based key would never match and the user
   // would be asked twice.
   const key = JSON.stringify([

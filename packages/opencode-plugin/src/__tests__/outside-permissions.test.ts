@@ -188,7 +188,7 @@ describe("engine outside-access asks", () => {
     await withOutsidePermissions(runtime, { file: "/outside/a" }, send, true, "undo_preview");
     await withOutsidePermissions(
       runtime,
-      { op: "undo", filePath: "/outside/a" },
+      { op: "undo", path: "/outside/a" },
       send,
       false,
       "safety",
