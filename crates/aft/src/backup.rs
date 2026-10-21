@@ -1010,8 +1010,9 @@ impl BackupStore {
     /// Retry moving root backups from `<storage>/backups` into
     /// `<storage>/<harness>/backups` on backup operations. Run stale-session GC and
     /// tighten permissions once for each storage-directory/harness pair in this
-    /// process. Run flat-layout migration on the first pass, then rerun it only
-    /// when this call moves root backups into the harness directory.
+    /// process. Attempt flat-layout migration on the first pass, retry after a busy
+    /// namespace deferral, then rerun it only when this call moves root backups into
+    /// the harness directory.
     ///
     /// Configure deliberately does not invoke this. Backup mutations or restores
     /// perform the maintenance; ordinary project binding does not enumerate the
@@ -1028,7 +1029,7 @@ impl BackupStore {
             self.gc_stale_sessions(self.maintenance_ttl_hours);
         }
 
-        let first_migration = BACKUP_MIGRATION_KEYS.lock().unwrap().insert(key);
+        let first_migration = !BACKUP_MIGRATION_KEYS.lock().unwrap().contains(&key);
         if first_migration || repair.moved > 0 {
             self.migrate_legacy_layout_if_needed();
         }
@@ -3312,10 +3313,33 @@ impl BackupStore {
     /// to the effective harness's `<storage_dir>/<harness>/backups/` directory,
     /// move legacy flat entries into the default session namespace.
     ///
-    /// Detection: any directory directly under `backups/` that contains a
-    /// `meta.json` (rather than `session.json` and per-path subdirectories)
-    /// identifies a legacy entry.
+    /// Detection: a directory directly under `backups/` is a legacy entry only
+    /// when its name matches the stored path hash and its metadata has an absolute
+    /// path plus a non-zero entry count. Session directories and move staging names
+    /// do not satisfy that finished-entry shape.
     fn migrate_legacy_layout_if_needed(&mut self) {
+        let Some(storage_dir) = self.storage_dir.clone() else {
+            return;
+        };
+        let _namespace = match backup_namespace_gate(&storage_dir, false) {
+            Ok(Some(gate)) => gate,
+            Ok(None) => {
+                crate::slog_warn!(
+                    "legacy backup migration deferred: namespace is busy; retry on the next backup operation"
+                );
+                return;
+            }
+            Err(error) => {
+                crate::slog_warn!("cannot lock legacy backup namespace for migration: {error}");
+                return;
+            }
+        };
+        // A busy namespace leaves this key absent so a later maintenance pass retries.
+        BACKUP_MIGRATION_KEYS
+            .lock()
+            .unwrap()
+            .insert((storage_dir, self.effective_storage_harness()));
+
         let backups_dir = match self.backups_dir() {
             Some(d) if d.exists() => d,
             _ => return,
@@ -3333,16 +3357,15 @@ impl BackupStore {
         let mut migrated = 0usize;
         for entry in entries.flatten() {
             let entry_path = entry.path();
-            // Skip non-directories and already-sessionized layouts.
-            if !entry_path.is_dir() {
+            // Only finished flat entries have a path-hash name and valid legacy metadata.
+            // Cross-volume copies use `.{destination}.aft-move-{pid}-{nonce}` names until
+            // publication, so a staging directory is not treated as backup history even if
+            // it contains a copied `meta.json`.
+            if !entry_path.is_dir() || !is_legacy_flat_backup_entry(&entry_path) {
                 continue;
             }
             if entry_path == default_session_dir {
                 continue;
-            }
-            let meta_path = entry_path.join("meta.json");
-            if !meta_path.exists() {
-                continue; // Already a session-hash dir (contains per-path subdirs), skip
             }
             // This is a legacy flat-layout path-hash directory. Move it under
             // the default session namespace.
@@ -5899,6 +5922,22 @@ fn legacy_numeric_backup_name(name: &str) -> bool {
         .is_some_and(|stem| !stem.is_empty() && stem.chars().all(|ch| ch.is_ascii_digit()))
 }
 
+fn is_legacy_flat_backup_entry(path_dir: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path_dir.join("meta.json")) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    let Some(path) = meta.get("path").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(count) = meta.get("count").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    count > 0 && is_loadable_backup_path(Path::new(path), path_dir)
+}
+
 fn is_loadable_backup_path(key: &Path, path_dir: &Path) -> bool {
     if !key.is_absolute()
         || key
@@ -7600,13 +7639,14 @@ mod tests {
         let backups = dir.join("backups");
         fs::create_dir_all(&backups).unwrap();
 
-        // Fake legacy entry for some path hash.
-        let legacy_hash = "deadbeefcafebabe";
-        let legacy_dir = backups.join(legacy_hash);
+        // Fake a completed legacy entry for an absolute file path.
+        let legacy_key = Path::new("/tmp/migrated_file.txt");
+        let legacy_hash = BackupStore::path_hash(legacy_key);
+        let legacy_dir = backups.join(&legacy_hash);
         fs::create_dir_all(&legacy_dir).unwrap();
         fs::write(legacy_dir.join("0.bak"), "original content").unwrap();
         let legacy_meta = serde_json::json!({
-            "path": "/tmp/migrated_file.txt",
+            "path": legacy_key.display().to_string(),
             "count": 1,
         });
         fs::write(
@@ -7625,17 +7665,102 @@ mod tests {
         // and the entry should now live under the default-session hash dir.
         let default_session_dir = backups.join(BackupStore::session_hash(DEFAULT_SESSION_ID));
         assert!(default_session_dir.exists());
-        assert!(default_session_dir.join(legacy_hash).exists());
-        assert!(!backups.join(legacy_hash).exists());
+        assert!(default_session_dir.join(&legacy_hash).exists());
+        assert!(!backups.join(&legacy_hash).exists());
 
         // The upgraded meta.json should now include session_id + schema_version.
         let meta_content =
-            fs::read_to_string(default_session_dir.join(legacy_hash).join("meta.json")).unwrap();
+            fs::read_to_string(default_session_dir.join(&legacy_hash).join("meta.json")).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
         assert_eq!(meta["session_id"], DEFAULT_SESSION_ID);
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_maintenance_defers_legacy_migration_while_namespace_is_busy() {
+        let storage = tempfile::tempdir().unwrap();
+        let key = storage.path().join("legacy.txt");
+        let backups_dir = storage.path().join("opencode/backups");
+        let legacy_dir = backups_dir.join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("0.bak"), "original content").unwrap();
+        fs::write(
+            legacy_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        let namespace_lock = backup_namespace_file(storage.path()).unwrap();
+        namespace_lock.lock().unwrap();
+
+        store.run_process_maintenance_once();
+        assert!(
+            legacy_dir.exists(),
+            "a busy namespace must defer flat-layout migration"
+        );
+
+        drop(namespace_lock);
+        store.run_process_maintenance_once();
+        let migrated_dir = backups_dir
+            .join(BackupStore::session_hash(DEFAULT_SESSION_ID))
+            .join(BackupStore::path_hash(&key));
+        assert!(migrated_dir.join("meta.json").exists());
+        assert!(!legacy_dir.exists());
+    }
+
+    #[test]
+    fn flat_migration_ignores_cross_volume_staging_directories() {
+        let storage = tempfile::tempdir().unwrap();
+        let key = storage.path().join("legacy.txt");
+        let backups_dir = storage.path().join("opencode/backups");
+        let target_name = BackupStore::path_hash(&key);
+        let staging_name = format!(
+            ".{target_name}.aft-move-{}-{:016x}",
+            std::process::id(),
+            0x1234_u64
+        );
+        let staging_dir = backups_dir.join(&staging_name);
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("0.bak"), "original content").unwrap();
+        fs::write(
+            staging_dir.join("meta.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": key.display().to_string(),
+                "count": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        store.run_process_maintenance_once();
+
+        let default_session_dir = backups_dir.join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        assert!(
+            staging_dir.exists(),
+            "an unpublished cross-volume move must remain in the harness backup directory"
+        );
+        assert!(
+            !default_session_dir.join(staging_name).exists(),
+            "staging contents must not be migrated as completed history"
+        );
     }
 
     #[test]
