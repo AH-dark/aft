@@ -1730,11 +1730,17 @@ fn launcher_closes_late_inherited_listener_above_marker_slots() {
     let mut command = launcher_command(131, &["python3", "-c", script]);
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(profile_fd,131)<0 || libc::fcntl(131,libc::F_SETFD,0)<0 {return Err(std::io::Error::last_os_error());}
-            for target in [5,10,128] {
-                if libc::dup2(source,target)<0 || libc::fcntl(target,libc::F_SETFD,0)<0 {return Err(std::io::Error::last_os_error());}
+            if libc::dup2(profile_fd, 131) < 0 || libc::fcntl(131, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-            if ![5,10,128,131].contains(&source) {libc::close(source);}
+            for target in [5, 10, 128] {
+                if libc::dup2(source, target) < 0 || libc::fcntl(target, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if ![5, 10, 128, 131].contains(&source) {
+                libc::close(source);
+            }
             Ok(())
         });
     }
