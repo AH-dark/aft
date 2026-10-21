@@ -6430,6 +6430,328 @@ async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
     }
 }
 
+/// Points in a draining-retry worker where a test can hold it, so a pause can
+/// land exactly between two of the worker's own decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum DrainingGate {
+    /// After the worker found no cancellation intent, before it checks the
+    /// retry budget and decides whether to resubmit.
+    BeforeBudgetCheck,
+    /// After the worker decided to resubmit, before it records the dispatch.
+    BeforeResubmit,
+}
+
+type DrainingGateKey = (PathBuf, DrainingGate);
+
+fn draining_gates() -> &'static Mutex<
+    HashMap<
+        DrainingGateKey,
+        (
+            tokio::sync::watch::Sender<bool>,
+            tokio::sync::watch::Receiver<bool>,
+        ),
+    >,
+> {
+    static GATES: std::sync::OnceLock<
+        Mutex<
+            HashMap<
+                DrainingGateKey,
+                (
+                    tokio::sync::watch::Sender<bool>,
+                    tokio::sync::watch::Receiver<bool>,
+                ),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Called by the draining-retry worker at each `DrainingGate` point. A gate
+/// holds the worker once, then is gone; unarmed points return at once.
+pub(super) async fn draining_gate(root: &Path, gate: DrainingGate) {
+    let armed = draining_gates()
+        .lock()
+        .unwrap()
+        .remove(&(test_clock_key(root), gate));
+    if let Some((reached, mut release)) = armed {
+        reached.send_replace(true);
+        let _ = release.wait_for(|released| *released).await;
+    }
+}
+
+struct HeldDrainingGate {
+    key: DrainingGateKey,
+    reached: tokio::sync::watch::Receiver<bool>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+impl HeldDrainingGate {
+    fn arm(root: &Path, gate: DrainingGate) -> Self {
+        let key = (test_clock_key(root), gate);
+        let (reached_tx, reached) = tokio::sync::watch::channel(false);
+        let (release, release_rx) = tokio::sync::watch::channel(false);
+        assert!(draining_gates()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (reached_tx, release_rx))
+            .is_none());
+        Self {
+            key,
+            reached,
+            release,
+        }
+    }
+
+    async fn reached(&mut self) {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.reached.wait_for(|reached| *reached),
+        )
+        .await
+        .expect("draining worker must reach the gate")
+        .expect("draining gate dropped");
+    }
+
+    fn release(&self) {
+        self.release.send_replace(true);
+    }
+}
+
+impl Drop for HeldDrainingGate {
+    fn drop(&mut self) {
+        draining_gates().lock().unwrap().remove(&self.key);
+        // Release a held worker even when an assertion failed.
+        self.release.send_replace(true);
+    }
+}
+
+fn owner_scope(scope_ref: &str) -> subc_protocol::scope::ScopeStamp {
+    subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        scope_ref,
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    )
+}
+
+/// Start the owner's `bash.kill_scope` off the test runtime. It blocks until
+/// every paused remote task settles its cancellation, or its own 10-second
+/// deadline passes.
+fn start_kill_scope(
+    registry: &BgTaskRegistry,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> tokio::task::JoinHandle<crate::protocol::Response> {
+    let registry = registry.clone();
+    let scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &[registry],
+        )
+    })
+}
+
+/// The pause has ended the task: it recorded its cancellation intent and the
+/// paused terminal state. A worker held at a gate can be released from here on
+/// to observe it. Releasing it earlier would let the worker race the pause to
+/// the task's terminal state.
+async fn pause_recorded(registry: &BgTaskRegistry, task: &str) {
+    wait_for("the pause must end the task", || {
+        let task = registry.task(task)?;
+        let state = task.state.lock().unwrap();
+        (state.metadata.remote.as_ref()?.cancel_requested
+            && state.metadata.is_terminal()
+            && state.metadata.status_reason.as_deref()
+                == Some(crate::bash_background::registry::OWNER_PAUSED_REASON))
+        .then_some(())
+    })
+    .await
+}
+
+/// A worker that settles the owner's pause answers `bash.kill_scope` at once.
+/// One that never settles it leaves the reply waiting out its whole 10-second
+/// deadline and then reporting a failed cancellation. Half that deadline tells
+/// the two apart without depending on machine speed, and the reply text must
+/// also show the settled outcome rather than the deadline's.
+async fn assert_pause_settles_promptly(
+    registry: &BgTaskRegistry,
+    operation: tokio::task::JoinHandle<crate::protocol::Response>,
+    task: &str,
+) {
+    let reply = tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .expect("bash.kill_scope must settle well before its 10-second deadline")
+        .unwrap();
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert_eq!(
+        killed.len(),
+        1,
+        "{reply:?}; task: {:?}",
+        registry.status(task, "session", None, None, 0)
+    );
+    assert_eq!(killed[0]["task_id"], task, "{reply:?}");
+    // A refused submission leaves no runner job to cancel, so withholding the
+    // retry is the whole cancellation and is reported as sent.
+    assert_eq!(killed[0]["remote"]["cancel"], "sent", "{reply:?}");
+}
+
+fn assert_paused(registry: &BgTaskRegistry, task: &str) {
+    let done = registry.status(task, "session", None, None, 0).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed, "{done:?}");
+    assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+}
+
+fn start_scoped_runon_retry(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    connection: PathBuf,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> String {
+    super::super::with_scope_spawn(Some(scope.clone()), || {
+        start_runon_retry(registry, dir, connection)
+    })
+}
+
+/// The owner pauses a worker whose `runon` task sleeps before retrying a
+/// draining runner. The worker wakes, sees the cancellation, and must settle
+/// the pause itself: nothing else ever will.
+#[tokio::test]
+async fn bash_kill_scope_settles_while_draining_retry_sleeps() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-sleep");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 1000).await;
+    assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
+    // The retry clock never moved: cancellation, not a retry deadline, woke
+    // the worker.
+    assert_eq!(clock.now(), first);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// The pause lands after the worker decided to resubmit but before it records
+/// the dispatch. Its recheck there must settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_just_before_draining_resubmit() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-resubmit");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeResubmit);
+    clock.advance(200);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    assert_eq!(clock.now(), first + 200);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// The pause lands just before the worker finds its retry budget spent. The
+/// worker then records the draining refusal, which cannot replace the pause's
+/// terminal state, and must still settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_draining_budget_runs_out() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(dir.path(), 600);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-budget");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 600).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
+    clock.advance(600);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// After a restart, a draining retry is due and the worker must reconnect to
+/// resubmit. The pause lands before that reconnect fails; the worker records
+/// that it could not dispatch and must still settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_restored_draining_retry_cannot_reconnect() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let scope = owner_scope("draining-reconnect");
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    // The runner's connection file is gone by the time the module restarts.
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let mut saved = read_task(&json).unwrap();
+    saved.remote.as_mut().unwrap().connection_file = Some(dir.path().join("missing.json"));
+    write_task(&json, &saved).unwrap();
+    clock.advance(200);
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    gate.reached().await;
+    let operation = start_kill_scope(&restarted, &scope);
+    pause_recorded(&restarted, &task_id).await;
+    gate.release();
+    assert_pause_settles_promptly(&restarted, operation, &task_id).await;
+    assert_paused(&restarted, &task_id);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
 #[tokio::test]
 async fn head_blocking_runon_uses_configured_cap_while_queued() {
     let daemon = daemon(Script::GatedStages { position: 9 }, "exec-remote/v1").await;
