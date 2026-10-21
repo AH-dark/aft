@@ -1006,7 +1006,14 @@ impl PinnedDir {
         }
         output.push(id);
         let mount = self.repair_mount_identity()?;
-        for name in self.repair_names(budget)? {
+        let names = self.repair_names(budget)?;
+        #[cfg(test)]
+        REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(self.path());
+            }
+        });
+        for name in names {
             match self.repair_child(&name) {
                 Ok(child) => {
                     let child_id = child.directory_identity()?;
@@ -1019,6 +1026,13 @@ impl PinnedDir {
                     }
                 }
                 Err(error) if repair_leaf_error(&error) => {}
+                // Listed, then removed before it could be opened: an atomic
+                // write's temporary file or an SQLite journal in live storage.
+                // A deleted entry has no identity left to protect. (An entry
+                // renamed into an already-listed directory is missed whether or
+                // not this error is tolerated, so failing here adds no safety;
+                // it only failed every census that met ordinary writes.)
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
@@ -3306,6 +3320,8 @@ pub(crate) fn with_repair_failure_after_for_test<T>(entries: usize, work: impl F
 }
 
 #[cfg(test)]
+thread_local! { pub(crate) static REPAIR_CENSUS_AFTER_NAMES: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
 thread_local! { pub(crate) static REPAIR_IDENTITIES: std::cell::RefCell<std::collections::HashMap<PathBuf, (u64,u64)>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
 #[cfg(test)]
 thread_local! { pub(crate) static REPAIR_MOUNTS: std::cell::RefCell<std::collections::HashMap<PathBuf, u64>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
@@ -3467,6 +3483,42 @@ fn repair_census_propagates_late_readdir_failure() {
             .raw_os_error(),
         Some(libc::EIO)
     );
+}
+
+/// Live storage creates and removes files all the time (atomic-write
+/// temporaries, SQLite journals). An entry removed between the census listing
+/// it and opening it is simply gone: it is not protected and must not fail the
+/// census, which would stop the retention reaper and doctor cleanup.
+#[test]
+fn repair_census_skips_an_entry_removed_after_listing() {
+    let temp = tempfile::tempdir().unwrap();
+    let kept = temp.path().join("kept");
+    let vanishing = temp.path().join("vanishing");
+    fs::create_dir(&kept).unwrap();
+    fs::create_dir(&vanishing).unwrap();
+    fs::write(temp.path().join("journal"), b"short-lived").unwrap();
+    let kept_id = PinnedDir::open(&kept)
+        .unwrap()
+        .directory_identity()
+        .unwrap();
+    let listed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = listed.clone();
+    let removed = (vanishing.clone(), temp.path().join("journal"));
+    REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |directory: &Path| {
+            observed.borrow_mut().push(directory.to_path_buf());
+            fs::remove_dir(&removed.0).unwrap();
+            fs::remove_file(&removed.1).unwrap();
+        }));
+    });
+    let pinned = PinnedDir::open(temp.path()).unwrap();
+    let mut identities = Vec::new();
+    let result = pinned.repair_directory_identities(&mut identities, &mut RepairBudget::new());
+    REPAIR_CENSUS_AFTER_NAMES.with(|hook| hook.borrow_mut().take());
+    result.expect("an entry removed after listing must not fail the census");
+    assert_eq!(*listed.borrow(), vec![temp.path().to_path_buf()]);
+    assert!(!vanishing.exists());
+    assert!(identities.contains(&kept_id), "{identities:?}");
 }
 
 #[cfg(target_os = "macos")]

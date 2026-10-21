@@ -1427,10 +1427,19 @@ pub(crate) fn deletion_protections(paths: &[PathBuf]) -> io::Result<Vec<(u64, u6
         if !path.try_exists()? {
             continue;
         }
-        let canonical = fs::canonicalize(path)?;
+        // A path removed after the check above has nothing left to protect,
+        // the same as one that never existed.
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if canonical.is_dir() {
-            PinnedDir::open(&canonical)?
-                .repair_directory_identities(&mut protected, &mut budget)?;
+            match PinnedDir::open(&canonical) {
+                Ok(pinned) => pinned.repair_directory_identities(&mut protected, &mut budget)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         for ancestor in canonical.ancestors() {
             if let Ok(id) = identity(ancestor) {

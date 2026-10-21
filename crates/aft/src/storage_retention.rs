@@ -279,6 +279,15 @@ pub(crate) fn allow_next_scheduled_pass_for_test(storage: &Path) {
 }
 
 #[cfg(test)]
+fn reaper_running_for_test(artifacts: &Path) -> bool {
+    states()
+        .lock()
+        .unwrap()
+        .get(artifacts)
+        .is_some_and(|state| state.reaping)
+}
+
+#[cfg(test)]
 pub(crate) fn scheduled_pass_finished_for_test(storage: &Path) -> bool {
     states()
         .lock()
@@ -7454,16 +7463,22 @@ mod storage_retention_tests {
 
     #[test]
     fn retention_retires_a_mount_point_cache_by_emptying_it_on_its_own_volume() {
+        // The reaper runs on its own thread and reports why it deferred work
+        // only through warnings. Send them to this test's captured output so
+        // a failure explains itself.
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_module("aft::storage_retention", log::LevelFilter::Warn)
+            .filter_module("aft::cache_location", log::LevelFilter::Warn)
+            .try_init();
         let (temp, _, _, path) = due_cache_fixture();
-        let (reap_tx, reap_rx) = std::sync::mpsc::channel();
+        let steps = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = steps.clone();
         let _hook = observe_test_hook(
             temp.path(),
-            Arc::new(move |step| {
-                if step == "reap-root" {
-                    let _ = reap_tx.send(());
-                }
-            }),
+            Arc::new(move |step| observed.lock().unwrap().push(step.to_owned())),
         );
+        let seen = |step: &str| steps.lock().unwrap().iter().any(|seen| seen == step);
         fs::create_dir_all(path.join("nested")).unwrap();
         fs::write(path.join("nested/derived.bin"), b"rebuildable").unwrap();
         // The domain folder and the cache folder below it report different
@@ -7476,12 +7491,56 @@ mod storage_retention_tests {
         );
         let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
 
-        let report = run_pass(temp.path(), &|| false);
+        // A pass past its time budget skips scheduling the reaper, and a
+        // loaded runner can exhaust the budget; this test is about where the
+        // retired entries go, not about speed.
+        let report = run_pass_with_budget(temp.path(), &|| false, &Instant::now, NO_TIME_BOUND);
         assert_eq!(report.removed_roots, 1, "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
-        reap_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        // The hook runs before unlink; wait for the worker to release its lock
-        // before checking that all mount-local trash has gone.
+        assert!(
+            seen("reaper-launch"),
+            "the pass did not schedule a reaper: {:?}",
+            steps.lock().unwrap()
+        );
+        // Hang guard, not a speed bound: wait for the scheduled reaper to
+        // finish however slow the runner is, and fail only if it never does.
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        while reaper_running_for_test(temp.path()) {
+            assert!(
+                Instant::now() < hang_guard,
+                "hang guard: the reaper scheduled for {} was still running after 120 s; steps: {:?}",
+                temp.path().display(),
+                steps.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // That reaper may leave the mount-local trash for a later reaper, by
+        // design: when sweep.lock is busy, or after a transient error it
+        // logs. Run later reaper passes, as the next retention pass would.
+        let mount_emptied = || fs::read_dir(&path).unwrap().next().is_none();
+        for _ in 0..3 {
+            if mount_emptied() {
+                break;
+            }
+            if let Err(error) = reap_retired(temp.path()) {
+                panic!(
+                    "a later reaper pass failed: {error}; steps: {:?}",
+                    steps.lock().unwrap()
+                );
+            }
+        }
+        assert!(
+            seen("reap-root") && mount_emptied(),
+            "the mount-local trash was never reaped; steps: {:?}; pending marker present: {}; left in the mount: {:?}",
+            steps.lock().unwrap(),
+            temp.path().join("retention/mount-trash-pending").exists(),
+            fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        );
+        // Every reaper has returned; take its lock anyway so the checks below
+        // cannot overlap a straggling unlink.
         let reaped = crate::fs_lock::try_acquire(
             &temp.path().join("retention/reap.lock"),
             Duration::from_secs(10),
