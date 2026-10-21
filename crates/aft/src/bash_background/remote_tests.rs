@@ -163,7 +163,7 @@ pub(super) fn note_remote_worker_exit(task: &str) {
         .insert(task.to_owned());
 }
 
-/// Wait until the task's remote worker thread has finished, so a test can
+/// Wait until the task's remote worker reaches its last step, so a test can
 /// assert what the worker did not do afterwards without sleeping.
 async fn remote_worker_exited(task: &str) {
     wait_for("the remote worker must stop", || {
@@ -7383,8 +7383,8 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
 }
 
-/// `bash.kill_scope` pauses the owner while the worker of an accepted job is
-/// reconnecting after the runner's route closed. The worker sends the cancel
+/// The scope's owner calls `bash.kill_scope` while the worker of an accepted
+/// job in that scope is reconnecting after the runner's route closed. The worker sends the cancel
 /// once it is connected again, and that settles the pause. From then on the
 /// worker must stop: no further reconnect or `exec.cancel`, and the recorded
 /// `sent` must still stand after the whole recovery deadline has passed.
@@ -7413,7 +7413,8 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
         )
     });
     // The route closed after acceptance and the runner is away, so the worker
-    // is reconnecting. Hold one reconnect open and pause the owner during it.
+    // is reconnecting. Hold one reconnect open and call `bash.kill_scope` as
+    // the scope's owner during it.
     daemon.after_refused_connects(1).await;
     daemon.hold_next_connect();
     daemon.after_held_connect().await;

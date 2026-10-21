@@ -836,8 +836,8 @@ impl OutageDaemon {
 
     /// Hold the next connection's catalog request unanswered until
     /// [`OutageDaemon::release_held_connect`], so a test can act while the
-    /// caller is in the middle of reconnecting. The held reply reports the
-    /// provider as it is at release time.
+    /// reconnecting client waits for its catalog reply. The held reply reports
+    /// the provider as it is at release time.
     pub(crate) fn hold_next_connect(&self) {
         self.hold_next
             .store(true, std::sync::atomic::Ordering::SeqCst);
