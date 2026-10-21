@@ -541,6 +541,8 @@ pub(super) struct DispatchPathMetrics {
     pub(super) writer_active: AtomicBool,
     pub(super) writer_saturation_count: AtomicU64,
     root_broadcast_over_1mib_total: AtomicU64,
+    pub(super) status_push_compacted_total: AtomicU64,
+    pub(super) status_push_aggregate_limited_total: AtomicU64,
     root_broadcast_warned: StdMutex<HashMap<(ProjectRootId, &'static str), Instant>>,
     pub(super) control_completion_queued: AtomicUsize,
     pub(super) maintenance_queued: AtomicUsize,
@@ -587,6 +589,8 @@ impl DispatchPathMetrics {
             writer_active: AtomicBool::new(false),
             writer_saturation_count: AtomicU64::new(0),
             root_broadcast_over_1mib_total: AtomicU64::new(0),
+            status_push_compacted_total: AtomicU64::new(0),
+            status_push_aggregate_limited_total: AtomicU64::new(0),
             root_broadcast_warned: StdMutex::new(HashMap::new()),
             control_completion_queued: AtomicUsize::new(0),
             maintenance_queued: AtomicUsize::new(0),
@@ -1304,6 +1308,8 @@ impl DispatchPathMetrics {
                 "capacity": WRITER_QUEUE_CAPACITY,
                 "saturation_count": self.writer_saturation_count.load(Ordering::Relaxed),
                 "root_broadcast_over_1mib_total": self.root_broadcast_over_1mib_total.load(Ordering::Relaxed),
+                "status_push_compacted_total": self.status_push_compacted_total.load(Ordering::Relaxed),
+                "status_push_aggregate_limited_total": self.status_push_aggregate_limited_total.load(Ordering::Relaxed),
             },
             "response_tasks": {
                 "live": self.response_tasks_live.load(Ordering::Relaxed),
@@ -1332,11 +1338,63 @@ impl DispatchPathMetrics {
         now: Instant,
         log: &dyn Fn(&str),
     ) {
-        if body_bytes.saturating_mul(routes) <= 1024 * 1024 {
+        self.record_broadcast_detail(root, kind, body_bytes, routes, now, log, None);
+    }
+
+    pub(super) fn record_status_push(
+        &self,
+        root: &ProjectRootId,
+        body: &crate::status_push::StatusBody,
+        recipients: usize,
+    ) {
+        self.record_status_push_with(root, body, recipients, Instant::now(), &|line| {
+            log::warn!("{line}")
+        });
+    }
+
+    fn record_status_push_with(
+        &self,
+        root: &ProjectRootId,
+        body: &crate::status_push::StatusBody,
+        recipients: usize,
+        now: Instant,
+        log: &dyn Fn(&str),
+    ) {
+        if body.compacted {
+            self.status_push_compacted_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_broadcast_detail(
+            root,
+            "status_changed",
+            body.original_bytes,
+            recipients,
+            now,
+            log,
+            Some(body),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_broadcast_detail(
+        &self,
+        root: &ProjectRootId,
+        kind: &'static str,
+        body_bytes: usize,
+        routes: usize,
+        now: Instant,
+        log: &dyn Fn(&str),
+        status: Option<&crate::status_push::StatusBody>,
+    ) {
+        let oversized = body_bytes.saturating_mul(routes) > 1024 * 1024;
+        let compacted = status.is_some_and(|body| body.compacted);
+        if !oversized && !compacted {
             return;
         }
-        self.root_broadcast_over_1mib_total
-            .fetch_add(1, Ordering::Relaxed);
+        if oversized {
+            self.root_broadcast_over_1mib_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Count every oversized fan-out, but warn at most once per root/kind
         // per minute. Warning entries at least one minute old are removed.
         let mut warned = self
@@ -1347,7 +1405,11 @@ impl DispatchPathMetrics {
         if let std::collections::hash_map::Entry::Vacant(entry) = warned.entry((root.clone(), kind))
         {
             entry.insert(now);
-            log(&format!("subc root broadcast exceeds 1 MiB: root={} kind={kind} body_bytes={body_bytes} route_count={routes}", root.as_path().display()));
+            let fields = status
+                .map(|body| serde_json::to_string(&body.field_bytes).expect("status field sizes"))
+                .unwrap_or_else(|| "{}".into());
+            let bounded_bytes = status.map_or(body_bytes, |body| body.bytes.len());
+            log(&format!("subc root broadcast pressure: root={} kind={kind} body_bytes={body_bytes} route_count={routes} recipients={routes} bounded_body_bytes={bounded_bytes} details_omitted={compacted} top_level_field_bytes={fields}", root.as_path().display()));
         }
     }
 }
@@ -3908,6 +3970,43 @@ mod tests {
         assert_eq!(
             metrics.snapshot(&HashMap::new())["writer"]["root_broadcast_over_1mib_total"],
             5
+        );
+    }
+
+    #[test]
+    fn status_push_backstop_logs_component_sizes_and_counts_suppressed_events() {
+        let (_dir, root) = test_root("status-compaction-observability");
+        let frame = crate::protocol::StatusChangedFrame::new(
+            None,
+            json!({"semantic_index":{"status":"loading","entries_done":42_000,"error":"\u{0000}".repeat(12_000)}}),
+        );
+        let body = crate::status_push::bounded_body(&frame);
+        assert!(body.compacted);
+        let metrics = DispatchPathMetrics::new();
+        let logs = std::cell::RefCell::new(Vec::<String>::new());
+        let capture = |line: &str| logs.borrow_mut().push(line.to_owned());
+        let now = Instant::now();
+        metrics.record_status_push_with(&root, &body, 1, now, &capture);
+        metrics.record_status_push_with(&root, &body, 1, now + Duration::from_secs(10), &capture);
+        metrics.record_status_push_with(&root, &body, 1, now + Duration::from_secs(60), &capture);
+        assert_eq!(
+            logs.borrow().len(),
+            2,
+            "compaction warnings share the existing per-root/kind rate limit"
+        );
+        let logs = logs.borrow();
+        assert!(logs[0].contains("kind=status_changed"));
+        assert!(logs[0].contains(&format!("body_bytes={}", body.original_bytes)));
+        assert!(logs[0].contains("recipients=1"));
+        assert!(logs[0].contains("top_level_field_bytes={\"semantic_index\":"));
+        assert!(logs[0].contains(&root.as_path().display().to_string()));
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["writer"]["status_push_compacted_total"],
+            3
+        );
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["writer"]["root_broadcast_over_1mib_total"],
+            0
         );
     }
     use serde_json::json;

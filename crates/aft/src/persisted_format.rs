@@ -393,7 +393,25 @@ pub(crate) fn refusals_for_push(
 ) -> (Vec<UnsupportedPersistedFormat>, usize) {
     let mut owned = Vec::new();
     let mut unattributed = 0;
-    for refusal in refusals_under(storage) {
+    let mut refusals = refusals_under(storage);
+    refusals.sort_by(|a, b| {
+        (
+            a.store.name(),
+            &a.path,
+            a.source as u8,
+            a.found,
+            a.supported,
+        )
+            .cmp(&(
+                b.store.name(),
+                &b.path,
+                b.source as u8,
+                b.found,
+                b.supported,
+            ))
+    });
+    refusals.dedup();
+    for refusal in refusals {
         if refusal.source != RefusalSource::Artifact
             || (refusal.store == PersistedStore::AftDb && refusal.path == storage.join("aft.db"))
         {
@@ -420,9 +438,6 @@ pub(crate) fn refusals_for_push(
             unattributed += 1;
         }
     }
-    owned.sort_by(|a, b| {
-        (a.store.name(), &a.path, a.found).cmp(&(b.store.name(), &b.path, b.found))
-    });
     (owned, unattributed)
 }
 

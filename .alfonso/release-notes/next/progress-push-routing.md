@@ -1,1 +1,1 @@
-Route command progress only to its originating request and split large output updates into bounded frames to prevent multi-session disconnects.
+Keep command progress on its originating route and bound project status updates so busy sessions do not disconnect one another.

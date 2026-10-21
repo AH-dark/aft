@@ -814,14 +814,20 @@ fn fan_out_lossy_push_frame(
         };
     }
 
-    let body = match serde_json::to_vec(frame) {
-        Ok(body) => body,
-        Err(error) => {
-            log::warn!("subc attach: failed to serialize PushFrame for fan-out: {error}");
-            return FanOutResult {
-                matched_channels,
-                sent_frames: 0,
-            };
+    let body = if let PushFrame::StatusChanged(status) = frame {
+        let body = crate::status_push::bounded_body(status);
+        metrics.record_status_push(root, &body, matched_channels);
+        body.bytes
+    } else {
+        match serde_json::to_vec(frame) {
+            Ok(body) => body,
+            Err(error) => {
+                log::warn!("subc attach: failed to serialize PushFrame for fan-out: {error}");
+                return FanOutResult {
+                    matched_channels,
+                    sent_frames: 0,
+                };
+            }
         }
     };
 
@@ -837,7 +843,9 @@ fn fan_out_lossy_push_frame(
         })
         .count();
 
-    if let Some(kind) = root_broadcast_kind(frame) {
+    if let Some(kind) =
+        root_broadcast_kind(frame).filter(|_| !matches!(frame, PushFrame::StatusChanged(_)))
+    {
         metrics.record_root_broadcast(root, kind, body.len(), sent_frames);
     }
 
@@ -1148,6 +1156,116 @@ pub(super) fn drain_reliable_push_turn(
     (processed, deferred)
 }
 
+#[derive(Default)]
+pub(super) struct StatusPushes {
+    pending: HashMap<ProjectRootId, PendingStatus>,
+}
+
+struct PendingStatus {
+    frame: Option<crate::protocol::StatusChangedFrame>,
+    body: Option<Arc<Vec<u8>>>,
+    recipients: VecDeque<RouteChannel>,
+    cursor: Option<RouteChannel>,
+    session: Option<String>,
+}
+
+const STATUS_FANOUT_TURN_BYTES: usize = 1024 * 1024;
+
+impl StatusPushes {
+    fn queue(&mut self, root: ProjectRootId, frame: crate::protocol::StatusChangedFrame) {
+        // Keep the newest state and resume at the first recipient still waiting,
+        // rather than restarting every update at routes already served.
+        let cursor = self
+            .pending
+            .get(&root)
+            .and_then(|pending| pending.recipients.front().copied().or(pending.cursor));
+        let session = frame.session_id.clone();
+        self.pending.insert(
+            root,
+            PendingStatus {
+                frame: Some(frame),
+                body: None,
+                recipients: VecDeque::new(),
+                cursor,
+                session,
+            },
+        );
+    }
+
+    pub(super) fn drain_turn(
+        &mut self,
+        writer: &WriterSender,
+        metrics: &DispatchPathMetrics,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        roots: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    ) {
+        for (root, pending) in &mut self.pending {
+            if let Some(frame) = pending.frame.take() {
+                let envelope = PushFrame::StatusChanged(frame);
+                let mut recipients = matching_route_channels(routes, roots, root, &envelope);
+                recipients.sort_by_key(|route| (route.channel, route.epoch));
+                if let Some(cursor) = pending.cursor {
+                    let start = recipients.partition_point(|route| {
+                        (route.channel, route.epoch) < (cursor.channel, cursor.epoch)
+                    });
+                    let len = recipients.len();
+                    if len > 0 {
+                        recipients.rotate_left(start % len);
+                    }
+                }
+                if !recipients.is_empty() {
+                    let PushFrame::StatusChanged(frame) = envelope else {
+                        unreachable!()
+                    };
+                    let body = crate::status_push::bounded_body(&frame);
+                    metrics.record_status_push(root, &body, recipients.len());
+                    pending.body = Some(Arc::new(body.bytes));
+                    pending.recipients = recipients.into();
+                }
+            }
+            let Some(body) = pending.body.as_ref() else {
+                continue;
+            };
+            let wire_bytes = body.len() + subc_protocol::HEADER_LEN;
+            let mut spent = 0;
+            while let Some(channel) = pending.recipients.front().copied() {
+                let live = roots
+                    .get(root)
+                    .is_some_and(|channels| channels.contains(&channel))
+                    && routes.get(&channel).is_some_and(|identity| {
+                        &identity.root == root
+                            && pending
+                                .session
+                                .as_ref()
+                                .is_none_or(|session| &identity.session == session)
+                    });
+                if !live {
+                    pending.recipients.pop_front();
+                    continue;
+                }
+                if spent + wire_bytes > STATUS_FANOUT_TURN_BYTES {
+                    metrics
+                        .status_push_aggregate_limited_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                match try_send_shared_push_body(writer, metrics, channel, Arc::clone(body)) {
+                    PushSendOutcome::Sent => {
+                        spent += wire_bytes;
+                        pending.recipients.pop_front();
+                    }
+                    PushSendOutcome::Backpressure => break,
+                    PushSendOutcome::PermanentFailure => {
+                        pending.recipients.pop_front();
+                    }
+                }
+            }
+        }
+        self.pending
+            .retain(|_, pending| pending.frame.is_some() || !pending.recipients.is_empty());
+    }
+}
+
 pub(super) fn process_lossy_push_frame(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
@@ -1169,6 +1287,7 @@ pub(super) fn process_lossy_push_frame(
     let _ = fan_out_lossy_push_frame(writer_tx, metrics, routes, root_channels, &root, &frame);
 }
 
+#[cfg(test)]
 pub(super) fn process_lossy_push_batch(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
@@ -1197,20 +1316,27 @@ pub(super) fn process_lossy_push_envelope_batch(
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     completed_tasks: &CompletedTaskIds,
     mut batch: Vec<LossyPushEnvelope>,
+    statuses: &mut StatusPushes,
 ) {
     batch.sort_by_key(|(order, _, _)| *order);
     let batch = batch
         .into_iter()
         .map(|(_, root, frame)| (root, frame))
         .collect();
-    process_lossy_push_batch(
-        writer_tx,
-        metrics,
-        routes,
-        root_channels,
-        completed_tasks,
-        batch,
-    );
+    for (root, frame) in coalesce_push_batch(batch) {
+        match frame {
+            PushFrame::StatusChanged(status) => statuses.queue(root, status),
+            frame => process_lossy_push_frame(
+                writer_tx,
+                metrics,
+                routes,
+                root_channels,
+                completed_tasks,
+                root,
+                frame,
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1218,6 +1344,161 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::protocol::{ConfigureWarningsFrame, StatusChangedFrame};
+
+    #[cfg(unix)]
+    fn busy_status(error_bytes: usize, done: usize) -> StatusChangedFrame {
+        let fixture = crate::bash_background::push_projection_fixture::busy_root();
+        let mut snapshot =
+            crate::status_push::project(&fixture.ctx, fixture.ctx.build_status_snapshot());
+        snapshot["semantic_index"]["error"] = json!("e".repeat(error_bytes));
+        snapshot["semantic_index"]["entries_done"] = json!(done);
+        StatusChangedFrame::new(None, snapshot)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_serialized_backstop_preserves_fresh_counts() {
+        let (_dir, root) = test_root("status-byte-backstop");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut frame = busy_status(100_000, 41_234);
+        frame.snapshot["storage_refusals"]=json!((0..8).map(|i|json!({"code":"unsupported_persisted_format","store":"search_index","path":format!("/root/cache-{i}"),"found":99,"supported":1,"message":"unreadable artifact"})).collect::<Vec<_>>());
+        frame.snapshot["storage_refusals_total"] = json!(19);
+        frame.snapshot["storage_refusals_omitted"] = json!(11);
+        frame.snapshot["storage_refusals_unattributed"] = json!(7);
+        frame.snapshot["degraded"] = json!(true);
+        let metrics = DispatchPathMetrics::new();
+        let first = crate::status_push::bounded_body(&frame);
+        assert_eq!(
+            first.bytes,
+            crate::status_push::bounded_body(&frame).bytes,
+            "compaction must be deterministic"
+        );
+        fan_out_lossy_push_frame(
+            &tx,
+            &metrics,
+            &routes,
+            &roots,
+            &root,
+            &PushFrame::StatusChanged(frame),
+        );
+        let body = rx.try_recv().expect("an oversized status must still emit");
+        assert!(
+            body.body().len() <= 16 * 1024,
+            "complete status body exceeds 16 KiB: {}",
+            body.body().len()
+        );
+        let value: Value = serde_json::from_slice(body.body()).unwrap();
+        assert_eq!(value["snapshot"]["semantic_index"]["entries_done"], 41_234);
+        assert_eq!(value["snapshot"]["storage_refusals_total"], 19);
+        assert_eq!(value["snapshot"]["storage_refusals_omitted"], 19);
+        assert_eq!(value["snapshot"]["storage_refusals_unattributed"], 7);
+        assert_eq!(value["snapshot"]["degraded"], true);
+        assert_eq!(value["snapshot"]["push_details"]["omitted"], true);
+        assert_eq!(value["snapshot"]["push_details"]["read"], "status");
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["writer"]["status_push_compacted_total"],
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_forty_five_and_ninety_recipients_obey_turn_budget() {
+        for count in [45, 90] {
+            let (_dir, root) = test_root("status-turn-budget");
+            let (routes, roots) = progress_routes(&root, count);
+            let (tx, mut rx) = mpsc::channel(256);
+            let mut pending = StatusPushes::default();
+            let frame = busy_status(12 * 1024, 42_000);
+            assert!(
+                serde_json::to_vec(&frame).unwrap().len() <= 16 * 1024,
+                "fixture must exercise the aggregate bound without invoking the body cap"
+            );
+            pending.queue(root.clone(), frame);
+            let metrics = DispatchPathMetrics::new();
+            let mut seen = HashSet::new();
+            for _ in 0..4 {
+                pending.drain_turn(&tx, &metrics, &routes, &roots);
+                let mut wire_bytes = 0;
+                while let Ok(frame) = rx.try_recv() {
+                    wire_bytes += frame.body().len() + subc_protocol::HEADER_LEN;
+                    assert!(
+                        seen.insert(frame.header.channel),
+                        "no route deduplication or duplicate delivery"
+                    );
+                }
+                assert!(
+                    wire_bytes <= 1024 * 1024,
+                    "{count} recipients exceeded 1 MiB in one turn: {wire_bytes}"
+                );
+                if pending.pending.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                seen.len(),
+                usize::from(count),
+                "every route must receive the fresh state, including deferred recipients"
+            );
+            assert!(pending.pending.is_empty());
+            let limited = metrics.snapshot(&HashMap::new())["writer"]
+                ["status_push_aggregate_limited_total"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                limited > 0,
+                count == 90,
+                "aggregate backstop must be visible in health"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_full_writer_retains_only_latest_pending_state() {
+        let (_dir, root) = test_root("status-pending-latest");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        let metrics = DispatchPathMetrics::new();
+        let blocker = Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        assert!(try_enqueue_writer_frame(&tx, &metrics, blocker).is_enqueued());
+        let mut pending = StatusPushes::default();
+        pending.queue(root.clone(), busy_status(0, 1));
+        pending.queue(root.clone(), busy_status(0, 2));
+        pending.drain_turn(&tx, &metrics, &routes, &roots);
+        assert_eq!(
+            pending.pending.len(),
+            1,
+            "full writer must retain latest status rather than dropping it"
+        );
+        assert_eq!(rx.try_recv().unwrap().header.ty, FrameType::Ping);
+        pending.queue(root, busy_status(0, 3));
+        pending.drain_turn(&tx, &metrics, &routes, &roots);
+        let frame = rx.try_recv().unwrap();
+        let value: Value = serde_json::from_slice(frame.body()).unwrap();
+        assert_eq!(value["snapshot"]["semantic_index"]["entries_done"], 3);
+        assert!(pending.pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_push_backstop_counts_json_escaping_not_raw_text() {
+        let mut frame = busy_status(0, 43_210);
+        frame.snapshot["semantic_index"]["error"] = json!("\u{0000}".repeat(12_000));
+        let body = crate::status_push::bounded_body(&frame);
+        assert!(
+            body.compacted,
+            "a raw string below 16 KiB can exceed the serialized budget"
+        );
+        assert!(body.bytes.len() <= 16 * 1024);
+        let decoded: Value = serde_json::from_slice(&body.bytes).unwrap();
+        assert_eq!(
+            decoded["snapshot"]["semantic_index"]["entries_done"],
+            43_210
+        );
+        assert_eq!(decoded["snapshot"]["push_details"]["read"], "status");
+    }
     const TEST_PROGRESS_BODY_LIMIT: usize = 16 * 1024;
 
     fn originated_progress(chunk: &str) -> PushFrame {

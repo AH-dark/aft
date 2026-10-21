@@ -418,6 +418,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "root-owned status notification detail, not an agent result list; exact refusal totals, omitted and unattributed counts remain present with an explicit status read pointer",
     },
     ExclusionEntry {
+        file: "status_push.rs",
+        enclosing_item: "bounded_body, scalar, summary",
+        location_or_primitive: "BODY_MAX_BYTES count-only wire summary and bounded scalar strings",
+        reason: "status notifications are not paginated results; deterministic compact summaries retain consumer scalar state and exact list/refusal totals with an explicit status read pointer",
+    },
+    ExclusionEntry {
+        file: "subc/push.rs",
+        enclosing_item: "drain_turn",
+        location_or_primitive: "STATUS_FANOUT_TURN_BYTES",
+        reason: "per-root status wire scheduling budget; remaining route deliveries retain the latest state and resume on later turns without omitting recipients",
+    },
+    ExclusionEntry {
         file: "bash_background/registry.rs",
         enclosing_item: "cleanup_finished_at_with, gc_harness_stores",
         location_or_primitive: "GC_ENTRY_BUDGET maintenance queue and namespace iterator",

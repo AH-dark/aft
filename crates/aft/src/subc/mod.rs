@@ -4868,6 +4868,7 @@ where
     let mut retry_buffer: RetryBuffer = HashMap::new();
     let mut reclaimed_routes = ReclaimedRoutes::default();
     let mut completed_tasks = push::CompletedTaskIds::default();
+    let mut status_pushes = push::StatusPushes::default();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
     let mut pending_binds: HashMap<RouteChannel, PendingBind> = HashMap::new();
     let mut pending_bash_asks: HashMap<ReverseCorrKey, PendingBashAsk> = HashMap::new();
@@ -5052,13 +5053,16 @@ where
             }
         }
 
-        // A lossy emitter may place its newest update in the overflow buffer
-        // when the bounded channel is full, while this receive loop is draining
-        // the channel. Drain overflow before selecting again so that raced
-        // update is delivered on the next timer tick instead of waiting for
-        // another lossy enqueue.
+        // Merge queued and overflow updates before retrying pending status.
+        // A slow writer must get the newest state, not an older pending copy
+        // followed by the update that was already waiting in the channel.
         let overflow_batch = lossy_overflow.drain();
-        if !overflow_batch.is_empty() {
+        let mut batch = Vec::new();
+        while let Ok(item) = lossy_rx.try_recv() {
+            batch.push(item);
+        }
+        batch.extend(overflow_batch);
+        if !batch.is_empty() {
             let (processed, deferred) = push::drain_reliable_push_turn(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5082,11 +5086,6 @@ where
                 tokio::task::yield_now().await;
             }
 
-            let mut batch = Vec::new();
-            while let Ok(item) = lossy_rx.try_recv() {
-                batch.push(item);
-            }
-            batch.extend(overflow_batch);
             push::process_lossy_push_envelope_batch(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5094,8 +5093,11 @@ where
                 &root_channels,
                 &completed_tasks,
                 batch,
+                &mut status_pushes,
             );
         }
+
+        status_pushes.drain_turn(&writer_tx, &dispatch_path_metrics, &routes, &root_channels);
 
         // The drain-tick arm below guarantees this select returns by
         // `next_drain_at`; publishing that promise lets the stall watchdog tell
@@ -5856,6 +5858,7 @@ where
                     &root_channels,
                     &completed_tasks,
                     batch,
+                    &mut status_pushes,
                 );
             }
             Some(done) = bash_deferred_rx.recv() => {
