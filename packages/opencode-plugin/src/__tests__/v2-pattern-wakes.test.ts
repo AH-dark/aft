@@ -321,7 +321,9 @@ test("V2 unretired wake overflow is typed and does not evict duplicate protectio
     text: "READY",
   };
   for (let i = 0; i < MAX_ADMITTED_WAKES; i++) {
-    expect(await Effect.runPromise(delivery.patternMatch({ ...wake, matchOffset: i }))).toBe(true);
+    expect(await Effect.runPromise(delivery.patternMatch({ ...wake, matchOffset: i }))).toBe(
+      "delivered",
+    );
   }
   const overflow = await Effect.runPromise(
     delivery
@@ -330,7 +332,7 @@ test("V2 unretired wake overflow is typed and does not evict duplicate protectio
   );
   expect(overflow).toBeInstanceOf(WakeDeliveryOverflow);
   expect(overflow).toMatchObject({ type: "wake_delivery_overflow" });
-  expect(await Effect.runPromise(delivery.patternMatch(wake))).toBe(false);
+  expect(await Effect.runPromise(delivery.patternMatch(wake))).toBe("already-delivered");
   expect(admitted).toBe(MAX_ADMITTED_WAKES);
   delivery.dispose();
 });
