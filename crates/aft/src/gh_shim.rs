@@ -3149,6 +3149,41 @@ pub(crate) fn verified_worker_read_repository(
     Ok(repository.to_string())
 }
 
+/// Copy public signed routing data into command-local, non-authoritative state.
+/// The child still verifies signatures, while the daemon independently checks
+/// its own current manifest before serving reads. No cache or audit is shared.
+#[cfg(unix)]
+pub(crate) fn seed_worker_state(root: &Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root)
+        .map_err(|e| e.to_string())?;
+    let paths = StatePaths::from_process();
+    let source = match std::fs::File::open(&paths.manifest) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bytes = Vec::new();
+    source
+        .take(1_048_577)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 1_048_576 {
+        return Err("signed routing manifest exceeds snapshot limit".into());
+    }
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root.join("gh-routing-manifest.json"))
+        .map_err(|e| e.to_string())?;
+    destination.write_all(&bytes).map_err(|e| e.to_string())
+}
+
 pub(crate) fn ticket_repository_snapshot(project_root: &Path) -> Option<String> {
     if !project_root.is_dir() {
         return None;
