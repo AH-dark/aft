@@ -17466,52 +17466,40 @@ fn insert_method_dispatch_edge(
 
 /// Method names whose dispatch candidates changed in a refresh. `path_form`
 /// holds the ones that came from non-JS/TS files, whose callers can store a
-/// whole path as a call's short name. `stored_node_ids` are the stored node
-/// ids of the candidates under those names in the files where they changed:
-/// a dispatch edge pointing at one of them may now point elsewhere.
+/// whole path as a call's short name.
 #[derive(Debug, Default)]
 struct DispatchNames {
     all: BTreeSet<String>,
     path_form: BTreeSet<String>,
-    stored_node_ids: BTreeSet<String>,
 }
 
 impl DispatchNames {
-    fn extend(&mut self, rel_path: &str, changed: ChangedDispatchCandidates) {
+    fn extend(&mut self, rel_path: &str, names: BTreeSet<String>) {
         let js_family = Path::new(rel_path)
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| JS_TS_EXTENSIONS.contains(&ext));
         if !js_family {
-            self.path_form.extend(changed.names.iter().cloned());
+            self.path_form.extend(names.iter().cloned());
         }
-        self.all.extend(changed.names);
-        self.stored_node_ids.extend(changed.stored_node_ids);
+        self.all.extend(names);
     }
-}
-
-/// What [`changed_dispatch_candidates`] found for one file.
-#[derive(Debug, Default)]
-struct ChangedDispatchCandidates {
-    /// Names whose candidates in the file differ between the stored rows and
-    /// the new extract.
-    names: BTreeSet<String>,
-    /// Stored node ids of the file's candidates under those names.
-    stored_node_ids: BTreeSet<String>,
 }
 
 /// Names under which `rel_path` offers a different set of method-dispatch
 /// candidates in `new_nodes` (None when the file is being deleted) than in its
-/// stored rows, with the stored node ids of the candidates under those names.
-/// A dispatch edge depends only on the candidates sharing its method name:
-/// their node id, file, scoped name and kind, and how many there are. Node ids
-/// do not encode positions, so a method that only moved within its file is
-/// not listed and its callers keep their edges.
+/// stored rows. A dispatch edge depends only on the candidates sharing its
+/// method name (their node id, file, scoped name and kind, and how many there
+/// are) and on the caller itself. The one positional input, a candidate's
+/// enclosing `impl` for a Rust `self.field` call, is read only when the
+/// candidate is in the caller's own file, which is a root whenever it changes.
+/// Node ids do not encode positions, so a method that only moved within its
+/// file is not listed and its callers keep their edges.
 fn changed_dispatch_candidates(
     conn: &Connection,
     rel_path: &str,
     new_nodes: Option<&[NodeRecord]>,
-) -> Result<ChangedDispatchCandidates> {
+) -> Result<BTreeSet<String>> {
     type Candidate = (String, String, String);
     fn by_name(
         rows: impl Iterator<Item = (String, Candidate)>,
@@ -17556,21 +17544,12 @@ fn changed_dispatch_candidates(
                 )
             }),
     );
-    let mut changed = ChangedDispatchCandidates::default();
-    for name in stored.keys().chain(current.keys()) {
-        let before = stored.get(name);
-        if before == current.get(name) {
-            continue;
-        }
-        changed.names.insert(name.clone());
-        changed.stored_node_ids.extend(
-            before
-                .into_iter()
-                .flatten()
-                .map(|(_, _, node_id)| node_id.clone()),
-        );
-    }
-    Ok(changed)
+    Ok(stored
+        .keys()
+        .chain(current.keys())
+        .filter(|name| stored.get(*name) != current.get(*name))
+        .cloned()
+        .collect())
 }
 
 /// Ids of `rel_path`'s unresolved calls, the only refs that get
@@ -17595,30 +17574,18 @@ struct DispatchCallerSelection {
 }
 
 /// Caller files whose method-dispatch edges a refresh must recompute: `roots`
-/// (rewritten files and callers whose set of unresolved calls changed),
-/// callers holding a name-match or type-match edge into a candidate whose
-/// method name had its candidates changed, and callers with an unresolved
-/// call named after such a method.
+/// (rewritten files and callers whose set of unresolved calls changed) and
+/// callers with an unresolved call named after a method whose candidates
+/// changed. A dispatch edge is chosen only among the candidates sharing its
+/// call's method name, and that name is the call's short name or, for a
+/// path-form call, its last segment; so these callers include every caller
+/// holding an edge that could change.
 fn dispatch_callers_to_recompute(
     tx: &Transaction<'_>,
     roots: &BTreeSet<String>,
     changed_names: &DispatchNames,
 ) -> Result<DispatchCallerSelection> {
     let mut callers = roots.clone();
-    // The edges still name the stored node ids: rewriting a file's nodes does
-    // not delete the dispatch edges pointing at them.
-    let mut by_target = tx.prepare_cached(
-        "SELECT DISTINCT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id
-         WHERE e.target_node = ?1 AND e.kind = 'call' AND e.provenance IN (?2, ?3)",
-    )?;
-    for node_id in &changed_names.stored_node_ids {
-        for row in by_target.query_map(
-            params![node_id, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH],
-            |row| row.get::<_, String>(0),
-        )? {
-            callers.insert(row?);
-        }
-    }
     let mut by_name = tx.prepare_cached(
         "SELECT DISTINCT caller_file FROM refs
          WHERE short_name = ?1 AND +kind = 'call' AND status = 'unresolved'",

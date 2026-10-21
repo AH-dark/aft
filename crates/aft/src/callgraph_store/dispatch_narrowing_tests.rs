@@ -98,7 +98,7 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
         files.extend(entries.map(|entry| entry.unwrap().path()).filter(|path| {
             path.extension()
                 .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| matches!(ext, "rs" | "ts" | "py" | "java" | "cpp"))
+                .is_some_and(|ext| matches!(ext, "rs" | "ts" | "py" | "java" | "cpp" | "go"))
         }));
     }
     files.sort();
@@ -686,6 +686,112 @@ fn s3_cross_file_type_moved_between_files() {
     );
 }
 
+/// Checks that every name-match and type-match edge is found by the name
+/// lookups `dispatch_callers_to_recompute` runs when its target method's
+/// candidates change: the call's short name equals the method name, or the
+/// call is a path-form call whose last segment does and the method's file is
+/// not JS/TS (only non-JS/TS changes run the path-form lookup). Returns the
+/// number of edges checked and how many only the path-form lookup finds.
+fn check_edges_found_by_name_lookups(
+    store: &CallGraphStore,
+) -> std::result::Result<(usize, usize), String> {
+    let conn = store.conn.lock().unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT r.full_ref, r.short_name, r.callee_last_segment, n.name, n.file_path
+             FROM edges e JOIN refs r ON r.ref_id = e.ref_id JOIN nodes n ON n.id = e.target_node
+             WHERE e.provenance IN (?1, ?2)",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map(
+            params![PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let mut path_form_only = 0;
+    for (full_ref, short_name, last_segment, name, file) in &rows {
+        if short_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        let js_family = Path::new(file)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| JS_TS_EXTENSIONS.contains(&ext));
+        if last_segment.as_deref() == Some(name.as_str()) && !js_family {
+            path_form_only += 1;
+            continue;
+        }
+        return Err(format!(
+            "edge from {full_ref:?} (short name {short_name:?}) to {file}:{name} is not found by name"
+        ));
+    }
+    Ok((rows.len(), path_form_only))
+}
+
+#[test]
+fn s3_every_dispatch_edge_is_found_by_the_name_lookups() {
+    let fixture = Fixture::new(10, 10);
+    let (edges, path_form_only) = check_edges_found_by_name_lookups(&fixture.store).unwrap();
+    assert!(edges >= 10, "{edges}");
+    // `Hub::build()` in path0.rs and path1.rs.
+    assert_eq!(path_form_only, 2);
+
+    // Receiver shapes across the languages with method dispatch.
+    let languages = Fixture::from_files(&[
+        (
+            "a.rs",
+            "pub struct Foo; impl Foo { pub fn run(&self) {} }\nfn f(x: &Foo, y: Option<Foo>, s: S) { x.run::<u8>(); Foo::<u8>::run(); (*x).run(); x.clone().run(); y.unwrap().run(); s.inner.run(); <Foo as T>::run(x); }\n",
+        ),
+        (
+            "b.ts",
+            "export class Box { run(): void {} }\nexport function g(x: any) { x?.run(); x!.run(); new Box().run(); x.a.b.run(); (x as Box).run(); }\n",
+        ),
+        (
+            "c.py",
+            "class K:\n    def run(self):\n        pass\n\n\ndef h(x):\n    x.y.run()\n    super().run()\n    K().run()\n",
+        ),
+        (
+            "d.cpp",
+            "struct S { void run(); };\nvoid k(S* p, S s) { p->run(); s.run(); S::run(); s.template run<int>(); (*p).run(); }\n",
+        ),
+        (
+            "e.java",
+            "class J { void run() {} void m(J o) { o.run(); this.run(); new J().run(); } }\n",
+        ),
+        (
+            "f.go",
+            "package f\ntype G struct{}\nfunc (g G) Run() {}\nfunc m(g G) { g.Run(); (&g).Run() }\n",
+        ),
+    ]);
+    let (edges, _) = check_edges_found_by_name_lookups(&languages.store).unwrap();
+    assert!(edges >= 10, "{edges}");
+
+    // Witness: an edge whose call no longer carries the method name fails.
+    fixture
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE refs SET short_name = 'renamed', callee_last_segment = 'renamed'
+             WHERE ref_id = (SELECT ref_id FROM edges WHERE provenance = 'name_match' LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    assert!(check_edges_found_by_name_lookups(&fixture.store).is_err());
+}
+
 /// The probe edit of the call-graph incremental-speed study: a leading comment
 /// that shifts every line, plus a new uniquely named caller/callee pair at the
 /// end of the file.
@@ -759,4 +865,27 @@ fn s3_offline_hub_refresh_measurement() {
             store.refresh_files(std::slice::from_ref(&path)).unwrap();
         }
     }
+}
+
+/// Runs [`check_edges_found_by_name_lookups`] over a cold build of a real
+/// repository (`AFT_S3_MEASURE_ROOT`, a git checkout whose tracked sources are
+/// copied).
+#[test]
+#[ignore = "offline census: set AFT_S3_MEASURE_ROOT to a git checkout"]
+fn s3_offline_dispatch_edge_name_census() {
+    let source = PathBuf::from(std::env::var_os("AFT_S3_MEASURE_ROOT").expect("source checkout"));
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    perf_tests::copy_tracked_sources(&source, &root);
+    let files: Vec<_> = callgraph::walk_project_files(&root).collect();
+    let store = CallGraphStore::open(temp.path().join("store"), root).unwrap();
+    store.cold_build(&files).unwrap();
+    let (edges, path_form_only) = check_edges_found_by_name_lookups(&store).unwrap();
+    eprintln!(
+        "S3 census: files={} dispatch_edges={edges} found_only_by_path_form={path_form_only}",
+        files.len()
+    );
+    assert!(edges > 0);
 }
