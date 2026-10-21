@@ -407,8 +407,9 @@ impl SemanticArena {
     /// chunks reads no chunk rows. The epoch and the markers are read in one
     /// read transaction, the markers in one key-ordered batch through the
     /// payload-free membership index. A marker from an earlier epoch is never
-    /// probed: some chunk row was deleted since it was written, and another
-    /// process may have stored different floats under that key. A store
+    /// probed: some row was deleted, or the counter rebuilt, since it was
+    /// written, so one of its chunk rows may since hold another process's
+    /// different floats. A store
     /// without a valid epoch, or a failed read, indexes nothing.
     ///
     /// Seeding never evicts an entry: once the index holds
@@ -471,7 +472,9 @@ impl SemanticArena {
 
     /// Records a vector only after its exact chunk row was read or stored.
     /// `checked_at` is the store's deletion epoch read before that read or
-    /// store, so the row held these floats at that epoch. The caller keeps
+    /// store. The entry can vouch for a run only while `checked_at` is still the
+    /// store's current epoch: then no row was deleted, so none was replaced,
+    /// after the read or store. The caller keeps
     /// this allocation alive until the file run shares it.
     pub(crate) fn remember_chunk(
         &self,

@@ -1163,7 +1163,8 @@ fn set_up_payload_totals(
     tx.commit()
 }
 
-/// A count of the rows ever deleted from `blob_payloads`, kept in a one-row
+/// A count of the rows deleted from `blob_payloads` since this counter was
+/// created, kept in a one-row
 /// table by a SQLite trigger. The trigger lives in the store's schema, so it
 /// also counts deletes by AFT releases that predate it (their GC and
 /// disk-limit SQL). No AFT write path rewrites the payload of an existing
@@ -1337,7 +1338,7 @@ impl FamilyStoreReader {
     /// In one read transaction: reads the store's deletion epoch, asks `keys`
     /// which keys to probe for it, and returns the epoch with the probed keys
     /// that are stored. Keys are probed in key order through the payload-free
-    /// membership index, so each index page is visited once. `None` when the
+    /// membership index, so neighbouring probes reuse the same cached pages. `None` when the
     /// store has no valid deletion epoch.
     pub(crate) fn contains_many_at_deletion_epoch(
         &self,
