@@ -4,6 +4,14 @@ use serde_json::Value;
 
 const REFUSAL_DETAILS: usize = 8;
 pub(crate) const BODY_MAX_BYTES: usize = 16 * 1024;
+// Preserve every fixed InspectCategory name, with an explicit overflow signal.
+const COMPACTED_DISABLED_CATEGORIES: usize = 13;
+// Keep a bounded sample of degradation reasons; status_push_list_omitted reports the rest.
+const COMPACTED_DEGRADED_REASONS: usize = REFUSAL_DETAILS;
+// A handful of producer gaps fits the push budget; the remainder is counted.
+const COMPACTED_DIAGNOSTIC_GAPS: usize = 8;
+// Bound free-form text nested in these otherwise small lists.
+const COMPACTED_STATUS_TEXT_BYTES: usize = 128;
 
 pub(crate) struct StatusBody {
     pub bytes: Vec<u8>,
@@ -77,8 +85,59 @@ fn scalar(value: &Value, string_limit: usize) -> Value {
     }
 }
 
+fn compact_named_list(value: &Value, max_items: usize, max_text_bytes: usize) -> (Value, usize) {
+    let Some(values) = value.as_array() else {
+        return (value.clone(), 0);
+    };
+    let compacted = values
+        .iter()
+        .take(max_items)
+        .map(|value| match value.as_str() {
+            Some(text) if text.len() <= max_text_bytes => value.clone(),
+            Some(_) => serde_json::json!("Details omitted; run status"),
+            None => scalar(value, 0),
+        })
+        .collect();
+    (
+        Value::Array(compacted),
+        values.len().saturating_sub(max_items),
+    )
+}
+
+fn compact_diagnostic_gaps(value: &Value) -> (Value, usize) {
+    let Some(values) = value.as_array() else {
+        return (value.clone(), 0);
+    };
+    let compacted = values
+        .iter()
+        .take(COMPACTED_DIAGNOSTIC_GAPS)
+        .map(|gap| {
+            let mut fields = serde_json::Map::new();
+            for field in ["language", "producer", "root"] {
+                if let Some(value) = gap.get(field) {
+                    let value = match value.as_str() {
+                        Some(text) if text.len() > COMPACTED_STATUS_TEXT_BYTES => {
+                            serde_json::json!("Details omitted; run status")
+                        }
+                        Some(_) => value.clone(),
+                        None => scalar(value, 0),
+                    };
+                    fields.insert(field.into(), value);
+                }
+            }
+            Value::Object(fields)
+        })
+        .collect();
+    (
+        Value::Array(compacted),
+        values.len().saturating_sub(COMPACTED_DIAGNOSTIC_GAPS),
+    )
+}
+
 fn summary(source: &Value, string_limit: usize) -> Value {
     let mut out = serde_json::Map::new();
+    let mut lists = serde_json::Map::new();
+    let mut omitted_lists = serde_json::Map::new();
     for key in [
         "version",
         "project_root",
@@ -93,11 +152,26 @@ fn summary(source: &Value, string_limit: usize) -> Value {
         "checkpoints_total",
     ] {
         if let Some(value) = source.get(key) {
-            out.insert(key.into(), scalar(value, string_limit));
+            if key == "degraded_reasons" {
+                if let Some(values) = value.as_array() {
+                    lists.insert(key.into(), serde_json::json!(values.len()));
+                }
+                let (compacted, omitted) = compact_named_list(
+                    value,
+                    COMPACTED_DEGRADED_REASONS,
+                    COMPACTED_STATUS_TEXT_BYTES,
+                );
+                if omitted > 0 {
+                    omitted_lists.insert(key.into(), serde_json::json!(omitted));
+                }
+                out.insert(key.into(), compacted);
+            } else {
+                out.insert(key.into(), scalar(value, string_limit));
+            }
         }
     }
-    // Keep scalar fields used by plugin status parsing and progress displays.
-    // Omitted detail remains available from an explicit status read.
+    // Keep fields used by plugin status parsing and progress displays. Pushes
+    // retain bounded samples of user-visible lists; use a full status read for omitted items.
     let containers: &[(&str, &[&str])] = &[
         (
             "features",
@@ -173,7 +247,6 @@ fn summary(source: &Value, string_limit: usize) -> Value {
             ],
         ),
     ];
-    let mut lists = serde_json::Map::new();
     for (container, keys) in containers {
         if let Some(value) = source.get(*container) {
             if value.is_null() {
@@ -186,7 +259,20 @@ fn summary(source: &Value, string_limit: usize) -> Value {
                     if let Some(rows) = value.as_array() {
                         lists.insert(format!("{container}.{key}"), serde_json::json!(rows.len()));
                     }
-                    selected.insert((*key).into(), scalar(value, string_limit));
+                    let (compacted, omitted) = match *key {
+                        "disabled_categories" => compact_named_list(
+                            value,
+                            COMPACTED_DISABLED_CATEGORIES,
+                            COMPACTED_STATUS_TEXT_BYTES,
+                        ),
+                        "diagnostics_gaps" => compact_diagnostic_gaps(value),
+                        _ => (scalar(value, string_limit), 0),
+                    };
+                    if omitted > 0 {
+                        omitted_lists
+                            .insert(format!("{container}.{key}"), serde_json::json!(omitted));
+                    }
+                    selected.insert((*key).into(), compacted);
                 }
             }
             out.insert((*container).into(), Value::Object(selected));
@@ -212,6 +298,12 @@ fn summary(source: &Value, string_limit: usize) -> Value {
         lists.insert("degraded_reasons".into(), serde_json::json!(reasons.len()));
     }
     out.insert("status_push_list_totals".into(), Value::Object(lists));
+    if !omitted_lists.is_empty() {
+        out.insert(
+            "status_push_list_omitted".into(),
+            Value::Object(omitted_lists),
+        );
+    }
     let total = source
         .get("storage_refusals_total")
         .and_then(Value::as_u64)
@@ -662,6 +754,10 @@ mod tests {
         ))
         .unwrap();
         let mut snapshot = project(&fixture.ctx, full);
+        for bar in ["status_bar", "status_bar_values"] {
+            snapshot[bar]["disabled_categories"] = serde_json::json!(["dead_code", "todos"]);
+            snapshot[bar]["diagnostics"] = serde_json::json!("producer_missing");
+        }
         snapshot["semantic_index"]["error"] = serde_json::json!("\u{0000}".repeat(12_000));
         snapshot["storage_refusals_total"] = serde_json::json!(19);
         snapshot["storage_refusals_omitted"] = serde_json::json!(19);
@@ -677,6 +773,55 @@ mod tests {
             serde_json::from_slice::<Value>(&body.bytes).unwrap(),
             captured,
             "shared compacted fixture must match the Rust backstop"
+        );
+    }
+
+    #[test]
+    fn status_push_compaction_marks_omitted_consumer_list_entries() {
+        let snapshot = serde_json::json!({
+            "degraded_reasons": (0..=COMPACTED_DEGRADED_REASONS)
+                .map(|index| format!("reason_{index}"))
+                .collect::<Vec<_>>(),
+            "status_bar": {
+                "disabled_categories": (0..=COMPACTED_DISABLED_CATEGORIES)
+                    .map(|index| format!("category_{index}"))
+                    .collect::<Vec<_>>(),
+                "diagnostics_gaps": (0..=COMPACTED_DIAGNOSTIC_GAPS)
+                    .map(|index| serde_json::json!({
+                        "language": format!("language_{index}"),
+                        "producer": format!("producer_{index}"),
+                        "root": format!("/project/{index}"),
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+        });
+
+        let compacted = summary(&snapshot, 256);
+        assert_eq!(
+            compacted["degraded_reasons"].as_array().unwrap().len(),
+            COMPACTED_DEGRADED_REASONS
+        );
+        assert_eq!(
+            compacted["status_bar"]["disabled_categories"]
+                .as_array()
+                .unwrap()
+                .len(),
+            COMPACTED_DISABLED_CATEGORIES
+        );
+        assert_eq!(
+            compacted["status_bar"]["diagnostics_gaps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            COMPACTED_DIAGNOSTIC_GAPS
+        );
+        assert_eq!(
+            compacted["status_push_list_omitted"],
+            serde_json::json!({
+                "degraded_reasons": 1,
+                "status_bar.disabled_categories": 1,
+                "status_bar.diagnostics_gaps": 1,
+            })
         );
     }
 

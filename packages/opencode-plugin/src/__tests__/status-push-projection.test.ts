@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { coerceAftStatus } from "../shared/status.js";
+import { formatAftStatusSegment } from "../tui/v2-status.js";
 
 function fixture(name: string): Record<string, unknown> {
   return JSON.parse(
@@ -34,6 +35,21 @@ describe("OpenCode 1 and 2 status push compatibility", () => {
     expect(status.semantic_index.entries_total).toBe(52_000);
     expect(status.runtime.open_routes).toBe(90);
     expect(status.degraded).toBe(true);
+    expect(status.degraded_reasons).toContain("root_too_broad");
+    expect(status.status_bar?.diagnostics).toBe("producer_missing");
+    expect(status.status_bar?.diagnostics_gaps).toEqual([
+      { language: "rust", producer: "rust-analyzer", root: "/project" },
+    ]);
+    expect((snapshot.status_bar as Record<string, unknown>).disabled_categories).toEqual([
+      "dead_code",
+      "todos",
+    ]);
+    expect((snapshot.status_bar_values as Record<string, unknown>).disabled_categories).toEqual([
+      "dead_code",
+      "todos",
+    ]);
+    expect(formatAftStatusSegment(status)).toContain("D○");
+    expect(formatAftStatusSegment(status)).toContain("T○");
     expect(snapshot).toMatchObject({
       storage_refusals_total: 19,
       storage_refusals_omitted: 19,

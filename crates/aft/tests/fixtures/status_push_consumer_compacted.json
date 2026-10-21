@@ -7,7 +7,9 @@
     "canonical_root": "/project",
     "cache_role": "main",
     "degraded": true,
-    "degraded_reasons": [],
+    "degraded_reasons": [
+      "root_too_broad"
+    ],
     "message": "project status",
     "config_error": {},
     "lsp_servers": 5,
@@ -66,27 +68,45 @@
       "warm_entries": 2000
     },
     "status_bar": {
-      "disabled_categories": [],
+      "disabled_categories": [
+        "dead_code",
+        "todos"
+      ],
       "errors": 1,
       "warnings": 2,
       "dead_code": 3,
       "unused_exports": 4,
       "duplicates": 5,
       "todos": 6,
-      "diagnostics": "pending",
-      "diagnostics_gaps": [],
+      "diagnostics": "producer_missing",
+      "diagnostics_gaps": [
+        {
+          "language": "rust",
+          "producer": "rust-analyzer",
+          "root": "/project"
+        }
+      ],
       "tier2_stale": true
     },
     "status_bar_values": {
-      "disabled_categories": [],
+      "disabled_categories": [
+        "dead_code",
+        "todos"
+      ],
       "errors": 1,
       "warnings": 2,
       "dead_code": 3,
       "unused_exports": 4,
       "duplicates": 5,
       "todos": 6,
-      "diagnostics": "pending",
-      "diagnostics_gaps": [],
+      "diagnostics": "producer_missing",
+      "diagnostics_gaps": [
+        {
+          "language": "rust",
+          "producer": "rust-analyzer",
+          "root": "/project"
+        }
+      ],
       "tier2_stale": true
     },
     "compression": {
@@ -98,9 +118,9 @@
       }
     },
     "status_push_list_totals": {
-      "status_bar.disabled_categories": 0,
+      "status_bar.disabled_categories": 2,
       "status_bar.diagnostics_gaps": 1,
-      "status_bar_values.disabled_categories": 0,
+      "status_bar_values.disabled_categories": 2,
       "status_bar_values.diagnostics_gaps": 1,
       "degraded_reasons": 1
     },
@@ -128,7 +148,7 @@
       "omitted": true,
       "read": "status",
       "reason": "serialized_body_limit",
-      "original_body_bytes": 74159
+      "original_body_bytes": 74215
     }
   }
 }
