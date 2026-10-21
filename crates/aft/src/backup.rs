@@ -1009,9 +1009,9 @@ impl BackupStore {
 
     /// Retry moving root backups from `<storage>/backups` into
     /// `<storage>/<harness>/backups` on backup operations. Run stale-session GC and
-    /// permission tightening once per process/storage namespace. Once root repair
-    /// completes, move direct child directories with `meta.json` into the default
-    /// session namespace.
+    /// tighten permissions once for each storage-directory/harness pair in this
+    /// process. Run flat-layout migration on the first pass, then rerun it only
+    /// when this call moves root backups into the harness directory.
     ///
     /// Configure deliberately does not invoke this. Backup mutations or restores
     /// perform the maintenance; ordinary project binding does not enumerate the
@@ -1028,10 +1028,8 @@ impl BackupStore {
             self.gc_stale_sessions(self.maintenance_ttl_hours);
         }
 
-        let first_migration = repair.leftovers == 0
-            && repair.failed == 0
-            && BACKUP_MIGRATION_KEYS.lock().unwrap().insert(key);
-        if first_migration {
+        let first_migration = BACKUP_MIGRATION_KEYS.lock().unwrap().insert(key);
+        if first_migration || repair.moved > 0 {
             self.migrate_legacy_layout_if_needed();
         }
         if first_maintenance {
@@ -7684,6 +7682,80 @@ mod tests {
             0,
             "completed legacy migration must not rescan the harness backups directory"
         );
+    }
+
+    #[test]
+    fn root_repair_with_conflicts_still_migrates_moved_history_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let blocked_path = storage.path().join("blocked.txt");
+        let movable_path = storage.path().join("movable.txt");
+        fs::write(&movable_path, "current content").unwrap();
+        let blocked_key = canonicalize_key(&blocked_path);
+        let movable_key = canonicalize_key(&movable_path);
+        let root_backups = storage.path().join("backups");
+        let harness_backups = storage.path().join("opencode/backups");
+        let blocked_root_dir = root_backups.join(BackupStore::path_hash(&blocked_key));
+        let movable_root_dir = root_backups.join(BackupStore::path_hash(&movable_key));
+        for (legacy_dir, key) in [
+            (&blocked_root_dir, &blocked_key),
+            (&movable_root_dir, &movable_key),
+        ] {
+            fs::create_dir_all(legacy_dir).unwrap();
+            fs::write(legacy_dir.join("0.bak"), "original content").unwrap();
+            fs::write(
+                legacy_dir.join("meta.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": key.display().to_string(),
+                    "count": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let blocked_destination = harness_backups.join(BackupStore::path_hash(&blocked_key));
+        fs::create_dir_all(&blocked_destination).unwrap();
+        fs::write(blocked_destination.join("keep"), "existing destination").unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        store.run_process_maintenance_once();
+
+        assert!(
+            blocked_root_dir.exists(),
+            "the conflicting entry stays in place"
+        );
+        assert!(blocked_destination.join("keep").exists());
+        assert!(!movable_root_dir.exists());
+        let default_session_dir =
+            harness_backups.join(BackupStore::session_hash(DEFAULT_SESSION_ID));
+        let migrated_dir = default_session_dir.join(BackupStore::path_hash(&movable_key));
+        assert!(migrated_dir.join("meta.json").exists());
+        assert_eq!(store.history(DEFAULT_SESSION_ID, &movable_path).len(), 1);
+        let reads_after_migration = store.migration_backups_dir_reads_for_tests();
+        assert_eq!(reads_after_migration, 1);
+
+        for _ in 0..3 {
+            store.run_process_maintenance_once();
+        }
+
+        assert_eq!(
+            store.migration_backups_dir_reads_for_tests(),
+            reads_after_migration,
+            "maintenance without new root-backup moves must not rescan legacy history"
+        );
+        store
+            .restore_latest(DEFAULT_SESSION_ID, &movable_path)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&movable_path).unwrap(),
+            "original content"
+        );
+        assert!(store.history(DEFAULT_SESSION_ID, &movable_path).is_empty());
     }
 
     #[test]
