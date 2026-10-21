@@ -284,6 +284,8 @@ describe("buildUnifiedDiff", () => {
     expect(new TextEncoder().encode(after).length).toBeLessThan(512_000);
 
     const originalPush = Array.prototype.push;
+    // Bun accepts larger spreads than some production runtimes; simulate a
+    // conservative argument limit while exercising the real diff path.
     Array.prototype.push = function <T>(this: T[], ...items: T[]): number {
       if (items.length > 100_000) {
         throw new RangeError("simulated JavaScript argument limit exceeded");
