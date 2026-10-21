@@ -76,6 +76,223 @@ fn project_root_path_is_narrow(directory: &Path, home: &Path, volume: &Path) -> 
         && directory != volume
 }
 
+/// The volume a canonical project root is judged against when deciding whether
+/// it is too broad to watch and index. `None` means the volume is unknown.
+///
+/// The device walk in `volume_anchor` stops at any directory whose device
+/// differs from its parent's. On Linux that includes a bind mount of a
+/// subdirectory, such as a dev container's `-v "$PWD":/workspace`: the mount
+/// point looks like a volume root to the device walk, although it exposes only
+/// a subdirectory of another filesystem. For a root that is itself such a
+/// mount point, judge it against the volume that contains the mount point
+/// instead. Other platforms keep the device walk.
+pub(crate) fn project_root_volume(canonical_root: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let (volume, _) = crate::storage_retention::volume_anchor(canonical_root)?;
+    #[cfg(target_os = "linux")]
+    return project_root_volume_with(canonical_root, volume, home, read_mountinfo, |path| {
+        crate::storage_retention::volume_anchor(path).map(|(volume, _)| volume)
+    });
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (canonical_root, home);
+        Some(volume)
+    }
+}
+
+/// Testable core of [`project_root_volume`]: `read` supplies the text of
+/// `/proc/self/mountinfo` and `volume_of` runs the device walk for a path.
+#[cfg(target_os = "linux")]
+fn project_root_volume_with(
+    root: &Path,
+    volume: PathBuf,
+    home: Option<&Path>,
+    read: impl FnOnce() -> std::io::Result<String>,
+    volume_of: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    // Only a root that is itself the mount point is misjudged; a directory
+    // below a mount point is already narrow. The filesystem root stays broad
+    // whatever it mounts.
+    if root != volume {
+        return Some(volume);
+    }
+    let Some(parent) = volume.parent() else {
+        return Some(volume);
+    };
+    let mountinfo = match read() {
+        Ok(text) => text,
+        Err(error) => {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                crate::slog_warn!(
+                    "cannot read {MOUNTINFO_PATH} ({error}); mount points are judged as volume roots"
+                );
+            });
+            return Some(volume);
+        }
+    };
+    match mount_root_in(&mountinfo, &volume) {
+        MountRoot::Subdirectory(source_root) if !source_root_is_home_like(&source_root, home) => {
+            volume_of(parent)
+        }
+        _ => Some(volume),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
+/// Hosts with many containers can list thousands of mounts; a larger table is
+/// treated as unreadable rather than parsed in part, because a cut table could
+/// miss the entry that is mounted on top.
+#[cfg(target_os = "linux")]
+const MOUNTINFO_MAX_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MOUNTINFO_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(target_os = "linux")]
+fn read_mountinfo() -> std::io::Result<String> {
+    use std::io::Read;
+    // Read under this function's own deadline instead of the caller's I/O
+    // budget: a failed read recorded in that budget would make the rest of the
+    // configure request's file access fail too.
+    crate::bounded_io::with_budget(None, || {
+        crate::bounded_io::run(
+            Path::new(MOUNTINFO_PATH),
+            Some(std::time::Instant::now() + MOUNTINFO_BUDGET),
+            |path| {
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)?
+                    .take(MOUNTINFO_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MOUNTINFO_MAX_BYTES {
+                    return Err(std::io::Error::other("mount table exceeds the size limit"));
+                }
+                String::from_utf8(bytes).map_err(std::io::Error::other)
+            },
+        )
+    })
+}
+
+/// What a mount exposes of its filesystem, read from one mountinfo entry.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum MountRoot {
+    /// The filesystem's root, or the root of a whole btrfs subvolume.
+    WholeVolume,
+    /// A subdirectory of the filesystem, as a bind mount exposes. Holds the
+    /// subdirectory's path inside its filesystem.
+    Subdirectory(PathBuf),
+    /// No entry for the mount point, or one this parser cannot interpret.
+    Unknown,
+}
+
+/// Classify the mount at `mount_point` from the text of `/proc/self/mountinfo`.
+/// Line format (proc(5)): id, parent id, major:minor, root, mount point, mount
+/// options, optional fields, `-`, filesystem type, source, super options.
+#[cfg(target_os = "linux")]
+fn mount_root_in(mountinfo: &str, mount_point: &Path) -> MountRoot {
+    // Mounts stacked on one mount point are listed in mount order, so the last
+    // matching entry is the one that is visible.
+    let Some(fields) = mountinfo
+        .lines()
+        .map(|line| line.split(' ').collect::<Vec<_>>())
+        .filter(|fields| {
+            fields
+                .get(4)
+                .is_some_and(|point| unescape_mount_field(point) == mount_point)
+        })
+        .last()
+    else {
+        return MountRoot::Unknown;
+    };
+    let Some(separator) = fields.iter().skip(6).position(|field| *field == "-") else {
+        return MountRoot::Unknown;
+    };
+    let tail = &fields[6 + separator + 1..];
+    let (Some(fs_type), Some(super_options)) = (tail.first(), tail.get(2)) else {
+        return MountRoot::Unknown;
+    };
+    let root = unescape_mount_field(fields[3]);
+    if !root.is_absolute() {
+        return MountRoot::Unknown;
+    }
+    if root == Path::new("/") {
+        return MountRoot::WholeVolume;
+    }
+    // A btrfs subvolume mount reports the subvolume's path as its root, so a
+    // root other than `/` only means a bind of a subdirectory when it lies
+    // below the mounted subvolume.
+    let subvolume = super_options
+        .split(',')
+        .find_map(|option| option.strip_prefix("subvol="))
+        .map(unescape_mount_field);
+    match subvolume {
+        Some(subvolume) if root == subvolume => MountRoot::WholeVolume,
+        Some(subvolume) if root.starts_with(&subvolume) => MountRoot::Subdirectory(root),
+        Some(_) => MountRoot::Unknown,
+        // Subvolume-capable filesystems that do not name the subvolume give no
+        // way to tell a subvolume root from a bind.
+        None if matches!(*fs_type, "btrfs" | "bcachefs") => MountRoot::Unknown,
+        None => MountRoot::Subdirectory(root),
+    }
+}
+
+/// Decode the octal escapes (`\040` for a space, for example) that mountinfo
+/// uses for whitespace and backslashes in paths.
+#[cfg(target_os = "linux")]
+fn unescape_mount_field(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let octal = bytes.get(index + 1..index + 4).filter(|digits| {
+            bytes[index] == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d))
+        });
+        match octal {
+            Some(digits) => {
+                let value = digits
+                    .iter()
+                    .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0'));
+                decoded.push(value as u8);
+                index += 4;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(decoded))
+}
+
+/// A bind of a home folder or of a folder containing home folders exposes as
+/// much as opening that folder directly, so it stays too broad. The source path
+/// comes from another machine or namespace (the host of a container), so the
+/// account home is not enough: conventional home locations count too.
+#[cfg(target_os = "linux")]
+fn source_root_is_home_like(source_root: &Path, home: Option<&Path>) -> bool {
+    if home.is_some_and(|home| home.starts_with(source_root)) {
+        return true;
+    }
+    let names: Vec<&str> = source_root
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_str().unwrap_or("")),
+            _ => None,
+        })
+        .collect();
+    matches!(
+        names.as_slice(),
+        [] | ["root"]
+            | ["home"]
+            | ["home", _]
+            | ["Users"]
+            | ["Users", _]
+            | ["var", "home"]
+            | ["var", "home", _]
+    )
+}
+
 /// Bind mounts can preserve a protected directory's identity without preserving
 /// its path spelling. Device/inode checks also catch same-device volume aliases.
 #[cfg(unix)]
@@ -292,6 +509,161 @@ mod tests {
 
     use super::*;
     use std::fs;
+
+    /// Mount-table fixtures in the `/proc/self/mountinfo` format, judged the
+    /// way a container sees its bind-mounted workspace: the project root is on
+    /// a different device from its parent, and the parent is on the
+    /// container's overlay root `/`.
+    #[cfg(target_os = "linux")]
+    mod mount_table {
+        use super::super::{
+            mount_root_in, project_root_path_is_narrow, project_root_volume_with, MountRoot,
+        };
+        use std::path::{Path, PathBuf};
+
+        const OVERLAY_ROOT: &str = "1748 1 0:173 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n";
+
+        fn narrow_with(root: &str, read: impl FnOnce() -> std::io::Result<String>) -> bool {
+            let root = Path::new(root);
+            let home = Path::new("/root");
+            let volume =
+                project_root_volume_with(root, root.to_path_buf(), Some(home), read, |_| {
+                    Some(PathBuf::from("/"))
+                });
+            volume.is_some_and(|volume| project_root_path_is_narrow(root, home, &volume))
+        }
+
+        fn narrow(root: &str, mount: &str) -> bool {
+            narrow_with(root, || Ok(format!("{OVERLAY_ROOT}{mount}\n")))
+        }
+
+        #[test]
+        fn bind_of_a_subdirectory_is_narrow() {
+            // `docker run -v /tmp/repro/proj-x:/proj` and `-v /tmp/repro:/data`.
+            assert!(narrow(
+                "/proj",
+                "1801 1748 8:1 /tmp/repro/proj-x /proj ro,relatime - ext4 /dev/sda1 rw"
+            ));
+            assert!(narrow(
+                "/data",
+                "1801 1748 8:1 /tmp/repro /data ro,relatime shared:5 master:1 - ext4 /dev/sda1 rw"
+            ));
+            assert!(narrow(
+                "/workspace",
+                "1801 1748 8:1 /var/lib/docker/volumes/x/_data /workspace rw - ext4 /dev/sda1 rw"
+            ));
+            assert!(narrow(
+                "/work space",
+                "1801 1748 8:1 /srv/my\\040proj /work\\040space rw - xfs /dev/sda1 rw"
+            ));
+        }
+
+        #[test]
+        fn whole_filesystem_mount_is_broad() {
+            let mount = "1801 1748 8:17 / /data rw,relatime shared:5 - ext4 /dev/sdb1 rw";
+            assert!(!narrow("/data", mount));
+            // Classified as a whole volume, not as a bind that only the
+            // home-folder rule keeps broad.
+            assert_eq!(
+                mount_root_in(mount, Path::new("/data")),
+                MountRoot::WholeVolume
+            );
+        }
+
+        #[test]
+        fn mount_on_top_of_a_bind_decides() {
+            assert!(!narrow(
+                "/data",
+                "1801 1748 8:1 /tmp/repro /data rw - ext4 /dev/sda1 rw\n\
+                 1802 1801 8:17 / /data rw - ext4 /dev/sdb1 rw"
+            ));
+        }
+
+        #[test]
+        fn btrfs_subvolume_root_is_broad() {
+            assert!(!narrow(
+                "/data",
+                "1801 1748 0:45 /@data /data rw,relatime shared:5 - btrfs /dev/sdb2 rw,space_cache=v2,subvolid=257,subvol=/@data"
+            ));
+            // Without a `subvol=` option a subvolume cannot be told from a bind.
+            assert!(!narrow(
+                "/data",
+                "1801 1748 0:45 /@data /data rw - btrfs /dev/sdb2 rw,space_cache=v2"
+            ));
+            // A root outside the named subvolume is not understood.
+            assert!(!narrow(
+                "/data",
+                "1801 1748 0:45 /@other /data rw - btrfs /dev/sdb2 rw,subvolid=257,subvol=/@data"
+            ));
+            // A bind of a folder inside the subvolume is a project.
+            assert!(narrow(
+                "/data",
+                "1801 1748 0:45 /@data/proj /data rw - btrfs /dev/sdb2 rw,subvolid=257,subvol=/@data"
+            ));
+        }
+
+        #[test]
+        fn bind_of_a_home_folder_is_broad() {
+            for source in ["/home/u", "/home", "/Users/u", "/root", "/var/home/u"] {
+                assert!(
+                    !narrow(
+                        "/workspace",
+                        &format!("1801 1748 8:1 {source} /workspace rw - ext4 /dev/sda1 rw")
+                    ),
+                    "{source}"
+                );
+            }
+            // The account home and its ancestors count wherever they live.
+            let home = Path::new("/srv/people/u");
+            for source in ["/srv/people/u", "/srv/people", "/srv"] {
+                let root = Path::new("/workspace");
+                let volume = project_root_volume_with(
+                    root,
+                    root.to_path_buf(),
+                    Some(home),
+                    || {
+                        Ok(format!(
+                            "{OVERLAY_ROOT}1801 1748 8:1 {source} /workspace rw - ext4 /dev/sda1 rw\n"
+                        ))
+                    },
+                    |_| Some(PathBuf::from("/")),
+                );
+                assert_eq!(volume.as_deref(), Some(root), "{source}");
+            }
+        }
+
+        #[test]
+        fn filesystem_root_is_broad() {
+            // A sandbox whose `/` is itself a bind of a host subdirectory.
+            assert!(!narrow_with("/", || Ok(
+                "1748 317 9:5 /runner/sandboxes/x/root / ro - xfs /dev/md5 rw\n".to_owned()
+            )));
+        }
+
+        #[test]
+        fn unreadable_mount_table_keeps_the_device_answer() {
+            assert!(!narrow_with("/proj", || Err(std::io::Error::other(
+                "permission denied"
+            ))));
+            // A mount point missing from the table is not understood either.
+            assert!(!narrow(
+                "/proj",
+                "1801 1748 8:1 /tmp/repro/proj-x /elsewhere rw - ext4 /dev/sda1 rw"
+            ));
+        }
+
+        #[test]
+        fn root_below_its_mount_point_keeps_its_volume() {
+            let volume = project_root_volume_with(
+                Path::new("/data/proj"),
+                PathBuf::from("/data"),
+                None,
+                || panic!("the mount table is only read for a mount point root"),
+                |_| panic!("no re-anchoring below a mount point"),
+            );
+            assert_eq!(volume, Some(PathBuf::from("/data")));
+        }
+    }
 
     #[test]
     fn lexical_normalization_preserves_parents_and_root_boundaries() {
