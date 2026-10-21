@@ -1,0 +1,22 @@
+{
+  "after_outputs": {
+    "aft": ".cortexkit/internal-docs/investigations/inspect-truth-follow-up/raw/aft/after"
+  },
+  "provenance": {
+    "source_commit": "dab88ab951f1216b494bff68f1952c16252fbea6",
+    "scope": "Current-capture sample, not a replacement for own-repo-close.json's 43 historical judgments. No oracle rows are removed.",
+    "capture": "Linux release aft 0.61.0; project D22/U145, including Rust D12 and seven in-domain plugin dead-code rows."
+  },
+  "entries": [
+    {"repo":"aft","category":"dead_code","side":"aft","path":"crates/aft/src/db/file_identity.rs","symbol":"is_live_sqlite_handle","verdict":"aft_false_positive","note":"The production exact-read path calls this handle-identity guard at commands/file_read_exact.rs:75,144; subc/flow_read.rs:496 calls read_exact. This is a new live helper, not one of the historical four allowed-dead helpers."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"crates/aft/src/edit.rs","symbol":"link_count","verdict":"aft_false_positive","note":"The Windows source-replacement branch calls windows::link_count at edit.rs:339 to reject multiply linked files. Its declaration is in the cfg(windows) module; a Linux rustc lint count cannot establish Windows liveness."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"crates/aft/src/edit.rs","symbol":"copy_platform_security","verdict":"aft_false_positive","note":"The shared replacement path calls xattrs::copy_platform_security at edit.rs:384. Separate cfg(target_os) definitions implement macOS ACL copying and the Linux no-op; the reported source name has a real production caller."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/opencode-plugin/src/bg-notifications.ts","symbol":"setActiveSessionId","verdict":"aft_correct","note":"The setter still has no consumer; the OpenCode entry point imports getActiveSessionId instead. This agrees with the historical row review."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/opencode-plugin/src/config.ts","symbol":"PiToolPresentation","verdict":"aft_correct","note":"The config schema consumes PiToolPresentationEnum directly; the exported inferred type alias has no named consumer."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/opencode-plugin/src/config.ts","symbol":"GithubConfig","verdict":"aft_correct","note":"Callers consume schema-backed settings through resolveGithubConfig, not this unreferenced named type alias."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/opencode-plugin/src/tools/_shared.ts","symbol":"bridgeFor","verdict":"aft_correct","note":"Only the exported declaration at _shared.ts:248 names this helper. Current production paths use sendForCanonicalRoot and toolCallForCanonicalRoot at :317-325,374-382. The distinct bridgeForDrain and test-local helper are not consumers."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/opencode-plugin/src/tools/inspect.ts","symbol":"collapseInspectPhases","verdict":"aft_correct","note":"Only the declaration references this helper; production parses and renders terminal phases directly at inspect.ts:418-419."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/pi-plugin/src/tools/inspect.ts","symbol":"collapseInspectPhases","verdict":"aft_correct","note":"Only the declaration references this helper; production parses and renders the terminal directly at inspect.ts:534-535."},
+    {"repo":"aft","category":"dead_code","side":"aft","path":"packages/pi-plugin/src/tool-registration.ts","symbol":"PI_REGISTRABLE_TOOLS","verdict":"aft_correct","note":"Only the declaration references this constant; index.ts and tool-registration.test.ts import other registration functions."}
+  ]
+}
