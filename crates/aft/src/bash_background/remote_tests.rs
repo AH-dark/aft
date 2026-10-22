@@ -6849,3 +6849,58 @@ async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restar
     assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
     assert_no_retry_sleep(&mut clock);
 }
+
+/// A retry wait that ends after the job's admission time has run out sends
+/// nothing: the clock moves past the deadline while the worker waits.
+#[tokio::test]
+async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(2000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_hinted_retry_budget(dir.path(), 3000);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    // The worker wakes 5 s after the first submission, 2 s past its deadline.
+    clock.advance(5000);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(exec_runs(&daemon).len(), 1, "no request after the deadline");
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// A zero hint on a job whose admission time is already used up sends
+/// nothing either, although it needs no wait at all.
+#[tokio::test]
+async fn runon_signer_zero_hint_after_the_deadline_surfaces_the_refusal() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(0),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    // No admission time at all: the deadline is the first submission itself.
+    shorten_hinted_retry_budget(dir.path(), 0);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(exec_runs(&daemon).len(), 1, "no request after the deadline");
+    assert_no_retry_sleep(&mut clock);
+}

@@ -2301,7 +2301,8 @@ impl BgTaskRegistry {
     /// Act on a refusal the runner marked transient with a retry hint: wait
     /// for the hint, then send the same request again. The refusal is reported
     /// unchanged when it carries no usable hint, the hint is longer than the
-    /// job's admission time left, or the job was already resubmitted
+    /// job's admission time left, that time has run out by the moment of
+    /// resending, or the job was already resubmitted
     /// [`HINTED_RETRY_MAX_RESUBMITS`] times. A kill during the wait ends the
     /// task at once.
     async fn hinted_retry(
@@ -2387,6 +2388,12 @@ impl BgTaskRegistry {
                 drop(db);
                 self.remote_terminal(task, Verdict::Cancelled, None);
                 return Ok(HintedRetryStep::Ended);
+            }
+            // The wait can end late, and a zero hint does not wait at all, so
+            // check the admission time again right before sending: once it has
+            // run out, report the saved refusal as it is.
+            if draining_now_ms(root) >= retry.deadline_ms {
+                return Ok(HintedRetryStep::Surface);
             }
             // Clear the refusal before dispatch, as a draining resubmission
             // does: a crash after this write is ambiguous and must recover by
