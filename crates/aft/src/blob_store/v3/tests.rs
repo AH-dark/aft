@@ -502,7 +502,7 @@ fn v3_child() {
             )
         };
         let before = read_audit::counts();
-        fs::write(
+        write_control(
             &control,
             serde_json::to_vec(
                 &serde_json::json!({"reserved":accounting.reserved_bytes,"readonly":readonly,"before":before}),
