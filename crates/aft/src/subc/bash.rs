@@ -4627,23 +4627,45 @@ mod grant_path_tests {
         .unwrap_or_else(|_| panic!("the remote task never reached: {what}"));
     }
 
-    /// Asserts the ordinary background launch reply: the task handle with
-    /// status `running`, and no input-capture warning anywhere in it.
+    /// Before the runner accepts the job, the launch reply reports status
+    /// `starting`, tells the caller not to rerun, and warns that input capture is
+    /// unconfirmed. After acceptance, the launch reply reports status `running`
+    /// without the input-capture warning.
     #[cfg(unix)]
     fn assert_accepted_launch_reply(done: &BashDeferredCompletion, task_id: &str, case: &str) {
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
         assert!(response.success, "{case}: {response:?}");
         assert_eq!(response.data["task_id"], task_id, "{case}: {response:?}");
-        assert_eq!(response.data["status"], "running", "{case}: {response:?}");
-        assert!(
-            !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
-            "{case}: {text}"
-        );
-        assert!(
-            !response.data.to_string().contains("hasn't confirmed"),
-            "{case}: {response:?}"
-        );
+        match response.data["status"].as_str() {
+            Some("starting") => {
+                assert_eq!(
+                    response.data["remote_phase"], "submitting",
+                    "{case}: {response:?}"
+                );
+                assert!(
+                    text.contains(REMOTE_ADMISSION_PENDING_NOTE),
+                    "{case}: pending reply must warn against rerunning: {text}"
+                );
+                assert!(
+                    text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                    "{case}: pending reply must identify unconfirmed input capture: {text}"
+                );
+            }
+            Some("running") => {
+                assert!(
+                    !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                    "{case}: {text}"
+                );
+                assert!(
+                    !response.data.to_string().contains("hasn't confirmed"),
+                    "{case}: {response:?}"
+                );
+            }
+            status => panic!(
+                "{case}: expected a starting or running launch reply, got {status:?}: {response:?}"
+            ),
+        }
     }
 
     #[cfg(unix)]
@@ -5831,13 +5853,12 @@ mod grant_path_tests {
         );
     }
 
-    /// The capture wait can also end without seeing the worker settle: a module
-    /// drain answers at once, and the capture deadline can expire before the
-    /// launch reply is even decided (a slow dispatch spends the whole budget).
-    /// When the runner's Accepted is already recorded by then, the reply is the
-    /// same ordinary launch reply a settled wait gives, whether the job is still
-    /// running or already finished: never the capture warning, and never the
-    /// finished result in place of the task handle.
+    /// This test checks launch replies after the input-capture wait ends once
+    /// the runner has accepted the job. The wait can end because AFT begins
+    /// restarting or because its deadline expires. Before acceptance, the reply
+    /// reports `starting` and warns against rerunning; afterward it reports
+    /// `running` without the capture warning. Even if the job finishes before
+    /// the reply is sent, the launch call returns its task handle, not the result.
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_wait_ended_after_accepted_keeps_launch_reply() {
