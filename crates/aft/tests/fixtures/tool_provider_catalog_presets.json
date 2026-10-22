@@ -3427,8 +3427,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "7356f39e4f1a5d671a61eb6e0980907615f67d0627e1868438983452a6bf2b58",
-      "catalog_digest": "7356f39e4f1a5d671a61eb6e0980907615f67d0627e1868438983452a6bf2b58",
+      "generation": "9a46f76484b448f5d2c267c4c84c66f8e7bc0c294dd615f7c7782886785cdb85",
+      "catalog_digest": "9a46f76484b448f5d2c267c4c84c66f8e7bc0c294dd615f7c7782886785cdb85",
       "tools": [
         {
           "name": "status",
@@ -4666,8 +4666,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "e11d20ee7161cb404fa6e462d67184efe8d7fb2f43e663ae852631f5aebe402b",
-      "catalog_digest": "e11d20ee7161cb404fa6e462d67184efe8d7fb2f43e663ae852631f5aebe402b",
+      "generation": "d63753d78b32085b9c71c125de5acc4ec13fc478409a3800ef4ac6b1106572b8",
+      "catalog_digest": "d63753d78b32085b9c71c125de5acc4ec13fc478409a3800ef4ac6b1106572b8",
       "tools": [
         {
           "name": "status",
