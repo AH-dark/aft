@@ -1496,24 +1496,18 @@ fn capture_proc_stacks(pid: u32, seconds: u64) -> Result<CapturedSample, Profile
 
 #[cfg(target_os = "linux")]
 fn append_proc_stack(thread: &mut SampleThread, state: &str, stack: &str) {
-    let first = thread.nodes.len();
-    thread.nodes.push(SampleNode {
-        parent: None,
-        samples: 1,
-        frame: state.to_string(),
-        offset: None,
-    });
-    let mut parent = Some(first);
-    for line in stack.lines().filter(|line| !line.trim().is_empty()) {
-        let index = thread.nodes.len();
-        thread.nodes.push(SampleNode {
-            parent,
-            samples: 1,
-            frame: line.trim().to_string(),
-            offset: parse_hex_address(line),
-        });
-        parent = Some(index);
-    }
+    // `/proc/<tid>/stack` lists the innermost kernel frame first; store the
+    // frames outermost first under the thread state, like the other samplers.
+    let frames = stack
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    append_stack(
+        thread,
+        std::iter::once(state.to_string()).chain(frames.into_iter().rev()),
+    );
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1633,7 +1627,7 @@ fn parse_sample_offset(frame: &str) -> Option<String> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_hex_address(line: &str) -> Option<String> {
     line.split_whitespace()
         .find(|part| part.starts_with("0x"))
@@ -1643,57 +1637,92 @@ fn parse_hex_address(line: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_perf_script(raw: &str) -> Vec<SampleThread> {
     let mut threads = BTreeMap::<String, SampleThread>::new();
     let mut current: Option<String> = None;
-    let mut current_parent: Option<usize> = None;
+    // `perf script` prints each callchain innermost frame first. Collect a
+    // whole sample, then store it outermost first so the tree has the same
+    // orientation as macOS `sample` output (root = thread entry).
+    let mut frames = Vec::<String>::new();
+    let flush = |threads: &mut BTreeMap<String, SampleThread>,
+                 current: &Option<String>,
+                 frames: &mut Vec<String>| {
+        if let Some(thread) = current.as_ref().and_then(|key| threads.get_mut(key)) {
+            append_stack(thread, frames.drain(..).rev());
+        }
+        frames.clear();
+    };
     for line in raw.lines() {
-        if !line.starts_with(char::is_whitespace) && line.contains('/') && line.contains(':') {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            let Some(pid_tid) = fields.get(1) else {
+        if !line.starts_with(char::is_whitespace) {
+            flush(&mut threads, &current, &mut frames);
+            current = None;
+            let Some((name, tid)) = parse_perf_header(line) else {
                 continue;
             };
-            let Some((_, tid)) = pid_tid.split_once('/') else {
-                continue;
-            };
-            let key = tid.to_string();
-            let name = fields.first().copied().unwrap_or("aft").to_string();
-            let thread = threads.entry(key.clone()).or_insert_with(|| SampleThread {
-                id: key.clone(),
+            let thread = threads.entry(tid.clone()).or_insert_with(|| SampleThread {
+                id: tid.clone(),
                 name,
                 declared_samples: 0,
                 nodes: Vec::new(),
                 symbols_unavailable: None,
             });
             thread.declared_samples += 1;
-            current = Some(key);
-            current_parent = None;
-            continue;
-        }
-        let Some(key) = current.as_ref() else {
-            continue;
-        };
-        if !line.starts_with(char::is_whitespace) {
-            current = None;
-            current_parent = None;
+            current = Some(tid);
             continue;
         }
         let text = line.trim();
-        if text.is_empty() {
-            continue;
+        if current.is_some() && !text.is_empty() {
+            frames.push(text.to_string());
         }
-        let thread = threads.get_mut(key).expect("perf sample thread exists");
+    }
+    flush(&mut threads, &current, &mut frames);
+    threads.into_values().collect()
+}
+
+/// Read the thread name and id from a `perf script` sample header. The
+/// default fields print `comm tid [cpu] time: ...`; with `-F +pid` the id is
+/// `pid/tid`. A thread name may contain spaces, so the id is the first token
+/// after the name that is a number or a `number/number` pair.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_perf_header(line: &str) -> Option<(String, String)> {
+    if !line.contains(':') {
+        return None;
+    }
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let is_number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let position = fields.iter().skip(1).position(|field| {
+        let tid = field.rsplit_once('/').map_or(
+            *field,
+            |(pid, tid)| {
+                if is_number(pid) {
+                    tid
+                } else {
+                    ""
+                }
+            },
+        );
+        is_number(tid)
+    })? + 1;
+    let tid = fields[position].rsplit('/').next()?.to_string();
+    Some((fields[..position].join(" "), tid))
+}
+
+/// Store one sample's frames, given outermost first, as a one-sample chain.
+/// `thread_report` folds identical chains together before ranking.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn append_stack(thread: &mut SampleThread, frames: impl IntoIterator<Item = String>) {
+    let mut parent = None;
+    for frame in frames {
         let index = thread.nodes.len();
         thread.nodes.push(SampleNode {
-            parent: current_parent,
+            parent,
             samples: 1,
-            frame: text.to_string(),
-            offset: parse_hex_address(text),
+            offset: parse_hex_address(&frame),
+            frame,
         });
-        current_parent = Some(index);
+        parent = Some(index);
     }
-    threads.into_values().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2376,6 +2405,8 @@ fn build_report(
 }
 
 fn thread_report(thread: &SampleThread) -> ThreadReport {
+    let merged = merge_matching_prefixes(thread);
+    let thread = &merged;
     let leaves = leaf_paths(thread);
     let leaf_samples = leaves.iter().map(|(samples, _)| *samples).sum::<u64>();
     let parse_inconsistent = leaf_samples != thread.declared_samples;
@@ -2473,6 +2504,58 @@ fn heaviest_paths(
     }
     paths.sort_by(|left, right| right.samples.cmp(&left.samples));
     paths
+}
+
+/// Fold stacks that share the same frames from the root into one tree.
+///
+/// The Linux samplers record each sample as its own chain of nodes, while
+/// macOS `sample` already prints a merged call tree. Ranking counts samples
+/// per node, so without this step a stack seen 100 times on Linux would be 100
+/// one-sample chains, and none would look hot. Folding makes both platforms
+/// rank the same shape.
+///
+/// A node that ended a stack (a leaf) folds only into other leaves, never into
+/// a frame that also has callees. Otherwise the samples spent in that frame
+/// itself would disappear from the leaf totals that `parse_inconsistent` and
+/// the running count are built from. Parents must precede their children in
+/// `nodes`, which every parser here guarantees.
+fn merge_matching_prefixes(thread: &SampleThread) -> SampleThread {
+    let mut has_children = vec![false; thread.nodes.len()];
+    for node in &thread.nodes {
+        if let Some(parent) = node.parent.filter(|parent| *parent < thread.nodes.len()) {
+            has_children[parent] = true;
+        }
+    }
+    let mut merged = Vec::<SampleNode>::with_capacity(thread.nodes.len());
+    let mut merged_index = vec![usize::MAX; thread.nodes.len()];
+    let mut by_key = HashMap::<(Option<usize>, bool, &str), usize>::new();
+    for (index, node) in thread.nodes.iter().enumerate() {
+        // A parent that is missing or listed after its child cannot be
+        // folded safely; keep such a node as its own root.
+        let parent = node
+            .parent
+            .filter(|parent| *parent < index)
+            .map(|parent| merged_index[parent]);
+        let key = (parent, has_children[index], node.frame.as_str());
+        let target = *by_key.entry(key).or_insert_with(|| {
+            merged.push(SampleNode {
+                parent,
+                samples: 0,
+                frame: node.frame.clone(),
+                offset: node.offset.clone(),
+            });
+            merged.len() - 1
+        });
+        merged[target].samples += node.samples;
+        merged_index[index] = target;
+    }
+    SampleThread {
+        id: thread.id.clone(),
+        name: thread.name.clone(),
+        declared_samples: thread.declared_samples,
+        nodes: merged,
+        symbols_unavailable: thread.symbols_unavailable.clone(),
+    }
 }
 
 fn leaf_paths(thread: &SampleThread) -> Vec<(u64, Vec<usize>)> {
@@ -3355,6 +3438,82 @@ mod tests {
         assert_eq!(json["heaviest_paths"][0]["samples"], 140);
         assert_eq!(json["heaviest_paths"][0]["truncated_at_fanout"], true);
         assert!(json.get("symbols_unavailable").is_none());
+    }
+
+    // `perf script` default text: one callchain per sample, innermost frame
+    // first. The health-rollup thread repeats one stack 100 times and spreads
+    // another 60 samples under one frame over 30 leaf sites; the executor
+    // thread uses the `pid/tid` header that `perf script -F +pid` prints.
+    #[test]
+    fn linux_perf_stacks_fold_into_one_tree_before_ranking() {
+        let raw = include_str!("../../tests/fixtures/linux-perf-script.txt");
+        let threads = parse_perf_script(raw);
+        let ids = threads
+            .iter()
+            .map(|thread| (thread.id.as_str(), thread.declared_samples))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![("4242", 160), ("4243", 8)]);
+        assert_eq!(threads[0].name, "aft-health-roll");
+
+        let report = thread_report(&threads[0]);
+        assert!(!report.parse_inconsistent);
+        assert_eq!(report.running_samples, 160);
+        let summary = report
+            .heaviest_paths
+            .iter()
+            .map(|path| {
+                (
+                    path.samples,
+                    path.truncated_at_fanout,
+                    path.frames.first().cloned().unwrap_or_default(),
+                    path.frames.last().cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outermost = "7f3a2b126850 __clone3+0x30 (/usr/lib/x86_64-linux-gnu/libc.so.6)";
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    100,
+                    false,
+                    outermost.to_string(),
+                    "55d1c0a2d0b3 aft::subc::health::count_actors+0x23 (/usr/local/bin/aft)"
+                        .to_string()
+                ),
+                (
+                    60,
+                    true,
+                    outermost.to_string(),
+                    "55d1c0a2e2c8 aft::subc::health::scan_actor_snapshots+0x88 (/usr/local/bin/aft)"
+                        .to_string()
+                ),
+            ]
+        );
+
+        let executor = thread_report(&threads[1]);
+        assert_eq!(executor.heaviest_paths.len(), 1);
+        assert_eq!(executor.heaviest_paths[0].samples, 8);
+        assert!(!executor.heaviest_paths[0].truncated_at_fanout);
+    }
+
+    #[test]
+    fn folding_keeps_samples_that_ended_in_a_frame_with_callees_elsewhere() {
+        // Three perf samples: one stopped in `B` itself, two went on into `C`.
+        let mut thread = SampleThread {
+            id: "7".to_string(),
+            name: "worker".to_string(),
+            declared_samples: 3,
+            nodes: Vec::new(),
+            symbols_unavailable: None,
+        };
+        for frames in [vec!["A", "B"], vec!["A", "B", "C"], vec!["A", "B", "C"]] {
+            append_stack(&mut thread, frames.into_iter().map(str::to_string));
+        }
+        let report = thread_report(&thread);
+        assert!(!report.parse_inconsistent);
+        assert_eq!(report.leaf_samples, 3);
+        assert_eq!(report.running_samples, 3);
     }
 
     #[test]
