@@ -143,6 +143,47 @@ fn probe_location(path: &std::path::Path) -> ProbeLocation {
 /// config unchanged: availability and its reason, root identity, cache epoch
 /// and the semantic model folder must all match. Only a change needs the
 /// session's indexes stopped or restarted.
+/// The cache settings a probe started from. The probe prepares the cache root
+/// off the actor, and its result waits in the actor queue; a reconnect that
+/// runs first can select another cache root, lease or epoch. The result is
+/// applied only while the context still runs with these exact settings.
+#[derive(Debug, Clone, PartialEq)]
+struct CacheProbeBasis {
+    storage_dir: Option<std::path::PathBuf>,
+    cache_dir: Option<std::path::PathBuf>,
+    cache_dir_configured: Option<crate::config::ConfiguredCacheDir>,
+    cache_dir_opt_out: bool,
+    cache_config_unknown: Option<String>,
+    cache_epoch: u64,
+}
+
+impl CacheProbeBasis {
+    fn of(config: &Config) -> Self {
+        Self {
+            storage_dir: config.storage_dir.clone(),
+            cache_dir: config.cache_dir.clone(),
+            cache_dir_configured: config.cache_dir_configured.clone(),
+            cache_dir_opt_out: config.cache_dir_opt_out,
+            cache_config_unknown: config.cache_config_unknown.clone(),
+            cache_epoch: config.cache_epoch,
+        }
+    }
+}
+
+/// Copy the probe's cache fields onto `config`, unless `config` no longer runs
+/// the settings the probe started from; then the result is stale and dropped
+/// (the next probe checks the new settings). Returns whether it applied.
+fn apply_cache_probe(config: &mut Config, basis: &CacheProbeBasis, prepared: &Config) -> bool {
+    if CacheProbeBasis::of(config) != *basis {
+        return false;
+    }
+    config.cache_unavailable = prepared.cache_unavailable.clone();
+    config.cache_epoch = prepared.cache_epoch;
+    config.cache_lease = prepared.cache_lease.clone();
+    config.semantic.local_cache_dir = prepared.semantic.local_cache_dir.clone();
+    true
+}
+
 fn cache_state_matches(running: &Config, probed: &Config) -> bool {
     let same_lease = match (&running.cache_lease, &probed.cache_lease) {
         (Some(running), Some(probed)) => running.same_root(probed),
@@ -384,7 +425,10 @@ impl StandingActor {
             for (root, ctx) in entries {
                 // Verify this context's configuration rather than borrowing
                 // another context's cache lease or unavailable status.
-                let mut prepared = ctx.config().as_ref().clone();
+                let running = ctx.config();
+                let basis = CacheProbeBasis::of(&running);
+                let mut prepared = running.as_ref().clone();
+                drop(running);
                 root_cache::prepare_cache_root(&mut prepared);
                 let prepared = Arc::new(prepared);
                 let id = format!(
@@ -399,16 +443,13 @@ impl StandingActor {
                         Lane::Mutating,
                         id,
                         Box::new(move |ctx| {
+                            let mut applied = false;
                             ctx.update_config(|config| {
-                                config.cache_unavailable = prepared.cache_unavailable.clone();
-                                config.cache_epoch = prepared.cache_epoch;
-                                config.cache_lease = prepared.cache_lease.clone();
-                                config.semantic.local_cache_dir =
-                                    prepared.semantic.local_cache_dir.clone();
+                                applied = apply_cache_probe(config, &basis, &prepared);
                             });
                             crate::protocol::Response::success(
                                 response_id,
-                                serde_json::json!({"cache_rechecked": true}),
+                                serde_json::json!({"cache_rechecked": applied}),
                             )
                         }),
                     );
@@ -1134,6 +1175,47 @@ mod tests {
         assert!(storage.path().join("aft.db").exists());
         actor.tick();
         assert_eq!(ctx.artifact_cache_key_derivation_count_for_test(), 0);
+    }
+
+    #[test]
+    fn cache_probe_for_an_old_root_leaves_a_reconnected_root_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let prepared_for = |parent: &std::path::Path| {
+            std::fs::create_dir_all(parent).unwrap();
+            let mut config = Config {
+                storage_dir: Some(storage.clone()),
+                cache_dir: Some(parent.to_path_buf()),
+                ..Default::default()
+            };
+            assert!(root_cache::prepare_cache_root_for_test(&mut config).is_none());
+            config
+        };
+        // The probe snapshots the running config on root A and prepares it.
+        let on_a = prepared_for(&temp.path().join("volume-a"));
+        let basis = CacheProbeBasis::of(&on_a);
+        let mut probed = on_a.clone();
+        root_cache::prepare_cache_root(&mut probed);
+        // A reconnect selects root B before the probe's callback runs.
+        let mut on_b = prepared_for(&temp.path().join("volume-b"));
+        let lease_b = on_b.cache_lease.clone().unwrap();
+        let epoch_b = on_b.cache_epoch;
+        let models_b = on_b.semantic.local_cache_dir.clone();
+        assert_ne!(models_b, probed.semantic.local_cache_dir);
+
+        assert!(!apply_cache_probe(&mut on_b, &basis, &probed));
+        assert!(Arc::ptr_eq(on_b.cache_lease.as_ref().unwrap(), &lease_b));
+        assert_eq!(on_b.cache_epoch, epoch_b);
+        assert_eq!(on_b.semantic.local_cache_dir, models_b);
+        assert!(root_cache::cache_unavailable(&on_b).is_none());
+
+        // On the configuration it was probed for, the result applies.
+        let mut still_a = on_a.clone();
+        assert!(apply_cache_probe(&mut still_a, &basis, &probed));
+        assert!(Arc::ptr_eq(
+            still_a.cache_lease.as_ref().unwrap(),
+            probed.cache_lease.as_ref().unwrap()
+        ));
     }
 
     #[test]
