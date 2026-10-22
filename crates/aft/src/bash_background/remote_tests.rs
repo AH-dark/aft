@@ -6661,6 +6661,9 @@ pub(super) enum DrainingGate {
     /// After a retry's resubmission failed without reaching the runner
     /// (see `refuse_resubmission`), before the worker reports that.
     BeforeNoStartRefusal,
+    /// After the startup pass claimed a saved task's owed runner cancel,
+    /// before it sends it. Keyed by the pass's storage root.
+    OwedCancelClaimed,
 }
 
 fn refused_resubmission_roots() -> &'static Mutex<HashSet<PathBuf>> {
@@ -7127,6 +7130,247 @@ fn exec_cancels(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_js
         .filter(|(_, body)| body["method"] == "exec.cancel")
         .map(|(_, body)| body["params"].clone())
         .collect()
+}
+
+/// A `runon` task of a fresh owner scope whose job the runner (accepting up
+/// to `clients` connections) has accepted, paused while its worker was
+/// stopped right before it would send the cancel, and saved by a registry
+/// that is then dropped, as a module restart leaves it. Returns the runner,
+/// the task id, the job id and the path of the saved record, which is
+/// finished and still owes the runner the cancel.
+async fn saved_task_owing_a_cancel(
+    dir: &Path,
+    clients: usize,
+) -> (
+    crate::exec_remote::wire_tests::Daemon,
+    String,
+    Uuid,
+    PathBuf,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Cancel,
+        "exec-remote/v1",
+        clients,
+    )
+    .await;
+    let scope = owner_scope("owed-cancel");
+    let original = registry();
+    let task_id = start_scoped_runon_retry(&original, dir, daemon.connection.clone(), &scope);
+    let job_id = wait_for("the runner must accept the job", || {
+        let task = original.task(&task_id)?;
+        let state = task.state.lock().unwrap();
+        state.metadata.remote.as_ref()?.job_id
+    })
+    .await;
+    stopped_draining_roots().lock().unwrap().insert(dir.into());
+    let members = original.begin_scope_pause(&scope).unwrap();
+    original.pause_scope(&scope, true, &members).unwrap();
+    remote_worker_exited(&task_id).await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    original.detach();
+    let saved = read_task(&json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    assert!(
+        saved.remote.unwrap().cancel_pending,
+        "the cancel must be owed"
+    );
+    assert!(exec_cancels(&daemon).is_empty(), "the cancel was sent");
+    (daemon, task_id, job_id, json)
+}
+
+/// Run the startup pass that sends owed cancels under `storage` to its end,
+/// off the test runtime that serves the fake runner.
+async fn run_owed_cancel_pass(storage: &Path) -> super::OwedCancelReport {
+    let handle = BgTaskRegistry::start_owed_cancel_pass(storage).expect("first pass for this root");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || handle.join().unwrap()),
+    )
+    .await
+    .expect("the owed cancel pass must finish")
+    .unwrap()
+}
+
+/// The saved record shows the owed cancel sent once and nothing owed.
+fn assert_owed_cancel_sent_once(
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+    job_id: Uuid,
+    json: &Path,
+) {
+    let cancels = exec_cancels(daemon);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert!(
+        cancels[0].to_string().contains(&job_id.to_string()),
+        "{cancels:?}"
+    );
+    let saved = read_task(json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    assert_eq!(saved.status_reason.as_deref(), Some("paused_by_owner"));
+    let remote = saved.remote.unwrap();
+    assert!(!remote.cancel_pending, "{remote:?}");
+    assert_eq!(remote.owner_pause_cancel.as_deref(), Some("sent"));
+    assert_eq!(exec_runs(daemon).len(), 1, "never resubmitted");
+}
+
+/// A paused worker's checkout may never bind again after a restart, so its
+/// task's owed runner cancel must not wait for a replay. The startup pass
+/// finds it in the saved records and sends it, with no project bound and no
+/// task restored.
+#[tokio::test]
+async fn an_owed_runner_cancel_is_sent_at_startup_without_a_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    // A new module starts; no project binds.
+    let restarted = registry();
+    let report = run_owed_cancel_pass(dir.path()).await;
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    assert!(
+        restarted.task(&task_id).is_none(),
+        "the pass restores no task"
+    );
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "the pass starts no worker"
+    );
+}
+
+fn failed_owed_cancel_attempts() -> &'static Mutex<HashMap<String, usize>> {
+    static ATTEMPTS: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    ATTEMPTS.get_or_init(Default::default)
+}
+
+/// Called by the owed cancel pass after each attempt that failed to reach
+/// the runner.
+pub(super) fn note_owed_cancel_attempt_failed(task: &str) {
+    *failed_owed_cancel_attempts()
+        .lock()
+        .unwrap()
+        .entry(task.to_owned())
+        .or_default() += 1;
+}
+
+/// The runner's connection is not available when the startup pass first
+/// tries to send an owed cancel. The pass waits and tries again, and the
+/// cancel is sent once the runner can be reached.
+#[tokio::test]
+async fn the_owed_cancel_pass_retries_until_the_runner_is_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let hidden = daemon.connection.with_extension("hidden");
+    fs::rename(&daemon.connection, &hidden).unwrap();
+    let pass = {
+        let handle = BgTaskRegistry::start_owed_cancel_pass(dir.path()).unwrap();
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+    };
+    wait_for("the first attempt must fail", || {
+        (failed_owed_cancel_attempts()
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .copied()
+            .unwrap_or_default()
+            >= 1)
+            .then_some(())
+    })
+    .await;
+    fs::rename(&hidden, &daemon.connection).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(60), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+}
+
+/// The startup pass has claimed a saved task's owed cancel when its project
+/// binds and replays the task. The replay must not start a worker that sends
+/// the cancel a second time; it takes the pass's outcome instead.
+#[tokio::test]
+async fn a_replay_during_the_owed_cancel_pass_sends_no_second_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 3).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::OwedCancelClaimed);
+    let pass = {
+        let handle = BgTaskRegistry::start_owed_cancel_pass(dir.path()).unwrap();
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+    };
+    gate.reached().await;
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "the replay started a worker"
+    );
+    gate.release();
+    let report = tokio::time::timeout(Duration::from_secs(60), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    let task = project.task(&task_id).unwrap();
+    let remote = task.state.lock().unwrap().metadata.remote.clone().unwrap();
+    assert!(!remote.cancel_pending, "{remote:?}");
+    assert_eq!(remote.owner_pause_cancel.as_deref(), Some("sent"));
+    assert_eq!(remote_workers(&task_id), (1, 1));
+}
+
+/// The startup pass and a project's replay of the same saved task run at the
+/// same moment, ten times. Whichever claims the owed cancel first sends it;
+/// the runner must receive it exactly once each time.
+#[tokio::test]
+async fn the_owed_cancel_pass_and_a_replay_racing_send_one_cancel() {
+    for round in 0..10 {
+        let dir = tempfile::tempdir().unwrap();
+        let (daemon, _task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 3).await;
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let pass = {
+            let (start, storage) = (start.clone(), dir.path().to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+                BgTaskRegistry::start_owed_cancel_pass(&storage)
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+        };
+        let project = registry();
+        let replay = {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+                project.replay_session(&storage, "session").unwrap();
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(60), pass)
+            .await
+            .unwrap()
+            .unwrap();
+        replay.await.unwrap();
+        wait_for(
+            &format!("round {round}: the owed cancel must be saved"),
+            || {
+                let remote = read_task(&json).ok()?.remote?;
+                (!remote.cancel_pending && remote.owner_pause_cancel.as_deref() == Some("sent"))
+                    .then_some(())
+            },
+        )
+        .await;
+        // Give a second sender the time it would need to reach the runner.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            exec_cancels(&daemon).len(),
+            1,
+            "round {round}: {:?}",
+            exec_cancels(&daemon)
+        );
+        assert_owed_cancel_sent_once(&daemon, job_id, &json);
+        project.detach();
+    }
 }
 
 /// `bash.kill_scope` stops a scope's local tasks in one pass and its remote
