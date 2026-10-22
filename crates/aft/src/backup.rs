@@ -1099,9 +1099,9 @@ impl BackupStore {
 
     /// Maintenance for restores. A restore reads history from the current
     /// layout, so it must not defer layout work just because another holder has
-    /// the backup namespace: it waits for the namespace, for at most the
-    /// request's remaining budget less a reply margin (or a fixed cap outside a
-    /// request), then attempts root repair and runs the flat migration when
+    /// the backup namespace: it waits for the namespace, for at most a fixed
+    /// cap or the request's remaining budget less a reply margin, whichever
+    /// ends first, then attempts root repair and runs the flat migration when
     /// they are pending, before reading history. Otherwise an undo could
     /// report no history for a file whose history still sits in the root or
     /// flat legacy layout. A namespace still
@@ -6110,24 +6110,28 @@ fn backup_namespace_admission(storage: &Path) -> std::io::Result<std::fs::File> 
     Ok(file)
 }
 
-/// Longest a restore waits for a busy backup namespace when it runs outside a
-/// request budget.
+/// Longest any caller waits for a busy backup namespace. The wait holds the
+/// backup store (and, for an edit, the surrounding mutation), so other backups
+/// and edits on the store queue behind it; a long request budget must not
+/// stretch that.
 const NAMESPACE_WAIT_CAP: Duration = Duration::from_secs(5);
 /// Part of a request's remaining budget kept for answering after a namespace
 /// wait, so a wait that times out still leaves time to report why.
 const NAMESPACE_WAIT_REPLY_MARGIN: Duration = Duration::from_millis(500);
 
-/// Deadline for a waiting namespace acquisition: the current request's
-/// deadline less the reply margin, or [`NAMESPACE_WAIT_CAP`] from now when no
-/// request budget is in effect.
+/// Deadline for a waiting namespace acquisition: [`NAMESPACE_WAIT_CAP`] from
+/// now, or the current request's deadline less the reply margin if that comes
+/// first.
 fn namespace_wait_deadline() -> Instant {
     let now = Instant::now();
+    let capped = now + NAMESPACE_WAIT_CAP;
     match crate::bounded_io::current() {
         Some(budget) => budget
             .deadline
             .checked_sub(NAMESPACE_WAIT_REPLY_MARGIN)
-            .map_or(now, |deadline| deadline.max(now)),
-        None => now + NAMESPACE_WAIT_CAP,
+            .map_or(now, |deadline| deadline.max(now))
+            .min(capped),
+        None => capped,
     }
 }
 
@@ -8546,6 +8550,23 @@ mod tests {
         assert!(
             elapsed >= budget - NAMESPACE_WAIT_REPLY_MARGIN - Duration::from_millis(100),
             "the undo waits until the budget less the reply margin, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn default_session_undo_waits_no_longer_than_fixed_cap_under_long_request_budget() {
+        // A budget well past the cap: the cap, not the budget, must end the
+        // wait. Its deadline less the reply margin (7.5 s) stays short of the
+        // holder's 10 s backstop, so an uncapped wait still ends in the busy
+        // error, only later.
+        let budget = Duration::from_secs(8);
+        let (restored, elapsed) =
+            undo_against_held_namespace(Some(crate::bounded_io::Budget::after(budget)));
+        assert_busy_namespace_undo_error(&restored);
+        assert!(
+            elapsed >= NAMESPACE_WAIT_CAP
+                && elapsed < NAMESPACE_WAIT_CAP + Duration::from_millis(1_500),
+            "a long request budget must not stretch the wait past the fixed cap, took {elapsed:?}"
         );
     }
 
