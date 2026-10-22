@@ -4964,9 +4964,13 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
         thread::sleep(Duration::from_millis(10));
     }
     ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
-        server_kind: ServerKind::Rust, root: root.clone(),
+        // The client's own root and a URI made from the product-normalized path:
+        // on Windows `fs::canonicalize` gives a verbatim `\\?\` spelling that
+        // matches no client root and is not a valid `file://` URI, so the
+        // publication would be dropped before alert ingestion.
+        server_kind: ServerKind::Rust, root: rust_key.root.clone(),
         method: "textDocument/publishDiagnostics".into(),
-        params: Some(json!({"uri":format!("file://{}", rust.display()),"version":0,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
+        params: Some(json!({"uri":file_uri(&rust),"version":0,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
     });
     // Do not drain here: the background completion must consume the queued Rust
     // publication while applying the Python response, then retain the Rust
@@ -5458,6 +5462,19 @@ fn scoped_python_progress_silent_open_cannot_reuse_cached_report_or_poison_serve
     );
 }
 
+/// `file` relative to `root`, compared the way the alert state compares them
+/// (`DiagnosticIdentity::from_stored` canonicalizes both sides). On Windows a
+/// root from `fs::canonicalize` is spelled `\\?\C:\...` while the diagnostics
+/// store holds `C:\...`, so a plain `strip_prefix` fails.
+fn alert_relative_file(root: &Path, file: &Path) -> PathBuf {
+    let canonical_root = fs::canonicalize(root).expect("canonical alert root");
+    let canonical_file = fs::canonicalize(file).expect("canonical diagnostic file");
+    canonical_file
+        .strip_prefix(&canonical_root)
+        .unwrap_or_else(|_| panic!("diagnostic file {file:?} is outside alert root {root:?}"))
+        .to_path_buf()
+}
+
 fn accept_progress_alerts(
     root: &Path,
     state: &mut aft::alert_state::AlertDeltaState,
@@ -5482,7 +5499,7 @@ fn accept_progress_alerts(
                     .filter(|d| d.severity == aft::lsp::diagnostics::DiagnosticSeverity::Error)
                     .map(|d| {
                         AlertDiagnostic::error(
-                            d.file.strip_prefix(root).unwrap().to_string_lossy(),
+                            alert_relative_file(root, &d.file).to_string_lossy(),
                             d.line,
                             d.message.clone(),
                         )
@@ -5518,9 +5535,12 @@ fn scoped_python_progress_reanalysis_keeps_warm_counts_and_alert_episode() {
     );
     let first = scoped_diagnostics_inspect(&ctx, "progress-alert-warmup", "broken.py");
     assert_eq!(first["summary"]["diagnostics"]["errors"], 1, "{first:#}");
+    // The manager keys its client by the normalized root (no Windows `\\?\`
+    // prefix). A key with the verbatim spelling finds no client, so
+    // `server_is_warming` would report false at once.
     let key = ServerKey {
         kind: ServerKind::Python,
-        root: root.clone(),
+        root: crate::helpers::canonicalize_like_product(&root),
     };
     let diagnostics = ctx
         .lsp()
