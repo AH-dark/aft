@@ -5745,9 +5745,9 @@ mod grant_path_tests {
         let args =
             json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000});
 
-        // The launch reply is decided after Accepted, while the job still runs.
+        // Keep the runner behind its gate until the pending launch reply is checked.
         let (daemon, _dir, root, executor, ctx) =
-            capture_fixture(Script::GatedStages { position: 1 }).await;
+            capture_fixture(Script::GatedAcceptanceThenExit).await;
         let mut rx = capture_call(&executor, &root, args.clone());
         let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
             .await
@@ -5757,28 +5757,28 @@ mod grant_path_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let inputs_captured = ctx
-            .bash_background()
-            .runon_inputs_captured(&task_id, "deadline-session");
-        match inputs_captured {
-            Some(true) => assert_accepted_launch_reply(&done, &task_id, "already accepted"),
-            Some(false) => {
-                let response = done.response_for_test();
-                let text = done.text_for_test().unwrap();
-                assert_eq!(response.data["status"], "starting", "{response:?}");
-                assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
-                assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
-                assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
-            }
-            None => panic!("registered runon task must retain its capture state"),
-        }
+        assert_eq!(
+            ctx.bash_background()
+                .runon_inputs_captured(&task_id, "deadline-session"),
+            Some(false),
+            "the acceptance gate keeps the launch reply pending"
+        );
+        let response = done.response_for_test();
+        let text = done.text_for_test().unwrap();
+        assert_eq!(response.data["status"], "starting", "{response:?}");
+        assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
+        assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
+        assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
         assert!(
             !ctx.bash_background().is_task_terminal(&task_id),
-            "the runner still holds the terminal record"
+            "the runner has not accepted or completed the task"
         );
-        daemon.output_gate.notify_one();
+        daemon.acceptance_gate.notify_one();
+        wait_for_task_state(&ctx, "runner accepted", |registry| {
+            registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+        })
+        .await;
         wait_for_task_state(&ctx, "completed", |registry| {
-            daemon.completion_gate.notify_one();
             registry.is_task_terminal(&task_id)
         })
         .await;
