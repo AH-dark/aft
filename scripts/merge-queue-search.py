@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,28 +48,94 @@ def resolve_git_descriptor(descriptor: dict, changed: list[str], base: str, head
 
 
 PR_LOOKUP_BACKOFF_SECONDS = (5, 10, 15, 30)
+PR_API_RETRY_BACKOFF_SECONDS = (2, 5)
+GH_API_TIMEOUT_SECONDS = 30
 
 
-def lookup_member_prs(repository: str, head: str) -> list[dict]:
-    result = subprocess.run(
-        ["gh", "api", "--paginate", "--slurp",
-         f"repos/{repository}/commits/{head}/pulls?per_page=100"],
-        text=True, capture_output=True, check=False,
+def _transient_gh_error(stderr: str) -> bool:
+    definite_status = r"\bHTTP(?:/\d(?:\.\d)?)?\s+(?:401|403|404)\b"
+    if re.search(definite_status, stderr, re.IGNORECASE):
+        return False
+    if re.search(r"\b5\d\d\b", stderr):
+        return True
+    json_parse_error = (
+        r"\b(?:unexpected end of JSON input|unexpected EOF|invalid JSON|"
+        r"invalid character .+looking for|error (?:parsing|decoding) JSON)\b"
     )
-    if result.returncode:
-        raise InputFault(f"queue_pr_lookup_failed:{head}:{result.stderr.strip()}")
-    pages = json.loads(result.stdout)
+    if re.search(json_parse_error, stderr, re.IGNORECASE):
+        return True
+    return re.search(
+        r"\b(?:timeout|timed out|connection (?:reset|refused|closed|aborted|error)|"
+        r"failed to connect|error connecting|could not resolve|"
+        r"temporary failure in name resolution|network is unreachable|no route to host|"
+        r"remote end closed connection)\b",
+        stderr,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _gh_api_json(command: list[str], lookup_key: str, *, sleep=None) -> Any:
+    delay = time.sleep if sleep is None else sleep
+    attempts = len(PR_API_RETRY_BACKOFF_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=GH_API_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            detail = f"gh api timed out after {GH_API_TIMEOUT_SECONDS} seconds"
+            if error.stderr:
+                timeout_stderr = (
+                    error.stderr.decode(errors="replace")
+                    if isinstance(error.stderr, bytes)
+                    else error.stderr
+                )
+                detail += f": {timeout_stderr}"
+        else:
+            if result.returncode:
+                detail = result.stderr.strip()
+                if not _transient_gh_error(detail):
+                    raise InputFault(f"queue_pr_lookup_failed:{lookup_key}:{detail}")
+            else:
+                try:
+                    return json.loads(result.stdout)
+                except json.JSONDecodeError as error:
+                    detail = (
+                        "empty reply"
+                        if not result.stdout.strip()
+                        else f"invalid JSON reply: {error}"
+                    )
+
+        if attempt == attempts:
+            raise InputFault(
+                f"queue_pr_lookup_failed:{lookup_key}:retries_exhausted:"
+                f"attempts={attempts}:{detail}"
+            )
+        delay(PR_API_RETRY_BACKOFF_SECONDS[attempt - 1])
+
+
+def lookup_member_prs(repository: str, head: str, *, sleep=None) -> list[dict]:
+    pages = _gh_api_json(
+        [
+            "gh", "api", "--paginate", "--slurp",
+            f"repos/{repository}/commits/{head}/pulls?per_page=100",
+        ],
+        head,
+        sleep=sleep,
+    )
     return [pr for page in pages for pr in page]
 
 
-def lookup_queue_ref_pr(repository: str, number: int) -> dict:
-    result = subprocess.run(
+def lookup_queue_ref_pr(repository: str, number: int, *, sleep=None) -> dict:
+    return _gh_api_json(
         ["gh", "api", f"repos/{repository}/pulls/{number}"],
-        text=True, capture_output=True, check=False,
+        str(number),
+        sleep=sleep,
     )
-    if result.returncode:
-        raise InputFault(f"queue_pr_lookup_failed:{number}:{result.stderr.strip()}")
-    return json.loads(result.stdout)
 
 
 def is_member_pr(pr: dict, repository: str, head: str) -> bool:

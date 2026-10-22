@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -152,6 +156,130 @@ class MemberPrRetryTests(unittest.TestCase):
             )
 
         self.assertEqual(calls, 5)
+
+
+class GhLookupRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.responses_path = self.root / "responses.json"
+        self.calls_path = self.root / "calls.jsonl"
+        gh = self.root / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "root = os.environ['GH_FIXTURE_DIR']\n"
+            "with open(os.path.join(root, 'calls.jsonl'), 'a+') as calls:\n"
+            "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "    calls.seek(0)\n"
+            "    call_number = sum(1 for _ in calls)\n"
+            "with open(os.path.join(root, 'responses.json')) as source:\n"
+            "    responses = json.load(source)\n"
+            "response = responses[min(call_number - 1, len(responses) - 1)]\n"
+            "sys.stdout.write(response.get('stdout', ''))\n"
+            "sys.stderr.write(response.get('stderr', ''))\n"
+            "sys.exit(response.get('returncode', 0))\n"
+        )
+        gh.chmod(0o755)
+        self.env = patch.dict(
+            os.environ,
+            {
+                "GH_FIXTURE_DIR": str(self.root),
+                "PATH": f"{self.root}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def configure_responses(self, responses: list[dict]) -> None:
+        self.responses_path.write_text(json.dumps(responses))
+
+    def call_count(self) -> int:
+        return len(self.calls_path.read_text().splitlines())
+
+    def test_empty_member_reply_retries_until_valid_json(self) -> None:
+        expected = [{"number": 23}]
+        self.configure_responses(
+            [{"stdout": ""}, {"stdout": json.dumps([expected])}]
+        )
+        delays: list[float] = []
+
+        result = merge_queue_search.lookup_member_prs(
+            "cortexkit/aft", "a" * 40, sleep=delays.append
+        )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(self.call_count(), 2)
+        self.assertEqual(delays, [2])
+
+    def test_empty_queue_ref_replies_exhaust_retries(self) -> None:
+        self.configure_responses([{"stdout": ""}] * 3)
+        delays: list[float] = []
+
+        with self.assertRaisesRegex(
+            merge_queue_search.InputFault,
+            r"queue_pr_lookup_failed:23:retries_exhausted:attempts=3:",
+        ):
+            merge_queue_search.lookup_queue_ref_pr(
+                "cortexkit/aft", 23, sleep=delays.append
+            )
+
+        self.assertEqual(self.call_count(), 3)
+        self.assertEqual(delays, [2, 5])
+
+    def test_http_404_is_not_retried(self) -> None:
+        self.configure_responses(
+            [{"returncode": 1, "stderr": "gh: Not Found (HTTP 404)"}]
+        )
+        delays: list[float] = []
+
+        with self.assertRaisesRegex(
+            merge_queue_search.InputFault,
+            r"queue_pr_lookup_failed:a{40}:gh: Not Found \(HTTP 404\)",
+        ):
+            merge_queue_search.lookup_member_prs(
+                "cortexkit/aft", "a" * 40, sleep=delays.append
+            )
+
+        self.assertEqual(self.call_count(), 1)
+        self.assertEqual(delays, [])
+
+    def test_http_502_retries_and_succeeds(self) -> None:
+        expected = {"number": 23}
+        self.configure_responses(
+            [
+                {"returncode": 1, "stderr": "gh: Bad Gateway (HTTP 502)"},
+                {"stdout": json.dumps(expected)},
+            ]
+        )
+        delays: list[float] = []
+
+        result = merge_queue_search.lookup_queue_ref_pr(
+            "cortexkit/aft", 23, sleep=delays.append
+        )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(self.call_count(), 2)
+        self.assertEqual(delays, [2])
+
+    def test_nonzero_json_parse_error_retries(self) -> None:
+        expected = {"number": 23}
+        self.configure_responses(
+            [
+                {"returncode": 1, "stderr": "unexpected end of JSON input"},
+                {"stdout": json.dumps(expected)},
+            ]
+        )
+        delays: list[float] = []
+
+        result = merge_queue_search.lookup_queue_ref_pr(
+            "cortexkit/aft", 23, sleep=delays.append
+        )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(self.call_count(), 2)
+        self.assertEqual(delays, [2])
 
 
 if __name__ == "__main__":
