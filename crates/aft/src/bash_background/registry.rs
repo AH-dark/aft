@@ -7560,8 +7560,7 @@ impl BgTaskRegistry {
                     }
                 }
                 memo.session_read(&session_dir);
-                if let Err(error) =
-                    super::persistence::remove_empty_session_directory(&session_dir)
+                if let Err(error) = super::persistence::remove_empty_session_directory(&session_dir)
                 {
                     crate::slog_warn!(
                         "failed to remove empty persisted-task session directory {}: {error}",
@@ -13605,7 +13604,10 @@ mod tests {
             .maybe_gc_persisted(storage.path())
             .unwrap();
 
-        assert!(!task_session.exists(), "persisted GC left an empty task session");
+        assert!(
+            !task_session.exists(),
+            "persisted GC left an empty task session"
+        );
         assert!(
             !quarantine_session.exists(),
             "quarantine GC left an empty quarantine session"
@@ -18547,12 +18549,9 @@ mod tests {
         let registry = BgTaskRegistry::default();
         let storage = tempfile::tempdir().unwrap();
         let task_id = "bash-0000000000000020".to_string();
-        let layout = super::super::persistence::create_task_layout(
-            storage.path(),
-            "session",
-            &task_id,
-        )
-        .unwrap();
+        let layout =
+            super::super::persistence::create_task_layout(storage.path(), "session", &task_id)
+                .unwrap();
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
             "session".into(),
@@ -18582,7 +18581,10 @@ mod tests {
 
         assert!(registry.task_for_session(&task_id, "session").is_none());
         assert_eq!(registry.finished_delete_attempt_count(&task_id), 0);
-        assert!(!task.paths.dir.exists(), "empty task directory was left behind");
+        assert!(
+            !task.paths.dir.exists(),
+            "empty task directory was left behind"
+        );
         assert!(
             !task.paths.session_dir.exists(),
             "empty session directory was left behind"

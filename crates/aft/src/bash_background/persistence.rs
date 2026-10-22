@@ -3571,22 +3571,16 @@ mod tests {
     #[test]
     fn empty_task_directory_is_classified_and_removed_on_delete() {
         let storage = tempfile::tempdir().unwrap();
-        let task = super::create_task_layout(
-            storage.path(),
-            "empty-layout",
-            "bash-0000000000000010",
-        )
-        .unwrap();
+        let task =
+            super::create_task_layout(storage.path(), "empty-layout", "bash-0000000000000010")
+                .unwrap();
         let paths = task.paths.clone();
         drop(task);
         std::fs::remove_dir(&paths.control_dir).unwrap();
         std::fs::remove_dir(&paths.io_dir).unwrap();
 
-        let error = super::resolve_uninitialized_task_layout(
-            &paths.session_dir,
-            &paths.task_id,
-        )
-        .unwrap_err();
+        let error = super::resolve_uninitialized_task_layout(&paths.session_dir, &paths.task_id)
+            .unwrap_err();
         assert!(
             super::is_task_layout_not_found(&error),
             "missing required layout directories were not classified: {error}"

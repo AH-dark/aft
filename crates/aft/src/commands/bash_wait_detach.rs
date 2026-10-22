@@ -49,9 +49,9 @@ mod tests {
             super::log_detach_outcome("session", false, 0);
         });
         assert!(
-            no_op.iter().any(|line| {
-                line.starts_with("DEBUG ") && line.contains("detached=false")
-            }),
+            no_op
+                .iter()
+                .any(|line| { line.starts_with("DEBUG ") && line.contains("detached=false") }),
             "no-op detach was not debug-logged: {no_op:?}"
         );
         assert!(
@@ -63,9 +63,9 @@ mod tests {
             super::log_detach_outcome("session", true, 1);
         });
         assert!(
-            success.iter().any(|line| {
-                line.starts_with("INFO ") && line.contains("detached=true")
-            }),
+            success
+                .iter()
+                .any(|line| { line.starts_with("INFO ") && line.contains("detached=true") }),
             "successful detach was not info-logged: {success:?}"
         );
     }
