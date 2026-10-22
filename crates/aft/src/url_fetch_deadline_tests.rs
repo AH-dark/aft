@@ -718,3 +718,36 @@ fn a_fetch_ending_inside_its_deadline_and_a_stalled_read_back_still_reply_before
         "the reply came {elapsed:?} into a {budget:?} call"
     );
 }
+
+#[test]
+fn a_stalled_cache_check_returns_the_remembered_failure_within_the_budget_and_is_not_repeated() {
+    let storage = tempfile::tempdir().unwrap();
+    // No server: with the failure remembered, nothing may be fetched.
+    let target = "http://127.0.0.1:9/never-fetched.md";
+    remember_failure(
+        FailureKey::new(storage.path(), target, true),
+        &UrlFetchError::http_status(503, "HTTP 503 Service Unavailable"),
+    );
+    let stall = stall_cache_reads(storage.path());
+    let budget = Duration::from_secs(2);
+    for call in 1..=2 {
+        let (result, elapsed) = fetch_within(budget, target, storage.path(), local());
+        let error = result.expect_err("the remembered failure answers");
+        assert!(error.retry_after().is_some(), "call {call}: {error}");
+        assert!(
+            error.to_string().contains("HTTP 503"),
+            "call {call}: {error}"
+        );
+        // The check waits until one reply margin before the end of the call.
+        assert!(
+            elapsed + URL_REPLY_MARGIN / 2 < budget,
+            "call {call} answered {elapsed:?} into a {budget:?} call"
+        );
+    }
+    assert_eq!(
+        stall.reached.load(Ordering::SeqCst),
+        1,
+        "the second call joined the stalled check instead of starting another"
+    );
+    stall.release();
+}

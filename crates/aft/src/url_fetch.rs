@@ -375,6 +375,61 @@ fn forget_failure(key: &FailureKey) {
         .remove(key);
 }
 
+/// Test hook: a document-cache read under `storage_dir` that blocks until
+/// released (or for at most 10 s, so a broken test cannot hang the suite),
+/// standing in for a cache filesystem that stops answering.
+#[cfg(test)]
+#[derive(Default)]
+struct CacheReadStall {
+    reached: std::sync::atomic::AtomicUsize,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl CacheReadStall {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn cache_read_stalls() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<CacheReadStall>>> {
+    static STALLS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<CacheReadStall>>>> =
+        std::sync::OnceLock::new();
+    STALLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
+    let stall = Arc::new(CacheReadStall::default());
+    cache_read_stalls()
+        .lock()
+        .unwrap()
+        .insert(storage_dir.to_path_buf(), Arc::clone(&stall));
+    stall
+}
+
+#[cfg(test)]
+fn stall_cache_read_if_requested(storage_dir: &Path) {
+    let Some(stall) = cache_read_stalls()
+        .lock()
+        .unwrap()
+        .get(storage_dir)
+        .cloned()
+    else {
+        return;
+    };
+    stall
+        .reached
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let released = stall.released.lock().unwrap();
+    let _ = stall
+        .release
+        .wait_timeout_while(released, Duration::from_secs(10), |released| !*released);
+}
+
 /// Test hook: make one remembered failure `by` older.
 #[cfg(test)]
 fn age_remembered_failure(key: &FailureKey, by: Duration) {
@@ -390,9 +445,111 @@ fn age_remembered_failure(key: &FailureKey, by: Duration) {
     }
 }
 
-/// The document cache is consulted first: a document that is cached is
-/// served (after the SSRF check) even while a failure of the same URL is
-/// remembered. Only a cache miss can be answered by a remembered failure.
+/// What a document-cache check needs, owned so a helper thread can run it.
+struct CacheCheckInput {
+    storage_dir: PathBuf,
+    hash: String,
+    meta_file: PathBuf,
+    url: Url,
+}
+
+type CacheCheckResult = Result<Option<PathBuf>, UrlFetchError>;
+
+/// A document-cache check running on a helper thread. Calls that find one
+/// running for their URL wait for it instead of starting another, so a cache
+/// filesystem that stops answering holds at most one thread per URL.
+#[derive(Default)]
+struct CacheCheck {
+    result: std::sync::Mutex<Option<CacheCheckResult>>,
+    done: std::sync::Condvar,
+}
+
+fn cache_checks() -> &'static std::sync::Mutex<HashMap<FailureKey, Arc<CacheCheck>>> {
+    static CHECKS: std::sync::OnceLock<std::sync::Mutex<HashMap<FailureKey, Arc<CacheCheck>>>> =
+        std::sync::OnceLock::new();
+    CHECKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The latest a bounded cache check may answer: the call's deadline less the
+/// reply margin, or the URL ceiling for a call without a budget.
+fn cache_check_deadline() -> Instant {
+    let now = Instant::now();
+    let ceiling = now + URL_FETCH_CEILING;
+    match crate::bounded_io::current() {
+        Some(budget) => budget
+            .deadline
+            .checked_sub(URL_REPLY_MARGIN)
+            .unwrap_or(now)
+            .clamp(now, ceiling),
+        None => ceiling,
+    }
+}
+
+/// Run (or join) the document-cache check for `key` and wait for it until
+/// `deadline`. `Ok(None)` means no usable cached copy, including a check
+/// that did not finish in time.
+fn bounded_cache_check(
+    key: &FailureKey,
+    input: CacheCheckInput,
+    deadline: Instant,
+) -> CacheCheckResult {
+    let check = {
+        let mut checks = cache_checks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match checks.get(key) {
+            Some(running) => Arc::clone(running),
+            None => {
+                let check = Arc::new(CacheCheck::default());
+                checks.insert(key.clone(), Arc::clone(&check));
+                let worker = Arc::clone(&check);
+                let worker_key = key.clone();
+                thread::spawn(move || {
+                    let result = fresh_cached_path(
+                        &input.storage_dir,
+                        &input.hash,
+                        &input.meta_file,
+                        &input.url,
+                    );
+                    *worker
+                        .result
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                    worker.done.notify_all();
+                    cache_checks()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&worker_key);
+                });
+                check
+            }
+        }
+    };
+    let mut result = check
+        .result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        result = check
+            .done
+            .wait_timeout(result, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// A document that is cached is served (after the SSRF check) even while a
+/// failure of the same URL is remembered; only a cache miss is answered by a
+/// remembered failure. With a failure remembered, the call waits for the
+/// cache check only until its deadline less the reply margin; a check still
+/// running then counts as a miss, and its helper thread may run on.
 fn download_to_cache(
     url: &str,
     storage_dir: &Path,
@@ -403,6 +560,26 @@ fn download_to_cache(
     let deadline = FetchDeadline::for_current_call();
     let fetch_url = rewrite_url_for_fetch(&parsed);
     let approved = Arc::new(ApprovedHosts::default());
+    let hash = hash_url(url);
+    let meta_file = meta_path(storage_dir, &hash);
+
+    // With a failure remembered, the answer is already in memory, so the call
+    // must not wait on the cache check past its deadline; the check runs on
+    // a helper thread that may outlive the call. No directory is created:
+    // nothing will be written.
+    if let Some(remembered) = remembered_failure(failure_key) {
+        let check = CacheCheckInput {
+            storage_dir: storage_dir.to_path_buf(),
+            hash,
+            meta_file,
+            url: fetch_url.clone(),
+        };
+        let Some(cached) = bounded_cache_check(failure_key, check, cache_check_deadline())? else {
+            return Err(remembered);
+        };
+        validate_public_url(&fetch_url, &options, &deadline, &approved)?;
+        return Ok(cached);
+    }
 
     let dir = cache_dir(storage_dir);
     crate::private_storage::open_dir(storage_dir, &dir).map_err(|error| {
@@ -412,14 +589,7 @@ fn download_to_cache(
         ))
     })?;
 
-    let hash = hash_url(url);
-    let meta_file = meta_path(storage_dir, &hash);
     let cached = fresh_cached_path(storage_dir, &hash, &meta_file, &fetch_url)?;
-    if cached.is_none() {
-        if let Some(remembered) = remembered_failure(failure_key) {
-            return Err(remembered);
-        }
-    }
     // A cache hit is checked too: the request may refuse private addresses
     // that the call which filled the cache allowed.
     validate_public_url(&fetch_url, &options, &deadline, &approved)?;
@@ -746,6 +916,8 @@ fn fresh_cached_path(
     meta_file: &Path,
     url: &Url,
 ) -> Result<Option<PathBuf>, UrlFetchError> {
+    #[cfg(test)]
+    stall_cache_read_if_requested(storage_dir);
     if !meta_file.exists() {
         return Ok(None);
     }
