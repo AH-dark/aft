@@ -310,6 +310,7 @@ fn lane_paused_view_cursor_retains_completed_and_unattempted_chunks() {
                         reason: "maintenance".into(),
                         cause: Default::default(),
                         safe_to_retry_same_request: true,
+                        record_id: 0,
                     })
                     .to_string())
                 } else {
@@ -348,6 +349,7 @@ fn lane_pause_error() -> String {
         reason: "maintenance".into(),
         cause: Default::default(),
         safe_to_retry_same_request: true,
+        record_id: 0,
     })
     .to_string()
 }

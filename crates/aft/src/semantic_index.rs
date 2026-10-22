@@ -11127,6 +11127,7 @@ mod tests {
                                 reason: "maintenance".into(),
                                 cause: Default::default(),
                                 safe_to_retry_same_request: true,
+                                record_id: 0,
                             },
                         )
                         .to_string())
@@ -11308,6 +11309,7 @@ mod tests {
                     reason: "maintenance".into(),
                     cause: Default::default(),
                     safe_to_retry_same_request: true,
+                    record_id: 0,
                 };
                 Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(pause).to_string())
             });
@@ -11675,6 +11677,7 @@ mod tests {
                                             reason: "maintenance".into(),
                                             cause: Default::default(),
                                             safe_to_retry_same_request: true,
+                                            record_id: 0,
                                         },
                                     )
                                     .to_string(),
@@ -11749,6 +11752,7 @@ mod tests {
                         reason: "maintenance".into(),
                         cause: Default::default(),
                         safe_to_retry_same_request: true,
+                        record_id: 0,
                     },
                 )
                 .to_string())
@@ -11810,7 +11814,7 @@ mod tests {
                                         );
                                         Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(crate::synapse_embed::LanePause {
                                 lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true,
+                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
                             }).to_string())
                                     },
                                     100,

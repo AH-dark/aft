@@ -70,6 +70,11 @@ pub struct LanePause {
     /// [`LanePause::retry_same_request`].
     #[serde(default = "same_request_is_safe")]
     pub safe_to_retry_same_request: bool,
+    /// Which recorded pause this is: set when the client records the
+    /// refusal for its route root, and unique within the process, so a
+    /// worker's retry time reaches only the pause it waits on. 0 until then.
+    #[serde(default)]
+    pub record_id: u64,
 }
 
 fn same_request_is_safe() -> bool {
@@ -100,19 +105,27 @@ impl LanePause {
 /// `retry_at_ms`, so status shows when the wait really ends. A warm-up or
 /// other transient refusal may carry no hint (or a hint shorter than the
 /// worker's backoff); the daemon's own end time of an announced lane pause is
-/// left as it is.
+/// left as it is. Only the recorded pause the worker waits on is extended:
+/// another root's identical pause, or a newer refusal that replaced this one,
+/// keeps its own end time.
 pub(crate) fn note_pause_retry_at(pause: &LanePause, retry_at_ms: u64) {
-    if pause.cause == PauseCause::LanePaused {
+    if pause.cause == PauseCause::LanePaused || pause.record_id == 0 {
         return;
     }
     let mut pauses = lane_pauses()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for recorded in pauses.values_mut() {
-        if recorded == pause {
-            recorded.paused_until_ms = recorded.paused_until_ms.max(retry_at_ms);
-        }
+    if let Some(recorded) = pauses
+        .values_mut()
+        .find(|recorded| recorded.record_id == pause.record_id)
+    {
+        recorded.paused_until_ms = recorded.paused_until_ms.max(retry_at_ms);
     }
+}
+
+fn next_pause_record_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn lane_pauses() -> &'static Mutex<HashMap<PathBuf, LanePause>> {
@@ -317,6 +330,7 @@ pub(crate) mod pause_test_support {
                     reason: "scheduled maintenance".into(),
                     cause: Default::default(),
                     safe_to_retry_same_request: true,
+                    record_id: 0,
                 },
             );
     }
@@ -338,6 +352,7 @@ pub(crate) mod pause_test_support {
                     reason: "shape_compiling: compiling".into(),
                     cause: PauseCause::WarmingUp,
                     safe_to_retry_same_request: true,
+                    record_id: 0,
                 },
             );
     }
@@ -1063,10 +1078,11 @@ impl SynapseState {
                                     "{operation} response exceeded 512KiB page bound"
                                 )));
                             }
-                            let result =
+                            let mut result =
                                 decode_result_envelope_for_request(response, Some(&params));
-                            match &result {
+                            match &mut result {
                                 Err(SynapseEmbeddingError::LanePaused(pause)) => {
+                                    pause.record_id = next_pause_record_id();
                                     lane_pauses()
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1287,6 +1303,7 @@ fn decode_result_envelope_for_request(
                     safe_to_retry_same_request: error["safe_to_retry_same_request"]
                         .as_bool()
                         .unwrap_or(true),
+                    record_id: 0,
                 }))
             }
             "not_certified" => Err(SynapseEmbeddingError::ModelNotCertified(
@@ -1349,6 +1366,7 @@ fn transient_refusal(
         safe_to_retry_same_request: error["safe_to_retry_same_request"]
             .as_bool()
             .unwrap_or(true),
+        record_id: 0,
     }
 }
 

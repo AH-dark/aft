@@ -6927,6 +6927,7 @@ mod tests {
                 reason: "maintenance".into(),
                 cause: Default::default(),
                 safe_to_retry_same_request: true,
+                record_id: 0,
             },
         )
         .to_string();
