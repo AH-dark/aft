@@ -310,6 +310,13 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 
 Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` for local bash children from `../.cargo/alfonso-test-threads` (one decimal integer plus newline), defaulting to 4 when the file is missing, invalid, or above 256; valid values through 256 are preserved. Existing inherited or per-call values take precedence, and shell command prefixes still override them; head sessions and unscoped plugin worker flags receive no defaults, and exec-remote requests never carry these variables.
 
+**Command environment:**
+
+- **Where it comes from.** In standalone mode AFT runs as a child of the host, so a local command inherits the host's environment. Under the CortexKit daemon, a command inherits the AFT module's environment, not the host's. Sandboxed commands get a filtered environment.
+- **Setting a variable for one command.** Put it in the command text, for example `SUDO_ASKPASS=/path/to/helper sudo -A make install`. On OpenCode 1, AFT also calls the host's `shell.env` plugin hook for each bash call and adds the variables it returns. OpenCode 2 has no equivalent hook a plugin can call.
+- **What AFT changes.** Before launch, AFT removes the daemon's credentials. When the GitHub shim is enabled it puts its `gh` shim first on `PATH`, and when git co-author attribution is enabled it points Git at its managed hooks.
+- **Remote `runon` jobs.** The command text, including any `NAME=value` prefix, is sent unchanged. Forwarded variables are filtered by name, case-insensitively: names containing `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PRIVATE_KEY`, `API_KEY` or `CREDENTIAL`; names starting with `AWS_`, `GH_`, `AFT_`, `CORTEXKIT_`, `CORTEX_`, `CK_` or `SUBC_`; and `SSH_AUTH_SOCK`, `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` are never sent.
+
 **Timeout model:** `timeout` is a hard-kill cap, never a polling parameter, and starts after
 process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
 SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
