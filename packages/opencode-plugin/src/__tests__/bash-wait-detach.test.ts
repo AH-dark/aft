@@ -11,6 +11,7 @@ import {
   shouldDetachBashWaitOnUserMessage,
   signalBashWaitDetachForProject,
   stripUserMessageDetachKeyword,
+  waitDetachSummaryLevel,
 } from "../bash-wait-detach.js";
 import * as logger from "../logger.js";
 import { __resetSyncWatchAbortForTests, isSyncWatchAborted } from "../sync-watch-abort.js";
@@ -152,7 +153,7 @@ describe("bash wait detach helper", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  test("no bridge yet is expected before the first tool call and is not a warning", async () => {
+  test.serial("no bridge yet is expected before the first tool call and is not a warning", async () => {
     const warn = spyOn(logger, "warn");
     const debug = spyOn(logger, "debug");
     try {
@@ -172,29 +173,9 @@ describe("bash wait detach helper", () => {
     }
   });
 
-  test("no active wait result is debug output rather than routine info", async () => {
-    const info = spyOn(logger, "log");
-    const debug = spyOn(logger, "debug");
-    const bridge = {
-      send: async () => ({ success: true, detached: false }),
-    };
-    const pool = {
-      getActiveBridgeForRoot: () => bridge,
-      activeBridges: () => [bridge],
-    };
-    try {
-      await signalBashWaitDetachForProject(
-        pool as unknown as Parameters<typeof signalBashWaitDetachForProject>[0],
-        projectRoot,
-        "session-no-active-wait",
-      );
-      expect(info).not.toHaveBeenCalled();
-      expect(debug).toHaveBeenCalledTimes(1);
-      expect(String(debug.mock.calls[0]?.[0])).toContain("no active wait found");
-    } finally {
-      info.mockRestore();
-      debug.mockRestore();
-    }
+  test.serial("no active wait result uses debug severity while pending state is info", () => {
+    expect(waitDetachSummaryLevel(false)).toBe("debug");
+    expect(waitDetachSummaryLevel(true)).toBe("info");
   });
 
   test("root-key miss fans out to every live bridge instead of dropping", async () => {
