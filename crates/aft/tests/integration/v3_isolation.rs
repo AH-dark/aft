@@ -1,4 +1,4 @@
-//! G7: an already released build leaves v3 data alone.
+//! An already released build (v0.60.0) leaves v3 data alone.
 //!
 //! The v3 namespace (`<storage>/blobs/v3/<family>/`, including the member view
 //! directories at `views/<scope>/` below it) is invisible to v0.60.0. These
@@ -53,11 +53,22 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The two cases run one at a time, so neither one's close-out runs while
+/// the other's release process is alive.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn release_binary() -> PathBuf {
     let path = std::env::var_os("AFT_V0_60_0_BINARY")
         .map(PathBuf::from)
         .expect("set AFT_V0_60_0_BINARY to an aft binary built from tag v0.60.0");
-    let version = Command::new(&path).arg("--version").output().unwrap();
+    let version = Command::new(&path)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", path.display()));
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(
         version.contains("0.60.0"),
@@ -200,8 +211,20 @@ impl Release {
         }
     }
 
-    fn configure(&mut self, project: &Path, storage: &Path, embedder: &Embedder) -> Value {
+    /// `second` flips `format_on_edit`, a setting that selects no artifact.
+    /// The release answers a configure whose effective configuration equals
+    /// the bound one without queuing configure maintenance, and only that
+    /// maintenance schedules retention (`commands/configure.rs:3406-3505` and
+    /// `7124-7144` at the tag).
+    fn configure(
+        &mut self,
+        project: &Path,
+        storage: &Path,
+        embedder: &Embedder,
+        second: bool,
+    ) -> Value {
         let doc = json!({
+            "format_on_edit": second,
             "views": { "enabled": true },
             "indexes": { "trigram": true, "semantic": true, "callgraph": true },
             "semantic": {
@@ -381,7 +404,32 @@ fn wait_for_runtime(release: &mut Release, fixture: &Fixture) -> String {
     }
 }
 
+/// The plane stores in `directory`: SQLite files with a `blob_payloads`
+/// table. A v1 family directory also holds other stores, such as the OID
+/// alias store.
 fn sqlite_stores(directory: &Path) -> Vec<PathBuf> {
+    plane_candidates(directory)
+        .into_iter()
+        .filter(|path| {
+            let connection = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            connection.busy_timeout(Duration::from_secs(30)).unwrap();
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blob_payloads'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        })
+        .collect()
+}
+
+fn plane_candidates(directory: &Path) -> Vec<PathBuf> {
     let mut stores = std::fs::read_dir(directory)
         .map(|entries| {
             entries
@@ -434,7 +482,9 @@ fn seed_collectable(storage: &Path, family: &str) -> Vec<PathBuf> {
             )
             .unwrap();
     }
-    v1.into_iter().chain(v2).collect()
+    let seeded = v1.into_iter().chain(v2).collect::<Vec<_>>();
+    eprintln!("seeded collectable rows into {seeded:?}");
+    seeded
 }
 
 fn seeded_row_present(path: &Path) -> bool {
@@ -626,15 +676,19 @@ fn prune_legacy(binary: &Path, fixture: &Fixture) -> Vec<String> {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
-        // `--yes` may be refused (exit 3) when the machine-wide process census
-        // sees another AFT process, such as a parallel test; the walk and its
-        // listing happen before that census either way.
+        // The census is machine-wide, so an AFT process this test does not
+        // own (another job on a shared runner) can make either mode refuse
+        // (exit 3). The inventory walk and its listing come before that
+        // census either way, and this test runs no release process here.
         let code = output.status.code();
         assert!(
-            code == Some(0) || (yes && code == Some(3)),
+            code == Some(0) || code == Some(3),
             "prune-legacy failed: {output:?}"
         );
-        assert!(!stdout.trim().is_empty(), "prune-legacy listed nothing");
+        assert!(
+            stdout.contains("Legacy sets under"),
+            "prune-legacy listed nothing: {stdout}"
+        );
         printed.push(stdout);
     }
     printed
@@ -690,7 +744,7 @@ fn storage_retention(status: &Value) -> Option<&Value> {
 
 /// After the second configure: polls `status` until the release reports a
 /// retention pass that started after it, and checks that pass.
-fn retention_witness(release: &mut Release, second_configure_ms: u64) -> Value {
+fn retention_witness(release: &mut Release, log: &Path, second_configure_ms: u64) -> Value {
     let deadline = Instant::now() + SLACK;
     loop {
         let status = release.status();
@@ -708,10 +762,20 @@ fn retention_witness(release: &mut Release, second_configure_ms: u64) -> Value {
                 return report.clone();
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "no retention pass after the second configure within {SLACK:?}: {status:#}"
-        );
+        if Instant::now() >= deadline {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let lines = text
+                .lines()
+                .filter(|line| line.contains("retention") || line.contains("configure"))
+                .collect::<Vec<_>>();
+            panic!(
+                "no retention pass after the second configure within {SLACK:?}: \
+                 storage_retention={} storage_dir={}\nlog:\n{}",
+                status["storage_retention"],
+                status["storage_dir"],
+                lines[lines.len().saturating_sub(60)..].join("\n")
+            );
+        }
         thread::sleep(Duration::from_secs(2));
     }
 }
@@ -742,12 +806,13 @@ fn close_out(
 #[test]
 #[ignore = "runs v0.60.0 for over seven minutes; set AFT_V0_60_0_BINARY"]
 fn g7_freshly_started_release_leaves_v3_data_alone() {
+    let _serial = serial();
     let binary = release_binary();
     let fixture = Fixture::new();
     let embedder = Embedder::start();
     // A first run creates the checkout's v1 and v2 stores to seed into.
     let mut bootstrap = Release::spawn(&binary, &fixture.home, "bootstrap");
-    bootstrap.configure(&fixture.project, &fixture.storage, &embedder);
+    bootstrap.configure(&fixture.project, &fixture.storage, &embedder, false);
     let family = wait_for_runtime(&mut bootstrap, &fixture);
     bootstrap.stop();
 
@@ -757,11 +822,12 @@ fn g7_freshly_started_release_leaves_v3_data_alone() {
     let before = v3_digest(&fixture.storage);
 
     let mut release = Release::spawn(&binary, &fixture.home, "fresh");
-    release.configure(&fixture.project, &fixture.storage, &embedder);
+    release.configure(&fixture.project, &fixture.storage, &embedder, false);
     release.idle(STARTUP_GRACE + PASS_BUDGET + SLACK);
     let second = now_ms();
-    release.configure(&fixture.project, &fixture.storage, &embedder);
-    let report = retention_witness(&mut release, second);
+    release.configure(&fixture.project, &fixture.storage, &embedder, true);
+    let log = fixture.log(release.pid());
+    let report = retention_witness(&mut release, &log, second);
     eprintln!("retention witness: {report}");
     let lines = enforcement_lines(&fixture.log(release.pid()), &family);
     let line = lines
@@ -778,12 +844,13 @@ fn g7_freshly_started_release_leaves_v3_data_alone() {
 #[test]
 #[ignore = "runs v0.60.0 for over thirteen minutes; set AFT_V0_60_0_BINARY"]
 fn g7_already_running_release_leaves_v3_data_alone() {
+    let _serial = serial();
     let binary = release_binary();
     let fixture = Fixture::new();
     let embedder = Embedder::start();
     let mut release = Release::spawn(&binary, &fixture.home, "running");
     let first = Instant::now();
-    release.configure(&fixture.project, &fixture.storage, &embedder);
+    release.configure(&fixture.project, &fixture.storage, &embedder, false);
     let family = wait_for_runtime(&mut release, &fixture);
 
     seed_v3(&fixture, &family);
@@ -795,8 +862,9 @@ fn g7_already_running_release_leaves_v3_data_alone() {
         (ENFORCEMENT_INTERVAL + ENFORCEMENT_DEADLINE + SLACK).saturating_sub(first.elapsed()),
     );
     let second = now_ms();
-    release.configure(&fixture.project, &fixture.storage, &embedder);
-    let report = retention_witness(&mut release, second);
+    release.configure(&fixture.project, &fixture.storage, &embedder, true);
+    let log = fixture.log(release.pid());
+    let report = retention_witness(&mut release, &log, second);
     eprintln!("retention witness: {report}");
     let lines = enforcement_lines(&fixture.log(release.pid()), &family);
     let line = lines

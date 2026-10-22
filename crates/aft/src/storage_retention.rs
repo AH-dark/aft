@@ -7757,6 +7757,9 @@ mod v3_collector_tests {
         });
         assert_eq!(state, crate::views::registry::STATE_EVICTING);
         assert!(view_dir(&storage, "crash").join("data.bin").exists());
+        // Once `evicting` is committed the eviction is finished regardless:
+        // a root that reappears now does not bring the member back.
+        fs::create_dir_all(&root).unwrap();
         let finished = pass(&storage);
         assert_eq!(finished.removed_roots, 1, "{finished:?}");
         assert!(member_scopes(&storage).is_empty());

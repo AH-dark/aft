@@ -373,7 +373,7 @@ Result: passing. Tests in `blob_store::v3::replay_tests` (unix only):
 the red control `red_control_without_the_closure_flush_a_power_cut_tears_the_copy`
 (without `ClosureFlushed`, a replay shows `committed` with a missing row).
 
-## Release isolation (G7)
+## Release isolation
 
 `crates/aft/tests/integration/v3_isolation.rs` runs the binary built from tag
 v0.60.0 (commit `988f4f3e52b9`) over a storage root holding a v3 tree
@@ -381,7 +381,10 @@ v0.60.0 (commit `988f4f3e52b9`) over a storage root holding a v3 tree
 `views/<scope>/` with `pins/`, `readers/` and a pointer database) next to a
 v1 and a v2 store holding collectable rows. Both the freshly started and the
 already-running case wait for a retention pass and an enforcement pass after
-the seed, then run `aft cache prune-legacy` dry and with `--yes`. The digest
+the seed, then run `aft cache prune-legacy` dry and with `--yes`. The second
+configure of each case flips `format_on_edit`: v0.60.0 queues the configure
+maintenance that schedules retention only when the effective configuration
+changed, and answers an equivalent configure without it. The digest
 of bytes and `st_mode` over `blobs/v3/` must be unchanged, and no v3 member
 may appear in a v2 registry. The tests are `#[ignore]`d (they take seven and
 thirteen minutes) and need `AFT_V0_60_0_BINARY`.
