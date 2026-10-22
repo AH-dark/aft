@@ -2070,93 +2070,104 @@ impl FileParser {
         &mut self,
         path: &Path,
     ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
-        let canon = path.to_path_buf();
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| AftError::FileNotFound {
-                path: format!("{}: {}", path.display(), e),
-            })?;
+        {
+            let canon = path.to_path_buf();
+            let current_mtime = crate::bounded_io::metadata(path)
+                .and_then(|m| m.modified())
+                .map_err(|e| AftError::FileNotFound {
+                    path: format!("{}: {}", path.display(), e),
+                })?;
 
-        // Snapshot the entry before checking the file: hashing a touched file must
-        // not block cache writers. Refresh metadata only if the entry is unchanged.
-        let cached = self
-            .symbol_cache
-            .read()
-            .map_err(|_| AftError::ParseError {
-                message: "symbol cache lock poisoned".to_string(),
-            })?
-            .entries
-            .get(&canon)
-            .cloned();
-        if let Some(cached) = cached {
-            if cached_file_is_fresh(
-                path,
-                cached.mtime,
-                cached.size,
-                cached.content_hash,
-                current_mtime,
-            ) {
-                if cached.mtime != current_mtime {
-                    #[cfg(test)]
-                    CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
-                        if let Some((arrived, released)) = slot.borrow_mut().take() {
-                            arrived.wait();
-                            released.wait();
-                        }
-                    });
-                    let mut cache =
-                        self.symbol_cache
-                            .write()
-                            .map_err(|_| AftError::ParseError {
-                                message: "symbol cache lock poisoned".to_string(),
-                            })?;
-                    if let Some(entry) = cache.entries.get_mut(&canon) {
-                        if entry.mtime == cached.mtime
-                            && entry.size == cached.size
-                            && entry.content_hash == cached.content_hash
-                        {
-                            entry.mtime = current_mtime;
+            // Snapshot the entry before checking the file: hashing a touched file must
+            // not block cache writers. Refresh metadata only if the entry is unchanged.
+            let cached = self
+                .symbol_cache
+                .read()
+                .map_err(|_| AftError::ParseError {
+                    message: "symbol cache lock poisoned".to_string(),
+                })?
+                .entries
+                .get(&canon)
+                .cloned();
+            if let Some(cached) = cached {
+                if cached_file_is_fresh(
+                    path,
+                    cached.mtime,
+                    cached.size,
+                    cached.content_hash,
+                    current_mtime,
+                ) {
+                    if cached.mtime != current_mtime {
+                        #[cfg(test)]
+                        CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
+                            if let Some((arrived, released)) = slot.borrow_mut().take() {
+                                arrived.wait();
+                                released.wait();
+                            }
+                        });
+                        let mut cache =
+                            self.symbol_cache
+                                .write()
+                                .map_err(|_| AftError::ParseError {
+                                    message: "symbol cache lock poisoned".to_string(),
+                                })?;
+                        if let Some(entry) = cache.entries.get_mut(&canon) {
+                            if entry.mtime == cached.mtime
+                                && entry.size == cached.size
+                                && entry.content_hash == cached.content_hash
+                            {
+                                entry.mtime = current_mtime;
+                            } else {
+                                // A concurrent writer replaced the snapshot while we hashed.
+                                // Retry rather than returning superseded symbols.
+                                drop(cache);
+                                return self.extract_symbols_shared_inner(path);
+                            }
                         } else {
-                            // A concurrent writer replaced the snapshot while we hashed.
-                            // Retry rather than returning superseded symbols.
                             drop(cache);
                             return self.extract_symbols_shared_inner(path);
                         }
-                    } else {
-                        drop(cache);
-                        return self.extract_symbols_shared_inner(path);
                     }
+                    return Ok((cached.symbols, false, true));
                 }
-                return Ok((cached.symbols, false, true));
             }
-        }
 
-        let source = read_source(path).map_err(|e| AftError::FileNotFound {
-            path: format!("{}: {}", path.display(), e),
-        })?;
-        let size = source.len() as u64;
-        let content_hash = content_hash_for_source(&source);
-
-        let (symbols, modules) = {
-            // Reuse the source we just read instead of letting parse() read the
-            // same file a second time.
-            let (tree, lang) =
-                self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
-            (
-                Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
-                (lang == LangId::Rust).then(|| Arc::new(rust_modules(tree.root_node(), &source))),
-            )
-        };
-
-        let mut symbol_cache = self
-            .symbol_cache
-            .write()
-            .map_err(|_| AftError::ParseError {
-                message: "symbol cache lock poisoned".to_string(),
+            let source = read_source(path).map_err(|e| AftError::FileNotFound {
+                path: format!("{}: {}", path.display(), e),
             })?;
-        let cache_changed = if let Some(generation) = self.symbol_cache_generation {
-            symbol_cache.generation == generation
-                && symbol_cache.insert_shared(
+            let size = source.len() as u64;
+            let content_hash = content_hash_for_source(&source);
+
+            let (symbols, modules) = {
+                // Reuse the source we just read instead of letting parse() read the
+                // same file a second time.
+                let (tree, lang) =
+                    self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
+                (
+                    Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
+                    (lang == LangId::Rust)
+                        .then(|| Arc::new(rust_modules(tree.root_node(), &source))),
+                )
+            };
+
+            let mut symbol_cache = self
+                .symbol_cache
+                .write()
+                .map_err(|_| AftError::ParseError {
+                    message: "symbol cache lock poisoned".to_string(),
+                })?;
+            let cache_changed = if let Some(generation) = self.symbol_cache_generation {
+                symbol_cache.generation == generation
+                    && symbol_cache.insert_shared(
+                        canon,
+                        current_mtime,
+                        size,
+                        content_hash,
+                        Arc::clone(&symbols),
+                        modules,
+                    )
+            } else {
+                symbol_cache.insert_shared(
                     canon,
                     current_mtime,
                     size,
@@ -2164,18 +2175,10 @@ impl FileParser {
                     Arc::clone(&symbols),
                     modules,
                 )
-        } else {
-            symbol_cache.insert_shared(
-                canon,
-                current_mtime,
-                size,
-                content_hash,
-                Arc::clone(&symbols),
-                modules,
-            )
-        };
+            };
 
-        Ok((symbols, cache_changed, false))
+            Ok((symbols, cache_changed, false))
+        }
     }
 
     /// Drop one local parse tree while preserving its shared extracted symbols.
