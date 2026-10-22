@@ -658,6 +658,9 @@ if args[:1] == ['api']:
     if '/commits/' in endpoint and ('/check-runs?' in endpoint or '/status?' in endpoint):
         print('')
         sys.exit(0)
+    if '/actions/runs/' in endpoint and endpoint.endswith('/jobs?per_page=100'):
+        print(json.dumps([{'total_count': 0, 'jobs': []}]))
+        sys.exit(0)
     sys.exit('unexpected fake API query: ' + repr(args))
 if args[:2] == ['run', 'rerun']:
     (state / 'reruns').write_text('unexpected rerun\n')
@@ -1390,7 +1393,7 @@ test_queued_job_waits_while_another_job_runs() {
   add_train_commit "$dir/work" queued-running
   echo in_progress > "$dir/ci-state/watch_status"
   echo 2 > "$dir/ci-state/watch_complete_after"
-  created_at="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+  created_at="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
   python3 - "$dir/ci-state/jobs_api_response.json" "$created_at" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -1407,9 +1410,9 @@ PY
   watch_polls="$(cat "$dir/ci-state/watch_poll_count" 2>/dev/null || echo 0)"
   if [ "$LAST_RC" = 0 ] && [ "$jobs_api_polls" -ge 1 ] && [ "$watch_polls" -ge 2 ] &&
     [[ "$LAST_OUT" != *"no runner serves that label"* ]]; then
-    ok "a queued job under the bound waits while another job is running"
+    ok "an over-limit queued job waits while another job is running"
   else
-    fail "a queued job under the bound waits while another job is running"
+    fail "an over-limit queued job waits while another job is running"
   fi
 }
 

@@ -31,6 +31,10 @@ set -u
 STATE="${WATCH_CI_TEST_STATE:?}"
 if [ "${1:-}" = "api" ]; then
   printf '%s\n' "$*" >> "$STATE/api-calls"
+  if [ "${WATCH_CI_TEST_API_ALWAYS_ERROR:-0}" = 1 ]; then
+    echo 'injected jobs API unavailable' >&2
+    exit 1
+  fi
   printf '[{"total_count":0,"jobs":[]}]\n'
   exit 0
 fi
@@ -84,7 +88,7 @@ ok() { checks=$((checks + 1)); printf 'watch-ci.test.sh: ok — %s\n' "$1"; }
 fail() { printf 'watch-ci.test.sh: FAIL — %s\n' "$1" >&2; failures=$((failures + 1)); }
 
 reset_case() {
-  rm -f "$STATE/calls" "$STATE/sleeps" "$STATE/responses"/* "$TMP_ROOT/output"
+  rm -f "$STATE/calls" "$STATE/api-calls" "$STATE/sleeps" "$STATE/responses"/* "$TMP_ROOT/output"
 }
 
 response() {
@@ -136,12 +140,12 @@ make_numeric_short_sha() {
 }
 
 run_watch_repeated_gh_error() {
-  local poll_sleep="${1:-0.01}" max_sleep="${2:-0.04}"
+  local poll_sleep="${1:-0.01}" max_sleep="${2:-0.04}" error_scope="${3:-run-view}"
   set +e
-  python3 - "$WATCH_CI" "$REPO" "$BIN" "$STATE" "$REAL_JQ" "$REAL_SLEEP" "$TMP_ROOT/output" "$poll_sleep" "$max_sleep" <<'PY'
+  python3 - "$WATCH_CI" "$REPO" "$BIN" "$STATE" "$REAL_JQ" "$REAL_SLEEP" "$TMP_ROOT/output" "$poll_sleep" "$max_sleep" "$error_scope" <<'PY'
 import os, signal, subprocess, sys
 
-script, repo, bin_dir, state, real_jq, real_sleep, output, poll_sleep, max_sleep = sys.argv[1:]
+script, repo, bin_dir, state, real_jq, real_sleep, output, poll_sleep, max_sleep, error_scope = sys.argv[1:]
 env = os.environ.copy()
 env.pop("WATCH_CI_WORKFLOW", None)
 env.update({
@@ -149,7 +153,8 @@ env.update({
     "WATCH_CI_TEST_STATE": state,
     "WATCH_CI_TEST_REAL_JQ": real_jq,
     "WATCH_CI_TEST_FAIL_JQ": "",
-    "WATCH_CI_TEST_ALWAYS_ERROR": "1",
+    "WATCH_CI_TEST_ALWAYS_ERROR": "1" if error_scope == "run-view" else "0",
+    "WATCH_CI_TEST_API_ALWAYS_ERROR": "1" if error_scope == "jobs-api" else "0",
     "WATCH_CI_TEST_REAL_SLEEP": "1",
     "WATCH_CI_TEST_REAL_SLEEP_BIN": real_sleep,
     "OPERATOR_GH_FALLBACK_PATHS": os.path.join(bin_dir, "gh"),
@@ -292,6 +297,23 @@ if [ "$WATCH_RC" -eq 5 ] && [ "$calls" -eq 4 ] && [ "$delays" = '0.010 0.020 0.0
   ok 'repeated gh errors back off, stop after four attempts, and report the last error'
 else
   fail "repeated gh errors are bounded with the last error (rc=$WATCH_RC calls=$calls delays=$delays)"
+fi
+
+# A successful run-view call must not reset failures from the separate jobs API.
+reset_case
+for attempt in 1 2 3 4; do
+  response "$attempt" '{"status":"in_progress","conclusion":null,"jobs":[],"url":""}'
+done
+run_watch_repeated_gh_error 0.01 0.04 jobs-api
+calls="$(wc -l < "$STATE/calls" | tr -d ' ')"
+api_calls="$(wc -l < "$STATE/api-calls" | tr -d ' ')"
+if [ "$WATCH_RC" -eq 5 ] && [ "$calls" -eq 4 ] && [ "$api_calls" -eq 4 ] &&
+  grep -Fq 'jobs API query for run 42424242424 failed after 4 attempts' "$TMP_ROOT/output" &&
+  grep -Fq 'injected jobs API unavailable' "$TMP_ROOT/output" &&
+  grep -Fq 'repos/example/repo/actions/runs/42424242424/jobs' "$STATE/api-calls"; then
+  ok 'persistent jobs API failures stop with the run and endpoint named'
+else
+  fail "persistent jobs API failures are bounded and named (rc=$WATCH_RC run calls=$calls jobs calls=$api_calls)"
 fi
 
 # Successful CLI calls can still return unusable text. Those replies must also
