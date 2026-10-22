@@ -138,8 +138,8 @@ fn lane_pauses() -> &'static Mutex<HashMap<PathBuf, LanePause>> {
 /// (it does so for `deadline_exceeded`). Such a page must not be resent
 /// unchanged, so the retry splits the same texts into pages half as large,
 /// which also gives each page its own `request_key`. A one-row page cannot be
-/// split further, so it is sent again with the same payload and `request_key`:
-/// there is no smaller request to send instead. Each fully embedded batch doubles
+/// split further; it is sent again under a fresh `request_key` instead (see
+/// [`refused_request_keys`]). Each fully embedded batch doubles
 /// the limit back toward the model's recommended rows. It lives outside the
 /// client because a background build opens a new client for every retry.
 fn page_row_caps() -> &'static Mutex<HashMap<(PathBuf, String), usize>> {
@@ -177,6 +177,48 @@ fn grow_page_rows(root: &Path, model: &str, recommended: usize) {
     if *cap >= recommended {
         caps.remove(&key);
     }
+}
+
+/// One-row `embed.batch` pages Synapse refused with
+/// `safe_to_retry_same_request: false`, by their stable request key, with how
+/// often each was refused. Synapse's wire contract makes a request the "same"
+/// one by its `request_key` and the digest bound to that key (operation,
+/// model, constraints, ordered item ids and content hashes); a new key with
+/// the same items is admitted as a new job. A row cannot be split the way a
+/// larger refused page is, so its next send uses a fresh key derived from the
+/// stable one and the refusal count instead: the same row, never the same
+/// request. A successful send forgets the entry, so later sends of that row
+/// use its stable key again.
+fn refused_request_keys() -> &'static Mutex<HashMap<String, u64>> {
+    static KEYS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    KEYS.get_or_init(Mutex::default)
+}
+
+fn request_key_to_send(stable_key: &str) -> String {
+    let refusals = refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(stable_key)
+        .copied();
+    match refusals {
+        Some(refusals) => hex_sha256(format!("{stable_key}:resend:{refusals}").as_bytes()),
+        None => stable_key.to_owned(),
+    }
+}
+
+fn note_refused_request_key(stable_key: &str) {
+    *refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(stable_key.to_owned())
+        .or_default() += 1;
+}
+
+fn forget_refused_request_key(stable_key: &str) {
+    refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(stable_key);
 }
 
 pub(crate) fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
@@ -876,7 +918,25 @@ impl SynapseEmbeddingClient {
         &mut self,
         items: &[BatchItem],
     ) -> Result<HashMap<String, Vec<f32>>, SynapseEmbeddingError> {
-        let request_key = batch_request_key(&self.state.model, &self.metadata.identity, items);
+        let stable_key = batch_request_key(&self.state.model, &self.metadata.identity, items);
+        let result = self.embed_batch_page_as(items, request_key_to_send(&stable_key));
+        match &result {
+            Ok(_) => forget_refused_request_key(&stable_key),
+            Err(SynapseEmbeddingError::LanePaused(pause))
+                if !pause.retry_same_request() && items.len() == 1 =>
+            {
+                note_refused_request_key(&stable_key);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    fn embed_batch_page_as(
+        &mut self,
+        items: &[BatchItem],
+        request_key: String,
+    ) -> Result<HashMap<String, Vec<f32>>, SynapseEmbeddingError> {
         let wire_items = items
             .iter()
             .map(|item| {
@@ -2028,6 +2088,60 @@ mod tests {
                 assert!(lane_pause_for_root(root).is_none());
                 assert_eq!(requests.lock().unwrap().len(), 3);
             });
+        });
+    }
+
+    #[test]
+    fn unsafe_refusal_of_one_row_resends_it_as_a_new_request() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            let refusal = json!({"result": {"error": {
+                "class": "transient", "code": "deadline_exceeded", "message": "deadline",
+                "retry_after_ms": 100, "safe_to_retry_same_request": false,
+            }}});
+            with_fake_synapse_refusing(
+                clock.clone(),
+                START + 100,
+                move |_| refusal.clone(),
+                |config, requests| {
+                    // A text no other test embeds, so its stable key is ours.
+                    let texts = vec!["one row refused with an unsafe deadline".to_string()];
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert!(matches!(
+                        client.embed_batch(&texts),
+                        Err(SynapseEmbeddingError::LanePaused(_))
+                    ));
+                    clock.store(START + 100, Ordering::SeqCst);
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert_eq!(client.embed_batch(&texts).unwrap().len(), 1);
+                    assert_eq!(client.embed_batch(&texts).unwrap().len(), 1);
+                    let sent = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == BATCH_OPERATION)
+                        .map(|(_, request)| {
+                            (
+                                request["params"]["request_key"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                                request["params"]["items"].clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(sent.len(), 3);
+                    assert!(sent.iter().all(|(_, items)| *items == sent[0].1));
+                    assert_ne!(
+                        sent[1].0, sent[0].0,
+                        "the refused row was resent as the same request"
+                    );
+                    assert_eq!(
+                        sent[2].0, sent[0].0,
+                        "after it succeeded the row did not return to its stable key"
+                    );
+                },
+            );
         });
     }
 
