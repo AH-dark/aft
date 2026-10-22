@@ -8895,6 +8895,8 @@ fn spawn_configure_storage_sweeps(
     // finishes. The worker owns only immutable sweep inputs, never the actor
     // gate or lifecycle admission; the view snapshot keeps its query pin live.
     let storage_root = job.storage_root.clone();
+    let sweep_paths =
+        crate::root_cache::StoragePaths::new(job.storage_root.clone(), job.artifact_root.clone());
     let root = job.canonical_cache_root.clone();
     let harness = job.harness.clone();
     let session = Some(job.session_id.clone());
@@ -8908,7 +8910,7 @@ fn spawn_configure_storage_sweeps(
                 ConfigureMaintenanceStage::StorageSweeps,
             );
             delay_configure_storage_sweeps_for_debug();
-            run_configure_storage_sweeps(&storage_root, harness);
+            run_configure_storage_sweeps(&sweep_paths, harness);
             if let Some(view) = view {
                 run_configure_view_sweep(&view, &storage_root);
             }
@@ -8937,11 +8939,24 @@ fn spawn_configure_storage_sweeps(
     }
 }
 
-fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
-    match crate::url_fetch::cleanup_url_cache(storage_root) {
-        Ok(0) => {}
-        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
-        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+/// `paths.artifacts` is where rebuildable caches live (the `storage.cache_dir`
+/// volume when one is configured); `paths.durable` holds locks, ownership
+/// records and migration state. Each sweep runs where its data is written.
+fn run_configure_storage_sweeps(paths: &crate::root_cache::StoragePaths, harness: Harness) {
+    let storage_root = paths.durable.as_path();
+    // URL downloads are written under the cache root (`AppContext::cache_dir`).
+    // Downloads made before `storage.cache_dir` was set stay under the durable
+    // root, so that copy is swept too until it is empty.
+    let mut url_roots = vec![paths.artifacts.as_path()];
+    if paths.durable != paths.artifacts {
+        url_roots.push(storage_root);
+    }
+    for url_root in url_roots {
+        match crate::url_fetch::cleanup_url_cache(url_root) {
+            Ok(0) => {}
+            Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+            Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+        }
     }
     match crate::fs_lock::sweep_stale_reclaim_tokens(storage_root) {
         Ok(None | Some(0)) => {}
@@ -24057,6 +24072,63 @@ mod tests {
 mod inspect_orphan_sweep_tests {
     use super::*;
 
+    /// Write a URL download fetched at `fetched_at_ms` under `storage`, the
+    /// way `url_fetch` lays it out, and return its content and metadata paths.
+    fn url_download(storage: &Path, url: &str, fetched_at_ms: u64) -> (PathBuf, PathBuf) {
+        let content = crate::url_fetch::cache_content_path_for_url(storage, url, ".md");
+        let meta = crate::url_fetch::cache_meta_path_for_url(storage, url);
+        fs::create_dir_all(content.parent().unwrap()).unwrap();
+        fs::write(&content, "body").unwrap();
+        let meta_json = serde_json::json!({
+            "url": url,
+            "contentType": "text/markdown",
+            "extension": ".md",
+            "fetchedAt": fetched_at_ms,
+        });
+        fs::write(&meta, serde_json::to_vec(&meta_json).unwrap()).unwrap();
+        (content, meta)
+    }
+
+    /// With `storage.cache_dir` set, URL downloads are written under the cache
+    /// root, so the configure sweep must expire them there; sweeping only the
+    /// durable root would let them pile up on the cache volume forever.
+    #[test]
+    fn configure_storage_sweep_expires_url_downloads_on_the_cache_root() {
+        let durable = tempfile::tempdir().expect("durable storage");
+        let cache = tempfile::tempdir().expect("cache root");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (expired, expired_meta) = url_download(cache.path(), "https://example.com/old.md", 0);
+        let (fresh, fresh_meta) = url_download(cache.path(), "https://example.com/new.md", now_ms);
+        // A download made before `storage.cache_dir` was set.
+        let (legacy, legacy_meta) =
+            url_download(durable.path(), "https://example.com/legacy.md", 0);
+
+        run_configure_storage_sweeps(
+            &crate::root_cache::StoragePaths::new(
+                durable.path().to_path_buf(),
+                cache.path().to_path_buf(),
+            ),
+            Harness::Opencode,
+        );
+
+        assert!(!expired.exists(), "expired download kept on the cache root");
+        assert!(
+            !expired_meta.exists(),
+            "expired metadata kept on the cache root"
+        );
+        assert!(
+            fresh.exists() && fresh_meta.exists(),
+            "fresh download removed"
+        );
+        assert!(
+            !legacy.exists() && !legacy_meta.exists(),
+            "expired download from before cache_dir kept on durable storage"
+        );
+    }
+
     #[test]
     fn configure_scheduled_storage_sweep_reaps_dead_inspect_scope_after_grace() {
         let storage = tempfile::tempdir().expect("storage");
@@ -24073,7 +24145,10 @@ mod inspect_orphan_sweep_tests {
         )
         .expect("age cache fixture");
 
-        run_configure_storage_sweeps(storage.path(), Harness::Opencode);
+        run_configure_storage_sweeps(
+            &crate::root_cache::StoragePaths::same(storage.path()),
+            Harness::Opencode,
+        );
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
