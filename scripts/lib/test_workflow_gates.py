@@ -389,6 +389,71 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("AFT_GATE_PHASES: conformance", conformance)
         self.assertIn("bun run test:unit", conformance)
 
+    def test_bash_timeout_contract_reuses_the_macos_conformance_build(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        watcher_steps = suite["jobs"]["unit-macos-watcher"]["steps"]
+        self.assertFalse(any(
+            step.get("name") == "Bash reply timeout contract (test-timing-hooks)"
+            for step in watcher_steps
+        ))
+
+        conformance_steps = suite["jobs"]["unit-macos-conformance"]["steps"]
+        gate_index = next(
+            index for index, step in enumerate(conformance_steps)
+            if step.get("run") == "./scripts/rust-test-gate.sh"
+            and step.get("env", {}).get("AFT_GATE_PHASES") == "conformance"
+        )
+        timeout_index = next(
+            index for index, step in enumerate(conformance_steps)
+            if step.get("name") == "Bash reply timeout contract (test-timing-hooks)"
+        )
+        self.assertLess(gate_index, timeout_index)
+        timeout_step = conformance_steps[timeout_index]["run"]
+        self.assertIn("--features test-timing-hooks --test integration", timeout_step)
+        self.assertIn(
+            'test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"',
+            timeout_step,
+        )
+        self.assertIn('"$test_name" -- --list', timeout_step)
+        self.assertIn('"$test_name" -- --exact', timeout_step)
+        self.assertIn("expected test missing from integration inventory", timeout_step)
+        self.assertIn(
+            "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
+            GATE_TEXT,
+        )
+
+    def test_bash_timeout_inventory_guard_rejects_a_renamed_test(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        steps = suite["jobs"]["unit-macos-conformance"]["steps"]
+        timeout_step = next(
+            step for step in steps
+            if step.get("name") == "Bash reply timeout contract (test-timing-hooks)"
+        )
+        guard = re.search(
+            r'(?ms)^[ \t]*if \[\[ "\$listing" != \*"\$test_name: test"\* \]\]; then\n.*?^[ \t]*fi[ \t]*$',
+            timeout_step["run"],
+        )
+        assert guard is not None, "the integration inventory must reject a missing expected test"
+        test_name = "bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
+
+        for listing, expected_status in (
+            (f"{test_name}: test", 0),
+            ("bash_reply_timing_contract_test::renamed_timeout_test: test", 1),
+        ):
+            script = (
+                "set -euo pipefail\n"
+                f'test_name="{test_name}"\n'
+                f'listing="{listing}"\n'
+                f"{guard.group(0)}\n"
+            )
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+            with self.subTest(listing=listing):
+                self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+                if expected_status:
+                    self.assertIn("expected test missing from integration inventory", result.stderr)
+
     def test_macos_libtest_archives_are_prewarmed_before_keychain_test(self) -> None:
         prewarm_start = GATE_TEXT.index("if phase_enabled lib-shard")
         prewarm = GATE_TEXT.index("extract nextest archive for macOS libtest prewarming")
