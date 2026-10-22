@@ -696,38 +696,40 @@ fn copy_response(response: &Response) -> Response {
     }
 }
 
-/// The launch reply once the remote dispatch worker has settled (the runner's
-/// `Accepted` arrived, or the worker finished without it), and the same
-/// decision when the capture wait ends before seeing it settle. `None` keeps
-/// the caller's normal reply: inputs were captured, the runner has not refused
-/// the job, and the task is live or about to report through its usual wait.
+/// Chooses a launch reply from state observed after dispatch returns. An accepted
+/// background task gets a fresh task-handle response instead of reusing an older
+/// `starting` response; foreground calls keep their normal wait path.
 fn settled_runon_launch_reply(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
     session: &str,
     response: &Response,
+    background_runon: bool,
 ) -> Option<Response> {
     if registry.runon_inputs_captured(task_id, session) == Some(true) {
-        // A refusal after Accepted still answers the launch with its error.
-        let snapshot = registry
+        if let Some(snapshot) = registry
             .observed_status(
                 task_id,
                 session,
                 crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
             )
-            .filter(|snapshot| snapshot.remote_refusal.is_some())?;
-        let now = Instant::now();
-        return match crate::commands::bash_orchestrate::decide_bash_step(
-            snapshot,
-            now,
-            false,
-            false,
-            now,
-            &response.id,
-        ) {
-            crate::commands::bash_orchestrate::BashStep::Done(reply) => Some(reply),
-            _ => None,
-        };
+            .filter(|snapshot| snapshot.remote_refusal.is_some())
+        {
+            let now = Instant::now();
+            return match crate::commands::bash_orchestrate::decide_bash_step(
+                snapshot,
+                now,
+                false,
+                false,
+                now,
+                &response.id,
+            ) {
+                crate::commands::bash_orchestrate::BashStep::Done(reply) => Some(reply),
+                _ => None,
+            };
+        }
+        return background_runon
+            .then(|| accepted_runon_launch_reply(registry, task_id, session, response));
     }
     // Without Accepted, a task that already ended (refused, failed, outcome
     // unknown, killed) reports that saved outcome; only a live task says
@@ -737,26 +739,63 @@ fn settled_runon_launch_reply(
     ))
 }
 
+fn accepted_runon_launch_reply(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: &Response,
+) -> Response {
+    let mut reply = copy_response(response);
+    reply.data["status"] = json!("running");
+    if let Some(progress) = registry.remote_progress(task_id, session) {
+        let phase = progress.phase.tag();
+        reply.data["phase"] = json!(phase);
+        reply.data["remote_phase"] = json!(phase);
+        reply.data["remote_job_id"] = progress
+            .job_id
+            .map(|job_id| json!(job_id.to_string()))
+            .unwrap_or(Value::Null);
+    }
+    let output_field =
+        if reply.data.get("output").is_none() && reply.data.get("output_preview").is_some() {
+            "output_preview"
+        } else {
+            "output"
+        };
+    if let Some(output) = reply.data[output_field].as_str() {
+        let mut output = output.to_owned();
+        for warning in [
+            crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING,
+            REMOTE_ADMISSION_PENDING_NOTE,
+        ] {
+            if let Some(prefix) = output.strip_suffix(warning) {
+                output = prefix.trim_end_matches('\n').to_owned();
+            }
+        }
+        reply.data[output_field] = json!(output);
+    }
+    reply
+}
+
 /// The launch reply when the capture wait ends (deadline or module drain)
 /// without having seen the worker settle. Reads saved state off the frame
 /// runtime and decides it with [`settled_runon_launch_reply`], so a wait that
 /// saw the worker settle and one that did not give the same answer for the
-/// same saved state. The runner's
-/// `Accepted` can land between the last poll and this read: a recorded
-/// `Accepted` keeps the caller's ordinary launch reply (`None`) unless the
-/// runner then refused the job, in which case the reply is that refusal error,
-/// since the command never ran. Without `Accepted`, a task that ended in the
-/// meantime reports its outcome and a live one says `starting` with the
-/// warning.
+/// same saved state. `Accepted` can land between the last poll and this read:
+/// an accepted background task gets a refreshed task handle, while a foreground
+/// task keeps its normal wait path. A refusal after acceptance is returned as
+/// an error; without `Accepted`, a saved terminal outcome is returned or a live
+/// task says `starting` with the capture warning.
 async fn unsettled_runon_launch_reply(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
     session: String,
     response: &Response,
+    background_runon: bool,
 ) -> Option<Response> {
     let pending = copy_response(response);
     tokio::task::spawn_blocking(move || {
-        settled_runon_launch_reply(&registry, &task_id, &session, &pending)
+        settled_runon_launch_reply(&registry, &task_id, &session, &pending, background_runon)
     })
     .await
     .unwrap_or_else(|_| Some(with_capture_warning(response)))
@@ -856,6 +895,7 @@ async fn await_runon_launch_reply(
                         &observed_task,
                         &observed_session,
                         &launch,
+                        background_runon,
                     )
                 })
             });
@@ -886,6 +926,7 @@ async fn await_runon_launch_reply(
                         task_id.clone(),
                         session.to_owned(),
                         response,
+                        background_runon,
                     )
                     .await;
                 }
@@ -906,6 +947,7 @@ async fn await_runon_launch_reply(
             task_id.clone(),
             session.to_owned(),
             response,
+            background_runon,
         )
         .await,
         reply = capture => reply,
@@ -4572,6 +4614,7 @@ mod grant_path_tests {
             timing,
             cancel,
             Arc::new(DispatchPathMetrics::new()),
+            Instant::now(),
         )
         .await
     }
@@ -4586,6 +4629,7 @@ mod grant_path_tests {
         timing: Arc<BashTimingForTest>,
         cancel: BashWaitCancel,
         metrics: Arc<DispatchPathMetrics>,
+        received_at: Instant,
     ) -> (mpsc::Receiver<BashDeferredCompletion>, String) {
         let rx = with_bash_timing_for_test(Some(timing.clone()), || {
             deadline_test_call_controlled(
@@ -4593,7 +4637,7 @@ mod grant_path_tests {
                 root,
                 held_remote_runon_stub,
                 arguments,
-                Instant::now(),
+                received_at,
                 false,
                 false,
                 metrics,
@@ -4627,23 +4671,78 @@ mod grant_path_tests {
         .unwrap_or_else(|_| panic!("the remote task never reached: {what}"));
     }
 
-    /// Asserts the ordinary background launch reply: the task handle with
-    /// status `running`, and no input-capture warning anywhere in it.
     #[cfg(unix)]
-    fn assert_accepted_launch_reply(done: &BashDeferredCompletion, task_id: &str, case: &str) {
+    #[derive(Clone, Copy)]
+    enum ReplyDecided {
+        AfterAcceptance,
+        MayPrecedeAcceptance,
+    }
+
+    #[cfg(unix)]
+    fn assert_launch_reply(
+        done: &BashDeferredCompletion,
+        task_id: &str,
+        case: &str,
+        decided: ReplyDecided,
+    ) {
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
         assert!(response.success, "{case}: {response:?}");
         assert_eq!(response.data["task_id"], task_id, "{case}: {response:?}");
-        assert_eq!(response.data["status"], "running", "{case}: {response:?}");
-        assert!(
-            !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
-            "{case}: {text}"
-        );
-        assert!(
-            !response.data.to_string().contains("hasn't confirmed"),
-            "{case}: {response:?}"
-        );
+        match decided {
+            ReplyDecided::AfterAcceptance => {
+                assert_eq!(response.data["status"], "running", "{case}: {response:?}");
+                assert_ne!(
+                    response.data["remote_phase"], "submitting",
+                    "{case}: accepted launch must not appear pending: {response:?}"
+                );
+                assert!(
+                    response.data["remote_job_id"].as_str().is_some(),
+                    "{case}: accepted launch must carry the runner job ID: {response:?}"
+                );
+                assert!(
+                    !text.contains(REMOTE_ADMISSION_PENDING_NOTE),
+                    "{case}: accepted launch must not carry the no-rerun note: {text}"
+                );
+                assert!(
+                    !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                    "{case}: {text}"
+                );
+                assert!(
+                    !response.data.to_string().contains("hasn't confirmed"),
+                    "{case}: {response:?}"
+                );
+            }
+            ReplyDecided::MayPrecedeAcceptance => match response.data["status"].as_str() {
+                Some("starting") => {
+                    assert_eq!(
+                        response.data["remote_phase"], "submitting",
+                        "{case}: {response:?}"
+                    );
+                    assert!(
+                        text.contains(REMOTE_ADMISSION_PENDING_NOTE),
+                        "{case}: pending reply must warn against rerunning: {text}"
+                    );
+                    assert!(
+                        text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                        "{case}: pending reply must identify unconfirmed input capture: {text}"
+                    );
+                }
+                Some("running") => {
+                    assert!(
+                        !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                        "{case}: {text}"
+                    );
+                    assert!(
+                        !response.data.to_string().contains("hasn't confirmed"),
+                        "{case}: {response:?}"
+                    );
+                }
+                status => panic!(
+                    "{case}: expected a starting or running launch reply, got {status:?}: {response:?}"
+                ),
+            },
+        }
     }
 
     #[cfg(unix)]
@@ -5154,6 +5253,7 @@ mod grant_path_tests {
                 drain: drain::ModuleDrainWindow::default(),
             },
             metrics.clone(),
+            Instant::now(),
         )
         .await;
         wait_for_task_state(&ctx, "Accepted", |registry| {
@@ -5312,9 +5412,8 @@ mod grant_path_tests {
                 Instant::now(),
             )
         });
-        wait_for_capture_submission(&daemon, &mut rx).await;
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             timing.capture_registered.notified(),
         )
         .await
@@ -5330,8 +5429,8 @@ mod grant_path_tests {
         assert!(registered_at.elapsed() < Duration::from_secs(1));
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
-        assert!(response.success, "{response:?}");
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
+        assert!(response.success, "{response:?}");
         assert_eq!(response.data["status"], "starting", "{response:?}");
         assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
         assert!(text.contains("promoted to background"), "{text}");
@@ -5810,6 +5909,10 @@ mod grant_path_tests {
             },
         )
         .await;
+        wait_for_task_state(&ctx, "runner accepted", |registry| {
+            registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+        })
+        .await;
         wait_for_task_state(&ctx, "completed", |registry| {
             registry.is_task_terminal(&task_id)
         })
@@ -5820,7 +5923,13 @@ mod grant_path_tests {
             .await
             .expect("the released launch must answer")
             .unwrap();
-        assert_accepted_launch_reply(&done, &task_id, "reply after completion");
+        // Acceptance and completion were observed before releasing the dispatch.
+        assert_launch_reply(
+            &done,
+            &task_id,
+            "reply after completion",
+            ReplyDecided::AfterAcceptance,
+        );
         assert_eq!(
             ctx.bash_background()
                 .observed_status(&task_id, "deadline-session", 0)
@@ -5831,13 +5940,11 @@ mod grant_path_tests {
         );
     }
 
-    /// The capture wait can also end without seeing the worker settle: a module
-    /// drain answers at once, and the capture deadline can expire before the
-    /// launch reply is even decided (a slow dispatch spends the whole budget).
-    /// When the runner's Accepted is already recorded by then, the reply is the
-    /// same ordinary launch reply a settled wait gives, whether the job is still
-    /// running or already finished: never the capture warning, and never the
-    /// finished result in place of the task handle.
+    /// This test checks launch replies after the input-capture wait ends once
+    /// the runner has accepted the job. Module-drain replies are decided only after
+    /// acceptance is observed; a capture deadline may instead return a pending reply
+    /// before the runner accepts the job. A completed job still returns its task
+    /// handle, not the finished result.
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_wait_ended_after_accepted_keeps_launch_reply() {
@@ -5853,7 +5960,10 @@ mod grant_path_tests {
                     },
                     if finished { "finished" } else { "running" }
                 );
-                let script = if finished {
+                let gate_acceptance_after_deadline = !drain_ends_wait && finished;
+                let script = if gate_acceptance_after_deadline {
+                    Script::GatedAcceptanceThenExit
+                } else if finished {
                     Script::Plain
                 } else {
                     Script::GatedStages { position: 1 }
@@ -5861,7 +5971,6 @@ mod grant_path_tests {
                 let (daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
                 let mut timing = BashTimingForTest::new(Instant::now());
                 if !drain_ends_wait {
-                    // The capture deadline passes while the dispatch is held.
                     Arc::get_mut(&mut timing).unwrap().capture_wait =
                         Some(Duration::from_millis(1));
                 }
@@ -5874,14 +5983,61 @@ mod grant_path_tests {
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
                 };
-                let (mut rx, task_id) = held_capture_call(
-                    &executor,
-                    &root,
-                    json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
-                    timing.clone(),
-                    cancel.clone(),
-                )
-                .await;
+                let received_at = if gate_acceptance_after_deadline {
+                    Instant::now() - Duration::from_secs(2)
+                } else {
+                    Instant::now()
+                };
+                let (mut rx, task_id) = held_capture_call_with_metrics(
+                &executor,
+                &root,
+                json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+                timing.clone(),
+                cancel.clone(),
+                Arc::new(DispatchPathMetrics::new()),
+                received_at,
+            )
+            .await;
+                if gate_acceptance_after_deadline {
+                    // Keep Accepted behind the runner gate until the 1 ms deadline reply is sent.
+                    daemon.wait_for_requests("exec.run", 1).await;
+                    assert_eq!(
+                        ctx.bash_background()
+                            .runon_inputs_captured(&task_id, "deadline-session"),
+                        Some(false),
+                        "the runner remains behind its acceptance gate after the capture deadline"
+                    );
+                    assert!(
+                        Instant::now() >= received_at + Duration::from_millis(1),
+                        "the one-millisecond capture deadline must expire before Accepted"
+                    );
+                    tokio::time::timeout(Duration::from_secs(5), timing.startup.armed.notified())
+                        .await
+                        .expect("startup handoff must be waiting for its test gate");
+                    timing.startup.fire.notify_one();
+                    let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .expect("the expired capture deadline must answer before Accepted")
+                        .unwrap();
+                    assert_eq!(
+                        ctx.bash_background()
+                            .runon_inputs_captured(&task_id, "deadline-session"),
+                        Some(false),
+                        "the reply is selected while the runner is still gated"
+                    );
+                    daemon.acceptance_gate.notify_one();
+                    wait_for_task_state(&ctx, "Accepted and completed", |registry| {
+                        registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+                            && registry.is_task_terminal(&task_id)
+                    })
+                    .await;
+                    BashTimingForTest::release(&timing.result);
+                    // The reply was selected before acceptance, so its starting status is accurate.
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::MayPrecedeAcceptance);
+                    assert_eq!(done.response_for_test().data["status"], "starting");
+                    continue;
+                }
+
                 wait_for_task_state(&ctx, "Accepted", |registry| {
                     registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
                         && (!finished || registry.is_task_terminal(&task_id))
@@ -5895,7 +6051,13 @@ mod grant_path_tests {
                     .await
                     .expect("the released launch must answer")
                     .unwrap();
-                assert_accepted_launch_reply(&done, &task_id, &case);
+                if drain_ends_wait {
+                    // Acceptance was observed before the module drain decided the reply.
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
+                } else {
+                    // The capture deadline can decide the reply before Accepted is observed.
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::MayPrecedeAcceptance);
+                }
                 if !finished {
                     daemon.output_gate.notify_one();
                     wait_for_task_state(&ctx, "completed", |registry| {
