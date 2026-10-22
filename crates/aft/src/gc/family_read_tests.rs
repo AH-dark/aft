@@ -950,7 +950,12 @@ fn returning_free_pages_reads_a_bounded_number_of_pages() {
     );
 
     let probe = ReadProbe::start(&fixture.store);
+    // The pass's one-second budget is wall time: on a slow runner it can end
+    // the pass after a few steps, which says nothing about the cap. With the
+    // reclaim clock frozen only the cap can stop it.
+    let clock = crate::blob_store::reclaim::freeze_clock();
     let reclaimed = fixture.store.reclaim_all_free_pages(None, cap).unwrap();
+    drop(clock);
     let counts = probe.finish();
 
     assert_eq!(reclaimed.reclaimed_pages, cap, "{reclaimed:?}");
