@@ -1144,11 +1144,19 @@ impl RootHealthSnapshot {
 }
 
 pub struct StatusEmitter {
-    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
-    notify: mpsc::Sender<()>,
+    state: Arc<StatusEmitterState>,
+    notify: mpsc::Sender<Weak<StatusEmitterState>>,
     context: Mutex<Weak<AppContext>>,
     #[cfg(test)]
     pub(crate) snapshot_builds: AtomicUsize,
+}
+
+/// The part of a context's status emitter that the process-wide debounce
+/// thread reads when a window closes. That thread holds it only weakly between
+/// signals, so it never keeps a dropped context's emitter alive.
+struct StatusEmitterState {
+    latest: Mutex<Option<PendingStatusSnapshot>>,
+    progress_sender: SharedProgressSender,
 }
 
 enum PendingStatusSnapshot {
@@ -2379,15 +2387,12 @@ pub(crate) struct ConfigureMaintenanceJob {
 
 impl StatusEmitter {
     fn new(progress_sender: SharedProgressSender) -> Self {
-        let (notify, rx) = mpsc::channel();
-        let latest = Arc::new(Mutex::new(None));
-        let latest_for_thread = Arc::clone(&latest);
-        std::thread::spawn(move || {
-            status_debounce_loop(rx, latest_for_thread, progress_sender);
-        });
         Self {
-            latest,
-            notify,
+            state: Arc::new(StatusEmitterState {
+                latest: Mutex::new(None),
+                progress_sender,
+            }),
+            notify: status_debounce_sender(),
             context: Mutex::new(Weak::new()),
             #[cfg(test)]
             snapshot_builds: AtomicUsize::new(0),
@@ -2400,66 +2405,118 @@ impl StatusEmitter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Ok(mut latest) = self.latest.lock() {
+        if let Ok(mut latest) = self.state.latest.lock() {
             *latest = Some(PendingStatusSnapshot::Ready(snapshot, context));
         }
-        let _ = self.notify.send(());
+        let _ = self.notify.send(Arc::downgrade(&self.state));
     }
 
     fn signal_context(&self, context: Weak<AppContext>) {
-        if let Ok(mut latest) = self.latest.lock() {
+        if let Ok(mut latest) = self.state.latest.lock() {
             *latest = Some(PendingStatusSnapshot::Context(context));
         }
-        let _ = self.notify.send(());
+        let _ = self.notify.send(Arc::downgrade(&self.state));
     }
 }
 
-fn status_debounce_loop(
-    rx: mpsc::Receiver<()>,
-    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
-    progress_sender: SharedProgressSender,
-) {
-    while rx.recv().is_ok() {
-        let deadline = Instant::now() + Duration::from_millis(STATUS_DEBOUNCE_MS);
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(remaining) {
-                Ok(()) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+/// The sender into the one debounce thread that serves every context's status
+/// emitter. A thread per context would sit blocked for as long as the context
+/// lives, and the daemon keeps a context for every root it has served, idle
+/// or not.
+fn status_debounce_sender() -> mpsc::Sender<Weak<StatusEmitterState>> {
+    static SENDER: std::sync::LazyLock<mpsc::Sender<Weak<StatusEmitterState>>> =
+        std::sync::LazyLock::new(|| {
+            let (notify, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("aft-status-debounce".to_string())
+                .spawn(move || status_debounce_loop(rx))
+                .expect("spawn status debounce thread");
+            notify
+        });
+    SENDER.clone()
+}
+
+/// Coalesce status signals per emitter: the first signal opens a window of
+/// `STATUS_DEBOUNCE_MS`, later signals inside it only replace the pending
+/// snapshot, and the window's close pushes the latest one. Windows of
+/// different emitters run independently. Returns once every sender is gone.
+fn status_debounce_loop(rx: mpsc::Receiver<Weak<StatusEmitterState>>) {
+    // Every window has the same length, so arrival order is deadline order.
+    let mut windows: VecDeque<(Instant, Weak<StatusEmitterState>)> = VecDeque::new();
+    loop {
+        let now = Instant::now();
+        while windows
+            .front()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let Some((_, state)) = windows.pop_front() else {
+                break;
+            };
+            // A context dropped inside its window pushes nothing.
+            if let Some(state) = state.upgrade() {
+                emit_pending_status(&state);
             }
         }
-
-        let snapshot = latest.lock().ok().and_then(|mut latest| latest.take());
-        let Some(snapshot) = snapshot else { continue };
-        let sender = progress_sender
-            .lock()
-            .ok()
-            .and_then(|sender| sender.clone());
-        if let Some(sender) = sender {
-            // Census work happens only for the surviving signal, outside the
-            // emitter lock. Upgrade at emission so queued signals cannot keep a
-            // retired actor (and its watchers/servers) alive.
-            let snapshot = match snapshot {
-                PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
-                    Some(context) => crate::status_push::project(&context, snapshot),
-                    None => snapshot,
-                },
-                PendingStatusSnapshot::Context(context) => {
-                    let Some(context) = context.upgrade() else {
-                        continue;
-                    };
-                    let Some(snapshot) = context.try_build_status_push_snapshot() else {
-                        // Keep the previous bar; the next producer signal retries.
-                        continue;
-                    };
-                    snapshot
+        let signalled = match windows.front() {
+            Some((deadline, _)) => {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(state) => state,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
-            };
-            sender(PushFrame::StatusChanged(StatusChangedFrame::new(
-                None, snapshot,
-            )));
+            }
+            None => match rx.recv() {
+                Ok(state) => state,
+                Err(_) => return,
+            },
+        };
+        if !windows
+            .iter()
+            .any(|(_, open)| Weak::ptr_eq(open, &signalled))
+        {
+            windows.push_back((
+                Instant::now() + Duration::from_millis(STATUS_DEBOUNCE_MS),
+                signalled,
+            ));
         }
     }
+}
+
+fn emit_pending_status(state: &StatusEmitterState) {
+    let snapshot = state
+        .latest
+        .lock()
+        .ok()
+        .and_then(|mut latest| latest.take());
+    let Some(snapshot) = snapshot else { return };
+    let sender = state
+        .progress_sender
+        .lock()
+        .ok()
+        .and_then(|sender| sender.clone());
+    let Some(sender) = sender else { return };
+    // Census work happens only for the surviving signal, outside the
+    // emitter lock. Upgrade at emission so queued signals cannot keep a
+    // retired actor (and its watchers/servers) alive.
+    let snapshot = match snapshot {
+        PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
+            Some(context) => crate::status_push::project(&context, snapshot),
+            None => snapshot,
+        },
+        PendingStatusSnapshot::Context(context) => {
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            let Some(snapshot) = context.try_build_status_push_snapshot() else {
+                // Keep the previous bar; the next producer signal retries.
+                return;
+            };
+            snapshot
+        }
+    };
+    sender(PushFrame::StatusChanged(StatusChangedFrame::new(
+        None, snapshot,
+    )));
 }
 use crate::cache_freshness::FileFreshness;
 use crate::search_index::SearchIndex;
@@ -4298,6 +4355,10 @@ pub struct AppContext {
     /// Set to true once the filter_registry has been populated. Avoids
     /// double-loading on hot paths without holding a write lock.
     filter_registry_loaded: std::sync::atomic::AtomicBool,
+    /// Set when idle eviction cleared the shared registry slot, until a
+    /// background bash spawn has loaded it again (see
+    /// [`AppContext::reload_released_filter_registry`]).
+    filter_registry_released: std::sync::atomic::AtomicBool,
     /// Live `experimental.bash.compress` flag, kept in sync with `config`
     /// from the configure handler. Exposed via [`AppContext::bash_compress_flag`]
     /// so the BgTaskRegistry's watchdog-thread compressor can read it without
@@ -4998,6 +5059,7 @@ impl AppContext {
             )),
             filter_registry_rebuild_count: AtomicU64::new(0),
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
+            filter_registry_released: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: Arc::new(std::sync::RwLock::new(None)),
             gitignore_generation: Arc::new(AtomicU64::new(0)),
@@ -5974,6 +6036,42 @@ impl AppContext {
     #[cfg(test)]
     pub fn filter_registry_rebuild_count_for_test(&self) -> u64 {
         self.filter_registry_rebuild_count.load(Ordering::SeqCst)
+    }
+
+    /// Whether the compiled filter registry is resident.
+    #[cfg(test)]
+    pub(crate) fn filter_registry_loaded(&self) -> bool {
+        self.filter_registry_loaded.load(Ordering::Acquire)
+    }
+
+    /// Take the compiled filters of an idle root out of the shared slot. They
+    /// are rebuilt from the same sources by the next
+    /// [`Self::filter_registry`] or [`Self::shared_filter_registry`] call, or
+    /// by [`Self::reload_released_filter_registry`] when a background bash
+    /// task is spawned. The compiled builtin filters
+    /// alone take over a megabyte per root, which an evicted root has no use
+    /// for.
+    pub(crate) fn take_filter_registry(&self) -> crate::compress::toml_filter::FilterRegistry {
+        let mut slot = self
+            .filter_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cleared under the same write lock that publishes the flag
+        // everywhere else, so the slot and the flag never disagree.
+        self.filter_registry_loaded.store(false, Ordering::Release);
+        self.filter_registry_released.store(true, Ordering::Release);
+        std::mem::take(&mut *slot)
+    }
+
+    /// Load the filters again if idle eviction took them. A background bash
+    /// task's output is compressed on the watchdog thread through the shared
+    /// handle, which reads the registry as it is and cannot load it. A root
+    /// whose registry was never released keeps the cost of its first load
+    /// where it was (configure, or the first compression).
+    pub(crate) fn reload_released_filter_registry(&self) {
+        if self.filter_registry_released.swap(false, Ordering::AcqRel) {
+            self.ensure_filter_registry_loaded();
+        }
     }
 
     pub fn app(&self) -> Arc<App> {
@@ -13088,9 +13186,11 @@ impl AppContext {
             .map(|runtime| runtime.family_arena_bytes())
     }
 
-    /// Let go of this root's loaded views-on semantic lane when its artifacts
-    /// are evicted for idleness. Without this an idle root keeps its overlay
-    /// and pins every arena run its view names until the daemon exits.
+    /// Let go of this root's views-on semantic lane, loaded or still loading,
+    /// when its artifacts are evicted for idleness. Without this an idle root
+    /// keeps its overlay and pins every arena run its view names until the
+    /// daemon exits, and a lane that never finished loading keeps its worker
+    /// thread.
     ///
     /// The checkout runtime drops once its worker notices the closed lane and
     /// exits; the view then unbinds and the family arena drops every run no
@@ -13163,10 +13263,26 @@ impl AppContext {
                 }
                 lsp.shutdown_all();
             }
-            let _ = ctx.subc_lifecycle.run_if_unbound(|| {
+            let released = ctx.subc_lifecycle.run_if_unbound(|| {
                 ctx.bash_background.clear_db_pool();
                 ctx.backup.lock().clear_db_pool();
+                // The root's own config file watches each hold a thread (and on
+                // macOS an FSEvents run loop). Nothing reloads an unbound
+                // root's config; a rebind's configure starts them again.
+                let watches = ctx.config_live.take_watches();
+                // A query embedding model is rebuilt on the next semantic
+                // query. A local model holds its ONNX session and a query
+                // thread, which an evicted root has no use for. A model in
+                // use is left alone rather than waited for.
+                let model = ctx
+                    .semantic_embedding_model
+                    .try_lock()
+                    .and_then(|mut model| model.take());
+                (watches, model, ctx.take_filter_registry())
             });
+            // Dropped after the lifecycle check releases, so their shutdown
+            // never holds up a rebind.
+            drop(released);
         });
     }
 
@@ -15439,6 +15555,35 @@ mod core_regressions {
         ctx.reset_filter_registry();
         ctx.install_lazy_filter_registry(stale);
         assert!(ctx.filter_registry().lookup("stale-command").is_none());
+    }
+
+    /// Idle eviction takes the compiled filters; the background bash spawn
+    /// path loads them again, because the watchdog's shared handle cannot.
+    #[test]
+    fn released_filter_registry_is_reloaded_for_background_bash() {
+        let ctx = context();
+        ctx.reset_filter_registry();
+        let handle = Arc::clone(&ctx.filter_registry);
+        let builtin = handle.read().unwrap().all().len();
+        assert!(builtin > 0, "builtin filters are compiled at reset");
+
+        let taken = ctx.take_filter_registry();
+        assert_eq!(taken.all().len(), builtin);
+        assert!(!ctx.filter_registry_loaded());
+        assert_eq!(
+            handle.read().unwrap().all().len(),
+            0,
+            "the shared slot is emptied"
+        );
+
+        let rebuilds = ctx.filter_registry_rebuild_count_for_test();
+        ctx.reload_released_filter_registry();
+        assert!(ctx.filter_registry_loaded());
+        assert_eq!(handle.read().unwrap().all().len(), builtin);
+        assert_eq!(ctx.filter_registry_rebuild_count_for_test(), rebuilds + 1);
+        // Only a release triggers the spawn-path load.
+        ctx.reload_released_filter_registry();
+        assert_eq!(ctx.filter_registry_rebuild_count_for_test(), rebuilds + 1);
     }
 
     /// In the configure timing line (`configure_ack_phase_snapshot`, used by
@@ -19530,13 +19675,11 @@ mod status_emitter_tests {
         // Status hydrates checkpoints even before configure. Keep its namespace
         // and file lock private instead of sharing the cwd-wide default store.
         *ctx.checkpoint().lock() = CheckpointStore::unbound_in_for_test(&ctx.storage_dir());
-        // Disconnect the constructor's idle worker and queue the whole burst
-        // before starting its replacement. Scheduler pauses must not split the
+        // Route this emitter to a private debounce loop and queue the whole
+        // burst before starting it. Scheduler pauses must not split the
         // signals across debounce windows.
         let (notify, notifications) = mpsc::channel();
         ctx.status_emitter.notify = notify;
-        let latest = Arc::clone(&ctx.status_emitter.latest);
-        let progress_sender = Arc::clone(&ctx.progress_sender);
         let ctx = Arc::new(ctx);
         ctx.bind_status_context();
         for _ in 0..12 {
@@ -19549,7 +19692,7 @@ mod status_emitter_tests {
 
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            status_debounce_loop(notifications, latest, progress_sender);
+            status_debounce_loop(notifications);
             let _ = done_tx.send(());
         });
         // These deadlines guard hangs, not the duration of a snapshot build.
@@ -19731,10 +19874,34 @@ mod status_emitter_tests {
     }
 
     #[test]
-    fn status_emitter_shutdown_cleanly_exits_debounce_thread() {
+    fn status_emitter_dropped_context_pushes_nothing() {
+        // A context dropped inside its open debounce window must not push.
         let (ctx, rx) = ctx_with_frame_rx();
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
         drop(ctx);
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(rx
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 300))
+            .is_err());
+    }
+
+    #[test]
+    fn status_emitter_windows_are_per_context() {
+        // Contexts share one debounce thread; a burst on one context must not
+        // absorb another context's push.
+        let (first, first_rx) = ctx_with_frame_rx();
+        let (second, second_rx) = ctx_with_frame_rx();
+        for _ in 0..5 {
+            first.status_emitter().signal(first.build_status_snapshot());
+            second
+                .status_emitter()
+                .signal(second.build_status_snapshot());
+        }
+        for rx in [&first_rx, &second_rx] {
+            let frame = rx
+                .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 2_000))
+                .expect("each context pushes its own status");
+            assert!(matches!(frame, PushFrame::StatusChanged(_)));
+        }
     }
 
     #[test]

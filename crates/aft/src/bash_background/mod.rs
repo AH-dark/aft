@@ -1225,6 +1225,10 @@ pub(crate) fn spawn(
     }
 
     let cleanup_plan = spawn_plan.clone();
+    // The watchdog compresses this task's output through the shared filter
+    // handle, which reads the registry as it is. An idle-evicted root has
+    // released its registry, so load it again before the task can finish.
+    ctx.reload_released_filter_registry();
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);

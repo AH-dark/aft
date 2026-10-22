@@ -2,7 +2,6 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
-use std::thread;
 use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -11,11 +10,40 @@ use super::job::{InspectCategory, InspectJob, InspectResult};
 
 pub type InspectWorker = Arc<dyn Fn(InspectJob) -> InspectResult + Send + Sync + 'static>;
 
+/// Submits one root's inspect jobs to the process-wide pool and collects their
+/// results on that root's channel.
+///
+/// Jobs go straight from the submitting thread onto the pool's FIFO queue.
+/// There is no per-root forwarding thread: a root that is idle, or kept
+/// registered after idle eviction, costs no thread for inspect.
 #[derive(Clone)]
-pub struct DispatchHandles {
-    pub request_tx: Sender<InspectJob>,
+pub struct InspectDispatcher {
+    worker: InspectWorker,
+    result_tx: Sender<InspectResult>,
     pub result_rx: Receiver<InspectResult>,
     pub pool: Arc<rayon::ThreadPool>,
+}
+
+impl InspectDispatcher {
+    pub fn new(worker: InspectWorker) -> Self {
+        let (result_tx, result_rx) = unbounded::<InspectResult>();
+        Self {
+            worker,
+            result_tx,
+            result_rx,
+            pool: inspect_pool(),
+        }
+    }
+
+    /// Queue `job` on the shared pool. Its result arrives on `result_rx`.
+    pub fn submit(&self, job: InspectJob) {
+        run_on_pool(
+            &self.pool,
+            job,
+            self.result_tx.clone(),
+            Arc::clone(&self.worker),
+        );
+    }
 }
 
 /// Number of live workers in the process-wide inspect pool. The pool's start
@@ -55,21 +83,6 @@ static INSPECT_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
     )
 });
 
-pub fn start_dispatch_loop(worker: InspectWorker) -> DispatchHandles {
-    let (request_tx, request_rx) = unbounded::<InspectJob>();
-    let (result_tx, result_rx) = unbounded::<InspectResult>();
-    let pool = inspect_pool();
-
-    let loop_pool = Arc::clone(&pool);
-    thread::spawn(move || dispatch_loop(request_rx, result_tx, loop_pool, worker));
-
-    DispatchHandles {
-        request_tx,
-        result_rx,
-        pool,
-    }
-}
-
 fn inspect_pool() -> Arc<rayon::ThreadPool> {
     Arc::clone(&INSPECT_POOL)
 }
@@ -88,41 +101,37 @@ pub fn default_worker() -> InspectWorker {
     Arc::new(dispatch_category)
 }
 
-fn dispatch_loop(
-    request_rx: Receiver<InspectJob>,
-    result_tx: Sender<InspectResult>,
-    pool: Arc<rayon::ThreadPool>,
+fn run_on_pool(
+    pool: &rayon::ThreadPool,
+    job: InspectJob,
+    tx: Sender<InspectResult>,
     worker: InspectWorker,
 ) {
-    while let Ok(job) = request_rx.recv() {
-        let tx = result_tx.clone();
-        let worker = Arc::clone(&worker);
-        pool.spawn_fifo(move || {
-            let started = Instant::now();
-            let panic_job = job.clone();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(job)))
-                .unwrap_or_else(|panic| {
-                    InspectResult::failed(
-                        &panic_job,
-                        format!(
-                            "inspect worker panicked before completion: {}",
-                            panic_message(panic.as_ref())
-                        ),
-                        started.elapsed(),
-                    )
-                });
-            let scanner_ready = result.outcome.is_ok()
-                && matches!(
-                    result.category,
-                    InspectCategory::Metrics | InspectCategory::Todos
-                );
-            let category = result.category;
-            let _ = tx.send(result);
-            if scanner_ready {
-                signal_scanner_ready_for_test(category);
-            }
-        });
-    }
+    pool.spawn_fifo(move || {
+        let started = Instant::now();
+        let panic_job = job.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(job)))
+            .unwrap_or_else(|panic| {
+                InspectResult::failed(
+                    &panic_job,
+                    format!(
+                        "inspect worker panicked before completion: {}",
+                        panic_message(panic.as_ref())
+                    ),
+                    started.elapsed(),
+                )
+            });
+        let scanner_ready = result.outcome.is_ok()
+            && matches!(
+                result.category,
+                InspectCategory::Metrics | InspectCategory::Todos
+            );
+        let category = result.category;
+        let _ = tx.send(result);
+        if scanner_ready {
+            signal_scanner_ready_for_test(category);
+        }
+    });
 }
 
 /// Test hook that signals successful scanner completion to subprocess fixtures.

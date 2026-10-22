@@ -209,6 +209,8 @@ mod consent;
 mod drain;
 mod flow_read;
 mod health;
+#[cfg(test)]
+mod idle_root_retention_tests;
 mod perf_sweep;
 mod standalone;
 #[doc(hidden)]
