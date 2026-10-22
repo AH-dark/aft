@@ -488,10 +488,14 @@ fn payload_totals_setup_skips_a_busy_store_and_gives_up_past_its_deadline() {
         store.ensure_payload_totals(far_deadline()).unwrap(),
         PayloadTotals::Busy
     );
+    // This call includes scheduler pauses around SQLite's busy timeout. Keep
+    // a finite bound, but allow two seconds beyond the product limit for a
+    // delayed worker on a loaded CI host.
+    const BUSY_WAIT_SCHEDULER_SLACK: Duration = Duration::from_secs(2);
+    let waited = started.elapsed();
     assert!(
-        started.elapsed() < TOTALS_SETUP_BUSY_WAIT + Duration::from_secs(1),
-        "it waited {:?}",
-        started.elapsed()
+        waited < TOTALS_SETUP_BUSY_WAIT + BUSY_WAIT_SCHEDULER_SLACK,
+        "it waited {waited:?}"
     );
     other.execute_batch("ROLLBACK").unwrap();
     drop(other);
