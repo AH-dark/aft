@@ -1691,30 +1691,43 @@ fn parse_perf_script(raw: &str) -> Vec<SampleThread> {
 
 /// Read the thread name and id from a `perf script` sample header. The
 /// default fields print `comm tid [cpu] time: ...`; with `-F +pid` the id is
-/// `pid/tid`. A thread name may contain spaces, so the id is the first token
-/// after the name that is a number or a `number/number` pair.
+/// `pid/tid`, and `[cpu]` appears only when the samples carry a CPU. A thread
+/// name may contain spaces and digits (`worker 7`), so the id is found from
+/// the fixed fields after the name: the token just before the timestamp, or
+/// before `[cpu]` when that is present. Reading left to right would take a
+/// digit inside the name as the id and merge unrelated threads.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_perf_header(line: &str) -> Option<(String, String)> {
-    if !line.contains(':') {
-        return None;
-    }
     let fields = line.split_whitespace().collect::<Vec<_>>();
     let is_number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    let position = fields.iter().skip(1).position(|field| {
-        let tid = field.rsplit_once('/').map_or(
-            *field,
-            |(pid, tid)| {
-                if is_number(pid) {
-                    tid
-                } else {
-                    ""
-                }
-            },
-        );
-        is_number(tid)
-    })? + 1;
-    let tid = fields[position].rsplit('/').next()?.to_string();
-    Some((fields[..position].join(" "), tid))
+    let is_timestamp = |text: &str| {
+        text.strip_suffix(':').is_some_and(|value| {
+            value.bytes().any(|byte| byte.is_ascii_digit())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        })
+    };
+    let is_cpu = |text: &str| {
+        text.strip_prefix('[')
+            .and_then(|text| text.strip_suffix(']'))
+            .is_some_and(is_number)
+    };
+    let time = fields.iter().position(|field| is_timestamp(field))?;
+    let mut position = time.checked_sub(1)?;
+    if is_cpu(fields[position]) {
+        position = position.checked_sub(1)?;
+    }
+    // A header always starts with the thread name, so the id is never first.
+    if position == 0 {
+        return None;
+    }
+    let tid = match fields[position].rsplit_once('/') {
+        Some((pid, tid)) if is_number(pid) && is_number(tid) => tid,
+        None if is_number(fields[position]) => fields[position],
+        _ => return None,
+    };
+    Some((fields[..position].join(" "), tid.to_string()))
 }
 
 /// Store one sample's frames, given outermost first, as a one-sample chain.
@@ -3483,6 +3496,39 @@ mod tests {
     // first. The health-rollup thread repeats one stack 100 times and spreads
     // another 60 samples under one frame over 30 leaf sites; the executor
     // thread uses the `pid/tid` header that `perf script -F +pid` prints.
+    // A thread name may itself contain numbers; the id comes from the fixed
+    // fields after the name, so `worker 7` with tid 4242 is thread 4242.
+    #[test]
+    fn perf_header_takes_the_id_after_a_name_that_contains_numbers() {
+        let cases = [
+            (
+                "worker 7 4242 [003] 12345.004000: 1 cycles:",
+                "worker 7",
+                "4242",
+            ),
+            ("worker 7 4242 12345.004000: 1 cycles:", "worker 7", "4242"),
+            ("pool 1/2 99/4243 [000] 1.5: 1 cycles:", "pool 1/2", "4243"),
+            (
+                "aft-health-rollup 4244 77.25: 1 cycles:",
+                "aft-health-rollup",
+                "4244",
+            ),
+        ];
+        for (header, name, tid) in cases {
+            assert_eq!(
+                parse_perf_header(header),
+                Some((name.to_string(), tid.to_string())),
+                "{header}"
+            );
+        }
+        // Stack frames and lines without a timestamp are not headers.
+        assert_eq!(
+            parse_perf_header("55d1c0a2d0b3 aft::subc::health::run+0x23 (/x)"),
+            None
+        );
+        assert_eq!(parse_perf_header("4242 12345.004000: 1 cycles:"), None);
+    }
+
     #[test]
     fn linux_perf_stacks_fold_into_one_tree_before_ranking() {
         let raw = include_str!("../../tests/fixtures/linux-perf-script.txt");
