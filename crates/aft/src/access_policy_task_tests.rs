@@ -11,6 +11,9 @@ struct Fixture {
     ctx: AppContext,
     head: ScopeKey,
     worker: TaskPaths,
+    // Declared last so it drops after the context: `AFT_STORAGE_DIR` stays
+    // cleared for the whole fixture lifetime.
+    _storage_env: crate::test_env::StorageOverrideGuard,
 }
 
 fn stamp(
@@ -69,6 +72,14 @@ fn record(
 }
 
 fn fixture() -> Fixture {
+    // The context resolves its storage folder on every call, and
+    // `AFT_STORAGE_DIR` outranks the configured one below. Other tests in this
+    // process set that variable while they run; if it changed under this
+    // fixture, the storage floor would protect that other folder instead of
+    // these task records, and a refusal the tests expect would become a
+    // success. Clear it, and hold the process environment lock so no other
+    // test can set it again, until the fixture is dropped.
+    let storage_env = crate::test_env::without_storage_override();
     let dir = tempfile::tempdir().unwrap();
     // Grep opens resolved task paths. Keep the fixture and its open probes in
     // that same path form, including Windows prefixes and macOS temp aliases.
@@ -111,6 +122,7 @@ fn fixture() -> Fixture {
         ctx,
         head,
         worker,
+        _storage_env: storage_env,
     }
 }
 
@@ -395,6 +407,38 @@ fn explicit_task_io_grep_opens_only_registered_nonsecret_artifacts() {
     opened.sort();
     opened.dedup();
     assert_eq!(opened, expected);
+}
+
+// `AFT_STORAGE_DIR` outranks a configured storage folder, and other tests in
+// this process set it while they run. If it were set while a fixture is alive,
+// the storage floor would cover that other folder instead of the fixture's task
+// records, and the unrelated session's grep below would succeed instead of
+// being refused. Holding the variable set here shows the fixture clears it.
+#[test]
+fn fixture_floor_ignores_a_storage_override_set_by_another_test() {
+    let _env = crate::test_env::process_env_lock();
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("AFT_STORAGE_DIR", value),
+                None => std::env::remove_var("AFT_STORAGE_DIR"),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os("AFT_STORAGE_DIR"));
+    let other_storage = tempfile::tempdir().unwrap();
+    std::env::set_var("AFT_STORAGE_DIR", other_storage.path());
+    let f = fixture();
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+    );
+    req.session_id = Some("unrelated-session".into());
+    assert_floor(
+        crate::commands::grep::handle_grep(&req, &f.ctx),
+        &f.worker.io_dir,
+    );
 }
 
 #[test]
