@@ -8944,21 +8944,22 @@ fn spawn_configure_storage_sweeps(
 /// records and migration state. Each sweep runs where its data is written.
 fn run_configure_storage_sweeps(paths: &crate::root_cache::StoragePaths, harness: Harness) {
     let storage_root = paths.durable.as_path();
-    // URL downloads are written under the cache root (`AppContext::cache_dir`).
-    // Downloads made before `storage.cache_dir` was set stay under the durable
-    // root, so that copy is swept too until it is empty.
-    let mut url_roots = vec![paths.artifacts.as_path()];
+    // Rebuildable data is written under the cache root (URL downloads through
+    // `AppContext::cache_dir`, cache-domain locks beside their caches). Data
+    // written before `storage.cache_dir` was set stays under the durable root,
+    // so that root is swept too.
+    let mut cache_sweep_roots = vec![paths.artifacts.as_path()];
     if paths.durable != paths.artifacts {
-        url_roots.push(storage_root);
+        cache_sweep_roots.push(storage_root);
     }
-    for url_root in url_roots {
+    for url_root in &cache_sweep_roots {
         match crate::url_fetch::cleanup_url_cache(url_root) {
             Ok(0) => {}
             Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
             Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
         }
     }
-    match crate::fs_lock::sweep_stale_reclaim_tokens(storage_root) {
+    match crate::fs_lock::sweep_stale_reclaim_tokens(&cache_sweep_roots) {
         Ok(None | Some(0)) => {}
         Ok(Some(n)) => slog_info!(
             "filesystem lock cleanup: removed {} stale reclaim tokens",
