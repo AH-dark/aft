@@ -688,6 +688,57 @@ mod tests {
         assert_eq!(refused.data["code"], crate::persisted_format::CODE);
     }
 
+    /// With the store unavailable, status reads the task bundle on disk. Those
+    /// byte pages must stay bounded like registered-task pages, and continue
+    /// at the offset actually returned.
+    #[test]
+    fn approved_store_unavailable_status_pages_are_bounded() {
+        use base64::Engine as _;
+        let fixture = RestoreFixture::new(Harness::Opencode);
+        fixture.ctx.finish_database_runtime_error(
+            "storage_requires_newer_reader: database reader floor".into(),
+            false,
+        );
+        fs::write(&fixture.running.exit, "0\n").unwrap();
+        let output = b"abcdefgh".repeat(3 * 8 * 1024 + 1);
+        fs::write(&fixture.running.stdout, &output).unwrap();
+        let page = |offset: u64| {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "disk-page", "command": "bash_status", "session_id": SESSION,
+                "params": { "task_id": RUNNING_TASK, "output_offset": offset, "stderr_offset": 0 },
+            }))
+            .unwrap();
+            let response = super::handle(&request, &fixture.ctx);
+            assert!(response.success, "{response:?}");
+            assert!(response.data["store_unavailable"].is_string());
+            response
+        };
+        let mut cursor = 0;
+        let mut collected = Vec::new();
+        loop {
+            let response = page(cursor);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(response.data["output_chunk_base64"].as_str().unwrap())
+                .unwrap();
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "one page held {} bytes",
+                bytes.len()
+            );
+            let next = response.data["output_next_offset"].as_u64().unwrap();
+            assert_eq!(next, cursor + bytes.len() as u64);
+            let has_more = response.data["output_has_more"].as_bool().unwrap();
+            assert_eq!(has_more, (next as usize) < output.len());
+            assert_eq!(response.data["stderr_has_more"], false);
+            collected.extend(bytes);
+            cursor = next;
+            if !has_more {
+                break;
+            }
+        }
+        assert_eq!(collected, output);
+    }
+
     #[test]
     fn future_bash_task_restore_preserves_output_even_after_failed_gc() {
         for harness in [Harness::Opencode, Harness::Pi, Harness::Runner] {
