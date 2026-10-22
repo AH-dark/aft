@@ -71,6 +71,11 @@ struct Candidate {
 thread_local! {
     static RETAINED_CANDIDATE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HEAD_REWRITE: std::cell::RefCell<Option<HeadRewrite>> = const { std::cell::RefCell::new(None) };
+    /// Queries the publication closure's blob probe ran on this thread, and
+    /// how long it took in total.
+    pub(crate) static CLOSURE_PROBE_STATS: std::cell::Cell<crate::blob_store::ProbeStats> = const {
+        std::cell::Cell::new(crate::blob_store::ProbeStats { queries: 0, nanos: 0 })
+    };
 }
 
 #[cfg(test)]
@@ -606,14 +611,8 @@ pub fn prepare_checkout_deferring(
                     fresh_semantic_classes
                         .insert(tracked.rel_path.clone(), semantic_class_of_bytes(&source));
                 }
-                let (candidate, skip) = reader.regular(
-                    rel_path,
-                    &absolute,
-                    executable,
-                    source,
-                    Some(tracked),
-                    true,
-                )?;
+                let (candidate, skip) =
+                    reader.regular(rel_path, &absolute, executable, source, Some(tracked), true)?;
                 fresh_skips.extend(skip);
                 candidates.push(candidate);
             }
@@ -1653,6 +1652,10 @@ impl PublicationClosure for SqliteClosure {
     }
 
     fn probe_blobs(&self, keys: &[(ArtifactPlane, &str)]) -> Result<()> {
+        #[cfg(test)]
+        let started = Instant::now();
+        #[cfg(test)]
+        let mut queries = 0;
         let mut present = BTreeSet::new();
         for (plane_id, plane) in [ArtifactPlane::Semantic, ArtifactPlane::Callgraph]
             .into_iter()
@@ -1672,6 +1675,10 @@ impl PublicationClosure for SqliteClosure {
                     continue;
                 };
                 self.contains_blob(plane, first_valid)?;
+                #[cfg(test)]
+                {
+                    queries += 1;
+                }
                 let connections = self.connections.borrow();
                 let Some(connection) = connections.get(&(plane == ArtifactPlane::Semantic)) else {
                     continue;
@@ -1684,6 +1691,10 @@ impl PublicationClosure for SqliteClosure {
                     continue;
                 }
                 let sql = membership_query(decoded.len());
+                #[cfg(test)]
+                {
+                    queries += 1;
+                }
                 let mut statement = connection.prepare_cached(&sql)?;
                 for key in statement.query_map(rusqlite::params_from_iter(&decoded), |row| {
                     row.get::<_, Vec<u8>>(0)
@@ -1694,6 +1705,10 @@ impl PublicationClosure for SqliteClosure {
         }
         // Return the first missing key in manifest order, even though membership
         // reads are grouped by plane and sorted for index locality.
+        #[cfg(test)]
+        CLOSURE_PROBE_STATS.with(|stats| {
+            crate::blob_store::ProbeStats::add(stats, queries, started);
+        });
         for &(plane, key) in keys {
             let plane_id = usize::from(plane == ArtifactPlane::Callgraph);
             if decode_hex(key).is_none_or(|key| !present.contains(&(plane_id, key))) {

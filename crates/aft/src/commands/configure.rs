@@ -7592,7 +7592,8 @@ impl Drop for ConfigureTailStageGateGuard {
 }
 
 /// Hold the configure tail of `root` (its canonical path) when it reaches
-/// `stage`, a [`ConfigureMaintenanceStage`] label such as `"view_load"`. The
+/// `stage`, a [`ConfigureMaintenanceStage`] label such as `"view_load"`, or
+/// `"view_payload_check"` for the payload check inside the view load. The
 /// first receiver fires once the tail is held; a send on the returned sender
 /// lets it continue.
 #[cfg(test)]
@@ -7621,15 +7622,28 @@ pub(crate) fn gate_configure_tail_stage_for_test(
 
 #[cfg(test)]
 fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaintenanceStage) {
+    wait_on_configure_tail_gate_for_test(
+        root,
+        stage.label(),
+        matches!(stage, ConfigureMaintenanceStage::StorageSweeps),
+    );
+}
+
+/// Holds the caller while a test gate for `root` and `label` is installed:
+/// signals that the gate was reached, then waits for the release. With
+/// `test_release_only`, only the test may release it; otherwise a 60 s timer
+/// also does, so a failed test never leaves a worker parked for good.
+#[cfg(test)]
+fn wait_on_configure_tail_gate_for_test(root: &Path, label: &str, test_release_only: bool) {
     let gate = configure_tail_stage_gates()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
-        .find(|gate| gate.root == root && gate.stage == stage.label())
+        .find(|gate| gate.root == root && gate.stage == label)
         .map(|gate| (gate.reached.clone(), gate.release.clone()));
     if let Some((reached, release)) = gate {
         let _ = reached.try_send(());
-        if matches!(stage, ConfigureMaintenanceStage::StorageSweeps) {
+        if test_release_only {
             // Only the test may release the sweep: a timer must not let an
             // admission reply pass after the supposedly held worker resumes.
             let _ = release.recv();
@@ -8463,6 +8477,14 @@ fn open_view_runtime_for_configure(
         }
     }
     if let Some(manifest) = manifest.as_ref() {
+        // Tests hold the check here, under the label `view_payload_check`, to
+        // show that binds are answered while it runs.
+        #[cfg(test)]
+        wait_on_configure_tail_gate_for_test(
+            &job.canonical_cache_root,
+            "view_payload_check",
+            false,
+        );
         let check = view_payload_check(
             manifest,
             &callgraph_store,
@@ -11280,6 +11302,202 @@ mod tests {
             store.edge_snapshot().unwrap(),
             cold.edge_snapshot().unwrap()
         );
+    }
+
+    /// Measures, on a checkout of about AFT's size with both payload planes
+    /// populated, what the payload checks cost: the bind-time check of a
+    /// healthy store, and a one-file edit's publication split into the
+    /// assembly probe and the closure probe. Run in a release build:
+    /// `cargo test --release -p agent-file-tools --lib -- --ignored --nocapture
+    /// views_payload_probe_cost`.
+    #[test]
+    #[ignore = "measurement; run on demand in a release build"]
+    fn views_payload_probe_cost_on_a_5000_file_checkout() {
+        use crate::blob_store::{ProbeStats, MEMBERSHIP_PROBE_STATS};
+        use crate::views::assembly::CLOSURE_PROBE_STATS;
+        use std::collections::BTreeMap;
+        const FILES: usize = 5_000;
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        let path = |index: usize| format!("src/m{}/f{index}.rs", index / 100);
+        let body = |index: usize, revision: usize| {
+            format!(
+                "pub fn f{index}() -> usize {{ crate::m{}::f{}::f{}() + {revision} }}\n",
+                ((index + 1) % FILES) / 100,
+                (index + 1) % FILES,
+                (index + 1) % FILES
+            )
+        };
+        for index in 0..FILES {
+            let file = root.join(path(index));
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, body(index, 0)).unwrap();
+        }
+        init_git_fixture(&root);
+        let root = root.canonicalize().unwrap();
+        let family = crate::search_index::artifact_cache_key(&root);
+        let scope = crate::path_identity::project_scope_key(&root);
+        let semantic_keys = |root: &Path| {
+            let mut store = crate::blob_store::BlobStore::open(
+                &storage,
+                family.clone(),
+                crate::blob_store::BlobPlane::Semantic,
+            )
+            .unwrap();
+            (0..FILES)
+                .map(|index| {
+                    let rel = path(index);
+                    let key = crate::blob_store::SemanticKey::for_current(
+                        &fs::read(root.join(&rel)).unwrap(),
+                        rel.as_bytes(),
+                        "bench-model",
+                    )
+                    .full_key();
+                    store.put(&key, &[7_u8; 2048]).unwrap();
+                    (rel.into_bytes(), key.to_hex())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let request = |changed: BTreeSet<Vec<u8>>, semantic: BTreeMap<Vec<u8>, String>| {
+            crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: root.clone(),
+                family: family.clone(),
+                scope: scope.clone(),
+                desired_head: crate::views::assembly::head_tree_fingerprint(
+                    &crate::alias::head_tree_entries(&root).unwrap(),
+                ),
+                changed_paths: changed,
+                semantic_keys: semantic,
+                // tracked.rs has no semantic payload; it must not leave the
+                // publication pending.
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            }
+        };
+        let all_keys = semantic_keys(&root);
+        let started = Instant::now();
+        let initial =
+            crate::views::assembly::publish_checkout(&request(BTreeSet::new(), all_keys.clone()))
+                .unwrap();
+        assert!(initial.published && initial.pending_paths.is_empty());
+        eprintln!(
+            "setup: {FILES} files, full publication {} ms",
+            started.elapsed().as_millis()
+        );
+
+        // Bind-time check of a healthy store: the first run on fresh
+        // connections, then repeated runs.
+        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
+        let manifest = view
+            .load_manifest(&view.current_generation().unwrap().unwrap())
+            .unwrap();
+        let mut bind_runs = Vec::new();
+        for _ in 0..11 {
+            let callgraph = crate::blob_store::BlobStore::open(
+                &storage,
+                family.clone(),
+                crate::blob_store::BlobPlane::Callgraph,
+            )
+            .unwrap();
+            let semantic = crate::blob_store::BlobStore::open(
+                &storage,
+                family.clone(),
+                crate::blob_store::BlobPlane::Semantic,
+            )
+            .unwrap();
+            MEMBERSHIP_PROBE_STATS.with(|stats| stats.set(ProbeStats::default()));
+            let started = Instant::now();
+            let check = super::view_payload_check(
+                &manifest,
+                &callgraph,
+                &semantic,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            let elapsed = started.elapsed();
+            assert!(check.complete() && check.missing.is_empty());
+            // Every file has both keys; tracked.rs has only a call-graph key.
+            assert_eq!(check.total, FILES * 2 + 1);
+            bind_runs.push((elapsed, MEMBERSHIP_PROBE_STATS.with(|stats| stats.get())));
+        }
+        let first = bind_runs[0];
+        let mut warm = bind_runs[1..]
+            .iter()
+            .map(|(elapsed, _)| *elapsed)
+            .collect::<Vec<_>>();
+        warm.sort();
+        eprintln!(
+            "bind check, healthy, {} keys: first {:.2} ms ({} queries), median of 10 {:.2} ms ({} queries)",
+            FILES * 2 + 1,
+            first.0.as_secs_f64() * 1000.0,
+            first.1.queries,
+            warm[warm.len() / 2].as_secs_f64() * 1000.0,
+            bind_runs[1].1.queries,
+        );
+
+        // One-file edits. `live`: the caller passes every semantic key, as the
+        // legacy semantic flow does; `none`: it passes none, so every reused
+        // entry's semantic key is probed as well.
+        for (variant, pass_semantic) in [("live", true), ("none", false)] {
+            let mut runs = Vec::new();
+            for edit in 0..7 {
+                let index = edit * 701 % FILES + usize::from(!pass_semantic);
+                let rel = path(index);
+                fs::write(
+                    root.join(&rel),
+                    body(index, edit + 1 + 100 * usize::from(!pass_semantic)),
+                )
+                .unwrap();
+                let semantic = if pass_semantic {
+                    semantic_keys(&root)
+                } else {
+                    BTreeMap::new()
+                };
+                MEMBERSHIP_PROBE_STATS.with(|stats| stats.set(ProbeStats::default()));
+                CLOSURE_PROBE_STATS.with(|stats| stats.set(ProbeStats::default()));
+                let started = Instant::now();
+                let report = crate::views::assembly::publish_checkout(&request(
+                    BTreeSet::from([rel.into_bytes()]),
+                    semantic,
+                ))
+                .unwrap();
+                let total = started.elapsed();
+                assert!(report.published, "{report:?}");
+                runs.push((
+                    total,
+                    MEMBERSHIP_PROBE_STATS.with(|stats| stats.get()),
+                    CLOSURE_PROBE_STATS.with(|stats| stats.get()),
+                ));
+            }
+            // The first edit also pays for the first incremental patch.
+            let mut sorted = runs[1..].to_vec();
+            sorted.sort_by_key(|(total, _, _)| *total);
+            let (total, assembly, closure) = sorted[sorted.len() / 2];
+            let ms = |nanos: u128| nanos as f64 / 1_000_000.0;
+            eprintln!(
+                "one-file edit [{variant}] median of 6: publication {:.2} ms; assembly probe {:.2} ms ({} queries, {:.1}% of publication); closure probe {:.2} ms ({} queries)",
+                total.as_secs_f64() * 1000.0,
+                ms(assembly.nanos),
+                assembly.queries,
+                ms(assembly.nanos) * 100.0 / (total.as_secs_f64() * 1000.0),
+                ms(closure.nanos),
+                closure.queries,
+            );
+            for (run, (total, assembly, closure)) in runs.iter().enumerate() {
+                eprintln!(
+                    "  [{variant}] edit {run}: publication {:.2} ms, assembly probe {:.2} ms/{}q, closure probe {:.2} ms/{}q",
+                    total.as_secs_f64() * 1000.0,
+                    ms(assembly.nanos),
+                    assembly.queries,
+                    ms(closure.nanos),
+                    closure.queries
+                );
+            }
+        }
     }
 
     /// A missing payload whose file changed since the view was published is

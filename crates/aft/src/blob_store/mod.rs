@@ -36,6 +36,30 @@ thread_local! {
     pub(crate) static PAYLOAD_READ_COUNTS: std::cell::Cell<PayloadReadCounts> = const {
         std::cell::Cell::new(PayloadReadCounts { bytes: 0, blake3_calls: 0 })
     };
+    /// Membership queries [`BlobStore::missing_hex_keys`] ran on this thread,
+    /// and how long they took in total.
+    pub(crate) static MEMBERSHIP_PROBE_STATS: std::cell::Cell<ProbeStats> = const {
+        std::cell::Cell::new(ProbeStats { queries: 0, nanos: 0 })
+    };
+}
+
+/// Counts and total time of the membership queries one probe path ran.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProbeStats {
+    pub queries: usize,
+    pub nanos: u128,
+}
+
+#[cfg(test)]
+impl ProbeStats {
+    pub(crate) fn add(cell: &std::cell::Cell<Self>, queries: usize, started: std::time::Instant) {
+        let current = cell.get();
+        cell.set(Self {
+            queries: current.queries + queries,
+            nanos: current.nanos + started.elapsed().as_nanos(),
+        });
+    }
 }
 
 /// The SQLite busy wait used by every blob-store connection.
@@ -689,6 +713,8 @@ impl BlobStore {
                 .collect::<Vec<_>>();
             let mut present = std::collections::BTreeSet::new();
             if !decoded.is_empty() {
+                #[cfg(test)]
+                let started = std::time::Instant::now();
                 let sql = format!(
                     "SELECT full_key FROM blob_payloads INDEXED BY blob_membership
                      WHERE full_key IN ({})",
@@ -702,6 +728,8 @@ impl BlobStore {
                 for key in rows {
                     present.insert(key?);
                 }
+                #[cfg(test)]
+                MEMBERSHIP_PROBE_STATS.with(|stats| ProbeStats::add(stats, 1, started));
             }
             for key in batch {
                 let stored = v2::parse_hex32(key).is_some_and(|bytes| present.contains(&bytes[..]));
