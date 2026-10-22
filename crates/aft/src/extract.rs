@@ -44,52 +44,50 @@ pub fn detect_free_variables(
 ) -> FreeVariableResult {
     let root = tree.root_node();
 
-    // 1. Collect all identifiers referenced in the range (excluding property access)
-    let mut references: Vec<String> = Vec::new();
-    collect_identifier_refs(&root, source, start_byte, end_byte, lang, &mut references);
-
-    // 2. Collect declarations within the range (these are locals, not free)
-    let mut local_decls: HashSet<String> = HashSet::new();
-    collect_declarations_in_range(&root, source, start_byte, end_byte, lang, &mut local_decls);
-
-    // 3. Find the enclosing function scope boundary
-    let enclosing_fn = find_enclosing_function(&root, start_byte, lang);
-
-    // 4. Collect declarations in the enclosing function but outside the range
-    let mut enclosing_decls: HashSet<String> = HashSet::new();
-    if let Some(fn_node) = enclosing_fn {
-        collect_declarations_in_range(
-            &fn_node,
-            source,
-            fn_node.start_byte(),
-            start_byte, // only before the range
-            lang,
-            &mut enclosing_decls,
-        );
-        // Also collect function parameters
-        collect_function_params(&fn_node, source, lang, &mut enclosing_decls);
+    let mut references = Vec::new();
+    collect_reference_nodes(&root, start_byte, end_byte, lang, &mut references);
+    let mut bindings = Vec::new();
+    collect_scoped_bindings(&root, source, lang, &mut bindings);
+    let mut bindings_by_name = std::collections::HashMap::<&str, Vec<&ScopedBinding>>::new();
+    for binding in &bindings {
+        bindings_by_name
+            .entry(&binding.name)
+            .or_default()
+            .push(binding);
     }
-
-    // 5. Check for this/self
     let has_this_or_self = check_this_or_self(&root, source, start_byte, end_byte, lang);
-
-    // 6. Classify: a reference is a parameter if it's not a local decl,
-    //    IS declared in the enclosing function scope, and is not module-level.
     let mut seen = HashSet::new();
     let mut parameters = Vec::new();
-    for name in &references {
-        if local_decls.contains(name) {
+    for reference in references {
+        let name = node_text(source, &reference);
+        if is_keyword(name, lang) || is_binding_identifier(&reference) {
             continue;
         }
-        if !seen.insert(name.clone()) {
-            continue; // dedup
+        let Some(candidates) = bindings_by_name.get(name) else {
+            continue;
+        };
+        let binding = candidates
+            .iter()
+            .filter(|binding| {
+                binding.scope_start <= reference.start_byte()
+                    && reference.end_byte() <= binding.scope_end
+                    && (binding.hoisted || binding.declaration <= reference.start_byte())
+            })
+            .min_by_key(|binding| {
+                (
+                    binding.scope_end - binding.scope_start,
+                    std::cmp::Reverse(binding.declaration),
+                )
+            });
+        if let Some(binding) = binding {
+            if !binding.module_scope
+                && !(start_byte <= binding.declaration && binding.declaration < end_byte)
+                && seen.insert(name.to_string())
+            {
+                parameters.push(name.to_string());
+            }
         }
-        if enclosing_decls.contains(name) {
-            parameters.push(name.clone());
-        }
-        // If not in enclosing_decls, it's module-level or global — skip
     }
-
     FreeVariableResult {
         parameters,
         has_this_or_self,
@@ -233,6 +231,137 @@ fn is_keyword(name: &str, lang: LangId) -> bool {
     }
 }
 
+#[derive(Debug)]
+struct ScopedBinding {
+    name: String,
+    declaration: usize,
+    scope_start: usize,
+    scope_end: usize,
+    module_scope: bool,
+    hoisted: bool,
+}
+
+fn collect_reference_nodes<'a>(
+    node: &Node<'a>,
+    start: usize,
+    end: usize,
+    lang: LangId,
+    out: &mut Vec<Node<'a>>,
+) {
+    if node.end_byte() <= start || node.start_byte() >= end {
+        return;
+    }
+    if matches!(node.kind(), "identifier" | "shorthand_property_identifier")
+        && start <= node.start_byte()
+        && node.end_byte() <= end
+        && !is_property_access(node, lang)
+    {
+        out.push(*node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_reference_nodes(&child, start, end, lang, out);
+    }
+}
+
+fn declaration_patterns<'a>(node: &Node<'a>, lang: LangId) -> Vec<Node<'a>> {
+    if matches!(node.kind(), "for_in_statement" | "for_of_statement")
+        && node.child_by_field_name("kind").is_none()
+    {
+        // A loop assignment reuses its existing binding; it does not declare
+        // a new block-local name that could shadow a module variable.
+        return Vec::new();
+    }
+    let field = match (lang, node.kind()) {
+        (
+            _,
+            "variable_declarator"
+            | "function_declaration"
+            | "function_expression"
+            | "function_definition"
+            | "class_declaration"
+            | "class_definition",
+        ) => "name",
+        (LangId::Python, "assignment" | "for_statement") => "left",
+        (LangId::Python, "as_pattern") => "alias",
+        (_, "for_in_statement" | "for_of_statement") => "left",
+        (_, "catch_clause") => "parameter",
+        _ => return Vec::new(),
+    };
+    node.child_by_field_name(field).into_iter().collect()
+}
+
+fn binding_scope<'a>(node: &Node<'a>, lang: LangId) -> Node<'a> {
+    if node.kind() == "function_expression" {
+        return *node;
+    }
+    let function_scoped = lang == LangId::Python
+        || node
+            .child_by_field_name("kind")
+            .is_some_and(|kind| kind.kind() == "var")
+        || (node.kind() == "variable_declarator"
+            && js_declaration_kind_for_declarator(node) == JsDeclarationKind::Var);
+    if matches!(
+        node.kind(),
+        "catch_clause" | "for_in_statement" | "for_of_statement"
+    ) && !function_scoped
+    {
+        return *node;
+    }
+    let mut scope = node.parent().unwrap_or(*node);
+    loop {
+        if is_function_scope_node(&scope, lang)
+            || (!function_scoped
+                && matches!(
+                    scope.kind(),
+                    "statement_block"
+                        | "for_statement"
+                        | "for_in_statement"
+                        | "for_of_statement"
+                        | "catch_clause"
+                ))
+            || scope.parent().is_none()
+        {
+            return scope;
+        }
+        scope = scope.parent().unwrap();
+    }
+}
+
+fn collect_scoped_bindings(node: &Node, source: &str, lang: LangId, out: &mut Vec<ScopedBinding>) {
+    for pattern in declaration_patterns(node, lang) {
+        let scope = binding_scope(node, lang);
+        for name in collect_binding_pattern_names(source, &pattern, lang) {
+            out.push(ScopedBinding {
+                name,
+                declaration: pattern.start_byte(),
+                scope_start: scope.start_byte(),
+                scope_end: scope.end_byte(),
+                module_scope: scope.parent().is_none(),
+                hoisted: matches!(node.kind(), "function_declaration" | "function_definition"),
+            });
+        }
+    }
+    if is_function_scope_node(node, lang) {
+        let mut names = HashSet::new();
+        collect_function_params(node, source, lang, &mut names);
+        for name in names {
+            out.push(ScopedBinding {
+                name,
+                declaration: node.start_byte(),
+                scope_start: node.start_byte(),
+                scope_end: node.end_byte(),
+                module_scope: false,
+                hoisted: true,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_scoped_bindings(&child, source, lang, out);
+    }
+}
+
 /// Collect names declared (via variable declarations) within a byte range.
 fn collect_declarations_in_range(
     node: &Node,
@@ -246,33 +375,10 @@ fn collect_declarations_in_range(
         return;
     }
 
-    let kind = node.kind();
-
-    match lang {
-        LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
-            // variable_declarator has a "name" child that is the declared identifier
-            if kind == "variable_declarator" {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    if name_node.start_byte() >= start_byte && name_node.end_byte() <= end_byte {
-                        out.insert(node_text(source, &name_node).to_string());
-                    }
-                }
-            }
+    for pattern in declaration_patterns(node, lang) {
+        if start_byte <= pattern.start_byte() && pattern.end_byte() <= end_byte {
+            out.extend(collect_binding_pattern_names(source, &pattern, lang));
         }
-        LangId::Python => {
-            // assignment: left side
-            if kind == "assignment" {
-                if let Some(left) = node.child_by_field_name("left") {
-                    if left.kind() == "identifier"
-                        && left.start_byte() >= start_byte
-                        && left.end_byte() <= end_byte
-                    {
-                        out.insert(node_text(source, &left).to_string());
-                    }
-                }
-            }
-        }
-        _ => {}
     }
 
     // Recurse
@@ -342,21 +448,29 @@ fn collect_param_identifiers(
                     if child.kind() == "required_parameter" || child.kind() == "optional_parameter"
                     {
                         if let Some(pattern) = child.child_by_field_name("pattern") {
-                            if pattern.kind() == "identifier" {
-                                out.insert(node_text(source, &pattern).to_string());
-                            }
+                            out.extend(collect_binding_pattern_names(source, &pattern, lang));
                         }
-                    } else if child.kind() == "identifier" {
-                        out.insert(node_text(source, &child).to_string());
+                    } else {
+                        out.extend(collect_binding_pattern_names(source, &child, lang));
                     }
                 }
                 LangId::Python => {
-                    if child.kind() == "identifier" {
-                        let name = node_text(source, &child).to_string();
-                        // Skip `self` parameter
-                        if name != "self" {
-                            out.insert(name);
+                    let binding = match child.kind() {
+                        "default_parameter" | "typed_default_parameter" => {
+                            child.child_by_field_name("name")
                         }
+                        "typed_parameter" => child.named_child(0),
+                        "identifier" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+                            Some(child)
+                        }
+                        _ => None,
+                    };
+                    if let Some(binding) = binding {
+                        out.extend(
+                            collect_binding_pattern_names(source, &binding, lang)
+                                .into_iter()
+                                .filter(|name| name != "self"),
+                        );
                     }
                 }
                 _ => {}
@@ -818,8 +932,15 @@ fn collect_binding_pattern_names(source: &str, node: &Node, lang: LangId) -> Vec
                     }
                 }
             }
-            "pattern_list" | "tuple_pattern" | "list_pattern" | "list" | "tuple"
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "list"
+            | "tuple"
             | "starred_expression"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "as_pattern_target"
                 if lang == LangId::Python =>
             {
                 for index in 0..node.named_child_count() as u32 {
@@ -980,15 +1101,9 @@ fn generate_ts_function(
         base_indent, name, params_str
     ));
 
-    // Re-indent body to be inside the function while preserving relative nesting.
-    let common_indent = common_leading_indent(body_text);
-    for line in body_text.lines() {
-        if line.trim().is_empty() {
-            lines.push(String::new());
-        } else {
-            let body_line = strip_leading_indent(line, &common_indent);
-            lines.push(format!("{}{}{}", base_indent, indent_unit, body_line));
-        }
+    let body = reindent_body(body_text, base_indent, indent_unit, LangId::TypeScript);
+    if !body.is_empty() {
+        lines.push(body);
     }
 
     // Add return statement if needed
@@ -1018,7 +1133,7 @@ fn generate_ts_function(
     }
 
     lines.push(format!("{}}}", base_indent));
-    lines.join("\n")
+    lines.join(crate::indent::source_line_ending(body_text))
 }
 
 fn generate_py_function(
@@ -1034,15 +1149,9 @@ fn generate_py_function(
 
     lines.push(format!("{}def {}({}):", base_indent, name, params_str));
 
-    // Re-indent body while preserving relative nesting.
-    let common_indent = common_leading_indent(body_text);
-    for line in body_text.lines() {
-        if line.trim().is_empty() {
-            lines.push(String::new());
-        } else {
-            let body_line = strip_leading_indent(line, &common_indent);
-            lines.push(format!("{}{}{}", base_indent, indent_unit, body_line));
-        }
+    let body = reindent_body(body_text, base_indent, indent_unit, LangId::Python);
+    if !body.is_empty() {
+        lines.push(body);
     }
 
     // Add return statement if needed
@@ -1068,7 +1177,61 @@ fn generate_py_function(
         ReturnKind::Void => {}
     }
 
-    lines.join("\n")
+    lines.join(crate::indent::source_line_ending(body_text))
+}
+
+/// Interior rows of multiline literals contain data, not syntactic indentation.
+/// Keep those rows byte-for-byte while moving only the surrounding code.
+fn reindent_body(body: &str, base: &str, unit: &str, lang: LangId) -> String {
+    fn protect(node: &Node, protected: &mut HashSet<usize>) {
+        if matches!(node.kind(), "string" | "template_string")
+            && node.start_position().row < node.end_position().row
+        {
+            protected.extend(node.start_position().row + 1..=node.end_position().row);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            protect(&child, protected);
+        }
+    }
+    let mut protected = HashSet::new();
+    if let Ok(tree) =
+        crate::parser::parse_source_with_cached_parser(std::path::Path::new("body"), body, lang)
+    {
+        protect(&tree.root_node(), &mut protected);
+    }
+    let code_lines = body
+        .lines()
+        .enumerate()
+        .filter(|(row, _)| !protected.contains(row))
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let common = common_leading_indent(&code_lines);
+    let mut result = String::new();
+    let mut rows = body.split_inclusive('\n').enumerate().peekable();
+    while let Some((row, segment)) = rows.next() {
+        let ending = if segment.ends_with("\r\n") {
+            "\r\n"
+        } else if segment.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let line = &segment[..segment.len() - ending.len()];
+        if protected.contains(&row) {
+            result.push_str(line);
+        } else if !line.trim().is_empty() {
+            result.push_str(base);
+            result.push_str(unit);
+            result.push_str(strip_leading_indent(line, &common));
+        }
+        if rows.peek().is_some() {
+            result.push_str(ending);
+        }
+    }
+    result
 }
 
 fn common_leading_indent(text: &str) -> String {
@@ -2205,5 +2368,115 @@ class UserService:
         let map = std::collections::HashMap::new();
         let result = substitute_params(body, &map, LangId::TypeScript);
         assert_eq!(result, body);
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+    use std::path::Path;
+
+    fn free_variables(source: &str, selected: &str, lang: LangId) -> Vec<String> {
+        let path = Path::new(if lang == LangId::Python {
+            "a.py"
+        } else {
+            "a.ts"
+        });
+        let tree = crate::parser::parse_source_with_cached_parser(path, source, lang).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let start = source.find(selected).unwrap();
+        detect_free_variables(source, &tree, start, start + selected.len(), lang).parameters
+    }
+
+    #[test]
+    fn python_typed_default_and_splat_parameters_are_bindings() {
+        let source = "def outer(a: Kind, b=default_value, *args: Kind, c: Kind=other, **kwargs: Kind):\r\n    consume(a, b, args, c, kwargs, Kind, default_value, other)\r\n";
+        let selected = "consume(a, b, args, c, kwargs, Kind, default_value, other)";
+        let params = free_variables(source, selected, LangId::Python);
+        assert_eq!(params, ["a", "b", "args", "c", "kwargs"]);
+        let generated = generate_extracted_function(
+            "helper",
+            &params,
+            &ReturnKind::Void,
+            "    consume(a, b, args, c, kwargs)",
+            "",
+            LangId::Python,
+            IndentStyle::Spaces(4),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.py");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"def helper(a, b, args, c, kwargs):\n    consume(a, b, args, c, kwargs)"
+        );
+    }
+
+    #[test]
+    fn destructuring_and_scoped_local_binders_are_parameters() {
+        for (source, selected, lang, expected) in [
+            ("function outer(input) { const {key: renamed, other, ...rest} = input; consume(renamed, other, rest); }", "consume(renamed, other, rest)", LangId::TypeScript, vec!["renamed", "other", "rest"]),
+            ("function outer(xs) { for (const [a,b] of xs) { consume(a, b); } }", "consume(a, b)", LangId::TypeScript, vec!["a", "b"]),
+            ("function outer(xs) { for (var item of xs) {} consume(item); }", "consume(item)", LangId::TypeScript, vec!["item"]),
+            ("let item; function outer(xs) { for (item of xs) { consume(item); } }", "consume(item)", LangId::TypeScript, vec![]),
+            ("function outer() { const value = function self() { consume(self); }; }", "consume(self)", LangId::TypeScript, vec!["self"]),
+            ("function outer() { try {} catch ({message}) { consume(message); } }", "consume(message)", LangId::TypeScript, vec!["message"]),
+            ("function outer() { function helper() {} consume(helper); }", "consume(helper)", LangId::TypeScript, vec!["helper"]),
+            ("def outer(xs):\n    a, b = xs\n    consume(a, b)\n", "consume(a, b)", LangId::Python, vec!["a", "b"]),
+            ("def outer(xs):\n    for a, b in xs:\n        consume(a, b)\n", "consume(a, b)", LangId::Python, vec!["a", "b"]),
+            ("def outer():\n    with open('x') as handle:\n        consume(handle)\n", "consume(handle)", LangId::Python, vec!["handle"]),
+            ("def outer():\n    try:\n        work()\n    except Error as error:\n        consume(error)\n", "consume(error)", LangId::Python, vec!["error"]),
+            ("function outer() { function nested() { const hidden = 1; } consume(hidden); }", "consume(hidden)", LangId::TypeScript, vec![]),
+            ("function outer() { { let hidden = 1; } consume(hidden); }", "consume(hidden)", LangId::TypeScript, vec![]),
+        ] {
+            assert_eq!(free_variables(source, selected, lang), expected, "{source}");
+        }
+        let source = "function outer(input) { const {key: renamed, other, ...rest} = input; consume(renamed, other, rest); }";
+        let params = free_variables(source, "consume(renamed, other, rest)", LangId::TypeScript);
+        let generated = generate_extracted_function(
+            "helper",
+            &params,
+            &ReturnKind::Void,
+            "    consume(renamed, other, rest);",
+            "",
+            LangId::TypeScript,
+            IndentStyle::Spaces(4),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"function helper(renamed, other, rest) {\n    consume(renamed, other, rest);\n}"
+        );
+    }
+
+    #[test]
+    fn multiline_literal_interiors_and_crlf_survive_reindentation() {
+        for (body, lang, expected) in [
+            ("    const value = `first\r\n  literal\r\n\r\nlast`;\r\n    consume(value);", LangId::TypeScript, "function helper() {\r\n    const value = `first\r\n  literal\r\n\r\nlast`;\r\n    consume(value);\r\n}"),
+            ("    value = '''first\r\n  literal\r\n\r\nlast'''\r\n    consume(value)", LangId::Python, "def helper():\r\n    value = '''first\r\n  literal\r\n\r\nlast'''\r\n    consume(value)"),
+        ] {
+            let generated = generate_extracted_function("helper", &[], &ReturnKind::Void, body, "", lang, IndentStyle::Spaces(4));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("out.txt");
+            let config = crate::config::Config { format_on_edit: false, ..Default::default() };
+            crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({})).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+        }
     }
 }
