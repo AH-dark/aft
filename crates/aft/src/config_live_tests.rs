@@ -403,6 +403,32 @@ fn repaired_user_config_with_new_text_turns_caches_back_on_and_keeps_deferred_ke
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unchanged_symlinked_cache_dir_is_not_reported_deferred_on_reload() {
+    // The running config holds the directory a symlinked `storage.cache_dir`
+    // resolved to; the file still names the link. A reload that leaves the
+    // setting alone must not list it as waiting for the next connect.
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("cache-target");
+    std::fs::create_dir(&target).unwrap();
+    let link = temp.path().join("cache-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let user = |extra: &str| {
+        json!({"storage": {"cache_dir": link}, "format_on_edit": extra == "on"}).to_string()
+    };
+    let fixture = Fixture::new(&user("off"), None);
+    assert_eq!(
+        fixture.ctx.config().cache_dir,
+        Some(std::fs::canonicalize(&target).unwrap()),
+        "the running config holds the resolved directory, not the link"
+    );
+    write(&fixture.user_path, &user("on"));
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["format_on_edit"]);
+    assert!(deferred(&outcome).is_empty(), "{outcome:?}");
+}
+
 #[test]
 fn invalid_unrelated_user_edit_live_keeps_caches_on() {
     let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
