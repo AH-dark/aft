@@ -272,6 +272,59 @@ fn cache_root_doctor_process_scan_timeout_is_reported() {
     );
 }
 
+/// Every path under `root`, so a test can show a run created nothing.
+#[cfg(unix)]
+fn tree(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() && !path.is_symlink() {
+                pending.push(path.clone());
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// On a fresh install there is no storage root: the repair succeeds, cache
+/// cleanup reports nothing to clean, and no storage folder is created.
+#[cfg(unix)]
+#[test]
+fn cache_root_doctor_fresh_install_without_storage_succeeds_and_creates_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    // No daemon is listed, so a scan (if one ran) could not refuse.
+    let path = process_snapshot_fixture(temp.path(), "");
+    let before = tree(temp.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    command
+        .arg("fix-config")
+        .current_dir(&home)
+        .env("PATH", path)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
+        .env_remove("AFT_STORAGE_DIR");
+    let output = BoundedChild::spawn(&mut command, "aft fix-config on a fresh install")
+        .output(CHILD_TIMEOUT);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["cache_cleanup"]["error"].is_null(), "{report}");
+    assert_eq!(report["cache_cleanup"]["removed"], serde_json::json!([]));
+    assert_eq!(
+        tree(temp.path()),
+        before,
+        "fix-config created files: {report}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cache_root_doctor_prelease_process_snapshot_refuses_cleanup() {

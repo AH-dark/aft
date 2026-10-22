@@ -2106,6 +2106,15 @@ pub fn reclaim_configured_inactive_caches(
             ..Default::default()
         };
     }
+    // A fresh install has no storage root yet, so there is nothing to clean.
+    // Report that rather than failing in the cleanup lease, and do not create
+    // the root just to clean it.
+    match fs::symlink_metadata(storage) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return CleanupReport::default();
+        }
+        _ => {}
+    }
     let mut config = result.config;
     config.storage_dir = Some(storage.to_path_buf());
     let _cleanup_lease = match acquire_cache_cleanup_lease(storage) {
