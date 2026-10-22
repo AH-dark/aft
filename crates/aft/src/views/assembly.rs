@@ -1866,10 +1866,11 @@ fn missing_callgraph_payload(
 }
 
 /// The path-status reason recorded for a path left out of a generation because
-/// its call-graph payload was missing from the family blob store and the file
-/// could not be read to extract it again.
+/// its call-graph payload was missing from the family blob store and could not
+/// be rebuilt from the working tree: the file is unreadable, or the entry is
+/// synthetic and has no file.
 pub const MISSING_PAYLOAD_SOURCE_UNREADABLE: &str =
-    "callgraph payload missing from the blob store and the source file is unreadable";
+    "callgraph payload missing from the blob store and the source could not be read";
 
 /// Turns working-tree files into manifest candidates for one assembly.
 struct CandidateReader<'a> {
@@ -1998,9 +1999,9 @@ struct HealOutcome {
 /// unchanged key, is not extracted: its payload is taken to be stored. Rows can
 /// still be gone. A store that SQLite reports as corrupt is moved aside and
 /// recreated empty when it is opened, and an operator can delete a store while
-/// the daemon is stopped. Publishing such a candidate would name a missing key,
-/// the publication's closure check would refuse it on every retry, and the view
-/// would stop following edits for good.
+/// the daemon is stopped. Without this repair, such a candidate would name a
+/// missing key, the publication's closure check would refuse it on every
+/// retry, and the view would stop following edits for good.
 ///
 /// This checks those keys in one batched index probe per plane, without
 /// reading payloads, and repairs only the candidates whose rows are gone:
@@ -2150,7 +2151,7 @@ fn heal_missing_payloads(
     }
     *candidates = healed;
     log::info!(
-        "view payloads missing from the blob store were repaired root={} callgraph_missing={} reextracted={} callgraph_dropped={} unreadable={} semantic_missing={} semantic_replaced={} semantic_dropped={}",
+        "view payloads missing from the blob store handled root={} callgraph_missing={} reextracted={} callgraph_dropped={} unreadable={} semantic_missing={} semantic_replaced={} semantic_dropped={}",
         request.project_root.display(),
         callgraph_missing.len(),
         outcome.reextracted,
@@ -2516,7 +2517,8 @@ mod payload_heal_tests {
     /// A semantic key carried over from the previous manifest whose payload
     /// is gone is replaced by the key the caller just stored for the path, or
     /// dropped when there is none, leaving the path pending for semantic work.
-    /// The publication never names the missing key and never fails over it.
+    /// The publication does not name the missing key, so its closure check
+    /// does not fail.
     #[test]
     fn views_missing_semantic_payload_is_replaced_or_dropped_not_published() {
         let project = tempfile::tempdir().unwrap();
@@ -2529,8 +2531,7 @@ mod payload_heal_tests {
         git(project.path(), &["commit", "--quiet", "-m", "base"]);
         let family = "semantic-heal-family";
         let put = |model: &str| {
-            let key =
-                crate::blob_store::SemanticKey::for_current(lib, b"lib.rs", model).full_key();
+            let key = crate::blob_store::SemanticKey::for_current(lib, b"lib.rs", model).full_key();
             BlobStore::open(storage.path(), family, BlobPlane::Semantic)
                 .unwrap()
                 .put(&key, b"vector")

@@ -1196,10 +1196,7 @@ mod tests {
         let mut store = BlobStore::open(dir.path(), "presence", BlobPlane::Callgraph).unwrap();
         // More than one batch, every other key stored.
         let keys = (0..(MEMBERSHIP_BATCH * 2 + 7))
-            .map(|index| {
-                CallgraphKey::for_current(&index.to_le_bytes(), "rust")
-                    .full_key()
-            })
+            .map(|index| CallgraphKey::for_current(&index.to_le_bytes(), "rust").full_key())
             .collect::<Vec<_>>();
         for key in keys.iter().step_by(2) {
             store.put(key, b"payload").unwrap();
@@ -1232,7 +1229,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        assert!(!expired.complete(), "an expired budget is not a clean check");
+        assert!(
+            !expired.complete(),
+            "an expired budget is not a clean check"
+        );
         assert_eq!(expired.checked, 0);
         assert!(expired.missing.is_empty());
     }

@@ -103,9 +103,9 @@ impl PublicationRetry {
             reason: kind.as_str(),
             repeat_count: self.failures,
             error: self.error.clone().unwrap_or_default(),
-            next_retry_ms: self.due.map(|due| {
-                due.saturating_duration_since(Instant::now()).as_millis() as u64
-            }),
+            next_retry_ms: self
+                .due
+                .map(|due| due.saturating_duration_since(Instant::now()).as_millis() as u64),
         })
     }
 

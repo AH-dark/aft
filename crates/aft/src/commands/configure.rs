@@ -8244,12 +8244,13 @@ impl ViewPayloadCheck {
     }
 }
 
-/// Checks that every payload key `manifest` names is still stored, stopping
-/// at `deadline`. A manifest naming a missing key cannot be republished: each
-/// later publication would fail its closure check. Rows go missing when a
-/// corrupt store is moved aside and recreated empty, or when a store is
-/// deleted while the daemon is stopped. Paths found here are scheduled for a
-/// publication, which extracts their payloads again from the working tree.
+/// Checks that every payload key `manifest` names is still stored, starting
+/// no new batch after `deadline`. Rows go missing when a corrupt store is
+/// moved aside and recreated empty, or when a store is deleted while the
+/// daemon is stopped. Until a publication repairs them, the served generation
+/// keeps naming the missing keys. Paths found here are scheduled for a
+/// publication, which extracts missing call-graph payloads again from the
+/// working tree and replaces or drops missing semantic keys.
 fn view_payload_check(
     manifest: &crate::views::Manifest,
     callgraph: &crate::blob_store::BlobStore,
@@ -8472,7 +8473,7 @@ fn open_view_runtime_for_configure(
             Ok(check) => {
                 if !check.complete() {
                     slog_info!(
-                        "content-addressed view payload check incomplete checked={} of {} keys root={}; a missing payload, if any, is extracted again by the next publication",
+                        "content-addressed view payload check incomplete checked={} of {} keys root={}; missing payloads, if any, are repaired by the next publication",
                         check.checked,
                         check.total,
                         job.canonical_cache_root.display()
@@ -8480,7 +8481,7 @@ fn open_view_runtime_for_configure(
                 }
                 if !check.missing.is_empty() {
                     slog_warn!(
-                        "content-addressed view names payloads missing from the blob store paths={} checked={} of {} keys root={}; scheduling a publication to extract them again",
+                        "content-addressed view names payloads missing from the blob store paths={} checked={} of {} keys root={}; scheduling a publication to repair them",
                         check.missing.len(),
                         check.checked,
                         check.total,
@@ -11312,8 +11313,16 @@ mod tests {
             Some(new_tracked_key.as_str()),
             "the changed file is published under its current content's key"
         );
-        assert!(blob_removal_has_payload(&storage, &family, &new_tracked_key));
-        assert!(!blob_removal_has_payload(&storage, &family, &old_tracked_key));
+        assert!(blob_removal_has_payload(
+            &storage,
+            &family,
+            &new_tracked_key
+        ));
+        assert!(!blob_removal_has_payload(
+            &storage,
+            &family,
+            &old_tracked_key
+        ));
         let (callers_after_edit, _) = blob_removal_answers(&ctx);
         assert!(
             callers_after_edit.contains("second"),
@@ -11329,9 +11338,11 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let (_temp, root, storage, family, _ctx) = blob_heal_running_fixture();
-        let view =
-            crate::views::ViewStore::open(&storage, &crate::path_identity::project_scope_key(&root))
-                .unwrap();
+        let view = crate::views::ViewStore::open(
+            &storage,
+            &crate::path_identity::project_scope_key(&root),
+        )
+        .unwrap();
         let manifest = view
             .load_manifest(&view.current_generation().unwrap().unwrap())
             .unwrap();
@@ -11360,7 +11371,10 @@ mod tests {
             check.missing.keys().cloned().collect::<Vec<_>>(),
             vec![b"lib.rs".to_vec(), b"tracked.rs".to_vec()]
         );
-        assert!(check.missing.values().all(|input| input.plane == "callgraph"));
+        assert!(check
+            .missing
+            .values()
+            .all(|input| input.plane == "callgraph"));
 
         let exhausted = super::view_payload_check(
             &manifest,

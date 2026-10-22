@@ -1,0 +1,1 @@
+- When a checkout's stored call-graph or semantic data goes missing (a damaged store that AFT moves aside, or one removed while AFT was stopped), AFT now rebuilds the missing entries from your files instead of leaving that checkout's call graph frozen. A view whose updates keep failing is reported in health.

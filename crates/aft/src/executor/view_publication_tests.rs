@@ -90,7 +90,9 @@ fn persistent_missing_payload_failures_keep_logging_and_report_a_typed_reason() 
         assert_eq!(retry.suppressed, 0);
     }
 
-    let failure = retry.failure_snapshot().expect("a failing streak is reported");
+    let failure = retry
+        .failure_snapshot()
+        .expect("a failing streak is reported");
     assert_eq!(failure.reason, "missing_payload");
     assert_eq!(failure.repeat_count, 6);
     assert_eq!(failure.error, error);
