@@ -125,8 +125,17 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 && crate::grep_executor::target_is_ignored(root)
         })
         .collect::<Vec<_>>();
+    let mut named_ignored_roots = Vec::new();
+    for root in &search_roots {
+        match named_ignored_root(req, ctx, root, pattern) {
+            Ok(named) => named_ignored_roots.push(named),
+            Err(refusal) => return refusal,
+        }
+    }
+    let has_named_ignored_root = named_ignored_roots.iter().any(Option::is_some);
     let parent_answer = if crate::context::confinement::active()
         || ignored_targets.iter().any(|ignored| *ignored)
+        || has_named_ignored_root
     {
         None
     } else {
@@ -157,7 +166,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             0,
         )
     } else if search_roots.len() == 1 {
-        let discovery = glob_root(
+        let discovery = discover_glob_root(
+            named_ignored_roots[0].as_deref(),
             ctx,
             &project_root,
             &search_roots[0],
@@ -185,8 +195,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let discoveries: Vec<GlobDiscovery> = search_roots
             .iter()
             .zip(&ignored_targets)
-            .map(|(root, ignored)| {
-                glob_root(
+            .zip(&named_ignored_roots)
+            .map(|((root, ignored), named)| {
+                discover_glob_root(
+                    named.as_deref(),
                     ctx,
                     &project_root,
                     root,
@@ -275,6 +287,9 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
+    if has_named_ignored_root {
+        body["walk_entries_examined"] = serde_json::json!(entries_visited);
+    }
     if walk_time_limit_reached {
         body["walk_entries_examined"] = serde_json::json!(entries_visited);
         body["text"] = serde_json::Value::String(format!(
@@ -282,7 +297,14 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             body["text"].as_str().unwrap_or_default(),
         ));
     }
-    if !scope_has_files {
+    if !scope_has_files && has_named_ignored_root {
+        // The prefix walk already examined this scope. Probing the original
+        // root would count the overridden ignore rule instead of those entries.
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(0 files searched: no files matched the pattern in the named folder scope; nothing was searched.)",
+            body["text"].as_str().unwrap_or_default(),
+        ));
+    } else if !scope_has_files {
         let counts = {
             let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
             search_roots.iter().zip(&ignored_targets).try_fold(
@@ -298,7 +320,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n{}",
             body["text"].as_str().unwrap_or_default(),
-            counts.map(|counts| counts.empty_note(true)).unwrap_or_else(|| {
+            counts.map(|counts| counts.empty_glob_note()).unwrap_or_else(|| {
                 "(0 files searched: the bounded walk could not determine why no files matched the scope; nothing was searched.)".to_string()
             })
         ));
@@ -372,6 +394,116 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     Response::success(&req.id, body)
+}
+
+fn named_ignored_root(
+    req: &RawRequest,
+    ctx: &AppContext,
+    search_root: &Path,
+    pattern: &str,
+) -> Result<Option<PathBuf>, Response> {
+    let Some((folders, _)) = pattern.rsplit_once('/') else {
+        return Ok(None);
+    };
+    let mut prefix = PathBuf::new();
+    // The final component is a filename pattern, even when it is literal.
+    for segment in folders.split('/') {
+        if segment.contains(['*', '?', '[', ']', '{', '}']) {
+            break;
+        }
+        if segment.is_empty() {
+            return Ok(None);
+        }
+        prefix.push(segment);
+    }
+    if prefix.as_os_str().is_empty()
+        || prefix.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            ) || crate::grep_executor::is_fallback_skipped_directory_name(
+                &component.as_os_str().to_string_lossy(),
+            )
+        })
+    {
+        return Ok(None);
+    }
+    // A pattern narrows its existing search root; unlike `path`, it must not
+    // introduce a new external scope, including through a directory symlink.
+    let Ok(candidate) = crate::bounded_io::canonicalize(&search_root.join(&prefix)) else {
+        return Ok(None);
+    };
+    if !candidate.starts_with(search_root)
+        || candidate.strip_prefix(search_root).is_ok_and(|relative| {
+            relative.components().any(|component| {
+                crate::grep_executor::is_fallback_skipped_directory_name(
+                    &component.as_os_str().to_string_lossy(),
+                )
+            })
+        })
+        || !crate::bounded_io::metadata(&candidate).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Ok(None);
+    }
+    let ignored = match crate::context::confinement::ConfinedIgnoreRules::current(
+        crate::context::confinement::SEARCH_IGNORE_FILES,
+    ) {
+        Some(rules) => candidate
+            .ancestors()
+            .take_while(|path| path.starts_with(search_root))
+            .any(|path| rules.is_ignored(path, true)),
+        None => crate::grep_executor::target_is_ignored(&candidate),
+    };
+    if !ignored {
+        return Ok(None);
+    }
+    ctx.validate_read_path(&req.id, req.session(), &candidate)?;
+    crate::context::confinement::check_walk_root(&req.id, &candidate)?;
+    Ok(Some(candidate))
+}
+
+fn discover_glob_root(
+    named_ignored_root: Option<&Path>,
+    ctx: &AppContext,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    max_results: usize,
+    ignored_target: bool,
+    explicit_session: Option<&str>,
+) -> GlobDiscovery {
+    if let Some(named_root) = named_ignored_root {
+        let filters = build_path_filters(&[pattern.to_owned()], &[]).unwrap_or_default();
+        let started = Instant::now();
+        let outcome = crate::grep_executor::bounded_glob_walk_in_named_ignored_folder(
+            search_root,
+            named_root,
+            &filters,
+        );
+        return GlobDiscovery {
+            scope_has_files: !outcome.files.is_empty()
+                || outcome.walk_truncated
+                || outcome.skipped_foreign_mounts > 0,
+            files: outcome.files,
+            indexed_mtimes: HashMap::new(),
+            walk_truncated: outcome.walk_truncated,
+            walk_time_limit_reached: outcome.walk_time_limit_reached,
+            source: "fallback",
+            entries_visited: outcome.entries_visited,
+            walk_time: started.elapsed(),
+            scope_probe: Duration::ZERO,
+            skipped_foreign_mounts: outcome.skipped_foreign_mounts,
+        };
+    }
+    glob_root(
+        ctx,
+        project_root,
+        search_root,
+        pattern,
+        max_results,
+        ignored_target,
+        explicit_session,
+    )
 }
 
 /// Text disclosure for index entries dropped because they are not on disk.
@@ -770,6 +902,54 @@ mod tests {
             glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
                 .files
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn named_ignored_glob_walk_stops_at_cap_and_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(project.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(project.join("ignored")).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(project.join("ignored").join(name), "cost").unwrap();
+        }
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project),
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "glob-named-ignored-bounds", "command": "glob", "pattern": "ignored/*.md"
+        }))
+        .unwrap();
+        let capped = crate::grep_executor::with_walk_limit(1, || handle_glob(&request, &ctx));
+        let body = serde_json::to_value(&capped).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(body["total"], 1, "{body}");
+        assert_eq!(body["walk_truncated"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        assert_eq!(body["walk_entries_examined"], 3, "{body}");
+
+        let timed = crate::grep_executor::with_fallback_walk_budget_for_test(
+            Duration::from_millis(100),
+            || {
+                crate::grep_executor::with_fallback_walk_entry_delay_for_test(
+                    Duration::from_millis(250),
+                    || handle_glob(&request, &ctx),
+                )
+            },
+        );
+        let body = serde_json::to_value(&timed).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(body["total"], 1, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        assert_eq!(body["walk_entries_examined"], 2, "{body}");
+        assert_eq!(
+            body["files_list_envelope"]["reason"], "time_limit",
+            "{body}"
         );
     }
 

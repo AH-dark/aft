@@ -268,6 +268,40 @@ fn confined_walks_honor_only_the_pinned_trees_own_ignore_files() {
 }
 
 #[test]
+fn confined_glob_named_ignored_folder_keeps_local_ignores_and_read_denials() {
+    let f = Fixture::new();
+    std::fs::write(f.pin.join(".gitignore"), "ignored/\n*ancestor*\n").unwrap();
+    std::fs::create_dir_all(f.pin.join("ignored/nested")).unwrap();
+    std::fs::write(f.pin.join("ignored/nested/.gitignore"), "hidden.rs\n").unwrap();
+    for name in ["ancestor.rs", "hidden.rs", "denied.rs"] {
+        std::fs::write(f.pin.join("ignored/nested").join(name), "fn example() {}\n").unwrap();
+    }
+    f.ctx.update_config(|config| {
+        config.sandbox.read_deny = vec![f.pin.join("ignored/nested/denied.rs")];
+    });
+    let response = f.call("glob", json!({"pattern":"ignored/nested/*.rs"}));
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["total"], 1, "{response:?}");
+    assert!(
+        response.data["files"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("ancestor.rs"),
+        "{response:?}"
+    );
+    assert_eq!(response.data["skipped_denied"], 1, "{response:?}");
+    let response = f.call("glob", json!({"pattern":"**/*.rs"}));
+    assert_eq!(response.data["total"], 1, "{response:?}");
+    assert!(
+        response.data["files"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("only.rs"),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn confined_call_time_tool_check() {
     let f = Fixture::new();
     for name in [
