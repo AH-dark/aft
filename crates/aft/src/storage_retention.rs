@@ -3415,7 +3415,8 @@ fn v3_finish_eviction(
     registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
     scope: &str,
     view_dir: &Path,
-) -> io::Result<()> {
+    deadline: Instant,
+) -> io::Result<crate::blob_store::v3::Measurement> {
     #[cfg(test)]
     test_hook(storage, "v3-evicting-committed");
     #[cfg(not(test))]
@@ -3430,10 +3431,12 @@ fn v3_finish_eviction(
             Ok(())
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
+    // Under the pass deadline: the reservation lock held here is the one
+    // v3 publishers need, so a measurement that runs out of time is left
+    // owed rather than finished late.
     registry
-        .covering_measurement()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(())
+        .covering_measurement_until(deadline)
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 /// The v3 retention collector. Each pass visits one family under
@@ -3554,7 +3557,7 @@ fn collect_v3_family(
     report: &mut SweepReport,
     bounds: V3Bounds,
 ) -> io::Result<V3Visit> {
-    use crate::blob_store::v3::{RegistryWriter, ReservationLock};
+    use crate::blob_store::v3::{Measurement, RegistryWriter, ReservationLock};
     let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
     let registry_path = storage.join("blobs/v3").join(family).join("members.sqlite");
     if !registry_path.try_exists()? {
@@ -3577,8 +3580,18 @@ fn collect_v3_family(
         Err(error) => return Err(v3(error)),
     };
     // Opening the registry takes a covering measurement and releases the
-    // reservations of dead owners.
-    let mut registry = RegistryWriter::open_existing(storage, family, &lock).map_err(v3)?;
+    // reservations of dead owners. Like every measurement here it stops at
+    // the pass deadline; one that runs out records nothing and is owed (see
+    // `Measurement::Owed`), and the visit ends so the lock is released.
+    let (mut registry, opened) =
+        RegistryWriter::open_existing_until(storage, family, &lock, deadline).map_err(v3)?;
+    if opened == Measurement::Owed {
+        report
+            .skipped_families
+            .push(format!("blobs/v3/{family}: measurement_owed"));
+        return Ok(V3Visit::Done);
+    }
+    let mut owed = false;
     let cursor_path = v3_member_cursor_path(storage, family);
     // An unreadable cursor only costs the resume position.
     let resume = read_json::<V3MemberCursor>(&cursor_path)
@@ -3647,8 +3660,10 @@ fn collect_v3_family(
         };
         if member.state == crate::views::registry::STATE_EVICTING {
             let bytes = retention_tree_bytes(&view_dir, deadline).ok();
-            v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir)?;
+            let measured =
+                v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir, deadline)?;
             record_v3_removal(&mut domain, bytes);
+            owed |= measured == Measurement::Owed;
             continue;
         }
         let Some(root) = member.root.as_deref().and_then(v3_root_path) else {
@@ -3698,8 +3713,10 @@ fn collect_v3_family(
         match step {
             V3Step::Evicting => {
                 let bytes = retention_tree_bytes(&view_dir, deadline).ok();
-                v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir)?;
+                let measured =
+                    v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir, deadline)?;
                 record_v3_removal(&mut domain, bytes);
+                owed |= measured == Measurement::Owed;
             }
             V3Step::Retained if missing => domain.skipped_protected += 1,
             V3Step::Retained | V3Step::Present | V3Step::Gone | V3Step::Due { .. } => {}
@@ -3715,7 +3732,15 @@ fn collect_v3_family(
     }
     // Every collector pass ends with a covering measurement, so committed
     // usage also reflects files removed by anything else since the last one.
-    registry.covering_measurement().map_err(v3)?;
+    // It is skipped once one is already owed: the deadline has passed.
+    if !owed {
+        owed = registry.covering_measurement_until(deadline).map_err(v3)? == Measurement::Owed;
+    }
+    if owed {
+        report
+            .skipped_families
+            .push(format!("blobs/v3/{family}: measurement_owed"));
+    }
     report.examined += domain.examined;
     report.skipped_live += domain.skipped_live;
     report.skipped_recent += domain.skipped_recent;
@@ -7930,6 +7955,65 @@ mod v3_collector_tests {
         }
         assert_eq!(member_scopes(&storage), ["p1", "p2", "p3"]);
         assert!(!view_dir(&storage, "z-target").exists());
+    }
+
+    /// A covering measurement that runs out of pass budget records nothing,
+    /// reports the measurement as owed and releases the reservation lock; the
+    /// next pass takes the complete measurement.
+    #[cfg(unix)]
+    #[test]
+    fn v3_measurement_past_the_deadline_records_nothing_and_is_owed() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        seed(&storage, &[("member", "view", None)]);
+        fill_view_dir(&view_dir(&storage, "member"));
+        let measured = || {
+            v3::LedgerReader::open_existing(&storage, FAMILY)
+                .unwrap()
+                .accounting()
+                .unwrap()
+                .measured_bytes
+        };
+        // Bring the record up to date, then grow the family so any complete
+        // walk would record a different total.
+        pass(&storage);
+        let recorded = measured();
+        let family = storage.join("blobs/v3").join(FAMILY);
+        fs::write(family.join("growth.bin"), vec![5u8; 256 * 1024]).unwrap();
+
+        // Every entry of the walk now takes 100 ms; the family has more
+        // entries than a 300 ms budget allows.
+        v3::set_walk_delay_for_test(Duration::from_millis(100));
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let mut report = SweepReport::default();
+        let result = collect_one_v3_family(
+            &storage,
+            &|| false,
+            &mut report,
+            V3Bounds {
+                budget,
+                ..V3Bounds::PASS
+            },
+        );
+        let elapsed = started.elapsed();
+        v3::set_walk_delay_for_test(Duration::ZERO);
+        result.unwrap();
+        assert!(elapsed < budget + Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(
+            report.skipped_families,
+            [format!("blobs/v3/{FAMILY}: measurement_owed")]
+        );
+        assert_eq!(measured(), recorded, "a partial walk was recorded");
+        // The reservation lock is free again at once.
+        drop(ReservationLock::acquire_until(&storage, Instant::now()).unwrap());
+
+        let next = pass(&storage);
+        assert!(next.skipped_families.is_empty(), "{next:?}");
+        assert_eq!(measured(), inventory(&family));
+        assert!(measured() > recorded);
     }
 
     /// Another process's hold on the reservation lock costs the pass at most

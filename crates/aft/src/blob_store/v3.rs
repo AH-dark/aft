@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
@@ -161,12 +161,31 @@ fn probe_free_space(_path: &Path) -> Option<(u64, u64)> {
 /// Read the whole namespace, including SQLite sidecars and member directories.
 /// Symlinks are charged as entries, not followed outside the namespace.
 pub fn allocated_bytes(path: &Path) -> Result<u64> {
+    Ok(allocated_bytes_until(path, None)?.expect("a walk without a deadline completes"))
+}
+
+/// [`allocated_bytes`], stopping at `deadline`. The deadline is checked before
+/// each directory entry is read, and a walk that reaches it returns `None`:
+/// its partial sum is never a total.
+pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)? {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        WALK_DELAY.with(|delay| {
+            if !delay.get().is_zero() {
+                std::thread::sleep(delay.get());
+            }
+        });
         let entry = entry?;
         let meta = fs::symlink_metadata(entry.path())?;
         if meta.is_dir() {
-            total = total.saturating_add(allocated_bytes(&entry.path())?);
+            let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
+                return Ok(None);
+            };
+            total = total.saturating_add(bytes);
         } else {
             #[cfg(unix)]
             {
@@ -179,7 +198,32 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
             }
         }
     }
-    Ok(total)
+    Ok(Some(total))
+}
+
+#[cfg(test)]
+thread_local! {
+    static WALK_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+/// Test seam: every namespace walk on this thread sleeps this long per entry.
+/// Its only caller is a unix-only test.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn set_walk_delay_for_test(delay: Duration) {
+    WALK_DELAY.with(|cell| cell.set(delay));
+}
+
+/// The outcome of a covering measurement taken under a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Measurement {
+    /// A complete walk was recorded, with this many allocated bytes.
+    Recorded(u64),
+    /// The deadline passed during the walk. Nothing was recorded and no
+    /// reservation was released; the registry keeps its last complete
+    /// measurement, which can only overstate usage after deletions. Every
+    /// writer open measures again, so the next writer (or the collector's
+    /// next visit) repays it.
+    Owed,
 }
 
 /// Owning capability for the non-reentrant storage-root lease. Pass this guard
@@ -595,14 +639,36 @@ impl<'a> RegistryWriter<'a> {
     pub fn open_existing(storage: &Path, family: &str, lock: &'a ReservationLock) -> Result<Self> {
         Self::open(storage, family, lock, false)
     }
+    /// [`Self::open_existing`] whose covering measurement stops at `deadline`.
+    /// An [`Measurement::Owed`] open still returns the writer.
+    pub fn open_existing_until(
+        storage: &Path,
+        family: &str,
+        lock: &'a ReservationLock,
+        deadline: Instant,
+    ) -> Result<(Self, Measurement)> {
+        let mut writer = Self::open_unmeasured(storage, family, lock, false)?;
+        let measurement = writer.covering_measurement_until(deadline)?;
+        Ok((writer, measurement))
+    }
     fn open(storage: &Path, family: &str, lock: &'a ReservationLock, create: bool) -> Result<Self> {
+        let mut writer = Self::open_unmeasured(storage, family, lock, create)?;
+        writer.covering_measurement()?;
+        Ok(writer)
+    }
+    fn open_unmeasured(
+        storage: &Path,
+        family: &str,
+        lock: &'a ReservationLock,
+        create: bool,
+    ) -> Result<Self> {
         persisted_format::register_storage_root(storage);
         lock.verify(storage)?;
         let dir = family_dir(storage, family)?;
         if create {
             fs::create_dir_all(&dir)?;
         }
-        let mut writer = Self {
+        Ok(Self {
             database: connections::shared(
                 &dir.join("members.sqlite"),
                 Kind::Registry,
@@ -611,9 +677,7 @@ impl<'a> RegistryWriter<'a> {
             )?,
             dir,
             lock,
-        };
-        writer.covering_measurement()?;
-        Ok(writer)
+        })
     }
     pub fn accounting(&self) -> Result<Accounting> {
         accounting(&**self.connection()?)
@@ -624,9 +688,21 @@ impl<'a> RegistryWriter<'a> {
     /// After deleting namespace files, call this to refresh accounting. It releases dead rows
     /// in the same barrier transaction as the measurement, retaining plane data.
     pub fn covering_measurement(&mut self) -> Result<u64> {
-        self.measure_and_release(None)
+        match self.measure_and_release(None, None)? {
+            Measurement::Recorded(bytes) => Ok(bytes),
+            Measurement::Owed => unreachable!("a measurement without a deadline completes"),
+        }
     }
-    fn measure_and_release(&mut self, release: Option<i64>) -> Result<u64> {
+    /// [`Self::covering_measurement`] that stops at `deadline`, recording
+    /// nothing when it does.
+    pub fn covering_measurement_until(&mut self, deadline: Instant) -> Result<Measurement> {
+        self.measure_and_release(None, Some(deadline))
+    }
+    fn measure_and_release(
+        &mut self,
+        release: Option<i64>,
+        deadline: Option<Instant>,
+    ) -> Result<Measurement> {
         self.lock.verify(&self.lock.storage)?;
         // Checkpoint first: recording a measurement must not itself leave a new
         // WAL charge. Repeat if the accounting update allocated registry pages.
@@ -634,7 +710,11 @@ impl<'a> RegistryWriter<'a> {
         checkpoint(&connection)?;
         for _ in 0..8 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let bytes = allocated_bytes(&self.dir)?;
+            // Dropping the transaction rolls it back: a walk cut short by the
+            // deadline records nothing and releases nothing.
+            let Some(bytes) = allocated_bytes_until(&self.dir, deadline)? else {
+                return Ok(Measurement::Owed);
+            };
             if let Some(id) = release {
                 tx.execute(
                     "UPDATE reservations SET state='released',reserved_bytes=0 WHERE id=?1",
@@ -674,8 +754,11 @@ impl<'a> RegistryWriter<'a> {
             )?;
             tx.commit()?;
             checkpoint(&connection)?;
-            if allocated_bytes(&self.dir)? == bytes {
-                return Ok(bytes);
+            // The recorded total came from a complete walk. If the deadline
+            // stops the stability recheck, keep it rather than repeat.
+            match allocated_bytes_until(&self.dir, deadline)? {
+                Some(again) if again != bytes => {}
+                _ => return Ok(Measurement::Recorded(bytes)),
             }
         }
         Err(Error::Refused("reservation_ledger_unreadable"))
@@ -713,7 +796,7 @@ impl<'a> RegistryWriter<'a> {
         if reservation.registry != self.registry_identity()? {
             return Err(Error::ReservationRegistryMismatch);
         }
-        self.measure_and_release(Some(reservation.id))?;
+        self.measure_and_release(Some(reservation.id), None)?;
         Ok(())
     }
     pub fn reserve(&mut self, request: u64) -> Result<Reservation> {

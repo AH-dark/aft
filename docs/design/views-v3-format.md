@@ -285,6 +285,16 @@ Each value is set and read back; a mismatch refuses as `pragma:<name>`.
 - On failure (owner alive or dead) one transaction takes a covering
   measurement, which includes plane rows already committed, and releases the
   row. Orphan plane rows stay charged until they are reclaimed.
+- A measurement taken under a deadline (`covering_measurement_until`,
+  `open_existing_until`) checks it before each directory entry of the walk.
+  If the deadline passes, the walk stops, its transaction is rolled back, and
+  nothing is recorded or released: the result is `Measurement::Owed`. A
+  partial sum is never recorded as a total. The registry keeps its last
+  complete measurement, which can only overstate usage after deletions, and
+  every writer open measures again, so the next writer or the collector's
+  next visit repays it. The retention collector uses its pass deadline for
+  every measurement and reports an owed one in the pass report's
+  `skipped_families` as `blobs/v3/<family>: measurement_owed`.
 - Deletions lower committed usage only through the next covering measurement,
   by the allocated bytes actually freed. Plane row deletions count once their
   pages are reclaimed or the WAL is checkpointed; v3 plane stores use
@@ -368,7 +378,8 @@ Tests (`storage_retention::v3_collector_tests`):
 `collecting_a_view_member_lowers_committed_usage_by_its_allocated_bytes`,
 `v3_collector_never_creates_a_registry`,
 `v3_collector_skips_a_family_whose_reservation_lock_is_busy`,
-`v3_collector_resumes_after_the_last_examined_member` and
+`v3_collector_resumes_after_the_last_examined_member`,
+`v3_measurement_past_the_deadline_records_nothing_and_is_owed` and
 `no_production_path_writes_v3_over_a_v0_60_0_floor`.
 
 ## Replay prototype
