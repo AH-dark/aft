@@ -9444,6 +9444,8 @@ impl BgTaskRegistry {
         let task_id = metadata.task_id.clone();
         // Held while the task is built and its worker started, so another
         // registry can neither build a second copy nor start a worker first.
+        // Released before this registry publishes the task's pending
+        // notices below (see the lock order at `saved_remote_task_claims`).
         let mut claims = saved_remote_task_claims()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9452,7 +9454,7 @@ impl BgTaskRegistry {
             if let Some(task) = claim.task.upgrade() {
                 claim.adopters.push(Arc::downgrade(&self.inner));
                 let held = claim.held;
-                self.register_claimed_task(&task)?;
+                let publishes = self.register_claimed_task(&task)?;
                 // The owner's worker stopped without finishing the task: run
                 // it here, unless this registry is itself holding tasks for a
                 // pause, which must reach a task before its worker does.
@@ -9462,6 +9464,10 @@ impl BgTaskRegistry {
                     && !task.is_terminal()
                 {
                     self.resume_remote_task(&task_id)?;
+                }
+                drop(claims);
+                if publishes {
+                    self.publish_registered_task_notices(&task)?;
                 }
                 return Ok(());
             }
@@ -9493,9 +9499,12 @@ impl BgTaskRegistry {
     }
 
     /// Make a task another registry restored addressable here too, as
-    /// `insert_rehydrated_task` registers a task it builds.
+    /// `insert_rehydrated_task` registers a task it builds. Returns whether
+    /// this registry has just become the task's notice publisher, in which
+    /// case the caller must publish its pending notices with
+    /// `publish_registered_task_notices` once the claim lock is released.
     #[cfg(unix)]
-    fn register_claimed_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+    fn register_claimed_task(&self, task: &Arc<BgTask>) -> Result<bool, String> {
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(task);
         {
@@ -9505,7 +9514,7 @@ impl BgTaskRegistry {
                 .lock()
                 .map_err(|_| "background task registry lock poisoned".to_string())?;
             if tasks.contains_key(&task.task_id) {
-                return Ok(());
+                return Ok(false);
             }
             tasks.insert(task.task_id.clone(), Arc::clone(task));
         }
@@ -9522,39 +9531,43 @@ impl BgTaskRegistry {
                 .insert(task.task_id.clone(), Arc::clone(task));
         }
         if self.inner.saved_task_recovery.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
         // A project registry publishes the task's notices from now on, unless
         // another project registry already does.
-        let publishes = {
-            let mut publisher = task
-                .notice_registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let taken = publisher
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some();
-            if !taken {
-                *publisher = Some(Arc::downgrade(&self.inner));
-            }
-            !taken
-        };
-        if publishes {
-            // A `bash.kill_scope` recovery registry may have stopped the task
-            // before this registry registered it, and kept no notice of it.
-            // Publish those notices here; the task's routed flag keeps the
-            // completion from being queued twice.
-            let metadata = task
-                .lock_state()
-                .map_err(|_| "background task lock poisoned")?
-                .metadata
-                .clone();
-            if metadata.cancelled_call_unannounced {
-                self.index_cancelled_call_here(&task.session_id, &task.task_id);
-            }
-            self.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
+        let mut publisher = task
+            .notice_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = publisher
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some();
+        if !taken {
+            *publisher = Some(Arc::downgrade(&self.inner));
         }
+        Ok(!taken)
+    }
+
+    /// Publish the notices of a task this registry has just become the
+    /// publisher of. A `bash.kill_scope` recovery registry may have stopped
+    /// the task before this registry registered it, and kept no notice of
+    /// it. The publisher was set before the task's state is read here, and a
+    /// stop sets its state before it looks up the publisher, so each notice
+    /// is published by this call, by the stop, or by both; the task's routed
+    /// flag keeps the completion from being queued twice, and the
+    /// cancelled-call index is a set.
+    #[cfg(unix)]
+    fn publish_registered_task_notices(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        let metadata = task
+            .lock_state()
+            .map_err(|_| "background task lock poisoned")?
+            .metadata
+            .clone();
+        if metadata.cancelled_call_unannounced {
+            self.index_cancelled_call_here(&task.session_id, &task.task_id);
+        }
+        self.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
         Ok(())
     }
 
@@ -12728,6 +12741,24 @@ struct SavedRemoteTaskClaim {
 
 /// Claims by task id. An entry lives while some registry or worker still
 /// holds its task; dead entries are dropped on the next restore.
+///
+/// Lock order. This mutex is always taken first, with no other lock held:
+/// by `restore_claimed_remote_task` (from a project's replay, a watch's
+/// single-task recovery, or `recover_saved_scope_tasks`) and by
+/// `start_held_remote_workers`. While it is held, code registers or builds
+/// a task, which takes registry-inner locks (`tasks`, `cleanup_queue`,
+/// `watchdog_tasks`, `held_remote_workers`, and `cancelled_call_tasks` when
+/// a saved cancelled-call flag is indexed), the task's `state`, and the
+/// database pool and progress sender when a built task's saved watches are
+/// re-armed; it sets the task's `notice_registry` and may spawn a remote
+/// worker thread, which runs without this mutex. It never renders or
+/// queues a completion: `publish_registered_task_notices` and every
+/// `enqueue_completion_from_parts` (which nests a task's
+/// `terminal_notification_routed`, then its `state`, then the registry's
+/// `completions`) run without it. Since no path takes this mutex while
+/// holding another lock, it is outermost in every nesting and cannot be
+/// part of a lock cycle. `notice_registry` is a leaf: no other lock is
+/// taken while it is held.
 #[cfg(unix)]
 fn saved_remote_task_claims() -> &'static Mutex<HashMap<String, SavedRemoteTaskClaim>> {
     static CLAIMS: std::sync::OnceLock<Mutex<HashMap<String, SavedRemoteTaskClaim>>> =
