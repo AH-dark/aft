@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
 
@@ -282,7 +283,12 @@ struct State {
 #[derive(Default)]
 struct Flight {
     state: Mutex<State>,
+    /// Cache-wide use counter of the latest lookup, for capacity eviction.
+    last_used: AtomicU64,
 }
+
+/// Cached (root, configuration) snapshots kept before an idle one is dropped.
+pub(super) const MAX_CACHED_SNAPSHOTS: usize = 64;
 
 #[derive(Default)]
 struct Completion {
@@ -322,9 +328,29 @@ impl Drop for ScanGuard<'_> {
 #[derive(Default)]
 pub(super) struct ApplicabilityCache {
     entries: Mutex<HashMap<Key, Arc<Flight>>>,
+    uses: AtomicU64,
     metrics: Mutex<HashMap<PathBuf, ApplicabilityMetrics>>,
     #[cfg(test)]
     waiter_joined: (Mutex<bool>, Condvar),
+}
+
+/// Make room for one new key. Only the least recently used idle snapshots go:
+/// dropping every idle one at the cap also discarded warm snapshots of roots in
+/// active use, so their next lookup paid a full walk.
+fn evict_least_recently_used(entries: &mut HashMap<Key, Arc<Flight>>) {
+    while entries.len() >= MAX_CACHED_SNAPSHOTS {
+        // Never evict a flight with a caller: doing so would admit a second
+        // concurrent scan of that root and configuration.
+        let Some(oldest) = entries
+            .iter()
+            .filter(|(_, flight)| Arc::strong_count(flight) == 1)
+            .min_by_key(|(_, flight)| flight.last_used.load(Ordering::Relaxed))
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        entries.remove(&oldest);
+    }
 }
 
 pub(super) fn shared() -> &'static ApplicabilityCache {
@@ -493,12 +519,14 @@ impl ApplicabilityCache {
         );
         let flight = {
             let mut entries = self.entries.lock();
-            if entries.len() >= 64 {
-                // Never evict a flight with a caller: doing so would admit a
-                // second concurrent scan of that root and configuration.
-                entries.retain(|_, flight| Arc::strong_count(flight) > 1);
+            if !entries.contains_key(&key) {
+                evict_least_recently_used(&mut entries);
             }
-            Arc::clone(entries.entry(key).or_default())
+            let flight = Arc::clone(entries.entry(key).or_default());
+            flight
+                .last_used
+                .store(self.uses.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+            flight
         };
         loop {
             let mut state = flight.state.lock();

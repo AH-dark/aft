@@ -1,0 +1,1 @@
+- Working across many projects in one session no longer makes language-server detection rescan projects you are actively editing.
